@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Outline symbol category.
 ///
-/// The names follow LSP `DocumentSymbol.kind`, but ast-grep stores the symbolic
+/// The names follow LSP `DocumentSymbol.kind`, but vorpal stores the symbolic
 /// category directly instead of exposing LSP numeric values.
 /// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentSymbol
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]

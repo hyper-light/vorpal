@@ -115,7 +115,7 @@ fn edit_root_toml<P: AsRef<Path>>(path: P, version: &str) -> Result<()> {
     .as_table_mut()
     .context("dep should be table")?;
   for (key, value) in deps.iter_mut() {
-    if !key.starts_with("ast-grep-") {
+    if !key.starts_with("vorpal-") {
       continue;
     }
     if value.is_str() {

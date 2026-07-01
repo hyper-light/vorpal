@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 #[derive(Parser)]
 pub struct NewArg {
-  /// The ast-grep item type to create. Available options: project/rule/test/utils.
+  /// The vorpal item type to create. Available options: project/rule/test/utils.
   #[clap(subcommand)]
   entity: Option<Entity>,
   /// The id of the item to create.
@@ -101,12 +101,12 @@ impl NewArg {
   }
 }
 
-/// The ast-grep item type to create.
+/// The vorpal item type to create.
 #[derive(Subcommand, Debug, PartialEq, Eq, Clone)]
 enum Entity {
   /// Create an new project by scaffolding.
   ///
-  /// By default, this command will create a root config file `sgconfig.yml`,
+  /// By default, this command will create a root config file `vorpalconfig.yml`,
   /// a rule folder `rules`, a test case folder `rule-tests` and a utility rule folder `utils`.
   /// You can customize the folder names during the creation.
   Project,
@@ -114,22 +114,22 @@ enum Entity {
   ///
   /// This command will create a new rule in one of the `rule_dirs`.
   /// You need to provide `name` and `language` either by interactive input or via command line arguments.
-  /// ast-grep will ask you which `rule_dir` to use if multiple ones are configured in the `sgconfig.yml`.
-  /// If `-y, --yes` flag is true, ast-grep will choose the first `rule_dir` to create the new rule.
+  /// vorpal will ask you which `rule_dir` to use if multiple ones are configured in the `vorpalconfig.yml`.
+  /// If `-y, --yes` flag is true, vorpal will choose the first `rule_dir` to create the new rule.
   Rule,
   /// Create a new test case.
   ///
   /// This command will create a new test in one of the `test_dirs`.
   /// You need to provide `name` either by interactive input or via command line arguments.
-  /// ast-grep will ask you which `test_dir` to use if multiple ones are configured in the `sgconfig.yml`.
-  /// If `-y, --yes` flag is true, ast-grep will choose the first `test_dir` to create the new test.
+  /// vorpal will ask you which `test_dir` to use if multiple ones are configured in the `vorpalconfig.yml`.
+  /// If `-y, --yes` flag is true, vorpal will choose the first `test_dir` to create the new test.
   Test,
   /// Create a new global utility rule.
   ///
   /// This command will create a new global utility rule in one of the `utils` folders.
   /// You need to provide `name` and `language` either by interactive input or via command line arguments.
-  /// ast-grep will ask you which `util_dir` to use if multiple ones are configured in the `sgconfig.yml`.
-  /// If `-y, --yes` flag is true, ast-grep will choose the first `util_dir` to create the new item.
+  /// vorpal will ask you which `util_dir` to use if multiple ones are configured in the `vorpalconfig.yml`.
+  /// If `-y, --yes` flag is true, vorpal will choose the first `util_dir` to create the new item.
   Util,
 }
 
@@ -182,21 +182,21 @@ fn do_create_entity(entity: Entity, found: ProjectConfig, arg: NewArg) -> Result
 }
 
 fn ask_entity_type(arg: NewArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
-  // 1. check if we are under a sgconfig.yml
+  // 1. check if we are under a vorpalconfig.yml
   if let Ok(found) = project {
     // 2. ask users what to create if yes
     let entity = arg.ask_entity_type()?;
     do_create_entity(entity, found, arg)
   } else {
-    // 3. ask users to provide project info if no sgconfig found
-    print!("No sgconfig.yml found. ");
+    // 3. ask users to provide project info if no vorpalconfig found
+    print!("No vorpalconfig.yml found. ");
     let current_dir = std::env::current_dir()?;
     create_new_project(arg, &current_dir)
   }
 }
 
 fn create_new_project(arg: NewArg, project_dir: &Path) -> Result<ExitCode> {
-  println!("Creating a new ast-grep project...");
+  println!("Creating a new vorpal project...");
   let ask_dir_and_create = |prompt: &str, default: &str| -> Result<PathBuf> {
     let dir = arg.ask_dir(prompt, default)?;
     create_dir(project_dir, &dir)
@@ -222,16 +222,16 @@ fn create_new_project(arg: NewArg, project_dir: &Path) -> Result<ExitCode> {
     language_globs: None,        // advanced feature, skip now
     language_injections: vec![], // advanced feature
   };
-  let config_path = project_dir.join("sgconfig.yml");
+  let config_path = project_dir.join("vorpalconfig.yml");
   let f = File::create(config_path)?;
   serde_yaml::to_writer(f, &root_config)?;
-  println!("Your new ast-grep project has been created!");
+  println!("Your new vorpal project has been created!");
   Ok(ExitCode::SUCCESS)
 }
 
 fn default_rule(id: &str, lang: SgLang) -> String {
   format!(
-    r#"# yaml-language-server: $schema=https://raw.githubusercontent.com/ast-grep/ast-grep/main/schemas/rule.json
+    r#"# yaml-language-server: $schema=https://raw.githubusercontent.com/adalundhe/vorpal/main/schemas/rule.json
 
 id: {id}
 message: Add your rule message here....
@@ -374,12 +374,12 @@ mod test {
       yes: true,
     };
     create_new_project(arg, tempdir)?;
-    assert!(tempdir.join("sgconfig.yml").exists());
+    assert!(tempdir.join("vorpalconfig.yml").exists());
     Ok(())
   }
 
   fn create_rule(temp: &Path) -> Result<()> {
-    let project = ProjectConfig::setup(Some(temp.join("sgconfig.yml")))?;
+    let project = ProjectConfig::setup(Some(temp.join("vorpalconfig.yml")))?;
     let arg = NewArg {
       entity: Some(Entity::Rule),
       name: Some("test-rule".into()),
@@ -392,7 +392,7 @@ mod test {
   }
 
   fn create_util(temp: &Path) -> Result<()> {
-    let project = ProjectConfig::setup(Some(temp.join("sgconfig.yml")))?;
+    let project = ProjectConfig::setup(Some(temp.join("vorpalconfig.yml")))?;
     let arg = NewArg {
       entity: Some(Entity::Util),
       name: Some("test-utils".into()),

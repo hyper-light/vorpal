@@ -1,4 +1,4 @@
-//! Provides utility to convert ast-grep data types to lsp data types
+//! Provides utility to convert vorpal data types to lsp data types
 use vorpal_config::Label;
 use vorpal_config::LabelStyle;
 use vorpal_config::RuleConfig;
@@ -125,7 +125,7 @@ pub fn diagnostic_to_code_action(
       let edit = WorkspaceEdit::new(changes);
       let title = fixer
         .title
-        .unwrap_or_else(|| format!("Fix `{id}` with ast-grep"));
+        .unwrap_or_else(|| format!("Fix `{id}` with vorpal"));
       CodeAction {
         title,
         command: None,
@@ -231,7 +231,7 @@ pub fn convert_match_to_diagnostic<L: LanguageExt>(
       Severity::Off => unreachable!("turned-off rule should not have match"),
     }),
     message: get_non_empty_message(rule, node_match),
-    source: Some(String::from("ast-grep")),
+    source: Some(String::from("vorpal")),
     tags: None,
     related_information,
     data: None,

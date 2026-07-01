@@ -50,16 +50,16 @@ enum OutlineView {
 pub struct OutlineArg {
   /// Specify the input language.
   ///
-  /// For path input, ast-grep parses only files of this language. For stdin,
+  /// For path input, vorpal parses only files of this language. For stdin,
   /// this flag is required because there is no file path to infer the language from.
   #[clap(short, long, required_if_eq("stdin", "true"))]
   lang: Option<SgLang>,
 
   /// Output outline entries in structured JSON.
   ///
-  /// If this flag is set, ast-grep will output outline entries in JSON format.
+  /// If this flag is set, vorpal will output outline entries in JSON format.
   /// You can pass optional value to this flag by using `--json=<STYLE>` syntax
-  /// to further control how JSON object is formatted and printed. ast-grep will
+  /// to further control how JSON object is formatted and printed. vorpal will
   /// `pretty`-print JSON if no value is passed.
   /// Note, the json flag must use `=` to specify its value.
   #[clap(
@@ -74,9 +74,9 @@ pub struct OutlineArg {
   /// Controls output color.
   ///
   /// This flag controls when to use colors. The default setting is 'auto', which
-  /// means ast-grep will try to guess when to use colors. If ast-grep is
+  /// means vorpal will try to guess when to use colors. If vorpal is
   /// printing to a terminal, then it will use colors, but if it is redirected to a
-  /// file or a pipe, then it will suppress color output. ast-grep will also suppress
+  /// file or a pipe, then it will suppress color output. vorpal will also suppress
   /// color output in some other circumstances. For example, no color will be used
   /// if the TERM environment variable is not set or set to 'dumb'.
   #[clap(long, default_value = "auto", value_name = "WHEN")]
@@ -86,7 +86,7 @@ pub struct OutlineArg {
   ///
   /// This option controls top-level structure such as classes, structs, interfaces,
   /// functions, and modules. It does not filter members.
-  /// By default, ast-grep picks the items automatically based on the input path.
+  /// By default, vorpal picks the items automatically based on the input path.
   #[clap(long, default_value = "auto", value_name = "ITEMS")]
   items: OutlineItems,
 
@@ -114,7 +114,7 @@ pub struct OutlineArg {
   ///
   /// Views contain increasingly more information, from grouped names to expanded
   /// member signatures.
-  /// By default, ast-grep picks the view automatically based on the input path.
+  /// By default, vorpal picks the view automatically based on the input path.
   #[clap(long, default_value = "auto", value_name = "VIEW")]
   view: OutlineView,
 

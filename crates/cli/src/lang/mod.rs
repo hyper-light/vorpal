@@ -65,7 +65,7 @@ impl SgLang {
   pub fn injectable_sg_langs(&self) -> Option<impl Iterator<Item = Self>> {
     let langs = self.injectable_languages()?;
     // TODO: handle injected languages not found
-    // e.g vue can inject scss which is not supported by sg
+    // e.g vue can inject scss which is not supported by vorpal
     // we should report an error here
     // Dedup because aliases like "ts" and "typescript" resolve to the same SgLang
     let deduped: HashSet<_> = langs

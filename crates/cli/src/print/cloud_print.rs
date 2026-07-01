@@ -69,7 +69,7 @@ impl<W: Write> Printer for CloudPrinter<W> {
 
   fn after_print(&mut self) -> Result<()> {
     if self.platform == Platform::Sarif {
-      let tool_component = sarif::ToolComponent::builder().name("ast-grep").build();
+      let tool_component = sarif::ToolComponent::builder().name("vorpal").build();
       let tool = sarif::Tool::builder().driver(tool_component).build();
       let mut run = sarif::Run::builder().tool(tool).build();
       run.results = Some(self.sarif_results.clone());

@@ -58,13 +58,13 @@ pub enum RuleConfigError {
 }
 
 #[derive(Serialize, Deserialize, Clone, JsonSchema)]
-#[schemars(title = "ast-grep rule")]
+#[schemars(title = "vorpal rule")]
 pub struct SerializableRuleConfig<L: Language> {
   #[serde(flatten)]
   pub core: SerializableRuleCore,
   /// A pattern string or a FixConfig object to auto fix the issue.
   /// It can reference metavariables appeared in rule.
-  /// See details in fix [object reference](https://ast-grep.github.io/reference/yaml/fix.html#fixconfig).
+  /// See details in fix [object reference](https://vorpal.github.io/reference/yaml/fix.html#fixconfig).
   pub fix: Option<SerializableFixer>,
   /// Rewrite rules for `rewrite` transformation
   pub rewriters: Option<Vec<SerializableRewriter>>,

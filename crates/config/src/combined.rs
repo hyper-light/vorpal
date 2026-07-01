@@ -211,7 +211,7 @@ impl MaySuppressed<'_> {
   }
 }
 
-const IGNORE_TEXT: &str = "ast-grep-ignore";
+const IGNORE_TEXT: &str = "vorpal-ignore";
 pub const UNUSED_SUPPRESSION_ID: &str = "unused-suppression";
 pub const NO_SUPPRESS_ALL_ID: &str = "no-suppress-all";
 
@@ -338,8 +338,8 @@ impl<'r, L: Language> CombinedScan<'r, L> {
     let config = SerializableRuleConfig {
       id: NO_SUPPRESS_ALL_ID.into(),
       severity,
-      message: "ast-grep-ignore must specify rule IDs.".into(),
-      note: Some("Use 'ast-grep-ignore: rule-id' to suppress specific rules.".into()),
+      message: "vorpal-ignore must specify rule IDs.".into(),
+      note: Some("Use 'vorpal-ignore: rule-id' to suppress specific rules.".into()),
       ..Self::builtin_config(lang)
     };
     RuleConfig::try_from(config, &Default::default()).unwrap()
@@ -349,7 +349,7 @@ impl<'r, L: Language> CombinedScan<'r, L> {
     let config = SerializableRuleConfig {
       id: UNUSED_SUPPRESSION_ID.into(),
       severity,
-      message: "Unused 'ast-grep-ignore' directive.".into(),
+      message: "Unused 'vorpal-ignore' directive.".into(),
       fix: crate::from_str(r#"''"#).unwrap(),
       ..Self::builtin_config(lang)
     };
@@ -381,7 +381,7 @@ impl<'r, L: Language> CombinedScan<'r, L> {
   }
 }
 
-// trim text after whitepaces, this is useful for comment like `/* ast-grep-ignore: test */`
+// trim text after whitepaces, this is useful for comment like `/* vorpal-ignore: test */`
 // we assume no rule-id contains whitespace, so trailing comment can be stripped
 // see https://github.com/ast-grep/ast-grep/issues/2644
 fn trim_comment_trailing(text: &str) -> Option<&str> {
@@ -445,14 +445,14 @@ language: Tsx",
   #[test]
   fn test_ignore_node() {
     let source = r#"
-    // ast-grep-ignore
+    // vorpal-ignore
     console.log('ignored all')
     console.log('no ignore')
-    // ast-grep-ignore: test
+    // vorpal-ignore: test
     console.log('ignore one')
-    // ast-grep-ignore: not-test
+    // vorpal-ignore: not-test
     console.log('ignore another')
-    // ast-grep-ignore: not-test, test
+    // vorpal-ignore: not-test, test
     console.log('multiple ignore')
     "#;
     test_scan(source, |scanned| {
@@ -466,11 +466,11 @@ language: Tsx",
   #[test]
   fn test_ignore_node_same_line() {
     let source = r#"
-    console.log('ignored all') // ast-grep-ignore
+    console.log('ignored all') // vorpal-ignore
     console.log('no ignore')
-    console.log('ignore one') // ast-grep-ignore: test
-    console.log('ignore another') // ast-grep-ignore: not-test
-    console.log('multiple ignore') // ast-grep-ignore: not-test, test
+    console.log('ignore one') // vorpal-ignore: test
+    console.log('ignore another') // vorpal-ignore: not-test
+    console.log('multiple ignore') // vorpal-ignore: not-test, test
     "#;
     test_scan(source, |scanned| {
       let matches = &scanned[0];
@@ -482,10 +482,10 @@ language: Tsx",
 
   #[test]
   fn test_ignore_multiline_node_same_line() {
-    // A trailing `// ast-grep-ignore` on the LAST line of a multi-line statement
+    // A trailing `// vorpal-ignore` on the LAST line of a multi-line statement
     // suppresses that statement (there is a preceding AST on the comment's line),
     // not the following line.
-    let source = "console.log(\n  'multi'\n) // ast-grep-ignore\nconsole.log('after')\n";
+    let source = "console.log(\n  'multi'\n) // vorpal-ignore\nconsole.log('after')\n";
     test_scan(source, |scanned| {
       let matches = &scanned[0];
       assert_eq!(matches.1.len(), 1);
@@ -496,11 +496,11 @@ language: Tsx",
   #[test]
   fn test_ignore_node_block_comment() {
     let source = r#"
-    /* ast-grep-ignore: test */
+    /* vorpal-ignore: test */
     console.log('ignore one')
-    /* ast-grep-ignore: not-test */
+    /* vorpal-ignore: not-test */
     console.log('ignore another')
-    /* ast-grep-ignore: not-test, test */
+    /* vorpal-ignore: not-test, test */
     console.log('multiple ignore')
     console.log('no ignore')
     "#;
@@ -514,11 +514,11 @@ language: Tsx",
 
   #[test]
   fn test_parse_suppression_set_trims_block_comment_trailing() {
-    let set = parse_suppression_set("/* ast-grep-ignore: test */").expect("should parse");
+    let set = parse_suppression_set("/* vorpal-ignore: test */").expect("should parse");
     assert!(set.contains("test"));
     assert!(!set.contains("test */"));
 
-    let set = parse_suppression_set("/* ast-grep-ignore: not-test, test */").expect("should parse");
+    let set = parse_suppression_set("/* vorpal-ignore: not-test, test */").expect("should parse");
     assert!(set.contains("not-test"));
     assert!(set.contains("test"));
     assert!(!set.contains("test */"));
@@ -548,31 +548,31 @@ language: Tsx",
   fn test_non_used_suppression() {
     let source = r#"
     console.log('no ignore')
-    console.debug('not used') // ast-grep-ignore: test
-    console.log('multiple ignore') // ast-grep-ignore: test
+    console.debug('not used') // vorpal-ignore: test
+    console.log('multiple ignore') // vorpal-ignore: test
     "#;
     test_scan_unused(source, |scanned| {
       assert_eq!(scanned.len(), 2);
       let unused = &scanned[1];
       assert_eq!(unused.1.len(), 1);
-      assert_eq!(unused.1[0].text(), "// ast-grep-ignore: test");
+      assert_eq!(unused.1[0].text(), "// vorpal-ignore: test");
     });
   }
 
   #[test]
   fn test_file_suppression() {
-    let source = r#"// ast-grep-ignore: test
+    let source = r#"// vorpal-ignore: test
 
     console.log('ignored')
-    console.debug('report') // ast-grep-ignore: test
-    console.log('report') // ast-grep-ignore: test
+    console.debug('report') // vorpal-ignore: test
+    console.log('report') // vorpal-ignore: test
     "#;
     test_scan_unused(source, |scanned| {
       assert_eq!(scanned.len(), 1);
       let unused = &scanned[0];
       assert_eq!(unused.1.len(), 2);
     });
-    let source = r#"// ast-grep-ignore: test
+    let source = r#"// vorpal-ignore: test
     console.debug('above is not file sup')
     console.log('not ignored')
     "#;
@@ -604,9 +604,9 @@ language: Tsx",
 
   #[test]
   fn test_no_suppress_all_bare() {
-    // bare `ast-grep-ignore` (intentional suppress-all) should fire
+    // bare `vorpal-ignore` (intentional suppress-all) should fire
     let source = r#"
-    // ast-grep-ignore
+    // vorpal-ignore
     console.log('ignored all')
     console.log('no ignore')
     "#;
@@ -617,15 +617,15 @@ language: Tsx",
         .collect();
       assert_eq!(no_sup_all.len(), 1);
       assert_eq!(no_sup_all[0].1.len(), 1);
-      assert_eq!(no_sup_all[0].1[0].text(), "// ast-grep-ignore");
+      assert_eq!(no_sup_all[0].1[0].text(), "// vorpal-ignore");
     });
   }
 
   #[test]
   fn test_no_suppress_all_missing_colon() {
-    // `ast-grep-ignore rule-id` (missing colon) is also suppress-all
+    // `vorpal-ignore rule-id` (missing colon) is also suppress-all
     let source = r#"
-    // ast-grep-ignore test
+    // vorpal-ignore test
     console.log('ignored all')
     "#;
     test_scan_no_suppress_all(source, |scanned| {
@@ -640,9 +640,9 @@ language: Tsx",
 
   #[test]
   fn test_no_suppress_all_with_colon_does_not_fire() {
-    // `ast-grep-ignore: rule-id` (specific suppression) should NOT fire
+    // `vorpal-ignore: rule-id` (specific suppression) should NOT fire
     let source = r#"
-    // ast-grep-ignore: test
+    // vorpal-ignore: test
     console.log('ignored specific')
     console.log('no ignore')
     "#;
@@ -658,7 +658,7 @@ language: Tsx",
   #[test]
   fn test_no_suppress_all_same_line() {
     let source = r#"
-    console.log('ignored') // ast-grep-ignore
+    console.log('ignored') // vorpal-ignore
     console.log('no ignore')
     "#;
     test_scan_no_suppress_all(source, |scanned| {
@@ -674,7 +674,7 @@ language: Tsx",
   #[test]
   fn test_no_suppress_all_file_level() {
     // file-level suppress-all should also fire
-    let source = r#"// ast-grep-ignore
+    let source = r#"// vorpal-ignore
 
     console.log('ignored')
     "#;
@@ -689,16 +689,16 @@ language: Tsx",
 
   #[test]
   fn test_file_suppression_all() {
-    let source = r#"// ast-grep-ignore
+    let source = r#"// vorpal-ignore
 
     console.log('ignored')
-    console.debug('report') // ast-grep-ignore: test
-    console.log('report') // ast-grep-ignore
+    console.debug('report') // vorpal-ignore: test
+    console.log('report') // vorpal-ignore
     "#;
     test_scan_unused(source, |scanned| {
       assert_eq!(scanned.len(), 0);
     });
-    let source = r#"// ast-grep-ignore
+    let source = r#"// vorpal-ignore
 
     console.debug('no hit')
     "#;

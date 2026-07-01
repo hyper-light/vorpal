@@ -9,10 +9,10 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 
-/// A trait to abstract how ast-grep discovers work Items.
+/// A trait to abstract how vorpal discovers work Items.
 ///
 /// It follows multiple-producer-single-consumer pattern.
-/// ast-grep will produce items in one or more separate thread(s) and
+/// vorpal will produce items in one or more separate thread(s) and
 /// `consume_items` in the main thread, blocking the function return.
 /// Worker at the moment has two main flavors:
 /// * PathWorker: discovers files on the file system, based on ignore
@@ -23,10 +23,10 @@ pub trait Worker: Sync + Send {
   fn consume_items<P: Printer>(&self, items: Items<P::Processed>, printer: P) -> Result<ExitCode>;
 }
 
-/// A trait to abstract how ast-grep discovers, parses and processes files.
+/// A trait to abstract how vorpal discovers, parses and processes files.
 ///
 /// It follows multiple-producer-single-consumer pattern.
-/// ast-grep discovers files in parallel by `build_walk`.
+/// vorpal discovers files in parallel by `build_walk`.
 /// Then every file is parsed and filtered in `produce_item`.
 /// Finally, `produce_item` will send `Item` to the consumer thread.
 pub trait PathWorker: Worker {

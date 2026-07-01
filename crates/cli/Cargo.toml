@@ -60,7 +60,7 @@ assert_cmd = "2.0.14"
 predicates = "3.1.0"
 tempfile = "3.10.1"
 
-# Support cargo bininstall, https://github.com/ast-grep/ast-grep/issues/1742
+# Support cargo bininstall, https://github.com/adalundhe/vorpal/issues/1742
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ version }/app-{ target }{ archive-suffix }"
 pkg-fmt = "zip"

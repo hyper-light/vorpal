@@ -138,11 +138,11 @@ pub async fn request_execute_command_to_lsp(
     "id": 1,
     "method": "workspace/executeCommand",
     "params": {
-      "command": "ast-grep.applyAllFixes",
+      "command": "vorpal.applyAllFixes",
       "arguments": [
         {
           "text": "class AstGrepTest {\n  test() {\n    console.log('Hello, world!')\n  }\n}\n\nclass AnotherCase {\n  get test2() {\n    return 123\n  }\n}\n\nconst NoProblemHere = {\n  test() {\n    if (Math.random() > 3) {\n      throw new Error('This is not an error')\n    }\n  },\n}\n",
-          "uri": "file:///Users/codes/ast-grep-vscode/fixture/test.ts",
+          "uri": "file:///Users/codes/vorpal-vscode/fixture/test.ts",
           "version": 1,
           "languageId": "typescript"
         }
@@ -180,7 +180,7 @@ fn test_execute_apply_all_fixes() {
 
     let buf = request_execute_command_to_lsp(&mut req_client, &mut resp_client).await;
 
-    // {"jsonrpc":"2.0","method":"window/logMessage","params":{"message":"Running ExecuteCommand ast-grep.applyAllFixes","type":3}}
+    // {"jsonrpc":"2.0","method":"window/logMessage","params":{"message":"Running ExecuteCommand vorpal.applyAllFixes","type":3}}
     let resp_list = resp(&buf);
 
     let running_command_resp = resp_list
@@ -190,7 +190,7 @@ fn test_execute_apply_all_fixes() {
 
     assert_eq!(
       running_command_resp["params"]["message"],
-      "Running ExecuteCommand ast-grep.applyAllFixes"
+      "Running ExecuteCommand vorpal.applyAllFixes"
     );
   });
 }
@@ -264,7 +264,7 @@ async fn test_did_change_watched_files() {
       "params": {
         "changes": [
           {
-            "uri": "file:///test/sgconfig.yml",
+            "uri": "file:///test/vorpalconfig.yml",
             "type": 2
           }
         ]
@@ -327,8 +327,8 @@ pub async fn wait_for_diagnostics(
           "jsonrpc": "2.0",
           "id": msg["id"].clone(),
           "result": [{
-            "uri": "file:///Users/codes/ast-grep-vscode",
-            "name": "ast-grep-vscode"
+            "uri": "file:///Users/codes/vorpal-vscode",
+            "name": "vorpal-vscode"
           }]
         });
         sender.send(response).await.unwrap();
@@ -432,7 +432,7 @@ fix: |-
   let mut client = create_lsp_framed(yamls).await;
 
   // Send file content to server
-  let file_uri = "file:///Users/codes/ast-grep-vscode/test.ts";
+  let file_uri = "file:///Users/codes/vorpal-vscode/test.ts";
   let file_content = "console.log('Hello, world!')\n";
   send_did_open_framed(&mut client, file_uri, "typescript", file_content).await;
 
@@ -474,7 +474,7 @@ fix: |-
 ";
   let mut client = create_lsp_framed(yamls).await;
 
-  let file_uri = "file:///Users/codes/ast-grep-vscode/test.html";
+  let file_uri = "file:///Users/codes/vorpal-vscode/test.html";
   let file_content = "<script lang=typescript>alert('Hello, world!')</script>\n";
   send_did_open_framed(&mut client, file_uri, "html", file_content).await;
 
@@ -517,9 +517,9 @@ rule:
 "#;
   let mut client = create_lsp_framed(yamls).await;
 
-  let file_uri = "file:///Users/codes/ast-grep-vscode/test.html";
+  let file_uri = "file:///Users/codes/vorpal-vscode/test.html";
   let file_content =
-    "<script lang=typescript>// ast-grep-ignore: no-alert\nconsole.log('Hello, world!')</script>\n";
+    "<script lang=typescript>// vorpal-ignore: no-alert\nconsole.log('Hello, world!')</script>\n";
   send_did_open_framed(&mut client, file_uri, "html", file_content).await;
 
   let diagnostics = wait_for_diagnostics(&mut client)
@@ -560,7 +560,7 @@ fix: |-
   let mut client = create_lsp_framed(yamls).await;
 
   // Send file content to server
-  let file_uri = "file:///Users/codes/ast-grep-vscode/test.ts";
+  let file_uri = "file:///Users/codes/vorpal-vscode/test.ts";
   let file_content = "console.log('Hello, world!')\n";
   send_did_open_framed(&mut client, file_uri, "typescript", file_content).await;
 
@@ -581,12 +581,12 @@ fix: |-
       .expect("Result should be an array");
     assert_eq!(actions.len(), 1, "Expected 1 code action per diagnostic");
     if diagnostic["code"] == "use-alert" {
-      assert_eq!(actions[0]["title"], "Fix `use-alert` with ast-grep");
+      assert_eq!(actions[0]["title"], "Fix `use-alert` with vorpal");
 
       let fixed_text = apply_all_code_actions(file_content, actions);
       assert_eq!(fixed_text, "alert('Hello, world!')");
     } else if diagnostic["code"] == "use-window-alert" {
-      assert_eq!(actions[0]["title"], "Fix `use-window-alert` with ast-grep");
+      assert_eq!(actions[0]["title"], "Fix `use-window-alert` with vorpal");
 
       let fixed_text = apply_all_code_actions(file_content, actions);
       assert_eq!(fixed_text, "window.alert('Hello, world!')");
@@ -609,7 +609,7 @@ fix: |-
   let mut client = create_lsp_framed(yamls).await;
 
   // Send file content to server
-  let file_uri = "file:///Users/codes/ast-grep-vscode/test.ts";
+  let file_uri = "file:///Users/codes/vorpal-vscode/test.ts";
   let file_content = "console.log('Hello, world!')\nconsole.log('Another log')\n";
   send_did_open_framed(&mut client, file_uri, "typescript", file_content).await;
   let diagnostics = &wait_for_diagnostics(&mut client)
@@ -643,7 +643,7 @@ fix: |-
     .as_array()
     .expect("Result should be an array");
   assert!(actions.len() == 1, "Expected 1 code action for fix all");
-  assert_eq!(actions[0]["title"], "Fix by ast-grep");
+  assert_eq!(actions[0]["title"], "Fix by vorpal");
   // Apply the fix all code action and verify the text change
   let fixed_text = apply_all_code_actions(file_content, actions);
   // TODO: This fix ends up with \n being trimmed at the end, need to investigate

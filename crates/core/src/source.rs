@@ -1,6 +1,6 @@
 //! This module defines the `Doc` and `Content` traits to abstract away source code encoding issues.
 //!
-//! ast-grep supports three kinds of encoding: utf-8 for CLI, utf-16 for nodeJS napi and `Vec<char>` for wasm.
+//! vorpal supports three kinds of encoding: utf-8 for CLI, utf-16 for nodeJS napi and `Vec<char>` for wasm.
 //! Different encoding will produce different tree-sitter Node's range and position.
 //!
 //! The `Content` trait is defined to abstract different encoding.

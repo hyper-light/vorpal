@@ -48,7 +48,7 @@ pub struct SerializableRuleCore {
   pub utils: Option<HashMap<String, SerializableRule>>,
   /// A dictionary for metavariable manipulation. Dict key is the new variable name.
   /// Dict value is a [transformation] that specifies how meta var is processed.
-  /// See [transformation doc](https://ast-grep.github.io/reference/yaml/transformation.html).
+  /// See [transformation doc](https://vorpal.github.io/reference/yaml/transformation.html).
   pub transform: Option<HashMap<String, Transformation>>,
 }
 

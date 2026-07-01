@@ -33,7 +33,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use thiserror::Error;
 
-/// A rule object to find matching AST nodes. We have three categories of rules in ast-grep.
+/// A rule object to find matching AST nodes. We have three categories of rules in vorpal.
 ///
 /// * Atomic: the most basic rule to match AST. We have two variants: Pattern and Kind.
 ///

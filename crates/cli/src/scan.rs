@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct ScanArg {
   /// Scan the codebase with the single rule located at the path RULE_FILE.
   ///
-  /// It is useful to run single rule without project setup or sgconfig.yml.
+  /// It is useful to run single rule without project setup or vorpalconfig.yml.
   #[clap(short, long, value_name = "RULE_FILE")]
   rule: Option<PathBuf>,
 
@@ -502,7 +502,7 @@ rule:
 
   #[test]
   fn test_run_with_config() {
-    let dir = create_test_files([("sgconfig.yml", "ruleDirs: [rules]")]);
+    let dir = create_test_files([("vorpalconfig.yml", "ruleDirs: [rules]")]);
     std::fs::create_dir_all(dir.path().join("rules")).unwrap();
     let mut file = File::create(dir.path().join("rules/test.yml")).unwrap();
     file.write_all(RULE.as_bytes()).unwrap();
@@ -511,7 +511,7 @@ rule:
       .write_all("fn test() { Some(123) }".as_bytes())
       .unwrap();
     file.sync_all().unwrap();
-    let project_config = ProjectConfig::setup(Some(dir.path().join("sgconfig.yml"))).unwrap();
+    let project_config = ProjectConfig::setup(Some(dir.path().join("vorpalconfig.yml"))).unwrap();
     let arg = default_scan_arg();
     assert!(run_with_config(arg, project_config).is_ok());
   }

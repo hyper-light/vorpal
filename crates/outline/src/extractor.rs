@@ -1,7 +1,7 @@
 //! Rule loading and compilation for outline extraction.
 //!
 //! Outline rule files describe extractors in a YAML-friendly shape. This module
-//! converts that schema into runtime rules with compiled ast-grep matchers,
+//! converts that schema into runtime rules with compiled vorpal matchers,
 //! templates, and predicates. Traversal code should depend on the runtime
 //! `Outline*Rule` types, not on serde defaults or config parsing details.
 
@@ -54,11 +54,11 @@ impl<L> SerializableOutlineRule<L> {
 pub struct SerializableOutlineCommon<L> {
   /// Stable extractor id used in diagnostics and member parent references.
   pub id: String,
-  /// Language accepted by ast-grep, including built-in and registered custom languages.
+  /// Language accepted by vorpal, including built-in and registered custom languages.
   pub language: L,
   /// LSP-compatible outline category produced by this extractor.
   pub symbol_type: SymbolType,
-  /// ast-grep rule-core fields used to select candidate syntax.
+  /// vorpal rule-core fields used to select candidate syntax.
   #[serde(flatten)]
   pub matcher: SerializableRuleCore,
   /// Rewrite rules for `rewrite` transformation.
@@ -125,13 +125,13 @@ pub struct SerializableMemberRule<L> {
 pub enum SerializablePredicate {
   /// Literal boolean value.
   Literal(bool),
-  /// ast-grep predicate evaluated against the extracted candidate node.
+  /// vorpal predicate evaluated against the extracted candidate node.
   Rule(Box<SerializableRule>),
 }
 
 /// Shared parsed fields for every runnable outline extractor.
 pub struct ExtractorCommon<L: Language> {
-  /// Parsed ast-grep rule config used to select candidate syntax.
+  /// Parsed vorpal rule config used to select candidate syntax.
   pub rule: RuleConfig<L>,
   /// LSP-compatible outline category produced by this extractor.
   pub symbol_type: SymbolType,

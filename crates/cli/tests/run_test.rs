@@ -159,7 +159,7 @@ fn test_unsupport_config_arg() -> Result<()> {
 
 #[test]
 fn test_trace_default_project() -> Result<()> {
-  let dir = create_test_files([("sgconfig.yml", "ruleDirs: []")])?;
+  let dir = create_test_files([("vorpalconfig.yml", "ruleDirs: []")])?;
   Command::new(cargo_bin!())
     .current_dir(dir.path())
     .args(["-p", "alert($A)", "--inspect=summary"])

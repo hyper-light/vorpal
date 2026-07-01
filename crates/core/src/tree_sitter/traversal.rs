@@ -1,6 +1,6 @@
 //! # Traverse Node AST
 //!
-//! ast-grep supports common tree traversal algorithms, including
+//! vorpal supports common tree traversal algorithms, including
 //! * Pre order traversal
 //! * Post order traversal
 //! * Level order traversal

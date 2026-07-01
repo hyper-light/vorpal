@@ -269,8 +269,8 @@ pub fn read_rule_file(path: &Path, global_rules: &GlobalRules) -> Result<Vec<Rul
   Ok(rules)
 }
 
-const CONFIG_FILE_YML: &str = "sgconfig.yml";
-const CONFIG_FILE_YAML: &str = "sgconfig.yaml";
+const CONFIG_FILE_YML: &str = "vorpalconfig.yml";
+const CONFIG_FILE_YAML: &str = "vorpalconfig.yaml";
 
 /// return None if config file does not exist
 fn find_config_path_with_default(config_path: Option<PathBuf>) -> Result<Option<PathBuf>> {

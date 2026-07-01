@@ -1,8 +1,8 @@
-// The alias command `sg` redirects everything to ast-grep
+// The alias command `vp` redirects everything to vorpal
 // we need this to avoid "multiple build target" warning
 // See https://github.com/rust-lang/cargo/issues/5930
 fn main() -> std::io::Result<()> {
-  // redirect to ast-grep
+  // redirect to vorpal
   use std::env::args;
   use std::process::{Command, Stdio};
   let mut child = Command::new("vorpal")

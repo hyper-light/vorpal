@@ -1,4 +1,4 @@
-//! Code outline primitives for ast-grep.
+//! Code outline primitives for vorpal.
 
 mod default_rule;
 

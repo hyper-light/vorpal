@@ -1,4 +1,4 @@
-//! This module defines the core `Matcher` trait in ast-grep.
+//! This module defines the core `Matcher` trait in vorpal.
 //!
 //! `Matcher` has three notable implementations in this module:
 //! * Pattern: matches against a tree-sitter node based on its tree structure.

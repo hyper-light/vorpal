@@ -50,9 +50,9 @@ pub struct Backend<L: LSPLang> {
 const FALLBACK_CODE_ACTION_PROVIDER: Option<CodeActionProviderCapability> =
   Some(CodeActionProviderCapability::Simple(true));
 
-const APPLY_ALL_FIXES: &str = "ast-grep.applyAllFixes";
-const QUICKFIX_AST_GREP: &str = "quickfix.ast-grep";
-const FIX_ALL_AST_GREP: &str = "source.fixAll.ast-grep";
+const APPLY_ALL_FIXES: &str = "vorpal.applyAllFixes";
+const QUICKFIX_AST_GREP: &str = "quickfix.vorpal";
+const FIX_ALL_AST_GREP: &str = "source.fixAll.vorpal";
 
 fn code_action_provider(
   client_capability: &ClientCapabilities,
@@ -85,7 +85,7 @@ impl<L: LSPLang> LanguageServer for Backend<L> {
     }
     Ok(InitializeResult {
       server_info: Some(ServerInfo {
-        name: "ast-grep language server".to_string(),
+        name: "vorpal language server".to_string(),
         version: None,
       }),
       capabilities: ServerCapabilities {
@@ -288,7 +288,7 @@ impl<L: LSPLang> Backend<L> {
     // iterate over all main doc and injected docs
     for injected in docs {
       let rule_refs = rules.get_rule_from_lang(&path, injected.lang().clone());
-      if rule_refs.is_empty() && !injected.source().contains("ast-grep-ignore") {
+      if rule_refs.is_empty() && !injected.source().contains("vorpal-ignore") {
         continue;
       }
       let unused_suppression_rule =
@@ -544,7 +544,7 @@ impl<L: LSPLang> Backend<L> {
     let fixed = self.compute_all_fixes(text_document).ok()?;
     let edit = WorkspaceEdit::new(fixed);
     let code_action = CodeAction {
-      title: "Fix by ast-grep".into(),
+      title: "Fix by vorpal".into(),
       command: None,
       diagnostics: None,
       edit: Some(edit),
@@ -572,7 +572,7 @@ impl<L: LSPLang> Backend<L> {
       .filter(|d| {
         d.source
           .as_ref()
-          .map(|s| s.contains("ast-grep"))
+          .map(|s| s.contains("vorpal"))
           .unwrap_or(false)
       })
       .filter_map(|d| diagnostic_to_code_action(&text_doc, d, fixes_cache))
@@ -682,7 +682,7 @@ impl<L: LSPLang> Backend<L> {
       kind: Some(WatchKind::Create | WatchKind::Change | WatchKind::Delete),
     };
     let registration = Registration {
-      id: "ast-grep-config-watcher".to_string(),
+      id: "vorpal-config-watcher".to_string(),
       method: DidChangeWatchedFiles::METHOD.to_string(),
       register_options: Some(
         serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {

@@ -1,5 +1,5 @@
 //! See https://github.com/ast-grep/ast-grep/issues/905
-//! The `--tracing` flag helps user to inspect ast-grep's scan process. It has these levels:
+//! The `--tracing` flag helps user to inspect vorpal's scan process. It has these levels:
 //! - Summary level: show how many files are scanned, how many matches and etc for one CLI run. Included stats
 //!   * number of rules used in this scan and skipped rules (due to severity: off)
 //!   * number file scanned
@@ -113,7 +113,7 @@ impl<T, W: Write + Sync> TraceInfo<T, W> {
       return Ok(());
     }
     let mut w = self.output.lock().expect("lock should not be poisoned");
-    write!(w, "sg: {level:?}")?;
+    write!(w, "vp: {level:?}")?;
     f(&mut *w)?;
     writeln!(&mut *w)?;
     Ok(())
@@ -246,7 +246,7 @@ mod test {
     assert!(run_trace.print().is_ok());
     assert_eq!(
       ret,
-      "sg: summary|file: scannedFileCount=0,skippedFileCount=0\n"
+      "vp: summary|file: scannedFileCount=0,skippedFileCount=0\n"
     );
 
     let mut ret = String::new();
@@ -278,8 +278,8 @@ mod test {
     assert!(scan_trace.print().is_ok());
     assert_eq!(
       ret,
-      r"sg: summary|file: scannedFileCount=0,skippedFileCount=0
-sg: summary|rule: effectiveRuleCount=10,skippedRuleCount=2
+      r"vp: summary|file: scannedFileCount=0,skippedFileCount=0
+vp: summary|rule: effectiveRuleCount=10,skippedRuleCount=2
 "
     );
   }

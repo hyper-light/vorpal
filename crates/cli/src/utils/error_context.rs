@@ -6,11 +6,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const DOC_SITE_HOST: &str = "https://ast-grep.github.io";
+const DOC_SITE_HOST: &str = "https://vorpal.github.io";
 const PATTERN_GUIDE: Option<&str> = Some("/guide/pattern-syntax.html");
 const ESQUERY_GUIDE: Option<&str> = Some("/reference/rule/esquery.html");
 const CONFIG_GUIDE: Option<&str> = Some("/guide/rule-config.html");
-const CONFIG_REFERENCE: Option<&str> = Some("/reference/sgconfig.html");
+const CONFIG_REFERENCE: Option<&str> = Some("/reference/vorpalconfig.html");
 const PROJECT_GUIDE: Option<&str> = Some("/guide/scan-project.html");
 const TOOL_OVERVIEW: Option<&str> = Some("/guide/tooling-overview.html#parse-code-from-stdin");
 const CLI_USAGE: Option<&str> = Some("/reference/cli.html");
@@ -22,7 +22,7 @@ const PLAYGROUND: Option<&str> = Some("/playground.html");
 const CUSTOM_LANG_GUIDE: Option<&str> = Some("/advanced/custom-language.html");
 const UTILITY_RULE: Option<&str> = Some("/guide/rule-config/utility-rule.html");
 
-/// AppError stands for ast-grep command line usage.
+/// AppError stands for vorpal command line usage.
 /// It provides abstraction around exit code, context,
 /// message, potential fix and reference link.
 #[derive(Debug, Clone)]
@@ -136,12 +136,12 @@ impl ErrorMessage {
     match ctx {
       ReadConfiguration => Self::new(
         "Cannot read configuration.",
-        "Please add an sgconfig.yml configuration file in the project root to run the scan command.",
+        "Please add a vorpalconfig.yml configuration file in the project root to run the scan command.",
         CONFIG_GUIDE,
       ),
       ParseConfiguration => Self::new(
         "Cannot parse configuration",
-        "The sgconfig.yml is not a valid configuration file. Please refer to doc and fix the error.",
+        "The vorpalconfig.yml is not a valid configuration file. Please refer to doc and fix the error.",
         CONFIG_REFERENCE,
       ),
       WalkRuleDir(dir) => Self::new(
@@ -156,7 +156,7 @@ impl ErrorMessage {
       ),
       ParseRule(file) => Self::new(
         format!("Cannot parse rule {}", file.display()),
-        "The file is not a valid ast-grep rule. Please refer to doc and fix the error.",
+        "The file is not a valid vorpal rule. Please refer to doc and fix the error.",
         CONFIG_GUIDE,
       ),
       InvalidRuleId(file) => Self::new(
@@ -191,12 +191,12 @@ impl ErrorMessage {
       ),
       UnrecognizableLanguage(lang) => Self::new(
         format!("Language `{lang}` is not supported"),
-        "Please choose a built-in language or register a custom language in sgconfig.yml.",
+        "Please choose a built-in language or register a custom language in vorpalconfig.yml.",
         LANGUAGE_LIST,
       ),
       ParseTest(file) => Self::new(
         format!("Cannot parse test case {}", file.display()),
-        "The file is not a valid ast-grep test case. Please refer to doc and fix the error.",
+        "The file is not a valid vorpal test case. Please refer to doc and fix the error.",
         TEST_GUIDE,
       ),
       DuplicateRuleId(id) => Self::new(
@@ -216,7 +216,7 @@ impl ErrorMessage {
       ),
       ParseSelector => Self::new(
         "Cannot parse kind as a valid selector.",
-        "Please refer to ast-grep's ESQuery selector guide.",
+        "Please refer to vorpal's ESQuery selector guide.",
         ESQUERY_GUIDE,
       ),
       LanguageNotSpecified => Self::new(
@@ -231,7 +231,7 @@ impl ErrorMessage {
       ),
       PatternHasError => Self::new(
         "Pattern contains an ERROR node and may cause unexpected results.",
-        "ast-grep parsed the pattern but it matched nothing in this run. Try using playground to refine the pattern.",
+        "vorpal parsed the pattern but it matched nothing in this run. Try using playground to refine the pattern.",
         PLAYGROUND,
       ),
       RuleNotSpecified => Self::new(
@@ -263,7 +263,7 @@ impl ErrorMessage {
       ),
       TestFail(message) => Self::new(
         message,
-        "You can use ast-grep playground to debug your rules and test cases.",
+        "You can use vorpal playground to debug your rules and test cases.",
         PLAYGROUND,
       ),
       TestSnapshotMismatch(message) => Self::new(
@@ -272,13 +272,13 @@ impl ErrorMessage {
         TEST_GUIDE,
       ),
       ProjectAlreadyExist => Self::new(
-        "ast-grep project already exists.",
-        "You are already inside a sub-folder of an ast-grep project. Try finding sgconfig.yml in ancestor directory?",
+        "vorpal project already exists.",
+        "You are already inside a sub-folder of a vorpal project. Try finding vorpalconfig.yml in ancestor directory?",
         PROJECT_GUIDE,
       ),
       ProjectNotExist => Self::new(
-        "No ast-grep project configuration is found.",
-        "You need to create an ast-grep project for this command. Try `sg new` to create one.",
+        "No vorpal project configuration is found.",
+        "You need to create a vorpal project for this command. Try `vorpal new` to create one.",
         PROJECT_GUIDE,
       ),
       FileAlreadyExist(path) => Self::new(
@@ -288,12 +288,12 @@ impl ErrorMessage {
       ),
       NoTestDirConfigured => Self::new(
         "No test file directory is configured.",
-        "Fail to create a test file because the project `sgconfig.yml` does not specify any test configuration.",
+        "Fail to create a test file because the project `vorpalconfig.yml` does not specify any test configuration.",
         TEST_GUIDE,
       ),
       NoUtilDirConfigured => Self::new(
         "No util file directory is configured.",
-        "Fail to create a utility rule because the project `sgconfig.yml` does not specify any utils directory.",
+        "Fail to create a utility rule because the project `vorpalconfig.yml` does not specify any utils directory.",
         UTIL_GUIDE,
       ),
       InsufficientCLIArgument(name) => Self::new(
@@ -303,7 +303,7 @@ impl ErrorMessage {
       ),
       CannotInferShell => Self::new(
         "Can not infer which shell to generate completions.",
-        "Either specify shell flavor by `sg completions [SHELL]` or set correct `SHELL` environment.",
+        "Either specify shell flavor by `vorpal completions [SHELL]` or set correct `SHELL` environment.",
         CLI_USAGE,
       ),
       ExitInteractiveEditing => Self::new(

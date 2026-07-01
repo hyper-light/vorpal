@@ -12,7 +12,7 @@
             "type": "string"
           },
           "title": "Rule directories",
-          "description": "A list of string instructing where to discover ast-grep's YAML rules."
+          "description": "A list of string instructing where to discover vorpal's YAML rules."
         },
         "testConfigs": {
           "type": "array",
@@ -20,7 +20,7 @@
             "$ref": "#/definitions/TestConfig"
           },
           "title": "Test configurations",
-          "description": "A list of object to configure ast-grep's test cases. Each object can have two fields."
+          "description": "A list of object to configure vorpal's test cases. Each object can have two fields."
         },
         "utilDirs": {
           "type": "array",
@@ -28,7 +28,7 @@
             "type": "string"
           },
           "title": "Utility directories",
-          "description": "A list of string instructing where to discover ast-grep's global utility rules."
+          "description": "A list of string instructing where to discover vorpal's global utility rules."
         },
         "languageGlobs": {
           "type": "object",
@@ -56,7 +56,7 @@
         }
       },
       "required": ["ruleDirs"],
-      "title": "ast-grep project configuration"
+      "title": "vorpal project configuration"
     },
     "TestConfig": {
       "type": "object",
@@ -64,11 +64,11 @@
       "properties": {
         "testDir": {
           "type": "string",
-          "description": "A string specifies where to discover test cases for ast-grep."
+          "description": "A string specifies where to discover test cases for vorpal."
         },
         "snapshotDir": {
           "type": "string",
-          "description": "A string path relative to testDir that specifies where to store test snapshots for ast-grep. You can think it like __snapshots___ in popular test framework like jest. If this option is not specified, ast-grep will store the snapshot under the __snapshots__ folder under the testDir."
+          "description": "A string path relative to testDir that specifies where to store test snapshots for vorpal. You can think it like __snapshots___ in popular test framework like jest. If this option is not specified, vorpal will store the snapshot under the __snapshots__ folder under the testDir."
         }
       },
       "required": ["testDir"],
@@ -113,7 +113,7 @@
         },
         "rule": {
           "$ref": "./rule.json#/$defs/SerializableRule",
-          "description": "Defines the ast-grep rule to identify the injected language region within the host language documents."
+          "description": "Defines the vorpal rule to identify the injected language region within the host language documents."
         },
         "injected": {
           "oneOf": [

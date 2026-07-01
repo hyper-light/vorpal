@@ -193,7 +193,7 @@ pub struct TestArg {
   filter: Option<Regex>,
   /// Include `severity:off` rules in test
   ///
-  /// ast-grep will not run rules with `severity: off` by default.
+  /// vorpal will not run rules with `severity: off` by default.
   /// This option will include those rules in the test.
   #[clap(long)]
   include_off: bool,
@@ -203,9 +203,9 @@ pub struct TestArg {
   /// Controls output color.
   ///
   /// This flag controls when to use colors. The default setting is 'auto', which
-  /// means ast-grep will try to guess when to use colors. If ast-grep is
+  /// means vorpal will try to guess when to use colors. If vorpal is
   /// printing to a terminal, then it will use colors, but if it is redirected to a
-  /// file or a pipe, then it will suppress color output. ast-grep will also suppress
+  /// file or a pipe, then it will suppress color output. vorpal will also suppress
   /// color output in some other circumstances. For example, no color will be used
   /// if the TERM environment variable is not set or set to 'dumb'.
   #[clap(long, default_value = "auto", value_name = "WHEN")]

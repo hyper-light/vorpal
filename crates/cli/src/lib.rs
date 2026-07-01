@@ -25,25 +25,25 @@ use utils::exit_with_error;
 use verify::{TestArg, run_test_rule};
 
 const LOGO: &str = r#"
+__     _____  ____  ____   _    _
+\ \   / / _ \|  _ \|  _ \ / \  | |
+ \ \ / / | | | |_) | |_) / _ \ | |
+  \ V /| |_| |  _ <|  __/ ___ \| |___
+   \_/  \___/|_| \_\_|  /_/   \_\_____|
+
 Search and Rewrite code at large scale using AST pattern.
-                    __
-        ____ ______/ /_      ____ _________  ____
-       / __ `/ ___/ __/_____/ __ `/ ___/ _ \/ __ \
-      / /_/ (__  ) /_/_____/ /_/ / /  /  __/ /_/ /
-      \__,_/____/\__/      \__, /_/   \___/ .___/
-                          /____/         /_/
 "#;
 #[derive(Parser)]
 #[clap(author, version, about, long_about = LOGO)]
 /**
- * TODO: add some description for ast-grep: sg
+ * TODO: add some description for vorpal: vp
  * Example:
- * sg -p "$PATTERN.to($MATCH)" -l ts --rewrite "use($MATCH)"
+ * vp -p "$PATTERN.to($MATCH)" -l ts --rewrite "use($MATCH)"
  */
 struct App {
   #[clap(subcommand)]
   command: Commands,
-  /// Path to ast-grep root config, default is sgconfig.yml.
+  /// Path to vorpal root config, default is vorpalconfig.yml.
   #[clap(short, long, global = true, value_name = "CONFIG_FILE")]
   config: Option<PathBuf>,
 }
@@ -54,9 +54,9 @@ enum Commands {
   Run(RunArg),
   /// Scan and rewrite code by configuration.
   Scan(ScanArg),
-  /// Test ast-grep rules.
+  /// Test vorpal rules.
   Test(TestArg),
-  /// Create new ast-grep project or items like rules/tests.
+  /// Create new vorpal project or items like rules/tests.
   New(NewArg),
   /// Start language server.
   Lsp(LspArg),
@@ -131,7 +131,7 @@ fn setup_project_is_possible(args: &[String]) -> Result<Result<ProjectConfig>> {
 pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
   let args: Vec<_> = args.collect();
   // do not unwrap project before cmd parsing
-  // sg help does not need a valid sgconfig.yml
+  // vorpal help does not need a valid vorpalconfig.yml
   let project = setup_project_is_possible(&args);
   if let Some(arg) = try_default_run(&args)? {
     return run_with_pattern(arg, project?);
@@ -157,7 +157,7 @@ mod test_cli {
 
   fn sg(args: &str) -> Result<App> {
     let app = App::try_parse_from(
-      std::iter::once("sg".into()).chain(args.split(' ').map(|s| s.to_string())),
+      std::iter::once("vorpal".into()).chain(args.split(' ').map(|s| s.to_string())),
     )?;
     Ok(app)
   }
@@ -199,9 +199,9 @@ mod test_cli {
   }
   #[test]
   fn test_no_arg_run() {
-    let ret = main_with_args(["sg".to_owned()].into_iter());
+    let ret = main_with_args(["vorpal".to_owned()].into_iter());
     let err = ret.unwrap_err();
-    assert!(err.to_string().contains("sg [OPTIONS] <COMMAND>"));
+    assert!(err.to_string().contains("vorpal [OPTIONS] <COMMAND>"));
   }
   #[test]
   fn test_default_subcommand() {
@@ -304,7 +304,7 @@ mod test_cli {
   #[test]
   fn test_test() {
     ok("test");
-    ok("test -c sgconfig.yml");
+    ok("test -c vorpalconfig.yml");
     ok("test --skip-snapshot-tests");
     ok("test -U");
     ok("test --update-all");
@@ -320,11 +320,11 @@ mod test_cli {
   fn test_new() {
     ok("new");
     ok("new project");
-    ok("new -c sgconfig.yml rule");
+    ok("new -c vorpalconfig.yml rule");
     ok("new rule -y");
     ok("new test -y");
     ok("new util -y");
-    ok("new rule -c sgconfig.yml");
+    ok("new rule -c vorpalconfig.yml");
     error("new --base-dir");
   }
 

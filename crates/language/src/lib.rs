@@ -1,11 +1,11 @@
-//! This module defines the supported programming languages for ast-grep.
+//! This module defines the supported programming languages for vorpal.
 //!
 //! It provides a set of customized languages with expando_char / pre_process_pattern,
 //! and a set of stub languages without preprocessing.
 //! A rule of thumb: if your language does not accept identifiers like `$VAR`.
 //! You need use `impl_lang_expando!` macro and a standalone file for testing.
 //! Otherwise, you can define it as a stub language using `impl_lang!`.
-//! To see the full list of languages, visit `<https://ast-grep.github.io/reference/languages.html>`
+//! To see the full list of languages, visit `<https://vorpal.github.io/reference/languages.html>`
 //!
 //! ```
 //! use vorpal_language::{LanguageExt, SupportLang};

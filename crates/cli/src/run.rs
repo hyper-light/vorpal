@@ -26,7 +26,7 @@ fn lang_help() -> String {
   )
 }
 
-const LANG_HELP_LONG: &str = "The language of the pattern. For full language list, visit https://ast-grep.github.io/reference/languages.html";
+const LANG_HELP_LONG: &str = "The language of the pattern. For full language list, visit https://vorpal.github.io/reference/languages.html";
 
 #[derive(Clone)]
 struct Strictness(MatchStrictness);
@@ -67,7 +67,7 @@ struct MatcherArg {
   /// AST kind to extract sub-part of pattern to match.
   ///
   /// selector defines the sub-syntax node kind that is the actual matcher of the pattern.
-  /// See https://ast-grep.github.io/guide/rule-config/atomic-rule.html#pattern-object.
+  /// See https://vorpal.github.io/guide/rule-config/atomic-rule.html#pattern-object.
   #[clap(
     long,
     value_name = "KIND",
@@ -78,7 +78,7 @@ struct MatcherArg {
 
   /// The strictness of the pattern.
   ///
-  /// See https://ast-grep.github.io/guide/rule-config/atomic-rule.html#strictness
+  /// See https://vorpal.github.io/guide/rule-config/atomic-rule.html#strictness
   #[clap(
     long,
     value_name = "STRICTNESS",
@@ -89,7 +89,7 @@ struct MatcherArg {
   /// AST kind to match.
   ///
   /// It accepts ESQuery style selector.
-  /// See https://ast-grep.github.io/guide/rule-config/atomic-rule.html#esquery-style-kind
+  /// See https://vorpal.github.io/guide/rule-config/atomic-rule.html#esquery-style-kind
   #[clap(short, long, value_name = "KIND", conflicts_with = "pattern")]
   kind: Option<String>,
 }
@@ -160,7 +160,7 @@ pub struct RunArg {
   /// Controls whether to print the file name as heading.
   ///
   /// If heading is used, the file name will be printed as heading before all matches of that file.
-  /// If heading is not used, ast-grep will print the file path before each match as prefix.
+  /// If heading is not used, vorpal will print the file path before each match as prefix.
   /// The default value `auto` is to use heading when printing to a terminal
   /// and to disable heading when piping to another program or redirected to files.
   #[clap(long, default_value = "auto", value_name = "WHEN")]

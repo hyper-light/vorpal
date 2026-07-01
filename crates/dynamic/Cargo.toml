@@ -1,6 +1,6 @@
 [package]
 name = "vorpal-dynamic"
-description = "Load tree-sitter dynamic library for ast-grep"
+description = "Load tree-sitter dynamic library for vorpal"
 keywords = ["ast", "pattern", "codemod", "search", "rewrite"]
 
 authors.workspace = true

@@ -67,7 +67,7 @@ fn add_lang_info_to_schema<T: LanguageExt + Alias>(
 ) -> Result<()> {
   // change rule title
   let title = schema.get_mut("title").context("must have title")?;
-  *title = Value::String(format!("ast-grep rule for {name}"));
+  *title = Value::String(format!("vorpal rule for {name}"));
 
   let definitions = schema.get_mut("$defs").context("must have definitions")?;
 

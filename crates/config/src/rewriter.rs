@@ -37,7 +37,7 @@ pub struct SerializableRewriter {
   pub id: String,
   /// A pattern string or a FixConfig object to auto fix the issue.
   /// It can reference metavariables appeared in rule.
-  /// See details in fix [object reference](https://ast-grep.github.io/reference/yaml/fix.html#fixconfig).
+  /// See details in fix [object reference](https://vorpal.github.io/reference/yaml/fix.html#fixconfig).
   pub fix: SerializableFixer,
   #[serde(flatten)]
   pub core: SerializableRuleCore,

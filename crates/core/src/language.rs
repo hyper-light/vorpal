@@ -4,7 +4,7 @@ use crate::{Pattern, PatternError};
 use std::borrow::Cow;
 use std::path::Path;
 
-/// Trait to abstract ts-language usage in ast-grep, which includes:
+/// Trait to abstract ts-language usage in vorpal, which includes:
 /// * which character is used for meta variable.
 /// * if we need to use other char in meta var for parser at runtime
 /// * pre process the Pattern code.

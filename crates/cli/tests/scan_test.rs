@@ -55,12 +55,12 @@ rule:
 
 fn setup() -> Result<TempDir> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/on-rule.yml", RULE1),
     ("rules/off-rule.yml", RULE2),
     ("test.ts", "Some(123)"),
   ])?;
-  assert!(dir.path().join("sgconfig.yml").exists());
+  assert!(dir.path().join("vorpalconfig.yml").exists());
   Ok(dir)
 }
 
@@ -72,14 +72,14 @@ fn sg(s: &str) -> Result<ExitCode> {
 #[test]
 fn test_sg_scan() -> Result<()> {
   let dir = setup()?;
-  let config = dir.path().join("sgconfig.yml");
-  let ret = sg(&format!("ast-grep scan -c {}", config.display()));
+  let config = dir.path().join("vorpalconfig.yml");
+  let ret = sg(&format!("vorpal scan -c {}", config.display()));
   assert!(ret.is_ok());
-  let ret = sg(&format!("ast-grep scan -c={}", config.display()));
+  let ret = sg(&format!("vorpal scan -c={}", config.display()));
   assert!(ret.is_ok());
-  let ret = sg(&format!("ast-grep scan --config {}", config.display()));
+  let ret = sg(&format!("vorpal scan --config {}", config.display()));
   assert!(ret.is_ok());
-  let ret = sg(&format!("ast-grep scan --config={}", config.display()));
+  let ret = sg(&format!("vorpal scan --config={}", config.display()));
   assert!(ret.is_ok());
   drop(dir);
   Ok(())
@@ -102,7 +102,7 @@ fn test_sg_rule_off() -> Result<()> {
 #[test]
 fn test_sg_scan_update_all_reports_unfixable_rules() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/no-var.yml", FIXABLE_JS_RULE),
     ("rules/no-console.yml", UNFIXABLE_JS_RULE),
     ("test.js", "var x = 1;\nconsole.log(x);\n"),
@@ -196,9 +196,9 @@ fn test_sg_scan_html() -> Result<()> {
 #[test]
 fn test_scan_unused_suppression() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", RULE1),
-    ("test.ts", "None(123) // ast-grep-ignore"),
+    ("test.ts", "None(123) // vorpal-ignore"),
   ])?;
   Command::new(cargo_bin!())
     .current_dir(dir.path())
@@ -212,9 +212,9 @@ fn test_scan_unused_suppression() -> Result<()> {
 #[test]
 fn test_scan_update_all_removes_unused_suppression() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", RULE1),
-    ("test.ts", "None(123) // ast-grep-ignore"),
+    ("test.ts", "None(123) // vorpal-ignore"),
   ])?;
   Command::new(cargo_bin!())
     .current_dir(dir.path())
@@ -222,16 +222,16 @@ fn test_scan_update_all_removes_unused_suppression() -> Result<()> {
     .assert()
     .success();
   let updated = std::fs::read_to_string(dir.path().join("test.ts"))?;
-  assert!(!updated.contains("ast-grep-ignore"));
+  assert!(!updated.contains("vorpal-ignore"));
   Ok(())
 }
 
 #[test]
 fn test_unused_suppression_only_in_scan() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", RULE1),
-    ("test.ts", "None(123) // ast-grep-ignore"),
+    ("test.ts", "None(123) // vorpal-ignore"),
   ])?;
   Command::new(cargo_bin!())
     .current_dir(dir.path())
@@ -263,9 +263,9 @@ fn test_unused_suppression_only_in_scan() -> Result<()> {
 #[test]
 fn test_scan_unused_suppression_off() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", RULE1),
-    ("test.ts", "None(123) // ast-grep-ignore"),
+    ("test.ts", "None(123) // vorpal-ignore"),
   ])?;
   Command::new(cargo_bin!())
     .current_dir(dir.path())
@@ -313,7 +313,7 @@ fn test_severity_override_with_rule_path() -> Result<()> {
 
 #[test]
 fn test_severity_override_with_inline_rule() -> Result<()> {
-  let dir = create_test_files([("sgconfig.yml", CONFIG), ("test.ts", "Some(123)")])?;
+  let dir = create_test_files([("vorpalconfig.yml", CONFIG), ("test.ts", "Some(123)")])?;
 
   Command::new(cargo_bin!())
     .current_dir(dir.path())
@@ -365,7 +365,7 @@ if something:
 #[test]
 fn test_transform_indent() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", PY_RULE),
     ("test.py", PY_FILE),
   ])?;
@@ -395,7 +395,7 @@ labels:
 #[test]
 fn test_label() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", LABEL_RULE),
     ("test.ts", "Some(123) + None"),
   ])?;
@@ -421,7 +421,7 @@ files: [ test/*.ts ]
 #[test]
 fn test_file() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", FILE_RULE),
     ("test/hit.ts", "Some(123)"),
     ("not.ts", "Some(456)"),
@@ -435,14 +435,14 @@ fn test_file() -> Result<()> {
     .stdout(contains("not.ts").not());
   Command::new(cargo_bin!())
     .current_dir(dir.path().join("test"))
-    .args(["scan", "-c", "../sgconfig.yml"])
+    .args(["scan", "-c", "../vorpalconfig.yml"])
     .assert()
     .success()
     .stdout(contains("hit.ts"))
     .stdout(contains("not.ts").not());
   Command::new(cargo_bin!())
     .current_dir(dir.path())
-    .args(["scan", "-c", "sgconfig.yml"])
+    .args(["scan", "-c", "vorpalconfig.yml"])
     .assert()
     .success()
     .stdout(contains("hit.ts"))
@@ -462,7 +462,7 @@ rule: { pattern: Some($A) }
 fn test_max_diagnostics_shown() -> Result<()> {
   // Create 4 files, each with one match
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", MAX_DIAG_RULE),
     ("a.ts", "Some(1)"),
     ("b.ts", "Some(2)"),
@@ -488,7 +488,7 @@ fn test_max_diagnostics_shown() -> Result<()> {
 fn test_max_diagnostics_shown_single_file() -> Result<()> {
   // Single file with 4 matches
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/rule.yml", MAX_DIAG_RULE),
     ("test.ts", "Some(1); Some(2); Some(3); Some(4)"),
   ])?;
@@ -541,8 +541,8 @@ fn test_max_diagnostics_shown_stdin() -> Result<()> {
 }
 
 #[test]
-fn test_yaml_sgconfig_extension() -> Result<()> {
-  let dir = create_test_files([("sgconfig.yaml", CONFIG), ("rules/rule.yml", FILE_RULE)])?;
+fn test_yaml_vorpalconfig_extension() -> Result<()> {
+  let dir = create_test_files([("vorpalconfig.yaml", CONFIG), ("rules/rule.yml", FILE_RULE)])?;
   Command::new(cargo_bin!())
     .current_dir(dir.path())
     .args(["scan"])
@@ -739,7 +739,7 @@ language: TypeScript
 rule: { pattern: Some($A) }
 ";
   let dir = create_test_files([
-    ("sgconfig.yml", "ruleDirs:\n- rules"),
+    ("vorpalconfig.yml", "ruleDirs:\n- rules"),
     ("rules/check.yml", rule),
     ("rules/check.yaml", rule),
     ("test.ts", "Some(123)"),
@@ -761,7 +761,7 @@ fn test_scan_invalid_rule_id() -> Result<()> {
   let dir = TempDir::new()?;
   let rules_dir = dir.path().join("rules");
   std::fs::create_dir_all(&rules_dir)?;
-  std::fs::write(dir.path().join("sgconfig.yml"), "ruleDirs:\n- rules")?;
+  std::fs::write(dir.path().join("vorpalconfig.yml"), "ruleDirs:\n- rules")?;
   std::fs::write(
     rules_dir.join(OsStr::from_bytes(b"\xff.yml")),
     "language: TypeScript\nrule: { pattern: Some($A) }",

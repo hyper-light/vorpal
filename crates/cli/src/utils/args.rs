@@ -23,9 +23,9 @@ pub struct InputArgs {
 
   /// Follow symbolic links.
   ///
-  /// This flag instructs ast-grep to follow symbolic links while traversing
-  /// directories. This behavior is disabled by default. Note that ast-grep will
-  /// check for symbolic link loops and report errors if it finds one. ast-grep will
+  /// This flag instructs vorpal to follow symbolic links while traversing
+  /// directories. This behavior is disabled by default. Note that vorpal will
+  /// check for symbolic link loops and report errors if it finds one. vorpal will
   /// also report errors for broken links.
   #[clap(long)]
   pub follow: bool,
@@ -55,7 +55,7 @@ pub struct InputArgs {
   /// Set the approximate number of threads to use.
   ///
   /// This flag sets the approximate number of threads to use. A value of 0
-  /// (which is the default) causes ast-grep to choose the thread count using
+  /// (which is the default) causes vorpal to choose the thread count using
   /// heuristics.
   #[clap(short = 'j', long, default_value = "0", value_name = "NUM")]
   pub threads: usize,
@@ -137,9 +137,9 @@ pub struct OutputArgs {
 
   /// Output matches in structured JSON.
   ///
-  /// If this flag is set, ast-grep will output matches in JSON format.
+  /// If this flag is set, vorpal will output matches in JSON format.
   /// You can pass optional value to this flag by using `--json=<STYLE>` syntax
-  /// to further control how JSON object is formatted and printed. ast-grep will `pretty`-print JSON if no value is passed.
+  /// to further control how JSON object is formatted and printed. vorpal will `pretty`-print JSON if no value is passed.
   /// Note, the json flag must use `=` to specify its value.
   /// It conflicts with interactive.
   #[clap(
@@ -155,9 +155,9 @@ pub struct OutputArgs {
   /// Controls output color.
   ///
   /// This flag controls when to use colors. The default setting is 'auto', which
-  /// means ast-grep will try to guess when to use colors. If ast-grep is
+  /// means vorpal will try to guess when to use colors. If vorpal is
   /// printing to a terminal, then it will use colors, but if it is redirected to a
-  /// file or a pipe, then it will suppress color output. ast-grep will also suppress
+  /// file or a pipe, then it will suppress color output. vorpal will also suppress
   /// color output in some other circumstances. For example, no color will be used
   /// if the TERM environment variable is not set or set to 'dumb'.
   #[clap(long, default_value = "auto", value_name = "WHEN")]
@@ -165,7 +165,7 @@ pub struct OutputArgs {
 
   /// Inspect information for file/rule discovery and scanning.
   ///
-  /// This flag helps user to observe ast-grep's internal filtering of files and rules.
+  /// This flag helps user to observe vorpal's internal filtering of files and rules.
   /// Inspection will output how many and why files and rules are scanned and skipped.
   /// Inspection outputs to stderr and does not affect the result of the search.
   #[clap(long, default_value = "nothing", value_name = "GRANULARITY")]
@@ -231,7 +231,7 @@ pub enum IgnoreFile {
   /// Search hidden files and directories. By default, hidden files and directories are skipped.
   Hidden,
   /// Don't respect .ignore files.
-  /// This does *not* affect whether ast-grep will ignore files and directories whose names begin with a dot.
+  /// This does *not* affect whether vorpal will ignore files and directories whose names begin with a dot.
   /// For that, use --no-ignore hidden.
   Dot,
   /// Don't respect ignore files that are manually configured for the repository such as git's '.git/info/exclude'.

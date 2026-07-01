@@ -48,12 +48,12 @@ invalid:
 
 fn setup() -> Result<TempDir> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/test-rule.yml", RULE),
     ("rule-tests/test-rule-test.yml", TEST),
     ("test.ts", "Some(123)"),
   ])?;
-  assert!(dir.path().join("sgconfig.yml").exists());
+  assert!(dir.path().join("vorpalconfig.yml").exists());
   Ok(dir)
 }
 
@@ -65,9 +65,9 @@ fn sg(s: &str) -> Result<ExitCode> {
 #[test]
 fn test_sg_test() -> Result<()> {
   let dir = setup()?;
-  let config = dir.path().join("sgconfig.yml");
+  let config = dir.path().join("vorpalconfig.yml");
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests",
+    "vorpal test -c {} --skip-snapshot-tests",
     config.display()
   ));
   assert!(ret.is_ok());
@@ -77,21 +77,21 @@ fn test_sg_test() -> Result<()> {
 
 fn setup_error() -> Result<TempDir> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/test-rule.yml", RULE),
     ("rule-tests/test-rule-test.yml", WRONG_TEST),
     ("test.ts", "Some(123)"),
   ])?;
-  assert!(dir.path().join("sgconfig.yml").exists());
+  assert!(dir.path().join("vorpalconfig.yml").exists());
   Ok(dir)
 }
 
 #[test]
 fn test_sg_test_error() -> Result<()> {
   let dir = setup_error()?;
-  let config = dir.path().join("sgconfig.yml");
+  let config = dir.path().join("vorpalconfig.yml");
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests",
+    "vorpal test -c {} --skip-snapshot-tests",
     config.display()
   ));
   assert!(ret.is_err());
@@ -103,14 +103,14 @@ fn test_sg_test_error() -> Result<()> {
 #[test]
 fn test_sg_test_filter() -> Result<()> {
   let dir = setup_error()?;
-  let config = dir.path().join("sgconfig.yml");
+  let config = dir.path().join("vorpalconfig.yml");
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests -f error-rule",
+    "vorpal test -c {} --skip-snapshot-tests -f error-rule",
     config.display()
   ));
   assert!(ret.is_err());
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests -f test-rule",
+    "vorpal test -c {} --skip-snapshot-tests -f test-rule",
     config.display()
   ));
   assert!(ret.is_err());
@@ -121,19 +121,19 @@ fn test_sg_test_filter() -> Result<()> {
 #[test]
 fn test_sg_test_off_rule() -> Result<()> {
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/test-rule.yml", OFF_RULE),
     ("rule-tests/test-rule-test.yml", WRONG_TEST),
     ("test.ts", "Some(123)"),
   ])?;
-  let config = dir.path().join("sgconfig.yml");
+  let config = dir.path().join("vorpalconfig.yml");
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests",
+    "vorpal test -c {} --skip-snapshot-tests",
     config.display()
   ));
   assert!(ret.is_ok());
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests --include-off",
+    "vorpal test -c {} --skip-snapshot-tests --include-off",
     config.display()
   ));
   assert!(ret.is_err());
@@ -147,7 +147,7 @@ fn test_sg_test_follow_symlinked_test_dir() -> Result<()> {
   use std::os::unix::fs::symlink;
 
   let dir = create_test_files([
-    ("sgconfig.yml", CONFIG),
+    ("vorpalconfig.yml", CONFIG),
     ("rules/test-rule.yml", RULE),
     ("rule-tests/.keep", ""),
     ("real-rule-tests/test-rule-test.yml", WRONG_TEST),
@@ -157,15 +157,15 @@ fn test_sg_test_follow_symlinked_test_dir() -> Result<()> {
     dir.path().join("rule-tests").join("linked"),
   )?;
 
-  let config = dir.path().join("sgconfig.yml");
+  let config = dir.path().join("vorpalconfig.yml");
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests",
+    "vorpal test -c {} --skip-snapshot-tests",
     config.display()
   ));
   assert!(ret.is_ok());
 
   let ret = sg(&format!(
-    "ast-grep test -c {} --skip-snapshot-tests --follow",
+    "vorpal test -c {} --skip-snapshot-tests --follow",
     config.display()
   ));
   assert!(ret.is_err());

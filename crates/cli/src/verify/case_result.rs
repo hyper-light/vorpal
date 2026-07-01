@@ -1,15 +1,15 @@
 /*!
 Maintains struct/enum for rule test results.
 
-ast-grep rule test has several concepts.
-Refer to https://ast-grep.github.io/guide/test-rule.html#basic-concepts
+vorpal rule test has several concepts.
+Refer to https://vorpal.github.io/guide/test-rule.html#basic-concepts
 for general review.
 */
 use super::{SgLang, TestSnapshots, snapshot::TestSnapshot};
 use vorpal_config::RuleConfig;
 use vorpal_language::LanguageExt;
 
-/// [CaseStatus] categorize whether and how ast-grep
+/// [CaseStatus] categorize whether and how vorpal
 /// reports error for either valid or invalid code.
 ///
 /// TestCase has two forms of input: valid code and invalid code.

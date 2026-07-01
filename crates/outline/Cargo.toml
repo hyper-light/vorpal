@@ -1,6 +1,6 @@
 [package]
 name = "vorpal-outline"
-description = "Code outline extraction primitives for ast-grep"
+description = "Code outline extraction primitives for vorpal"
 keywords = ["ast", "outline", "symbols", "tree-sitter"]
 
 authors.workspace = true

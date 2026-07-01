@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 // NB, you should not use SgLang in the (de_serialize interface
-// since Injected is used before lang registration in sgconfig.yml
+// since Injected is used before lang registration in vorpalconfig.yml
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum Injected {
