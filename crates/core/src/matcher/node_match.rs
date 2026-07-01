@@ -115,7 +115,7 @@ mod test {
 
   #[test]
   fn test_node_match_as_node() {
-    let root = Tsx.ast_grep("var a = 1");
+    let root = Tsx.grep("var a = 1");
     let node = root.root();
     let src = node.text().to_string();
     let nm = NodeMatch::from(node);
@@ -126,7 +126,7 @@ mod test {
 
   #[test]
   fn test_node_env() {
-    let root = Tsx.ast_grep("var a = 1");
+    let root = Tsx.grep("var a = 1");
     let find = root.root().find("var $A = 1").expect("should find");
     let env = find.get_env();
     let node = env.get_match("A").expect("should find");
@@ -135,7 +135,7 @@ mod test {
 
   #[test]
   fn test_replace_by() {
-    let root = Tsx.ast_grep("var a = 1");
+    let root = Tsx.grep("var a = 1");
     let find = root.root().find("var $A = 1").expect("should find");
     let fixed = find.replace_by("var b = $A");
     assert_eq!(fixed.position, 0);

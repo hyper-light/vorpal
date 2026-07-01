@@ -358,7 +358,7 @@ impl StdInWorker for ScanStdin {
     use vorpal_core::tree_sitter::LanguageExt;
     let lang = self.rules[0].language;
     let combined = CombinedScan::new(self.rules.iter().collect());
-    let grep = lang.ast_grep(src);
+    let grep = lang.grep(src);
     let path = Path::new("STDIN");
     let file_content = grep.source();
     // do not separate_fix rule in stdin mode

@@ -328,7 +328,7 @@ language: TypeScript
 
   fn test_output(src: &str, rule_str: &str, expect: &str) {
     let mut printer = make_test_printer();
-    let grep = SgLang::from(SupportLang::Tsx).ast_grep(src);
+    let grep = SgLang::from(SupportLang::Tsx).grep(src);
     let rule = make_rule(rule_str);
     let matches = grep.root().find_all(&rule.matcher).collect();
     let file = SimpleFile::new(Cow::Borrowed("test.tsx"), src);
@@ -405,7 +405,7 @@ severity: error
   fn test_sarif_output() {
     let mut printer = make_sarif_test_printer();
     let source = "let a = 123";
-    let grep = SgLang::from(SupportLang::Tsx).ast_grep(source);
+    let grep = SgLang::from(SupportLang::Tsx).grep(source);
     let rule = make_rule("rule: { pattern: a }\nseverity: error");
     let matches: Vec<_> = grep.root().find_all(&rule.matcher).collect();
     printer.before_print().unwrap();

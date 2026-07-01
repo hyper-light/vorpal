@@ -53,7 +53,7 @@ mod tests {
   #[test]
   fn rust_builtin_rules_extract_file_outline() {
     let combined = rust_combined();
-    let grep = SupportLang::Rust.ast_grep(
+    let grep = SupportLang::Rust.grep(
       r#"
 pub use crate::api::Parser;
 use std::fmt;
@@ -184,7 +184,7 @@ mod tests {
   #[test]
   fn rust_builtin_rules_scope_inline_modules_and_impls() {
     let combined = rust_combined();
-    let grep = SupportLang::Rust.ast_grep(
+    let grep = SupportLang::Rust.grep(
       r#"
 mod tests {
   pub fn public_case() {}
@@ -291,7 +291,7 @@ impl Rewrite<String> {
   #[test]
   fn rust_builtin_rules_extract_tokio_declaration_shapes() {
     let combined = rust_combined();
-    let grep = SupportLang::Rust.ast_grep(
+    let grep = SupportLang::Rust.grep(
       r#"
 pub(super) struct Cell<T: Future, S> {
   pub(super) header: Header,
@@ -415,7 +415,7 @@ impl<T: Future> CoreStage<T> {
   #[test]
   fn rust_builtin_rules_extract_async_functions_and_methods() {
     let combined = rust_combined();
-    let grep = SupportLang::Rust.ast_grep(
+    let grep = SupportLang::Rust.grep(
       r#"
 pub async fn exported_async() -> usize { 1 }
 

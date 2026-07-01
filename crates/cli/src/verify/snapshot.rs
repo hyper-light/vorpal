@@ -85,7 +85,7 @@ impl TestSnapshot {
   // then Result<T> indicates if we have error during replace
   // But to reuse anyhow we use the Result<Option<T>>
   pub fn generate(rule_config: &RuleConfig<SgLang>, case: &str) -> Result<Option<Self>> {
-    let mut sg = rule_config.language.ast_grep(case);
+    let mut sg = rule_config.language.grep(case);
     let rule = &rule_config.matcher;
     let Some(matched) = sg.root().find(rule) else {
       return Ok(None);

@@ -314,7 +314,7 @@ mod test {
     config.id = "test".into();
     config.message = "Found $A".into();
     let config = RuleConfig::try_from(config, &Default::default()).expect("should work");
-    let grep = TypeScript::Tsx.ast_grep("class TestClass {}");
+    let grep = TypeScript::Tsx.grep("class TestClass {}");
     let node_match = grep
       .root()
       .find(&config.matcher)
@@ -344,7 +344,7 @@ matches:
     )
     .expect("should parse");
     let config = ts_rule_config(rule);
-    let grep = TypeScript::Tsx.ast_grep("let value = Some(123)");
+    let grep = TypeScript::Tsx.grep("let value = Some(123)");
     let node_match = grep
       .root()
       .find(config.get_matcher(&globals).unwrap())
@@ -379,7 +379,7 @@ all:
     )
     .expect("should parse");
     let config = ts_rule_config(rule);
-    let grep = TypeScript::Tsx.ast_grep("Some(123)");
+    let grep = TypeScript::Tsx.grep("Some(123)");
     let node_match = grep
       .root()
       .find(config.get_matcher(&globals).unwrap())
@@ -417,7 +417,7 @@ all:
     )
     .expect("should parse");
     let config = ts_rule_config(rule);
-    let grep = TypeScript::Tsx.ast_grep("wrapper(Some(123))");
+    let grep = TypeScript::Tsx.grep("wrapper(Some(123))");
     let node_match = grep
       .root()
       .find(config.get_matcher(&globals).unwrap())
@@ -451,7 +451,7 @@ matches:
     )
     .expect("should parse");
     let config = ts_rule_config(rule);
-    let grep = TypeScript::Tsx.ast_grep("Some(123)");
+    let grep = TypeScript::Tsx.grep("Some(123)");
     let node_match = grep
       .root()
       .find(config.get_matcher(&globals).unwrap())
@@ -487,7 +487,7 @@ test-rule:
     config.fix = Some(from_str("string!!").unwrap());
     let rule = RuleConfig::try_from(config, &globals).unwrap();
     let fixer = rule.get_fixer().unwrap().remove(0);
-    let grep = TypeScript::Tsx.ast_grep("some(123)");
+    let grep = TypeScript::Tsx.grep("some(123)");
     let nm = grep.root().find(&rule.matcher).unwrap();
     let replacement = fixer.generate_replacement(&nm);
     assert_eq!(String::from_utf8_lossy(&replacement), "string!!");
@@ -536,7 +536,7 @@ rewriters:
     )
     .expect("should parse");
     let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
-    let grep = TypeScript::Tsx.ast_grep("a = 123");
+    let grep = TypeScript::Tsx.grep("a = 123");
     let nm = grep.root().find(&rule.matcher).unwrap();
     let b = nm.get_env().get_transformed("B").expect("should have");
     assert_eq!(String::from_utf8_lossy(b), "yjsnp");
@@ -564,7 +564,7 @@ rewriters:
     )
     .expect("should parse");
     let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
-    let grep = TypeScript::Tsx.ast_grep("a = 456");
+    let grep = TypeScript::Tsx.grep("a = 456");
     let nm = grep.root().find(&rule.matcher).unwrap();
     let b = nm.get_env().get_transformed("B").expect("should have");
     assert!(nm.get_env().get_match("NOT").is_none());
@@ -633,7 +633,7 @@ rewriters:
     )
     .expect("should parse");
     let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
-    let grep = TypeScript::Tsx.ast_grep("a = 114514");
+    let grep = TypeScript::Tsx.grep("a = 114514");
     let nm = grep.root().find(&rule.matcher).unwrap();
     let b = nm.get_env().get_transformed("B").expect("should have");
     assert_eq!(String::from_utf8_lossy(b), "yjsnp");
@@ -661,7 +661,7 @@ rewriters:
     )
     .expect("should parse");
     let rule = RuleConfig::try_from(rule, &Default::default()).expect("work");
-    let grep = TypeScript::Tsx.ast_grep("a = 114514");
+    let grep = TypeScript::Tsx.grep("a = 114514");
     let nm = grep.root().find(&rule.matcher).unwrap();
     let b = nm.get_env().get_transformed("B").expect("should have");
     assert_eq!(String::from_utf8_lossy(b), "1919810");
@@ -834,7 +834,7 @@ message: $TEST
     ";
     let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
     let rule = RuleConfig::try_from(rule, &Default::default()).expect("should work");
-    let grep = TypeScript::Tsx.ast_grep("a = '123'");
+    let grep = TypeScript::Tsx.grep("a = '123'");
     let nm = grep.root().find(&rule.matcher).unwrap();
     assert_eq!(rule.get_message(&nm), "'123'");
   }
@@ -851,7 +851,7 @@ message: $TEST
     ";
     let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
     let rule = RuleConfig::try_from(rule, &Default::default()).expect("should work");
-    let grep = TypeScript::Tsx.ast_grep("a = '123'");
+    let grep = TypeScript::Tsx.grep("a = '123'");
     let nm = grep.root().find(&rule.matcher).unwrap();
     assert_eq!(rule.get_message(&nm), "'123'");
   }
@@ -867,7 +867,7 @@ metadata:
   ";
     let rule: SerializableRuleConfig<TypeScript> = from_str(src).expect("should parse");
     let rule = RuleConfig::try_from(rule, &Default::default()).expect("should work");
-    let grep = TypeScript::Tsx.ast_grep("a = '123'");
+    let grep = TypeScript::Tsx.grep("a = '123'");
     let nm = grep.root().find(&rule.matcher);
     assert!(nm.is_some());
   }

@@ -493,7 +493,7 @@ name: $NAME
     .expect("extractors should deserialize");
     let combined = CombinedExtractors::try_from(extractors, &Default::default())
       .expect("extractors should parse");
-    let grep = SupportLang::TypeScript.ast_grep(
+    let grep = SupportLang::TypeScript.grep(
       r#"
 function outer() {
   function inner() {}
@@ -540,7 +540,7 @@ signature: $NAME()
     .expect("extractors should deserialize");
     let combined = CombinedExtractors::try_from(extractors, &Default::default())
       .expect("extractors should parse");
-    let grep = SupportLang::TypeScript.ast_grep(
+    let grep = SupportLang::TypeScript.grep(
       r#"
 class Box {
   parse() {
@@ -595,7 +595,7 @@ name: $NAME
     .expect("extractors should deserialize");
     let combined = CombinedExtractors::try_from(extractors, &Default::default())
       .expect("extractors should parse");
-    let grep = SupportLang::TypeScript.ast_grep(
+    let grep = SupportLang::TypeScript.grep(
       r#"
 class Box {
   parse() {}
@@ -650,7 +650,7 @@ signature: $NAME()
     };
     let combined = CombinedExtractors::try_from_rules(extractors, options, &Default::default())
       .expect("extractors should parse");
-    let grep = SupportLang::TypeScript.ast_grep("class Box { parse() {} }");
+    let grep = SupportLang::TypeScript.grep("class Box { parse() {} }");
 
     let items = combined.extract(grep.root()).collect::<Vec<_>>();
 
@@ -692,7 +692,7 @@ isImport: false
     };
     let combined = CombinedExtractors::try_from_rules(extractors, options, &Default::default())
       .expect("extractors should parse");
-    let grep = SupportLang::TypeScript.ast_grep(
+    let grep = SupportLang::TypeScript.grep(
       r#"
 import { readFile } from 'node:fs';
 function local() {}

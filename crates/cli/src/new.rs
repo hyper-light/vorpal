@@ -1,4 +1,4 @@
-use crate::config::{AstGrepConfig, ProjectConfig, TestConfig};
+use crate::config::{VorpalConfig, ProjectConfig, TestConfig};
 use crate::lang::SgLang;
 use crate::utils::ErrorContext as EC;
 
@@ -214,7 +214,7 @@ fn create_new_project(arg: NewArg, project_dir: &Path) -> Result<ExitCode> {
   } else {
     None
   };
-  let root_config = AstGrepConfig {
+  let root_config = VorpalConfig {
     rule_dirs: vec![rule_dirs],
     test_configs: test_dirs.map(|t| vec![t]),
     util_dirs: utils.map(|u| vec![u]),

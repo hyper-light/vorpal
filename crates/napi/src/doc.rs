@@ -174,7 +174,7 @@ impl Doc for JsDoc {
 #[cfg(test)]
 mod test {
   use super::*;
-  use vorpal_core::AstGrep;
+  use vorpal_core::Vorpal;
   use vorpal_language::SupportLang;
   fn make_doc(src: &str) -> JsDoc {
     JsDoc::try_new(src.to_string(), SupportLang::JavaScript.into()).expect("should work")
@@ -182,7 +182,7 @@ mod test {
   #[test]
   fn test_js_doc() {
     let doc = make_doc("console.log(123)");
-    let grep = AstGrep::doc(doc);
+    let grep = Vorpal::doc(doc);
     assert_eq!(grep.root().text(), "console.log(123)");
     let node = grep.root().find("console");
     assert!(node.is_some());
@@ -191,7 +191,7 @@ mod test {
   #[test]
   fn test_js_doc_single_node_replace() {
     let doc = make_doc("console.log(1 + 2 + 3)");
-    let mut grep = AstGrep::doc(doc);
+    let mut grep = Vorpal::doc(doc);
     let edit = grep
       .root()
       .replace("console.log($SINGLE)", "log($SINGLE)")
@@ -203,7 +203,7 @@ mod test {
   #[test]
   fn test_js_doc_multiple_node_replace() {
     let doc = make_doc("console.log(1 + 2 + 3)");
-    let mut grep = AstGrep::doc(doc);
+    let mut grep = Vorpal::doc(doc);
     let edit = grep
       .root()
       .replace("console.log($$$MULTI)", "log($$$MULTI)")

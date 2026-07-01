@@ -408,7 +408,7 @@ mod test {
   use super::*;
   use vorpal_config::{Fixer, GlobalRules, from_yaml_string};
   use vorpal_core::tree_sitter::{StrDoc, Visitor};
-  use vorpal_core::{AstGrep, Matcher};
+  use vorpal_core::{Vorpal, Matcher};
   use vorpal_language::SupportLang;
 
   fn make_rule(rule: &str) -> RuleConfig<SgLang> {
@@ -429,7 +429,7 @@ language: TypeScript
     .unwrap()
   }
 
-  fn make_diffs(grep: &AstGrep<StrDoc<SgLang>>, matcher: impl Matcher, fixer: &Fixer) -> Diffs<()> {
+  fn make_diffs(grep: &Vorpal<StrDoc<SgLang>>, matcher: impl Matcher, fixer: &Fixer) -> Diffs<()> {
     let root = grep.root();
     let old_source = root.root().get_text().to_string();
     let contents = Visitor::new(&matcher)
@@ -455,7 +455,7 @@ language: TypeScript
 
   #[test]
   fn test_apply_rewrite() {
-    let root = AstGrep::new("let a = () => c++", SupportLang::TypeScript.into());
+    let root = Vorpal::new("let a = () => c++", SupportLang::TypeScript.into());
     let mut config = make_rule(
       r"
 rule:
@@ -474,7 +474,7 @@ fix: ($B, lifecycle.update(['$A']))",
 
   #[test]
   fn test_rewrite_nested() {
-    let root = AstGrep::new("Some(Some(1))", SupportLang::TypeScript.into());
+    let root = Vorpal::new("Some(Some(1))", SupportLang::TypeScript.into());
     let diffs = make_diffs(
       &root,
       "Some($A)",
@@ -488,7 +488,7 @@ fix: ($B, lifecycle.update(['$A']))",
   // https://github.com/ast-grep/ast-grep/issues/668
   #[test]
   fn test_rewrite_with_empty_lines() {
-    let root = AstGrep::new("\n\n\nSome(1)", SupportLang::TypeScript.into());
+    let root = Vorpal::new("\n\n\nSome(1)", SupportLang::TypeScript.into());
     let diffs = make_diffs(
       &root,
       "Some($A)",

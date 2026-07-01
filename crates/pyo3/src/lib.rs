@@ -9,7 +9,7 @@ use py_node::{Edit, SgNode};
 use range::{Pos, Range};
 
 use vorpal_core::{
-  AstGrep, NodeMatch,
+  Vorpal, NodeMatch,
   tree_sitter::{LanguageExt, StrDoc},
 };
 use py_lang::PyLang;
@@ -31,7 +31,7 @@ fn vorpal_py(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
 
 #[pyclass]
 struct SgRoot {
-  inner: AstGrep<StrDoc<PyLang>>,
+  inner: Vorpal<StrDoc<PyLang>>,
   filename: String,
   pub(crate) position: UnicodePosition,
 }
@@ -42,7 +42,7 @@ impl SgRoot {
   fn new(src: &str, lang: &str) -> Self {
     let position = UnicodePosition::new(src);
     let lang: PyLang = lang.parse().unwrap();
-    let inner = lang.ast_grep(src);
+    let inner = lang.grep(src);
     Self {
       inner,
       filename: "anonymous".into(),
@@ -51,7 +51,7 @@ impl SgRoot {
   }
 
   fn root(slf: PyRef<Self>) -> SgNode {
-    let tree = unsafe { &*(&slf.inner as *const AstGrep<_>) } as &'static AstGrep<_>;
+    let tree = unsafe { &*(&slf.inner as *const Vorpal<_>) } as &'static Vorpal<_>;
     let inner = NodeMatch::from(tree.root());
     SgNode {
       inner,

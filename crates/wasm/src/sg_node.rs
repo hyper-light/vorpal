@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::ts_types as ts;
 use vorpal_core::matcher::KindMatcher;
 use vorpal_core::source::Content;
-use vorpal_core::{AstGrep, NodeMatch, Pattern};
+use vorpal_core::{Vorpal, NodeMatch, Pattern};
 use wasm_bindgen::prelude::*;
 
 use crate::doc::{WasmConfig, WasmDoc, Wrapper};
@@ -40,7 +40,7 @@ pub struct Range {
 /// Represents the parsed tree of code.
 #[wasm_bindgen]
 pub struct SgRoot {
-  inner: Rc<AstGrep<WasmDoc>>,
+  inner: Rc<Vorpal<WasmDoc>>,
   filename: String,
 }
 
@@ -50,9 +50,9 @@ impl SgRoot {
   pub fn root(&self) -> SgNode {
     // SAFETY: WasmDoc's Node type wraps a JS SyntaxNode (GC-managed, Clone).
     // It does not actually borrow from the Rust tree. The Rc keeps the
-    // AstGrep alive as long as any SgNode references it.
-    let root_ref: &'static AstGrep<WasmDoc> =
-      unsafe { &*(Rc::as_ptr(&self.inner) as *const AstGrep<WasmDoc>) };
+    // Vorpal alive as long as any SgNode references it.
+    let root_ref: &'static Vorpal<WasmDoc> =
+      unsafe { &*(Rc::as_ptr(&self.inner) as *const Vorpal<WasmDoc>) };
     let node_match: NodeMatch<'static, WasmDoc> = root_ref.root().into();
     SgNode {
       _root: self.inner.clone(),
@@ -74,7 +74,7 @@ impl SgRoot {
 }
 
 impl SgRoot {
-  pub fn new(inner: AstGrep<WasmDoc>, filename: String) -> Self {
+  pub fn new(inner: Vorpal<WasmDoc>, filename: String) -> Self {
     Self {
       inner: Rc::new(inner),
       filename,
@@ -85,8 +85,8 @@ impl SgRoot {
 /// Represents a single AST node.
 #[wasm_bindgen]
 pub struct SgNode {
-  // Prevent the AstGrep from being dropped while SgNode is alive
-  _root: Rc<AstGrep<WasmDoc>>,
+  // Prevent the Vorpal from being dropped while SgNode is alive
+  _root: Rc<Vorpal<WasmDoc>>,
   inner: NodeMatch<'static, WasmDoc>,
 }
 

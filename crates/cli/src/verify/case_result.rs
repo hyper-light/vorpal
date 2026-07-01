@@ -43,7 +43,7 @@ pub enum CaseStatus<'a> {
 impl<'a> CaseStatus<'a> {
   pub fn verify_valid(rule_config: &RuleConfig<SgLang>, case: &'a str) -> Self {
     let rule = &rule_config.matcher;
-    let sg = rule_config.language.ast_grep(case);
+    let sg = rule_config.language.grep(case);
     if sg.root().find(rule).is_some() {
       CaseStatus::Noisy(case)
     } else {
@@ -52,7 +52,7 @@ impl<'a> CaseStatus<'a> {
   }
 
   pub fn verify_invalid(rule_config: &RuleConfig<SgLang>, case: &'a str) -> Self {
-    let sg = rule_config.language.ast_grep(case);
+    let sg = rule_config.language.grep(case);
     let rule = &rule_config.matcher;
     if sg.root().find(rule).is_some() {
       CaseStatus::Reported

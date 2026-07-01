@@ -178,7 +178,7 @@ if (true) {
     let template = r"c(
   $B
 )";
-    let mut src = Tsx.ast_grep(src);
+    let mut src = Tsx.grep(src);
     let pattern = Pattern::new(pattern, Tsx);
     let success = src.replace(pattern, template).expect("should replace");
     assert!(success);
@@ -194,11 +194,11 @@ if (true) {
 
   fn test_str_replace(replacer: &str, vars: &[(&str, &str)], expected: &str) {
     let mut env = MetaVarEnv::new();
-    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.ast_grep(p))).collect();
+    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.grep(p))).collect();
     for (var, root) in &roots {
       env.insert(var, root.root());
     }
-    let dummy = Tsx.ast_grep("dummy");
+    let dummy = Tsx.grep("dummy");
     let node_match = NodeMatch::new(dummy.root(), env.clone());
     let replaced = replacer.generate_replacement(&node_match);
     let replaced = String::from_utf8_lossy(&replaced);
@@ -253,11 +253,11 @@ if (true) {
 
   fn test_ellipsis_replace(replacer: &str, vars: &[(&str, &str)], expected: &str) {
     let mut env = MetaVarEnv::new();
-    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.ast_grep(p))).collect();
+    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.grep(p))).collect();
     for (var, root) in &roots {
       env.insert_multi(var, root.root().children().collect());
     }
-    let dummy = Tsx.ast_grep("dummy");
+    let dummy = Tsx.grep("dummy");
     let node_match = NodeMatch::new(dummy.root(), env.clone());
     let replaced = replacer.generate_replacement(&node_match);
     let replaced = String::from_utf8_lossy(&replaced);
@@ -299,11 +299,11 @@ if (true) {
 
   fn test_template_replace(template: &str, vars: &[(&str, &str)], expected: &str) {
     let mut env = MetaVarEnv::new();
-    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.ast_grep(p))).collect();
+    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.grep(p))).collect();
     for (var, root) in &roots {
       env.insert(var, root.root());
     }
-    let dummy = Tsx.ast_grep("dummy");
+    let dummy = Tsx.grep("dummy");
     let node_match = NodeMatch::new(dummy.root(), env.clone());
     let bytes = template.generate_replacement(&node_match);
     let ret = String::from_utf8(bytes).expect("replacement must be valid utf-8");
@@ -345,7 +345,7 @@ if (true) {
       "A",
       "if (b)\n  foo".bytes().collect(),
     );
-    let dummy = Tsx.ast_grep("dummy");
+    let dummy = Tsx.grep("dummy");
     let node_match = NodeMatch::new(dummy.root(), env.clone());
     let bytes = tf.generate_replacement(&node_match);
     let ret = String::from_utf8(bytes).expect("replacement must be valid utf-8");

@@ -37,7 +37,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-type AstGrep = vorpal_core::AstGrep<StrDoc<SgLang>>;
+type Vorpal = vorpal_core::Vorpal<StrDoc<SgLang>>;
 
 fn read_char() -> Result<char> {
   loop {
@@ -136,12 +136,12 @@ pub fn filter_file_rule(
   path: &Path,
   configs: &RuleCollection<SgLang>,
   trace: &ScanTrace,
-) -> Result<SmallVec<[AstGrep; 1]>> {
+) -> Result<SmallVec<[Vorpal; 1]>> {
   let Some(lang) = SgLang::from_path(path) else {
     return Ok(smallvec![]);
   };
   let file_content = read_file(path)?;
-  let grep = lang.ast_grep(file_content);
+  let grep = lang.grep(file_content);
   collect_file_stats(path, lang, configs, trace)?;
   let mut ret = smallvec![grep.clone()];
   if lang.injectable_languages().is_some() {
@@ -163,8 +163,8 @@ pub fn filter_file_pattern<'a>(
   sub_matchers: &'a [(SgLang, Rule)],
 ) -> Result<SmallVec<[MatchUnit<&'a Rule>; 1]>> {
   let file_content = read_file(path)?;
-  let grep = lang.ast_grep(&file_content);
-  let do_match = |ast_grep: AstGrep, matcher: &'a Rule| {
+  let grep = lang.grep(&file_content);
+  let do_match = |grep: Vorpal, matcher: &'a Rule| {
     let fixed = match matcher {
       Rule::Pattern(pat) => pat.fixed_string(),
       _ => std::borrow::Cow::Borrowed(""),
@@ -173,7 +173,7 @@ pub fn filter_file_pattern<'a>(
       return None;
     }
     Some(MatchUnit {
-      grep: ast_grep,
+      grep: grep,
       path: path.to_path_buf(),
       matcher,
     })
@@ -206,7 +206,7 @@ fn file_too_large(file_content: &str) -> bool {
 /// An analogy to compilation unit in C programming language.
 pub struct MatchUnit<M: Matcher> {
   pub path: PathBuf,
-  pub grep: AstGrep,
+  pub grep: Vorpal,
   pub matcher: M,
 }
 
@@ -218,7 +218,7 @@ mod test {
   #[test]
   fn test_html_embedding() {
     let root =
-      SgLang::Builtin(SupportLang::Html).ast_grep("<script lang=typescript>alert(123)</script>");
+      SgLang::Builtin(SupportLang::Html).grep("<script lang=typescript>alert(123)</script>");
     let docs = root.get_injections(|s| SgLang::from_str(s).ok());
     assert_eq!(docs.len(), 1);
     let script = docs[0].root().child(0).expect("should exist");
@@ -227,7 +227,7 @@ mod test {
 
   #[test]
   fn test_html_embedding_lang_not_found() {
-    let root = SgLang::Builtin(SupportLang::Html).ast_grep("<script lang=xxx>alert(123)</script>");
+    let root = SgLang::Builtin(SupportLang::Html).grep("<script lang=xxx>alert(123)</script>");
     let docs = root.get_injections(|s| SgLang::from_str(s).ok());
     assert_eq!(docs.len(), 0);
   }

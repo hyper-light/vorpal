@@ -33,7 +33,7 @@ impl From<PathBuf> for TestConfig {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct AstGrepConfig {
+pub struct VorpalConfig {
   /// YAML rule directories
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub rule_dirs: Vec<PathBuf>,
@@ -69,14 +69,14 @@ pub struct ProjectConfig {
 
 impl ProjectConfig {
   // return None if config file does not exist
-  fn discover_project(config_path: Option<PathBuf>) -> Result<Option<(PathBuf, AstGrepConfig)>> {
+  fn discover_project(config_path: Option<PathBuf>) -> Result<Option<(PathBuf, VorpalConfig)>> {
     let config_path = find_config_path_with_default(config_path).context(EC::ProjectNotExist)?;
     // NOTE: if config file does not exist, return None
     let Some(config_path) = config_path else {
       return Ok(None);
     };
     let config_str = read_to_string(&config_path).context(EC::ReadConfiguration)?;
-    let sg_config: AstGrepConfig = from_str(&config_str).context(EC::ParseConfiguration)?;
+    let sg_config: VorpalConfig = from_str(&config_str).context(EC::ParseConfiguration)?;
     let project_dir = config_path
       .parent()
       .expect("config file must have parent directory")
@@ -126,7 +126,7 @@ fn custom_language_outline_rules(
     .collect()
 }
 
-fn register_custom_language(project_dir: &Path, sg_config: AstGrepConfig) -> Result<()> {
+fn register_custom_language(project_dir: &Path, sg_config: VorpalConfig) -> Result<()> {
   if let Some(custom_langs) = sg_config.custom_languages {
     SgLang::register_custom_language(project_dir, custom_langs)?;
   }
@@ -300,7 +300,7 @@ mod tests {
 
   #[test]
   fn custom_language_outline_rules_are_project_relative() {
-    let config: AstGrepConfig = from_str(
+    let config: VorpalConfig = from_str(
       r#"
 customLanguages:
   blade:

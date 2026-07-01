@@ -2,7 +2,7 @@ use crate::{RuleConfig, SerializableRule, SerializableRuleConfig, SerializableRu
 
 use vorpal_core::language::Language;
 use vorpal_core::matcher::{Matcher, MatcherExt};
-use vorpal_core::{AstGrep, Doc, Node, NodeMatch};
+use vorpal_core::{Vorpal, Doc, Node, NodeMatch};
 
 use std::collections::{HashMap, HashSet};
 
@@ -106,7 +106,7 @@ struct Suppressions {
 }
 
 impl Suppressions {
-  fn collect_all<D: Doc>(root: &AstGrep<D>) -> (Self, HashMap<usize, Node<'_, D>>) {
+  fn collect_all<D: Doc>(root: &Vorpal<D>) -> (Self, HashMap<usize, Node<'_, D>>) {
     let mut suppressions = Self {
       file: None,
       lines: HashMap::new(),
@@ -271,7 +271,7 @@ impl<'r, L: Language> CombinedScan<'r, L> {
     self.unused_suppression_rule = Some(rule);
   }
 
-  pub fn scan<'a, D>(&self, root: &'a AstGrep<D>, separate_fix: bool) -> ScanResult<'a, '_, D, L>
+  pub fn scan<'a, D>(&self, root: &'a Vorpal<D>, separate_fix: bool) -> ScanResult<'a, '_, D, L>
   where
     D: Doc<Lang = L>,
   {
@@ -434,7 +434,7 @@ language: Tsx",
       )>,
     ),
   {
-    let root = TypeScript::Tsx.ast_grep(source);
+    let root = TypeScript::Tsx.grep(source);
     let rule = create_rule();
     let rules = vec![&rule];
     let scan = CombinedScan::new(rules);
@@ -533,7 +533,7 @@ language: Tsx",
       )>,
     ),
   {
-    let root = TypeScript::Tsx.ast_grep(source);
+    let root = TypeScript::Tsx.grep(source);
     let rule = create_rule();
     let rules = vec![&rule];
     let mut scan = CombinedScan::new(rules);
@@ -592,7 +592,7 @@ language: Tsx",
       )>,
     ),
   {
-    let root = TypeScript::Tsx.ast_grep(source);
+    let root = TypeScript::Tsx.grep(source);
     let rule = create_rule();
     let rules = vec![&rule];
     let mut scan = CombinedScan::new(rules);

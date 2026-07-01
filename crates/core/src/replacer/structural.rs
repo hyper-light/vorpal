@@ -101,11 +101,11 @@ mod test {
 
   fn test_pattern_replace(replacer: &str, vars: &[(&str, &str)], expected: &str) {
     let mut env = MetaVarEnv::new();
-    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.ast_grep(p))).collect();
+    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.grep(p))).collect();
     for (var, root) in &roots {
       env.insert(var, root.root());
     }
-    let dummy = Tsx.ast_grep("dummy");
+    let dummy = Tsx.grep("dummy");
     let node_match = NodeMatch::new(dummy.root(), env.clone());
     let replacer = Root::str(replacer, Tsx);
     let replaced = replacer.generate_replacement(&node_match);
@@ -161,11 +161,11 @@ mod test {
 
   fn test_ellipsis_replace(replacer: &str, vars: &[(&str, &str)], expected: &str) {
     let mut env = MetaVarEnv::new();
-    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.ast_grep(p))).collect();
+    let roots: Vec<_> = vars.iter().map(|(v, p)| (v, Tsx.grep(p))).collect();
     for (var, root) in &roots {
       env.insert_multi(var, root.root().children().collect());
     }
-    let dummy = Tsx.ast_grep("dummy");
+    let dummy = Tsx.grep("dummy");
     let node_match = NodeMatch::new(dummy.root(), env.clone());
     let replacer = Root::str(replacer, Tsx);
     let replaced = replacer.generate_replacement(&node_match);

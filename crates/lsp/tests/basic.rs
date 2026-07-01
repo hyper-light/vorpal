@@ -141,7 +141,7 @@ pub async fn request_execute_command_to_lsp(
       "command": "vorpal.applyAllFixes",
       "arguments": [
         {
-          "text": "class AstGrepTest {\n  test() {\n    console.log('Hello, world!')\n  }\n}\n\nclass AnotherCase {\n  get test2() {\n    return 123\n  }\n}\n\nconst NoProblemHere = {\n  test() {\n    if (Math.random() > 3) {\n      throw new Error('This is not an error')\n    }\n  },\n}\n",
+          "text": "class VorpalTest {\n  test() {\n    console.log('Hello, world!')\n  }\n}\n\nclass AnotherCase {\n  get test2() {\n    return 123\n  }\n}\n\nconst NoProblemHere = {\n  test() {\n    if (Math.random() > 3) {\n      throw new Error('This is not an error')\n    }\n  },\n}\n",
           "uri": "file:///Users/codes/vorpal-vscode/fixture/test.ts",
           "version": 1,
           "languageId": "typescript"

@@ -507,7 +507,7 @@ mod test {
   }
 
   fn pre_order_equivalent(source: &str) {
-    let grep = Tsx.ast_grep(source);
+    let grep = Tsx.grep(source);
     let node = grep.root();
     let iterative: Vec<_> = Pre::new(&node).map(|n| n.range()).collect();
     let recursive = pre_order(node);
@@ -515,7 +515,7 @@ mod test {
   }
 
   fn post_order_equivalent(source: &str) {
-    let grep = Tsx.ast_grep(source);
+    let grep = Tsx.grep(source);
     let node = grep.root();
     let iterative: Vec<_> = Post::new(&node).map(|n| n.range()).collect();
     let recursive = post_order(node);
@@ -539,7 +539,7 @@ mod test {
 
   #[test]
   fn test_prune_pre_order_skips_subtree() {
-    let grep = Tsx.ast_grep(
+    let grep = Tsx.grep(
       r#"
 function a() { foo(); }
 function b() { bar(); }
@@ -571,7 +571,7 @@ function b() { bar(); }
 
   #[test]
   fn test_prune_subtree_scope_tracks_exit() {
-    let grep = Tsx.ast_grep(
+    let grep = Tsx.grep(
       r#"
 function a() { foo(); }
 function b() { bar(); }
@@ -605,7 +605,7 @@ function b() { bar(); }
   #[test]
   fn test_different_order() {
     for case in CASES {
-      let grep = Tsx.ast_grep(case);
+      let grep = Tsx.grep(case);
       let node = grep.root();
       let pre: Vec<_> = Pre::new(&node).map(|n| n.range()).collect();
       let post: Vec<_> = Post::new(&node).map(|n| n.range()).collect();
@@ -619,7 +619,7 @@ function b() { bar(); }
   #[test]
   fn test_fused_traversal() {
     for case in CASES {
-      let grep = Tsx.ast_grep(case);
+      let grep = Tsx.grep(case);
       let node = grep.root();
       let mut pre = Pre::new(&node);
       let mut post = Post::new(&node);
@@ -634,7 +634,7 @@ function b() { bar(); }
 
   #[test]
   fn test_non_root_traverse() {
-    let grep = Tsx.ast_grep("let a = 123; let b = 123;");
+    let grep = Tsx.grep("let a = 123; let b = 123;");
     let node = grep.root();
     let pre: Vec<_> = Pre::new(&node).map(|n| n.range()).collect();
     let post: Vec<_> = Post::new(&node).map(|n| n.range()).collect();
@@ -684,7 +684,7 @@ function b() { bar(); }
   fn test_pre_order_visitor() {
     let matcher = "Some($$$)";
     for case in MATCHER_CASES {
-      let grep = Tsx.ast_grep(case);
+      let grep = Tsx.grep(case);
       let node = grep.root();
       let recur = pre_order_with_matcher(grep.root(), matcher);
       let visit: Vec<_> = Visitor::new(matcher)
@@ -699,7 +699,7 @@ function b() { bar(); }
   fn test_post_order_visitor() {
     let matcher = "Some($$$)";
     for case in MATCHER_CASES {
-      let grep = Tsx.ast_grep(case);
+      let grep = Tsx.grep(case);
       let node = grep.root();
       let recur = post_order_with_matcher(grep.root(), matcher);
       let visit: Vec<_> = Visitor::new(matcher)
@@ -717,7 +717,7 @@ function b() { bar(); }
   fn test_traversal_leaf() {
     let matcher = "true";
     let case = "((((true))));true";
-    let grep = Tsx.ast_grep(case);
+    let grep = Tsx.grep(case);
     let recur = pre_order_with_matcher(grep.root(), matcher);
     let visit: Vec<_> = Visitor::new(matcher)
       .reentrant(false)

@@ -289,7 +289,7 @@ rule:
 ",
     )
     .expect("rule should compile");
-    let grep = TypeScript::Tsx.ast_grep("function f() { bar(); return foo; target; }");
+    let grep = TypeScript::Tsx.grep("function f() { bar(); return foo; target; }");
     let nm = grep.root().find(&matcher).expect("should match target;");
     assert!(
       nm.get_env().get_match("A").is_none(),
@@ -350,11 +350,11 @@ transform:
     let rule = ReferentRule::try_new("test".into(), &env.registration).expect("should work");
     let not = ReferentRule::try_new("test2".into(), &env.registration).expect("should work");
     let matcher = ser_rule.get_matcher(env).expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("a = 123");
+    let grep = TypeScript::Tsx.grep("a = 123");
     assert!(grep.root().find(&matcher).is_some());
     assert!(grep.root().find(&rule).is_some());
     assert!(grep.root().find(&not).is_none());
-    let grep = TypeScript::Tsx.ast_grep("a = '123'");
+    let grep = TypeScript::Tsx.grep("a = '123'");
     assert!(grep.root().find(&matcher).is_none());
     assert!(grep.root().find(&rule).is_none());
     assert!(grep.root().find(&not).is_none());
@@ -372,9 +372,9 @@ rule:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("console.log(1)");
+    let grep = TypeScript::Tsx.grep("console.log(1)");
     assert!(grep.root().find(&matcher).is_none());
-    let grep = TypeScript::Tsx.ast_grep("function test() { console.log(1) }");
+    let grep = TypeScript::Tsx.grep("function test() { console.log(1) }");
     assert!(grep.root().find(&matcher).is_some());
   }
 
@@ -393,9 +393,9 @@ rule:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("function test() { console.log(1) }");
+    let grep = TypeScript::Tsx.grep("function test() { console.log(1) }");
     assert!(grep.root().find(&matcher).is_none());
-    let grep = TypeScript::Tsx.ast_grep("function test() { console.log(123) }");
+    let grep = TypeScript::Tsx.grep("function test() { console.log(123) }");
     assert!(grep.root().find(&matcher).is_some());
   }
 
@@ -412,7 +412,7 @@ rule:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("function test() { console.log(1) }");
+    let grep = TypeScript::Tsx.grep("function test() { console.log(1) }");
     let node_match = grep.root().find(&matcher).expect("should found");
     let env = node_match.get_env();
     let a = env.get_match("A").expect("should exist").text();
@@ -433,9 +433,9 @@ utils:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("some(123)");
+    let grep = TypeScript::Tsx.grep("some(123)");
     assert!(grep.root().find(&matcher).is_some());
-    let grep = TypeScript::Tsx.ast_grep("some()");
+    let grep = TypeScript::Tsx.grep("some()");
     assert!(grep.root().find(&matcher).is_none());
   }
 
@@ -453,7 +453,7 @@ utils:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("Some(123)");
+    let grep = TypeScript::Tsx.grep("Some(123)");
     assert!(grep.root().find(&matcher).is_none());
   }
 
@@ -472,7 +472,7 @@ transform:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("function test() { console.log(123) }");
+    let grep = TypeScript::Tsx.grep("function test() { console.log(123) }");
     let node_match = grep.root().find(&matcher).expect("should found");
     let env = node_match.get_env();
     let a = env.get_match("A").expect("should exist").text();
@@ -636,9 +636,9 @@ rule:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("Some(123)");
+    let grep = TypeScript::Tsx.grep("Some(123)");
     assert!(grep.root().find(&matcher).is_some());
-    let grep = TypeScript::Tsx.ast_grep("None");
+    let grep = TypeScript::Tsx.grep("None");
     assert!(grep.root().find(&matcher).is_none());
   }
 
@@ -669,9 +669,9 @@ rule:
 ",
     )
     .expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("Some(123)");
+    let grep = TypeScript::Tsx.grep("Some(123)");
     assert!(grep.root().find(&matcher).is_some());
-    let grep = TypeScript::Tsx.ast_grep("None");
+    let grep = TypeScript::Tsx.grep("None");
     assert!(grep.root().find(&matcher).is_none());
   }
 
@@ -684,9 +684,9 @@ rule:
     );
     let rule =
       RuleCore::new(Rule::Pattern(Pattern::new("$A", TypeScript::Tsx))).with_matchers(constraints);
-    let grep = TypeScript::Tsx.ast_grep("a");
+    let grep = TypeScript::Tsx.grep("a");
     assert!(grep.root().find(&rule).is_some());
-    let grep = TypeScript::Tsx.ast_grep("bbb");
+    let grep = TypeScript::Tsx.grep("bbb");
     assert!(grep.root().find(&rule).is_none());
   }
 
@@ -697,9 +697,9 @@ rule:
       from_str("{rule: {pattern: $A = $B}, constraints: {A: {pattern: $B}} }")
         .expect("should deser");
     let matcher = ser_rule.get_matcher(env).expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("a = a");
+    let grep = TypeScript::Tsx.grep("a = a");
     assert!(grep.root().find(&matcher).is_some());
-    let grep = TypeScript::Tsx.ast_grep("a = b");
+    let grep = TypeScript::Tsx.grep("a = b");
     assert!(grep.root().find(&matcher).is_none());
   }
 
@@ -710,9 +710,9 @@ rule:
       from_str("{rule: {pattern: $A = $B}, constraints: {B: {pattern: $C + $D}} }")
         .expect("should deser");
     let matcher = ser_rule.get_matcher(env).expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("a = a");
+    let grep = TypeScript::Tsx.grep("a = a");
     assert!(grep.root().find(&matcher).is_none());
-    let grep = TypeScript::Tsx.ast_grep("a = 1 + 2");
+    let grep = TypeScript::Tsx.grep("a = 1 + 2");
     let nm = grep.root().find(&matcher).expect("should match");
     let env = nm.get_env();
     let matched = env.get_match("C").expect("should match C").text();
@@ -750,7 +750,7 @@ transform:
     )
     .expect("should deser");
     let matcher = ser_rule.get_matcher(env).expect("should parse");
-    let grep = TypeScript::Tsx.ast_grep("a = 1 + 2");
+    let grep = TypeScript::Tsx.grep("a = 1 + 2");
     let nm = grep.root().find(&matcher).expect("should match");
     let env = nm.get_env();
     let matched = env.get_match("B").expect("should match").text();
@@ -761,7 +761,7 @@ transform:
     assert_eq!(String::from_utf8_lossy(transformed), "yjsnp + yjsnp");
     assert!(env.get_match("REWRITE").is_none());
 
-    let grep = TypeScript::Tsx.ast_grep("a = a");
+    let grep = TypeScript::Tsx.grep("a = a");
     let nm = grep.root().find(&matcher).expect("should match");
     let env = nm.get_env();
     let matched = env.get_match("B").expect("should match").text();

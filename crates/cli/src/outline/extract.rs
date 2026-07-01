@@ -123,7 +123,7 @@ pub fn extract_stdin(
 ) -> Result<OutlineFile<'static>> {
   let lang = arg.lang.expect("required by clap");
   let source = io::read_to_string(io::stdin())?;
-  let grep = lang.ast_grep(source);
+  let grep = lang.grep(source);
   let items = extractors.extract(lang, grep.root());
   Ok(OutlineFile {
     path: "STDIN".to_string(),
@@ -228,7 +228,7 @@ fn extract_path(
       return Err(err).with_context(|| format!("Cannot extract outline from {}", path.display()));
     }
   };
-  let grep = lang.ast_grep(source);
+  let grep = lang.grep(source);
   let items = extractors.extract(lang, grep.root());
   if !extractors.show_empty_files && items.is_empty() {
     return Ok(None);

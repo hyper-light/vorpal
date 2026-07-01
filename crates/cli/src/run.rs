@@ -396,7 +396,7 @@ impl StdInWorker for RunWithSpecificLang {
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
     let lang = self.arg.lang.expect("must present");
-    let grep = lang.ast_grep(src);
+    let grep = lang.grep(src);
     let root = grep.root();
     let mut matches = root.find_all(&self.rule).peekable();
     if matches.peek().is_none() {

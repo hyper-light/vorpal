@@ -1,4 +1,4 @@
-use vorpal_core::{AstGrep, NodeMatch, Pattern, Position, matcher::KindMatcher};
+use vorpal_core::{Vorpal, NodeMatch, Pattern, Position, matcher::KindMatcher};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -397,17 +397,17 @@ impl SgNode {
 
 /// Represents the parsed tree of code.
 #[napi]
-pub struct SgRoot(pub(super) AstGrep<JsDoc>, pub(super) String);
+pub struct SgRoot(pub(super) Vorpal<JsDoc>, pub(super) String);
 
 impl SgRoot {
-  /// Returns a `&'static` reference to the inner `AstGrep`.
+  /// Returns a `&'static` reference to the inner `Vorpal`.
   ///
   /// # Safety
   /// The caller **must** hold a `Reference<SgRoot>` (NAPI ref-count) that
   /// keeps this `SgRoot` alive for at least as long as any value derived
   /// from the returned reference.  In practice every `SgNode` satisfies
   /// this because it stores its own `root_ref: Reference<SgRoot>`.
-  pub(super) unsafe fn as_static(&self) -> &'static AstGrep<JsDoc> {
+  pub(super) unsafe fn as_static(&self) -> &'static Vorpal<JsDoc> {
     unsafe { std::mem::transmute(&self.0) }
   }
 }

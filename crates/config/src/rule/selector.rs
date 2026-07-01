@@ -464,7 +464,7 @@ mod test {
   fn test_parse_selector() -> Result<(), SelectorError> {
     let selector = "call_expression > identifier";
     let rule = parse_selector(selector, TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("test(123)");
+    let root = TS::Tsx.grep("test(123)");
     let ident = root.root().find(&rule).expect("Should find identifier");
     assert_eq!(ident.kind(), "identifier");
     assert_eq!(ident.text(), "test");
@@ -505,12 +505,12 @@ mod test {
   fn test_has_selector() -> Result<(), SelectorError> {
     // function_declaration:has(return_statement) - descendant search
     let rule = parse_selector("function_declaration:has(return_statement)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("function foo() { return 1 }");
+    let root = TS::Tsx.grep("function foo() { return 1 }");
     let found = root.root().find(&rule).expect("should find");
     assert_eq!(found.kind(), "function_declaration");
 
     // Should not match when descendant is absent
-    let root = TS::Tsx.ast_grep("function foo() { let x = 1 }");
+    let root = TS::Tsx.grep("function foo() { let x = 1 }");
     assert!(root.root().find(&rule).is_none());
     Ok(())
   }
@@ -519,7 +519,7 @@ mod test {
   fn test_has_direct_child_selector() -> Result<(), SelectorError> {
     // expression_statement:has(> call_expression) - direct child only
     let rule = parse_selector("expression_statement:has(> call_expression)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("foo()");
+    let root = TS::Tsx.grep("foo()");
     let found = root.root().find(&rule).expect("should find");
     assert_eq!(found.kind(), "expression_statement");
     Ok(())
@@ -529,7 +529,7 @@ mod test {
   fn test_has_with_whitespace() -> Result<(), SelectorError> {
     // whitespace inside :has() should work
     let rule = parse_selector("function_declaration:has( return_statement )", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("function foo() { return 1 }");
+    let root = TS::Tsx.grep("function foo() { return 1 }");
     assert!(root.root().find(&rule).is_some());
     Ok(())
   }
@@ -553,7 +553,7 @@ mod test {
   fn test_not_selector() -> Result<(), SelectorError> {
     // identifier:not(number) - match identifiers that are not numbers
     let rule = parse_selector("identifier:not(number)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("test(123)");
+    let root = TS::Tsx.grep("test(123)");
     let found = root.root().find(&rule).expect("should find");
     assert_eq!(found.kind(), "identifier");
     assert_eq!(found.text(), "test");
@@ -564,7 +564,7 @@ mod test {
   fn test_not_selector_excludes() -> Result<(), SelectorError> {
     // number:not(number) - should match nothing
     let rule = parse_selector("number:not(number)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("test(123)");
+    let root = TS::Tsx.grep("test(123)");
     assert!(root.root().find(&rule).is_none());
     Ok(())
   }
@@ -573,7 +573,7 @@ mod test {
   fn test_is_selector() -> Result<(), SelectorError> {
     // :is(identifier, number) - matches any of the listed kinds
     let rule = parse_selector(":is(identifier, number)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("test(123)");
+    let root = TS::Tsx.grep("test(123)");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 2);
     assert_eq!(matches[0].text(), "test");
@@ -585,7 +585,7 @@ mod test {
   fn test_is_selector_in_combinator() -> Result<(), SelectorError> {
     // call_expression > :is(identifier, number) - composing :is deeper in tree
     let rule = parse_selector("call_expression > :is(identifier, number)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("test(123)");
+    let root = TS::Tsx.grep("test(123)");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].text(), "test");
@@ -596,7 +596,7 @@ mod test {
   fn test_nth_child_selector() -> Result<(), SelectorError> {
     // array > number:nth-child(2n+1) - match odd-positioned numbers in array
     let rule = parse_selector("array > number:nth-child(2n+1)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("[1, 2, 3, 4, 5]");
+    let root = TS::Tsx.grep("[1, 2, 3, 4, 5]");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 3);
     assert_eq!(matches[0].text(), "1");
@@ -608,7 +608,7 @@ mod test {
   #[test]
   fn test_nth_child_selector_with_whitespace() -> Result<(), SelectorError> {
     let rule = parse_selector("array > number:nth-child( 2n + 1 )", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("[1, 2, 3, 4, 5]");
+    let root = TS::Tsx.grep("[1, 2, 3, 4, 5]");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 3);
     Ok(())
@@ -618,7 +618,7 @@ mod test {
   fn test_nth_child_negative_an_plus_b() -> Result<(), SelectorError> {
     // :nth-child(-n + 3) - first 3 children
     let rule = parse_selector("array > number:nth-child(-n + 3)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("[1, 2, 3, 4, 5]");
+    let root = TS::Tsx.grep("[1, 2, 3, 4, 5]");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 3);
     assert_eq!(matches[0].text(), "1");
@@ -631,7 +631,7 @@ mod test {
   fn test_nth_child_of_selector() -> Result<(), SelectorError> {
     // :nth-child(1 of number) - first number child among siblings
     let rule = parse_selector("array > :nth-child(1 of number)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("[a, 1, 2, 3]");
+    let root = TS::Tsx.grep("[a, 1, 2, 3]");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].text(), "1");
@@ -642,7 +642,7 @@ mod test {
   fn test_nth_child_of_complex_selector() -> Result<(), SelectorError> {
     // :nth-child(2n+1 of number) - odd-positioned numbers only
     let rule = parse_selector("array > :nth-child(2n+1 of number)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("[a, 1, 2, 3]");
+    let root = TS::Tsx.grep("[a, 1, 2, 3]");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 2);
     assert_eq!(matches[0].text(), "1");
@@ -653,7 +653,7 @@ mod test {
   #[test]
   fn test_nth_last_child_selector() -> Result<(), SelectorError> {
     let rule = parse_selector("array > number:nth-last-child(1)", TS::Tsx)?;
-    let root = TS::Tsx.ast_grep("[1, 2, 3, 4, 5]");
+    let root = TS::Tsx.grep("[1, 2, 3, 4, 5]");
     let matches: Vec<_> = root.root().find_all(&rule).collect();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].text(), "5");

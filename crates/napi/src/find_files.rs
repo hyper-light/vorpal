@@ -1,6 +1,6 @@
 use vorpal_config::RuleCore;
 use vorpal_core::pinned::{NodeData, PinnedNodeData};
-use vorpal_core::{AstGrep, NodeMatch};
+use vorpal_core::{Vorpal, NodeMatch};
 use ignore::{WalkBuilder, WalkParallel, WalkState};
 use napi::Task;
 use napi::anyhow::{Context, Result as Ret, anyhow};
@@ -26,7 +26,7 @@ impl Task for ParseAsync {
   fn compute(&mut self) -> Result<Self::Output> {
     let src = std::mem::take(&mut self.src);
     let doc = JsDoc::try_new(src, self.lang)?;
-    Ok(SgRoot(AstGrep::doc(doc), "anonymous".into()))
+    Ok(SgRoot(Vorpal::doc(doc), "anonymous".into()))
   }
   fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
     Ok(output)
@@ -130,14 +130,14 @@ fn call_sg_root(
   Ok(true)
 }
 
-fn get_root(entry: ignore::DirEntry, lang_option: &LangOption) -> Ret<(AstGrep<JsDoc>, String)> {
+fn get_root(entry: ignore::DirEntry, lang_option: &LangOption) -> Ret<(Vorpal<JsDoc>, String)> {
   let path = entry.into_path();
   let file_content = std::fs::read_to_string(&path)?;
   let lang = lang_option
     .get_lang(&path)
     .context(anyhow!("file not recognized"))?;
   let doc = JsDoc::try_new(file_content, lang)?;
-  Ok((AstGrep::doc(doc), path.to_string_lossy().into()))
+  Ok((Vorpal::doc(doc), path.to_string_lossy().into()))
 }
 
 pub type FindInFiles = IterateFiles<(ThreadsafeFunction<PinnedNodes, (), Vec<SgNode>>, RuleCore)>;

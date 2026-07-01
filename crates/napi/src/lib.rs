@@ -5,7 +5,7 @@ mod find_files;
 mod napi_lang;
 mod sg_node;
 
-use vorpal_core::{AstGrep, Language};
+use vorpal_core::{Vorpal, Language};
 use vorpal_language::SupportLang;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -68,7 +68,7 @@ impl_lang_mod!(css, Css);
 #[napi]
 pub fn parse(lang: String, src: String) -> Result<SgRoot> {
   let doc = JsDoc::try_new(src, lang.parse()?)?;
-  Ok(SgRoot(AstGrep::doc(doc), "anonymous".into()))
+  Ok(SgRoot(Vorpal::doc(doc), "anonymous".into()))
 }
 
 /// Parse a string to an ast-grep instance asynchronously in threads.

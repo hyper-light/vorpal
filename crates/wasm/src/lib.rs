@@ -10,7 +10,7 @@ use doc::{WasmConfig, WasmDoc};
 use wasm_lang::WasmLang;
 
 use vorpal_core::matcher::PatternNode;
-use vorpal_core::{AstGrep, Language, MatchStrictness, Node as CoreNode, Pattern};
+use vorpal_core::{Vorpal, Language, MatchStrictness, Node as CoreNode, Pattern};
 use std::collections::HashMap;
 use ts_types::TreeSitter;
 use wasm_bindgen::prelude::*;
@@ -46,7 +46,7 @@ pub fn parse(lang: String, src: String) -> Result<SgRoot, JsError> {
     .parse()
     .map_err(|e: wasm_lang::NotSupport| JsError::new(&e.to_string()))?;
   let doc = WasmDoc::try_new(src, lang)?;
-  Ok(SgRoot::new(AstGrep::doc(doc), "anonymous".into()))
+  Ok(SgRoot::new(Vorpal::doc(doc), "anonymous".into()))
 }
 
 /// Get the `kind` number from its string name.
@@ -127,7 +127,7 @@ pub fn dump_pattern(
   // separate WasmDoc so we can look up positions from the actual parsed tree.
   let processed = lang.pre_process_pattern(&pattern_str);
   let doc = WasmDoc::try_new(processed.to_string(), lang)?;
-  let root = AstGrep::doc(doc);
+  let root = Vorpal::doc(doc);
   let mut pat = if let Some(sel) = &selector {
     Pattern::contextual(&pattern_str, sel, lang).map_err(|e| JsError::new(&e.to_string()))?
   } else {

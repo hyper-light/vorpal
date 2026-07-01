@@ -48,7 +48,7 @@ fn test_print_matches() {
   for &(source, pattern, note) in MATCHES_CASES {
     // heading is required for CI
     let mut printer = make_test_printer().heading(Heading::Always);
-    let grep = lang.ast_grep(source);
+    let grep = lang.grep(source);
     let matches = grep.root().find_all(pattern).collect();
     let processor = printer.get_processor();
     let buffer = processor
@@ -73,7 +73,7 @@ fn test_print_matches_without_heading() {
   let lang = SgLang::from(SupportLang::Tsx);
   for &(source, pattern, note) in MATCHES_CASES {
     let mut printer = make_test_printer().heading(Heading::Never);
-    let grep = lang.ast_grep(source);
+    let grep = lang.grep(source);
     let matches = grep.root().find_all(pattern).collect();
     let processor = printer.get_processor();
     let buffer = processor
@@ -100,7 +100,7 @@ fn test_print_rules() {
     let mut printer = make_test_printer()
       .heading(Heading::Never)
       .style(ReportStyle::Short);
-    let grep = lang.ast_grep(source);
+    let grep = lang.grep(source);
     let file = SimpleFile::new(Cow::Borrowed("test.tsx"), source);
     let rule = from_yaml_string(
       &format!(
@@ -169,7 +169,7 @@ fn test_print_diffs() {
     let mut printer = make_test_printer().heading(Heading::Always);
     let lang = SgLang::from(SupportLang::Tsx);
     let fixer = Fixer::from_str(rewrite, &lang).expect("should work");
-    let grep = lang.ast_grep(source);
+    let grep = lang.grep(source);
     let root = grep.root();
     let matches = root.find_all(pattern);
     let diffs = matches
@@ -192,7 +192,7 @@ fn test_overlap_print_impl(heading: Heading) {
   ";
   let mut printer = make_test_printer().heading(heading).context((1, 1));
   let lang = SgLang::from(SupportLang::Tsx);
-  let grep = lang.ast_grep(src);
+  let grep = lang.grep(src);
   let matches = grep.root().find_all("Some($A)").collect();
   let buffer = printer
     .get_processor()
@@ -221,7 +221,7 @@ fn test_non_overlap_print_impl(heading: Heading) {
   ";
   let mut printer = make_test_printer().heading(heading);
   let lang = SgLang::from(SupportLang::Tsx);
-  let grep = lang.ast_grep(src);
+  let grep = lang.grep(src);
   let matches = grep.root().find_all("Some($A)").collect();
   let buffer = printer
     .get_processor()
@@ -244,7 +244,7 @@ fn test_non_overlap_print() {
 fn get_printed_text(mut printer: ColoredPrinter<Buffer>, diff_case: &DiffCase) -> String {
   let (source, pattern, rewrite, _) = diff_case;
   let globals = GlobalRules::default();
-  let grep = SgLang::from(SupportLang::TypeScript).ast_grep(source);
+  let grep = SgLang::from(SupportLang::TypeScript).grep(source);
   let rule = from_yaml_string(
     &format!(
       r"
@@ -316,7 +316,7 @@ fn test_before_after() {
     for a in 0..3 {
       let mut printer = make_test_printer().context((b, a));
       let lang = SgLang::from(SupportLang::Tsx);
-      let grep = lang.ast_grep(src);
+      let grep = lang.grep(src);
       let matches = grep.root().find_all("Some($A)").collect();
       let buffer = printer
         .get_processor()

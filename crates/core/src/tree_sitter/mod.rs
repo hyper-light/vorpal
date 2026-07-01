@@ -3,7 +3,7 @@ pub mod traversal;
 use crate::node::Root;
 use crate::replacer::Replacer;
 use crate::source::{Content, Doc, Edit, SgNode};
-use crate::{AstGrep, Matcher};
+use crate::{Vorpal, Matcher};
 use crate::{Language, Position, node::KindId};
 use std::borrow::Cow;
 use std::num::NonZero;
@@ -263,9 +263,9 @@ pub fn perform_edit<S: ContentExt>(tree: &mut Tree, input: &mut S, edit: &Edit<S
 
 /// tree-sitter specific language trait
 pub trait LanguageExt: Language {
-  /// Create an [`AstGrep`] instance for the language
-  fn ast_grep<S: AsRef<str>>(&self, source: S) -> AstGrep<StrDoc<Self>> {
-    AstGrep::new(source, self.clone())
+  /// Create an [`Vorpal`] instance for the language
+  fn grep<S: AsRef<str>>(&self, source: S) -> Vorpal<StrDoc<Self>> {
+    Vorpal::new(source, self.clone())
   }
 
   /// tree sitter language to parse the source
@@ -301,7 +301,7 @@ fn position_for_offset(input: &[u8], offset: usize) -> Point {
   Point::new(row, col)
 }
 
-impl<L: LanguageExt> AstGrep<StrDoc<L>> {
+impl<L: LanguageExt> Vorpal<StrDoc<L>> {
   pub fn new<S: AsRef<str>>(src: S, lang: L) -> Self {
     Root::str(src.as_ref(), lang)
   }

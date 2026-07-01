@@ -12,7 +12,7 @@
 //!
 //! let lang: SupportLang = "rs".parse().unwrap();
 //! let src = "fn foo() {}";
-//! let root = lang.ast_grep(src);
+//! let root = lang.grep(src);
 //! let found = root.root().find_all("fn $FNAME() {}").next().unwrap();
 //! assert_eq!(found.start_pos().line(), 0);
 //! assert_eq!(found.text(), "fn foo() {}");
@@ -573,7 +573,7 @@ mod test {
   use vorpal_core::{Pattern, matcher::MatcherExt};
 
   pub fn test_match_lang(query: &str, source: &str, lang: impl LanguageExt) {
-    let cand = lang.ast_grep(source);
+    let cand = lang.grep(source);
     let pattern = Pattern::new(query, lang);
     assert!(
       pattern.find_node(cand.root()).is_some(),
@@ -583,7 +583,7 @@ mod test {
   }
 
   pub fn test_non_match_lang(query: &str, source: &str, lang: impl LanguageExt) {
-    let cand = lang.ast_grep(source);
+    let cand = lang.grep(source);
     let pattern = Pattern::new(query, lang);
     assert!(
       pattern.find_node(cand.root()).is_none(),
@@ -598,7 +598,7 @@ mod test {
     replacer: &str,
     lang: impl LanguageExt,
   ) -> String {
-    let mut source = lang.ast_grep(src);
+    let mut source = lang.grep(src);
     assert!(
       source
         .replace(pattern, replacer)

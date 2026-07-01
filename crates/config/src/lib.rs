@@ -84,14 +84,14 @@ mod test {
   fn test_rule_match(yaml: &str, source: &str) {
     let globals = GlobalRules::default();
     let config = &from_yaml_string::<TypeScript>(yaml, &globals).expect("rule should parse")[0];
-    let grep = config.language.ast_grep(source);
+    let grep = config.language.grep(source);
     assert!(grep.root().find(&config.matcher).is_some());
   }
 
   fn test_rule_unmatch(yaml: &str, source: &str) {
     let globals = GlobalRules::default();
     let config = &from_yaml_string::<TypeScript>(yaml, &globals).expect("rule should parse")[0];
-    let grep = config.language.ast_grep(source);
+    let grep = config.language.grep(source);
     assert!(grep.root().find(&config.matcher).is_none());
   }
 

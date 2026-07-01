@@ -317,7 +317,7 @@ mod test {
   use vorpal_core::{Language, tree_sitter::LanguageExt};
 
   fn find_rule<M: Matcher>(src: &str, matcher: M) -> Option<String> {
-    let grep = TS::Tsx.ast_grep(src);
+    let grep = TS::Tsx.grep(src);
     grep.root().find(matcher).map(|s| s.text().to_string())
   }
 
@@ -354,7 +354,7 @@ mod test {
       ))))),
       stop_by: StopBy::End,
     };
-    let grep = TS::Tsx.ast_grep("function f() { bar(); return foo; target; }");
+    let grep = TS::Tsx.grep("function f() { bar(); return foo; target; }");
     let root = grep.root();
     let target = root
       .dfs()

@@ -9,7 +9,7 @@ use tower_lsp_server::{Client, LanguageServer};
 
 use vorpal_config::{CombinedScan, RuleCollection, Severity};
 use vorpal_core::{
-  AstGrep, Doc,
+  Vorpal, Doc,
   tree_sitter::{LanguageExt, StrDoc},
 };
 
@@ -29,7 +29,7 @@ type Notes = BTreeMap<(u32, u32, u32, u32), Arc<String>>;
 
 struct VersionedAst<D: Doc> {
   version: i32,
-  root: AstGrep<D>,
+  root: Vorpal<D>,
   notes: Notes,
   fixes: Fixes,
 }
@@ -276,7 +276,7 @@ impl<L: LSPLang> Backend<L> {
   fn get_diagnostics(
     &self,
     uri: &Uri,
-    root: &AstGrep<StrDoc<L>>,
+    root: &Vorpal<StrDoc<L>>,
   ) -> Option<(Vec<Diagnostic>, Fixes)> {
     let path = self.uri_to_relative_path(uri)?;
 
@@ -431,7 +431,7 @@ impl<L: LSPLang> Backend<L> {
     text: &str,
   ) -> Option<(VersionedAst<StrDoc<L>>, Vec<Diagnostic>)> {
     let lang = Self::infer_lang_from_uri(uri)?;
-    let root = AstGrep::new(text, lang);
+    let root = Vorpal::new(text, lang);
     let mut versioned = VersionedAst {
       version,
       root,

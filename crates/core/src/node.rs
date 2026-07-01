@@ -386,14 +386,14 @@ mod test {
   use crate::tree_sitter::LanguageExt;
   #[test]
   fn test_is_leaf() {
-    let root = Tsx.ast_grep("let a = 123");
+    let root = Tsx.grep("let a = 123");
     let node = root.root();
     assert!(!node.is_leaf());
   }
 
   #[test]
   fn test_children() {
-    let root = Tsx.ast_grep("let a = 123");
+    let root = Tsx.grep("let a = 123");
     let node = root.root();
     let children: Vec<_> = node.children().collect();
     assert_eq!(children.len(), 1);
@@ -405,7 +405,7 @@ mod test {
   }
   #[test]
   fn test_empty() {
-    let root = Tsx.ast_grep("let a = 123");
+    let root = Tsx.grep("let a = 123");
     let node = root.root();
     let edit = node.empty().unwrap();
     assert_eq!(edit.inserted_text.len(), 0);
@@ -415,7 +415,7 @@ mod test {
 
   #[test]
   fn test_field_children() {
-    let root = Tsx.ast_grep("let a = 123");
+    let root = Tsx.grep("let a = 123");
     let node = root.root().find("let a = $A").unwrap();
     let children: Vec<_> = node.field_children("kind").collect();
     assert_eq!(children.len(), 1);
@@ -440,7 +440,7 @@ if (a) {
     ];
     // display context should not panic
     for [src, matcher, lead, trail] in cases {
-      let root = Tsx.ast_grep(src);
+      let root = Tsx.grep(src);
       let node = root.root().find(matcher).expect("should match");
       let display = node.display_context(0, 0);
       assert_eq!(display.leading, lead);
@@ -456,7 +456,7 @@ if (a) {
     ];
     // display context should not panic
     for [src, matcher, lead, trail] in cases {
-      let root = Tsx.ast_grep(src);
+      let root = Tsx.grep(src);
       let node = root.root().find(matcher).expect("should match");
       let display = node.display_context(1, 1);
       assert_eq!(display.leading, lead);
@@ -466,7 +466,7 @@ if (a) {
 
   #[test]
   fn test_replace_all_nested() {
-    let root = Tsx.ast_grep("Some(Some(1))");
+    let root = Tsx.grep("Some(Some(1))");
     let node = root.root();
     let edits = node.replace_all("Some($A)", "$A");
     assert_eq!(edits.len(), 1);
@@ -475,7 +475,7 @@ if (a) {
 
   #[test]
   fn test_replace_all_multiple_sorted() {
-    let root = Tsx.ast_grep("Some(Some(1)); Some(2)");
+    let root = Tsx.grep("Some(Some(1)); Some(2)");
     let node = root.root();
     let edits = node.replace_all("Some($A)", "$A");
     // edits must be sorted by position
@@ -486,28 +486,28 @@ if (a) {
 
   #[test]
   fn test_inside() {
-    let root = Tsx.ast_grep("Some(Some(1)); Some(2)");
+    let root = Tsx.grep("Some(Some(1)); Some(2)");
     let root = root.root();
     let node = root.find("Some(1)").expect("should exist");
     assert!(node.inside("Some($A)"));
   }
   #[test]
   fn test_has() {
-    let root = Tsx.ast_grep("Some(Some(1)); Some(2)");
+    let root = Tsx.grep("Some(Some(1)); Some(2)");
     let root = root.root();
     let node = root.find("Some($A)").expect("should exist");
     assert!(node.has("Some(1)"));
   }
   #[test]
   fn precedes() {
-    let root = Tsx.ast_grep("Some(Some(1)); Some(2);");
+    let root = Tsx.grep("Some(Some(1)); Some(2);");
     let root = root.root();
     let node = root.find("Some($A);").expect("should exist");
     assert!(node.precedes("Some(2);"));
   }
   #[test]
   fn follows() {
-    let root = Tsx.ast_grep("Some(Some(1)); Some(2);");
+    let root = Tsx.grep("Some(Some(1)); Some(2);");
     let root = root.root();
     let node = root.find("Some(2);").expect("should exist");
     assert!(node.follows("Some(Some(1));"));
@@ -515,7 +515,7 @@ if (a) {
 
   #[test]
   fn test_field() {
-    let root = Tsx.ast_grep("class A{}");
+    let root = Tsx.grep("class A{}");
     let root = root.root();
     let node = root.find("class $C {}").expect("should exist");
     assert!(node.field("name").is_some());
@@ -523,7 +523,7 @@ if (a) {
   }
   #[test]
   fn test_child_by_field_id() {
-    let root = Tsx.ast_grep("class A{}");
+    let root = Tsx.grep("class A{}");
     let root = root.root();
     let node = root.find("class $C {}").expect("should exist");
     let id = Tsx.field_to_id("name").unwrap();
@@ -533,7 +533,7 @@ if (a) {
 
   #[test]
   fn test_remove() {
-    let root = Tsx.ast_grep("Some(Some(1)); Some(2);");
+    let root = Tsx.grep("Some(Some(1)); Some(2);");
     let root = root.root();
     let node = root.find("Some(2);").expect("should exist");
     let edit = node.remove();
@@ -543,7 +543,7 @@ if (a) {
 
   #[test]
   fn test_ascii_pos() {
-    let root = Tsx.ast_grep("a");
+    let root = Tsx.grep("a");
     let root = root.root();
     let node = root.find("$A").expect("should exist");
     assert_eq!(node.start_pos().line(), 0);
@@ -554,14 +554,14 @@ if (a) {
 
   #[test]
   fn test_unicode_pos() {
-    let root = Tsx.ast_grep("🦀");
+    let root = Tsx.grep("🦀");
     let root = root.root();
     let node = root.find("$A").expect("should exist");
     assert_eq!(node.start_pos().line(), 0);
     assert_eq!(node.start_pos().column(&*node), 0);
     assert_eq!(node.end_pos().line(), 0);
     assert_eq!(node.end_pos().column(&*node), 1);
-    let root = Tsx.ast_grep("\n  🦀🦀");
+    let root = Tsx.grep("\n  🦀🦀");
     let root = root.root();
     let node = root.find("$A").expect("should exist");
     assert_eq!(node.start_pos().line(), 1);

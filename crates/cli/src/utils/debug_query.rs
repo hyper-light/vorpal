@@ -45,7 +45,7 @@ impl DebugFormat {
   }
 
   pub fn debug_tree(&self, src: &str, lang: SgLang, colored: bool) {
-    let root = lang.ast_grep(src);
+    let root = lang.grep(src);
     match self {
       DebugFormat::Pattern => {
         debug_assert!(false, "debug_tree cannot be called with Pattern")
@@ -245,7 +245,7 @@ program (0,0)-(0,11)
   #[test]
   fn test_dump_node() {
     let lang = SgLang::Builtin(TypeScript.into());
-    let root = lang.ast_grep("var a = 123");
+    let root = lang.grep("var a = 123");
     let dumped = dump_node(root.root().get_inner_node());
     assert_eq!(DUMPED.trim(), dumped.ast(false).trim());
   }
@@ -262,7 +262,7 @@ translation_unit (0,0)-(0,9)
   #[test]
   fn test_missing_node() {
     let lang = SgLang::Builtin(C.into());
-    let root = lang.ast_grep("int a = 1");
+    let root = lang.grep("int a = 1");
     let dumped = dump_node(root.root().get_inner_node());
     assert_eq!(MISSING.trim(), dumped.cst(false).trim());
   }

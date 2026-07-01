@@ -349,7 +349,7 @@ fix: $D
     reg: RuleRegistration,
   ) -> Option<String> {
     use vorpal_core::tree_sitter::LanguageExt;
-    let grep = TypeScript::Tsx.ast_grep(src);
+    let grep = TypeScript::Tsx.grep(src);
     let root = grep.root();
     let mut nm = root.find(pat).expect("should find");
     let before_vars: Vec<_> = nm.get_env().get_matched_variables().collect();

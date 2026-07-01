@@ -131,7 +131,7 @@ mod test {
   }
 
   fn extract(src: &str) -> Vec<(String, Vec<TSRange>)> {
-    let root = Html.ast_grep(src);
+    let root = Html.grep(src);
     Html.extract_injections(root.root())
   }
 

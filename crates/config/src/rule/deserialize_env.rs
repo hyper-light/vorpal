@@ -314,7 +314,7 @@ member-name:
   #[test]
   fn test_local_util_matches() -> Result<()> {
     let (rule, _env) = get_dependent_utils()?;
-    let grep = TypeScript::Tsx.ast_grep("whatever");
+    let grep = TypeScript::Tsx.grep("whatever");
     assert!(grep.root().find(rule).is_some());
     Ok(())
   }

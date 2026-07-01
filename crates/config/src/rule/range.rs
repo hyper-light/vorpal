@@ -121,7 +121,7 @@ mod test {
 
   #[test]
   fn test_range_match() {
-    let cand = TS::Tsx.ast_grep("class A { a = 123 }");
+    let cand = TS::Tsx.grep("class A { a = 123 }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {
@@ -138,7 +138,7 @@ mod test {
 
   #[test]
   fn test_range_non_match() {
-    let cand = TS::Tsx.ast_grep("class A { a = 123 }");
+    let cand = TS::Tsx.grep("class A { a = 123 }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {
@@ -156,7 +156,7 @@ mod test {
   #[test]
   fn test_multiline_range() {
     let cand = TS::Tsx
-      .ast_grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
+      .grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {
@@ -173,7 +173,7 @@ mod test {
 
   #[test]
   fn test_unicode_range() {
-    let cand = TS::Tsx.ast_grep("let a = '🦄'");
+    let cand = TS::Tsx.grep("let a = '🦄'");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {
@@ -192,7 +192,7 @@ mod test {
 
   #[test]
   fn test_range_with_none_start_column() {
-    let cand = TS::Tsx.ast_grep("class A { a = 123 }");
+    let cand = TS::Tsx.grep("class A { a = 123 }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {
@@ -210,7 +210,7 @@ mod test {
 
   #[test]
   fn test_range_with_none_end_column() {
-    let cand = TS::Tsx.ast_grep("class A { a = 123 }");
+    let cand = TS::Tsx.grep("class A { a = 123 }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {
@@ -242,7 +242,7 @@ mod test {
   #[test]
   fn test_range_with_none_columns_multiline() {
     let cand = TS::Tsx
-      .ast_grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
+      .grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {

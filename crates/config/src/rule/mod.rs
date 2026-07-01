@@ -672,7 +672,7 @@ kind: class_declaration
     let rule: SerializableRule = from_str(src).expect("cannot parse rule");
     let env = DeserializeEnv::new(TypeScript::Tsx);
     let rule = deserialize_rule(rule, &env).expect("should deserialize");
-    let root = TypeScript::Tsx.ast_grep("class A {}");
+    let root = TypeScript::Tsx.grep("class A {}");
     assert!(root.root().find(rule).is_some());
   }
 
@@ -712,7 +712,7 @@ inside:
     let rule: SerializableRule = from_str(src).expect("cannot parse rule");
     let env = DeserializeEnv::new(TypeScript::Tsx);
     let rule = deserialize_rule(rule, &env).expect("should deserialize");
-    let root = TypeScript::Tsx.ast_grep(
+    let root = TypeScript::Tsx.grep(
       "if (a) {
       this.a = b;
       this.d = promise()
@@ -731,7 +731,7 @@ inside:
     let rule: SerializableRule = from_str(src).expect("cannot parse rule");
     let env = DeserializeEnv::new(TypeScript::Tsx);
     let rule = deserialize_rule(rule, &env).expect("should deserialize");
-    let root = TypeScript::Tsx.ast_grep(
+    let root = TypeScript::Tsx.grep(
       "{
         let x = 1;
         const z = 9;

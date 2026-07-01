@@ -167,7 +167,7 @@ if (true) {
     let mut trans = HashMap::new();
     let tr = from_str("{ substring: { source: $A } }").expect("should work");
     trans.insert("TR".into(), tr);
-    let grep = TypeScript::Tsx.ast_grep(src);
+    let grep = TypeScript::Tsx.grep(src);
     let root = grep.root();
     let mut nm = root.find("let a = $A").expect("should find");
     let env = DeserializeEnv::new(TypeScript::Tsx);

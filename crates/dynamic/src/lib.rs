@@ -321,7 +321,7 @@ mod test {
     }
     let (_lib, lang) = unsafe { load_ts_language(path.into(), "tree_sitter_json".into()).unwrap() };
     let lang = TSLangWrapper(lang);
-    let sg = lang.ast_grep("{\"a\": 123}");
+    let sg = lang.grep("{\"a\": 123}");
     assert_eq!(
       sg.root().get_inner_node().to_sexp(),
       "(document (object (pair key: (string (string_content)) value: (number))))"
@@ -350,7 +350,7 @@ mod test {
     let file_types = lang.file_types();
     assert!(file_types.matched("test.json", false).is_whitelist());
     assert_eq!(lang.name(), "json");
-    let sg = lang.ast_grep("{\"test\": 123}");
+    let sg = lang.grep("{\"test\": 123}");
     assert!(sg.root().find("123").is_some());
     let parsed = DynamicLang::from_str("json").expect("ok");
     assert_eq!(parsed.index, lang.index);

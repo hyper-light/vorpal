@@ -216,7 +216,7 @@ mod test {
   type R = std::result::Result<(), ()>;
 
   fn get_transformed(src: &str, pat: &str, trans: &Trans<String>) -> Option<String> {
-    let grep = TypeScript::Tsx.ast_grep(src);
+    let grep = TypeScript::Tsx.grep(src);
     let root = grep.root();
     let mut nm = root.find(pat).expect("should find");
     let mut ctx = Ctx {
@@ -310,7 +310,7 @@ mod test {
   }
 
   fn transform_env(trans: HashMap<String, Trans<String>>) -> HashMap<String, String> {
-    let grep = TypeScript::Tsx.ast_grep("let a = 123");
+    let grep = TypeScript::Tsx.grep("let a = 123");
     let root = grep.root();
     let trans = trans
       .into_iter()

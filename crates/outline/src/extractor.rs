@@ -653,7 +653,7 @@ isExported:
     };
     let item = ItemExtractor::try_from(item, &Default::default(), OutlineEntryDetail::Signature)
       .expect("item rule should parse");
-    let root = SupportLang::TypeScript.ast_grep("class Foo { bar() {} }");
+    let root = SupportLang::TypeScript.grep("class Foo { bar() {} }");
     let class_node = root
       .root()
       .children()

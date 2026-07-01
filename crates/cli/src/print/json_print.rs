@@ -526,7 +526,7 @@ mod test {
     for &(source, pattern, _, note) in MATCHES_CASES {
       // heading is required for CI
       let mut printer = make_test_printer(JsonStyle::Pretty);
-      let grep = SgLang::from(SupportLang::Tsx).ast_grep(source);
+      let grep = SgLang::from(SupportLang::Tsx).grep(source);
       let matches = grep.root().find_all(pattern).collect();
       printer.before_print().unwrap();
       let buffer = printer
@@ -547,7 +547,7 @@ mod test {
       // heading is required for CI
       let mut printer = make_test_printer(JsonStyle::Compact);
       let lang = SgLang::from(SupportLang::Tsx);
-      let grep = lang.ast_grep(source);
+      let grep = lang.grep(source);
       let root = grep.root();
       let matches = root.find_all(pattern);
       let fixer = Fixer::from_str(replace, &lang).expect("should work");
@@ -596,7 +596,7 @@ rule:
         continue;
       }
       let mut printer = make_test_printer(JsonStyle::Pretty);
-      let grep = SgLang::from(SupportLang::Tsx).ast_grep(source);
+      let grep = SgLang::from(SupportLang::Tsx).grep(source);
       let rule = make_rule(pattern);
       let matches = grep.root().find_all(&rule.matcher).collect();
       printer.before_print().unwrap();
@@ -618,7 +618,7 @@ rule:
   fn test_single_matched_json() {
     let mut printer = make_test_printer(JsonStyle::Pretty);
     let lang = SgLang::from(SupportLang::Tsx);
-    let grep = lang.ast_grep("console.log(123)");
+    let grep = lang.grep("console.log(123)");
     let matches = grep.root().find_all("console.log($A)").collect();
     printer.before_print().unwrap();
     let buffer = printer
@@ -641,7 +641,7 @@ rule:
   fn test_multi_matched_json() {
     let mut printer = make_test_printer(JsonStyle::Compact);
     let lang = SgLang::from(SupportLang::Tsx);
-    let grep = lang.ast_grep("console.log(1, 2, 3)");
+    let grep = lang.grep("console.log(1, 2, 3)");
     let matches = grep.root().find_all("console.log($$$A)").collect();
     printer.before_print().unwrap();
     let buffer = printer
@@ -662,7 +662,7 @@ rule:
   fn test_streaming() {
     for &(source, pattern, _, note) in MATCHES_CASES {
       let mut printer = make_test_printer(JsonStyle::Stream);
-      let grep = SgLang::from(SupportLang::Tsx).ast_grep(source);
+      let grep = SgLang::from(SupportLang::Tsx).grep(source);
       let matches = grep.root().find_all(pattern).collect();
       printer.before_print().unwrap();
       let buffer = printer
@@ -695,7 +695,7 @@ transform:
   fn test_transform() {
     let mut printer = make_test_printer(JsonStyle::Compact);
     let rule = get_rule_config(&format!("pattern: console.log($A)\n{TRANSFORM_TEXT}"));
-    let grep = SgLang::from(SupportLang::TypeScript).ast_grep("console.log(123)");
+    let grep = SgLang::from(SupportLang::TypeScript).grep("console.log(123)");
     let matches = grep.root().find_all(&rule.matcher).collect();
     printer.before_print().unwrap();
     let buffer = printer
@@ -721,7 +721,7 @@ labels:
   fn test_label() {
     let mut printer = make_test_printer(JsonStyle::Compact);
     let rule = get_rule_config(&format!("pattern: console.log($A)\n{LABEL_TEXT}"));
-    let grep = SgLang::from(SupportLang::TypeScript).ast_grep("console.log(123)");
+    let grep = SgLang::from(SupportLang::TypeScript).grep("console.log(123)");
     let matches = grep.root().find_all(&rule.matcher).collect();
     printer.before_print().unwrap();
     let file = SimpleFile::new(Cow::Borrowed("test.ts"), "console.log(123)");
@@ -748,7 +748,7 @@ metadata:
     for included in [true, false] {
       let mut printer = make_test_printer(JsonStyle::Compact).include_metadata(included);
       let rule = get_rule_config(&format!("pattern: console.log($A)\n{META_TEXT}"));
-      let grep = SgLang::from(SupportLang::TypeScript).ast_grep("console.log(123)");
+      let grep = SgLang::from(SupportLang::TypeScript).grep("console.log(123)");
       let matches = grep.root().find_all(&rule.matcher).collect();
       printer.before_print().unwrap();
       let file = SimpleFile::new(Cow::Borrowed("test.ts"), "console.log(123)");

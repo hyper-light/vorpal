@@ -334,7 +334,7 @@ mod test {
     let mut matchers = HashMap::new();
     matchers.insert("A".to_string(), Pattern::new(pattern, Tsx));
     let mut env = MetaVarEnv::new();
-    let root = Tsx.ast_grep(node);
+    let root = Tsx.grep(node);
     let node = root.root().child(0).unwrap().child(0).unwrap();
     env.insert("A", node);
     env.match_constraints(&matchers)
@@ -365,11 +365,11 @@ mod test {
 
   #[test]
   fn test_multi_var_match() {
-    let grep = Tsx.ast_grep("if (true) { a += 1; b += 1 } else { a += 1; b += 1 }");
+    let grep = Tsx.grep("if (true) { a += 1; b += 1 } else { a += 1; b += 1 }");
     let node = grep.root();
     let found = node.find("if (true) { $$$A } else { $$$A }");
     assert!(found.is_some());
-    let grep = Tsx.ast_grep("if (true) { a += 1 } else { b += 1 }");
+    let grep = Tsx.grep("if (true) { a += 1 } else { b += 1 }");
     let node = grep.root();
     let not_found = node.find("if (true) { $$$A } else { $$$A }");
     assert!(not_found.is_none());
@@ -377,11 +377,11 @@ mod test {
 
   #[test]
   fn test_multi_var_match_with_trailing() {
-    let grep = Tsx.ast_grep("if (true) { a += 1; } else { a += 1; b += 1 }");
+    let grep = Tsx.grep("if (true) { a += 1; } else { a += 1; b += 1 }");
     let node = grep.root();
     let not_found = node.find("if (true) { $$$A } else { $$$A }");
     assert!(not_found.is_none());
-    let grep = Tsx.ast_grep("if (true) { a += 1; b += 1; } else { a += 1 }");
+    let grep = Tsx.grep("if (true) { a += 1; b += 1; } else { a += 1 }");
     let node = grep.root();
     let not_found = node.find("if (true) { $$$A } else { $$$A }");
     assert!(not_found.is_none());

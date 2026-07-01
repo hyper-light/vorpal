@@ -330,7 +330,7 @@ mod test {
       reverse,
     };
     let mut env = Cow::Owned(MetaVarEnv::new());
-    let grep = TS::Tsx.ast_grep("[1,2,3,4]");
+    let grep = TS::Tsx.grep("[1,2,3,4]");
     let node = grep.root().find("2").unwrap();
     rule.find_index(&*node, &mut env)
   }
@@ -435,7 +435,7 @@ mod test {
 
   #[test]
   fn test_serialize() {
-    let root = TS::Tsx.ast_grep("[1,2,3,4]");
+    let root = TS::Tsx.grep("[1,2,3,4]");
     let root = root.root();
     let rule = deser(r"nthChild: 3");
     assert_eq!(root.find(rule).expect("should find").text(), "3");

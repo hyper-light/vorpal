@@ -299,7 +299,7 @@ mod test {
       title: None,
     };
     let fixer = parse(config)?;
-    let grep = TypeScript::Tsx.ast_grep("let a = 123");
+    let grep = TypeScript::Tsx.grep("let a = 123");
     let node = grep.root().find("let $A = 123").expect("should found");
     let edit = fixer.generate_replacement(&node);
     assert_eq!(String::from_utf8_lossy(&edit), "var a = 456");
@@ -317,7 +317,7 @@ mod test {
       title: None,
     };
     let fixer = parse(config)?;
-    let grep = TypeScript::Tsx.ast_grep("var a = { b: 123, }");
+    let grep = TypeScript::Tsx.grep("var a = { b: 123, }");
     let matcher = KindMatcher::new("pair", TypeScript::Tsx);
     let node = grep.root().find(&matcher).expect("should found");
     let edit = node.make_edit(&matcher, &fixer);
