@@ -1,0 +1,37 @@
+[package]
+name = "vorpal-napi"
+description = "Search and Rewrite code at large scale using precise AST pattern"
+keywords = ["ast", "pattern", "codemod", "search", "rewrite"]
+
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+# do not publish this crate since it is only used for napi
+publish = false
+
+[dependencies]
+vorpal-core.workspace = true
+vorpal-config.workspace = true
+vorpal-language = { path = "../language", features = ["napi-lang"], default-features = false }
+vorpal-dynamic.workspace = true
+
+napi = { version = "3.7.0", features = ["serde-json", "napi4", "error_anyhow"] }
+napi-derive = "3.4.0"
+
+ignore.workspace = true
+tree-sitter.workspace = true
+serde_json = "1.0.116"
+
+[features]
+# this feature is only for cargo test to avoid napi_ symbol undefined error
+# see also napi-rs/napi-rs#1005, napi-rs/napi-rs#1099 and napi-rs/napi-rs#1032
+napi-noop-in-unit-test = ["napi-derive/noop"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+napi-build = "2.2.2"

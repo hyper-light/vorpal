@@ -1,0 +1,17 @@
+[package]
+publish = false
+name = "xtask"
+version = "0.0.0"
+
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+vorpal-core.workspace = true
+vorpal-config.workspace = true
+vorpal-language.workspace = true
+
+anyhow.workspace = true
+serde_json = { version = "1.0.116", features = ["preserve_order"] }
+toml_edit = "0.25.0"
+schemars.workspace = true

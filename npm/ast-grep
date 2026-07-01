@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+
+// Fallback shim. On Unix, `postinstall` replaces this file with the native
+// binary. On Windows, npm-generated global wrappers call this JS bin target
+// through node, so it must stay in place and spawn the `.exe`.
+
+const { spawn } = require("node:child_process");
+const { resolveBinaryPath } = require("./postinstall");
+
+if (process.platform !== "win32") {
+  console.error(
+    "[warn] postinstall script did not run; falling back to runtime binary resolution.",
+  );
+  console.error("Enable postinstall to avoid the per-invocation overhead.");
+}
+
+const binaryPath = resolveBinaryPath();
+if (!binaryPath) {
+  console.error(
+    "[ast-grep] Failed to locate the native binary. " +
+      "Ensure optional dependencies are installed (do not pass --no-optional).",
+  );
+  process.exit(1);
+}
+
+const child = spawn(binaryPath, process.argv.slice(2), { stdio: "inherit" });
+
+child.on("error", (error) => {
+  console.error("[ast-grep] Failed to execute native binary:", error);
+  process.exit(1);
+});
+
+const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+const handlers = signals.map((signal) => {
+  const handler = () => {
+    if (!child.killed) {
+      try { child.kill(signal); } catch (_) {}
+    }
+  };
+  process.on(signal, handler);
+  return [signal, handler];
+});
+
+child.on("exit", (code, signal) => {
+  for (const [s, h] of handlers) process.removeListener(s, h);
+  if (signal) process.kill(process.pid, signal);
+  else process.exit(code == null ? 1 : code);
+});

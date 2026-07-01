@@ -1,0 +1,26 @@
+[package]
+name = "vorpal-core"
+description = "Search and Rewrite code at large scale using precise AST pattern"
+keywords = ["ast", "pattern", "codemod", "search", "rewrite"]
+categories = ["command-line-utilities", "development-tools", "parsing"]
+
+authors.workspace = true
+documentation.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bit-set.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tree-sitter = { workspace = true, optional = true }
+
+[features]
+default = ["tree-sitter"]
+
+[dev-dependencies]
+tree-sitter-typescript = "0.23.2"

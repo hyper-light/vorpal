@@ -1,0 +1,373 @@
+mod completions;
+mod config;
+mod lang;
+mod lsp;
+mod new;
+mod outline;
+mod print;
+mod run;
+mod scan;
+mod utils;
+mod verify;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::{path::PathBuf, process::ExitCode};
+
+use completions::{CompletionsArg, run_shell_completion};
+use config::ProjectConfig;
+use lsp::{LspArg, run_language_server};
+use new::{NewArg, run_create_new};
+use outline::{OutlineArg, run_outline};
+use run::{RunArg, run_with_pattern};
+use scan::{ScanArg, run_with_config};
+use utils::exit_with_error;
+use verify::{TestArg, run_test_rule};
+
+const LOGO: &str = r#"
+Search and Rewrite code at large scale using AST pattern.
+                    __
+        ____ ______/ /_      ____ _________  ____
+       / __ `/ ___/ __/_____/ __ `/ ___/ _ \/ __ \
+      / /_/ (__  ) /_/_____/ /_/ / /  /  __/ /_/ /
+      \__,_/____/\__/      \__, /_/   \___/ .___/
+                          /____/         /_/
+"#;
+#[derive(Parser)]
+#[clap(author, version, about, long_about = LOGO)]
+/**
+ * TODO: add some description for ast-grep: sg
+ * Example:
+ * sg -p "$PATTERN.to($MATCH)" -l ts --rewrite "use($MATCH)"
+ */
+struct App {
+  #[clap(subcommand)]
+  command: Commands,
+  /// Path to ast-grep root config, default is sgconfig.yml.
+  #[clap(short, long, global = true, value_name = "CONFIG_FILE")]
+  config: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+  /// Run one time search or rewrite in command line. (default command)
+  Run(RunArg),
+  /// Scan and rewrite code by configuration.
+  Scan(ScanArg),
+  /// Test ast-grep rules.
+  Test(TestArg),
+  /// Create new ast-grep project or items like rules/tests.
+  New(NewArg),
+  /// Start language server.
+  Lsp(LspArg),
+  /// Explore code structure for symbols, imports, exports, and members.
+  Outline(OutlineArg),
+  /// Generate shell completion script.
+  Completions(CompletionsArg),
+  /// Generate rule docs for current configuration. (Not Implemented Yet)
+  #[cfg(debug_assertions)]
+  Docs,
+}
+
+pub fn execute_main() -> Result<ExitCode> {
+  match main_with_args(std::env::args()) {
+    Err(error) => exit_with_error(error),
+    ok => ok,
+  }
+}
+
+fn is_command(arg: &str, command: &str) -> bool {
+  let arg = arg.split('=').next().unwrap_or(arg);
+  if arg.starts_with("--") {
+    let arg = arg.trim_start_matches("--");
+    arg == command
+  } else if arg.starts_with('-') {
+    let arg = arg.trim_start_matches('-');
+    arg == &command[..1]
+  } else {
+    false
+  }
+}
+
+fn try_default_run(args: &[String]) -> Result<Option<RunArg>> {
+  // use `run` if there is at least one pattern arg with no user provided command
+  let is_pattern = args.iter().skip(1).any(|p| is_command(p, "pattern"));
+  let is_kind = args.iter().skip(1).any(|p| is_command(p, "kind"));
+  let should_use_default_run_command = (is_pattern || is_kind) && args[1].starts_with('-');
+  if should_use_default_run_command {
+    // handle no subcommand
+    let arg = RunArg::try_parse_from(args)?;
+    Ok(Some(arg))
+  } else {
+    Ok(None)
+  }
+}
+
+/// finding project and setup custom language configuration
+fn setup_project_is_possible(args: &[String]) -> Result<Result<ProjectConfig>> {
+  let mut config = None;
+  for i in 0..args.len() {
+    let arg = &args[i];
+    if !is_command(arg, "config") {
+      continue;
+    }
+    // handle --config=config.yml, see ast-grep/ast-grep#1617
+    if arg.contains('=') {
+      let config_file = arg.split('=').nth(1).unwrap().into();
+      config = Some(config_file);
+      break;
+    }
+    // handle -c config.yml, arg value should be next
+    if i + 1 >= args.len() || args[i + 1].starts_with('-') {
+      return Err(anyhow::anyhow!("missing config file after -c"));
+    }
+    let config_file = (&args[i + 1]).into();
+    config = Some(config_file);
+  }
+  ProjectConfig::setup(config)
+}
+
+// this wrapper function is for testing
+pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
+  let args: Vec<_> = args.collect();
+  // do not unwrap project before cmd parsing
+  // sg help does not need a valid sgconfig.yml
+  let project = setup_project_is_possible(&args);
+  if let Some(arg) = try_default_run(&args)? {
+    return run_with_pattern(arg, project?);
+  }
+  let app = App::try_parse_from(args)?;
+  let project = project?; // unwrap here to report invalid project
+  match app.command {
+    Commands::Run(arg) => run_with_pattern(arg, project),
+    Commands::Scan(arg) => run_with_config(arg, project),
+    Commands::Test(arg) => run_test_rule(arg, project),
+    Commands::New(arg) => run_create_new(arg, project),
+    Commands::Lsp(arg) => run_language_server(arg, project).map(|_| ExitCode::SUCCESS),
+    Commands::Outline(arg) => run_outline(arg, project),
+    Commands::Completions(arg) => run_shell_completion::<App>(arg),
+    #[cfg(debug_assertions)]
+    Commands::Docs => todo!("todo, generate rule docs based on current config"),
+  }
+}
+
+#[cfg(test)]
+mod test_cli {
+  use super::*;
+
+  fn sg(args: &str) -> Result<App> {
+    let app = App::try_parse_from(
+      std::iter::once("sg".into()).chain(args.split(' ').map(|s| s.to_string())),
+    )?;
+    Ok(app)
+  }
+
+  fn ok(args: &str) -> App {
+    sg(args).expect("should parse")
+  }
+  fn error(args: &str) -> clap::Error {
+    let Err(err) = sg(args) else {
+      panic!("app parsing should fail!")
+    };
+    err
+      .downcast::<clap::Error>()
+      .expect("should have clap::Error")
+  }
+
+  #[test]
+  fn test_wrong_usage() {
+    error("");
+    error("Some($A) -l rs");
+    error("-l rs");
+  }
+
+  #[test]
+  fn test_version_and_help() {
+    let version = error("--version");
+    assert!(version.to_string().starts_with("vorpal"));
+    let version = error("-V");
+    assert!(version.to_string().starts_with("vorpal"));
+    let help = error("--help");
+    assert!(help.to_string().contains("Search and Rewrite code"));
+  }
+
+  fn default_run(args: &str) {
+    let args: Vec<_> = std::iter::once("sg".into())
+      .chain(args.split(' ').map(|s| s.to_string()))
+      .collect();
+    assert!(matches!(try_default_run(&args), Ok(Some(_))));
+  }
+  #[test]
+  fn test_no_arg_run() {
+    let ret = main_with_args(["sg".to_owned()].into_iter());
+    let err = ret.unwrap_err();
+    assert!(err.to_string().contains("sg [OPTIONS] <COMMAND>"));
+  }
+  #[test]
+  fn test_default_subcommand() {
+    default_run("-p Some($A) -l rs");
+    default_run("-p Some($A)");
+    default_run("-p Some($A) -l rs -r $A.unwrap()");
+    default_run("-k identifier -l rs");
+  }
+
+  #[test]
+  fn test_run() {
+    ok("run -p test -i");
+    ok("run -p test --interactive dir");
+    ok("run -p test -r Test dir");
+    ok("run -p test -l rs --debug-query");
+    ok("run -p test -l rs --debug-query not");
+    ok("run -p test -l rs --debug-query=ast");
+    ok("run -p test -l rs --debug-query=cst");
+    ok("run -p test -l rs --color always");
+    ok("run -p test -l rs --heading always");
+    ok("run -p test dir1 dir2 dir3"); // multiple paths
+    ok("run -p testm -r restm -U"); // update all
+    ok("run -p testm -r restm --update-all"); // update all
+    ok("run -p test --json compact"); // argument after --json should not be parsed as JsonStyle
+    ok("run -p test --json=pretty dir");
+    ok("run -p test --json dir"); // arg after --json should not be parsed as JsonStyle
+    ok("run -p test --strictness ast");
+    ok("run -p test --strictness relaxed");
+    ok("run -p test --selector identifier"); // pattern + selector
+    ok("run -p test --selector identifier -l js");
+    ok("run -k identifier");
+    ok("run --kind=call_expression>identifier -l js");
+    ok("run -p test --follow");
+    ok("run -p test --globs '*.js'");
+    ok("run -p test --globs '*.{js, ts}'");
+    ok("run -p test --globs '*.js' --globs '*.ts'");
+    ok("run -p fubuki -j8");
+    ok("run -p test --threads 12");
+    ok("run -p test --files-with-matches");
+    ok("run -p test -l rs -c config.yml"); // global config arg
+    ok("run -k gibberish"); // allow non-existing kind if no lang specified
+    error("run test");
+    error("run --debug-query test"); // missing lang
+    error("run -r Test dir");
+    error("run -p test -i --json dir"); // conflict
+    error("run -p test -U");
+    error("run -p test --update-all");
+    error("run -p test --strictness not");
+    error("run -p test -l rs --debug-query=not");
+    error("run -p test --selector");
+    error("run -p test -k identifier");
+    error("run -k identifier --selector identifier");
+    error("run -k identifier --strictness ast");
+    error("run -p test --threads");
+    error("run -p test --files-with-matches -r test -U");
+    error("run -p test --files-with-matches --json");
+  }
+
+  #[test]
+  fn test_scan() {
+    ok("scan");
+    ok("scan dir");
+    ok("scan -r test-rule.yml dir");
+    ok("scan -c test-rule.yml dir");
+    ok("scan -c test-rule.yml");
+    ok("scan --report-style short"); // conflict
+    ok("scan dir1 dir2 dir3"); // multiple paths
+    ok("scan -r test.yml --format github");
+    ok("scan --format github");
+    ok("scan --interactive");
+    ok("scan --follow");
+    ok("scan --json --include-metadata");
+    ok("scan -r test.yml -c test.yml --json dir"); // allow registering custom lang
+    ok("scan --globs '*.js'");
+    ok("scan --globs '*.{js, ts}'");
+    ok("scan --globs '*.js' --globs '*.ts'");
+    ok("scan -j 12");
+    ok("scan --threads 12");
+    ok("scan -A 12");
+    ok("scan --after 12");
+    ok("scan --context 1");
+    ok("scan --max-results=10");
+    ok("scan --max-results 5");
+    error("scan --max-results=10 --interactive"); // conflict
+    error("scan -i --json dir"); // conflict
+    error("scan --report-style rich --json dir"); // conflict
+    error("scan -r test.yml --inline-rules '{}'"); // conflict
+    error("scan --format gitlab");
+    error("scan --format github -i");
+    error("scan --format local");
+    error("scan --json=dir"); // wrong json flag
+    error("scan --json= not-pretty"); // wrong json flag
+    error("scan -j");
+    error("scan --include-metadata"); // requires json
+    error("scan --threads");
+    error("scan --files-with-matches -U");
+    error("scan --files-with-matches --json");
+  }
+
+  #[test]
+  fn test_test() {
+    ok("test");
+    ok("test -c sgconfig.yml");
+    ok("test --skip-snapshot-tests");
+    ok("test -U");
+    ok("test --update-all");
+    ok("test --follow");
+    error("test --update-all --skip-snapshot-tests");
+    ok("test --color always");
+    ok("test --color never");
+    ok("test --color auto");
+    ok("test --color ansi");
+    error("test --color invalid");
+  }
+  #[test]
+  fn test_new() {
+    ok("new");
+    ok("new project");
+    ok("new -c sgconfig.yml rule");
+    ok("new rule -y");
+    ok("new test -y");
+    ok("new util -y");
+    ok("new rule -c sgconfig.yml");
+    error("new --base-dir");
+  }
+
+  #[test]
+  fn test_shell() {
+    ok("completions");
+    ok("completions zsh");
+    ok("completions fish");
+    error("completions not-shell");
+    error("completions --shell fish");
+  }
+
+  #[test]
+  fn test_outline() {
+    ok("outline");
+    ok("outline crates/cli/src");
+    ok("outline crates/cli/src/lib.rs crates/cli/src/run.rs");
+    ok("outline crates/cli/src --json");
+    ok("outline crates/cli/src --json=compact");
+    ok("outline crates/cli/src --json=stream");
+    ok("outline crates/cli/src --color never");
+    ok("outline crates/cli/src --items exports");
+    ok("outline crates/cli/src --items imports");
+    ok("outline crates/cli/src --items all");
+    ok("outline crates/cli/src --type struct,enum,function");
+    ok("outline crates/cli/src --match Config");
+    ok("outline crates/cli/src --pub-members");
+    ok("outline crates/cli/src --view names");
+    ok("outline crates/cli/src --view signatures");
+    ok("outline crates/cli/src --view digest");
+    ok("outline crates/cli/src --view expanded");
+    ok("outline --stdin --lang rs");
+    ok("outline crates/cli/src --follow");
+    ok("outline crates/cli/src --no-ignore dot");
+    ok("outline crates/cli/src --globs '*.rs'");
+    ok("outline crates/cli/src --threads 12");
+    ok("outline crates/cli/src --json compact"); // argument after --json is parsed as a path
+    error("outline --stdin");
+    error("outline crates/cli/src --json=xml");
+    error("outline crates/cli/src --items public");
+    error("outline crates/cli/src --view full");
+    error("outline crates/cli/src --format json");
+    ok("outline crates/cli/src --outline-rules rules.yml");
+    ok("outline crates/cli/src --no-default-outline-rules");
+  }
+}

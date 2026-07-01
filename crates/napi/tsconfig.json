@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "strict": true,
+    "module": "nodenext",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "types": ["*"]
+  },
+  "ts-node": {
+    "transpileOnly": true
+  },
+  "include": ["."],
+  "exclude": ["node_modules", "ignore.d.ts"]
+}

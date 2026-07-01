@@ -1,0 +1,464 @@
+id: rust-use-public
+language: Rust
+role: item
+symbolType: module
+rule:
+  pattern: 'pub use $PATH;'
+name: '$PATH'
+isImport: true
+isExported: true
+---
+id: rust-use
+language: Rust
+role: item
+symbolType: module
+rule:
+  pattern: 'use $PATH;'
+name: '$PATH'
+isImport: true
+isExported: false
+---
+id: rust-mod
+language: Rust
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: mod_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$|;\s*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-function
+language: Rust
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-struct
+language: Rust
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: struct_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$|;\s*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-enum
+language: Rust
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: enum_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-trait
+language: Rust
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: trait_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-impl
+language: Rust
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: impl_item
+    - pattern: $DECL
+    - has:
+        field: type
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported: false
+---
+id: rust-const-public
+language: Rust
+role: item
+symbolType: constant
+rule:
+  pattern: 'pub const $NAME: $TYPE = $VALUE;'
+name: '$NAME'
+signature: 'pub const $NAME: $TYPE'
+isExported: true
+---
+id: rust-const
+language: Rust
+role: item
+symbolType: constant
+rule:
+  pattern: 'const $NAME: $TYPE = $VALUE;'
+name: '$NAME'
+signature: 'const $NAME: $TYPE'
+isExported: false
+---
+id: rust-static-public
+language: Rust
+role: item
+symbolType: variable
+rule:
+  pattern: 'pub static $NAME: $TYPE = $VALUE;'
+name: '$NAME'
+signature: 'pub static $NAME: $TYPE'
+isExported: true
+---
+id: rust-static
+language: Rust
+role: item
+symbolType: variable
+rule:
+  pattern: 'static $NAME: $TYPE = $VALUE;'
+name: '$NAME'
+signature: 'static $NAME: $TYPE'
+isExported: false
+---
+id: rust-field
+language: Rust
+role: member
+parentRuleIds: [rust-struct]
+symbolType: field
+rule:
+  all:
+    - kind: field_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isPublic:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-enum-variant
+language: Rust
+role: member
+parentRuleIds: [rust-enum]
+symbolType: enumMember
+rule:
+  all:
+    - kind: enum_variant
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+signature: '$NAME'
+isPublic: true
+---
+id: rust-mod-member-function
+language: Rust
+role: member
+parentRuleIds: [rust-mod]
+symbolType: function
+rule:
+  all:
+    - kind: function_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          kind: impl_item
+          stopBy: end
+    - not:
+        inside:
+          kind: trait_item
+          stopBy: end
+    - not:
+        inside:
+          kind: block
+          stopBy: end
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isPublic:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-mod-member-struct
+language: Rust
+role: member
+parentRuleIds: [rust-mod]
+symbolType: struct
+rule:
+  all:
+    - kind: struct_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          kind: block
+          stopBy: end
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$|;\s*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isPublic:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-mod-member-enum
+language: Rust
+role: member
+parentRuleIds: [rust-mod]
+symbolType: enum
+rule:
+  all:
+    - kind: enum_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          kind: block
+          stopBy: end
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isPublic:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-impl-method
+language: Rust
+role: member
+parentRuleIds: [rust-impl]
+symbolType: method
+rule:
+  all:
+    - kind: function_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          kind: block
+          stopBy: end
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isPublic:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-trait-method-signature
+language: Rust
+role: member
+parentRuleIds: [rust-trait]
+symbolType: method
+rule:
+  all:
+    - kind: function_signature_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: ';\s*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isPublic: true
+---
+id: rust-trait-method-default
+language: Rust
+role: member
+parentRuleIds: [rust-trait]
+symbolType: method
+rule:
+  all:
+    - kind: function_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          kind: block
+          stopBy: end
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isPublic: true

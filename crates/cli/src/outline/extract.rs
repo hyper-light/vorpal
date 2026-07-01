@@ -1,0 +1,333 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::thread;
+
+use anyhow::{Context, Result};
+use vorpal_core::Language;
+use vorpal_language::LanguageExt;
+use vorpal_outline::{
+  DEFAULT_OUTLINE_RULES,
+  combined_extractor::CombinedExtractors,
+  extractor::{SerializableOutlineRule, parse_outline_rules},
+  model::{OutlineEntry, OutlineItem, OutlineMember},
+  options::OutlineExtractorOptions,
+};
+use ignore::WalkState;
+use serde::Serialize;
+
+use crate::lang::SgLang;
+use crate::utils::{EmptyFile, InputArgs, read_file};
+
+use super::OutlineArg;
+use super::options::{extractor_options_from_arg, show_empty_files};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutlineFile<'a> {
+  pub path: String,
+  pub language: String,
+  pub items: Vec<OutlineItem<'a>>,
+}
+
+// One command-level cache of compiled outline rules. File workers borrow this
+// by language, so YAML deserialization and rule compilation never sit on the
+// per-file read/parse/extract path.
+pub struct OutlineExtractors {
+  by_lang: HashMap<SgLang, CombinedExtractors<SgLang>>,
+  show_empty_files: bool,
+}
+
+impl OutlineExtractors {
+  pub fn try_from_arg(
+    rules: Vec<SerializableOutlineRule<SgLang>>,
+    arg: &OutlineArg,
+  ) -> Result<Self> {
+    let options = extractor_options_from_arg(arg)?;
+    Self::try_from_options(rules, options, show_empty_files(arg))
+  }
+
+  fn try_from_options(
+    rules: Vec<SerializableOutlineRule<SgLang>>,
+    options: OutlineExtractorOptions,
+    show_empty_files: bool,
+  ) -> Result<Self> {
+    let mut rules_by_lang: HashMap<SgLang, Vec<SerializableOutlineRule<SgLang>>> = HashMap::new();
+    for rule in rules {
+      rules_by_lang
+        .entry(rule.common().language)
+        .or_default()
+        .push(rule);
+    }
+    let by_lang = rules_by_lang
+      .into_iter()
+      .map(|(lang, rules)| {
+        CombinedExtractors::try_from_rules(rules, options.clone(), &Default::default())
+          .map(|extractors| (lang, extractors))
+      })
+      .collect::<Result<_, _>>()?;
+    Ok(Self {
+      by_lang,
+      show_empty_files,
+    })
+  }
+
+  fn is_empty(&self) -> bool {
+    self.by_lang.is_empty()
+  }
+
+  fn languages(&self) -> impl Iterator<Item = SgLang> + '_ {
+    self.by_lang.keys().copied()
+  }
+
+  fn extract<'tree>(
+    &self,
+    lang: SgLang,
+    root: vorpal_core::Node<'tree, vorpal_core::tree_sitter::StrDoc<SgLang>>,
+  ) -> Vec<OutlineItem<'static>> {
+    self
+      .by_lang
+      .get(&lang)
+      .map(|extractors| extractors.extract(root).map(own_item).collect())
+      .unwrap_or_default()
+  }
+}
+
+pub fn load_outline_rules(
+  include_default: bool,
+  config_paths: &[PathBuf],
+  cli_paths: &[PathBuf],
+) -> Result<Vec<SerializableOutlineRule<SgLang>>> {
+  let mut rules = vec![];
+  if include_default {
+    rules.extend(
+      parse_outline_rules(DEFAULT_OUTLINE_RULES).context("Cannot parse builtin outline rules")?,
+    );
+  }
+  for path in config_paths.iter().chain(cli_paths) {
+    let source = std::fs::read_to_string(path)
+      .with_context(|| format!("Cannot read outline rules {}", path.display()))?;
+    rules.extend(
+      parse_outline_rules(&source)
+        .with_context(|| format!("Cannot parse outline rules {}", path.display()))?,
+    );
+  }
+  Ok(rules)
+}
+
+pub fn extract_stdin(
+  arg: &OutlineArg,
+  extractors: &OutlineExtractors,
+) -> Result<OutlineFile<'static>> {
+  let lang = arg.lang.expect("required by clap");
+  let source = io::read_to_string(io::stdin())?;
+  let grep = lang.ast_grep(source);
+  let items = extractors.extract(lang, grep.root());
+  Ok(OutlineFile {
+    path: "STDIN".to_string(),
+    language: lang.to_string(),
+    items,
+  })
+}
+
+pub fn stream_paths(
+  arg: &OutlineArg,
+  extractors: Arc<OutlineExtractors>,
+  mut emit: impl FnMut(OutlineFile<'static>) -> Result<()>,
+) -> Result<()> {
+  if arg.lang.is_none() && extractors.is_empty() {
+    return Ok(());
+  }
+  let walker = outline_walk(&arg.input, arg.lang, &extractors)?;
+  let (tx, rx) = mpsc::channel();
+  let lang = arg.lang;
+  let producer = thread::spawn(move || {
+    walker.run(|| {
+      let tx = tx.clone();
+      let extractors = extractors.clone();
+      Box::new(move |result| {
+        let Some(path) = outline_path(result) else {
+          return WalkState::Continue;
+        };
+        let Some(file) = extract_path_or_report(&path, lang, &extractors) else {
+          return WalkState::Continue;
+        };
+        if tx.send(file).is_err() {
+          return WalkState::Quit;
+        }
+        WalkState::Continue
+      })
+    });
+  });
+
+  let mut result = Ok(());
+  while let Ok(file) = rx.recv() {
+    if let Err(err) = emit(file) {
+      result = Err(err);
+      break;
+    }
+  }
+  drop(rx);
+  producer
+    .join()
+    .map_err(|_| anyhow::anyhow!("outline walker thread panicked"))?;
+  result
+}
+
+fn outline_walk(
+  input: &InputArgs,
+  lang: Option<SgLang>,
+  extractors: &OutlineExtractors,
+) -> Result<ignore::WalkParallel> {
+  if let Some(lang) = lang {
+    input.walk_lang(lang)
+  } else {
+    input.walk_langs(extractors.languages())
+  }
+}
+
+fn outline_path(result: Result<ignore::DirEntry, ignore::Error>) -> Option<PathBuf> {
+  let entry = match result {
+    Ok(entry) => entry,
+    Err(err) => {
+      eprintln!("ERROR: {err}");
+      return None;
+    }
+  };
+  entry.file_type()?.is_file().then(|| entry.into_path())
+}
+
+fn extract_path_or_report(
+  path: &Path,
+  lang: Option<SgLang>,
+  extractors: &OutlineExtractors,
+) -> Option<OutlineFile<'static>> {
+  match extract_path(path, lang, extractors) {
+    Ok(file) => file,
+    Err(err) => {
+      eprintln!("ERROR: {err:#}");
+      None
+    }
+  }
+}
+
+fn extract_path(
+  path: &Path,
+  lang: Option<SgLang>,
+  extractors: &OutlineExtractors,
+) -> Result<Option<OutlineFile<'static>>> {
+  let Some(lang) = lang.or_else(|| SgLang::from_path(path)) else {
+    return Ok(None);
+  };
+  let source = match read_file(path) {
+    Ok(source) => source,
+    Err(err) if err.downcast_ref::<EmptyFile>().is_some() => return Ok(None),
+    Err(err) => {
+      return Err(err).with_context(|| format!("Cannot extract outline from {}", path.display()));
+    }
+  };
+  let grep = lang.ast_grep(source);
+  let items = extractors.extract(lang, grep.root());
+  if !extractors.show_empty_files && items.is_empty() {
+    return Ok(None);
+  }
+  Ok(Some(OutlineFile {
+    path: path.to_string_lossy().into_owned(),
+    language: lang.to_string(),
+    items,
+  }))
+}
+
+fn own_item(item: OutlineItem<'_>) -> OutlineItem<'static> {
+  OutlineItem {
+    entry: own_entry(item.entry),
+    is_import: item.is_import,
+    is_exported: item.is_exported,
+    members: item.members.into_iter().map(own_member).collect(),
+  }
+}
+
+fn own_member(member: OutlineMember<'_>) -> OutlineMember<'static> {
+  OutlineMember {
+    entry: own_entry(member.entry),
+    is_public: member.is_public,
+  }
+}
+
+fn own_entry(entry: OutlineEntry<'_>) -> OutlineEntry<'static> {
+  OutlineEntry {
+    role: entry.role,
+    symbol_type: entry.symbol_type,
+    name: Cow::Owned(entry.name.into_owned()),
+    range: entry.range,
+    signature: Cow::Owned(entry.signature.into_owned()),
+    ast_kind: Cow::Owned(entry.ast_kind.into_owned()),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+  use tempfile::TempDir;
+
+  #[test]
+  fn empty_files_are_skipped_without_error() {
+    let dir = TempDir::new().expect("temp dir should be created");
+    let path = dir.path().join("empty.rs");
+    std::fs::write(&path, "").expect("empty file should be written");
+    let extractors = OutlineExtractors {
+      by_lang: HashMap::new(),
+      show_empty_files: true,
+    };
+
+    let file =
+      extract_path(&path, None, &extractors).expect("empty file should not be an extraction error");
+
+    assert!(file.is_none());
+  }
+
+  #[test]
+  fn load_outline_rules_reads_config_and_cli_paths() {
+    let dir = TempDir::new().expect("temp dir should be created");
+    let config_path = dir.path().join("config-outline.yml");
+    let cli_path = dir.path().join("cli-outline.yml");
+    fs::write(
+      &config_path,
+      r#"
+id: config-rust-function
+language: Rust
+role: item
+symbolType: function
+rule:
+  kind: function_item
+name: fn
+"#,
+    )
+    .expect("config outline file should be written");
+    fs::write(
+      &cli_path,
+      r#"
+id: cli-rust-struct
+language: Rust
+role: item
+symbolType: struct
+rule:
+  kind: struct_item
+name: struct
+"#,
+    )
+    .expect("cli outline file should be written");
+
+    let rules =
+      load_outline_rules(false, &[config_path], &[cli_path]).expect("outline rules should load");
+    let ids = rules
+      .iter()
+      .map(|rule| rule.common().id.as_str())
+      .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["config-rust-function", "cli-rust-struct"]);
+  }
+}

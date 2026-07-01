@@ -1,0 +1,132 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$ref": "#/definitions/Project",
+  "definitions": {
+    "Project": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ruleDirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "title": "Rule directories",
+          "description": "A list of string instructing where to discover ast-grep's YAML rules."
+        },
+        "testConfigs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TestConfig"
+          },
+          "title": "Test configurations",
+          "description": "A list of object to configure ast-grep's test cases. Each object can have two fields."
+        },
+        "utilDirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "title": "Utility directories",
+          "description": "A list of string instructing where to discover ast-grep's global utility rules."
+        },
+        "languageGlobs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": "A mapping to associate a language to files that have non-standard extensions or syntaxes."
+        },
+        "customLanguages": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/CustomLanguage"
+          },
+          "description": "A dictionary of custom languages in the project."
+        },
+        "languageInjections": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LanguageInjection"
+          },
+          "description": "A list of language injections to support embedded languages in the project like JS/CSS in HTML. This is an experimental feature."
+        }
+      },
+      "required": ["ruleDirs"],
+      "title": "ast-grep project configuration"
+    },
+    "TestConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "testDir": {
+          "type": "string",
+          "description": "A string specifies where to discover test cases for ast-grep."
+        },
+        "snapshotDir": {
+          "type": "string",
+          "description": "A string path relative to testDir that specifies where to store test snapshots for ast-grep. You can think it like __snapshots___ in popular test framework like jest. If this option is not specified, ast-grep will store the snapshot under the __snapshots__ folder under the testDir."
+        }
+      },
+      "required": ["testDir"],
+      "title": "Test configuration"
+    },
+    "CustomLanguage": {
+      "type": "object",
+      "properties": {
+        "libraryPath": {
+          "type": ["string", "object"],
+          "description": "The path to the tree-sitter dynamic library of the language."
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The file extensions for this language."
+        },
+        "expandoChar": {
+          "type": "string",
+          "description": "An optional char to replace $ in your pattern."
+        },
+        "languageSymbol": {
+          "type": "string",
+          "description": "The dylib symbol to load ts-language, default is tree_sitter_{name}"
+        },
+        "outlineRules": {
+          "type": "string",
+          "description": "The path to the YAML file containing outline rules for this custom language."
+        }
+      },
+      "required": ["libraryPath", "extensions"]
+    },
+    "LanguageInjection": {
+      "type": "object",
+      "description": "A list of language injections to support embedded languages in the project like JS/CSS in HTML. This is an experimental feature.",
+      "properties": {
+        "hostLanguage": {
+          "type": "string",
+          "description": "The host language name, e.g. html. This is the language of documents that contains the embedded language code."
+        },
+        "rule": {
+          "$ref": "./rule.json#/$defs/SerializableRule",
+          "description": "Defines the ast-grep rule to identify the injected language region within the host language documents."
+        },
+        "injected": {
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          ],
+          "description": "The injected language name"
+        }
+      },
+      "required": ["hostLanguage", "rule", "injected"]
+    }
+  }
+}
