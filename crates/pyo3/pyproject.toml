@@ -32,9 +32,9 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/adalundhe/vorpal"
+Repository = "https://github.com/hyper-light/vorpal"
 Documentation = "https://vorpal.github.io/"
-Changelog = "https://github.com/adalundhe/vorpal/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/hyper-light/vorpal/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 test = [

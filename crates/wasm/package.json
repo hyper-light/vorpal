@@ -2,7 +2,7 @@
   "name": "@vorpal/wasm",
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "homepage": "https://vorpal.github.io",
-  "repository": "https://github.com/adalundhe/vorpal",
+  "repository": "https://github.com/hyper-light/vorpal",
   "license": "MIT",
   "keywords": [
     "ast",

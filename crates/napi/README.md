@@ -11,7 +11,7 @@ vorpal(vp) is a CLI tool for code structural search, lint, and rewriting.
 This npm package is for programmatic usage of vorpal.
 Please see the [API usage guide](https://vorpal.github.io/guide/api-usage.html) and [API reference](https://vorpal.github.io/reference/api.html).
 
-Other resources include [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/adalundhe/vorpal).
+Other resources include [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/hyper-light/vorpal).
 
 ## Support matrix
 

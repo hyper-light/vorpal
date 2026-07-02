@@ -231,7 +231,7 @@ fn create_new_project(arg: NewArg, project_dir: &Path) -> Result<ExitCode> {
 
 fn default_rule(id: &str, lang: SgLang) -> String {
   format!(
-    r#"# yaml-language-server: $schema=https://raw.githubusercontent.com/adalundhe/vorpal/main/schemas/rule.json
+    r#"# yaml-language-server: $schema=https://raw.githubusercontent.com/hyper-light/vorpal/main/schemas/rule.json
 
 id: {id}
 message: Add your rule message here....

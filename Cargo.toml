@@ -14,9 +14,9 @@ version = "0.44.0"
 authors = ["Herrington Darkholme <2883231+HerringtonDarkholme@users.noreply.github.com>"]
 edition = "2024"
 license = "MIT"
-documentation = "https://github.com/adalundhe/vorpal"
-homepage = "https://github.com/adalundhe/vorpal"
-repository = "https://github.com/adalundhe/vorpal"
+documentation = "https://github.com/hyper-light/vorpal"
+homepage = "https://github.com/hyper-light/vorpal"
+repository = "https://github.com/hyper-light/vorpal"
 rust-version = "1.85"
 readme = "README.md"
 

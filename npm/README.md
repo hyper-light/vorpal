@@ -8,5 +8,5 @@
 
 vorpal(vp) is a CLI tool for code structural search, lint, and rewriting.
 
-Please see [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/adalundhe/vorpal)
+Please see [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/hyper-light/vorpal)
 for more information.

@@ -4,10 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "vorpal-cli"
-version = "0.44.0"
+version = "0.1.0"
 description = "Structural Search and Rewrite code at large scale using precise AST pattern."
-authors = [{ name = "Herrington Darkholme", email = "2883231+HerringtonDarkholme@users.noreply.github.com" }]
-maintainers = [{ name = "Herrington Darkholme", email = "2883231+HerringtonDarkholme@users.noreply.github.com" }]
+authors = [{ name = "Ada Lundhe", email = "adalundhe@lundhe.audio" }]
+maintainers = [{ name = "Ada Lundhe", email = "adalundhe@lundhe.audio" }]
 readme = "README.md"
 license = { file = "LICENSE" }
 keywords = [
@@ -32,9 +32,9 @@ classifiers = [
 
 
 [project.urls]
-Repository = "https://github.com/adalundhe/vorpal"
+Repository = "https://github.com/hyper-light/vorpal"
 Documentation = "https://vorpal.github.io/"
-Changelog = "https://github.com/adalundhe/vorpal/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/hyper-light/vorpal/blob/main/CHANGELOG.md"
 
 
 [tool.maturin]

@@ -25,7 +25,7 @@ You can take our tests as examples. For example, [test_simple.py](./tests/test_s
 
 Please see the [API usage guide](https://vorpal.github.io/guide/api-usage.html) and [API reference](https://vorpal.github.io/reference/api.html) for more details.
 
-Other resources include [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/adalundhe/vorpal).
+Other resources include [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/hyper-light/vorpal).
 
 ## Development
 
