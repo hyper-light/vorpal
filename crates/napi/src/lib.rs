@@ -64,14 +64,14 @@ impl_lang_mod!(ts, TypeScript);
 impl_lang_mod!(tsx, Tsx);
 impl_lang_mod!(css, Css);
 
-/// Parse a string to an ast-grep instance
+/// Parse a string to a Vorpal instance
 #[napi]
 pub fn parse(lang: String, src: String) -> Result<SgRoot> {
   let doc = JsDoc::try_new(src, lang.parse()?)?;
   Ok(SgRoot(Vorpal::doc(doc), "anonymous".into()))
 }
 
-/// Parse a string to an ast-grep instance asynchronously in threads.
+/// Parse a string to a Vorpal instance asynchronously in threads.
 /// It utilize multiple CPU cores when **concurrent processing sources**.
 /// However, spawning excessive many threads may backfire.
 /// Please refer to libuv doc, nodejs' underlying runtime
@@ -90,7 +90,7 @@ pub fn kind(lang: String, kind_name: String) -> Result<u16> {
   Ok(kind)
 }
 
-/// Compile a string to ast-grep Pattern.
+/// Compile a string to a Vorpal Pattern.
 #[napi]
 pub fn pattern(lang: String, pattern: String) -> NapiConfig {
   NapiConfig {
@@ -118,7 +118,7 @@ pub fn find_in_files(
   find_in_files_impl(lang, config, callback)
 }
 
-/// Register a dynamic language to ast-grep.
+/// Register a dynamic language to vorpal.
 /// `langs` is a Map of language name to its CustomLanguage registration.
 #[napi]
 pub fn register_dynamic_language(langs: serde_json::Value) -> Result<()> {

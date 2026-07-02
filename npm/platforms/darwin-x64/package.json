@@ -1,5 +1,5 @@
 {
-  "name": "@ast-grep/cli-darwin-x64",
+  "name": "@vorpal/cli-darwin-x64",
   "version": "0.44.0",
   "os": [
     "darwin"
@@ -8,7 +8,7 @@
     "x64"
   ],
   "files": [
-    "ast-grep"
+    "vorpal"
   ],
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "keywords": [
@@ -26,5 +26,5 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "repository": "https://github.com/ast-grep/ast-grep"
+  "repository": "https://github.com/adalundhe/vorpal"
 }

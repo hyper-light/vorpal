@@ -70,13 +70,13 @@ function requireNative() {
   } else if (process.platform === 'android') {
     if (process.arch === 'arm64') {
       try {
-        return require('./ast-grep-napi.android-arm64.node')
+        return require('./vorpal-napi.android-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-android-arm64')
-        const bindingPackageVersion = require('@ast-grep/napi-android-arm64/package.json').version
+        const binding = require('@vorpal/napi-android-arm64')
+        const bindingPackageVersion = require('@vorpal/napi-android-arm64/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -86,13 +86,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./ast-grep-napi.android-arm-eabi.node')
+        return require('./vorpal-napi.android-arm-eabi.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-android-arm-eabi')
-        const bindingPackageVersion = require('@ast-grep/napi-android-arm-eabi/package.json').version
+        const binding = require('@vorpal/napi-android-arm-eabi')
+        const bindingPackageVersion = require('@vorpal/napi-android-arm-eabi/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -107,13 +107,13 @@ function requireNative() {
     if (process.arch === 'x64') {
       if (process.config?.variables?.shlib_suffix === 'dll.a' || process.config?.variables?.node_target_type === 'shared_library') {
         try {
-        return require('./ast-grep-napi.win32-x64-gnu.node')
+        return require('./vorpal-napi.win32-x64-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-win32-x64-gnu')
-        const bindingPackageVersion = require('@ast-grep/napi-win32-x64-gnu/package.json').version
+        const binding = require('@vorpal/napi-win32-x64-gnu')
+        const bindingPackageVersion = require('@vorpal/napi-win32-x64-gnu/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -123,13 +123,13 @@ function requireNative() {
       }
       } else {
         try {
-        return require('./ast-grep-napi.win32-x64-msvc.node')
+        return require('./vorpal-napi.win32-x64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-win32-x64-msvc')
-        const bindingPackageVersion = require('@ast-grep/napi-win32-x64-msvc/package.json').version
+        const binding = require('@vorpal/napi-win32-x64-msvc')
+        const bindingPackageVersion = require('@vorpal/napi-win32-x64-msvc/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -140,13 +140,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ia32') {
       try {
-        return require('./ast-grep-napi.win32-ia32-msvc.node')
+        return require('./vorpal-napi.win32-ia32-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-win32-ia32-msvc')
-        const bindingPackageVersion = require('@ast-grep/napi-win32-ia32-msvc/package.json').version
+        const binding = require('@vorpal/napi-win32-ia32-msvc')
+        const bindingPackageVersion = require('@vorpal/napi-win32-ia32-msvc/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -156,13 +156,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./ast-grep-napi.win32-arm64-msvc.node')
+        return require('./vorpal-napi.win32-arm64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-win32-arm64-msvc')
-        const bindingPackageVersion = require('@ast-grep/napi-win32-arm64-msvc/package.json').version
+        const binding = require('@vorpal/napi-win32-arm64-msvc')
+        const bindingPackageVersion = require('@vorpal/napi-win32-arm64-msvc/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -175,13 +175,13 @@ function requireNative() {
     }
   } else if (process.platform === 'darwin') {
     try {
-      return require('./ast-grep-napi.darwin-universal.node')
+      return require('./vorpal-napi.darwin-universal.node')
     } catch (e) {
       loadErrors.push(e)
     }
     try {
-      const binding = require('@ast-grep/napi-darwin-universal')
-      const bindingPackageVersion = require('@ast-grep/napi-darwin-universal/package.json').version
+      const binding = require('@vorpal/napi-darwin-universal')
+      const bindingPackageVersion = require('@vorpal/napi-darwin-universal/package.json').version
       if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
         throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
       }
@@ -191,13 +191,13 @@ function requireNative() {
     }
     if (process.arch === 'x64') {
       try {
-        return require('./ast-grep-napi.darwin-x64.node')
+        return require('./vorpal-napi.darwin-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-darwin-x64')
-        const bindingPackageVersion = require('@ast-grep/napi-darwin-x64/package.json').version
+        const binding = require('@vorpal/napi-darwin-x64')
+        const bindingPackageVersion = require('@vorpal/napi-darwin-x64/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -207,13 +207,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./ast-grep-napi.darwin-arm64.node')
+        return require('./vorpal-napi.darwin-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-darwin-arm64')
-        const bindingPackageVersion = require('@ast-grep/napi-darwin-arm64/package.json').version
+        const binding = require('@vorpal/napi-darwin-arm64')
+        const bindingPackageVersion = require('@vorpal/napi-darwin-arm64/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -227,13 +227,13 @@ function requireNative() {
   } else if (process.platform === 'freebsd') {
     if (process.arch === 'x64') {
       try {
-        return require('./ast-grep-napi.freebsd-x64.node')
+        return require('./vorpal-napi.freebsd-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-freebsd-x64')
-        const bindingPackageVersion = require('@ast-grep/napi-freebsd-x64/package.json').version
+        const binding = require('@vorpal/napi-freebsd-x64')
+        const bindingPackageVersion = require('@vorpal/napi-freebsd-x64/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -243,13 +243,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./ast-grep-napi.freebsd-arm64.node')
+        return require('./vorpal-napi.freebsd-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-freebsd-arm64')
-        const bindingPackageVersion = require('@ast-grep/napi-freebsd-arm64/package.json').version
+        const binding = require('@vorpal/napi-freebsd-arm64')
+        const bindingPackageVersion = require('@vorpal/napi-freebsd-arm64/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -264,13 +264,13 @@ function requireNative() {
     if (process.arch === 'x64') {
       if (isMusl()) {
         try {
-          return require('./ast-grep-napi.linux-x64-musl.node')
+          return require('./vorpal-napi.linux-x64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-x64-musl')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-x64-musl/package.json').version
+          const binding = require('@vorpal/napi-linux-x64-musl')
+          const bindingPackageVersion = require('@vorpal/napi-linux-x64-musl/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -280,13 +280,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./ast-grep-napi.linux-x64-gnu.node')
+          return require('./vorpal-napi.linux-x64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-x64-gnu')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-x64-gnu/package.json').version
+          const binding = require('@vorpal/napi-linux-x64-gnu')
+          const bindingPackageVersion = require('@vorpal/napi-linux-x64-gnu/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -298,13 +298,13 @@ function requireNative() {
     } else if (process.arch === 'arm64') {
       if (isMusl()) {
         try {
-          return require('./ast-grep-napi.linux-arm64-musl.node')
+          return require('./vorpal-napi.linux-arm64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-arm64-musl')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-arm64-musl/package.json').version
+          const binding = require('@vorpal/napi-linux-arm64-musl')
+          const bindingPackageVersion = require('@vorpal/napi-linux-arm64-musl/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -314,13 +314,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./ast-grep-napi.linux-arm64-gnu.node')
+          return require('./vorpal-napi.linux-arm64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-arm64-gnu')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-arm64-gnu/package.json').version
+          const binding = require('@vorpal/napi-linux-arm64-gnu')
+          const bindingPackageVersion = require('@vorpal/napi-linux-arm64-gnu/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -332,13 +332,13 @@ function requireNative() {
     } else if (process.arch === 'arm') {
       if (isMusl()) {
         try {
-          return require('./ast-grep-napi.linux-arm-musleabihf.node')
+          return require('./vorpal-napi.linux-arm-musleabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-arm-musleabihf')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-arm-musleabihf/package.json').version
+          const binding = require('@vorpal/napi-linux-arm-musleabihf')
+          const bindingPackageVersion = require('@vorpal/napi-linux-arm-musleabihf/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -348,13 +348,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./ast-grep-napi.linux-arm-gnueabihf.node')
+          return require('./vorpal-napi.linux-arm-gnueabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-arm-gnueabihf')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-arm-gnueabihf/package.json').version
+          const binding = require('@vorpal/napi-linux-arm-gnueabihf')
+          const bindingPackageVersion = require('@vorpal/napi-linux-arm-gnueabihf/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -366,13 +366,13 @@ function requireNative() {
     } else if (process.arch === 'loong64') {
       if (isMusl()) {
         try {
-          return require('./ast-grep-napi.linux-loong64-musl.node')
+          return require('./vorpal-napi.linux-loong64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-loong64-musl')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-loong64-musl/package.json').version
+          const binding = require('@vorpal/napi-linux-loong64-musl')
+          const bindingPackageVersion = require('@vorpal/napi-linux-loong64-musl/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -382,13 +382,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./ast-grep-napi.linux-loong64-gnu.node')
+          return require('./vorpal-napi.linux-loong64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-loong64-gnu')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-loong64-gnu/package.json').version
+          const binding = require('@vorpal/napi-linux-loong64-gnu')
+          const bindingPackageVersion = require('@vorpal/napi-linux-loong64-gnu/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -400,13 +400,13 @@ function requireNative() {
     } else if (process.arch === 'riscv64') {
       if (isMusl()) {
         try {
-          return require('./ast-grep-napi.linux-riscv64-musl.node')
+          return require('./vorpal-napi.linux-riscv64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-riscv64-musl')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-riscv64-musl/package.json').version
+          const binding = require('@vorpal/napi-linux-riscv64-musl')
+          const bindingPackageVersion = require('@vorpal/napi-linux-riscv64-musl/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -416,13 +416,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./ast-grep-napi.linux-riscv64-gnu.node')
+          return require('./vorpal-napi.linux-riscv64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@ast-grep/napi-linux-riscv64-gnu')
-          const bindingPackageVersion = require('@ast-grep/napi-linux-riscv64-gnu/package.json').version
+          const binding = require('@vorpal/napi-linux-riscv64-gnu')
+          const bindingPackageVersion = require('@vorpal/napi-linux-riscv64-gnu/package.json').version
           if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
             throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
@@ -433,13 +433,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ppc64') {
       try {
-        return require('./ast-grep-napi.linux-ppc64-gnu.node')
+        return require('./vorpal-napi.linux-ppc64-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-linux-ppc64-gnu')
-        const bindingPackageVersion = require('@ast-grep/napi-linux-ppc64-gnu/package.json').version
+        const binding = require('@vorpal/napi-linux-ppc64-gnu')
+        const bindingPackageVersion = require('@vorpal/napi-linux-ppc64-gnu/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -449,13 +449,13 @@ function requireNative() {
       }
     } else if (process.arch === 's390x') {
       try {
-        return require('./ast-grep-napi.linux-s390x-gnu.node')
+        return require('./vorpal-napi.linux-s390x-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-linux-s390x-gnu')
-        const bindingPackageVersion = require('@ast-grep/napi-linux-s390x-gnu/package.json').version
+        const binding = require('@vorpal/napi-linux-s390x-gnu')
+        const bindingPackageVersion = require('@vorpal/napi-linux-s390x-gnu/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -469,13 +469,13 @@ function requireNative() {
   } else if (process.platform === 'openharmony') {
     if (process.arch === 'arm64') {
       try {
-        return require('./ast-grep-napi.openharmony-arm64.node')
+        return require('./vorpal-napi.openharmony-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-openharmony-arm64')
-        const bindingPackageVersion = require('@ast-grep/napi-openharmony-arm64/package.json').version
+        const binding = require('@vorpal/napi-openharmony-arm64')
+        const bindingPackageVersion = require('@vorpal/napi-openharmony-arm64/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -485,13 +485,13 @@ function requireNative() {
       }
     } else if (process.arch === 'x64') {
       try {
-        return require('./ast-grep-napi.openharmony-x64.node')
+        return require('./vorpal-napi.openharmony-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-openharmony-x64')
-        const bindingPackageVersion = require('@ast-grep/napi-openharmony-x64/package.json').version
+        const binding = require('@vorpal/napi-openharmony-x64')
+        const bindingPackageVersion = require('@vorpal/napi-openharmony-x64/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -501,13 +501,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./ast-grep-napi.openharmony-arm.node')
+        return require('./vorpal-napi.openharmony-arm.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@ast-grep/napi-openharmony-arm')
-        const bindingPackageVersion = require('@ast-grep/napi-openharmony-arm/package.json').version
+        const binding = require('@vorpal/napi-openharmony-arm')
+        const bindingPackageVersion = require('@vorpal/napi-openharmony-arm/package.json').version
         if (bindingPackageVersion !== '0.42.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           throw new Error(`Native binding package version mismatch, expected 0.42.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
@@ -529,7 +529,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   let wasiBinding = null
   let wasiBindingError = null
   try {
-    wasiBinding = require('./ast-grep-napi.wasi.cjs')
+    wasiBinding = require('./vorpal-napi.wasi.cjs')
     nativeBinding = wasiBinding
   } catch (err) {
     if (process.env.NAPI_RS_FORCE_WASI) {
@@ -538,7 +538,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   }
   if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
     try {
-      wasiBinding = require('@ast-grep/napi-wasm32-wasi')
+      wasiBinding = require('@vorpal/napi-wasm32-wasi')
       nativeBinding = wasiBinding
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {

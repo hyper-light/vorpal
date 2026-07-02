@@ -1,3 +1,3 @@
-# `@ast-grep/cli-darwin-x64`
+# `@vorpal/cli-darwin-x64`
 
-This is the **x86_64-apple-darwin** binary for `@ast-grep/cli`
+This is the **x86_64-apple-darwin** binary for `@vorpal/cli`

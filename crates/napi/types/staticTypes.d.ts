@@ -72,7 +72,7 @@ type ResolveType<M extends TypesMap, K> = K extends keyof M
   : K
 
 /**
- * All named nodes' kinds that are usable in ast-grep rule
+ * All named nodes' kinds that are usable in vorpal rule
  * NOTE: SgNode can return kind not in this list
  */
 export type NamedKinds<M extends TypesMap> = ResolveType<M, keyof M>

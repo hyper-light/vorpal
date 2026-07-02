@@ -1,5 +1,5 @@
 {
-  "name": "@ast-grep/napi-linux-arm64-musl",
+  "name": "@vorpal/napi-linux-arm64-musl",
   "version": "0.44.0",
   "os": [
     "linux"
@@ -10,9 +10,9 @@
   "libc": [
     "musl"
   ],
-  "main": "ast-grep-napi.linux-arm64-musl.node",
+  "main": "vorpal-napi.linux-arm64-musl.node",
   "files": [
-    "ast-grep-napi.linux-arm64-musl.node"
+    "vorpal-napi.linux-arm64-musl.node"
   ],
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "keywords": [
@@ -30,5 +30,5 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "repository": "https://github.com/ast-grep/ast-grep"
+  "repository": "https://github.com/adalundhe/vorpal"
 }

@@ -10,7 +10,7 @@ interface LangRegistration {
   metaVarChar?: string
   /**
    * An optional char to replace $ in your pattern.
-   * See https://ast-grep.github.io/advanced/custom-language.html#register-language-in-sgconfig-yml
+   * See https://vorpal.github.io/advanced/custom-language.html#register-language-in-sgconfig-yml
    */
   expandoChar?: string
 }

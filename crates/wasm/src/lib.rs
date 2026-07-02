@@ -39,7 +39,7 @@ pub async fn register_dynamic_language(langs: JsValue) -> Result<(), JsError> {
   WasmLang::register(langs).await
 }
 
-/// Parse a string to an ast-grep instance.
+/// Parse a string to a Vorpal instance.
 #[wasm_bindgen]
 pub fn parse(lang: String, src: String) -> Result<SgRoot, JsError> {
   let lang: WasmLang = lang
@@ -58,7 +58,7 @@ pub fn kind(lang: String, kind_name: String) -> Result<u16, JsError> {
   Ok(lang.kind_to_id(&kind_name))
 }
 
-/// Compile a string to ast-grep Pattern config.
+/// Compile a string to a Vorpal Pattern config.
 #[wasm_bindgen]
 pub fn pattern(lang: String, pattern_str: String) -> Result<JsValue, JsError> {
   let config = WasmConfig {
@@ -111,7 +111,7 @@ pub struct PatternTree {
 /// Dump a pattern's internal structure for inspection.
 /// `selector` is an optional kind name for contextual patterns.
 /// `strictness` is one of: "cst", "smart", "ast", "relaxed", "signature", "template".
-/// Returns a tree structure showing how ast-grep parses the pattern, including source positions.
+/// Returns a tree structure showing how vorpal parses the pattern, including source positions.
 #[wasm_bindgen(js_name = dumpPattern)]
 pub fn dump_pattern(
   lang: String,

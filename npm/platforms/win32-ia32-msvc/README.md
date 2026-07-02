@@ -1,3 +1,3 @@
-# `@ast-grep/cli-win32-ia32-msvc`
+# `@vorpal/cli-win32-ia32-msvc`
 
-This is the **i686-pc-windows-msvc** binary for `@ast-grep/cli`
+This is the **i686-pc-windows-msvc** binary for `@vorpal/cli`

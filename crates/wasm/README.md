@@ -1,13 +1,13 @@
-# @ast-grep/wasm
+# @vorpal/wasm
 
-WebAssembly build of [ast-grep](https://ast-grep.github.io/) for use in browsers and Node.js.
+WebAssembly build of [vorpal](https://vorpal.github.io/) for use in browsers and Node.js.
 
-This package provides the same API as [`@ast-grep/napi`](https://www.npmjs.com/package/@ast-grep/napi) but runs in any JavaScript environment that supports WebAssembly, including browsers, Deno, and edge runtimes.
+This package provides the same API as [`@vorpal/napi`](https://www.npmjs.com/package/@vorpal/napi) but runs in any JavaScript environment that supports WebAssembly, including browsers, Deno, and edge runtimes.
 
 ## Installation
 
 ```bash
-yarn add @ast-grep/wasm web-tree-sitter
+yarn add @vorpal/wasm web-tree-sitter
 ```
 
 `web-tree-sitter` is a required peer dependency.
@@ -22,10 +22,10 @@ When using Vite, you need to make `tree-sitter.wasm` available in your public di
 
 ## Usage
 
-Unlike `@ast-grep/napi`, this package has no predefined language support. All languages must be registered at runtime by loading their tree-sitter WASM parser.
+Unlike `@vorpal/napi`, this package has no predefined language support. All languages must be registered at runtime by loading their tree-sitter WASM parser.
 
 ```js
-import { initializeTreeSitter, registerDynamicLanguage, parse, kind } from '@ast-grep/wasm'
+import { initializeTreeSitter, registerDynamicLanguage, parse, kind } from '@vorpal/wasm'
 
 // 1. Initialize the tree-sitter WASM runtime (once)
 await initializeTreeSitter()
@@ -108,7 +108,7 @@ Compiles a pattern string into a rule config object (equivalent to `{ rule: { pa
 
 #### `dumpPattern(lang: string, patternStr: string, selector?: string, strictness?: string): PatternTree`
 
-Dumps the internal structure of a pattern for inspection and debugging. Returns a tree showing how ast-grep parses the pattern, including source positions and node kinds.
+Dumps the internal structure of a pattern for inspection and debugging. Returns a tree showing how vorpal parses the pattern, including source positions and node kinds.
 
 - `selector`: optional kind name for contextual patterns (e.g. `'field_definition'`)
 - `strictness`: one of `"cst"`, `"smart"` (default), `"ast"`, `"relaxed"`, `"signature"`, `"template"`

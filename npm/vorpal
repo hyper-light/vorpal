@@ -17,7 +17,7 @@ if (process.platform !== "win32") {
 const binaryPath = resolveBinaryPath();
 if (!binaryPath) {
   console.error(
-    "[ast-grep] Failed to locate the native binary. " +
+    "[vorpal] Failed to locate the native binary. " +
       "Ensure optional dependencies are installed (do not pass --no-optional).",
   );
   process.exit(1);
@@ -26,7 +26,7 @@ if (!binaryPath) {
 const child = spawn(binaryPath, process.argv.slice(2), { stdio: "inherit" });
 
 child.on("error", (error) => {
-  console.error("[ast-grep] Failed to execute native binary:", error);
+  console.error("[vorpal] Failed to execute native binary:", error);
   process.exit(1);
 });
 

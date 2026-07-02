@@ -1,5 +1,5 @@
 {
-  "name": "@ast-grep/napi-win32-ia32-msvc",
+  "name": "@vorpal/napi-win32-ia32-msvc",
   "version": "0.44.0",
   "os": [
     "win32"
@@ -7,9 +7,9 @@
   "cpu": [
     "ia32"
   ],
-  "main": "ast-grep-napi.win32-ia32-msvc.node",
+  "main": "vorpal-napi.win32-ia32-msvc.node",
   "files": [
-    "ast-grep-napi.win32-ia32-msvc.node"
+    "vorpal-napi.win32-ia32-msvc.node"
   ],
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "keywords": [
@@ -27,5 +27,5 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "repository": "https://github.com/ast-grep/ast-grep"
+  "repository": "https://github.com/adalundhe/vorpal"
 }

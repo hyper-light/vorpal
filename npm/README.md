@@ -1,12 +1,12 @@
-# @ast-grep/cli
+# @vorpal/cli
 
 <p align=center>
-  <img src="https://ast-grep.github.io/logo.svg" alt="ast-grep"/>
+  <img src="https://vorpal.github.io/logo.svg" alt="vorpal"/>
 </p>
 
-## ast-grep(sg)
+## vorpal(vp)
 
-ast-grep(sg) is a CLI tool for code structural search, lint, and rewriting.
+vorpal(vp) is a CLI tool for code structural search, lint, and rewriting.
 
-Please see [ast-grep's official site](https://ast-grep.github.io/) and [repository](https://github.com/ast-grep/ast-grep)
+Please see [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/adalundhe/vorpal)
 for more information.

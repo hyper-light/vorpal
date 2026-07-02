@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import List, TypedDict,  Literal, Dict, Union, Mapping, Optional
-from .ast_grep_py import SgNode, SgRoot, Pos, Range, Edit, register_dynamic_language
+from .vorpal_py import SgNode, SgRoot, Pos, Range, Edit, register_dynamic_language
 
 Strictness = Union[Literal["cst"], Literal["smart"], Literal["ast"], Literal["relaxed"], Literal["signature"]]
 

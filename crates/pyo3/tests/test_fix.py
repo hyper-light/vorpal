@@ -1,4 +1,4 @@
-from ast_grep_py import SgRoot
+from vorpal_py import SgRoot
 
 source = """
 function test() {

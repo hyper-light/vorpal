@@ -1,3 +1,3 @@
-# `@ast-grep/napi-win32-x64-msvc`
+# `@vorpal/napi-win32-x64-msvc`
 
-This is the **x86_64-pc-windows-msvc** binary for `@ast-grep/napi`
+This is the **x86_64-pc-windows-msvc** binary for `@vorpal/napi`

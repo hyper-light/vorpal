@@ -1,4 +1,4 @@
-from ast_grep_py import SgRoot, Rule
+from vorpal_py import SgRoot, Rule
 
 source = """
 function test() {

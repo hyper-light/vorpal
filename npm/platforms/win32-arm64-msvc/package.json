@@ -1,5 +1,5 @@
 {
-  "name": "@ast-grep/cli-win32-arm64-msvc",
+  "name": "@vorpal/cli-win32-arm64-msvc",
   "version": "0.44.0",
   "os": [
     "win32"
@@ -8,7 +8,7 @@
     "arm64"
   ],
   "files": [
-    "ast-grep.exe"
+    "vorpal.exe"
   ],
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "keywords": [
@@ -26,5 +26,5 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "repository": "https://github.com/ast-grep/ast-grep"
+  "repository": "https://github.com/adalundhe/vorpal"
 }

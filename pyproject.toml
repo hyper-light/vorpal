@@ -3,7 +3,7 @@ requires = ["maturin>=1.1,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "ast-grep-cli"
+name = "vorpal-cli"
 version = "0.44.0"
 description = "Structural Search and Rewrite code at large scale using precise AST pattern."
 authors = [{ name = "Herrington Darkholme", email = "2883231+HerringtonDarkholme@users.noreply.github.com" }]
@@ -32,9 +32,9 @@ classifiers = [
 
 
 [project.urls]
-Repository = "https://github.com/ast-grep/ast-grep"
-Documentation = "https://ast-grep.github.io/"
-Changelog = "https://github.com/ast-grep/ast-grep/blob/main/CHANGELOG.md"
+Repository = "https://github.com/adalundhe/vorpal"
+Documentation = "https://vorpal.github.io/"
+Changelog = "https://github.com/adalundhe/vorpal/blob/main/CHANGELOG.md"
 
 
 [tool.maturin]

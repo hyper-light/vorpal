@@ -1,5 +1,5 @@
 {
-  "name": "@ast-grep/napi-darwin-x64",
+  "name": "@vorpal/napi-darwin-x64",
   "version": "0.44.0",
   "os": [
     "darwin"
@@ -7,9 +7,9 @@
   "cpu": [
     "x64"
   ],
-  "main": "ast-grep-napi.darwin-x64.node",
+  "main": "vorpal-napi.darwin-x64.node",
   "files": [
-    "ast-grep-napi.darwin-x64.node"
+    "vorpal-napi.darwin-x64.node"
   ],
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "keywords": [
@@ -27,5 +27,5 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "repository": "https://github.com/ast-grep/ast-grep"
+  "repository": "https://github.com/adalundhe/vorpal"
 }

@@ -46,7 +46,7 @@ pub struct SgRoot {
 
 #[wasm_bindgen]
 impl SgRoot {
-  /// Returns the root SgNode of the ast-grep instance.
+  /// Returns the root SgNode of the Vorpal instance.
   pub fn root(&self) -> SgNode {
     // SAFETY: WasmDoc's Node type wraps a JS SyntaxNode (GC-managed, Clone).
     // It does not actually borrow from the Rust tree. The Rc keeps the
@@ -60,7 +60,7 @@ impl SgRoot {
     }
   }
 
-  /// Returns the path of the file if it is discovered by ast-grep's `findInFiles`.
+  /// Returns the path of the file if it is discovered by vorpal's `findInFiles`.
   /// Returns `"anonymous"` if the instance is created by `parse`.
   pub fn filename(&self) -> String {
     self.filename.clone()

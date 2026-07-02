@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 /// Rule configuration similar to YAML.
-/// See https://ast-grep.github.io/reference/yaml.html
+/// See https://vorpal.github.io/reference/yaml.html
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WasmConfig {
   pub rule: serde_json::Value,

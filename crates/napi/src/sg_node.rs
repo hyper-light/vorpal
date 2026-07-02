@@ -414,7 +414,7 @@ impl SgRoot {
 
 #[napi]
 impl SgRoot {
-  /// Returns the root SgNode of the ast-grep instance.
+  /// Returns the root SgNode of the Vorpal instance.
   #[napi]
   pub fn root(&self, root_ref: Reference<SgRoot>, _env: Env) -> Result<SgNode> {
     // SAFETY: root_ref keeps self alive for at least as long as the SgNode.
@@ -424,7 +424,7 @@ impl SgRoot {
       root_ref,
     })
   }
-  /// Returns the path of the file if it is discovered by ast-grep's `findInFiles`.
+  /// Returns the path of the file if it is discovered by vorpal's `findInFiles`.
   /// Returns `"anonymous"` if the instance is created by `lang.parse(source)`.
   #[napi]
   pub fn filename(&self) -> Result<String> {

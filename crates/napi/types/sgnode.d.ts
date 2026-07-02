@@ -88,10 +88,10 @@ export declare class SgNode<
 }
 /** Represents the parsed tree of code. */
 export declare class SgRoot<M extends TypesMap = TypesMap> {
-  /** Returns the root SgNode of the ast-grep instance. */
+  /** Returns the root SgNode of the Vorpal instance. */
   root(): SgNode<M, RootKind<M>>
   /**
-   * Returns the path of the file if it is discovered by ast-grep's `findInFiles`.
+   * Returns the path of the file if it is discovered by vorpal's `findInFiles`.
    * Returns `"anonymous"` if the instance is created by `lang.parse(source)`.
    */
   filename(): string

@@ -157,7 +157,7 @@ pub struct FindConfig {
   pub matcher: NapiConfig,
   /// An list of pattern globs to treat of certain files in the specified language.
   /// eg. ['*.vue', '*.svelte'] for html.findFiles, or ['*.ts'] for tsx.findFiles.
-  /// It is slightly different from https://ast-grep.github.io/reference/sgconfig.html#languageglobs
+  /// It is slightly different from https://vorpal.github.io/reference/sgconfig.html#languageglobs
   pub language_globs: Option<Vec<String>>,
 }
 

@@ -7,13 +7,13 @@ export declare function parseFiles<M extends TypesMap>(
   paths: Array<string> | FileOption,
   callback: (err: null | Error, result: SgRoot<M>) => void,
 ): Promise<number>
-/** Parse a string to an ast-grep instance */
+/** Parse a string to a Vorpal instance */
 export declare function parse<M extends TypesMap>(
   lang: NapiLang,
   src: string,
 ): SgRoot<M>
 /**
- * Parse a string to an ast-grep instance asynchronously in threads.
+ * Parse a string to a Vorpal instance asynchronously in threads.
  * It utilize multiple CPU cores when **concurrent processing sources**.
  * However, spawning excessive many threads may backfire.
  * Please refer to libuv doc, nodejs' underlying runtime
@@ -28,7 +28,7 @@ export declare function kind<M extends TypesMap>(
   lang: NapiLang,
   kindName: NamedKinds<M>,
 ): number
-/** Compile a string to ast-grep Pattern. */
+/** Compile a string to a Vorpal Pattern. */
 export declare function pattern<M extends TypesMap>(
   lang: NapiLang,
   pattern: string,

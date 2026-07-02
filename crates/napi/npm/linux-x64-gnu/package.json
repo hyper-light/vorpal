@@ -1,5 +1,5 @@
 {
-  "name": "@ast-grep/napi-linux-x64-gnu",
+  "name": "@vorpal/napi-linux-x64-gnu",
   "version": "0.44.0",
   "os": [
     "linux"
@@ -10,9 +10,9 @@
   "libc": [
     "glibc"
   ],
-  "main": "ast-grep-napi.linux-x64-gnu.node",
+  "main": "vorpal-napi.linux-x64-gnu.node",
   "files": [
-    "ast-grep-napi.linux-x64-gnu.node"
+    "vorpal-napi.linux-x64-gnu.node"
   ],
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "keywords": [
@@ -30,5 +30,5 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "repository": "https://github.com/ast-grep/ast-grep"
+  "repository": "https://github.com/adalundhe/vorpal"
 }

@@ -12,19 +12,19 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 /// Rule configuration similar to YAML
-/// See https://ast-grep.github.io/reference/yaml.html
+/// See https://vorpal.github.io/reference/yaml.html
 #[napi(object)]
 pub struct NapiConfig {
-  /// The rule object, see https://ast-grep.github.io/reference/rule.html
+  /// The rule object, see https://vorpal.github.io/reference/rule.html
   pub rule: serde_json::Value,
-  /// See https://ast-grep.github.io/guide/rule-config.html#constraints
+  /// See https://vorpal.github.io/guide/rule-config.html#constraints
   pub constraints: Option<serde_json::Value>,
   /// Available languages: html, css, js, jsx, ts, tsx
   pub language: Option<String>,
   /// transform is NOT useful in JavaScript. You can use JS code to directly transform the result.
-  /// https://ast-grep.github.io/reference/yaml.html#transform
+  /// https://vorpal.github.io/reference/yaml.html#transform
   pub transform: Option<serde_json::Value>,
-  /// https://ast-grep.github.io/guide/rule-config/utility-rule.html
+  /// https://vorpal.github.io/guide/rule-config/utility-rule.html
   pub utils: Option<serde_json::Value>,
 }
 

@@ -1,8 +1,8 @@
 {
-  "name": "@ast-grep/wasm",
+  "name": "@vorpal/wasm",
   "description": "Search and Rewrite code at large scale using precise AST pattern",
-  "homepage": "https://ast-grep.github.io",
-  "repository": "https://github.com/ast-grep/ast-grep",
+  "homepage": "https://vorpal.github.io",
+  "repository": "https://github.com/adalundhe/vorpal",
   "license": "MIT",
   "keywords": [
     "ast",
@@ -19,7 +19,7 @@
     "build": "wasm-pack build --target web --out-dir pkg",
     "build:nodejs": "wasm-pack build --target nodejs --out-dir pkg",
     "build:bundler": "wasm-pack build --target bundler --out-dir pkg",
-    "build:pkg": "wasm-pack build --scope ast-grep --release --target bundler --out-dir pkg && node scripts/patch-pkg.mjs",
+    "build:pkg": "wasm-pack build --scope vorpal --release --target bundler --out-dir pkg && node scripts/patch-pkg.mjs",
     "test": "NODE_PATH=$PWD/node_modules wasm-pack test --node",
     "test:js": "wasm-pack build --target nodejs --out-dir pkg && ava"
   },

@@ -1,4 +1,4 @@
-//! Integration tests for ast-grep-wasm.
+//! Integration tests for vorpal-wasm.
 //!
 //! Run with:
 //! ```bash
