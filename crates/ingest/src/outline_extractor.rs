@@ -62,6 +62,10 @@ impl OutlineExtractor {
 }
 
 impl FileExtractor for OutlineExtractor {
+  fn handles(&self, path: &str) -> bool {
+    OutlineExtractor::handles(self, path)
+  }
+
   fn extract_into(
     &self,
     path: &str,

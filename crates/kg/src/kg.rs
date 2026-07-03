@@ -131,6 +131,37 @@ impl Kg {
       .map(|u| NodeId::new(u as u64))
       .collect()
   }
+
+  /// All nodes whose display name equals `name` (a linear scan; the resident name/FTS index is
+  /// §3.2's job). The query surface a CLI/MCP exposes builds on this.
+  pub fn nodes_named(&self, name: &str) -> Vec<NodeId> {
+    (0..self.node_count() as u64)
+      .map(NodeId::new)
+      .filter(|&id| self.node(id).is_some_and(|view| view.name == name))
+      .collect()
+  }
+
+  /// Direct callers of any node named `name` (incoming `calls` edges).
+  pub fn callers_of(&self, name: &str) -> Vec<NodeId> {
+    self.incoming_named(name, EdgeType::CALLS)
+  }
+
+  /// Direct referrers of any node named `name` (incoming `references` edges).
+  pub fn references_to(&self, name: &str) -> Vec<NodeId> {
+    self.incoming_named(name, EdgeType::REFERENCES)
+  }
+
+  fn incoming_named(&self, name: &str, edge: EdgeType) -> Vec<NodeId> {
+    let mut found = Vec::new();
+    for target in self.nodes_named(name) {
+      for (from, kind) in self.in_neighbors(target) {
+        if kind == edge && !found.contains(&from) {
+          found.push(from);
+        }
+      }
+    }
+    found
+  }
 }
 
 fn is_containment(e: EdgeType) -> bool {

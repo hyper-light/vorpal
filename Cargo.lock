@@ -2412,6 +2412,7 @@ name = "vorpal-ingest"
 version = "0.44.0"
 dependencies = [
  "blake3",
+ "ignore",
  "vorpal-core",
  "vorpal-kg",
  "vorpal-language",

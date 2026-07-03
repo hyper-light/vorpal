@@ -18,6 +18,12 @@ pub trait FileExtractor {
     writer: &mut KgWriter,
     references: &mut Vec<Reference>,
   );
+
+  /// Whether this extractor handles `path` (default: all files). Directory ingestion skips files
+  /// for which this is false, avoiding reads of unsupported types.
+  fn handles(&self, _path: &str) -> bool {
+    true
+  }
 }
 
 /// Running totals for an ingest session.
@@ -77,6 +83,24 @@ impl<E: FileExtractor> Ingestor<E> {
   pub fn ingest_file(&mut self, path: &Path) -> io::Result<FileOutcome> {
     let source = std::fs::read_to_string(path)?;
     Ok(self.ingest_source(&path.to_string_lossy(), &source))
+  }
+
+  /// Recursively ingest a directory, respecting `.gitignore`, skipping files the extractor does
+  /// not handle. Bounded: one file is read at a time. Per-file read errors (e.g. non-UTF-8) are
+  /// skipped so a stray file cannot abort the walk.
+  pub fn ingest_dir(&mut self, root: &Path) -> io::Result<()> {
+    for entry in ignore::Walk::new(root) {
+      let entry = entry.map_err(io::Error::other)?;
+      if !entry.file_type().is_some_and(|t| t.is_file()) {
+        continue;
+      }
+      let path = entry.path();
+      if !self.extractor.handles(path.to_string_lossy().as_ref()) {
+        continue;
+      }
+      let _ = self.ingest_file(path);
+    }
+    Ok(())
   }
 
   pub fn stats(&self) -> IngestStats {

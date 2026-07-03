@@ -193,3 +193,16 @@ fn transitive_containment_closure() {
   // A leaf method reaches nothing downward.
   assert!(kg.reachable_out(parse).is_empty());
 }
+
+#[test]
+fn name_queries_over_the_kg() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("src/parser.rs", &parser_file());
+  let kg = writer.seal();
+
+  assert_eq!(kg.nodes_named("parse").len(), 1);
+  assert_eq!(kg.nodes_named("Parser").len(), 1);
+  assert!(kg.nodes_named("missing").is_empty());
+  // A containment-only graph has no `calls` edges.
+  assert!(kg.callers_of("parse").is_empty());
+}

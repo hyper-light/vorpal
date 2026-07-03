@@ -18,3 +18,4 @@ vorpal-language.workspace = true
 vorpal-resolve.workspace = true
 
 blake3 = "1"
+ignore.workspace = true
