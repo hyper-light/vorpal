@@ -1,0 +1,19 @@
+[package]
+name = "vorpal-ingest"
+description = "Streaming bounded-memory ingest pipeline (walk → parse → extract → KG) for vorpal"
+keywords = ["ingest", "streaming", "pipeline", "tree-sitter", "knowledge-graph"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-kg.workspace = true
+vorpal-outline.workspace = true
+vorpal-core.workspace = true
+vorpal-language.workspace = true
+
+blake3 = "1"

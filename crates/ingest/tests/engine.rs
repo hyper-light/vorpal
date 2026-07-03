@@ -1,0 +1,75 @@
+//! End-to-end L0→L1→L3: a real tree-sitter parse + outline extraction into the KG.
+
+use vorpal_ingest::{Ingestor, OutlineExtractor};
+use vorpal_kg::{NodeId, SymbolKind};
+
+const RUST_SRC: &str = "\
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+pub fn dist(p: Point) -> i32 {
+    p.x + p.y
+}
+";
+
+fn node_names(kg: &vorpal_kg::Kg) -> Vec<(String, SymbolKind)> {
+  (0..kg.node_count() as u64)
+    .filter_map(|i| kg.node(NodeId::new(i)))
+    .map(|v| (v.name.to_string(), v.kind))
+    .collect()
+}
+
+#[test]
+fn compiled_ruleset_covers_many_languages() {
+  let extractor = OutlineExtractor::new().expect("bundled rules compile");
+  assert!(
+    extractor.languages() >= 10,
+    "expected the bundled ruleset to cover many languages, got {}",
+    extractor.languages()
+  );
+  assert!(extractor.handles("lib.rs"));
+  assert!(extractor.handles("app.ts"));
+  assert!(!extractor.handles("notes.unknownext"));
+}
+
+#[test]
+fn extracts_a_real_rust_file_into_the_kg() {
+  let mut ing = Ingestor::new(OutlineExtractor::new().unwrap());
+  ing.ingest_source("lib.rs", RUST_SRC);
+  let kg = ing.seal();
+
+  let names = node_names(&kg);
+  assert!(
+    names.iter().any(|(n, _)| n == "lib.rs"),
+    "expected a File node; got {names:?}"
+  );
+  assert!(
+    names.iter().any(|(n, _)| n == "Point"),
+    "expected the Point struct to be extracted; got {names:?}"
+  );
+  assert!(
+    names.iter().any(|(n, _)| n == "dist"),
+    "expected the dist function to be extracted; got {names:?}"
+  );
+
+  // The file should define the top-level items (containment forest).
+  let file = (0..kg.node_count() as u64)
+    .map(NodeId::new)
+    .find(|&id| kg.node(id).is_some_and(|v| v.name == "lib.rs"))
+    .unwrap();
+  let defined: Vec<String> = kg
+    .defines(file)
+    .into_iter()
+    .filter_map(|id| kg.node(id).map(|v| v.name.to_string()))
+    .collect();
+  assert!(
+    defined.contains(&"Point".to_string()),
+    "file defines Point; got {defined:?}"
+  );
+  assert!(
+    defined.contains(&"dist".to_string()),
+    "file defines dist; got {defined:?}"
+  );
+}

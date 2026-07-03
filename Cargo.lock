@@ -2407,6 +2407,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorpal-ingest"
+version = "0.44.0"
+dependencies = [
+ "blake3",
+ "vorpal-core",
+ "vorpal-kg",
+ "vorpal-language",
+ "vorpal-outline",
+]
+
+[[package]]
 name = "vorpal-kg"
 version = "0.44.0"
 dependencies = [
