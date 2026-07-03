@@ -744,6 +744,15 @@ epoch-MVCC, reusing the fact that compaction already rewrites both CSR direction
   the forwarding cost. Path-clustered segments (the norm) → **no relabel, `fwd` dormant, zero
   overhead** — preserving "as efficient on 5 files as at Meta." RCM/BFS-order is deterministic →
   **bit-identical rebuild** (§10 bar).
+- **Tuning lever (not a redesign) if cross-unit translation gets hot.** The relabel unit is a
+  path-partitioned shard/subtree, so most edges stay intra-unit and `fwd` stays small. If the §8.4
+  loop shows boundary translation is still hot on **hub-heavy call graphs** (a few very-high-in-
+  degree nodes whose callers span many shards), **widen the compaction unit** — co-compact a hot
+  node's in-neighbor shards so its inbound edges are relabeled in the *same* pass, trading a larger
+  compaction working set for fewer forwarding lookups. Data-derived per hub (measured in-degree ×
+  cross-shard span, §8.1/§11.6); a knob, not a new mechanism. (The symmetric read-side option —
+  cap `fwd` translation by pinning hot hubs' ids across relabels — stays available if profiling
+  prefers it.)
 
 Sources: [FastLanes (VLDB'23)](https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf) ·
 [Vortex](https://github.com/vortex-data/vortex) · [Fjall 2.8](https://fjall-rs.github.io/post/fjall-2-8/) ·
