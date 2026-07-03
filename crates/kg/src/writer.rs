@@ -5,6 +5,7 @@
 //! references and inject `calls`/`references` edges before [`KgWriter::seal`] (§3.3 linking).
 
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
 use vorpal_canonical::{CanonicalIndex, CanonicalKey};
 use vorpal_graph::{EdgeLog, EdgeType, Graph};
@@ -82,9 +83,21 @@ impl KgWriter {
     self.edges.push(from.raw() as u32, to.raw() as u32, edge);
   }
 
-  /// Ingest one file's extracted outline: a `File` node, a node per top-level item, and a node
-  /// per member, wired with `defines` / `has_method` / `has_field` containment edges.
+  /// Ingest one file's extracted outline (see [`KgWriter::ingest_file_with_spans`]), discarding
+  /// the returned spans.
   pub fn ingest_file(&mut self, path: &str, items: &[OutlineItem<'_>]) {
+    let _ = self.ingest_file_with_spans(path, items);
+  }
+
+  /// Ingest a file's outline — a `File` node, a node per top-level item, and a node per member,
+  /// wired with `defines`/`has_method`/`has_field` edges — and return each item/member's
+  /// `(byte range, id)` so a caller can attribute references to their enclosing definition (§3.3).
+  pub fn ingest_file_with_spans(
+    &mut self,
+    path: &str,
+    items: &[OutlineItem<'_>],
+  ) -> Vec<(Range<usize>, NodeId)> {
+    let mut spans = Vec::new();
     let file_id = self.define(NodeDef {
       kind: SymbolKind::File,
       name: path,
@@ -109,6 +122,7 @@ impl KgWriter {
         content_hash: content_hash(&[name, signature]),
       });
       self.add_edge(file_id, item_id, EdgeType::DEFINES);
+      spans.push((item.entry.range.byte_offset.clone(), item_id));
 
       for member in &item.members {
         let mname = member.entry.name.as_ref();
@@ -125,8 +139,10 @@ impl KgWriter {
           content_hash: content_hash(&[&entity_path, msig]),
         });
         self.add_edge(item_id, member_id, mkind.containment_edge());
+        spans.push((member.entry.range.byte_offset.clone(), member_id));
       }
     }
+    spans
   }
 
   /// Visit every interned definition — used to build a symbol table for reference resolution.

@@ -12,6 +12,7 @@
 
 mod outline_extractor;
 mod pipeline;
+mod references;
 
 pub use outline_extractor::OutlineExtractor;
 pub use pipeline::{FileExtractor, FileOutcome, IngestStats, Ingestor};

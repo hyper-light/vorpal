@@ -13,6 +13,7 @@ use vorpal_outline::model::OutlineItem;
 use vorpal_resolve::Reference;
 
 use crate::pipeline::FileExtractor;
+use crate::references::{extract_references, ref_spec};
 
 /// Compiles the bundled outline rules into one [`CombinedExtractors`] per language and runs them
 /// against parsed files. Language is chosen from the file extension (§3.1 "all languages").
@@ -66,7 +67,7 @@ impl FileExtractor for OutlineExtractor {
     path: &str,
     source: &str,
     writer: &mut KgWriter,
-    _references: &mut Vec<Reference>,
+    references: &mut Vec<Reference>,
   ) {
     let Some(lang) = SupportLang::from_path(path) else {
       return;
@@ -74,10 +75,13 @@ impl FileExtractor for OutlineExtractor {
     let Some(combined) = self.by_lang.get(&lang) else {
       return;
     };
-    // The parse tree (`grep`) is owned locally; items borrow it and are copied into the KG heap
-    // by `ingest_file` before it drops — nothing borrowed escapes this scope.
+    // The parse tree (`grep`) is owned locally; items/nodes borrow it and are copied into the KG
+    // heap / reference buffer before it drops — nothing borrowed escapes this scope.
     let grep = lang.grep(source);
     let items: Vec<OutlineItem<'_>> = combined.extract(grep.root()).collect();
-    writer.ingest_file(path, &items);
+    let def_spans = writer.ingest_file_with_spans(path, &items);
+    if let Some(spec) = ref_spec(lang) {
+      extract_references(grep.root(), &spec, &def_spans, path, references);
+    }
   }
 }
