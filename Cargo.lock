@@ -2392,6 +2392,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorpal-graph"
+version = "0.44.0"
+dependencies = [
+ "vorpal-mem",
+]
+
+[[package]]
 name = "vorpal-language"
 version = "0.44.0"
 dependencies = [
