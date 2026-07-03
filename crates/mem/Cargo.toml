@@ -1,0 +1,16 @@
+[package]
+name = "vorpal-mem"
+description = "Adaptive memory substrate (huge pages, TLB-aware layout, prefetch, arenas) for vorpal"
+keywords = ["mmap", "hugepages", "tlb", "prefetch", "numa"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+memmap2 = "0.9.11"
+libc = "0.2"
+bumpalo = "3.20"
