@@ -11,6 +11,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+vorpal-mem.workspace = true
 vorpal-segment.workspace = true
 vorpal-graph.workspace = true
 vorpal-canonical.workspace = true

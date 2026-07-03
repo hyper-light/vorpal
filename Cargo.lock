@@ -2408,6 +2408,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorpal-index"
+version = "0.44.0"
+dependencies = [
+ "vorpal-ingest",
+ "vorpal-kg",
+]
+
+[[package]]
 name = "vorpal-ingest"
 version = "0.44.0"
 dependencies = [
@@ -2426,6 +2434,7 @@ version = "0.44.0"
 dependencies = [
  "vorpal-canonical",
  "vorpal-graph",
+ "vorpal-mem",
  "vorpal-outline",
  "vorpal-segment",
 ]

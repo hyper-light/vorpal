@@ -206,3 +206,35 @@ fn name_queries_over_the_kg() {
   // A containment-only graph has no `calls` edges.
   assert!(kg.callers_of("parse").is_empty());
 }
+
+#[test]
+fn persists_and_cold_opens_the_kg() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("src/parser.rs", &parser_file());
+  let kg = writer.seal();
+  let file = find(&kg, "src/parser.rs");
+  let before = defines_names(&kg, file);
+
+  let dir = std::env::temp_dir().join(format!("vorpal-kg-persist-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  kg.save(&dir).unwrap();
+
+  // Cold open (the node segment is mmapped, not heap-loaded).
+  let loaded = vorpal_kg::Kg::load(&dir).unwrap();
+  assert_eq!(loaded.node_count(), kg.node_count());
+  let file2 = find(&loaded, "src/parser.rs");
+  assert_eq!(loaded.node(file2).unwrap().name, "src/parser.rs");
+  assert_eq!(
+    defines_names(&loaded, file2),
+    before,
+    "containment survives the round-trip"
+  );
+  let parser = find(&loaded, "Parser");
+  assert_eq!(
+    defines_names(&loaded, parser),
+    vec!["parse", "pos"],
+    "members survive too"
+  );
+
+  let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1,7 +1,12 @@
 //! The sealed, queryable knowledge graph (§3.3, §3.5, §11).
 
-use vorpal_graph::{Direction, EdgeType, Graph, reachable};
-use vorpal_segment::{NodeId, Segment, SegmentDirectory};
+use std::fs;
+use std::io;
+use std::path::Path;
+
+use vorpal_graph::{Direction, EdgeLog, EdgeType, Graph, reachable};
+use vorpal_mem::{CorpusProbe, ResourcePolicy};
+use vorpal_segment::{NodeId, Segment, SegmentDirectory, SegmentError};
 
 use crate::model::SymbolKind;
 
@@ -162,6 +167,61 @@ impl Kg {
     }
     found
   }
+
+  /// Persist the graph to `dir`: the node `.vseg` segment, the string heap, and the edge list.
+  /// Sealed segments are immutable, so this is a plain write (§9.7).
+  pub fn save(&self, dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join("nodes.vseg"), self.nodes.bytes())?;
+    fs::write(dir.join("strings.heap"), &self.heap)?;
+
+    let edges: Vec<(u32, u32, u16)> = self.graph.out_edges().collect();
+    let mut buf = Vec::with_capacity(8 + edges.len() * 10);
+    buf.extend_from_slice(&(edges.len() as u64).to_le_bytes());
+    for (src, dst, etype) in edges {
+      buf.extend_from_slice(&src.to_le_bytes());
+      buf.extend_from_slice(&dst.to_le_bytes());
+      buf.extend_from_slice(&etype.to_le_bytes());
+    }
+    fs::write(dir.join("edges.bin"), &buf)?;
+    Ok(())
+  }
+
+  /// Cold-open a persisted graph: **mmap** the node segment (§9.1 — no heap load of the columns),
+  /// read the string heap, and rebuild the CSR/CSC from the edge list.
+  pub fn load(dir: &Path) -> Result<Self, SegmentError> {
+    let nodes_path = dir.join("nodes.vseg");
+    let size = fs::metadata(&nodes_path)?.len();
+    let policy = ResourcePolicy::probe(CorpusProbe::new(size, 1));
+    let nodes = Segment::open_file(&nodes_path, &policy)?;
+    let heap = fs::read(dir.join("strings.heap"))?;
+    let edge_bytes = fs::read(dir.join("edges.bin"))?;
+
+    let row_count = nodes.row_count();
+    let graph = rebuild_graph(row_count as u32, &edge_bytes);
+    let mut directory = SegmentDirectory::new();
+    directory.insert(0, row_count, 0);
+    Ok(Self::new(nodes, heap, graph, directory))
+  }
+}
+
+fn rebuild_graph(node_count: u32, bytes: &[u8]) -> Graph {
+  let mut log = EdgeLog::new();
+  if bytes.len() >= 8 {
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let mut off = 8usize;
+    for _ in 0..count {
+      if off + 10 > bytes.len() {
+        break;
+      }
+      let src = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+      let dst = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+      let etype = u16::from_le_bytes(bytes[off + 8..off + 10].try_into().unwrap());
+      log.push(src, dst, EdgeType(etype));
+      off += 10;
+    }
+  }
+  Graph::compact(node_count, &log)
 }
 
 fn is_containment(e: EdgeType) -> bool {
