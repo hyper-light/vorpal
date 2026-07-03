@@ -1,0 +1,16 @@
+[package]
+name = "vorpal-canonical"
+description = "Canonical blake3→NodeId identity/dedup/skip index (LSM-shaped) for vorpal"
+keywords = ["blake3", "dedup", "identity", "lsm", "interner"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-segment.workspace = true
+
+blake3 = "1"

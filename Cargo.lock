@@ -2351,6 +2351,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorpal-canonical"
+version = "0.44.0"
+dependencies = [
+ "blake3",
+ "vorpal-segment",
+]
+
+[[package]]
 name = "vorpal-config"
 version = "0.44.0"
 dependencies = [
