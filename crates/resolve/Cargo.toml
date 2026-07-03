@@ -1,0 +1,17 @@
+[package]
+name = "vorpal-resolve"
+description = "Cross-file reference resolution (§3.3): references → definitions with confidence"
+keywords = ["resolution", "code-graph", "symbols", "cross-file", "references"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-kg.workspace = true
+
+[dev-dependencies]
+vorpal-outline.workspace = true

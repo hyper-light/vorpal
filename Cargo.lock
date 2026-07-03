@@ -2416,6 +2416,7 @@ dependencies = [
  "vorpal-kg",
  "vorpal-language",
  "vorpal-outline",
+ "vorpal-resolve",
 ]
 
 [[package]]
