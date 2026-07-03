@@ -12,6 +12,7 @@
 //! successive relabels **compose** into a single lookup, so a stale cross-unit reference resolves
 //! without a chain. Node ids here are dense `u32` locators (a segment's local id space, §9.2).
 
+pub mod closure;
 pub mod edge;
 pub mod graph;
 pub mod relabel;
@@ -19,6 +20,7 @@ pub mod store;
 
 mod csr;
 
+pub use closure::{Direction, Strategy, reachable};
 pub use edge::{EdgeLog, EdgeType};
 pub use graph::Graph;
 pub use relabel::{ForwardingTable, avg_edge_id_span, bfs_locality_order};

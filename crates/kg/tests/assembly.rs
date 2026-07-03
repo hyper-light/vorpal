@@ -161,3 +161,35 @@ fn keeps_files_independent() {
   // The two `f` nodes have different containers.
   assert_ne!(kg.defines(a)[0], kg.defines(b)[0]);
 }
+
+#[test]
+fn transitive_containment_closure() {
+  let mut writer = KgWriter::new();
+  writer.ingest_file("src/parser.rs", &parser_file());
+  let kg = writer.seal();
+
+  let file = find(&kg, "src/parser.rs");
+  let parse = find(&kg, "parse");
+
+  let names = |ids: Vec<NodeId>| {
+    let mut v: Vec<String> = ids
+      .into_iter()
+      .map(|n| kg.node(n).unwrap().name.to_string())
+      .collect();
+    v.sort();
+    v
+  };
+
+  // The file transitively contains every node beneath it (§11.5 closure over out-edges).
+  assert_eq!(
+    names(kg.reachable_out(file)),
+    vec!["Parser", "helper", "parse", "pos"]
+  );
+  // A method's container chain up to the file (transitive in-edges).
+  assert_eq!(
+    names(kg.reachable_in(parse)),
+    vec!["Parser", "src/parser.rs"]
+  );
+  // A leaf method reaches nothing downward.
+  assert!(kg.reachable_out(parse).is_empty());
+}

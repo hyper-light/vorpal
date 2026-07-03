@@ -2403,6 +2403,7 @@ dependencies = [
 name = "vorpal-graph"
 version = "0.44.0"
 dependencies = [
+ "bit-set",
  "vorpal-mem",
 ]
 
@@ -2533,6 +2534,14 @@ dependencies = [
  "vorpal-core",
  "vorpal-dynamic",
  "vorpal-language",
+]
+
+[[package]]
+name = "vorpal-resolve"
+version = "0.44.0"
+dependencies = [
+ "vorpal-kg",
+ "vorpal-outline",
 ]
 
 [[package]]

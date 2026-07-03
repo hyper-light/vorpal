@@ -1,6 +1,6 @@
 //! The sealed, queryable knowledge graph (§3.3, §3.5, §11).
 
-use vorpal_graph::{EdgeType, Graph};
+use vorpal_graph::{Direction, EdgeType, Graph, reachable};
 use vorpal_segment::{NodeId, Segment, SegmentDirectory};
 
 use crate::model::SymbolKind;
@@ -110,6 +110,26 @@ impl Kg {
       .into_iter()
       .find(|(_, e)| is_containment(*e))
       .map(|(n, _)| n)
+  }
+
+  /// Everything reachable from `id` by following out-edges transitively (masked-SpMV closure,
+  /// §11.5). With today's containment-only edges this is the transitive `defines`/`has_*` set; the
+  /// same kernel covers `calls`/`references` once those edges are produced.
+  pub fn reachable_out(&self, id: NodeId) -> Vec<NodeId> {
+    self.reachable(id, Direction::Out)
+  }
+
+  /// Everything that transitively reaches `id` via in-edges (its container chain today;
+  /// transitive `callersOf` once call edges exist).
+  pub fn reachable_in(&self, id: NodeId) -> Vec<NodeId> {
+    self.reachable(id, Direction::In)
+  }
+
+  fn reachable(&self, id: NodeId, dir: Direction) -> Vec<NodeId> {
+    reachable(&self.graph, &[id.raw() as u32], dir)
+      .iter()
+      .map(|u| NodeId::new(u as u64))
+      .collect()
   }
 }
 
