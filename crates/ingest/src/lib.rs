@@ -15,4 +15,5 @@ mod pipeline;
 
 pub use outline_extractor::OutlineExtractor;
 pub use pipeline::{FileExtractor, FileOutcome, IngestStats, Ingestor};
-pub use vorpal_kg::{Kg, KgWriter};
+pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
+pub use vorpal_resolve::{RefKind, Reference, ResolveStats, Resolver};

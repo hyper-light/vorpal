@@ -1,27 +1,33 @@
 //! Assembles a knowledge graph from extraction output (§3.1→§3.3).
+//!
+//! Two-phase capable: [`KgWriter::define`] interns a node (returning its `NodeId`) and
+//! [`KgWriter::add_edge`] links two ids, so a caller can ingest definitions first, then resolve
+//! references and inject `calls`/`references` edges before [`KgWriter::seal`] (§3.3 linking).
 
 use std::hash::{Hash, Hasher};
 
 use vorpal_canonical::{CanonicalIndex, CanonicalKey};
 use vorpal_graph::{EdgeLog, EdgeType, Graph};
 use vorpal_outline::model::OutlineItem;
-use vorpal_segment::{Segment, SegmentBuilder, SegmentDirectory};
+use vorpal_segment::{NodeId, Segment, SegmentBuilder, SegmentDirectory};
 
 use crate::kg::Kg;
 use crate::model::SymbolKind;
 
-/// One node's attributes, staged for interning + column append.
-struct PendingNode<'a> {
-  kind: SymbolKind,
-  name: &'a str,
-  path: &'a str,
-  signature: &'a str,
-  exported: bool,
-  hash: u64,
+/// One node's attributes for [`KgWriter::define`]. `entity_path` is the identity within the file
+/// (e.g. `Owner.method`); `name` is the display name.
+pub struct NodeDef<'a> {
+  pub kind: SymbolKind,
+  pub name: &'a str,
+  pub entity_path: &'a str,
+  pub path: &'a str,
+  pub signature: &'a str,
+  pub exported: bool,
+  pub content_hash: u64,
 }
 
-/// Accumulates interned nodes (SoA columns + string heap) and containment edges, then seals a
-/// queryable [`Kg`]. Ids are dense and assignment-ordered, so a column row index equals its id.
+/// Accumulates interned nodes (SoA columns + string heap) and edges, then seals a queryable
+/// [`Kg`]. Ids are dense and assignment-ordered, so a column row index equals its id.
 #[derive(Default)]
 pub struct KgWriter {
   canonical: CanonicalIndex,
@@ -43,85 +49,99 @@ impl KgWriter {
     Self::default()
   }
 
-  /// Ingest one file's extracted outline: create a `File` node, a node per top-level item, and a
-  /// node per member, wired with `defines` / `has_method` / `has_field` containment edges.
-  pub fn ingest_file(&mut self, path: &str, items: &[OutlineItem<'_>]) {
-    let file_id = self.add_node(
-      CanonicalKey::of(path, ""),
-      PendingNode {
-        kind: SymbolKind::File,
-        name: path,
-        path,
-        signature: "",
-        exported: true,
-        hash: content_hash(&[path]),
-      },
-    );
-
-    for item in items {
-      let name = item.entry.name.as_ref();
-      let signature = item.entry.signature.as_ref();
-      let kind = SymbolKind::from_symbol_type(item.entry.symbol_type, item.is_import);
-      let item_id = self.add_node(
-        CanonicalKey::of(path, name),
-        PendingNode {
-          kind,
-          name,
-          path,
-          signature,
-          exported: item.is_exported,
-          hash: content_hash(&[name, signature]),
-        },
-      );
-      self.edges.push(file_id, item_id, EdgeType::DEFINES);
-
-      for member in &item.members {
-        let mname = member.entry.name.as_ref();
-        let msig = member.entry.signature.as_ref();
-        let mkind = SymbolKind::from_symbol_type(member.entry.symbol_type, false);
-        let entity_path = qualified(name, mname);
-        let member_id = self.add_node(
-          CanonicalKey::of(path, &entity_path),
-          PendingNode {
-            kind: mkind,
-            name: mname,
-            path,
-            signature: msig,
-            exported: member.is_public,
-            hash: content_hash(&[&entity_path, msig]),
-          },
-        );
-        self
-          .edges
-          .push(item_id, member_id, mkind.containment_edge());
-      }
-    }
-  }
-
-  /// Intern an entity and, if new, append its column row. Returns the dense node id (as `u32`).
-  fn add_node(&mut self, key: CanonicalKey, node: PendingNode<'_>) -> u32 {
-    let assignment = self.canonical.get_or_assign(key, node.hash);
-    let id = assignment.node_id().raw() as u32;
+  /// Intern an entity; if new, append its column row. Returns the dense node id. Re-defining the
+  /// same identity returns the existing id (dedup, §9.2) without appending.
+  pub fn define(&mut self, def: NodeDef<'_>) -> NodeId {
+    let key = CanonicalKey::of(def.path, def.entity_path);
+    let assignment = self.canonical.get_or_assign(key, def.content_hash);
+    let id = assignment.node_id();
     if assignment.is_new() {
       debug_assert_eq!(
-        id as usize,
+        id.raw() as usize,
         self.kind.len(),
         "dense assignment-ordered rows"
       );
-      let (name_off, name_len) = self.push_str(node.name);
-      let (path_off, path_len) = self.push_str(node.path);
-      let (sig_off, sig_len) = self.push_str(node.signature);
-      self.kind.push(node.kind.tag());
+      let (name_off, name_len) = self.push_str(def.name);
+      let (path_off, path_len) = self.push_str(def.path);
+      let (sig_off, sig_len) = self.push_str(def.signature);
+      self.kind.push(def.kind.tag());
       self.name_off.push(name_off);
       self.name_len.push(name_len);
       self.path_off.push(path_off);
       self.path_len.push(path_len);
       self.sig_off.push(sig_off);
       self.sig_len.push(sig_len);
-      self.content_hash.push(node.hash);
-      self.flags.push(u8::from(node.exported));
+      self.content_hash.push(def.content_hash);
+      self.flags.push(u8::from(def.exported));
     }
     id
+  }
+
+  /// Link two existing nodes with an edge (containment during ingest, resolved calls/refs after).
+  pub fn add_edge(&mut self, from: NodeId, to: NodeId, edge: EdgeType) {
+    self.edges.push(from.raw() as u32, to.raw() as u32, edge);
+  }
+
+  /// Ingest one file's extracted outline: a `File` node, a node per top-level item, and a node
+  /// per member, wired with `defines` / `has_method` / `has_field` containment edges.
+  pub fn ingest_file(&mut self, path: &str, items: &[OutlineItem<'_>]) {
+    let file_id = self.define(NodeDef {
+      kind: SymbolKind::File,
+      name: path,
+      entity_path: "",
+      path,
+      signature: "",
+      exported: true,
+      content_hash: content_hash(&[path]),
+    });
+
+    for item in items {
+      let name = item.entry.name.as_ref();
+      let signature = item.entry.signature.as_ref();
+      let kind = SymbolKind::from_symbol_type(item.entry.symbol_type, item.is_import);
+      let item_id = self.define(NodeDef {
+        kind,
+        name,
+        entity_path: name,
+        path,
+        signature,
+        exported: item.is_exported,
+        content_hash: content_hash(&[name, signature]),
+      });
+      self.add_edge(file_id, item_id, EdgeType::DEFINES);
+
+      for member in &item.members {
+        let mname = member.entry.name.as_ref();
+        let msig = member.entry.signature.as_ref();
+        let mkind = SymbolKind::from_symbol_type(member.entry.symbol_type, false);
+        let entity_path = qualified(name, mname);
+        let member_id = self.define(NodeDef {
+          kind: mkind,
+          name: mname,
+          entity_path: &entity_path,
+          path,
+          signature: msig,
+          exported: member.is_public,
+          content_hash: content_hash(&[&entity_path, msig]),
+        });
+        self.add_edge(item_id, member_id, mkind.containment_edge());
+      }
+    }
+  }
+
+  /// Visit every interned definition — used to build a symbol table for reference resolution.
+  pub fn for_each_definition<F: FnMut(NodeId, &str, &str, SymbolKind, bool)>(&self, mut visit: F) {
+    for row in 0..self.kind.len() {
+      let name = self.heap_str(self.name_off[row], self.name_len[row]);
+      let path = self.heap_str(self.path_off[row], self.path_len[row]);
+      let kind = SymbolKind::from_tag(self.kind[row]);
+      let exported = self.flags[row] & 1 != 0;
+      visit(NodeId::new(row as u64), name, path, kind, exported);
+    }
+  }
+
+  pub fn node_count(&self) -> usize {
+    self.kind.len()
   }
 
   fn push_str(&mut self, s: &str) -> (u32, u32) {
@@ -130,8 +150,8 @@ impl KgWriter {
     (off, s.len() as u32)
   }
 
-  pub fn node_count(&self) -> usize {
-    self.kind.len()
+  fn heap_str(&self, off: u32, len: u32) -> &str {
+    std::str::from_utf8(&self.heap[off as usize..(off + len) as usize]).unwrap_or("")
   }
 
   /// Seal the accumulated nodes into a `.vseg` node segment + string heap and compact the edges

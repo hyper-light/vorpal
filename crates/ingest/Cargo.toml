@@ -15,5 +15,6 @@ vorpal-kg.workspace = true
 vorpal-outline.workspace = true
 vorpal-core.workspace = true
 vorpal-language.workspace = true
+vorpal-resolve.workspace = true
 
 blake3 = "1"

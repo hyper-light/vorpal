@@ -12,7 +12,13 @@ use vorpal_outline::model::{
 struct StubExtractor;
 
 impl FileExtractor for StubExtractor {
-  fn extract_into(&self, path: &str, source: &str, writer: &mut KgWriter) {
+  fn extract_into(
+    &self,
+    path: &str,
+    source: &str,
+    writer: &mut KgWriter,
+    _references: &mut Vec<vorpal_ingest::Reference>,
+  ) {
     let item = OutlineItem {
       entry: OutlineEntry {
         role: EntryRole::Item,

@@ -10,6 +10,8 @@ use vorpal_outline::combined_extractor::CombinedExtractors;
 use vorpal_outline::extractor::{SerializableOutlineRule, parse_outline_rules};
 use vorpal_outline::model::OutlineItem;
 
+use vorpal_resolve::Reference;
+
 use crate::pipeline::FileExtractor;
 
 /// Compiles the bundled outline rules into one [`CombinedExtractors`] per language and runs them
@@ -59,7 +61,13 @@ impl OutlineExtractor {
 }
 
 impl FileExtractor for OutlineExtractor {
-  fn extract_into(&self, path: &str, source: &str, writer: &mut KgWriter) {
+  fn extract_into(
+    &self,
+    path: &str,
+    source: &str,
+    writer: &mut KgWriter,
+    _references: &mut Vec<Reference>,
+  ) {
     let Some(lang) = SupportLang::from_path(path) else {
       return;
     };
