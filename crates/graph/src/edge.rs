@@ -12,6 +12,8 @@ impl EdgeType {
   pub const IMPLEMENTS: EdgeType = EdgeType(4);
   pub const OF_TYPE: EdgeType = EdgeType(5);
   pub const OVERRIDES: EdgeType = EdgeType(6);
+  pub const HAS_METHOD: EdgeType = EdgeType(7);
+  pub const HAS_FIELD: EdgeType = EdgeType(8);
 }
 
 /// Append-only edge log: struct-of-arrays so a compaction pass streams columns (§9.3, §11.2).

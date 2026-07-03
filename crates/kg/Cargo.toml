@@ -1,0 +1,17 @@
+[package]
+name = "vorpal-kg"
+description = "Knowledge-graph assembly (L1→L3): outline extraction → interned nodes + graph edges"
+keywords = ["knowledge-graph", "code-graph", "extraction", "ingest"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-segment.workspace = true
+vorpal-graph.workspace = true
+vorpal-canonical.workspace = true
+vorpal-outline.workspace = true

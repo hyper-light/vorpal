@@ -164,3 +164,10 @@ impl CanonicalIndex {
     self.sealed.len()
   }
 }
+
+impl Default for CanonicalIndex {
+  /// An index assigning ids from 0.
+  fn default() -> Self {
+    Self::new(0)
+  }
+}

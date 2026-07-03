@@ -2407,6 +2407,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorpal-kg"
+version = "0.44.0"
+dependencies = [
+ "vorpal-canonical",
+ "vorpal-graph",
+ "vorpal-outline",
+ "vorpal-segment",
+]
+
+[[package]]
 name = "vorpal-language"
 version = "0.44.0"
 dependencies = [
