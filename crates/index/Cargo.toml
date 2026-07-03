@@ -1,0 +1,15 @@
+[package]
+name = "vorpal-index"
+description = "CLI over the vorpal ingest → resolve → persist → query pipeline"
+keywords = ["cli", "code-graph", "index", "query"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-ingest.workspace = true
+vorpal-kg.workspace = true
