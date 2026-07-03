@@ -529,7 +529,8 @@ measured statistic.**
 ### 8.2 Huge pages & TLB reach
 
 2 MB pages widen STLB reach ~512× (~3–4 GB); the hot subgraph becomes TLB-resident. **Trap:
-file-backed `MAP_HUGETLB` is anonymous-only** — `memmap2::huge()` silently no-ops on files.
+file-backed `MAP_HUGETLB` is anonymous-only** — `memmap2` 0.9.11 `MmapOptions::huge(Some(21|30))`
+(`MAP_HUGE_2MB`/`1GB`) applies only to `map_anon()`, and silently no-ops on files.
 Real paths: hot indexes on a **`hugetlbfs`** mount, or normal-file mmap + `MADV_HUGEPAGE` +
 **`MADV_COLLAPSE`** (Linux 6.1+, synchronously promotes page-cache to 2 MB folios at warmup),
 or an anonymous `MAP_HUGETLB` arena `pread` into. Use **mTHP** (6.10+, sub-PMD 16 K–512 K) as
@@ -545,16 +546,24 @@ runs on a Linux bench node.
 - **SoA + hot/cold split + 64 B (and 2 MB segment) alignment**, zero-copy typed mmap
   (`zerocopy`/`bytemuck`, `rkyv` for variable-shape) — not the `Cow`/`Vec`/`usize` DTO shapes.
   **Indices over pointers** everywhere (§9.2 dense `NodeId`); `blake3` is external identity only.
+- **Locality-preserving id order (delivers playbook #12's "graph reorder").** Commit-time
+  `NodeId` assignment follows **path/subtree order** (§3.4 path-partitioned shards, §10.5
+  path-sorted id space), so intra-file/package neighbors are already numerically clustered →
+  their CSR rows + hot columns share cache lines and (huge) pages for free. For hub-heavy call
+  graphs, **compaction may apply a within-segment locality relabel** (reverse Cuthill–McKee /
+  community order — Starling/Gorgeous "reorder-for-page-locality") behind a compaction-time id
+  remap (§9.7) — a bounded streaming pass on sealed/read-mostly segments only (adaptive; never on
+  the ingest hot path) — cutting cache-line *and* TLB misses on multi-hop `callersOf`/beam walks.
 - **Software prefetch** in ANN beam search and CSR frontier expansion — cfg-gated
   (`_mm_prefetch` x86 *stable*; inline `prfm pldl1keep` on aarch64, whose intrinsic is still
-  unstable). Distance auto-tuned by a warm-up sweep (D=0 no-op for tiny inputs). `MADV_WILLNEED`
+  unstable behind `feature(stdarch_aarch64_prefetch)`). Distance auto-tuned by a warm-up sweep (D=0 no-op for tiny inputs). `MADV_WILLNEED`
   ahead / `MADV_DONTNEED` behind for bounded-RSS streaming scans (Gorgeous/VeloANN pipelining).
 - **NUMA** (daemon, ≥2 sockets only): pin each shard's memory + its query workers to one node
   (`mbind`/`MPOL_BIND`), first-touch from the owning thread, **interleave** read-mostly global
-  indexes; disable `numa_balancing`. Crate: `hwlocality` (MSRV 1.85 = ours).
-- **Allocation:** per-worker **`bumpalo`** arenas, reset-per-batch (O(batch×workers), no global
-  allocator on the extract loop; huge-page-back once chunk ≥2 MiB); global = **`mimalloc`**
-  (THP by default) or **`tikv-jemallocator`** `thp:always,metadata_thp` for the server tier
+  indexes; disable `numa_balancing`. Crate: `hwlocality` 1.0.0-alpha (libhwloc ≥2.0, MSRV 1.85 = ours).
+- **Allocation:** per-worker **`bumpalo` 3.20.3** arenas, reset-per-batch (O(batch×workers), no
+  global allocator on the extract loop; huge-page-back once chunk ≥2 MiB); global = **`mimalloc`**
+  (THP by default) or **`tikv-jemallocator` 0.7.0** `thp:always,metadata_thp` for the server tier
   (not the small-run default — inflates RSS). `CachePadded` every hot atomic (dovetails §7.6).
 
 ### 8.4 Profiling loop ("lookaside profiling")
@@ -571,6 +580,7 @@ Sources: [kernel THP](https://docs.kernel.org/admin-guide/mm/transhuge.html) ·
 [mTHP (LWN 954094)](https://lwn.net/Articles/954094/) ·
 [madvise(2)](https://man7.org/linux/man-pages/man2/madvise.2.html) ·
 [Gorgeous disk-ANN layout (arXiv 2508.15290)](https://arxiv.org/html/2508.15290) ·
+[VeloANN cache-aware beam + proactive prefetch (arXiv 2602.22805)](https://arxiv.org/html/2602.22805v1) ·
 [rustc THP +5% (Kobzol)](https://kobzol.github.io/rust/rustc/2023/10/21/make-rust-compiler-5percent-faster.html) ·
 [Apple Silicon no superpages](https://developer.apple.com/forums/thread/713579) ·
 [perf top-down](https://perfwiki.github.io/main/top-down-analysis/) · `memmap2`, `hwlocality`,
