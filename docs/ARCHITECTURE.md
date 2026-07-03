@@ -552,7 +552,7 @@ runs on a Linux bench node.
   their CSR rows + hot columns share cache lines and (huge) pages for free. For hub-heavy call
   graphs, **compaction may apply a within-segment locality relabel** (reverse Cuthill–McKee /
   community order — Starling/Gorgeous "reorder-for-page-locality") behind a compaction-time id
-  remap (§9.7) — a bounded streaming pass on sealed/read-mostly segments only (adaptive; never on
+  remap (§9.8) — a bounded streaming pass on sealed/read-mostly segments only (adaptive; never on
   the ingest hot path) — cutting cache-line *and* TLB misses on multi-hop `callersOf`/beam walks.
 - **Software prefetch** in ANN beam search and CSR frontier expansion — cfg-gated
   (`_mm_prefetch` x86 *stable*; inline `prfm pldl1keep` on aarch64, whose intrinsic is still
@@ -614,13 +614,17 @@ zero decode, zero deserialize (mmap `&[T]` via `zerocopy`). Node HOT stripe ≈2
 
 - **Dense monotone `NodeId` u64** = `segment.logical_id_base + row`, assigned at commit. All
   internal cross-refs / CSR endpoints / offset math key on it → **O(1) direct**, no associative
-  structure. Because ids are dense+contiguous per segment, the "paged offset index" collapses
+  structure. It is a **physical locator, not a permanent identity** — valid from its assigning
+  epoch and **forwarded (not preserved) across a locality-relabel compaction (§9.8)**; `blake3`
+  carries permanent identity. Because ids are dense+contiguous per segment, the "paged offset index" collapses
   to a **~180 KB sorted segment directory** (`id_base → segment_id`, binary-searched, resident).
   *(Per-shard `u32` local ordinal + global `u48` handle; `u32` overflows at 10¹⁰ edges.)*
 - **`blake3`(path:entityPath) → `NodeId`** is the identity/dedup/skip spine and the **only
   associative index** (§9.6). It's the *external* identity.
-- Reconciliation with §7: durable cross-refs = offset-computable dense `NodeId`; the in-memory
-  *delta overlay* uses generational-index handles (`thunderdome`, ABA-safe); `blake3` = external.
+- Reconciliation with §7: durable *in-graph* cross-refs = offset-computable dense `NodeId`
+  (forwarded at compaction, §9.8); references that must survive an arbitrary relabel store
+  `blake3` and resolve via the canonical index; the in-memory *delta overlay* uses
+  generational-index handles (`thunderdome`, ABA-safe); `blake3` = external permanent identity.
 
 ### 9.3 Edges = one LSM (write form ⋈ read form)
 
@@ -689,14 +693,70 @@ the manifest or not, so no partial-segment corruption is observable (fixes playb
 **Compaction** is background, **per-shard** (preserves single-writer): read live + apply
 tombstones → write new segments → publish new epoch → `munmap`+unlink old **only after readers
 pinned at referencing epochs quiesce** (§7.3 Tier-A) — non-blocking for readers; also transforms
-edge delta-log → CSR (§9.3).
+edge delta-log → CSR (§9.3) and **optionally relabels for locality (§9.8)**.
+
+### 9.8 Compaction-time `NodeId` remap (locality relabel without breaking identity)
+
+Delivers §8.3's "graph reorder" as a *correct, bounded* mechanism, resolving the tension with the
+stable-`NodeId` contract (§9.2): **`NodeId` is a physical locator, not an identity — `blake3` is
+identity.** Compaction is therefore free to reassign `NodeId`s in locality order, via the
+copying-GC **"forwarding pointer + remembered set"** pattern mapped onto LSM segment compaction +
+epoch-MVCC, reusing the fact that compaction already rewrites both CSR directions.
+
+- **Fused into compaction, not a separate pass.** Compaction already reads a shard's live
+  nodes/edges, applies tombstones, and rebuilds **CSR(out)+CSC(in)** (§9.3/§9.7); it additionally
+  assigns new dense `NodeId`s in **locality order** — cheap **RCM / BFS-order** (deterministic
+  seed = lowest `blake3`), *not* full **Gorder** (whose reorder cost needs ~800+ queries to
+  amortize; RCM/BFS amortize far faster). The compaction unit is a path-partitioned shard/subtree
+  (already clustered, §3.4/§10.5), so this is a light refinement, and endpoints **inside the unit**
+  are emitted with new ids for free → zero extra passes.
+- **Forwarding table = remembered set.** Compaction emits `fwd: old_id → new_id` for relabeled
+  nodes — a **dense array over the old id range** (Elias–Fano if tombstones sparsified it),
+  published *immutable* into the new manifest epoch (RCU-swap, §7.4), resident, small (spans only
+  the relabeled range). **Successive relabels compose** (each new table rewrites its targets
+  through prior tables → maps straight to *current* ids), so translation is always a **single
+  lookup, never a chain**.
+- **Cross-unit edges — the one hard case.** An out-edge from `c` (un-compacted shard) to relabeled
+  `u` still holds `dst = u_old`. Two mechanisms: (1) **read-time translate** — a traversal
+  following endpoint `x` bounds-checks it against the epoch's relabeled ranges and, on hit, does
+  one `fwd[x]` load → **one check + one indexed load per cross-unit boundary crossing** (not per
+  hop; within-unit CSR already uses new ids), decaying as fixup proceeds. This is the
+  external→logical translation the dynamic-graph-store literature measures (Teseo/RapidStore vertex
+  index), but a *dense array* since our old ids are dense — not a hash table. (2) **Lazy scavenge**
+  — when shard `S` is itself later compacted, its endpoints are rewritten through the current `fwd`
+  and resolved entries retired; a `fwd` entry is GC'd once no segment at any pinned epoch
+  references its old id (epoch refcount). Forwarding lives **at most until every referencing shard
+  compacts once** — bounded by compaction cadence, like generational-GC remembered-set drain.
+- **MVCC — no torn relabel.** Old segments + ids stay mapped until readers pinned at referencing
+  epochs quiesce (§7.3 Tier-A, already the rule). A reader at epoch `E` translates only via `fwd`
+  tables published ≤`E`; a reader at the old epoch uses old ids directly and never consults `fwd`.
+  Tables are immutable once published → no reader observes a partial relabel.
+- **Remapped vs. untouched (the invariant that bounds cost).** *Only* `NodeId`-keyed structures
+  are touched: CSR/CSC (rebuilt — free); canonical `blake3→NodeId` (LSM *put*, stable key — one
+  put per relabeled node, batched into the compaction's canonical checkpoint, §9.6/§9.7);
+  containment forest (§11.4), tombstone bitmaps, offset directory (§9.2) — per-segment,
+  rebuilt/natural. **Untouched** (stable-keyed): ANN (`ChunkId`/vector id; chunk→node is a
+  forwarded graph edge), FTS (Tantivy join on `path`/`blake3`), and the in-memory delta overlay
+  (`thunderdome` generational handles, `NodeId`-independent, folded in with fresh ids at compaction).
+- **Adaptive — the common case pays nothing.** Relabel is **opt-in per compaction unit**, gated by
+  §8.1/§11.6: engage only when a segment's measured locality (avg edge id-span / cache-line
+  utilization, §8.4 loop) is poor enough that the reorder win (amortized over many queries) beats
+  the forwarding cost. Path-clustered segments (the norm) → **no relabel, `fwd` dormant, zero
+  overhead** — preserving "as efficient on 5 files as at Meta." RCM/BFS-order is deterministic →
+  **bit-identical rebuild** (§10 bar).
 
 Sources: [FastLanes (VLDB'23)](https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf) ·
 [Vortex](https://github.com/vortex-data/vortex) · [Fjall 2.8](https://fjall-rs.github.io/post/fjall-2-8/) ·
 [rust-storage-bench](https://github.com/marvin-j97/rust-storage-bench) ·
 [io-uring](https://github.com/tokio-rs/io-uring) · [glommio](https://github.com/DataDog/glommio) ·
 [Learned indexes on disk (arXiv 2305.01237)](https://arxiv.org/pdf/2305.01237) ·
-[EDBT'26 learned-index LSM eval](https://openproceedings.org/2026/conf/edbt/paper-111.pdf).
+[EDBT'26 learned-index LSM eval](https://openproceedings.org/2026/conf/edbt/paper-111.pdf) ·
+[Teseo dynamic graph store (VLDB'21)](http://vldb.org/pvldb/vol14/p1053-leo.pdf) ·
+[RapidStore (arXiv 2507.00839)](https://arxiv.org/html/2507.00839v1) ·
+[in-memory dynamic graph storage (arXiv 2502.10959)](https://arxiv.org/pdf/2502.10959) ·
+[graph-reordering survey (arXiv 2309.07581)](https://arxiv.org/pdf/2309.07581) ·
+[amortized cost of graph reordering (SSDBM'25)](https://dl.acm.org/doi/10.1145/3733723.3733730) ·
+[reordering for cache-efficient NNS](https://openreview.net/pdf?id=8LeCgKb6UX).
 
 ---
 
