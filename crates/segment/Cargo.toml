@@ -1,0 +1,19 @@
+[package]
+name = "vorpal-segment"
+description = "Immutable columnar `.vseg` segment container + dense-id segment directory for vorpal"
+keywords = ["columnar", "mmap", "segment", "storage", "zero-copy"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-mem.workspace = true
+
+bytemuck = "1"
+blake3 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+thiserror.workspace = true
