@@ -22,15 +22,20 @@ fn node_names(kg: &vorpal_kg::Kg) -> Vec<(String, SymbolKind)> {
 }
 
 #[test]
-fn compiled_ruleset_covers_many_languages() {
+fn compiled_ruleset_covers_all_supported_languages() {
   let extractor = OutlineExtractor::new().expect("bundled rules compile");
   assert!(
-    extractor.languages() >= 10,
-    "expected the bundled ruleset to cover many languages, got {}",
+    extractor.languages() >= 28,
+    "expected outline rules for all 28 supported languages, got {}",
     extractor.languages()
   );
-  assert!(extractor.handles("lib.rs"));
-  assert!(extractor.handles("app.ts"));
+  // One extension per SupportLang variant — every language is handled end-to-end.
+  for ext in [
+    "sh", "c", "cpp", "cs", "css", "dart", "go", "ex", "hs", "tf", "html", "java", "js", "json",
+    "kt", "lua", "md", "nix", "php", "py", "rb", "rs", "scala", "sol", "swift", "ts", "tsx", "yml",
+  ] {
+    assert!(extractor.handles(&format!("file.{ext}")), "extension {ext}");
+  }
   assert!(!extractor.handles("notes.unknownext"));
 }
 

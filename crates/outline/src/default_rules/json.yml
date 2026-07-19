@@ -1,0 +1,36 @@
+id: json-pair
+language: Json
+role: item
+symbolType: key
+rule:
+  all:
+    - kind: pair
+    - has:
+        field: key
+        pattern: $KEY
+transform:
+  NAME:
+    replace:
+      source: $KEY
+      replace: '"'
+      by: ''
+name: '$NAME'
+---
+id: json-nested-pair
+language: Json
+role: member
+parentRuleIds: [json-pair]
+symbolType: key
+rule:
+  all:
+    - kind: pair
+    - has:
+        field: key
+        pattern: $KEY
+transform:
+  NAME:
+    replace:
+      source: $KEY
+      replace: '"'
+      by: ''
+name: '$NAME'

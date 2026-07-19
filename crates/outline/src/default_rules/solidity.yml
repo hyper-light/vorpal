@@ -1,0 +1,149 @@
+id: solidity-contract
+language: Solidity
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: contract_declaration
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: solidity-interface
+language: Solidity
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: interface_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: solidity-library
+language: Solidity
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: library_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: solidity-struct
+language: Solidity
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: struct_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: solidity-enum
+language: Solidity
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: enum_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: solidity-function
+language: Solidity
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: solidity-contract-function
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract, solidity-interface, solidity-library]
+symbolType: method
+rule:
+  all:
+    - kind: function_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: solidity-event
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract, solidity-interface, solidity-library]
+symbolType: event
+rule:
+  all:
+    - kind: event_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: solidity-state-variable
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract, solidity-interface, solidity-library]
+symbolType: field
+rule:
+  all:
+    - kind: state_variable_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'

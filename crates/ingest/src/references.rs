@@ -326,9 +326,11 @@ const HASKELL: RefSpec = RefSpec {
 };
 
 const SOLIDITY: RefSpec = RefSpec {
+  // The pinned grammar's call_expression carries its callee as a child `expression` wrapper,
+  // not a `function` field (verified by parse probe).
   calls: &[CallSpec {
     kind: "call_expression",
-    callee: Sel::Field("function"),
+    callee: Sel::FirstNamedChild,
   }],
   imports: &[
     ImportSpec {
@@ -649,6 +651,8 @@ const DESCEND_KINDS: &[&str] = &[
   "scope_resolution",
   "dot",
   "aliased_import",
+  // Solidity wraps callees in a generic `expression` node.
+  "expression",
 ];
 
 /// The rightmost identifier of a callee/import expression — one universal navigator; unmatched

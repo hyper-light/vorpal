@@ -1,0 +1,117 @@
+id: dart-class
+language: Dart
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: class_declaration
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: dart-mixin
+language: Dart
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: mixin_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: dart-enum
+language: Dart
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: enum_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: dart-extension
+language: Dart
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: extension_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+# Dart wraps a function's signature and body in `function_declaration`; matching the wrapper
+# keeps the definition span covering the body (call attribution depends on it).
+id: dart-function
+language: Dart
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_declaration
+    - pattern: $DECL
+    - has:
+        kind: function_signature
+        has:
+          kind: identifier
+          pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: dart-method
+language: Dart
+role: member
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension]
+symbolType: method
+rule:
+  all:
+    - kind: function_declaration
+    - pattern: $DECL
+    - has:
+        kind: function_signature
+        has:
+          kind: identifier
+          pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'

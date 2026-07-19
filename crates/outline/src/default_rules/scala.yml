@@ -1,0 +1,177 @@
+id: scala-class
+language: Scala
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: class_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*(:|\{)[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: scala-object
+language: Scala
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: object_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*(:|\{)[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: scala-trait
+language: Scala
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: trait_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*(:|\{)[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: scala-enum
+language: Scala
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: enum_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*(:|\{)[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: scala-type
+language: Scala
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: type_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: scala-function
+language: Scala
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*(=|\{)[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: scala-method
+language: Scala
+role: member
+parentRuleIds: [scala-class, scala-object, scala-trait, scala-enum]
+symbolType: method
+rule:
+  all:
+    - kind: function_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\s*(=|\{)[\s\S]*$'
+      by: ''
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: scala-field
+language: Scala
+role: member
+parentRuleIds: [scala-class, scala-object, scala-trait, scala-enum]
+symbolType: field
+rule:
+  all:
+    - any:
+        - kind: val_definition
+        - kind: var_definition
+    - has:
+        field: pattern
+        pattern: $NAME
+name: '$NAME'

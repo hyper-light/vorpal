@@ -77,6 +77,8 @@ impl SymbolKind {
       SymbolType::Variable => SymbolKind::Variable,
       SymbolType::Constant => SymbolKind::Constant,
       SymbolType::TypeParameter => SymbolKind::TypeParameter,
+      // Structural-language keys (JSON/YAML pairs, Nix bindings) read as properties.
+      SymbolType::Key => SymbolKind::Property,
       _ => SymbolKind::Other,
     }
   }

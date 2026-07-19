@@ -1,0 +1,58 @@
+id: html-element
+language: Html
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'
+---
+id: html-child-element
+language: Html
+role: member
+parentRuleIds: [html-element]
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'
+---
+id: html-script
+language: Html
+role: member
+parentRuleIds: [html-element]
+symbolType: object
+rule:
+  kind: script_element
+name: 'script'
+---
+id: html-style
+language: Html
+role: member
+parentRuleIds: [html-element]
+symbolType: object
+rule:
+  kind: style_element
+name: 'style'

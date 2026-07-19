@@ -1,0 +1,36 @@
+id: css-rule
+language: Css
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: rule_set
+    - has:
+        kind: selectors
+        pattern: $NAME
+name: '$NAME'
+---
+id: css-keyframes
+language: Css
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: keyframes_statement
+    - has:
+        kind: keyframes_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: css-declaration
+language: Css
+role: member
+parentRuleIds: [css-rule, css-keyframes]
+symbolType: property
+rule:
+  all:
+    - kind: declaration
+    - has:
+        kind: property_name
+        pattern: $NAME
+name: '$NAME'

@@ -1,0 +1,57 @@
+# HCL/Terraform structure: labeled blocks (`resource "aws_instance" "web" {`) name themselves by
+# their last string label; bare blocks (`locals {`) by their type identifier.
+id: hcl-labeled-block
+language: Hcl
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: block
+    - pattern: $DECL
+    - has:
+        kind: identifier
+        pattern: $TYPE
+    - has:
+        kind: string_lit
+        pattern: $LABEL
+transform:
+  NAME:
+    replace:
+      source: $LABEL
+      replace: '"'
+      by: ''
+  SIG:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+---
+id: hcl-block
+language: Hcl
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: block
+    - has:
+        kind: identifier
+        pattern: $TYPE
+    - not:
+        has:
+          kind: string_lit
+name: '$TYPE'
+---
+id: hcl-attribute
+language: Hcl
+role: member
+parentRuleIds: [hcl-labeled-block, hcl-block]
+symbolType: property
+rule:
+  all:
+    - kind: attribute
+    - has:
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'

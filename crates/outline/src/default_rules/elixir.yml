@@ -1,0 +1,90 @@
+# Elixir definitions are `call` nodes (`defmodule`/`def`/… are macros); rules classify by the
+# call's `target` identifier text, mirroring the reference extractor's SkipDefinition family.
+id: elixir-module
+language: Elixir
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: call
+    - has:
+        field: target
+        regex: '^defmodule$'
+    - has:
+        kind: arguments
+        has:
+          kind: alias
+          pattern: $NAME
+name: '$NAME'
+---
+id: elixir-function
+language: Elixir
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: call
+    - has:
+        field: target
+        regex: '^(def|defmacro|defguard|defdelegate)$'
+    - has:
+        kind: arguments
+        any:
+          - has:
+              kind: call
+              has:
+                field: target
+                pattern: $NAME
+          - has:
+              kind: identifier
+              pattern: $NAME
+name: '$NAME'
+---
+id: elixir-module-function
+language: Elixir
+role: member
+parentRuleIds: [elixir-module]
+symbolType: function
+rule:
+  all:
+    - kind: call
+    - has:
+        field: target
+        regex: '^(def|defmacro|defguard|defdelegate)$'
+    - has:
+        kind: arguments
+        any:
+          - has:
+              kind: call
+              has:
+                field: target
+                pattern: $NAME
+          - has:
+              kind: identifier
+              pattern: $NAME
+name: '$NAME'
+---
+id: elixir-module-private-function
+language: Elixir
+role: member
+parentRuleIds: [elixir-module]
+symbolType: function
+rule:
+  all:
+    - kind: call
+    - has:
+        field: target
+        regex: '^(defp|defmacrop|defguardp)$'
+    - has:
+        kind: arguments
+        any:
+          - has:
+              kind: call
+              has:
+                field: target
+                pattern: $NAME
+          - has:
+              kind: identifier
+              pattern: $NAME
+name: '$NAME'
+isPublic: false

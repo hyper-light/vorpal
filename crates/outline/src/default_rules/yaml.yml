@@ -1,0 +1,26 @@
+id: yaml-pair
+language: Yaml
+role: item
+symbolType: key
+rule:
+  all:
+    - kind: block_mapping_pair
+    - has:
+        field: key
+        pattern: $NAME
+name: '$NAME'
+---
+id: yaml-nested-pair
+language: Yaml
+role: member
+parentRuleIds: [yaml-pair]
+symbolType: key
+rule:
+  all:
+    - any:
+        - kind: block_mapping_pair
+        - kind: flow_pair
+    - has:
+        field: key
+        pattern: $NAME
+name: '$NAME'

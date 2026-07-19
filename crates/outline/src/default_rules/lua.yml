@@ -1,0 +1,24 @@
+id: lua-function
+language: Lua
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_declaration
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  BODYLESS:
+    replace:
+      source: $DECL
+      replace: '\)[\s\S]*$'
+      by: ')'
+  SIG:
+    replace:
+      source: $BODYLESS
+      replace: '\n[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'

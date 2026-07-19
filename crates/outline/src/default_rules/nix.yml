@@ -1,0 +1,24 @@
+id: nix-binding
+language: Nix
+role: item
+symbolType: property
+rule:
+  all:
+    - kind: binding
+    - has:
+        field: attrpath
+        pattern: $NAME
+name: '$NAME'
+---
+id: nix-nested-binding
+language: Nix
+role: member
+parentRuleIds: [nix-binding]
+symbolType: property
+rule:
+  all:
+    - kind: binding
+    - has:
+        field: attrpath
+        pattern: $NAME
+name: '$NAME'

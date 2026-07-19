@@ -1,0 +1,39 @@
+# Markdown document structure: sections named by their headings; nested sections are members.
+# A bare `$NAME` pattern parses as a paragraph in markdown, so the heading text is captured via
+# the context+selector pattern form (parse `# $NAME`, root the pattern at the `inline` node).
+id: md-section
+language: Markdown
+role: item
+symbolType: namespace
+rule:
+  all:
+    - kind: section
+    - has:
+        any:
+          - kind: atx_heading
+          - kind: setext_heading
+        has:
+          stopBy: end
+          pattern:
+            context: '# $NAME'
+            selector: inline
+name: '$NAME'
+---
+id: md-subsection
+language: Markdown
+role: member
+parentRuleIds: [md-section]
+symbolType: namespace
+rule:
+  all:
+    - kind: section
+    - has:
+        any:
+          - kind: atx_heading
+          - kind: setext_heading
+        has:
+          stopBy: end
+          pattern:
+            context: '# $NAME'
+            selector: inline
+name: '$NAME'
