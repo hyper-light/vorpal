@@ -35,7 +35,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("unchanged — reused existing index ({} nodes)", report.nodes);
       } else {
         println!(
-          "indexed {} files ({} skipped) → {} nodes, {} calls resolved, {} unresolved",
+          "parsed {} files ({} replayed from cache) → {} nodes, {} calls resolved, {} unresolved",
           report.indexed, report.skipped, report.nodes, report.resolved, report.unresolved
         );
       }

@@ -85,6 +85,12 @@ impl<E: FileExtractor> Ingestor<E> {
     Ok(self.ingest_source(&path.to_string_lossy(), &source))
   }
 
+  /// Ingest a pre-extracted [`FileProduct`] (freshly built or replayed from the incremental
+  /// cache) — defines the file's entities and re-attributes its references by entity path.
+  pub fn ingest_product(&mut self, path: &str, product: &crate::FileProduct) {
+    apply_product(path, product, &mut self.writer, &mut self.references);
+  }
+
   /// Recursively ingest a directory, respecting `.gitignore`, skipping files the extractor does
   /// not handle. Bounded: one file is read at a time. Per-file read errors (e.g. non-UTF-8) are
   /// skipped so a stray file cannot abort the walk.
@@ -132,6 +138,30 @@ impl<E: FileExtractor> Ingestor<E> {
       self.writer.add_edge(edge.from, edge.to, edge.edge);
     }
     (self.writer.seal(), stats)
+  }
+}
+
+/// Apply one file's product to the writer: ingest its items, then push its references with
+/// `from` resolved through the writer's canonical identity (entity path → fresh `NodeId`).
+pub(crate) fn apply_product(
+  path: &str,
+  product: &crate::FileProduct,
+  writer: &mut KgWriter,
+  references: &mut Vec<Reference>,
+) {
+  writer.ingest_file(path, &product.items);
+  for r in &product.refs {
+    if let Some(from) = writer.entity_id(path, &r.from_entity) {
+      references.push(
+        Reference::new(
+          from,
+          path,
+          r.name.clone(),
+          crate::product::tag_refkind(r.kind),
+        )
+        .with_evidence(r.start, r.end),
+      );
+    }
   }
 }
 

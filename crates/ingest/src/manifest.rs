@@ -64,6 +64,20 @@ impl Manifest {
     self.entries == prior.entries
   }
 
+  /// All scanned files, sorted by path.
+  pub fn entries(&self) -> &[FileStat] {
+    &self.entries
+  }
+
+  /// Whether this manifest holds an identical stat for `stat` (same path, size, and mtime) —
+  /// the per-file unchanged test driving incremental re-index.
+  pub fn contains(&self, stat: &FileStat) -> bool {
+    self
+      .entries
+      .binary_search_by(|e| e.path.cmp(&stat.path))
+      .is_ok_and(|i| self.entries[i] == *stat)
+  }
+
   pub fn save(&self, path: &Path) -> io::Result<()> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());

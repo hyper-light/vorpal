@@ -148,6 +148,12 @@ impl KgWriter {
     spans
   }
 
+  /// The interned id for an entity (`entity_path` within `path`), if defined — the stable-key
+  /// lookup replayed extraction products use to re-attribute their references.
+  pub fn entity_id(&self, path: &str, entity_path: &str) -> Option<NodeId> {
+    self.canonical.lookup(&CanonicalKey::of(path, entity_path))
+  }
+
   /// Visit every interned definition — used to build a symbol table for reference resolution.
   pub fn for_each_definition<F: FnMut(NodeId, &str, &str, SymbolKind, bool)>(&self, mut visit: F) {
     for row in 0..self.kind.len() {

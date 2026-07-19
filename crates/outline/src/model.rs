@@ -62,7 +62,7 @@ pub enum EntryRole {
 /// This mirrors scan JSON's private `Position` shape. Core `Position` is not
 /// serializable, and config's serializable range type is an internal matcher
 /// input shape with optional columns, so outline keeps its output contract local.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourcePosition {
   /// Zero-based line number.
@@ -75,7 +75,7 @@ pub struct SourcePosition {
 ///
 /// This mirrors scan JSON's private `Range` shape. Outline owns the type here
 /// so the model does not depend on scan rendering internals.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceRange {
   /// Inclusive start and exclusive end byte offsets.
@@ -85,7 +85,7 @@ pub struct SourceRange {
 }
 
 /// Shared structural data for either a top-level item or a direct member.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutlineEntry<'a> {
   pub role: EntryRole,
@@ -97,7 +97,7 @@ pub struct OutlineEntry<'a> {
 }
 
 /// One top-level outline item.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutlineItem<'a> {
   #[serde(flatten)]
@@ -109,7 +109,7 @@ pub struct OutlineItem<'a> {
 }
 
 /// One direct member under an outline item.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutlineMember<'a> {
   #[serde(flatten)]

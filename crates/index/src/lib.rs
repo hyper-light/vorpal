@@ -1,13 +1,21 @@
 //! `vorpal-index` — a thin CLI over the ingest → resolve → persist → query pipeline (§3.6).
 //!
-//! `build_index` ingests a directory, resolves cross-file references into `calls` edges, and
-//! persists the knowledge graph; the query verbs cold-open it and answer `callers`/`refs`/`node`.
+//! `build_index` is incremental (§3.4): a stat manifest decides per file whether its cached
+//! extraction product can be replayed or the file must be re-parsed; the graph is always
+//! re-linked from the complete product set (so removals/renames cannot leave stale nodes), and
+//! an entirely unchanged tree short-circuits to reusing the persisted index outright.
 
+use std::collections::HashSet;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::Path;
 
-use vorpal_ingest::{Ingestor, Manifest, OutlineExtractor, Resolver};
+use vorpal_ingest::{
+  FileProduct, Ingestor, Manifest, OutlineExtractor, Resolver, cache_file_name, load_product,
+  save_product,
+};
 use vorpal_kg::{Kg, NodeId};
 
 /// Summary of an indexing run.
@@ -15,7 +23,9 @@ use vorpal_kg::{Kg, NodeId};
 pub struct IndexReport {
   /// The tree was unchanged since the last index — reused without re-parsing (§3.4).
   pub reused: bool,
+  /// Files re-parsed this run (changed, new, or cache-missing).
   pub indexed: u64,
+  /// Files whose cached extraction product was replayed without a parse.
   pub skipped: u64,
   pub nodes: usize,
   pub resolved: u64,
@@ -23,14 +33,12 @@ pub struct IndexReport {
 }
 
 /// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`.
-///
-/// Near-instant re-index (§3.4): a persisted stat-manifest is compared first; if the tree is
-/// unchanged, the existing index is reused without reading or parsing any file.
 pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>> {
   let extractor = OutlineExtractor::new()?;
   let manifest = Manifest::scan(src, |p| extractor.handles(p))?;
   let manifest_path = out.join("manifest.bin");
 
+  // Whole-tree fast path: nothing changed → reuse the persisted index without touching a file.
   if out.join("nodes.vseg").exists() {
     if let Ok(prior) = Manifest::load(&manifest_path) {
       if manifest.unchanged_since(&prior) {
@@ -47,16 +55,69 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
     }
   }
 
+  // Incremental path: replay cached products for stat-unchanged files, re-parse the rest.
+  let products_dir = out.join("products");
+  fs::create_dir_all(&products_dir)?;
+  let prior = Manifest::load(&manifest_path).unwrap_or_default();
+
+  let mut reparsed = 0u64;
+  let mut replayed = 0u64;
+  let mut products: Vec<(String, FileProduct)> = Vec::new();
+  for entry in manifest.entries() {
+    let cache = products_dir.join(cache_file_name(&entry.path));
+    let cached = if prior.contains(entry) {
+      load_product(&cache).ok()
+    } else {
+      None
+    };
+    let product = match cached {
+      Some(product) => {
+        replayed += 1;
+        product
+      }
+      None => {
+        // Changed, new, or cache-missing: re-parse (unreadable files are skipped, not fatal).
+        let Ok(source) = fs::read_to_string(&entry.path) else {
+          continue;
+        };
+        let Some(product) = extractor.extract_product(&entry.path, &source) else {
+          continue;
+        };
+        save_product(&cache, &product)?;
+        reparsed += 1;
+        product
+      }
+    };
+    products.push((entry.path.clone(), product));
+  }
+
+  // Cache hygiene: drop products of files no longer in the tree.
+  let expected: HashSet<OsString> = manifest
+    .entries()
+    .iter()
+    .map(|e| OsString::from(cache_file_name(&e.path)))
+    .collect();
+  if let Ok(dir) = fs::read_dir(&products_dir) {
+    for file in dir.flatten() {
+      if !expected.contains(&file.file_name()) {
+        let _ = fs::remove_file(file.path());
+      }
+    }
+  }
+
+  // Full re-link from the complete product set: identity, resolution, and edges are recomputed
+  // from scratch, so stale state is structurally impossible.
   let mut ingestor = Ingestor::new(extractor);
-  ingestor.ingest_dir(src)?;
-  let ingest = ingestor.stats();
+  for (path, product) in &products {
+    ingestor.ingest_product(path, product);
+  }
   let (kg, resolve) = ingestor.link_and_seal(&Resolver::new());
   kg.save(out)?;
   manifest.save(&manifest_path)?;
   Ok(IndexReport {
     reused: false,
-    indexed: ingest.indexed,
-    skipped: ingest.skipped,
+    indexed: reparsed,
+    skipped: replayed,
     nodes: kg.node_count(),
     resolved: resolve.resolved + resolve.ambiguous,
     unresolved: resolve.unresolved,

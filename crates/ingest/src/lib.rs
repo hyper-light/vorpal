@@ -13,10 +13,12 @@
 mod manifest;
 mod outline_extractor;
 mod pipeline;
+mod product;
 mod references;
 
 pub use manifest::{FileStat, Manifest};
 pub use outline_extractor::OutlineExtractor;
 pub use pipeline::{FileExtractor, FileOutcome, IngestStats, Ingestor};
+pub use product::{FileProduct, ProductRef, cache_file_name, load_product, save_product};
 pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
 pub use vorpal_resolve::{RefKind, Reference, ResolveStats, Resolver};
