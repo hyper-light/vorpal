@@ -28,10 +28,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
   match argv.as_slice() {
     ["index", src, out] => {
       let report = build_index(Path::new(src), Path::new(out))?;
-      println!(
-        "indexed {} files ({} skipped) → {} nodes, {} calls resolved, {} unresolved",
-        report.indexed, report.skipped, report.nodes, report.resolved, report.unresolved
-      );
+      if report.reused {
+        println!("unchanged — reused existing index ({} nodes)", report.nodes);
+      } else {
+        println!(
+          "indexed {} files ({} skipped) → {} nodes, {} calls resolved, {} unresolved",
+          report.indexed, report.skipped, report.nodes, report.resolved, report.unresolved
+        );
+      }
       Ok(())
     }
     [verb @ ("callers" | "refs" | "node"), index, name] => {

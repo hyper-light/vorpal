@@ -20,6 +20,7 @@ fn builds_persists_and_queries_an_index() {
   .unwrap();
 
   let report = build_index(&src, &out).unwrap();
+  assert!(!report.reused, "first index is a full build");
   assert_eq!(report.indexed, 2);
   assert!(report.nodes >= 2, "{report:?}");
   assert!(report.resolved >= 1, "cross-file call resolved: {report:?}");
@@ -35,6 +36,33 @@ fn builds_persists_and_queries_an_index() {
     callers.contains(&"caller".to_string()),
     "callers of target: {callers:?}"
   );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn reindex_of_unchanged_tree_is_reused() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-reuse-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("lib.rs"), "pub fn f() -> i32 {\n    1\n}\n").unwrap();
+
+  let first = build_index(&src, &out).unwrap();
+  assert!(!first.reused);
+  let nodes = first.nodes;
+
+  // Re-index with no changes: detected unchanged, reused without re-parsing.
+  let second = build_index(&src, &out).unwrap();
+  assert!(second.reused, "unchanged tree should be reused");
+  assert_eq!(second.indexed, 0);
+  assert_eq!(second.nodes, nodes);
+
+  // Change a file (different size): full rebuild.
+  fs::write(src.join("lib.rs"), "pub fn f() -> i32 {\n    12345\n}\n").unwrap();
+  let third = build_index(&src, &out).unwrap();
+  assert!(!third.reused, "changed tree should rebuild");
 
   let _ = fs::remove_dir_all(&base);
 }

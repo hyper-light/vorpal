@@ -10,10 +10,12 @@
 //! Content-hash skip (§3.4) is the incremental spine: unchanged file bytes are never re-parsed.
 //! A single [`Ingestor`] is a single-writer-per-shard sink (§7.5); scale-out shards it by path.
 
+mod manifest;
 mod outline_extractor;
 mod pipeline;
 mod references;
 
+pub use manifest::{FileStat, Manifest};
 pub use outline_extractor::OutlineExtractor;
 pub use pipeline::{FileExtractor, FileOutcome, IngestStats, Ingestor};
 pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
