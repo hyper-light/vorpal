@@ -91,6 +91,34 @@ fn ambiguous_exported_is_labeled_and_deterministic() {
 }
 
 #[test]
+fn path_imports_resolve_to_file_nodes() {
+  let mut table = SymbolTable::new();
+  table.insert_file("src/util.ts", NodeId::new(7));
+
+  // `./util` from a sibling file resolves via the importer's own extension.
+  let reference = Reference::new(NodeId::new(0), "src/a.ts", "./util", RefKind::Import);
+  let res = Resolver::new().resolve(&table, &reference);
+  assert_eq!(res.target, Some(NodeId::new(7)));
+  assert_eq!(res.confidence, Confidence::CROSS_FILE);
+
+  // `../` navigation and explicit-extension forms also match exactly.
+  let reference = Reference::new(
+    NodeId::new(0),
+    "src/deep/b.ts",
+    "../util.ts",
+    RefKind::Import,
+  );
+  assert_eq!(
+    Resolver::new().resolve(&table, &reference).target,
+    Some(NodeId::new(7))
+  );
+
+  // A path miss stays unresolved — exact matches only, never faked.
+  let reference = Reference::new(NodeId::new(0), "src/a.ts", "./missing", RefKind::Import);
+  assert_eq!(Resolver::new().resolve(&table, &reference).target, None);
+}
+
+#[test]
 fn unknown_name_is_unresolved() {
   let table = SymbolTable::new();
   let reference = Reference::new(NodeId::new(0), "a.rs", "nope", RefKind::Call);

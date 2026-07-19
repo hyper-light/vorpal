@@ -15,10 +15,12 @@ pub struct Symbol {
   pub exported: bool,
 }
 
-/// Maps a name to every definition with that name (§3.3 candidate set).
+/// Maps a name to every definition with that name (§3.3 candidate set), plus an exact-path map
+/// of file nodes for path-form import resolution.
 #[derive(Debug, Default, Clone)]
 pub struct SymbolTable {
   by_name: HashMap<String, Vec<Symbol>>,
+  files: HashMap<String, NodeId>,
 }
 
 impl SymbolTable {
@@ -34,14 +36,25 @@ impl SymbolTable {
       .push(symbol);
   }
 
-  /// Build a table from every node in a sealed [`Kg`] (its definitions). `File` nodes are
-  /// excluded — references resolve to code entities, not to file nodes.
+  /// Register a file node by its exact ingested path (the target of path-form imports).
+  pub fn insert_file(&mut self, path: &str, id: NodeId) {
+    self.files.insert(path.to_owned(), id);
+  }
+
+  /// The file node at exactly `path`, if indexed.
+  pub fn file(&self, path: &str) -> Option<NodeId> {
+    self.files.get(path).copied()
+  }
+
+  /// Build a table from every node in a sealed [`Kg`]. `File` nodes go to the path map (targets
+  /// of path-form imports); every other definition goes to the name candidate set.
   pub fn from_kg(kg: &Kg) -> Self {
     let mut table = Self::new();
     for i in 0..kg.node_count() as u64 {
       let id = NodeId::new(i);
       if let Some(node) = kg.node(id) {
         if node.kind == SymbolKind::File {
+          table.insert_file(node.path, id);
           continue;
         }
         table.insert(

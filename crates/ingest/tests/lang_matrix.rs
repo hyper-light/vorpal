@@ -162,14 +162,32 @@ fn symbol_imports_resolve_to_importing_files() {
 }
 
 #[test]
+fn path_imports_resolve_to_indexed_file_nodes() {
+  // `import "./util"` from a.ts resolves to the indexed util.ts FILE node — a real IMPORTS edge.
+  let (kg, stats) = kg_for(&[
+    (
+      "util.ts",
+      "export function tsHelper(): number { return 1 }\n",
+    ),
+    (
+      "a.ts",
+      "import { tsHelper } from \"./util\";\n\nexport function run(): number { return tsHelper() }\n",
+    ),
+  ]);
+  assert!(stats.resolved >= 1, "{stats:?}");
+  let importers = names_of(&kg, &kg.importers_of("util.ts"));
+  assert!(importers.iter().any(|n| n == "a.ts"), "{importers:?}");
+}
+
+#[test]
 fn string_imports_stay_honestly_unresolved() {
-  // `./util` names no symbol node, so the import is counted unresolved — never faked.
+  // `./missing` matches no indexed file and no symbol: counted unresolved — never faked.
   let (kg, stats) = kg_for(&[(
     "a.ts",
-    "import { x } from \"./util\";\n\nexport function run(): number { return x }\n",
+    "import { x } from \"./missing\";\n\nexport function run(): number { return x }\n",
   )]);
   assert!(stats.unresolved >= 1, "{stats:?}");
-  assert!(kg.nodes_named("./util").is_empty());
+  assert!(kg.nodes_named("./missing").is_empty());
 }
 
 #[test]
@@ -208,11 +226,12 @@ fn structural_languages_extract_structure_nodes() {
       &["html", "body"],
     ),
     ("nix", "default.nix", "{\n  pkgs = 1;\n}\n", &["pkgs"]),
+    // Labeled blocks are named by their LAST label (the Terraform resource name).
     (
       "hcl",
       "main.tf",
-      "resource \"aws_instance\" \"web\" {\n  ami = \"abc\"\n}\n",
-      &["ami"],
+      "resource \"aws_instance\" \"web\" {\n  ami = \"abc\"\n}\n\nmodule \"vpc\" {\n  source = \"./vpc\"\n}\n",
+      &["web", "vpc", "ami", "source"],
     ),
   ];
   let mut failures = Vec::new();

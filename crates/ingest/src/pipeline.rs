@@ -138,7 +138,10 @@ impl<E: FileExtractor> Ingestor<E> {
 fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
   let mut table = SymbolTable::new();
   writer.for_each_definition(|id, name, path, kind, exported| {
-    if kind != SymbolKind::File {
+    if kind == SymbolKind::File {
+      // File nodes are the targets of path-form imports (`import "./util"`).
+      table.insert_file(path, id);
+    } else {
       table.insert(
         name,
         Symbol {
