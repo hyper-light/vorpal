@@ -5,6 +5,10 @@
 //! templates, and predicates. Traversal code should depend on the runtime
 //! `Outline*Rule` types, not on serde defaults or config parsing details.
 
+use serde::{Deserialize, Serialize};
+use serde_yaml::{Deserializer, Error as YamlError, with::singleton_map_recursive::deserialize};
+use std::borrow::Cow;
+use thiserror::Error;
 use vorpal_config::{
   GlobalRules, Rule, RuleConfig, RuleConfigError, RuleSerializeError, SerializableRewriter,
   SerializableRule, SerializableRuleConfig, SerializableRuleCore, Severity,
@@ -15,10 +19,6 @@ use vorpal_core::{
   replacer::{Replacer, TemplateFix, TemplateFixError},
   source::Content,
 };
-use serde::{Deserialize, Serialize};
-use serde_yaml::{Deserializer, Error as YamlError, with::singleton_map_recursive::deserialize};
-use std::borrow::Cow;
-use thiserror::Error;
 
 use crate::model::{
   EntryRole, OutlineEntry, OutlineItem, OutlineMember, SourcePosition, SourceRange, SymbolType,

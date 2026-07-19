@@ -156,8 +156,8 @@ mod tests {
   use super::*;
   use crate::extractor::parse_outline_rules;
   use crate::model::{EntryRole, OutlineEntry, SourcePosition, SourceRange};
-  use vorpal_language::SupportLang;
   use std::borrow::Cow;
+  use vorpal_language::SupportLang;
 
   fn rules(src: &str) -> Vec<SerializableOutlineRule<SupportLang>> {
     parse_outline_rules(src).expect("outline rules should parse")

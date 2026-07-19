@@ -12,6 +12,7 @@
 //! switches to the item's scoped member extractors until the cursor leaves that
 //! item range.
 
+use std::collections::HashMap;
 use vorpal_config::GlobalRules;
 use vorpal_core::{
   Language, Matcher, Node, NodeMatch,
@@ -20,7 +21,6 @@ use vorpal_core::{
     traversal::{Prune, PruneSubtree},
   },
 };
-use std::collections::HashMap;
 
 use crate::extractor::{ItemExtractor, MemberExtractor, OutlineRuleError, SerializableOutlineRule};
 use crate::model::{OutlineItem, OutlineMember};
