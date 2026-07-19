@@ -217,10 +217,8 @@ impl Rewrite<String> {
       .map(|item| item.entry.name.as_ref())
       .collect::<Vec<_>>();
 
-    assert_eq!(
-      names,
-      vec!["tests", "Service", "Config", "Box<T>", "Rewrite<String>"]
-    );
+    // Impl names are the plain type identifier — generics/lifetimes live in the signature only.
+    assert_eq!(names, vec!["tests", "Service", "Config", "Box", "Rewrite"]);
 
     let tests = items
       .iter()
@@ -256,6 +254,10 @@ impl Rewrite<String> {
       .iter()
       .find(|item| item.entry.signature == "impl<T> Box<T>")
       .expect("generic impl should be extracted");
+    assert_eq!(
+      generic_impl.entry.name, "Box",
+      "name strips generics; the signature keeps them"
+    );
     let generic_impl_methods = generic_impl
       .members
       .iter()
@@ -369,7 +371,7 @@ impl<T: Future> CoreStage<T> {
         (SymbolType::Function, "spawn", true),
         (SymbolType::Function, "block_in_place", true),
         (SymbolType::Function, "with_current", false),
-        (SymbolType::Object, "CoreStage<T>", false),
+        (SymbolType::Object, "CoreStage", false),
       ]
     );
 
@@ -386,7 +388,7 @@ impl<T: Future> CoreStage<T> {
 
     let implementation = items
       .iter()
-      .find(|item| item.entry.name == "CoreStage<T>")
+      .find(|item| item.entry.name == "CoreStage")
       .expect("generic impl should be extracted");
     let methods = implementation
       .members

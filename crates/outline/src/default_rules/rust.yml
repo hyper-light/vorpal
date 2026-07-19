@@ -185,7 +185,15 @@ transform:
       source: $BODYLESS
       replace: '\n[\s\S]*$'
       by: ''
-name: '$NAME'
+  # The impl's *name* is the plain type identifier — generic/lifetime arguments are stripped so
+  # `impl<'a> Reader<'a>` names `Reader`, sharing identity with the type it implements (the full
+  # form stays in the signature). Specialized impls (`impl Foo<String>`) merge under one name.
+  TYPENAME:
+    replace:
+      source: $NAME
+      replace: '\s*<[\s\S]*$'
+      by: ''
+name: '$TYPENAME'
 signature: '$SIG'
 isExported: false
 ---
