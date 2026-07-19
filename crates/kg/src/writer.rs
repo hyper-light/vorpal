@@ -107,6 +107,9 @@ impl KgWriter {
       exported: true,
       content_hash: content_hash(&[path]),
     });
+    // The file node is the outermost enclosing scope, so file-level references (e.g. imports)
+    // attribute to it when no smaller item/member span contains them.
+    spans.push((0..usize::MAX, file_id));
 
     for item in items {
       let name = item.entry.name.as_ref();

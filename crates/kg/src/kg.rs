@@ -156,6 +156,11 @@ impl Kg {
     self.incoming_named(name, EdgeType::REFERENCES)
   }
 
+  /// Files that import any node named `name` (incoming `imports` edges).
+  pub fn importers_of(&self, name: &str) -> Vec<NodeId> {
+    self.incoming_named(name, EdgeType::IMPORTS)
+  }
+
   fn incoming_named(&self, name: &str, edge: EdgeType) -> Vec<NodeId> {
     let mut found = Vec::new();
     for target in self.nodes_named(name) {
