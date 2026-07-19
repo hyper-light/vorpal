@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use vorpal_index::build_index;
+use vorpal_index::{build_index, search_index};
 use vorpal_kg::Kg;
 
 #[test]
@@ -63,6 +63,30 @@ fn reindex_of_unchanged_tree_is_reused() {
   fs::write(src.join("lib.rs"), "pub fn f() -> i32 {\n    12345\n}\n").unwrap();
   let third = build_index(&src, &out).unwrap();
   assert!(!third.reused, "changed tree should rebuild");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn semantic_search_finds_definitions_by_description() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(
+    src.join("a.rs"),
+    "pub fn resolve_import_path() -> i32 {\n    1\n}\n\npub fn hamming_distance() -> i32 {\n    2\n}\n",
+  )
+  .unwrap();
+
+  build_index(&src, &out).unwrap();
+  let rendered = search_index(&out, "import path resolution", 3).unwrap();
+  let first = rendered.lines().next().unwrap_or("");
+  assert!(
+    first.contains("resolve_import_path"),
+    "top hit should be the lexically-matching definition:\n{rendered}"
+  );
 
   let _ = fs::remove_dir_all(&base);
 }

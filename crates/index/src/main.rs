@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use vorpal_index::{build_index, format_nodes};
+use vorpal_index::{build_index, format_nodes, search_index};
 use vorpal_kg::Kg;
 
 const USAGE: &str = "usage:
@@ -13,7 +13,8 @@ const USAGE: &str = "usage:
   vorpal-index importers    <index-dir> <name>      files importing a symbol
   vorpal-index implementors <index-dir> <name>      types implementing/extending a symbol
   vorpal-index typeusers    <index-dir> <name>      definitions using a type
-  vorpal-index node         <index-dir> <name>      nodes matching a name";
+  vorpal-index node         <index-dir> <name>      nodes matching a name
+  vorpal-index search       <index-dir> <query> [k] semantic (lexical-embedding) search";
 
 fn main() -> ExitCode {
   match run() {
@@ -62,9 +63,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       Ok(())
     }
+    ["search", index, query] => print_search(index, query, 10),
+    ["search", index, query, k] => print_search(index, query, k.parse()?),
     _ => {
       eprintln!("{USAGE}");
       Err("invalid arguments".into())
     }
   }
+}
+
+fn print_search(index: &str, query: &str, k: usize) -> Result<(), Box<dyn std::error::Error>> {
+  let rendered = search_index(Path::new(index), query, k)?;
+  if rendered.is_empty() {
+    println!("(no results for '{query}')");
+  } else {
+    print!("{rendered}");
+  }
+  Ok(())
 }

@@ -1,0 +1,13 @@
+[package]
+name = "vorpal-ann"
+description = "Adaptive approximate-nearest-neighbor tier (flat / quantized / Vamana + exact rerank) for vorpal"
+keywords = ["ann", "vector-search", "vamana", "quantization", "embeddings"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

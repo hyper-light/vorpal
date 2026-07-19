@@ -2351,6 +2351,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorpal-ann"
+version = "0.44.0"
+
+[[package]]
 name = "vorpal-canonical"
 version = "0.44.0"
 dependencies = [
@@ -2411,6 +2415,7 @@ dependencies = [
 name = "vorpal-index"
 version = "0.44.0"
 dependencies = [
+ "vorpal-ann",
  "vorpal-ingest",
  "vorpal-kg",
 ]

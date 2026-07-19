@@ -100,6 +100,17 @@ impl Server {
         };
         Ok(render(kg, &name, &ids))
       }
+      "search" => {
+        let query = str_arg("query")?;
+        let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+        let rendered =
+          vorpal_index::search_index(&self.index_dir, &query, k).map_err(|err| err.to_string())?;
+        Ok(if rendered.is_empty() {
+          format!("(no results for '{query}')")
+        } else {
+          rendered
+        })
+      }
       "reachable" => {
         let name = str_arg("name")?;
         let direction = str_arg("direction")?;
@@ -185,6 +196,16 @@ fn tools_list() -> Value {
         "direction": {"type": "string", "enum": ["in", "out"]}
       }),
       &["name", "direction"],
+    ),
+    tool(
+      "search",
+      "Semantic search over definitions (lexical-embedding similarity on names, signatures, \
+       and paths); returns the top-k matches with scores.",
+      json!({
+        "query": {"type": "string", "description": "Free-text query"},
+        "k": {"type": "integer", "description": "Max results (default 10)"}
+      }),
+      &["query"],
     ),
   ]})
 }

@@ -92,7 +92,8 @@ fn initialize_handshake_and_tool_listing() {
       "importers",
       "implementors",
       "type_users",
-      "reachable"
+      "reachable",
+      "search"
     ]
   );
   for tool in tools {

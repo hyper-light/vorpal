@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
+use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder};
 use vorpal_ingest::{
   FileProduct, Ingestor, Manifest, OutlineExtractor, Resolver, cache_file_name, load_product,
   save_product,
@@ -113,6 +114,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   }
   let (kg, resolve) = ingestor.link_and_seal(&Resolver::new());
   kg.save(out)?;
+  build_ann(&kg, out)?;
   manifest.save(&manifest_path)?;
   Ok(IndexReport {
     reused: false,
@@ -122,6 +124,50 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
     resolved: resolve.resolved + resolve.ambiguous,
     unresolved: resolve.unresolved,
   })
+}
+
+/// Build the semantic tier over every KG node: each definition embeds its name (double-weighted),
+/// signature, and file *basename* — never the full path, whose directory tokens are shared junk
+/// that drowns the signal — through the pluggable embedder (default: the deterministic lexical
+/// hasher) into the adaptive ANN index persisted beside the graph.
+fn build_ann(kg: &Kg, out: &Path) -> Result<(), Box<dyn Error>> {
+  let embedder = LexicalEmbedder::default();
+  let mut rows = Vec::with_capacity(kg.node_count());
+  for i in 0..kg.node_count() as u64 {
+    let id = NodeId::new(i);
+    if let Some(view) = kg.node(id) {
+      let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+      let text = format!(
+        "{} {} {} {}",
+        view.name, view.name, view.signature, basename
+      );
+      rows.push((i, embedder.embed(&text)));
+    }
+  }
+  AnnIndex::build(embedder.dim(), rows, None).save(&out.join("ann.bin"))?;
+  Ok(())
+}
+
+/// Semantic search over a persisted index: embed the query, search the ANN tier, render the
+/// matching nodes with their cosine similarity.
+pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, Box<dyn Error>> {
+  let kg = Kg::load(index_dir)?;
+  let ann = AnnIndex::load(&index_dir.join("ann.bin"))?;
+  let embedder = LexicalEmbedder::default();
+  let hits = ann.search(&embedder.embed(query), k);
+  let mut out = String::new();
+  for (row, dist_sq) in hits {
+    if let Some(view) = kg.node(NodeId::new(row)) {
+      // On unit vectors: cosine = 1 - d²/2.
+      let similarity = 1.0 - dist_sq / 2.0;
+      let _ = writeln!(
+        out,
+        "{similarity:.3}  {} [{:?}] {}",
+        view.name, view.kind, view.path
+      );
+    }
+  }
+  Ok(out)
 }
 
 /// Render nodes as `name [Kind] path` lines.
