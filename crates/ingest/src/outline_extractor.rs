@@ -55,9 +55,11 @@ impl OutlineExtractor {
     self.by_lang.len()
   }
 
-  /// Whether a file at `path` would be extracted (known extension + compiled rules).
+  /// Whether a file at `path` would be extracted: a known extension with compiled outline rules
+  /// and/or a reference-extraction spec (a language may have either independently).
   pub fn handles(&self, path: &str) -> bool {
-    SupportLang::from_path(path).is_some_and(|lang| self.by_lang.contains_key(&lang))
+    SupportLang::from_path(path)
+      .is_some_and(|lang| self.by_lang.contains_key(&lang) || ref_spec(lang).is_some())
   }
 }
 
@@ -76,16 +78,21 @@ impl FileExtractor for OutlineExtractor {
     let Some(lang) = SupportLang::from_path(path) else {
       return;
     };
-    let Some(combined) = self.by_lang.get(&lang) else {
+    let combined = self.by_lang.get(&lang);
+    let spec = ref_spec(lang);
+    if combined.is_none() && spec.is_none() {
       return;
-    };
+    }
     // The parse tree (`grep`) is owned locally; items/nodes borrow it and are copied into the KG
-    // heap / reference buffer before it drops — nothing borrowed escapes this scope.
+    // heap / reference buffer before it drops — nothing borrowed escapes this scope. Reference
+    // extraction runs even without outline rules (the file node is the only definition span).
     let grep = lang.grep(source);
-    let items: Vec<OutlineItem<'_>> = combined.extract(grep.root()).collect();
+    let items: Vec<OutlineItem<'_>> = combined
+      .map(|c| c.extract(grep.root()).collect())
+      .unwrap_or_default();
     let def_spans = writer.ingest_file_with_spans(path, &items);
-    if let Some(spec) = ref_spec(lang) {
-      extract_references(grep.root(), &spec, &def_spans, path, references);
+    if let Some(spec) = spec {
+      extract_references(grep.root(), spec, &def_spans, path, references);
     }
   }
 }
