@@ -1,0 +1,17 @@
+[package]
+name = "vorpal-mcp"
+description = "Warm-index MCP daemon: vorpal knowledge-graph queries served to agents over stdio"
+keywords = ["mcp", "agents", "code-graph", "daemon", "json-rpc"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-index.workspace = true
+vorpal-kg.workspace = true
+
+serde_json = "1"

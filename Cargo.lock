@@ -2495,6 +2495,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vorpal-mcp"
+version = "0.44.0"
+dependencies = [
+ "serde_json",
+ "vorpal-index",
+ "vorpal-kg",
+]
+
+[[package]]
 name = "vorpal-mem"
 version = "0.44.0"
 dependencies = [
