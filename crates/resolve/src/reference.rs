@@ -11,6 +11,8 @@ pub enum RefKind {
   Type,
   /// An import → `imports`.
   Import,
+  /// An implements/extends relation → `implements`.
+  Implements,
   /// A generic use/reference → `references`.
   Use,
 }
@@ -21,6 +23,7 @@ impl RefKind {
       RefKind::Call => EdgeType::CALLS,
       RefKind::Type => EdgeType::OF_TYPE,
       RefKind::Import => EdgeType::IMPORTS,
+      RefKind::Implements => EdgeType::IMPLEMENTS,
       RefKind::Use => EdgeType::REFERENCES,
     }
   }

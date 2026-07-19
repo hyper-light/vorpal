@@ -7,10 +7,13 @@ use vorpal_index::{build_index, format_nodes};
 use vorpal_kg::Kg;
 
 const USAGE: &str = "usage:
-  vorpal-index index   <src-dir> <index-dir>   build + persist a knowledge graph
-  vorpal-index callers <index-dir> <name>      direct callers of a symbol
-  vorpal-index refs    <index-dir> <name>      direct referrers of a symbol
-  vorpal-index node    <index-dir> <name>      nodes matching a name";
+  vorpal-index index        <src-dir> <index-dir>   build + persist a knowledge graph
+  vorpal-index callers      <index-dir> <name>      direct callers of a symbol
+  vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
+  vorpal-index importers    <index-dir> <name>      files importing a symbol
+  vorpal-index implementors <index-dir> <name>      types implementing/extending a symbol
+  vorpal-index typeusers    <index-dir> <name>      definitions using a type
+  vorpal-index node         <index-dir> <name>      nodes matching a name";
 
 fn main() -> ExitCode {
   match run() {
@@ -38,11 +41,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       Ok(())
     }
-    [verb @ ("callers" | "refs" | "node"), index, name] => {
+    [
+      verb @ ("callers" | "refs" | "importers" | "implementors" | "typeusers" | "node"),
+      index,
+      name,
+    ] => {
       let kg = Kg::load(Path::new(index))?;
       let ids = match *verb {
         "callers" => kg.callers_of(name),
         "refs" => kg.references_to(name),
+        "importers" => kg.importers_of(name),
+        "implementors" => kg.implementors_of(name),
+        "typeusers" => kg.users_of_type(name),
         _ => kg.nodes_named(name),
       };
       if ids.is_empty() {

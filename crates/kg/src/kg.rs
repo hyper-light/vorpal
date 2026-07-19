@@ -161,6 +161,16 @@ impl Kg {
     self.incoming_named(name, EdgeType::IMPORTS)
   }
 
+  /// Types implementing/extending a trait, interface, or base type (incoming `implements`).
+  pub fn implementors_of(&self, name: &str) -> Vec<NodeId> {
+    self.incoming_named(name, EdgeType::IMPLEMENTS)
+  }
+
+  /// Definitions using a type — fields, params, returns, annotations (incoming `of_type`).
+  pub fn users_of_type(&self, name: &str) -> Vec<NodeId> {
+    self.incoming_named(name, EdgeType::OF_TYPE)
+  }
+
   fn incoming_named(&self, name: &str, edge: EdgeType) -> Vec<NodeId> {
     let mut found = Vec::new();
     for target in self.nodes_named(name) {

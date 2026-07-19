@@ -132,6 +132,7 @@ fn ref_kinds_map_to_edge_types() {
   assert_eq!(RefKind::Call.edge(), EdgeType::CALLS);
   assert_eq!(RefKind::Type.edge(), EdgeType::OF_TYPE);
   assert_eq!(RefKind::Import.edge(), EdgeType::IMPORTS);
+  assert_eq!(RefKind::Implements.edge(), EdgeType::IMPLEMENTS);
   assert_eq!(RefKind::Use.edge(), EdgeType::REFERENCES);
 }
 

@@ -90,6 +90,8 @@ fn initialize_handshake_and_tool_listing() {
       "callers",
       "references",
       "importers",
+      "implementors",
+      "type_users",
       "reachable"
     ]
   );

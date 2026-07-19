@@ -87,13 +87,15 @@ impl Server {
           )
         })
       }
-      "node" | "callers" | "references" | "importers" => {
+      "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
         let name = str_arg("name")?;
         let kg = self.kg()?;
         let ids = match tool {
           "node" => kg.nodes_named(&name),
           "callers" => kg.callers_of(&name),
           "references" => kg.references_to(&name),
+          "implementors" => kg.implementors_of(&name),
+          "type_users" => kg.users_of_type(&name),
           _ => kg.importers_of(&name),
         };
         Ok(render(kg, &name, &ids))
@@ -172,6 +174,8 @@ fn tools_list() -> Value {
     tool("callers", "Direct callers of a symbol (incoming `calls` edges).", name_only.clone(), &["name"]),
     tool("references", "Direct referrers of a symbol (incoming `references` edges).", name_only.clone(), &["name"]),
     tool("importers", "Files importing a symbol (incoming `imports` edges).", name_only.clone(), &["name"]),
+    tool("implementors", "Types implementing/extending a trait, interface, or base type (incoming `implements` edges).", name_only.clone(), &["name"]),
+    tool("type_users", "Definitions using a type in fields, params, returns, or annotations (incoming `of_type` edges).", name_only.clone(), &["name"]),
     tool(
       "reachable",
       "Transitive closure from a symbol: direction \"in\" = everything reaching it \

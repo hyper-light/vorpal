@@ -60,14 +60,29 @@ enum TextAction {
   ImportFirstArg,
 }
 
+/// An implements/extends construct: matching nodes emit `implements` references for their type
+/// targets (`impl Trait for T`, `class C implements I`, `class Sub extends Base`).
+struct ImplSpec {
+  kind: &'static str,
+  /// Where the implemented types live; `None` collects type leaves from the node itself.
+  target: Option<Sel>,
+}
+
 pub(crate) struct RefSpec {
   calls: &'static [CallSpec],
   imports: &'static [ImportSpec],
   /// `(callee text, action)` — exact match, applied after callee extraction succeeds.
   text_rules: &'static [(&'static str, TextAction)],
+  /// Leaf kinds marking a type USE (grammars with a distinct `type_identifier`); definition
+  /// names and implements-construct targets are excluded by the walk.
+  types: &'static [&'static str],
+  implements: &'static [ImplSpec],
 }
 
 const NONE_TEXT: &[(&str, TextAction)] = &[];
+const NO_TYPES: &[&str] = &[];
+const NO_IMPL: &[ImplSpec] = &[];
+const TYPE_ID: &[&str] = &["type_identifier"];
 
 const RUST: RefSpec = RefSpec {
   calls: &[CallSpec {
@@ -80,6 +95,11 @@ const RUST: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: TYPE_ID,
+  implements: &[ImplSpec {
+    kind: "impl_item",
+    target: Some(Sel::Field("trait")),
+  }],
 };
 
 const PYTHON: RefSpec = RefSpec {
@@ -100,6 +120,11 @@ const PYTHON: RefSpec = RefSpec {
     },
   ],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: &[ImplSpec {
+    kind: "class_definition",
+    target: Some(Sel::Field("superclasses")),
+  }],
 };
 
 const GO: RefSpec = RefSpec {
@@ -113,6 +138,8 @@ const GO: RefSpec = RefSpec {
     string_target: true,
   }],
   text_rules: NONE_TEXT,
+  types: TYPE_ID,
+  implements: NO_IMPL,
 };
 
 /// JavaScript / TypeScript / Tsx share one grammar family for calls + ES imports + `require`.
@@ -127,6 +154,13 @@ const JS_LIKE: RefSpec = RefSpec {
     string_target: true,
   }],
   text_rules: &[("require", TextAction::ImportFirstArg)],
+  types: TYPE_ID,
+  // `class_heritage` covers both TS (`extends`/`implements` clauses within) and JS (bare
+  // `extends B`) in one row.
+  implements: &[ImplSpec {
+    kind: "class_heritage",
+    target: None,
+  }],
 };
 
 const C_LIKE: RefSpec = RefSpec {
@@ -140,6 +174,8 @@ const C_LIKE: RefSpec = RefSpec {
     string_target: true,
   }],
   text_rules: NONE_TEXT,
+  types: TYPE_ID,
+  implements: NO_IMPL,
 };
 
 const JAVA: RefSpec = RefSpec {
@@ -153,6 +189,21 @@ const JAVA: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: TYPE_ID,
+  implements: &[
+    ImplSpec {
+      kind: "superclass",
+      target: None,
+    },
+    ImplSpec {
+      kind: "super_interfaces",
+      target: None,
+    },
+    ImplSpec {
+      kind: "extends_interfaces",
+      target: None,
+    },
+  ],
 };
 
 const CSHARP: RefSpec = RefSpec {
@@ -166,6 +217,11 @@ const CSHARP: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: &[ImplSpec {
+    kind: "base_list",
+    target: None,
+  }],
 };
 
 const KOTLIN: RefSpec = RefSpec {
@@ -179,6 +235,8 @@ const KOTLIN: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: TYPE_ID,
+  implements: NO_IMPL,
 };
 
 const SWIFT: RefSpec = RefSpec {
@@ -192,6 +250,8 @@ const SWIFT: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: TYPE_ID,
+  implements: NO_IMPL,
 };
 
 const RUBY: RefSpec = RefSpec {
@@ -204,6 +264,8 @@ const RUBY: RefSpec = RefSpec {
     ("require", TextAction::ImportFirstArg),
     ("require_relative", TextAction::ImportFirstArg),
   ],
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const PHP: RefSpec = RefSpec {
@@ -231,6 +293,8 @@ const PHP: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const DART: RefSpec = RefSpec {
@@ -250,6 +314,8 @@ const DART: RefSpec = RefSpec {
     string_target: true,
   }],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const SCALA: RefSpec = RefSpec {
@@ -263,6 +329,8 @@ const SCALA: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const LUA: RefSpec = RefSpec {
@@ -272,6 +340,8 @@ const LUA: RefSpec = RefSpec {
   }],
   imports: &[],
   text_rules: &[("require", TextAction::ImportFirstArg)],
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const BASH: RefSpec = RefSpec {
@@ -284,6 +354,8 @@ const BASH: RefSpec = RefSpec {
     ("source", TextAction::ImportFirstArg),
     (".", TextAction::ImportFirstArg),
   ],
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const ELIXIR: RefSpec = RefSpec {
@@ -310,6 +382,8 @@ const ELIXIR: RefSpec = RefSpec {
     ("require", TextAction::ImportFirstArg),
     ("use", TextAction::ImportFirstArg),
   ],
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const HASKELL: RefSpec = RefSpec {
@@ -323,6 +397,8 @@ const HASKELL: RefSpec = RefSpec {
     string_target: false,
   }],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const SOLIDITY: RefSpec = RefSpec {
@@ -345,6 +421,8 @@ const SOLIDITY: RefSpec = RefSpec {
     },
   ],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const NIX: RefSpec = RefSpec {
@@ -354,6 +432,8 @@ const NIX: RefSpec = RefSpec {
   }],
   imports: &[],
   text_rules: &[("import", TextAction::ImportFirstArg)],
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 const HCL: RefSpec = RefSpec {
@@ -363,6 +443,8 @@ const HCL: RefSpec = RefSpec {
   }],
   imports: &[],
   text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: NO_IMPL,
 };
 
 /// Reference-extraction spec for a language. Pure-structural languages (CSS, HTML, JSON,
@@ -404,6 +486,8 @@ pub(crate) fn extract_references(
 ) {
   // Definition-head calls suppressed by a SkipDefinition rule (`def foo(x)` → `foo(x)`).
   let mut suppressed: HashSet<usize> = HashSet::new();
+  // Dedup for type/implements references: one edge per (from, name, kind) per file.
+  let mut seen: HashSet<(u64, String, u8)> = HashSet::new();
   let mut stack = vec![root];
   while let Some(node) = stack.pop() {
     for child in node.children() {
@@ -418,6 +502,15 @@ pub(crate) fn extract_references(
       emit_imports(&node, ispec, def_spans, path, out);
     }
     if is_import_node {
+      continue;
+    }
+
+    if spec.types.contains(&kind) {
+      emit_type_use(&node, spec, def_spans, path, &mut seen, out);
+      continue;
+    }
+    if let Some(ispec) = spec.implements.iter().find(|s| s.kind == kind) {
+      emit_implements(&node, ispec, def_spans, path, &mut seen, out);
       continue;
     }
 
@@ -472,6 +565,86 @@ pub(crate) fn extract_references(
               .with_evidence(range.start as u32, range.end as u32),
           );
         }
+      }
+    }
+  }
+}
+
+/// Leaf kinds an implements construct's targets reduce to.
+const IMPL_TARGET_KINDS: &[&str] = &["type_identifier", "identifier", "constant", "alias"];
+
+/// A type-identifier leaf marks a type USE unless it is a definition's own name or sits inside
+/// an implements construct (which emits `implements`, not `of_type`).
+fn emit_type_use(
+  node: &SgNode<'_>,
+  spec: &RefSpec,
+  def_spans: &[(Range<usize>, NodeId)],
+  path: &str,
+  seen: &mut HashSet<(u64, String, u8)>,
+  out: &mut Vec<Reference>,
+) {
+  let Some(parent) = node.parent() else {
+    return;
+  };
+  if parent
+    .field("name")
+    .is_some_and(|name| name.node_id() == node.node_id())
+  {
+    return;
+  }
+  let mut ancestor = Some(parent);
+  for _ in 0..2 {
+    let Some(a) = ancestor else { break };
+    if spec.implements.iter().any(|s| s.kind == a.kind().as_ref()) {
+      return;
+    }
+    ancestor = a.parent();
+  }
+  let range = node.range();
+  let (Some(name), Some(from)) = (callee_name(node), enclosing(def_spans, range.start)) else {
+    return;
+  };
+  if seen.insert((from.raw(), name.clone(), 0)) {
+    out.push(
+      Reference::new(from, path, name, RefKind::Type)
+        .with_evidence(range.start as u32, range.end as u32),
+    );
+  }
+}
+
+/// Emit an `implements` reference per implemented type: the construct's target selector (or the
+/// node itself) is reduced to a name directly when possible, else to its type leaves.
+fn emit_implements(
+  node: &SgNode<'_>,
+  ispec: &ImplSpec,
+  def_spans: &[(Range<usize>, NodeId)],
+  path: &str,
+  seen: &mut HashSet<(u64, String, u8)>,
+  out: &mut Vec<Reference>,
+) {
+  let range = node.range();
+  let Some(from) = enclosing(def_spans, range.start) else {
+    return;
+  };
+  let targets: Vec<SgNode<'_>> = match &ispec.target {
+    Some(sel) => select_all(node, sel),
+    None => vec![node.clone()],
+  };
+  for target in targets {
+    let names: Vec<String> = if let Some(name) = callee_name(&target) {
+      vec![name]
+    } else {
+      first_descendants_of_kinds(&target, IMPL_TARGET_KINDS)
+        .iter()
+        .filter_map(callee_name)
+        .collect()
+    };
+    for name in names {
+      if seen.insert((from.raw(), name.clone(), 1)) {
+        out.push(
+          Reference::new(from, path, name, RefKind::Implements)
+            .with_evidence(range.start as u32, range.end as u32),
+        );
       }
     }
   }

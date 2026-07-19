@@ -191,6 +191,41 @@ fn string_imports_stay_honestly_unresolved() {
 }
 
 #[test]
+fn type_and_implements_edges() {
+  // Rust: trait impl → IMPLEMENTS; param type use → OF_TYPE.
+  let (kg, _) = kg_for(&[(
+    "a.rs",
+    "pub trait Render {\n    fn go(&self) -> i32;\n}\n\npub struct Widget {\n    pub size: i32,\n}\n\nimpl Render for Widget {\n    fn go(&self) -> i32 {\n        self.size\n    }\n}\n\npub fn draw(w: Widget) -> i32 {\n    w.go()\n}\n",
+  )]);
+  let implementors = names_of(&kg, &kg.implementors_of("Render"));
+  assert!(
+    implementors.iter().any(|n| n == "Widget"),
+    "{implementors:?}"
+  );
+  let users = names_of(&kg, &kg.users_of_type("Widget"));
+  assert!(users.iter().any(|n| n == "draw"), "{users:?}");
+
+  // TypeScript: `implements` clause.
+  let (kg, _) = kg_for(&[(
+    "a.ts",
+    "export interface Shape {\n  area(): number\n}\n\nexport class Circle implements Shape {\n  area(): number { return 1 }\n}\n",
+  )]);
+  let implementors = names_of(&kg, &kg.implementors_of("Shape"));
+  assert!(
+    implementors.iter().any(|n| n == "Circle"),
+    "{implementors:?}"
+  );
+
+  // Java: `extends`.
+  let (kg, _) = kg_for(&[(
+    "A.java",
+    "class Base {\n  int x() { return 1; }\n}\n\nclass Sub extends Base {\n  int y() { return 2; }\n}\n",
+  )]);
+  let implementors = names_of(&kg, &kg.implementors_of("Base"));
+  assert!(implementors.iter().any(|n| n == "Sub"), "{implementors:?}");
+}
+
+#[test]
 fn structural_languages_extract_structure_nodes() {
   let cases: &[(&str, &str, &str, &[&str])] = &[
     (
