@@ -29,4 +29,4 @@ serde.workspace = true
 # uncomment default features when developing pyo3
 [features]
 # default = ["python"]
-python = ["pythonize", "pyo3", "pyo3/extension-module"]
+python = ["pythonize", "pyo3", "pyo3/extension-module", "pyo3/abi3-py39"]

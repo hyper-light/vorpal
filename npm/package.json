@@ -1,6 +1,6 @@
 {
   "name": "@vorpal/cli",
-  "version": "0.1.0",
+  "version": "0.44.0",
   "publishConfig": {
     "access": "public"
   },
@@ -36,7 +36,9 @@
     "@vorpal/cli-darwin-arm64": "0.44.0",
     "@vorpal/cli-darwin-x64": "0.44.0",
     "@vorpal/cli-linux-arm64-gnu": "0.44.0",
-    "@vorpal/cli-linux-x64-gnu": "0.44.0"
+    "@vorpal/cli-linux-x64-gnu": "0.44.0",
+    "@vorpal/cli-linux-arm64-musl": "0.44.0",
+    "@vorpal/cli-linux-x64-musl": "0.44.0"
   },
   "bin": {
     "vp": "vp",
