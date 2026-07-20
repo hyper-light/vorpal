@@ -154,6 +154,40 @@ pub fn filter_file_rule(
   Ok(ret)
 }
 
+/// Cap on prebuilt finders per matcher: the longest (most selective) literals win the slots.
+const MAX_PREFILTER_LITERALS: usize = 8;
+
+/// Pre-parse literal filter (§12): SIMD substring finders (memchr/memmem) over a matcher's
+/// required literals, checked against the raw bytes with per-token AND semantics. A file
+/// missing any required literal cannot match, so it is skipped before tree-sitter ever runs.
+/// Purely a necessary condition — matching semantics are unchanged.
+pub struct Prefilter {
+  finders: Vec<memchr::memmem::Finder<'static>>,
+}
+
+impl Prefilter {
+  pub fn for_rule(rule: &Rule) -> Self {
+    let mut literals = rule.required_literals();
+    literals.sort_unstable();
+    literals.dedup();
+    literals.sort_by_key(|l| std::cmp::Reverse(l.len()));
+    let finders = literals
+      .into_iter()
+      .take(MAX_PREFILTER_LITERALS)
+      .map(|l| memchr::memmem::Finder::new(l.as_bytes()).into_owned())
+      .collect();
+    Self { finders }
+  }
+
+  /// True when every required literal occurs in `content` (vacuously true with no literals).
+  pub fn may_match(&self, content: &str) -> bool {
+    self
+      .finders
+      .iter()
+      .all(|finder| finder.find(content.as_bytes()).is_some())
+  }
+}
+
 // sub_matchers are the injected languages
 // e.g. js/css in html
 pub fn filter_file_pattern<'a>(
@@ -163,30 +197,45 @@ pub fn filter_file_pattern<'a>(
   sub_matchers: &'a [(SgLang, Rule)],
 ) -> Result<SmallVec<[MatchUnit<&'a Rule>; 1]>> {
   let file_content = read_file(path)?;
+  // §12 fast path: consult required literals BEFORE parsing. Injected-language matchers are
+  // checked against the whole file (injected regions are substrings of it — sound). A file no
+  // candidate matcher can match never reaches tree-sitter.
+  let root_filter = root_matcher.map(Prefilter::for_rule);
+  let sub_filters: Vec<Prefilter> = sub_matchers
+    .iter()
+    .map(|(_, matcher)| Prefilter::for_rule(matcher))
+    .collect();
+  let root_viable = root_filter
+    .as_ref()
+    .is_some_and(|filter| filter.may_match(&file_content));
+  let any_sub_viable = sub_filters
+    .iter()
+    .any(|filter| filter.may_match(&file_content));
+  if !root_viable && !any_sub_viable {
+    return Ok(smallvec![]);
+  }
   let grep = lang.grep(&file_content);
-  let do_match = |grep: Vorpal, matcher: &'a Rule| {
-    let fixed = match matcher {
-      Rule::Pattern(pat) => pat.fixed_string(),
-      _ => std::borrow::Cow::Borrowed(""),
-    };
-    if !fixed.is_empty() && !file_content.contains(&*fixed) {
-      return None;
-    }
-    Some(MatchUnit {
-      grep,
-      path: path.to_path_buf(),
-      matcher,
-    })
-  };
   let mut ret = smallvec![];
-  if let Some(matcher) = root_matcher {
-    ret.extend(do_match(grep.clone(), matcher));
+  if root_viable {
+    if let Some(matcher) = root_matcher {
+      ret.push(MatchUnit {
+        grep: grep.clone(),
+        path: path.to_path_buf(),
+        matcher,
+      });
+    }
   }
   let injections = grep.get_injections(|s| SgLang::from_str(s).ok());
   let sub_units = injections.into_iter().filter_map(|inner| {
-    let (_, matcher) = sub_matchers.iter().find(|i| *inner.lang() == i.0)?;
-    let injected = inner;
-    do_match(injected, matcher)
+    let index = sub_matchers.iter().position(|i| *inner.lang() == i.0)?;
+    if !sub_filters[index].may_match(&file_content) {
+      return None;
+    }
+    Some(MatchUnit {
+      grep: inner,
+      path: path.to_path_buf(),
+      matcher: &sub_matchers[index].1,
+    })
   });
   ret.extend(sub_units);
   Ok(ret)
@@ -230,5 +279,40 @@ mod test {
     let root = SgLang::Builtin(SupportLang::Html).grep("<script lang=xxx>alert(123)</script>");
     let docs = root.get_injections(|s| SgLang::from_str(s).ok());
     assert_eq!(docs.len(), 0);
+  }
+
+  #[test]
+  fn test_prefilter_gates_on_required_literals() {
+    use vorpal_core::Pattern;
+    let lang = SgLang::Builtin(SupportLang::Rust);
+    let filter = Prefilter::for_rule(&Rule::Pattern(Pattern::new("special_sentinel($A)", lang)));
+    assert!(filter.may_match("fn x() { special_sentinel(1); }"));
+    // Per-token AND is formatting-insensitive.
+    assert!(filter.may_match("special_sentinel ( 1 )"));
+    assert!(!filter.may_match("fn x() { other(1); }"));
+    // A metavariable-only pattern requires nothing and gates nothing.
+    let all_pass = Prefilter::for_rule(&Rule::Pattern(Pattern::new("$A", lang)));
+    assert!(all_pass.may_match("anything at all"));
+  }
+
+  #[test]
+  fn test_filter_file_pattern_skips_unmatchable_files() {
+    use vorpal_core::Pattern;
+    let dir = tempfile::tempdir().unwrap();
+    let hit = dir.path().join("hit.rs");
+    let miss = dir.path().join("miss.rs");
+    std::fs::write(
+      &hit,
+      "fn special_sentinel() {}\nfn go() {\n    special_sentinel();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(&miss, "fn go() {\n    other();\n}\n").unwrap();
+    let lang = SgLang::Builtin(SupportLang::Rust);
+    let rule = Rule::Pattern(Pattern::new("special_sentinel()", lang));
+    // The literal-bearing file parses and yields a unit; the other is skipped pre-parse.
+    let units = filter_file_pattern(&hit, lang, Some(&rule), &[]).unwrap();
+    assert_eq!(units.len(), 1);
+    let units = filter_file_pattern(&miss, lang, Some(&rule), &[]).unwrap();
+    assert!(units.is_empty());
   }
 }

@@ -498,6 +498,35 @@ mod test {
     Root::str(s, Tsx)
   }
 
+  #[test]
+  fn test_required_literals() {
+    let pattern = Pattern::new("console.log($A)", Tsx);
+    let literals = pattern.required_literals();
+    assert!(literals.contains(&"console"), "{literals:?}");
+    assert!(literals.contains(&"log"), "{literals:?}");
+    assert!(literals.iter().all(|l| !l.contains('$')), "{literals:?}");
+    // A bare metavariable requires nothing.
+    assert!(Pattern::new("$A", Tsx).required_literals().is_empty());
+  }
+
+  #[test]
+  fn test_required_literals_respect_strictness() {
+    let mut pattern = Pattern::new("foo(bar)", Tsx);
+    assert!(pattern.required_literals().contains(&"("));
+    pattern.strictness = MatchStrictness::Ast;
+    let literals = pattern.required_literals();
+    assert!(literals.contains(&"foo"), "{literals:?}");
+    assert!(
+      !literals.contains(&"("),
+      "unnamed tokens are not matched in Ast mode: {literals:?}"
+    );
+    pattern.strictness = MatchStrictness::Signature;
+    assert!(
+      pattern.required_literals().is_empty(),
+      "Signature mode compares no text"
+    );
+  }
+
   fn test_match(s1: &str, s2: &str) {
     let pattern = Pattern::new(s1, Tsx);
     let cand = pattern_node(s2);

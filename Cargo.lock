@@ -2328,6 +2328,7 @@ dependencies = [
  "dashmap",
  "ignore",
  "inquire",
+ "memchr",
  "predicates",
  "regex",
  "serde",

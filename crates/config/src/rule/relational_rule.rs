@@ -76,6 +76,11 @@ impl Inside {
       .collect()
   }
 
+  /// The required ancestor's literals must appear somewhere in a matching file (§12 prefilter).
+  pub fn required_literals(&self) -> Vec<&str> {
+    self.outer.required_literals()
+  }
+
   pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
     self.outer.verify_util()?;
     self.stop_by.verify_util()
@@ -148,6 +153,11 @@ impl Has {
       .union(&self.stop_by.defined_vars())
       .copied()
       .collect()
+  }
+
+  /// The required descendant's literals must appear somewhere in a matching file (§12 prefilter).
+  pub fn required_literals(&self) -> Vec<&str> {
+    self.inner.required_literals()
   }
 
   pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
@@ -233,6 +243,11 @@ impl Precedes {
       .collect()
   }
 
+  /// The required later sibling's literals must appear in a matching file (§12 prefilter).
+  pub fn required_literals(&self) -> Vec<&str> {
+    self.later.required_literals()
+  }
+
   pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
     self.later.verify_util()?;
     self.stop_by.verify_util()
@@ -287,6 +302,11 @@ impl Follows {
       .union(&self.stop_by.defined_vars())
       .copied()
       .collect()
+  }
+
+  /// The required earlier sibling's literals must appear in a matching file (§12 prefilter).
+  pub fn required_literals(&self) -> Vec<&str> {
+    self.former.required_literals()
   }
 
   pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
@@ -745,6 +765,40 @@ mod test {
       Err(RuleSerializeError::InvalidField(_)) => {}
       _ => panic!("expected InvalidField error"),
     }
+  }
+
+  #[test]
+  fn test_required_literals_composition() {
+    // Relational rules require their target's literals somewhere in the file.
+    let has = Has {
+      stop_by: StopBy::End,
+      inner: Rule::Pattern(Pattern::new("needle($A)", TS::Tsx)),
+      field: None,
+    };
+    let rule = Rule::All(o::All::new(vec![
+      Rule::Kind(KindMatcher::new("call_expression", TS::Tsx)),
+      Rule::Has(Box::new(has)),
+    ]));
+    assert!(rule.required_literals().contains(&"needle"));
+
+    // `any`: only literals required by EVERY branch survive (intersection).
+    let any = Rule::Any(o::Any::new(vec![
+      Rule::Pattern(Pattern::new("shared(alpha)", TS::Tsx)),
+      Rule::Pattern(Pattern::new("shared(beta)", TS::Tsx)),
+    ]));
+    let literals = any.required_literals();
+    assert!(literals.contains(&"shared"), "{literals:?}");
+    assert!(
+      !literals.contains(&"alpha") && !literals.contains(&"beta"),
+      "branch-specific literals are not required: {literals:?}"
+    );
+
+    // `not` can require nothing.
+    let not = Rule::Not(Box::new(o::Not::new(Rule::Pattern(Pattern::new(
+      "forbidden",
+      TS::Tsx,
+    )))));
+    assert!(not.required_literals().is_empty());
   }
 
   #[test]
