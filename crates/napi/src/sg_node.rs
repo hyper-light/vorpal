@@ -1,6 +1,6 @@
-use vorpal_core::{Vorpal, NodeMatch, Pattern, Position, matcher::KindMatcher};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use vorpal_core::{NodeMatch, Pattern, Position, Vorpal, matcher::KindMatcher};
 
 use super::NapiConfig;
 use crate::{

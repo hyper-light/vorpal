@@ -9,10 +9,10 @@ pub use wasm_lang::WasmLangInfo;
 use doc::{WasmConfig, WasmDoc};
 use wasm_lang::WasmLang;
 
-use vorpal_core::matcher::PatternNode;
-use vorpal_core::{Vorpal, Language, MatchStrictness, Node as CoreNode, Pattern};
 use std::collections::HashMap;
 use ts_types::TreeSitter;
+use vorpal_core::matcher::PatternNode;
+use vorpal_core::{Language, MatchStrictness, Node as CoreNode, Pattern, Vorpal};
 use wasm_bindgen::prelude::*;
 
 /// Initialize the tree-sitter WASM runtime.

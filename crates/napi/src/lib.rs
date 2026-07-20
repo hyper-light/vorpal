@@ -5,11 +5,11 @@ mod find_files;
 mod napi_lang;
 mod sg_node;
 
-use vorpal_core::{Vorpal, Language};
-use vorpal_language::SupportLang;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use napi_lang::register_dynamic_language as register_dynamic_language_impl;
+use vorpal_core::{Language, Vorpal};
+use vorpal_language::SupportLang;
 
 use doc::{JsDoc, NapiConfig};
 use find_files::{FindConfig, FindInFiles, ParseAsync, find_in_files_impl};

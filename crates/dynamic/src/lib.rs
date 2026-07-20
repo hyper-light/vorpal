@@ -1,12 +1,12 @@
 use vorpal_core::Language;
 use vorpal_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
 
-use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
 use ignore::types::{Types, TypesBuilder};
 use libloading::{Error as LibError, Library, Symbol};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tree_sitter::{LANGUAGE_VERSION, Language as NativeTS, MIN_COMPATIBLE_LANGUAGE_VERSION};
+use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
 
 use std::borrow::Cow;
 use std::fs::canonicalize;

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::ts_types as ts;
 use vorpal_core::matcher::KindMatcher;
 use vorpal_core::source::Content;
-use vorpal_core::{Vorpal, NodeMatch, Pattern};
+use vorpal_core::{NodeMatch, Pattern, Vorpal};
 use wasm_bindgen::prelude::*;
 
 use crate::doc::{WasmConfig, WasmDoc, Wrapper};

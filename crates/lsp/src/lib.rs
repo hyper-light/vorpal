@@ -9,7 +9,7 @@ use tower_lsp_server::{Client, LanguageServer};
 
 use vorpal_config::{CombinedScan, RuleCollection, Severity};
 use vorpal_core::{
-  Vorpal, Doc,
+  Doc, Vorpal,
   tree_sitter::{LanguageExt, StrDoc},
 };
 

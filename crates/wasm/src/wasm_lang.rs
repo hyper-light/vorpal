@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
-use vorpal_core::language::Language;
-use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::borrow::Cow;
 use std::sync::Mutex;
+use vorpal_core::language::Language;
+use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
 use wasm_bindgen::prelude::*;
 
 use crate::doc::WasmDoc;

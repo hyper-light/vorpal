@@ -1,12 +1,12 @@
 use crate::napi_lang::NapiLang;
 
-use vorpal_config::{DeserializeEnv, RuleCore, SerializableRuleCore};
-use vorpal_core::source::{Content, Doc, Edit};
-use vorpal_core::tree_sitter::{ContentExt, LanguageExt, TSParseError};
 use napi::anyhow::Error;
 use napi::bindgen_prelude::Result as NapiResult;
 use napi_derive::napi;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
+use vorpal_config::{DeserializeEnv, RuleCore, SerializableRuleCore};
+use vorpal_core::source::{Content, Doc, Edit};
+use vorpal_core::tree_sitter::{ContentExt, LanguageExt, TSParseError};
 
 use std::borrow::Cow;
 use std::ops::Range;

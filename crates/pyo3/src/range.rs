@@ -1,9 +1,9 @@
 use crate::unicode_position::UnicodePosition;
-use vorpal_core::{Doc, Node, Position};
 use pyo3::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
+use vorpal_core::{Doc, Node, Position};
 
 #[pyclass(frozen, get_all)]
 #[derive(Clone, PartialEq, Eq, Hash)]

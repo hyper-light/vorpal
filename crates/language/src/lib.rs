@@ -43,12 +43,9 @@ mod solidity;
 mod swift;
 mod yaml;
 
-use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
 pub use html::Html;
+use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
 
-use vorpal_core::Node;
-use vorpal_core::meta_var::MetaVariable;
-use vorpal_core::tree_sitter::{StrDoc, TSLanguage, TSRange};
 use ignore::types::{Types, TypesBuilder};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -57,6 +54,9 @@ use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 use std::str::FromStr;
+use vorpal_core::Node;
+use vorpal_core::meta_var::MetaVariable;
+use vorpal_core::tree_sitter::{StrDoc, TSLanguage, TSRange};
 
 pub use vorpal_core::language::Language;
 pub use vorpal_core::tree_sitter::LanguageExt;

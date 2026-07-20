@@ -1,6 +1,3 @@
-use vorpal_config::{GlobalRules, RuleCollection, RuleConfig, from_yaml_string};
-use vorpal_language::SupportLang;
-use vorpal_lsp::*;
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::io;
@@ -9,6 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex, split};
 use tokio_util::bytes::{BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tower_lsp_server::ls_types::CodeAction;
+use vorpal_config::{GlobalRules, RuleCollection, RuleConfig, from_yaml_string};
+use vorpal_language::SupportLang;
+use vorpal_lsp::*;
 
 pub fn req(msg: &str) -> String {
   format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg)

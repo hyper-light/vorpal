@@ -1,6 +1,3 @@
-use vorpal_config::RuleCore;
-use vorpal_core::pinned::{NodeData, PinnedNodeData};
-use vorpal_core::{Vorpal, NodeMatch};
 use ignore::{WalkBuilder, WalkParallel, WalkState};
 use napi::Task;
 use napi::anyhow::{Context, Result as Ret, anyhow};
@@ -9,6 +6,9 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use vorpal_config::RuleCore;
+use vorpal_core::pinned::{NodeData, PinnedNodeData};
+use vorpal_core::{NodeMatch, Vorpal};
 
 use crate::doc::{JsDoc, NapiConfig};
 use crate::napi_lang::{LangOption, NapiLang, build_files};

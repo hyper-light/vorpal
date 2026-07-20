@@ -8,12 +8,12 @@ use py_lang::register_dynamic_language;
 use py_node::{Edit, SgNode};
 use range::{Pos, Range};
 
-use vorpal_core::{
-  Vorpal, NodeMatch,
-  tree_sitter::{LanguageExt, StrDoc},
-};
 use py_lang::PyLang;
 use pyo3::prelude::*;
+use vorpal_core::{
+  NodeMatch, Vorpal,
+  tree_sitter::{LanguageExt, StrDoc},
+};
 
 use unicode_position::UnicodePosition;
 
