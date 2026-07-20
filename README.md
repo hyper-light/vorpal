@@ -306,7 +306,7 @@ Indicative numbers from this repository (~300 files, ~8k nodes; debug builds on 
 
 ## TypeScript API
 
-`@vorpal/napi` exposes the pattern engine to Node.js as native bindings (napi-rs), with full
+`@vorpal/node` exposes the pattern engine to Node.js as native bindings (napi-rs), with full
 TypeScript definitions — including per-language typed node kinds, so `node.kind()` and
 `node.field(...)` narrow like you'd hope. Built from `crates/napi`. Every snippet below was
 executed against the built module before landing in this README.
@@ -314,7 +314,7 @@ executed against the built module before landing in this README.
 ### Parse, query, capture
 
 ```ts
-import { parse, Lang } from '@vorpal/napi'
+import { parse, Lang } from '@vorpal/node'
 
 // Patterns are real code; metavariables capture real AST nodes.
 const root = parse(Lang.TypeScript, 'console.log(user.name); console.log(count)')
@@ -347,7 +347,7 @@ root.root().commitEdits(edits)
 Migrate a test suite's assertions in a few lines:
 
 ```ts
-import { parse, Lang } from '@vorpal/napi'
+import { parse, Lang } from '@vorpal/node'
 
 function modernizeAsserts(source: string): string {
   const root = parse(Lang.TypeScript, source)
@@ -408,7 +408,7 @@ node.is('call_expression')     // type-guard narrowing for typed kinds
 Parsing, file discovery, and matching run in Rust worker threads:
 
 ```ts
-import { parseAsync, parseFiles, findInFiles } from '@vorpal/napi'
+import { parseAsync, parseFiles, findInFiles } from '@vorpal/node'
 
 await parseAsync(Lang.TypeScript, source)   // threaded parse of one source
 
@@ -427,11 +427,71 @@ const fileCount = await findInFiles(
 `registerDynamicLanguage(...)` loads custom tree-sitter grammars at runtime, and
 `kind(lang, name)` / `pattern(lang, src)` precompile matchers for reuse.
 
+## Python API
+
+`vorpal-py` (PyO3/maturin, module `vorpal_py`) exposes the same engine with a Pythonic surface:
+snake_case methods, and rule objects as keyword arguments. As with the TypeScript section,
+every snippet below was executed against a freshly built wheel before landing here.
+
+```python
+from vorpal_py import SgRoot
+
+# Parse, query, capture.
+root = SgRoot("console.log(user.name); console.log(count)", "typescript")
+node = root.root().find(pattern="console.log($ARG)")
+node.kind()                    # "call_expression"
+node.get_match("ARG").text()   # "user.name"
+
+# Rewrite: explicit edits committed against the source.
+r = root.root()
+edits = [
+    n.replace("logger.info({})".format(n.get_match("A").text()))
+    for n in r.find_all(pattern="console.log($A)")
+]
+r.commit_edits(edits)
+# => "logger.info(user.name); logger.info(count)"
+```
+
+Rules compose as keyword arguments — the same vocabulary as the YAML schema and the
+TypeScript rule objects:
+
+```python
+fn_root = SgRoot("function f() { console.log(1) }", "typescript")
+
+# console.log calls, but only inside function declarations
+hits = fn_root.root().find_all(
+    pattern="console.log($A)",
+    inside={"kind": "function_declaration", "stopBy": "end"},
+)
+
+# node predicates
+call = fn_root.root().find(kind="call_expression")
+call.matches(pattern="console.log($A)")        # True
+call.inside(kind="function_declaration")       # True
+```
+
+Navigation and captures mirror the TypeScript API:
+
+```python
+fn = fn_root.root().find(kind="function_declaration")
+fn.field("name").text()                        # "f"
+fn.children() / fn.parent() / fn.child(0)      # structural moves
+fn.next() / fn.prev()                          # siblings (+ next_all / prev_all)
+
+multi = fn_root.root().find(pattern="console.log($$$ARGS)")
+[n.text() for n in multi.get_multiple_matches("ARGS")]   # ["1"]
+
+[n.kind() for n in call.ancestors()][:3]
+# ["expression_statement", "statement_block", "function_declaration"]
+```
+
+`register_dynamic_language(...)` loads custom tree-sitter grammars, and `Range`/`Pos`/`Edit`
+are plain classes with the same shapes as their TypeScript counterparts.
+
 ## Other bindings
 
 | Package | Tech | Surface |
 |---|---|---|
-| `vorpal-py` | PyO3 / maturin | Python bindings (`vorpal_py`): the same parse/find/rewrite engine |
 | `@vorpal/wasm` | wasm-pack | Browser/WASM pattern engine |
 | `@vorpal/cli` | npm wrapper | Ships the `vorpal` / `vp` binaries per platform |
 
