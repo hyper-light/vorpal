@@ -67,15 +67,14 @@ jobs:
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
-      - name: Install dependencies
-        working-directory: crates/napi
-        run: yarn install --frozen-lockfile --ignore-scripts
+      - name: Install napi CLI
+        run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
       - uses: actions/download-artifact@v4
         with:
           path: crates/napi/artifacts
       - name: Move artifacts into platform packages
         working-directory: crates/napi
-        run: npx napi artifacts
+        run: napi artifacts
       - name: Publish (platform packages via prepublish, then main)
         working-directory: crates/napi
         env:

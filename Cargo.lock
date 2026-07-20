@@ -2315,7 +2315,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vorpal"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -2355,11 +2355,11 @@ dependencies = [
 
 [[package]]
 name = "vorpal-ann"
-version = "0.44.0"
+version = "0.1.0"
 
 [[package]]
 name = "vorpal-canonical"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "vorpal-segment",
@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-config"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "bit-set",
  "globset",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-core"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "bit-set",
  "regex",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-dynamic"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "ignore",
  "libloading",
@@ -2408,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-graph"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "bit-set",
  "vorpal-mem",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-index"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "vorpal-ann",
  "vorpal-ingest",
@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-ingest"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "ignore",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-kg"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "vorpal-canonical",
  "vorpal-graph",
@@ -2451,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-language"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "ignore",
  "serde",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-lsp"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-mcp"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "serde_json",
  "vorpal-index",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-mem"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "bumpalo",
  "libc",
@@ -2524,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-napi"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "ignore",
  "napi",
@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-outline"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "regex",
  "serde",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-py"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-resolve"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "vorpal-kg",
  "vorpal-outline",
@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "vorpal-segment"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -2612,7 +2612,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasm"
-version = "0.44.0"
+version = "0.1.0"
 dependencies = [
  "js-sys",
  "serde",

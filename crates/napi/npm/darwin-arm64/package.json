@@ -1,6 +1,6 @@
 {
   "name": "@vorpal/node-darwin-arm64",
-  "version": "0.44.0",
+  "version": "0.1.0",
   "os": [
     "darwin"
   ],

@@ -1,6 +1,6 @@
 {
   "name": "@vorpal/cli-win32-arm64-msvc",
-  "version": "0.44.0",
+  "version": "0.1.0",
   "os": [
     "win32"
   ],

@@ -1,6 +1,6 @@
 {
   "name": "@vorpal/node",
-  "version": "0.44.0",
+  "version": "0.1.0",
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "homepage": "https://vorpal.github.io",
   "main": "index.js",
@@ -54,7 +54,6 @@
     "typegen": "tsimp scripts/generateTypes.ts"
   },
   "devDependencies": {
-    "@vorpal/node": "0.44.0",
     "@napi-rs/cli": "3.7.2",
     "@types/node": "^24.0.0",
     "oxlint": "1.71.0",
