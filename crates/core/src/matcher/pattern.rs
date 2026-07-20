@@ -203,6 +203,25 @@ impl PatternNode {
       }
     }
   }
+
+  /// Collect leaf token texts a matching source must contain verbatim (metavariables and their
+  /// subtrees excluded). `named_only` skips unnamed tokens for strictness modes that do not
+  /// match them.
+  fn collect_literals<'a>(&'a self, named_only: bool, out: &mut Vec<&'a str>) {
+    match self {
+      PatternNode::Terminal { text, is_named, .. } => {
+        if (!named_only || *is_named) && !text.trim().is_empty() {
+          out.push(text);
+        }
+      }
+      PatternNode::MetaVar { .. } => {}
+      PatternNode::Internal { children, .. } => {
+        for child in children {
+          child.collect_literals(named_only, out);
+        }
+      }
+    }
+  }
 }
 impl<'r, D: Doc> From<Node<'r, D>> for PatternNode {
   fn from(node: Node<'r, D>) -> Self {
@@ -303,6 +322,23 @@ impl Pattern {
 
   pub fn fixed_string(&self) -> Cow<'_, str> {
     self.node.fixed_string()
+  }
+
+  /// Every fixed leaf token a matching source must contain verbatim — the per-token AND
+  /// prefilter (§12): the absence of any one literal proves the pattern cannot match, so a
+  /// file scan can skip parsing entirely. Strictly stronger than the single longest
+  /// [`Pattern::fixed_string`]. Respects strictness: unnamed tokens are only required by modes
+  /// that match them (Cst/Smart); Signature compares no text and therefore requires nothing.
+  pub fn required_literals(&self) -> Vec<&str> {
+    use MatchStrictness as M;
+    let named_only = match self.strictness {
+      M::Cst | M::Smart => false,
+      M::Ast | M::Relaxed | M::Template => true,
+      M::Signature => return Vec::new(),
+    };
+    let mut literals = Vec::new();
+    self.node.collect_literals(named_only, &mut literals);
+    literals
   }
 
   /// Get all defined variables in the pattern.

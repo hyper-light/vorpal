@@ -255,6 +255,36 @@ impl Rule {
     }
   }
 
+  /// Literals that must appear in any file this rule can match — a necessary condition, never
+  /// sufficient — so file scanning can skip the parse when one is absent (§12 prefilter).
+  /// Composition: `all` requires the union of its branches; `any` only what EVERY branch
+  /// requires (intersection); relational rules' targets must exist somewhere in the file;
+  /// `not` and rules we cannot analyze (kind/regex/nth-child/range/matches) require nothing.
+  pub fn required_literals(&self) -> Vec<&str> {
+    match self {
+      Rule::Pattern(p) => p.required_literals(),
+      Rule::Inside(inside) => inside.required_literals(),
+      Rule::Has(has) => has.required_literals(),
+      Rule::Precedes(precedes) => precedes.required_literals(),
+      Rule::Follows(follows) => follows.required_literals(),
+      Rule::All(sub) => sub
+        .inner()
+        .iter()
+        .flat_map(|r| r.required_literals())
+        .collect(),
+      Rule::Any(sub) => {
+        let mut branches = sub.inner().iter().map(|r| r.required_literals());
+        let Some(first) = branches.next() else {
+          return Vec::new();
+        };
+        branches.fold(first, |acc, branch| {
+          acc.into_iter().filter(|l| branch.contains(l)).collect()
+        })
+      }
+      _ => Vec::new(),
+    }
+  }
+
   pub fn defined_vars(&self) -> HashSet<&str> {
     match self {
       Rule::Pattern(p) => p.defined_vars(),
