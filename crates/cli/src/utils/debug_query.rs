@@ -1,9 +1,9 @@
 use crate::lang::SgLang;
 use ansi_term::Style;
-use vorpal_core::{Pattern, matcher::DumpPattern};
-use vorpal_language::LanguageExt;
 use clap::ValueEnum;
 use tree_sitter as ts;
+use vorpal_core::{Pattern, matcher::DumpPattern};
+use vorpal_language::LanguageExt;
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DebugFormat {

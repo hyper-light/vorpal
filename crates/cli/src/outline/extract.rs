@@ -6,6 +6,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use anyhow::{Context, Result};
+use ignore::WalkState;
+use serde::Serialize;
 use vorpal_core::Language;
 use vorpal_language::LanguageExt;
 use vorpal_outline::{
@@ -15,8 +17,6 @@ use vorpal_outline::{
   model::{OutlineEntry, OutlineItem, OutlineMember},
   options::OutlineExtractorOptions,
 };
-use ignore::WalkState;
-use serde::Serialize;
 
 use crate::lang::SgLang;
 use crate::utils::{EmptyFile, InputArgs, read_file};

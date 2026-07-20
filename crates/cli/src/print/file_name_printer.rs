@@ -1,9 +1,9 @@
 use super::{Diff, NodeMatch, PrintProcessor, Printer};
 use crate::lang::SgLang;
 use anyhow::Result;
-use vorpal_config::RuleConfig;
 use codespan_reporting::files::SimpleFile;
 use codespan_reporting::term::termcolor::{Buffer, ColorChoice, StandardStream, WriteColor};
+use vorpal_config::RuleConfig;
 
 use std::borrow::Cow;
 use std::path::Path;

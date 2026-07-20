@@ -28,8 +28,10 @@ path = "src/bin/alias.rs"
 vorpal-core.workspace = true
 vorpal-config.workspace = true
 vorpal-dynamic.workspace = true
+vorpal-index.workspace = true
 vorpal-language.workspace = true
 vorpal-lsp.workspace = true
+vorpal-mcp.workspace = true
 vorpal-outline.workspace = true
 tree-sitter.workspace = true
 

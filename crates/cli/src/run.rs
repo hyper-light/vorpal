@@ -2,11 +2,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use clap::{Args, Parser, ValueEnum, builder::PossibleValue};
+use ignore::WalkParallel;
 use vorpal_config::{Fixer, Rule, parse_selector};
 use vorpal_core::{MatchStrictness, Matcher, Pattern};
 use vorpal_language::{Language, LanguageExt};
-use clap::{Args, Parser, ValueEnum, builder::PossibleValue};
-use ignore::WalkParallel;
 
 use crate::config::ProjectConfig;
 use crate::lang::SgLang;
@@ -442,8 +442,8 @@ fn match_one_file<T, P: PrintProcessor<T>>(
 mod test {
   use super::*;
   use crate::print::ColorArg;
-  use vorpal_language::SupportLang;
   use std::path::PathBuf;
+  use vorpal_language::SupportLang;
 
   fn default_matcher_arg() -> MatcherArg {
     MatcherArg {

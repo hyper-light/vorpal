@@ -1,5 +1,6 @@
 mod completions;
 mod config;
+mod kg;
 mod lang;
 mod lsp;
 mod new;
@@ -16,6 +17,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use completions::{CompletionsArg, run_shell_completion};
 use config::ProjectConfig;
+use kg::{GraphArg, IndexArg, McpArg, SearchArg, run_graph, run_index, run_mcp, run_search};
 use lsp::{LspArg, run_language_server};
 use new::{NewArg, run_create_new};
 use outline::{OutlineArg, run_outline};
@@ -62,6 +64,14 @@ enum Commands {
   Lsp(LspArg),
   /// Explore code structure for symbols, imports, exports, and members.
   Outline(OutlineArg),
+  /// Build or refresh the knowledge-graph index for a directory.
+  Index(IndexArg),
+  /// Query the knowledge graph (callers, refs, importers, implementors, typeusers, node).
+  Graph(GraphArg),
+  /// Semantic search over indexed definitions.
+  Search(SearchArg),
+  /// Serve knowledge-graph queries to agents over MCP (stdio).
+  Mcp(McpArg),
   /// Generate shell completion script.
   Completions(CompletionsArg),
   /// Generate rule docs for current configuration. (Not Implemented Yet)
@@ -145,6 +155,10 @@ pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
     Commands::New(arg) => run_create_new(arg, project),
     Commands::Lsp(arg) => run_language_server(arg, project).map(|_| ExitCode::SUCCESS),
     Commands::Outline(arg) => run_outline(arg, project),
+    Commands::Index(arg) => run_index(arg),
+    Commands::Graph(arg) => run_graph(arg),
+    Commands::Search(arg) => run_search(arg),
+    Commands::Mcp(arg) => run_mcp(arg),
     Commands::Completions(arg) => run_shell_completion::<App>(arg),
     #[cfg(debug_assertions)]
     Commands::Docs => todo!("todo, generate rule docs based on current config"),
@@ -154,6 +168,20 @@ pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
 #[cfg(test)]
 mod test_cli {
   use super::*;
+
+  #[test]
+  fn kg_subcommands_parse() {
+    for args in [
+      "index .",
+      "index crates --out /tmp/idx",
+      "graph callers seal",
+      "graph implementors FileExtractor --index /tmp/idx",
+      "search import-path-resolution -k 5",
+      "mcp --index /tmp/idx",
+    ] {
+      sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));
+    }
+  }
 
   fn sg(args: &str) -> Result<App> {
     let app = App::try_parse_from(

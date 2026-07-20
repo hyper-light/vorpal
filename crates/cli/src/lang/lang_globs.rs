@@ -103,8 +103,8 @@ pub fn from_path(p: &Path) -> Option<SgLang> {
 #[cfg(test)]
 mod test {
   use super::*;
-  use vorpal_language::SupportLang;
   use serde_yaml::from_str;
+  use vorpal_language::SupportLang;
 
   const YAML: &str = r"
 js: ['.eslintrc']

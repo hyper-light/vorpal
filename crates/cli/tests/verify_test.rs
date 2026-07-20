@@ -3,9 +3,9 @@ mod common;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use vorpal::main_with_args;
 use common::create_test_files;
 use tempfile::TempDir;
+use vorpal::main_with_args;
 
 const CONFIG: &str = "
 ruleDirs:

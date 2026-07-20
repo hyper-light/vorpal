@@ -3,9 +3,9 @@ use crate::lang::SgLang;
 use crate::utils::ErrorContext as EC;
 
 use anyhow::Result;
+use regex::Regex;
 use vorpal_config::{RuleConfig, Severity};
 use vorpal_core::Language;
-use regex::Regex;
 
 use std::collections::HashMap;
 

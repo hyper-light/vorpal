@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
+use regex::Regex;
 use vorpal_outline::{
   model::SymbolType,
   options::{OutlineEntryDetail, OutlineExtractorOptions, OutlineFlagFilter, OutlineMemberOptions},
 };
-use regex::Regex;
 
 use super::{OutlineArg, OutlineItems, OutlineView};
 

@@ -1,7 +1,7 @@
 use super::{Diff, NodeMatch, PrintProcessor, Printer};
 use crate::lang::SgLang;
-use vorpal_config::{RuleConfig, Severity};
 use clap::ValueEnum;
+use vorpal_config::{RuleConfig, Severity};
 
 use anyhow::Result;
 use codespan_reporting::files::SimpleFile;
@@ -290,9 +290,9 @@ fn attach_sarif_fix(mut result: sarif::Result, path: &str, diff: Diff<'_>) -> sa
 #[cfg(test)]
 mod test {
   use super::*;
+  use codespan_reporting::term::termcolor::Buffer;
   use vorpal_config::{GlobalRules, from_yaml_string};
   use vorpal_language::{LanguageExt, SupportLang};
-  use codespan_reporting::term::termcolor::Buffer;
 
   fn make_test_printer() -> CloudPrinter<Buffer> {
     CloudPrinter::new(Buffer::no_color(), Platform::GitHub)

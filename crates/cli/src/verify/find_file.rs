@@ -3,11 +3,11 @@ use crate::config::ProjectConfig;
 use crate::utils::ErrorContext as EC;
 
 use anyhow::{Context, Result};
-use vorpal_config::from_str;
-use vorpal_language::config_file_type;
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde_yaml::{Deserializer, with::singleton_map_recursive::deserialize};
+use vorpal_config::from_str;
+use vorpal_language::config_file_type;
 
 use std::collections::HashMap;
 use std::fs::read_to_string;

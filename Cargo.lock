@@ -2345,8 +2345,10 @@ dependencies = [
  "vorpal-config",
  "vorpal-core",
  "vorpal-dynamic",
+ "vorpal-index",
  "vorpal-language",
  "vorpal-lsp",
+ "vorpal-mcp",
  "vorpal-outline",
 ]
 

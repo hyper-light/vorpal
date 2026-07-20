@@ -1,7 +1,7 @@
 use crate::lang::SgLang;
-use vorpal_config::RuleConfig;
 use dashmap::DashMap;
 use termimad::MadSkin;
+use vorpal_config::RuleConfig;
 
 /// A Markdown renderer that caches rendered notes to avoid recomputing.
 pub struct Markdown {

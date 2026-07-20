@@ -2,8 +2,8 @@ use super::case_result::{CaseResult, CaseStatus};
 use super::snapshot::TestSnapshots;
 use crate::lang::SgLang;
 
-use vorpal_config::RuleConfig;
 use serde::{Deserialize, Serialize};
+use vorpal_config::RuleConfig;
 
 /// Corresponds to one rule-test.yml for testing.
 ///

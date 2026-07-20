@@ -2,13 +2,13 @@ use super::{Diff, NodeMatch, PrintProcessor, Printer};
 use crate::lang::SgLang;
 use crate::utils::DiffStyles;
 use anyhow::Result;
-use vorpal_config::{RuleConfig, Severity};
-use vorpal_core::Doc;
 use clap::ValueEnum;
 use codespan_reporting::diagnostic::{self, Diagnostic, Label};
 use codespan_reporting::files::SimpleFile;
 use codespan_reporting::term::termcolor::{Buffer, ColorChoice, StandardStream, WriteColor};
 use codespan_reporting::term::{self, DisplayStyle};
+use vorpal_config::{RuleConfig, Severity};
+use vorpal_core::Doc;
 
 use std::borrow::Cow;
 use std::io::Write;

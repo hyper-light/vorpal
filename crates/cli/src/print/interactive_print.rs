@@ -4,10 +4,10 @@ use crate::utils::ErrorContext as EC;
 use crate::utils::{self, clear};
 
 use anyhow::{Context, Result};
-use vorpal_config::RuleConfig;
 use codespan_reporting::files::SimpleFile;
 use codespan_reporting::term::termcolor::{Buffer, StandardStream};
 use smallvec::{SmallVec, smallvec};
+use vorpal_config::RuleConfig;
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -408,7 +408,7 @@ mod test {
   use super::*;
   use vorpal_config::{Fixer, GlobalRules, from_yaml_string};
   use vorpal_core::tree_sitter::{StrDoc, Visitor};
-  use vorpal_core::{Vorpal, Matcher};
+  use vorpal_core::{Matcher, Vorpal};
   use vorpal_language::SupportLang;
 
   fn make_rule(rule: &str) -> RuleConfig<SgLang> {

@@ -3,8 +3,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use vorpal_index::{build_index, format_nodes, search_index};
-use vorpal_kg::Kg;
+use vorpal_index::{build_index, graph_query, search_index};
 
 const USAGE: &str = "usage:
   vorpal-index index        <src-dir> <index-dir>   build + persist a knowledge graph
@@ -47,20 +46,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       index,
       name,
     ] => {
-      let kg = Kg::load(Path::new(index))?;
-      let ids = match *verb {
-        "callers" => kg.callers_of(name),
-        "refs" => kg.references_to(name),
-        "importers" => kg.importers_of(name),
-        "implementors" => kg.implementors_of(name),
-        "typeusers" => kg.users_of_type(name),
-        _ => kg.nodes_named(name),
-      };
-      if ids.is_empty() {
-        println!("(no results for '{name}')");
-      } else {
-        print!("{}", format_nodes(&kg, &ids));
-      }
+      print!("{}", graph_query(Path::new(index), verb, name)?);
       Ok(())
     }
     ["search", index, query] => print_search(index, query, 10),

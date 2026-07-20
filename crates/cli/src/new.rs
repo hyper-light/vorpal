@@ -1,4 +1,4 @@
-use crate::config::{VorpalConfig, ProjectConfig, TestConfig};
+use crate::config::{ProjectConfig, TestConfig, VorpalConfig};
 use crate::lang::SgLang;
 use crate::utils::ErrorContext as EC;
 
@@ -362,9 +362,9 @@ fn create_new_util(found: ProjectConfig, arg: NewArg) -> Result<ExitCode> {
 #[cfg(test)]
 mod test {
   use super::*;
-  use vorpal_language::SupportLang;
   use std::path::Path;
   use tempfile::TempDir;
+  use vorpal_language::SupportLang;
 
   fn create_project(tempdir: &Path) -> Result<()> {
     let arg = NewArg {

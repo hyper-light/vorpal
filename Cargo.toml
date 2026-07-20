@@ -32,6 +32,7 @@ vorpal-ingest = { path = "crates/ingest", version = "0.44.0" }
 vorpal-kg = { path = "crates/kg", version = "0.44.0" }
 vorpal-language = { path = "crates/language", version = "0.44.0" }
 vorpal-lsp = { path = "crates/lsp", version = "0.44.0" }
+vorpal-mcp = { path = "crates/mcp", version = "0.44.0" }
 vorpal-mem = { path = "crates/mem", version = "0.44.0" }
 vorpal-outline = { path = "crates/outline", version = "0.44.0" }
 vorpal-resolve = { path = "crates/resolve", version = "0.44.0" }

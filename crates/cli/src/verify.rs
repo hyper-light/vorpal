@@ -10,10 +10,10 @@ use crate::print::ColorArg;
 use crate::utils::{ErrorContext, RuleOverwrite};
 use crate::verify::reporter::TestReportStyle;
 use anyhow::{Result, anyhow};
-use vorpal_config::RuleCollection;
 use clap::Args;
 use regex::Regex;
 use serde_yaml::to_string;
+use vorpal_config::RuleCollection;
 
 use std::collections::HashMap;
 use std::io::Write;

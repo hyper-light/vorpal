@@ -173,7 +173,7 @@ pub fn filter_file_pattern<'a>(
       return None;
     }
     Some(MatchUnit {
-      grep: grep,
+      grep,
       path: path.to_path_buf(),
       matcher,
     })

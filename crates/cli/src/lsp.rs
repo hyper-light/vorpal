@@ -1,9 +1,9 @@
 use crate::config::ProjectConfig;
 use crate::utils::{ErrorContext as EC, RuleOverwrite};
 use anyhow::{Context, Result};
-use vorpal_lsp::{Backend, LspService, Server};
 use clap::Args;
 use tracing_subscriber::EnvFilter;
+use vorpal_lsp::{Backend, LspService, Server};
 
 #[derive(Args)]
 pub struct LspArg {}

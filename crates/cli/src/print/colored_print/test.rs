@@ -1,9 +1,9 @@
 #![cfg(test)]
 
 use super::*;
+use codespan_reporting::term::termcolor::Buffer;
 use vorpal_config::{Fixer, GlobalRules, from_yaml_string};
 use vorpal_language::{LanguageExt, SupportLang};
-use codespan_reporting::term::termcolor::Buffer;
 
 use std::fmt::Write;
 

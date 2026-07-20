@@ -170,6 +170,26 @@ pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, B
   Ok(out)
 }
 
+/// Run one graph query verb against a persisted index and render the results — the shared
+/// implementation behind the `vorpal-index` binary and the `vorpal graph` subcommand.
+pub fn graph_query(index_dir: &Path, verb: &str, name: &str) -> Result<String, Box<dyn Error>> {
+  let kg = Kg::load(index_dir)?;
+  let ids = match verb {
+    "callers" => kg.callers_of(name),
+    "refs" | "references" => kg.references_to(name),
+    "importers" => kg.importers_of(name),
+    "implementors" => kg.implementors_of(name),
+    "typeusers" => kg.users_of_type(name),
+    "node" => kg.nodes_named(name),
+    other => return Err(format!("unknown graph verb '{other}'").into()),
+  };
+  Ok(if ids.is_empty() {
+    format!("(no results for '{name}')\n")
+  } else {
+    format_nodes(&kg, &ids)
+  })
+}
+
 /// Render nodes as `name [Kind] path` lines.
 pub fn format_nodes(kg: &Kg, ids: &[NodeId]) -> String {
   let mut out = String::new();

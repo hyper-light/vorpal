@@ -2,14 +2,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use clap::Args;
+use ignore::WalkParallel;
 use vorpal_config::{
   CombinedScan, NO_SUPPRESS_ALL_ID, RuleCollection, RuleConfig, Severity, UNUSED_SUPPRESSION_ID,
   from_yaml_string,
 };
 use vorpal_core::{NodeMatch, tree_sitter::StrDoc};
 use vorpal_language::SupportLang;
-use clap::Args;
-use ignore::WalkParallel;
 
 use crate::config::{ProjectConfig, read_rule_file, with_rule_stats};
 use crate::lang::SgLang;

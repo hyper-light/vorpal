@@ -2,12 +2,12 @@ use crate::lang::{CustomLang, LanguageGlobs, SerializableInjection, SgLang};
 use crate::utils::{ErrorContext as EC, RuleOverwrite, RuleTrace};
 
 use anyhow::{Context, Result};
+use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use vorpal_config::{
   DeserializeEnv, GlobalRules, RuleCollection, RuleConfig, from_str, from_yaml_string,
 };
 use vorpal_language::config_file_type;
-use ignore::WalkBuilder;
-use serde::{Deserialize, Serialize};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::read_to_string;
