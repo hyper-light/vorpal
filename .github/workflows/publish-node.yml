@@ -1,0 +1,108 @@
+# Node bindings: build the @vorpal/node native module for every platform, publish the
+# per-platform packages and the main package to npm, plus @vorpal/wasm.
+#
+# Triggers: tag `v<version>` publishes; workflow_dispatch is a build-only dry run.
+# Required repository secrets: NPM_TOKEN.
+name: Publish Node bindings
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  NAPI_CLI_VERSION: 3.7.2
+
+jobs:
+  build:
+    name: napi ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+          - { target: i686-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: napi-${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install napi CLI
+        run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+      - name: Build
+        working-directory: crates/napi
+        run: napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/napi/vorpal-napi.*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish @vorpal/node
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install dependencies
+        working-directory: crates/napi
+        run: yarn install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/napi/artifacts
+      - name: Move artifacts into platform packages
+        working-directory: crates/napi
+        run: npx napi artifacts
+      - name: Publish (platform packages via prepublish, then main)
+        working-directory: crates/napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  wasm:
+    name: Publish @vorpal/wasm
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install wasm-pack
+        run: npm install -g wasm-pack
+      - name: Build
+        run: wasm-pack build crates/wasm --release --scope vorpal
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd crates/wasm/pkg && npm publish --access public

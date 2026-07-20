@@ -1,0 +1,156 @@
+# CLI release: build the `vorpal` + `vp` binaries for every supported platform, attach them to
+# a GitHub Release as `app-<target>.zip` (the name cargo-binstall and the @vorpal/cli npm
+# wrapper expect), and publish the @vorpal/cli wrapper + its per-platform binary packages.
+#
+# Triggers: pushing a tag `v<version>` does the full release; workflow_dispatch runs the build
+# matrix only (a dry run — nothing is released or published without a tag).
+#
+# Required repository secrets: NPM_TOKEN (npm publish). GITHUB_TOKEN is provided automatically.
+#
+# Platform coverage: aarch64/arm64 + x86_64/amd64 across macOS, Linux glibc (Debian, Fedora,
+# Ubuntu, Arch, …), Linux musl (Alpine), and Windows (plus 32-bit Windows).
+name: Release CLI
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: Version guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v${version}" = "${GITHUB_REF_NAME}" \
+            || { echo "tag ${GITHUB_REF_NAME} != workspace version v${version}"; exit 1; }
+
+  test:
+    name: Test gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+          - { target: i686-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release -p vorpal --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          zip -j "${GITHUB_WORKSPACE}/app-${{ matrix.target }}.zip" vorpal vp
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path `
+            "target/${{ matrix.target }}/release/vorpal.exe", `
+            "target/${{ matrix.target }}/release/vp.exe" `
+            -DestinationPath "app-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.target }}
+          path: app-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/app-*.zip
+          generate_release_notes: true
+
+  publish-cli-npm:
+    name: Publish @vorpal/cli to npm
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Place binaries into platform packages
+        run: |
+          set -euo pipefail
+          for pair in \
+            x86_64-apple-darwin=darwin-x64 \
+            aarch64-apple-darwin=darwin-arm64 \
+            x86_64-unknown-linux-gnu=linux-x64-gnu \
+            aarch64-unknown-linux-gnu=linux-arm64-gnu \
+            x86_64-unknown-linux-musl=linux-x64-musl \
+            aarch64-unknown-linux-musl=linux-arm64-musl \
+            x86_64-pc-windows-msvc=win32-x64-msvc \
+            aarch64-pc-windows-msvc=win32-arm64-msvc \
+            i686-pc-windows-msvc=win32-ia32-msvc; do
+            target="${pair%%=*}"
+            platform="${pair##*=}"
+            zipfile="artifacts/app-${target}/app-${target}.zip"
+            case "$platform" in
+              win32-*) unzip -o "$zipfile" vorpal.exe -d "npm/platforms/${platform}/" ;;
+              *)       unzip -o "$zipfile" vorpal -d "npm/platforms/${platform}/" \
+                         && chmod +x "npm/platforms/${platform}/vorpal" ;;
+            esac
+          done
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for dir in npm/platforms/*/; do
+            (cd "$dir" && npm publish --access public)
+          done
+      - name: Publish @vorpal/cli wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: cd npm && npm publish --access public
