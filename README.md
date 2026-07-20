@@ -304,12 +304,134 @@ Indicative numbers from this repository (~300 files, ~8k nodes; debug builds on 
 | `vorpal mcp [--index]` | Serve the MCP server over stdio |
 | `vorpal completions` | Shell completion scripts |
 
-## Language bindings
+## TypeScript API
+
+`@vorpal/napi` exposes the pattern engine to Node.js as native bindings (napi-rs), with full
+TypeScript definitions — including per-language typed node kinds, so `node.kind()` and
+`node.field(...)` narrow like you'd hope. Built from `crates/napi`. Every snippet below was
+executed against the built module before landing in this README.
+
+### Parse, query, capture
+
+```ts
+import { parse, Lang } from '@vorpal/napi'
+
+// Patterns are real code; metavariables capture real AST nodes.
+const root = parse(Lang.TypeScript, 'console.log(user.name); console.log(count)')
+const node = root.root().find('console.log($ARG)')
+
+node.kind()                  // "call_expression"
+node.text()                  // 'console.log(user.name)'
+node.getMatch('ARG').text()  // "user.name"
+node.range()                 // { start: { line, column, index }, end: { ... } }
+
+// `$$$` captures node lists:
+const call = root.root().find('console.log($$$ARGS)')
+call.getMultipleMatches('ARGS').map(n => n.text())   // ["user.name"]
+```
+
+### Rewrite: edits are explicit and composable
+
+```ts
+const edits = root
+  .root()
+  .findAll('console.log($A)')
+  .map(n => n.replace(`logger.info(${n.getMatch('A').text()})`))
+
+root.root().commitEdits(edits)
+// => "logger.info(user.name); logger.info(count)"
+```
+
+### A complete codemod
+
+Migrate a test suite's assertions in a few lines:
+
+```ts
+import { parse, Lang } from '@vorpal/napi'
+
+function modernizeAsserts(source: string): string {
+  const root = parse(Lang.TypeScript, source)
+  const edits = root
+    .root()
+    .findAll('assert.equal($ACTUAL, $EXPECTED)')
+    .map(n =>
+      n.replace(
+        `expect(${n.getMatch('ACTUAL').text()}).toEqual(${n.getMatch('EXPECTED').text()})`,
+      ),
+    )
+  return root.root().commitEdits(edits)
+}
+
+modernizeAsserts(`assert.equal(add(1, 2), 3); assert.equal(name, 'ada');`)
+// => "expect(add(1, 2)).toEqual(3); expect(name).toEqual('ada');"
+```
+
+### Rule objects: the full YAML rule system, inline
+
+Everything the CLI's rule files can express — `kind`, `inside`, `has`, `all`/`any`/`not`,
+`stopBy` — works as a plain object:
+
+```ts
+// every call expression
+root.root().findAll({ rule: { kind: 'call_expression' } })
+
+// console.log calls, but only inside function declarations
+root.root().findAll({
+  rule: {
+    pattern: 'console.log($A)',
+    inside: { kind: 'function_declaration', stopBy: 'end' },
+  },
+})
+
+// relational/composite checks read as node predicates too
+node.matches('console.log($A)')
+node.inside('function_declaration')
+node.has('member_expression')
+node.follows('$SOMETHING')
+```
+
+### Navigate the tree
+
+```ts
+const fn = root.root().find({ rule: { kind: 'function_declaration' } })
+fn.field('name').text()        // typed field access: "f"
+fn.children()                  // Array<SgNode>
+fn.parent() / fn.child(0)      // structural moves
+fn.next() / fn.prev()          // siblings (plus nextAll() / prevAll())
+call.ancestors().map(n => n.kind())
+// ["arguments", "call_expression", "expression_statement", ...]
+node.is('call_expression')     // type-guard narrowing for typed kinds
+```
+
+### Scale: parse and search off the main thread
+
+Parsing, file discovery, and matching run in Rust worker threads:
+
+```ts
+import { parseAsync, parseFiles, findInFiles } from '@vorpal/napi'
+
+await parseAsync(Lang.TypeScript, source)   // threaded parse of one source
+
+// Walk directories, parse, and match entirely in Rust; matches stream back per file.
+const fileCount = await findInFiles(
+  Lang.TypeScript,
+  { paths: ['src/'], matcher: { rule: { pattern: 'console.log($MSG)' } } },
+  (err, nodes) => {
+    for (const n of nodes) {
+      console.log(`${n.getRoot().filename()}: ${n.text()}`)
+    }
+  },
+)
+```
+
+`registerDynamicLanguage(...)` loads custom tree-sitter grammars at runtime, and
+`kind(lang, name)` / `pattern(lang, src)` precompile matchers for reuse.
+
+## Other bindings
 
 | Package | Tech | Surface |
 |---|---|---|
-| `@vorpal/napi` | napi-rs | Node.js native bindings to the pattern engine |
-| `vorpal-py` | PyO3 / maturin | Python bindings (`vorpal_py`) |
+| `vorpal-py` | PyO3 / maturin | Python bindings (`vorpal_py`): the same parse/find/rewrite engine |
 | `@vorpal/wasm` | wasm-pack | Browser/WASM pattern engine |
 | `@vorpal/cli` | npm wrapper | Ships the `vorpal` / `vp` binaries per platform |
 
