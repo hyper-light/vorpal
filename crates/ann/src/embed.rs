@@ -54,8 +54,10 @@ impl Embedder for LexicalEmbedder {
   }
 }
 
-/// Split on non-alphanumeric boundaries and lower→Upper camel humps; lowercase every token.
-fn tokenize(text: &str) -> Vec<String> {
+/// Split on non-alphanumeric boundaries and lower→Upper camel humps; lowercase every token —
+/// the shared token model for embedding and for name matching (so `resolveImportPath`,
+/// `resolve_import_path`, and `resolve import path` all meet on the same tokens).
+pub fn tokenize(text: &str) -> Vec<String> {
   let mut tokens = Vec::new();
   let mut current = String::new();
   let mut prev_lower = false;

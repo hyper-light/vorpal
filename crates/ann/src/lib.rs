@@ -19,7 +19,7 @@ mod index;
 mod quant;
 mod vamana;
 
-pub use embed::{Embedder, LexicalEmbedder};
+pub use embed::{Embedder, LexicalEmbedder, tokenize};
 pub use index::{AnnConfig, AnnIndex};
 pub use quant::SignQuantizer;
 

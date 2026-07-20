@@ -199,8 +199,9 @@ fn tools_list() -> Value {
     ),
     tool(
       "search",
-      "Semantic search over definitions (lexical-embedding similarity on names, signatures, \
-       and paths); returns the top-k matches with scores.",
+      "Hybrid search over definitions: exact/token name matches, lexical-embedding similarity, \
+       and graph in-degree fused by reciprocal rank fusion; returns the top-k matches with \
+       scores.",
       json!({
         "query": {"type": "string", "description": "Free-text query"},
         "k": {"type": "integer", "description": "Max results (default 10)"}

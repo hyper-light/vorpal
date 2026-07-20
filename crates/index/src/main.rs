@@ -13,7 +13,7 @@ const USAGE: &str = "usage:
   vorpal-index implementors <index-dir> <name>      types implementing/extending a symbol
   vorpal-index typeusers    <index-dir> <name>      definitions using a type
   vorpal-index node         <index-dir> <name>      nodes matching a name
-  vorpal-index search       <index-dir> <query> [k] semantic (lexical-embedding) search";
+  vorpal-index search       <index-dir> <query> [k] hybrid search (name + semantic + graph, RRF)";
 
 fn main() -> ExitCode {
   match run() {

@@ -65,7 +65,8 @@ pub struct GraphArg {
 
 #[derive(Args)]
 pub struct SearchArg {
-  /// Free-text query (lexical-embedding similarity over names, signatures, and file names).
+  /// Free-text query — hybrid retrieval fusing exact/token name matches, lexical-embedding
+  /// similarity, and graph in-degree (RRF).
   query: String,
   /// Max results.
   #[clap(short, default_value_t = 10)]

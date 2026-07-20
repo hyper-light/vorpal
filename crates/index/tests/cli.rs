@@ -88,6 +88,14 @@ fn semantic_search_finds_definitions_by_description() {
     "top hit should be the lexically-matching definition:\n{rendered}"
   );
 
+  // Hybrid guarantee: querying a symbol by its exact name puts that symbol first.
+  let rendered = search_index(&out, "hamming_distance", 3).unwrap();
+  let first = rendered.lines().next().unwrap_or("");
+  assert!(
+    first.contains("hamming_distance [Function]"),
+    "exact-name query ranks the exact node first:\n{rendered}"
+  );
+
   let _ = fs::remove_dir_all(&base);
 }
 
