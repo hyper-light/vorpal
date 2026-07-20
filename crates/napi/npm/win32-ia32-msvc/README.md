@@ -1,3 +1,3 @@
-# `@vorpal/napi-win32-ia32-msvc`
+# `@vorpal/node-win32-ia32-msvc`
 
-This is the **i686-pc-windows-msvc** binary for `@vorpal/napi`
+This is the **i686-pc-windows-msvc** binary for `@vorpal/node`

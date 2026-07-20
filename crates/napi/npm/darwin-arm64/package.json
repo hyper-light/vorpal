@@ -1,5 +1,5 @@
 {
-  "name": "@vorpal/napi-darwin-arm64",
+  "name": "@vorpal/node-darwin-arm64",
   "version": "0.44.0",
   "os": [
     "darwin"

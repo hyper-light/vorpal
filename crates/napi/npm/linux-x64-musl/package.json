@@ -1,5 +1,5 @@
 {
-  "name": "@vorpal/napi-linux-x64-musl",
+  "name": "@vorpal/node-linux-x64-musl",
   "version": "0.44.0",
   "os": [
     "linux"

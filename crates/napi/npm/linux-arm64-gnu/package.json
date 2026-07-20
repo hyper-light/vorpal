@@ -1,5 +1,5 @@
 {
-  "name": "@vorpal/napi-linux-arm64-gnu",
+  "name": "@vorpal/node-linux-arm64-gnu",
   "version": "0.44.0",
   "os": [
     "linux"

@@ -1,5 +1,5 @@
 {
-  "name": "@vorpal/napi-win32-arm64-msvc",
+  "name": "@vorpal/node-win32-arm64-msvc",
   "version": "0.44.0",
   "os": [
     "win32"

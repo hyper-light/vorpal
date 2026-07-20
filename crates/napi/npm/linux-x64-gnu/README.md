@@ -1,3 +1,3 @@
-# `@vorpal/napi-linux-x64-gnu`
+# `@vorpal/node-linux-x64-gnu`
 
-This is the **x86_64-unknown-linux-gnu** binary for `@vorpal/napi`
+This is the **x86_64-unknown-linux-gnu** binary for `@vorpal/node`

@@ -3,7 +3,7 @@ import type { SgNode, SgRoot } from './sgnode'
 
 /**
  * @deprecated language specific objects are deprecated
- * use the equivalent functions like `parse` in @vorpal/napi
+ * use the equivalent functions like `parse` in @vorpal/node
  */
 export declare namespace html {
   /** @deprecated use `parse(Lang.Html, src)` instead */
@@ -22,7 +22,7 @@ export declare namespace html {
 }
 /**
  * @deprecated language specific objects are deprecated
- * use the equivalent functions like `parse` in @vorpal/napi
+ * use the equivalent functions like `parse` in @vorpal/node
  */
 export declare namespace js {
   /** @deprecated use `parse(Lang.JavaScript, src)` instead */
@@ -41,7 +41,7 @@ export declare namespace js {
 }
 /**
  * @deprecated language specific objects are deprecated
- * use the equivalent functions like `parse` in @vorpal/napi
+ * use the equivalent functions like `parse` in @vorpal/node
  */
 export declare namespace jsx {
   /** @deprecated use `parse(Lang.JavaScript, src)` instead */
@@ -60,7 +60,7 @@ export declare namespace jsx {
 }
 /**
  * @deprecated language specific objects are deprecated
- * use the equivalent functions like `parse` in @vorpal/napi
+ * use the equivalent functions like `parse` in @vorpal/node
  */
 export declare namespace ts {
   /** @deprecated use `parse(Lang.TypeScript, src)` instead */
@@ -79,7 +79,7 @@ export declare namespace ts {
 }
 /**
  * @deprecated language specific objects are deprecated
- * use the equivalent functions like `parse` in @vorpal/napi
+ * use the equivalent functions like `parse` in @vorpal/node
  */
 export declare namespace tsx {
   /** @deprecated use `parse(Lang.Tsx, src)` instead */
@@ -98,7 +98,7 @@ export declare namespace tsx {
 }
 /**
  * @deprecated language specific objects are deprecated
- * use the equivalent functions like `parse` in @vorpal/napi
+ * use the equivalent functions like `parse` in @vorpal/node
  */
 export declare namespace css {
   /** @deprecated use `parse(Lang.Css, src)` instead */
