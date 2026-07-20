@@ -43,10 +43,7 @@ pub(crate) fn greedy_search(
   let mut expanded: HashSet<u32> = HashSet::new();
   let mut visited: Vec<Scored> = Vec::new();
 
-  loop {
-    let Some(&(next, dist)) = beam.iter().find(|(v, _)| !expanded.contains(v)) else {
-      break;
-    };
+  while let Some(&(next, dist)) = beam.iter().find(|(v, _)| !expanded.contains(v)) {
     expanded.insert(next);
     visited.push((next, dist));
     for &nb in &graph[next as usize] {
@@ -62,7 +59,7 @@ pub(crate) fn greedy_search(
 
 impl Vamana {
   pub fn build(vectors: &[f32], dim: usize, params: &BuildParams) -> Self {
-    let n = if dim == 0 { 0 } else { vectors.len() / dim };
+    let n = vectors.len().checked_div(dim).unwrap_or(0);
     if n == 0 {
       return Self {
         graph: Vec::new(),
