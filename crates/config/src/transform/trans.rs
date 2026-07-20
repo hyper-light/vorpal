@@ -209,9 +209,9 @@ mod test {
   use super::*;
   use crate::test::TypeScript;
   use crate::{DeserializeEnv, Transformation};
-  use vorpal_core::tree_sitter::LanguageExt;
   use serde_yaml::with::singleton_map_recursive;
   use std::collections::HashMap;
+  use vorpal_core::tree_sitter::LanguageExt;
 
   type R = std::result::Result<(), ()>;
 

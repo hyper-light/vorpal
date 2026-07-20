@@ -1,8 +1,8 @@
-use vorpal_core::language::Language;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use thiserror::Error;
+use vorpal_core::language::Language;
 
 use crate::check_var::check_rewriter_fix;
 use crate::fixer::{Fixer, FixerError, SerializableFixer};

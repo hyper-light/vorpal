@@ -5,11 +5,11 @@ use crate::rule::referent_rule::RuleRegistration;
 use crate::rule::{RuleSerializeError, SerializableRule};
 use crate::transform::{Transform, TransformError, Transformation};
 
+use serde::{Deserialize, Serialize};
+use serde_yaml::Error as YamlError;
 use vorpal_core::language::Language;
 use vorpal_core::meta_var::MetaVarEnv;
 use vorpal_core::{Doc, Matcher, Node};
-use serde::{Deserialize, Serialize};
-use serde_yaml::Error as YamlError;
 
 use bit_set::BitSet;
 use schemars::JsonSchema;

@@ -1,6 +1,6 @@
-use vorpal_core::{Doc, Node, meta_var::MetaVarEnv};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use vorpal_core::{Doc, Node, meta_var::MetaVarEnv};
 
 /// Represents a zero-based character-wise position in a document
 #[derive(Serialize, Deserialize, Clone, JsonSchema)]
@@ -155,8 +155,8 @@ mod test {
 
   #[test]
   fn test_multiline_range() {
-    let cand = TS::Tsx
-      .grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
+    let cand =
+      TS::Tsx.grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {
@@ -241,8 +241,8 @@ mod test {
 
   #[test]
   fn test_range_with_none_columns_multiline() {
-    let cand = TS::Tsx
-      .grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
+    let cand =
+      TS::Tsx.grep("class A { \n b = () => { \n const c = 1 \n const d = 3 \n return c + d \n } }");
     let cand = cand.root();
     let pattern = RangeMatcher::new(
       SerializablePosition {

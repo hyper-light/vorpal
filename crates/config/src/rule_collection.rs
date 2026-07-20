@@ -1,7 +1,7 @@
 use crate::{RuleConfig, Severity, rule_config::RuleFileGlob};
-use vorpal_core::language::Language;
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use std::path::Path;
+use vorpal_core::language::Language;
 
 /// RuleBucket stores rules of the same language id.
 /// Rules for different language will stay in separate buckets.

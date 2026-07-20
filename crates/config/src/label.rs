@@ -1,7 +1,7 @@
-use vorpal_core::{Doc, Node, NodeMatch};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Range};
+use vorpal_core::{Doc, Node, NodeMatch};
 
 #[derive(Serialize, Deserialize, Clone, JsonSchema, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]

@@ -40,12 +40,12 @@ use super::{
   nth_child::{NthChild, NthChildError},
   relational_rule::{Follows, Has, Inside},
 };
+use thiserror::Error;
 use vorpal_core::{
   Language,
   matcher::{KindMatcher, KindMatcherError},
   ops,
 };
-use thiserror::Error;
 
 // Inspired by CSS Selector, see
 // https://www.w3.org/TR/selectors-4/#grammar

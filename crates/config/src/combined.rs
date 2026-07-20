@@ -2,7 +2,7 @@ use crate::{RuleConfig, SerializableRule, SerializableRuleConfig, SerializableRu
 
 use vorpal_core::language::Language;
 use vorpal_core::matcher::{Matcher, MatcherExt};
-use vorpal_core::{Vorpal, Doc, Node, NodeMatch};
+use vorpal_core::{Doc, Node, NodeMatch, Vorpal};
 
 use std::collections::{HashMap, HashSet};
 

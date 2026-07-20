@@ -50,10 +50,10 @@ pub fn from_yaml_string<'a, L: Language + Deserialize<'a>>(
 #[cfg(test)]
 mod test {
   use super::*;
+  use std::path::Path;
   use vorpal_core::Language;
   use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
   use vorpal_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
-  use std::path::Path;
 
   #[derive(Clone, Deserialize, PartialEq, Eq)]
   pub enum TypeScript {

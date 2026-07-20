@@ -2,11 +2,11 @@ use crate::DeserializeEnv;
 use crate::maybe::Maybe;
 use crate::rule::{Relation, Rule, RuleSerializeError, StopBy};
 use crate::transform::Transformation;
-use vorpal_core::replacer::{Content, Replacer, TemplateFix, TemplateFixError};
-use vorpal_core::{Doc, Language, Matcher, NodeMatch};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use vorpal_core::replacer::{Content, Replacer, TemplateFix, TemplateFixError};
+use vorpal_core::{Doc, Language, Matcher, NodeMatch};
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
