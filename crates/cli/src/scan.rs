@@ -291,6 +291,10 @@ impl PathWorker for ScanWithConfig {
       }
     }
     self.error_count.fetch_add(error_count, Ordering::AcqRel);
+    if !ret.is_empty() {
+      // Scan feeds the index too (§3.4): rule matches bank the file's extraction product.
+      let _ = vorpal_index::warm_product_cache(path);
+    }
     Ok(ret)
   }
 

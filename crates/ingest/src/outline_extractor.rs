@@ -1,7 +1,10 @@
 //! The concrete engine-backed extractor: L0 tree-sitter parse → L1 outline rules (§3.1).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
+use rayon::prelude::*;
 use vorpal_core::Language;
 use vorpal_kg::KgWriter;
 use vorpal_language::{LanguageExt, SupportLang};
@@ -15,48 +18,68 @@ use vorpal_resolve::Reference;
 
 use crate::pipeline::FileExtractor;
 use crate::product::{self, FileProduct, ProductRef};
-use crate::references::{extract_references, ref_spec};
+use crate::references::{extract_references, ref_spec, resolved_ref_spec};
+
+type LangExtractors = HashMap<SupportLang, CombinedExtractors<SupportLang>>;
+
+/// The compiled default rule set, shared process-wide: compiling ~20 languages' rules costs
+/// ~15 ms and every `OutlineExtractor::new` (CLI one-shots, MCP daemon re-indexes) was paying
+/// it; now only the first does.
+static DEFAULT_EXTRACTORS: OnceLock<Result<Arc<LangExtractors>, String>> = OnceLock::new();
 
 /// Compiles the bundled outline rules into one [`CombinedExtractors`] per language and runs them
 /// against parsed files. Language is chosen from the file extension (§3.1 "all languages").
 pub struct OutlineExtractor {
-  by_lang: HashMap<SupportLang, CombinedExtractors<SupportLang>>,
+  by_lang: Arc<LangExtractors>,
 }
 
 impl OutlineExtractor {
-  /// Compile the built-in outline rule set (`DEFAULT_OUTLINE_RULES`).
+  /// The built-in outline rule set (`DEFAULT_OUTLINE_RULES`), compiled once per process.
   pub fn new() -> Result<Self, String> {
-    Self::from_rules(DEFAULT_OUTLINE_RULES)
+    let by_lang = DEFAULT_EXTRACTORS
+      .get_or_init(|| compile_rules(DEFAULT_OUTLINE_RULES).map(Arc::new))
+      .clone()?;
+    Ok(Self { by_lang })
   }
 
   /// Compile an arbitrary outline-rule YAML document (bundled or user-supplied).
   pub fn from_rules(rules_yaml: &str) -> Result<Self, String> {
-    let rules =
-      parse_outline_rules::<SupportLang>(rules_yaml).map_err(|e| format!("parse rules: {e}"))?;
-
-    let mut grouped: HashMap<SupportLang, Vec<SerializableOutlineRule<SupportLang>>> =
-      HashMap::new();
-    for rule in rules {
-      grouped
-        .entry(rule.common().language)
-        .or_default()
-        .push(rule);
-    }
-
-    let mut by_lang = HashMap::new();
-    for (lang, lang_rules) in grouped {
-      let combined = CombinedExtractors::try_from(lang_rules, &Default::default())
-        .map_err(|e| format!("compile {lang} rules: {e}"))?;
-      by_lang.insert(lang, combined);
-    }
-    Ok(Self { by_lang })
+    Ok(Self {
+      by_lang: Arc::new(compile_rules(rules_yaml)?),
+    })
   }
 
   /// How many languages have compiled extractors.
   pub fn languages(&self) -> usize {
     self.by_lang.len()
   }
+}
 
+/// Parse the YAML rule set and compile each language's rules — languages compile in parallel
+/// (they are independent), with any failure surfaced eagerly, exactly as the serial path did.
+fn compile_rules(rules_yaml: &str) -> Result<LangExtractors, String> {
+  let rules =
+    parse_outline_rules::<SupportLang>(rules_yaml).map_err(|e| format!("parse rules: {e}"))?;
+
+  let mut grouped: HashMap<SupportLang, Vec<SerializableOutlineRule<SupportLang>>> = HashMap::new();
+  for rule in rules {
+    grouped
+      .entry(rule.common().language)
+      .or_default()
+      .push(rule);
+  }
+
+  grouped
+    .into_par_iter()
+    .map(|(lang, lang_rules)| {
+      let combined = CombinedExtractors::try_from(lang_rules, &Default::default())
+        .map_err(|e| format!("compile {lang} rules: {e}"))?;
+      Ok((lang, combined))
+    })
+    .collect()
+}
+
+impl OutlineExtractor {
   /// Whether a file at `path` would be extracted: a known extension with compiled outline rules
   /// and/or a reference-extraction spec (a language may have either independently).
   pub fn handles(&self, path: &str) -> bool {
@@ -73,7 +96,7 @@ impl OutlineExtractor {
   pub fn extract_product(&self, path: &str, source: &str) -> Option<FileProduct> {
     let lang = SupportLang::from_path(path)?;
     let combined = self.by_lang.get(&lang);
-    let spec = ref_spec(lang);
+    let spec = resolved_ref_spec(lang);
     if combined.is_none() && spec.is_none() {
       return None;
     }
@@ -85,48 +108,65 @@ impl OutlineExtractor {
       .map(|c| c.extract(grep.root()).collect())
       .unwrap_or_default();
 
-    // Local definition layout mirroring `KgWriter`'s identity convention: index 0 = the file
-    // (entity ""), then items (entity = name) and members (entity = owner.member).
-    let mut entities: Vec<String> = vec![String::new()];
-    let mut spans: Vec<(std::ops::Range<usize>, NodeId)> = vec![(0..usize::MAX, NodeId::new(0))];
-    for item in &items {
-      entities.push(item.entry.name.to_string());
-      spans.push((
-        item.entry.range.byte_offset.clone(),
-        NodeId::new(entities.len() as u64 - 1),
-      ));
-      for member in &item.members {
-        entities.push(product::member_entity_path(
-          &item.entry.name,
-          &member.entry.name,
-        ));
-        spans.push((
-          member.entry.range.byte_offset.clone(),
-          NodeId::new(entities.len() as u64 - 1),
-        ));
-      }
-    }
+    let (entities, spans) = local_layout(&items);
 
     let mut raw = Vec::new();
     if let Some(spec) = spec {
-      extract_references(grep.root(), spec, &spans, path, &mut raw);
+      extract_references(grep.root(), spec, &spans, &entities, &mut raw);
     }
+    // The single ownership point: names/qualifiers rode through extraction as borrows of
+    // `source`; they are copied exactly once, here, into the detachable product.
     let refs = raw
       .into_iter()
       .map(|r| ProductRef {
-        from_entity: entities[r.from.raw() as usize].clone(),
-        name: r.name,
+        from_entity_index: r.from.raw() as u32,
+        name: r.name.into_owned(),
         kind: product::refkind_tag(r.kind),
-        start: r.evidence.0,
-        end: r.evidence.1,
+        start: r.start,
+        end: r.end,
+        qualifier: r.qualifier.map(Cow::into_owned),
+        form: product::refform_tag(r.form),
       })
       .collect();
 
     Some(FileProduct {
+      version: product::PRODUCT_FORMAT_VERSION,
+      // The never-matching default stamp: persisting callers stat the source and stamp the
+      // product; an unstamped product can never replay.
+      source_size: 0,
+      source_mtime_ns: 0,
       items: items.into_iter().map(product::own_item).collect(),
       refs,
     })
   }
+}
+
+/// Local definition layout mirroring `KgWriter`'s identity convention: index 0 = the file
+/// (entity ""), then items (entity = name) and members (entity = owner.member), each with its
+/// byte span for reference attribution.
+pub(crate) fn local_layout(
+  items: &[OutlineItem<'_>],
+) -> (Vec<String>, Vec<(std::ops::Range<usize>, NodeId)>) {
+  let mut entities: Vec<String> = vec![String::new()];
+  let mut spans: Vec<(std::ops::Range<usize>, NodeId)> = vec![(0..usize::MAX, NodeId::new(0))];
+  for item in items {
+    entities.push(item.entry.name.to_string());
+    spans.push((
+      item.entry.range.byte_offset.clone(),
+      NodeId::new(entities.len() as u64 - 1),
+    ));
+    for member in &item.members {
+      entities.push(product::member_entity_path(
+        &item.entry.name,
+        &member.entry.name,
+      ));
+      spans.push((
+        member.entry.range.byte_offset.clone(),
+        NodeId::new(entities.len() as u64 - 1),
+      ));
+    }
+  }
+  (entities, spans)
 }
 
 impl FileExtractor for OutlineExtractor {
@@ -143,7 +183,7 @@ impl FileExtractor for OutlineExtractor {
   ) {
     // One extraction path for live and incremental ingest: build the product, apply it.
     if let Some(prod) = self.extract_product(path, source) {
-      crate::pipeline::apply_product(path, &prod, writer, references);
+      crate::pipeline::apply_product(path, prod, writer, references);
     }
   }
 }

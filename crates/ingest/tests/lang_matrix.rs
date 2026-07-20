@@ -186,7 +186,7 @@ fn string_imports_stay_honestly_unresolved() {
     "a.ts",
     "import { x } from \"./missing\";\n\nexport function run(): number { return x }\n",
   )]);
-  assert!(stats.unresolved >= 1, "{stats:?}");
+  assert!(stats.unresolved() >= 1, "{stats:?}");
   assert!(kg.nodes_named("./missing").is_empty());
 }
 

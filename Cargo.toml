@@ -48,4 +48,7 @@ tree-sitter = { version = "0.26.3" }
 thiserror = "2.0.0"
 schemars = "1.0.0"
 anyhow = "1.0.82"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
 dashmap = "6.0.0"
+rayon = "1.10.0"

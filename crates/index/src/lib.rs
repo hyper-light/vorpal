@@ -4,18 +4,27 @@
 //! extraction product can be replayed or the file must be re-parsed; the graph is always
 //! re-linked from the complete product set (so removals/renames cannot leave stale nodes), and
 //! an entirely unchanged tree short-circuits to reusing the persisted index outright.
+//!
+//! Per-file work (read → parse → extract → cache write, or cache replay) fans out on rayon
+//! (§7.5 work-stealing parse/extract): workers borrow the shared extractor immutably, and the
+//! order-preserving collect keeps the product list — and therefore node-id assignment — exactly
+//! as deterministic as the serial loop was.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
+use rayon::prelude::*;
 use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, tokenize};
 use vorpal_ingest::{
-  FileProduct, Ingestor, Manifest, OutlineExtractor, Resolver, cache_file_name, load_product,
-  save_product,
+  ExtractScratch, Manifest, OutlineExtractor, Resolver, StreamWork, cache_file_name, link_writer,
+  load_product, save_product, save_product_with, stream_apply,
 };
 use vorpal_kg::{Kg, NodeId};
 
@@ -29,8 +38,31 @@ pub struct IndexReport {
   /// Files whose cached extraction product was replayed without a parse.
   pub skipped: u64,
   pub nodes: usize,
+  /// Confidently resolved references (single visible definition).
   pub resolved: u64,
-  pub unresolved: u64,
+  /// Approximately resolved references (multiple candidates; labeled edges).
+  pub ambiguous: u64,
+  /// References whose name is defined nowhere in the tree (std/dependencies) — honest.
+  pub external: u64,
+  /// References with in-tree candidates none of which is safely attributable.
+  pub masked: u64,
+}
+
+impl IndexReport {
+  /// References that produced no edge (external + masked).
+  pub fn unresolved(&self) -> u64 {
+    self.external + self.masked
+  }
+}
+
+/// In-flight byte ceiling for the streaming ingest (§7.5): sources+products in transit stay
+/// under this regardless of corpus size. Sized to feed every worker generously; the essential
+/// output (the graph under construction) is not part of transit and scales with the corpus.
+fn stream_budget_bytes() -> u64 {
+  let threads = std::thread::available_parallelism()
+    .map(|n| n.get() as u64)
+    .unwrap_or(1);
+  (threads * 8 * 1024 * 1024).clamp(32 * 1024 * 1024, 512 * 1024 * 1024)
 }
 
 /// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`.
@@ -40,57 +72,64 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   let manifest_path = out.join("manifest.bin");
 
   // Whole-tree fast path: nothing changed → reuse the persisted index without touching a file.
-  if out.join("nodes.vseg").exists() {
-    if let Ok(prior) = Manifest::load(&manifest_path) {
-      if manifest.unchanged_since(&prior) {
-        let kg = Kg::load(out)?;
+  // The report only needs the node count, read from the segment header — no heap read, no edge
+  // read, no CSR rebuild. An unreadable/corrupt index falls through to a rebuild instead of
+  // wedging every subsequent run on the same error.
+  if let Ok(prior) = Manifest::load(&manifest_path) {
+    if manifest.unchanged_since(&prior)
+      && out.join("strings.heap").exists()
+      && out.join("edges.bin").exists()
+    {
+      if let Ok(nodes) = Kg::peek_node_count(out) {
         return Ok(IndexReport {
           reused: true,
           indexed: 0,
           skipped: manifest.len() as u64,
-          nodes: kg.node_count(),
+          nodes,
           resolved: 0,
-          unresolved: 0,
+          ambiguous: 0,
+          external: 0,
+          masked: 0,
         });
       }
     }
   }
 
-  // Incremental path: replay cached products for stat-unchanged files, re-parse the rest.
+  // Incremental path, streamed (§7.5): replay cached products for stat-unchanged files,
+  // re-parse the rest — admission is byte-budget-gated, extraction fans out over scoped
+  // workers with per-worker scratch, and products flow straight into the sharded single-writer
+  // commit, so a product exists in RAM only between extraction and application. Products are
+  // **self-validating** (§3.4): each carries the stat of the source it was extracted from, so
+  // any cached product whose stamp matches replays — whoever wrote it. Read/extract errors
+  // skip the file (as before); a cache-write error is fatal (as before). Sequence-ordered
+  // per-shard application keeps the output bit-identical to the batch path.
   let products_dir = out.join("products");
   fs::create_dir_all(&products_dir)?;
-  let prior = Manifest::load(&manifest_path).unwrap_or_default();
 
-  let mut reparsed = 0u64;
-  let mut replayed = 0u64;
-  let mut products: Vec<(String, FileProduct)> = Vec::new();
-  for entry in manifest.entries() {
-    let cache = products_dir.join(cache_file_name(&entry.path));
-    let cached = if prior.contains(entry) {
-      load_product(&cache).ok()
-    } else {
-      None
-    };
-    let product = match cached {
-      Some(product) => {
-        replayed += 1;
-        product
+  let (writer, references, stream) = stream_apply(
+    manifest.entries(),
+    stream_budget_bytes(),
+    |entry, scratch: &mut ExtractScratch| {
+      let cache = products_dir.join(cache_file_name(&entry.path));
+      if let Ok(product) = load_product(&cache) {
+        if product.source_size == entry.size && product.source_mtime_ns == entry.mtime_ns {
+          return Ok(StreamWork::Replayed(entry.path.clone(), product));
+        }
       }
-      None => {
-        // Changed, new, or cache-missing: re-parse (unreadable files are skipped, not fatal).
-        let Ok(source) = fs::read_to_string(&entry.path) else {
-          continue;
-        };
-        let Some(product) = extractor.extract_product(&entry.path, &source) else {
-          continue;
-        };
-        save_product(&cache, &product)?;
-        reparsed += 1;
-        product
-      }
-    };
-    products.push((entry.path.clone(), product));
-  }
+      // Changed, new, or cache-missing: re-parse (unreadable files are skipped, not fatal).
+      let Ok(source) = scratch.read_source(Path::new(&entry.path)) else {
+        return Ok(StreamWork::Skipped);
+      };
+      let Some(mut product) = extractor.extract_product(&entry.path, source) else {
+        return Ok(StreamWork::Skipped);
+      };
+      product.source_size = entry.size;
+      product.source_mtime_ns = entry.mtime_ns;
+      save_product_with(&cache, &product, &mut scratch.encode)?;
+      Ok(StreamWork::Parsed(entry.path.clone(), product))
+    },
+  )?;
+  let (reparsed, replayed) = (stream.parsed, stream.replayed);
 
   // Cache hygiene: drop products of files no longer in the tree.
   let expected: HashSet<OsString> = manifest
@@ -107,45 +146,199 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   }
 
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
-  // from scratch, so stale state is structurally impossible.
-  let mut ingestor = Ingestor::new(extractor);
-  for (path, product) in &products {
-    ingestor.ingest_product(path, product);
-  }
-  let (kg, resolve) = ingestor.link_and_seal(&Resolver::new());
+  // from scratch, so stale state is structurally impossible; resolution links the merged
+  // graph over the sharded table/resolve passes.
+  let (kg, resolve) = link_writer(writer, &references, &Resolver::new());
+  // Embeddings stay off the commit hot path (§3.4): the graph persists now; the ANN tier is
+  // built lazily by the first search and validated by stamp, so incremental re-indexes never
+  // pay a full vector-graph rebuild (at kernel scale that rebuild dominated the whole run).
+  // The manifest is the commit point and always lands last.
   kg.save(out)?;
-  build_ann(&kg, out)?;
   manifest.save(&manifest_path)?;
   Ok(IndexReport {
     reused: false,
     indexed: reparsed,
     skipped: replayed,
     nodes: kg.node_count(),
-    resolved: resolve.resolved + resolve.ambiguous,
-    unresolved: resolve.unresolved,
+    resolved: resolve.resolved,
+    ambiguous: resolve.ambiguous,
+    external: resolve.external,
+    masked: resolve.masked,
   })
 }
 
 /// Build the semantic tier over every KG node: each definition embeds its name (double-weighted),
 /// signature, and file *basename* — never the full path, whose directory tokens are shared junk
 /// that drowns the signal — through the pluggable embedder (default: the deterministic lexical
-/// hasher) into the adaptive ANN index persisted beside the graph.
-fn build_ann(kg: &Kg, out: &Path) -> Result<(), Box<dyn Error>> {
+/// hasher) into the adaptive ANN index persisted beside the graph. Rows embed in parallel with
+/// no per-node intermediate text; the order-preserving collect keeps the index bit-identical to
+/// the serial build.
+/// The ANN freshness stamp: xxh3 of the node segment bytes. Any node change (name,
+/// signature, count, order) changes the segment, which invalidates the stamp — necessary-
+/// condition semantics, same as every other cache in the pipeline.
+fn ann_stamp_of(index_dir: &Path) -> io::Result<u64> {
+  Ok(xxhash_rust::xxh3::xxh3_64(&fs::read(
+    index_dir.join("nodes.vseg"),
+  )?))
+}
+
+/// Build the ANN tier iff its stamp no longer matches the persisted graph (or it does not
+/// exist). Queries call this before touching `ann.bin`; `vorpal index` never does.
+fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+  let stamp_path = index_dir.join("ann.stamp");
+  let current = ann_stamp_of(index_dir)?;
+  let fresh = fs::read(&stamp_path)
+    .ok()
+    .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
+    .is_some_and(|stored| stored == current)
+    && index_dir.join("ann.bin").exists();
+  if fresh {
+    return Ok(());
+  }
+  let kg = Kg::load(index_dir)?;
+  build_ann(&kg, index_dir).map_err(|err| err as Box<dyn Error>)?;
+  fs::write(&stamp_path, current.to_le_bytes())?;
+  Ok(())
+}
+
+fn build_ann(kg: &Kg, out: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
   let embedder = LexicalEmbedder::default();
-  let mut rows = Vec::with_capacity(kg.node_count());
-  for i in 0..kg.node_count() as u64 {
-    let id = NodeId::new(i);
-    if let Some(view) = kg.node(id) {
-      let basename = view.path.rsplit('/').next().unwrap_or(view.path);
-      let text = format!(
-        "{} {} {} {}",
-        view.name, view.name, view.signature, basename
-      );
-      rows.push((i, embedder.embed(&text)));
+  let dim = embedder.dim();
+  let n = kg.node_count();
+  // One flat row-major matrix, rows embedded in place in parallel: no per-row heap vector
+  // (at kernel scale the per-row form allocated millions of 1 KB vectors before flattening).
+  let mut vectors = vec![0.0f32; n * dim];
+  vectors
+    .par_chunks_mut(dim)
+    .enumerate()
+    .for_each(|(i, row)| {
+      if let Some(view) = kg.node(NodeId::new(i as u64)) {
+        let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+        let parts = [view.name, view.name, view.signature, basename];
+        embedder.embed_parts_into(&parts, row);
+      }
+    });
+  let ids: Vec<u64> = (0..n as u64).collect();
+  AnnIndex::build_flat(dim, ids, vectors, None).save(&out.join("ann.bin"))?;
+  Ok(())
+}
+
+/// A discovered `.vorpal/index` a search can bank products into: where its products live, and
+/// how to spell file keys the way that index's `build_index` runs will (§3.4).
+struct WarmRoot {
+  products_dir: PathBuf,
+  /// Canonical directory containing `.vorpal` — file keys are derived relative to it.
+  canonical_root: PathBuf,
+  /// The manifest's path-spelling prefix (`"./"`, `""`, `"sub/dir/"`, an absolute base…):
+  /// `key(file) = prefix + (file relative to root)` reproduces the walker's exact strings.
+  key_prefix: String,
+}
+
+/// Process-wide cache of discovered warm roots (one per index root encountered).
+static WARM_ROOTS: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<WarmRoot>>>>> = OnceLock::new();
+
+/// Bank one file's extraction product into the nearest existing `.vorpal/index` cache — the
+/// **search-feeds-index** hook (§3.4). A search has already walked, read, and matched the
+/// file; this persists the extraction so the next `vorpal index` replays it instead of
+/// re-parsing (products are self-validating via their source stat stamp).
+///
+/// Deliberately conservative: it only feeds an index that already exists (searches never
+/// create index state in un-indexed trees), silently skips unsupported or unreadable files,
+/// and returns whether a product was written. A fresh product for the file's current stat is
+/// left untouched, so repeated matches are near-free.
+pub fn warm_product_cache(file: &Path) -> io::Result<bool> {
+  let Ok(canonical) = file.canonicalize() else {
+    return Ok(false);
+  };
+  let Some(index_root) = find_index_root(&canonical) else {
+    return Ok(false);
+  };
+  let Some(warm) = warm_root_for(index_root)? else {
+    return Ok(false);
+  };
+  let Ok(rel) = canonical.strip_prefix(&warm.canonical_root) else {
+    return Ok(false);
+  };
+  let keyed = format!("{}{}", warm.key_prefix, rel.display());
+
+  let meta = fs::metadata(&canonical)?;
+  let mtime_ns = meta
+    .modified()?
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_nanos() as u64)
+    .unwrap_or(0);
+  let cache = warm.products_dir.join(cache_file_name(&keyed));
+  if let Ok(existing) = load_product(&cache) {
+    if existing.source_size == meta.len() && existing.source_mtime_ns == mtime_ns {
+      return Ok(false);
     }
   }
-  AnnIndex::build(embedder.dim(), rows, None).save(&out.join("ann.bin"))?;
-  Ok(())
+
+  let Ok(source) = fs::read_to_string(&canonical) else {
+    return Ok(false);
+  };
+  let extractor = OutlineExtractor::new().map_err(io::Error::other)?;
+  let Some(mut product) = extractor.extract_product(&keyed, &source) else {
+    return Ok(false);
+  };
+  product.source_size = meta.len();
+  product.source_mtime_ns = mtime_ns;
+  fs::create_dir_all(&warm.products_dir)?;
+  save_product(&cache, &product)?;
+  Ok(true)
+}
+
+/// The nearest ancestor directory holding an existing default-location index.
+fn find_index_root(file: &Path) -> Option<PathBuf> {
+  let mut dir = file.parent()?;
+  loop {
+    if dir.join(".vorpal/index/manifest.bin").is_file() {
+      return Some(dir.to_path_buf());
+    }
+    dir = dir.parent()?;
+  }
+}
+
+/// Get-or-build the cached [`WarmRoot`] for an index root. `None` (also cached) means the
+/// root's key spelling could not be established — warming is skipped rather than guessed.
+fn warm_root_for(index_root: PathBuf) -> io::Result<Option<Arc<WarmRoot>>> {
+  let roots = WARM_ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
+  if let Some(cached) = roots.lock().unwrap().get(&index_root) {
+    return Ok(cached.clone());
+  }
+  let built = build_warm_root(&index_root)?.map(Arc::new);
+  let mut lock = roots.lock().unwrap();
+  Ok(lock.entry(index_root).or_insert_with(|| built).clone())
+}
+
+/// Establish how this index spells file keys: resolve one manifest entry to its canonical
+/// path, take its root-relative form, and split the entry string into
+/// `prefix + root-relative suffix` (`"./"` for `vorpal index .`, `"sub/"` for
+/// `vorpal index sub`, an absolute base for absolute invocations). String-suffix matching —
+/// not path joining — so spelling variants like `"./"` survive. An entry that cannot be
+/// verified (deleted file, `..`/symlink spelling) yields `None` and warming stays off for
+/// this root rather than guessing keys.
+fn build_warm_root(index_root: &Path) -> io::Result<Option<WarmRoot>> {
+  let index_dir = index_root.join(".vorpal").join("index");
+  let manifest = Manifest::load(&index_dir.join("manifest.bin"))?;
+  let canonical_root = index_root.canonicalize()?;
+  for entry in manifest.entries() {
+    let Ok(canonical_entry) = index_root.join(&entry.path).canonicalize() else {
+      continue;
+    };
+    let Ok(rel) = canonical_entry.strip_prefix(&canonical_root) else {
+      continue;
+    };
+    let rel = rel.display().to_string();
+    if let Some(prefix) = entry.path.strip_suffix(&rel) {
+      return Ok(Some(WarmRoot {
+        products_dir: index_dir.join("products"),
+        canonical_root,
+        key_prefix: prefix.to_string(),
+      }));
+    }
+  }
+  Ok(None)
 }
 
 /// Reciprocal Rank Fusion constant (the standard K=60): dampens the head of each list so no
@@ -179,6 +372,7 @@ fn rrf_fuse(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32)> {
 /// 3. **graph**: the candidates from (1)+(2) ranked by in-degree — heavily called/referenced
 ///    symbols outrank dead-weight lookalikes.
 pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, Box<dyn Error>> {
+  ensure_ann(index_dir)?;
   let kg = Kg::load(index_dir)?;
   let ann = AnnIndex::load(&index_dir.join("ann.bin"))?;
   let embedder = LexicalEmbedder::default();

@@ -111,8 +111,20 @@ impl Segment {
 
   /// A zero-copy view of the named HOT column, if present.
   pub fn column(&self, name: &str) -> Option<ColumnView<'_>> {
+    self.column_at(self.column_index(name)?)
+  }
+
+  /// The directory position of the named column — resolve once, then hit [`Segment::column_at`]
+  /// per access, so hot loops skip the name hash + directory scan entirely.
+  pub fn column_index(&self, name: &str) -> Option<usize> {
     let want = xxh3_64(name.as_bytes());
-    let desc = self.columns.iter().find(|d| d.name_hash == want)?;
+    self.columns.iter().position(|d| d.name_hash == want)
+  }
+
+  /// A zero-copy view of the column at directory position `index` (from
+  /// [`Segment::column_index`]) — the O(1), allocation-free point-access path.
+  pub fn column_at(&self, index: usize) -> Option<ColumnView<'_>> {
+    let desc = self.columns.get(index)?;
     let bytes = self.backing.bytes();
     let start = desc.data_offset as usize;
     let data = &bytes[start..start + desc.data_len as usize];

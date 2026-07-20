@@ -17,6 +17,7 @@ fn sym(id: u64, kind: SymbolKind, path: &str, exported: bool) -> Symbol {
     kind,
     path: path.to_string(),
     exported,
+    owner: None,
   }
 }
 
@@ -151,7 +152,8 @@ fn resolve_all_reports_stats_and_labeled_edges() {
   let (edges, stats) = resolve_all(&table, &refs, &Resolver::new());
   assert_eq!(stats.resolved, 1);
   assert_eq!(stats.ambiguous, 1);
-  assert_eq!(stats.unresolved, 1);
+  assert_eq!(stats.unresolved(), 1);
+  assert_eq!(stats.external, 1, "no `missing` definition exists anywhere");
   assert_eq!(
     edges.len(),
     2,

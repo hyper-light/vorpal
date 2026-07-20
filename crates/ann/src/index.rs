@@ -41,6 +41,34 @@ const VAMANA_ALPHA: f32 = 1.2;
 const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 const MAGIC: u32 = 0x414E_4E31; // "ANN1"
 
+/// One length-checked section slice, advancing the read offset.
+fn take_bulk<'a>(bytes: &'a [u8], off: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+  let end = off
+    .checked_add(len)
+    .ok_or_else(|| io::Error::other("truncated ann index"))?;
+  let section = bytes
+    .get(*off..end)
+    .ok_or_else(|| io::Error::other("truncated ann index"))?;
+  *off = end;
+  Ok(section)
+}
+
+/// Decode a packed little-endian section into a typed vec: a straight `pod_collect` on LE
+/// targets, the per-element decoder elsewhere.
+fn read_le_slice<T: bytemuck::Pod, const W: usize>(
+  section: &[u8],
+  decode: fn([u8; W]) -> T,
+) -> Vec<T> {
+  if cfg!(target_endian = "little") {
+    bytemuck::pod_collect_to_vec(section)
+  } else {
+    section
+      .chunks_exact(W)
+      .map(|chunk| decode(chunk.try_into().expect("exact chunk")))
+      .collect()
+  }
+}
+
 /// The sealed vector index: full-precision vectors (rerank ground truth) plus the tier's
 /// acceleration structure, and the caller's stable id per row.
 pub struct AnnIndex {
@@ -59,7 +87,6 @@ impl AnnIndex {
   /// follows `AnnConfig::for_n` unless overridden (tests exercise every tier at any size).
   pub fn build(dim: usize, rows: Vec<(u64, Vec<f32>)>, config: Option<AnnConfig>) -> AnnIndex {
     let n = rows.len();
-    let config = config.unwrap_or_else(|| AnnConfig::for_n(n));
     let mut ids = Vec::with_capacity(n);
     let mut vectors = Vec::with_capacity(n * dim);
     for (id, mut v) in rows {
@@ -68,6 +95,21 @@ impl AnnIndex {
       ids.push(id);
       vectors.extend_from_slice(&v);
     }
+    Self::build_flat(dim, ids, vectors, config)
+  }
+
+  /// Build from an already-flat row-major matrix of **pre-normalized** vectors — the
+  /// bulk-indexing path, which fills the matrix in place in parallel instead of allocating a
+  /// heap vector per row first.
+  pub fn build_flat(
+    dim: usize,
+    ids: Vec<u64>,
+    vectors: Vec<f32>,
+    config: Option<AnnConfig>,
+  ) -> AnnIndex {
+    let n = ids.len();
+    debug_assert_eq!(vectors.len(), n * dim);
+    let config = config.unwrap_or_else(|| AnnConfig::for_n(n));
 
     let quantizer = SignQuantizer::new(dim);
     let (codes, code_words) = if config == AnnConfig::FlatQuantized {
@@ -170,41 +212,53 @@ impl AnnIndex {
     ranked
   }
 
-  /// Persist: little-endian sections (header, ids, vectors, codes, CSR graph).
+  /// Persist: little-endian sections (header, ids, vectors, codes, CSR graph), **streamed**
+  /// through a buffered writer — at millions of nodes the bulk sections span gigabytes, and
+  /// building the whole file in memory first doubled peak RSS for nothing. Bulk sections are
+  /// single slice writes on little-endian targets (the format is LE either way; only the
+  /// fallback loops per element).
   pub fn save(&self, path: &Path) -> io::Result<()> {
-    let mut buf: Vec<u8> = Vec::new();
-    let push32 = |buf: &mut Vec<u8>, v: u32| buf.extend_from_slice(&v.to_le_bytes());
-    let push64 = |buf: &mut Vec<u8>, v: u64| buf.extend_from_slice(&v.to_le_bytes());
-    push32(&mut buf, MAGIC);
-    push32(&mut buf, self.dim as u32);
-    push64(&mut buf, self.len() as u64);
-    push32(
-      &mut buf,
-      match self.config {
-        AnnConfig::FlatExact => 0,
-        AnnConfig::FlatQuantized => 1,
-        AnnConfig::Vamana => 2,
-      },
-    );
-    push32(&mut buf, self.code_words as u32);
-    push32(&mut buf, self.medoid);
-    for &id in &self.ids {
-      push64(&mut buf, id);
-    }
-    for &x in &self.vectors {
-      buf.extend_from_slice(&x.to_le_bytes());
-    }
-    for &w in &self.codes {
-      push64(&mut buf, w);
-    }
-    push64(&mut buf, self.graph.len() as u64);
-    for neighbors in &self.graph {
-      push32(&mut buf, neighbors.len() as u32);
-      for &nb in neighbors {
-        push32(&mut buf, nb);
+    use std::io::Write;
+    let file = fs::File::create(path)?;
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+    out.write_all(&MAGIC.to_le_bytes())?;
+    out.write_all(&(self.dim as u32).to_le_bytes())?;
+    out.write_all(&(self.len() as u64).to_le_bytes())?;
+    let config_tag: u32 = match self.config {
+      AnnConfig::FlatExact => 0,
+      AnnConfig::FlatQuantized => 1,
+      AnnConfig::Vamana => 2,
+    };
+    out.write_all(&config_tag.to_le_bytes())?;
+    out.write_all(&(self.code_words as u32).to_le_bytes())?;
+    out.write_all(&self.medoid.to_le_bytes())?;
+    if cfg!(target_endian = "little") {
+      out.write_all(bytemuck::cast_slice(&self.ids))?;
+      out.write_all(bytemuck::cast_slice(&self.vectors))?;
+      out.write_all(bytemuck::cast_slice(&self.codes))?;
+    } else {
+      for &id in &self.ids {
+        out.write_all(&id.to_le_bytes())?;
+      }
+      for &x in &self.vectors {
+        out.write_all(&x.to_le_bytes())?;
+      }
+      for &w in &self.codes {
+        out.write_all(&w.to_le_bytes())?;
       }
     }
-    fs::write(path, buf)
+    out.write_all(&(self.graph.len() as u64).to_le_bytes())?;
+    for neighbors in &self.graph {
+      out.write_all(&(neighbors.len() as u32).to_le_bytes())?;
+      if cfg!(target_endian = "little") {
+        out.write_all(bytemuck::cast_slice(neighbors))?;
+      } else {
+        for &nb in neighbors {
+          out.write_all(&nb.to_le_bytes())?;
+        }
+      }
+    }
+    out.flush()
   }
 
   pub fn load(path: &Path) -> io::Result<AnnIndex> {
@@ -240,23 +294,17 @@ impl AnnIndex {
     };
     let code_words = take32(&bytes, &mut off)? as usize;
     let medoid = take32(&bytes, &mut off)?;
-    let mut ids = Vec::with_capacity(n);
-    for _ in 0..n {
-      ids.push(take64(&bytes, &mut off)?);
-    }
-    let mut vectors = Vec::with_capacity(n * dim);
-    for _ in 0..n * dim {
-      let end = off + 4;
-      let v = bytes
-        .get(off..end)
-        .ok_or_else(|| io::Error::other("truncated ann vectors"))?;
-      off = end;
-      vectors.push(f32::from_le_bytes(v.try_into().expect("4 bytes")));
-    }
-    let mut codes = Vec::with_capacity(n * code_words);
-    for _ in 0..n * code_words {
-      codes.push(take64(&bytes, &mut off)?);
-    }
+    // Bulk sections: one length-checked slice each, then a single unaligned LE copy — the
+    // element-at-a-time loops made cold `search` pay a bounds check + push per float.
+    let ids: Vec<u64> = read_le_slice(take_bulk(&bytes, &mut off, n * 8)?, u64::from_le_bytes);
+    let vectors: Vec<f32> = read_le_slice(
+      take_bulk(&bytes, &mut off, n * dim * 4)?,
+      f32::from_le_bytes,
+    );
+    let codes: Vec<u64> = read_le_slice(
+      take_bulk(&bytes, &mut off, n * code_words * 8)?,
+      u64::from_le_bytes,
+    );
     let graph_len = take64(&bytes, &mut off)? as usize;
     let mut graph = Vec::with_capacity(graph_len);
     for _ in 0..graph_len {

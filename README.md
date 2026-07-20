@@ -10,21 +10,21 @@ Point it at a repository and ask real questions:
 
 ```console
 $ vorpal index .
-parsed 305 files (0 replayed from cache) → 8101 nodes, 16282 calls resolved, 11883 unresolved
+parsed 355 files (0 replayed from cache) → 9772 nodes; refs: 10582 resolved, 1502 ambiguous, 7691 external, 8767 masked
 index: ./.vorpal/index
 
 $ vorpal graph callers resolve_import_path
-resolve [Method] crates/resolve/src/resolver.rs
+resolve [Method] ./crates/resolve/src/resolver.rs
 
 $ vorpal graph implementors FileExtractor
-OutlineExtractor [Struct] crates/ingest/src/outline_extractor.rs
-DefRefStub [Struct] crates/ingest/tests/linking.rs
-StubExtractor [Struct] crates/ingest/tests/pipeline.rs
+OutlineExtractor [Struct] ./crates/ingest/src/outline_extractor.rs
+DefRefStub [Struct] ./crates/ingest/tests/linking.rs
+StubExtractor [Struct] ./crates/ingest/tests/pipeline.rs
 
 $ vorpal search "stat manifest change detection"
-0.0167  manifest::{FileStat, Manifest} [Import] crates/ingest/src/lib.rs
-0.0164  FileStat [Struct] crates/ingest/src/manifest.rs
-0.0161  Manifest [Struct] crates/ingest/src/manifest.rs
+0.0167  manifest::{FileStat, Manifest} [Import] ./crates/ingest/src/lib.rs
+0.0164  FileStat [Struct] ./crates/ingest/src/manifest.rs
+0.0161  Manifest [Struct] ./crates/ingest/src/manifest.rs
 
 $ vorpal mcp          # serve all of the above to agents over MCP (stdio)
 ```
@@ -87,6 +87,14 @@ half of vorpal. Files that cannot possibly match are skipped **before parsing** 
 literal prefilter derived from your pattern (a per-token AND over required literals), so
 searches with any fixed text in them stay fast on large trees.
 
+**Search feeds the index.** In a tree that has a `.vorpal` index, every file a `run` or `scan`
+matches banks its extraction product into the index's cache as a side effect — the parse the
+search already paid for is never thrown away. The next `vorpal index` replays those products
+instead of re-parsing (products are self-validating; see below), so searching and indexing
+converge on the same warm cache. Searches never *create* index state: an un-indexed tree stays
+untouched, and a file rewritten by `--update-all` simply re-parses at the next index (its
+banked pre-rewrite product no longer matches the file's stat).
+
 ## The knowledge graph
 
 ### Indexing
@@ -100,17 +108,46 @@ AST reference extraction (call sites, imports, type uses, implements clauses) �
 interning (blake3, path-qualified — same-named symbols in different files stay distinct) →
 cross-file resolution → graph sealing. The persisted index cold-opens by `mmap`.
 
-Re-runs are incremental: a stat manifest (path, size, mtime) picks the changed files; unchanged
-files replay their cached extraction products with zero parsing; the graph is always re-linked
-from the complete product set. A fully unchanged tree short-circuits entirely:
+Indexing streams under a **byte budget**: files are admitted in order against a fixed
+in-flight byte ceiling, extracted by scoped workers with reused per-worker buffers, and
+committed straight into per-shard writers — a product exists in memory only between
+extraction and application, so peak transient memory is set by the budget, not the corpus.
+
+Re-runs are incremental: each cached extraction product is **self-validating** — it records
+the stat (size, mtime) of the source it was extracted from and replays only while that still
+matches. It makes no difference *which run* wrote a product: a completed index, an interrupted
+one (killed runs lose no work), or a search that banked its matches. Everything else re-parses,
+and the graph is always re-linked from the complete product set. A fully unchanged tree
+short-circuits entirely:
 
 ```console
 $ vorpal index .                     # again, after touching one file
-parsed 1 files (297 replayed from cache) → 7932 nodes, 15924 calls resolved, 11503 unresolved
+parsed 1 files (354 replayed from cache) → 9772 nodes; refs: 10582 resolved, 1502 ambiguous, 7691 external, 8767 masked
 
 $ vorpal index .                     # again, no changes
-unchanged — reused existing index (7932 nodes)
+unchanged — reused existing index (9772 nodes)
 ```
+
+Every reference is accounted for in one of four buckets, and an edge is only ever created on
+evidence:
+
+- **resolved** — one visible definition binds: same file, exported cross-file, or a
+  language-structural private scope (Rust ancestor-module privates are visible to their
+  subtree; Java package-privates are visible within their directory). Qualified references
+  bind precisely: `Kg::load()`, `self.helper()`, and `Self::assoc()` resolve against the
+  *owner's* members, and `util::helper()` against the `util` module file.
+- **ambiguous** — several visible definitions tie for a bare name; a deterministic pick is
+  emitted with a lowered confidence label, never silently.
+- **external** — the name is defined nowhere in the tree (`Ok`, `expect`, `PathBuf`): calls
+  into std or dependencies. Expected, honest, and not an error.
+- **masked** — same-named definitions exist but none is safely attributable: a method call on
+  an untyped receiver (`x.map()`), or a static path whose owner isn't in the tree
+  (`Vec::new()` when other `new`s exist). Guessing here would fake edges, so vorpal refuses —
+  `graph callers` results stay trustworthy.
+
+Import/alias nodes are wiring, not definitions — they are never resolution targets, and
+generic type parameters (`fn f<T>(x: T)`) are binders, not type uses, so neither pollutes the
+graph or the unresolved counts.
 
 ### Graph queries
 
@@ -151,6 +188,17 @@ Three ranked lists fused by reciprocal rank fusion:
 
 `vorpal mcp` speaks the [Model Context Protocol] over stdio (JSON-RPC 2.0, one message per
 line; protocol revisions `2024-11-05`, `2025-03-26`, `2025-06-18`).
+
+**Always fresh, for free.** When the index lives at the default `<src>/.vorpal/index`
+location, the daemon watches `<src>` through the OS (FSEvents on macOS, inotify on Linux) and
+revalidates lazily: a query on an untouched tree costs one atomic flag check — measured at
+**2.8 µs per complete tool call** — and a query after an edit transparently runs the
+incremental re-index first (only changed files parse), so answers are never stale. The watch
+is a necessary-condition filter in the §3.4 sense: anything doubtful — watcher errors, event
+overflow, changes from before the daemon started — fails open to revalidation, never to
+staleness. Reads, hidden trees (`.vorpal`, `.git`), and gitignored churn (`target/`) never
+trigger revalidation. Custom `--index` locations have no derivable source root to watch and
+keep the explicit `index`-tool behavior.
 
 **Claude Code:**
 
@@ -258,9 +306,14 @@ Design principles worth knowing before you rely on it:
   work that provably cannot produce results; correctness never depends on them.
 - **Full re-link from complete inputs.** Incrementality caches *extraction*, not conclusions —
   identity, resolution, and edges are recomputed every run, making staleness structurally
-  impossible rather than carefully avoided.
+  impossible rather than carefully avoided. Extraction products carry a format-generation
+  stamp, so upgrading vorpal re-parses instead of replaying stale-shaped caches.
+- **Edges on evidence only.** Resolution binds on what the grammar proves (qualifiers,
+  self-receivers, module structure) and refuses to guess otherwise: every reference lands in
+  `resolved` / `ambiguous` / `external` / `masked`, and a coin flip is never presented as an
+  edge.
 - **Determinism.** Same input, same index — bit-identical, including the vector tier's graph
-  build.
+  build and the parallel ingest fan-out.
 
 The index directory (default `<src>/.vorpal/index` — hidden, so it never indexes itself):
 
@@ -270,7 +323,7 @@ strings.heap    names / paths / signatures
 edges.bin       edge list (rebuilt into CSR/CSC on load)
 ann.bin         vector index (ids, vectors, tier structure)
 manifest.bin    stat manifest driving incremental re-index
-products/       per-file extraction product cache (JSON, keyed by blake3(path))
+products/       per-file extraction product cache (.vpb binary, keyed by blake3(path))
 ```
 
 The full architecture — storage format, adaptive memory model, concurrency plan, and the
@@ -278,15 +331,29 @@ billion-LOC scaling roadmap — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECT
 
 ## Performance
 
-Indicative numbers from this repository (~300 files, ~8k nodes; debug builds on Apple Silicon):
+Measured on this repository (351 files, ~2.8 MB of source, ~9.6k nodes; **release** builds,
+Apple Silicon; wall-clock for the whole CLI invocation including process start):
 
 | Operation | Time |
 |---|---|
-| Full index (parse + resolve + link + persist) | ~2.5 s |
-| Re-index after touching one file | ~0.31 s (1 parsed, 297 replayed) |
-| Re-index, nothing changed | ~0.06 s |
-| `vorpal run` structural search, no-match pattern | 0.032 s (2.3× faster than pre-prefilter) |
+| Full cold index (walk + parse + extract + resolve + link + persist) | **0.05 s** |
+| Re-index after touching one file | 0.03 s (1 parsed, 350 replayed) |
+| Re-index, nothing changed | 0.01 s |
+| `vorpal run` structural search, no-match pattern | 0.017 s |
 | Graph / search queries | milliseconds (mmap cold-open + in-memory graph) |
+
+In-process (the MCP daemon and library callers skip process start): a cold full index of this
+repository is ~57 ms, and a no-change re-validation by polling is ~6 ms — ~3 ms of which is
+the gitignore-aware walk + `stat` of every file, the floor for *proving* nothing changed
+without an OS file watcher. The watched `vorpal mcp` daemon removes even that: with FSEvents /
+inotify reporting changes, steady-state freshness is one atomic flag check — a complete MCP
+tool call (JSON-RPC parse + freshness check + graph query + render) measures **2.8 µs**.
+
+Per-file work fans out across cores (rayon work-stealing, §7.5 of the architecture doc); the
+output is bit-identical to a serial build — indexing twice produces byte-for-byte identical
+`nodes.vseg`, `edges.bin`, and `ann.bin`. Hot paths are allocation-audited: node attribute
+reads (`kg.node`) perform zero heap allocations, and the embedding tier hashes tokens without
+materializing them.
 
 ## CLI reference
 

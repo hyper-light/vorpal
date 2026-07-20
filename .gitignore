@@ -192,3 +192,6 @@ docs/_build/
 .python-version
 # uv lockfile (python CLI packaging tests)
 /uv.lock
+
+# vorpal knowledge-graph index (built artifact)
+.vorpal/

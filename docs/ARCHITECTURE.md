@@ -372,6 +372,42 @@ the future if a component needs wait-free *reclamation* (not just wait-free read
 
 ### 7.5 Streaming parallel ingest (bounded memory + backpressure, no `Arc`)
 
+> **Status:** the work-stealing parse/extract core of this section is implemented — `vorpal
+> index` fans per-file read → parse → extract → product-cache work (and the ANN embed pass)
+> across a rayon pool, workers borrowing the shared extractor by `&`, with an order-preserving
+> collect keeping output bit-identical to a serial build. The parallel walker also drives the
+> stat manifest scan. Reference extraction runs the §12 fused traversal: one walk per file
+> with dense kind-id dispatch (no per-node string comparison, no separate binder pass),
+> equivalence-tested against the specification implementation. The extraction-product cache is
+> the hand-rolled `.vpb` binary (bounds-checked, versioned; references index the file-local
+> entity layout instead of repeating entity-path strings). Products are **self-validating** —
+> each carries its source's stat stamp, so completed runs, interrupted runs, and searches
+> banking their matches (`run`/`scan` feed the cache for every file they match) all produce
+> equally replayable entries. The MCP daemon watches default-layout source roots via the OS
+> (FSEvents/inotify, `notify`): queries revalidate lazily off a dirty flag that fails open to
+> revalidation on any doubt, making steady-state freshness a single atomic check (measured
+> 2.8 µs per full tool call). The commit path runs the **sharded single-writer** design:
+> contiguous shards of the path-sorted product list each get a private lock-free writer in
+> parallel, absorbed in order with id/heap rebasing — proven byte-identical to the serial
+> writer and ~3× faster at repo scale (apply ~1 GB/s). The resolution pass is sharded the
+> same way: reference chunks resolve in parallel against the immutable table (edge lists
+> concatenate in chunk order — proven edge-for-edge identical to the serial loop), and the
+> table itself builds from contiguous row-range shards absorbed in order (proven equal to the
+> serial insertion). Ingest itself now **streams** through this section's full shape:
+> byte-budget admission (CAS reserve on a cache-padded atomic, condvar-parked when exhausted,
+> symmetric clamps so accounting always balances) gates in-order discovery; bounded
+> crossbeam channels join admission → scoped extraction workers (borrowing config by `&` —
+> no `Arc` on the hot path) → per-shard single-writer committers, whose sequence-ordered
+> reorder buffers are bounded by the byte budget and are what break the backpressure cycle.
+> A product exists in RAM only between extraction and application: peak transit is
+> O(budget + queue capacities), independent of corpus size, and the output is proven
+> byte-identical to the batch path — including under a deliberately starved budget. The
+> per-worker arenas are realized as scratch reuse (source-read and product-encode buffers
+> amortize to zero per file); contents that escape are copied exactly once, and the parse
+> tree itself remains in tree-sitter's allocator. What still scales with the corpus is the
+> essential output — the graph under construction — whose bounding is §9/§11 segment-spill
+> territory, not §7.5's.
+
 Pipeline `discover → read(mmap)+blake3 → hash-skip → parse → extract → chunk → (embed) → flush`
 as **fixed-capacity stages joined by bounded MPMC queues** (`crossbeam-queue::ArrayQueue`, or
 `flume`/`crossbeam-channel` bounded). Fixed capacity *is* the backpressure: a full downstream

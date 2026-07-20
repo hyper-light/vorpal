@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 use vorpal_index::{build_index, format_nodes};
 use vorpal_kg::{Kg, NodeId};
 
+use crate::watch::SourceWatch;
+
 /// Protocol revisions this server can speak; a client asking for one of these gets it echoed,
 /// anything else is answered with the oldest (most widely supported) revision.
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -14,16 +16,51 @@ const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The warm-index MCP server: one persisted index directory, its graph held in memory across
 /// calls (lazily cold-opened via mmap on first query, reloaded after each `index` tool call).
+///
+/// When the index lives at the default `<src>/.vorpal/index` location, the daemon watches
+/// `<src>` (§7.5): queries revalidate lazily whenever the watch reports possible changes, so
+/// the steady-state freshness check is one atomic load — no walk, no stats — while answers
+/// stay as fresh as an explicit re-index. Custom index locations (no derivable source root)
+/// keep the explicit-`index`-tool behavior unchanged.
 pub struct Server {
   index_dir: PathBuf,
   kg: Option<Kg>,
+  watch: Option<SourceWatch>,
 }
 
 impl Server {
   pub fn new(index_dir: PathBuf) -> Self {
+    let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     Self {
       index_dir,
       kg: None,
+      watch,
+    }
+  }
+
+  /// Bring the in-memory graph up to date with the watched source tree. With a clean watch
+  /// this is a single atomic load; with a dirty one it runs the incremental `build_index`
+  /// (stat manifest + product replay — only changed files parse) and reloads. Any failure
+  /// re-arms the dirty flag so the next query retries rather than serving stale data as fresh.
+  fn ensure_fresh(&mut self) -> Result<(), String> {
+    let Some(watch) = &self.watch else {
+      return Ok(());
+    };
+    if self.kg.is_some() && !watch.take_dirty() {
+      return Ok(());
+    }
+    let rebuilt = build_index(watch.src(), &self.index_dir)
+      .map_err(|err| err.to_string())
+      .and_then(|_| Kg::load(&self.index_dir).map_err(|err| err.to_string()));
+    match rebuilt {
+      Ok(kg) => {
+        self.kg = Some(kg);
+        Ok(())
+      }
+      Err(err) => {
+        watch.mark_dirty();
+        Err(format!("revalidating watched index failed: {err}"))
+      }
     }
   }
 
@@ -71,6 +108,11 @@ impl Server {
         .map(str::to_owned)
         .ok_or_else(|| format!("missing required argument '{key}'"))
     };
+    // Query tools serve from a graph the watch keeps fresh; the explicit `index` tool builds
+    // from its own `src` argument and needs no pre-validation.
+    if tool != "index" {
+      self.ensure_fresh()?;
+    }
     match tool {
       "index" => {
         let src = str_arg("src")?;
@@ -82,8 +124,14 @@ impl Server {
           format!("unchanged — reused existing index ({} nodes)", report.nodes)
         } else {
           format!(
-            "indexed {} files ({} skipped) → {} nodes, {} calls resolved, {} unresolved",
-            report.indexed, report.skipped, report.nodes, report.resolved, report.unresolved
+            "indexed {} files ({} skipped) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",
+            report.indexed,
+            report.skipped,
+            report.nodes,
+            report.resolved,
+            report.ambiguous,
+            report.external,
+            report.masked
           )
         })
       }
@@ -217,6 +265,24 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     "description": description,
     "inputSchema": {"type": "object", "properties": properties, "required": required}
   })
+}
+
+/// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`), if
+/// that root exists — the precondition for watching.
+fn watch_root(index_dir: &Path) -> Option<PathBuf> {
+  let vorpal = index_dir.parent()?;
+  if index_dir.file_name()? != "index" || vorpal.file_name()? != ".vorpal" {
+    return None;
+  }
+  let src = vorpal.parent()?;
+  // An empty parent means the index dir was given as a bare relative `.vorpal/index`: the
+  // source root is the current directory.
+  let src = if src.as_os_str().is_empty() {
+    Path::new(".")
+  } else {
+    src
+  };
+  src.is_dir().then(|| src.to_path_buf())
 }
 
 fn render(kg: &Kg, name: &str, ids: &[NodeId]) -> String {

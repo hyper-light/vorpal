@@ -11,6 +11,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+rayon.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 vorpal-ann.workspace = true
 vorpal-ingest.workspace = true
 vorpal-kg.workspace = true

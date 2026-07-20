@@ -295,6 +295,12 @@ impl PathWorker for RunWithInferredLang {
       };
       ret.push(processed);
     }
+    if !ret.is_empty() {
+      // Search feeds the index (§3.4): this file was walked, read, and matched — bank its
+      // extraction product so the next `vorpal index` replays it instead of re-parsing.
+      // Best-effort by design: search output must never depend on cache writability.
+      let _ = vorpal_index::warm_product_cache(path);
+    }
     Ok(ret)
   }
 }
@@ -384,6 +390,10 @@ impl PathWorker for RunWithSpecificLang {
         continue;
       };
       ret.push(processed);
+    }
+    if !ret.is_empty() {
+      // Search feeds the index (§3.4): bank the matched file's extraction product.
+      let _ = vorpal_index::warm_product_cache(path);
     }
     Ok(ret)
   }

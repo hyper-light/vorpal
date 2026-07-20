@@ -154,15 +154,74 @@ impl KgWriter {
     self.canonical.lookup(&CanonicalKey::of(path, entity_path))
   }
 
+  /// The containment/link edges accumulated so far — lets a resolver derive member→owner
+  /// relations (qualified-reference matching) before the graph is sealed.
+  pub fn edge_log(&self) -> &EdgeLog {
+    &self.edges
+  }
+
+  /// Absorb another writer's rows and edges after this writer's, rebasing node ids and heap
+  /// offsets — the merge step of the §7.5 sharded single-writer commit. Returns the id base
+  /// the absorbed writer's local ids were shifted by, so the caller can rebase anything else
+  /// that carries them (buffered references).
+  ///
+  /// Because canonical identity is path-qualified and a file's product lands in exactly one
+  /// shard, absorbed row sets are disjoint by construction — and absorbing shards in their
+  /// original (path-sorted) order reproduces the exact id assignment a single serial writer
+  /// would have produced, byte for byte.
+  ///
+  /// The absorbed writer's canonical index is discarded: a combined writer serves
+  /// `for_each_definition` / `edge_log` / `add_edge` / `seal`, but **must not** be used for
+  /// further `define` or `entity_id` calls (its canonical index no longer covers the absorbed
+  /// rows; `define` would fire the dense-assignment debug assertion).
+  pub fn absorb(&mut self, other: KgWriter) -> u64 {
+    let id_base = self.kind.len() as u64;
+    let heap_base = self.heap.len() as u32;
+    self.heap.extend_from_slice(&other.heap);
+    self.kind.extend_from_slice(&other.kind);
+    self
+      .name_off
+      .extend(other.name_off.iter().map(|off| off + heap_base));
+    self.name_len.extend_from_slice(&other.name_len);
+    self
+      .path_off
+      .extend(other.path_off.iter().map(|off| off + heap_base));
+    self.path_len.extend_from_slice(&other.path_len);
+    self
+      .sig_off
+      .extend(other.sig_off.iter().map(|off| off + heap_base));
+    self.sig_len.extend_from_slice(&other.sig_len);
+    self.content_hash.extend_from_slice(&other.content_hash);
+    self.flags.extend_from_slice(&other.flags);
+    for (src, dst, etype) in other.edges.iter() {
+      self
+        .edges
+        .push(src + id_base as u32, dst + id_base as u32, etype);
+    }
+    id_base
+  }
+
   /// Visit every interned definition — used to build a symbol table for reference resolution.
   pub fn for_each_definition<F: FnMut(NodeId, &str, &str, SymbolKind, bool)>(&self, mut visit: F) {
     for row in 0..self.kind.len() {
-      let name = self.heap_str(self.name_off[row], self.name_len[row]);
-      let path = self.heap_str(self.path_off[row], self.path_len[row]);
-      let kind = SymbolKind::from_tag(self.kind[row]);
-      let exported = self.flags[row] & 1 != 0;
-      visit(NodeId::new(row as u64), name, path, kind, exported);
+      let (id, name, path, kind, exported) = self.definition(row).expect("row < node_count");
+      visit(id, name, path, kind, exported);
     }
+  }
+
+  /// One interned definition by dense row (`row == id`): random access for sharded table
+  /// builds, where contiguous row ranges are processed on independent threads (§7.5).
+  pub fn definition(&self, row: usize) -> Option<(NodeId, &str, &str, SymbolKind, bool)> {
+    if row >= self.kind.len() {
+      return None;
+    }
+    Some((
+      NodeId::new(row as u64),
+      self.heap_str(self.name_off[row], self.name_len[row]),
+      self.heap_str(self.path_off[row], self.path_len[row]),
+      SymbolKind::from_tag(self.kind[row]),
+      self.flags[row] & 1 != 0,
+    ))
   }
 
   pub fn node_count(&self) -> usize {
@@ -203,6 +262,7 @@ impl KgWriter {
     directory.insert(0, n as u64, 0);
 
     Kg::new(nodes, self.heap, graph, directory)
+      .expect("sealed segment carries every column the builder just wrote")
   }
 }
 

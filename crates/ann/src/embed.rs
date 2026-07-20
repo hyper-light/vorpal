@@ -30,6 +30,43 @@ impl Default for LexicalEmbedder {
   }
 }
 
+impl LexicalEmbedder {
+  /// Embed the concatenation of `parts` exactly as if they were joined with spaces — without
+  /// materializing the joined string. Part boundaries are token boundaries (a space never
+  /// survives tokenization), so `embed_parts(&[a, b])` ≡ `embed(&format!("{a} {b}"))`, which
+  /// the tests pin. This is the per-node indexing path: zero intermediate allocations.
+  pub fn embed_parts(&self, parts: &[&str]) -> Vec<f32> {
+    let mut v = vec![0.0f32; self.dim];
+    self.embed_parts_into(parts, &mut v);
+    v
+  }
+
+  /// [`LexicalEmbedder::embed_parts`] into a caller-owned slice (`len == dim`), zeroed first —
+  /// the bulk-indexing path fills one flat matrix row per node with zero per-row allocation.
+  pub fn embed_parts_into(&self, parts: &[&str], out: &mut [f32]) {
+    debug_assert_eq!(out.len(), self.dim);
+    out.fill(0.0);
+    for part in parts {
+      for_each_token_hash(part, |h1| accumulate(out, h1));
+    }
+    normalize(out);
+  }
+}
+
+/// Scatter one token hash into the signed feature buckets.
+///
+/// Two independent hashes per token: a spurious similarity then needs two simultaneous bucket
+/// collisions with agreeing signs, quashing the single-collision false positives a one-hash
+/// sketch produces on short texts.
+fn accumulate(v: &mut [f32], h1: u64) {
+  let h2 = h1.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31);
+  for h in [h1, h2] {
+    let bucket = (h % v.len() as u64) as usize;
+    let sign = if (h >> 32) & 1 == 0 { 1.0 } else { -1.0 };
+    v[bucket] += sign;
+  }
+}
+
 impl Embedder for LexicalEmbedder {
   fn dim(&self) -> usize {
     self.dim
@@ -37,20 +74,48 @@ impl Embedder for LexicalEmbedder {
 
   fn embed(&self, text: &str) -> Vec<f32> {
     let mut v = vec![0.0f32; self.dim];
-    for token in tokenize(text) {
-      // Two independent hashes per token: a spurious similarity then needs two simultaneous
-      // bucket collisions with agreeing signs, quashing the single-collision false positives a
-      // one-hash sketch produces on short texts.
-      let h1 = fnv1a64(token.as_bytes());
-      let h2 = h1.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31);
-      for h in [h1, h2] {
-        let bucket = (h % self.dim as u64) as usize;
-        let sign = if (h >> 32) & 1 == 0 { 1.0 } else { -1.0 };
-        v[bucket] += sign;
-      }
-    }
+    // Hash tokens as they stream — no per-token `String` (this runs once per KG node on every
+    // index build; the materializing path allocated ~20 strings per node).
+    for_each_token_hash(text, |h1| accumulate(&mut v, h1));
     normalize(&mut v);
     v
+  }
+}
+
+/// Stream `fnv1a64(token)` for each token of `text` without materializing token strings —
+/// byte-identical to `tokenize(text)` + `fnv1a64` (the same boundary rules feed the same
+/// lowercased UTF-8 bytes into the same hash), which the tests pin down.
+fn for_each_token_hash(text: &str, mut emit: impl FnMut(u64)) {
+  const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+  let mut hash = FNV_OFFSET;
+  let mut empty = true;
+  let mut prev_lower = false;
+  let mut utf8 = [0u8; 4];
+  for c in text.chars() {
+    if c.is_alphanumeric() {
+      if c.is_uppercase() && prev_lower && !empty {
+        emit(hash);
+        hash = FNV_OFFSET;
+      }
+      for lower in c.to_lowercase() {
+        for &b in lower.encode_utf8(&mut utf8).as_bytes() {
+          hash ^= b as u64;
+          hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+      }
+      empty = false;
+      prev_lower = c.is_lowercase() || c.is_numeric();
+    } else {
+      if !empty {
+        emit(hash);
+        hash = FNV_OFFSET;
+        empty = true;
+      }
+      prev_lower = false;
+    }
+  }
+  if !empty {
+    emit(hash);
   }
 }
 
@@ -81,19 +146,20 @@ pub fn tokenize(text: &str) -> Vec<String> {
   tokens
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-  let mut hash = 0xcbf2_9ce4_8422_2325u64;
-  for &b in bytes {
-    hash ^= b as u64;
-    hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
-  }
-  hash
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::l2_sq;
+
+  /// The whole-token FNV-1a the streaming hasher must agree with.
+  fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+      hash ^= b as u64;
+      hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+  }
 
   #[test]
   fn embedding_is_deterministic_and_normalized() {
@@ -103,6 +169,53 @@ mod tests {
     assert_eq!(a, b);
     let norm: f32 = a.iter().map(|x| x * x).sum();
     assert!((norm - 1.0).abs() < 1e-5, "unit norm, got {norm}");
+  }
+
+  #[test]
+  fn embed_parts_equals_embed_of_space_joined_text() {
+    let e = LexicalEmbedder::default();
+    for parts in [
+      [
+        "build_index",
+        "build_index",
+        "fn build_index(src)",
+        "lib.rs",
+      ],
+      ["", "x", "", "üñïçødé Straße"],
+      ["a b", "c", "CamelCase9", "-"],
+    ] {
+      assert_eq!(
+        e.embed_parts(&parts),
+        e.embed(&parts.join(" ")),
+        "parts: {parts:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn streamed_token_hashes_match_materialized_tokenize() {
+    // The no-alloc hash stream must agree with tokenize() + fnv1a64 byte-for-byte — including
+    // camel humps, digits, Unicode lowercasing (İ expands to two chars), and delimiters.
+    for text in [
+      "resolveImportPath",
+      "HTTPServer2Config",
+      "a__b--c9 ÎмяȘİx",
+      "  leading and trailing  ",
+      "ONLYCAPS",
+      "",
+      "ΣΊΣΥΦΟΣ dès Straße",
+    ] {
+      let streamed = {
+        let mut hashes = Vec::new();
+        for_each_token_hash(text, |h| hashes.push(h));
+        hashes
+      };
+      let materialized: Vec<u64> = tokenize(text)
+        .iter()
+        .map(|token| fnv1a64(token.as_bytes()))
+        .collect();
+      assert_eq!(streamed, materialized, "text: {text:?}");
+    }
   }
 
   #[test]

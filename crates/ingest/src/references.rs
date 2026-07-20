@@ -15,18 +15,50 @@
 //!
 //! All node kinds and field names come from each pinned grammar's `node-types.json`.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::LazyLock;
 
-use vorpal_core::Node;
 use vorpal_core::tree_sitter::StrDoc;
+use vorpal_core::{Language, Node};
 use vorpal_kg::NodeId;
 use vorpal_language::SupportLang;
-use vorpal_resolve::{RefKind, Reference};
+use vorpal_resolve::{RefForm, RefKind};
 
 type SgNode<'t> = Node<'t, StrDoc<SupportLang>>;
 
+/// One extracted reference, file-locally attributed: `from` indexes the file's local
+/// definition layout (see `local_layout`). Deliberately path-free — the enclosing file's path
+/// is applied once at link time instead of being allocated per reference at extraction time
+/// (~30k dead `String`s per index of this repo under the previous `Reference`-based emission).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawRef<'t> {
+  pub(crate) from: NodeId,
+  pub(crate) name: Cow<'t, str>,
+  pub(crate) kind: RefKind,
+  pub(crate) start: u32,
+  pub(crate) end: u32,
+  pub(crate) qualifier: Option<Cow<'t, str>>,
+  pub(crate) form: RefForm,
+}
+
+impl<'t> RawRef<'t> {
+  fn plain(from: NodeId, name: Cow<'t, str>, kind: RefKind, start: u32, end: u32) -> Self {
+    Self {
+      from,
+      name,
+      kind,
+      start,
+      end,
+      qualifier: None,
+      form: RefForm::Bare,
+    }
+  }
+}
+
 /// How to locate the referenced sub-node inside a matched call/import node.
+#[derive(Clone, Copy)]
 enum Sel {
   /// `node.field(name)` — the common case.
   Field(&'static str),
@@ -39,10 +71,24 @@ enum Sel {
   ChildOfKind(&'static [&'static str]),
 }
 
+#[derive(Clone, Copy)]
 struct CallSpec {
   kind: &'static str,
   callee: Sel,
+  /// Field on the *call node* holding the receiver value, for grammars where the callee
+  /// selector skips it (Java `method_invocation.object`, PHP `member_call_expression.object`).
+  receiver_field: Option<&'static str>,
+  /// Field on the *call node* holding a static scope (PHP `scoped_call_expression.scope`).
+  scope_field: Option<&'static str>,
 }
+
+/// The common case: form evidence (if any) lives inside the callee expression itself.
+const CALL_DEFAULTS: CallSpec = CallSpec {
+  kind: "",
+  callee: Sel::FirstNamedChild,
+  receiver_field: None,
+  scope_field: None,
+};
 
 struct ImportSpec {
   kind: &'static str,
@@ -77,35 +123,73 @@ pub(crate) struct RefSpec {
   /// names and implements-construct targets are excluded by the walk.
   types: &'static [&'static str],
   implements: &'static [ImplSpec],
+  /// Node kinds declaring generic type parameters (`type_parameters`, …). Names they bind are
+  /// *binders*, not type uses: every mention within the declaring item's span is suppressed
+  /// (`fn f<T>(x: T) -> T` emits no `of_type` reference at all for `T`).
+  type_params: &'static [&'static str],
+  /// Type-position keywords/placeholders that are never definitions (`Self`, `_`): emitting
+  /// them as uses would only manufacture forever-unresolved references.
+  type_placeholders: &'static [&'static str],
+  /// Callee-expression kinds that are static namespace paths (`Kg::load`) — their path part is
+  /// grammar-guaranteed namespace evidence.
+  static_callee_kinds: &'static [&'static str],
+  /// Callee-expression kinds that are member accesses on a value (`x.helper()`) — the receiver
+  /// is opaque unless it is a self-receiver keyword.
+  method_callee_kinds: &'static [&'static str],
+  /// Receiver spellings that denote the enclosing type (`self`, `this`, `$this`).
+  self_receivers: &'static [&'static str],
 }
 
 const NONE_TEXT: &[(&str, TextAction)] = &[];
 const NO_TYPES: &[&str] = &[];
 const NO_IMPL: &[ImplSpec] = &[];
+const NO_KINDS: &[&str] = &[];
 const TYPE_ID: &[&str] = &["type_identifier"];
+
+/// Baseline spec: no extraction of any kind; language tables override what they support.
+const SPEC_DEFAULTS: RefSpec = RefSpec {
+  calls: &[],
+  imports: &[],
+  text_rules: NONE_TEXT,
+  types: NO_TYPES,
+  implements: NO_IMPL,
+  type_params: NO_KINDS,
+  type_placeholders: NO_KINDS,
+  static_callee_kinds: NO_KINDS,
+  method_callee_kinds: NO_KINDS,
+  self_receivers: NO_KINDS,
+};
 
 const RUST: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "use_declaration",
     target: Sel::Field("argument"),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
   types: TYPE_ID,
   implements: &[ImplSpec {
     kind: "impl_item",
     target: Some(Sel::Field("trait")),
   }],
+  type_params: &["type_parameters"],
+  // `Self` names the enclosing impl type; `_` is inference. Neither can be a definition.
+  type_placeholders: &["Self", "_"],
+  static_callee_kinds: &["scoped_identifier"],
+  method_callee_kinds: &["field_expression"],
+  self_receivers: &["self"],
+  ..SPEC_DEFAULTS
 };
 
 const PYTHON: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[
     ImportSpec {
@@ -119,27 +203,30 @@ const PYTHON: RefSpec = RefSpec {
       string_target: false,
     },
   ],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
   implements: &[ImplSpec {
     kind: "class_definition",
     target: Some(Sel::Field("superclasses")),
   }],
+  method_callee_kinds: &["attribute"],
+  self_receivers: &["self", "cls"],
+  ..SPEC_DEFAULTS
 };
 
 const GO: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "import_spec",
     target: Sel::Field("path"),
     string_target: true,
   }],
-  text_rules: NONE_TEXT,
   types: TYPE_ID,
-  implements: NO_IMPL,
+  type_params: &["type_parameter_list"],
+  method_callee_kinds: &["selector_expression"],
+  ..SPEC_DEFAULTS
 };
 
 /// JavaScript / TypeScript / Tsx share one grammar family for calls + ES imports + `require`.
@@ -147,6 +234,7 @@ const JS_LIKE: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "import_statement",
@@ -161,34 +249,43 @@ const JS_LIKE: RefSpec = RefSpec {
     kind: "class_heritage",
     target: None,
   }],
+  type_params: &["type_parameters"],
+  method_callee_kinds: &["member_expression"],
+  self_receivers: &["this"],
+  ..SPEC_DEFAULTS
 };
 
 const C_LIKE: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "preproc_include",
     target: Sel::Field("path"),
     string_target: true,
   }],
-  text_rules: NONE_TEXT,
   types: TYPE_ID,
-  implements: NO_IMPL,
+  type_params: &["template_parameter_list"],
+  static_callee_kinds: &["qualified_identifier"],
+  method_callee_kinds: &["field_expression"],
+  self_receivers: &["this"],
+  ..SPEC_DEFAULTS
 };
 
 const JAVA: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "method_invocation",
     callee: Sel::Field("name"),
+    receiver_field: Some("object"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "import_declaration",
     target: Sel::ChildOfKind(&["scoped_identifier", "identifier"]),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
   types: TYPE_ID,
   implements: &[
     ImplSpec {
@@ -204,68 +301,87 @@ const JAVA: RefSpec = RefSpec {
       target: None,
     },
   ],
+  type_params: &["type_parameters"],
+  // `var` is local-variable type inference (a reserved type name since Java 10, never a
+  // definable type) — the grammar surfaces it as a `type_identifier` leaf (verified by probe).
+  type_placeholders: &["var"],
+  self_receivers: &["this"],
+  ..SPEC_DEFAULTS
 };
 
 const CSHARP: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "invocation_expression",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "using_directive",
     target: Sel::Field("name"),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
   implements: &[ImplSpec {
     kind: "base_list",
     target: None,
   }],
+  type_params: &["type_parameter_list"],
+  method_callee_kinds: &["member_access_expression"],
+  self_receivers: &["this"],
+  ..SPEC_DEFAULTS
 };
 
 const KOTLIN: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "import_header",
     target: Sel::ChildOfKind(&["identifier"]),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
   types: TYPE_ID,
-  implements: NO_IMPL,
+  type_params: &["type_parameters"],
+  method_callee_kinds: &["navigation_expression"],
+  self_receivers: &["this"],
+  ..SPEC_DEFAULTS
 };
 
 const SWIFT: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "import_declaration",
     target: Sel::ChildOfKind(&["identifier"]),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
   types: TYPE_ID,
-  implements: NO_IMPL,
+  type_params: &["type_parameters"],
+  // Swift's `Self` (the enclosing/dynamic type) reaches the walk as a type leaf (verified by
+  // probe); it is a keyword, never a definable type.
+  type_placeholders: &["Self"],
+  method_callee_kinds: &["navigation_expression"],
+  self_receivers: &["self"],
+  ..SPEC_DEFAULTS
 };
 
 const RUBY: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call",
     callee: Sel::Field("method"),
+    receiver_field: Some("receiver"),
+    ..CALL_DEFAULTS
   }],
-  imports: &[],
   text_rules: &[
     ("require", TextAction::ImportFirstArg),
     ("require_relative", TextAction::ImportFirstArg),
   ],
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  self_receivers: &["self"],
+  ..SPEC_DEFAULTS
 };
 
 const PHP: RefSpec = RefSpec {
@@ -273,18 +389,25 @@ const PHP: RefSpec = RefSpec {
     CallSpec {
       kind: "function_call_expression",
       callee: Sel::Field("function"),
+      ..CALL_DEFAULTS
     },
     CallSpec {
       kind: "member_call_expression",
       callee: Sel::Field("name"),
+      receiver_field: Some("object"),
+      ..CALL_DEFAULTS
     },
     CallSpec {
       kind: "nullsafe_member_call_expression",
       callee: Sel::Field("name"),
+      receiver_field: Some("object"),
+      ..CALL_DEFAULTS
     },
     CallSpec {
       kind: "scoped_call_expression",
       callee: Sel::Field("name"),
+      scope_field: Some("scope"),
+      ..CALL_DEFAULTS
     },
   ],
   imports: &[ImportSpec {
@@ -292,9 +415,8 @@ const PHP: RefSpec = RefSpec {
     target: Sel::ChildOfKind(&["namespace_name", "name"]),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  self_receivers: &["$this", "self", "static"],
+  ..SPEC_DEFAULTS
 };
 
 const DART: RefSpec = RefSpec {
@@ -302,10 +424,12 @@ const DART: RefSpec = RefSpec {
     CallSpec {
       kind: "call_expression",
       callee: Sel::Field("function"),
+      ..CALL_DEFAULTS
     },
     CallSpec {
       kind: "constructor_invocation",
       callee: Sel::Field("constructor"),
+      ..CALL_DEFAULTS
     },
   ],
   imports: &[ImportSpec {
@@ -313,57 +437,55 @@ const DART: RefSpec = RefSpec {
     target: Sel::Field("uri"),
     string_target: true,
   }],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  self_receivers: &["this"],
+  ..SPEC_DEFAULTS
 };
 
 const SCALA: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "import_declaration",
     target: Sel::FieldLast("path"),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  self_receivers: &["this"],
+  ..SPEC_DEFAULTS
 };
 
 const LUA: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "function_call",
     callee: Sel::Field("name"),
+    ..CALL_DEFAULTS
   }],
-  imports: &[],
   text_rules: &[("require", TextAction::ImportFirstArg)],
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  self_receivers: &["self"],
+  ..SPEC_DEFAULTS
 };
 
 const BASH: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "command",
     callee: Sel::Field("name"),
+    ..CALL_DEFAULTS
   }],
-  imports: &[],
   text_rules: &[
     ("source", TextAction::ImportFirstArg),
     (".", TextAction::ImportFirstArg),
   ],
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  ..SPEC_DEFAULTS
 };
 
 const ELIXIR: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call",
     callee: Sel::Field("target"),
+    ..CALL_DEFAULTS
   }],
-  imports: &[],
   text_rules: &[
     ("def", TextAction::SkipDefinition),
     ("defp", TextAction::SkipDefinition),
@@ -382,23 +504,21 @@ const ELIXIR: RefSpec = RefSpec {
     ("require", TextAction::ImportFirstArg),
     ("use", TextAction::ImportFirstArg),
   ],
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  ..SPEC_DEFAULTS
 };
 
 const HASKELL: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "apply",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
   imports: &[ImportSpec {
     kind: "import",
     target: Sel::Field("module"),
     string_target: false,
   }],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  ..SPEC_DEFAULTS
 };
 
 const SOLIDITY: RefSpec = RefSpec {
@@ -407,6 +527,7 @@ const SOLIDITY: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "call_expression",
     callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
   }],
   imports: &[
     ImportSpec {
@@ -420,32 +541,176 @@ const SOLIDITY: RefSpec = RefSpec {
       string_target: true,
     },
   ],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  ..SPEC_DEFAULTS
 };
 
 const NIX: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "apply_expression",
     callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
   }],
-  imports: &[],
   text_rules: &[("import", TextAction::ImportFirstArg)],
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  ..SPEC_DEFAULTS
 };
 
 const HCL: RefSpec = RefSpec {
   calls: &[CallSpec {
     kind: "function_call",
     callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
   }],
-  imports: &[],
-  text_rules: NONE_TEXT,
-  types: NO_TYPES,
-  implements: NO_IMPL,
+  ..SPEC_DEFAULTS
 };
+
+/// One node's dispatch outcome in the fused walk — mirrors the priority of the original
+/// if-chain (imports > types > implements > calls); a kind belongs to exactly one chain arm.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Chain {
+  #[default]
+  None,
+  Import,
+  Type,
+  Implements(u16),
+  Call(u16),
+}
+
+/// A [`RefSpec`] with its node-kind names resolved to the grammar's numeric kind ids (§12
+/// build-once dispatch): the walk indexes one dense table per node instead of comparing the
+/// kind string against every spec entry.
+pub(crate) struct ResolvedRefSpec {
+  pub(crate) spec: &'static RefSpec,
+  /// `kind_id → chain arm`, dense over the ids the spec mentions.
+  chain: Vec<Chain>,
+  /// `kind_id → declares type parameters` (checked independently of the chain).
+  type_params: Vec<bool>,
+  /// Resolved kind id per `spec.imports` entry (multiple import specs may share a kind).
+  import_kind_ids: Vec<u16>,
+}
+
+impl ResolvedRefSpec {
+  fn build(lang: SupportLang, spec: &'static RefSpec) -> Self {
+    let id_of = |kind: &str| -> Option<u16> {
+      // `kind_to_id` returns 0 for kinds absent from the pinned grammar; such entries could
+      // never have matched by string either, so they simply don't dispatch.
+      match lang.kind_to_id(kind) {
+        0 => None,
+        id => Some(id),
+      }
+    };
+    let import_kind_ids: Vec<u16> = spec
+      .imports
+      .iter()
+      .map(|i| id_of(i.kind).unwrap_or(0))
+      .collect();
+
+    let max_id = spec
+      .calls
+      .iter()
+      .map(|c| c.kind)
+      .chain(spec.imports.iter().map(|i| i.kind))
+      .chain(spec.implements.iter().map(|i| i.kind))
+      .chain(spec.types.iter().copied())
+      .chain(spec.type_params.iter().copied())
+      .filter_map(id_of)
+      .max()
+      .unwrap_or(0) as usize;
+
+    let mut chain = vec![Chain::None; max_id + 1];
+    let mut type_params = vec![false; max_id + 1];
+    // Insert in reverse priority so higher-priority arms overwrite on (unlikely) kind overlap;
+    // within calls/implements, reverse entry order so the FIRST spec entry sharing a kind wins
+    // — the same tie-break the sequential `find()` dispatch had.
+    for (idx, call) in spec.calls.iter().enumerate().rev() {
+      if let Some(id) = id_of(call.kind) {
+        chain[id as usize] = Chain::Call(idx as u16);
+      }
+    }
+    for (idx, imp) in spec.implements.iter().enumerate().rev() {
+      if let Some(id) = id_of(imp.kind) {
+        chain[id as usize] = Chain::Implements(idx as u16);
+      }
+    }
+    for kind in spec.types {
+      if let Some(id) = id_of(kind) {
+        chain[id as usize] = Chain::Type;
+      }
+    }
+    for imp in spec.imports {
+      if let Some(id) = id_of(imp.kind) {
+        chain[id as usize] = Chain::Import;
+      }
+    }
+    for kind in spec.type_params {
+      if let Some(id) = id_of(kind) {
+        type_params[id as usize] = true;
+      }
+    }
+    Self {
+      spec,
+      chain,
+      type_params,
+      import_kind_ids,
+    }
+  }
+
+  #[inline]
+  fn chain_at(&self, kind_id: u16) -> Chain {
+    self
+      .chain
+      .get(kind_id as usize)
+      .copied()
+      .unwrap_or(Chain::None)
+  }
+
+  #[inline]
+  fn declares_type_params(&self, kind_id: u16) -> bool {
+    self
+      .type_params
+      .get(kind_id as usize)
+      .copied()
+      .unwrap_or(false)
+  }
+}
+
+/// Kind ids resolved once per language, process-wide.
+static RESOLVED_SPECS: LazyLock<HashMap<SupportLang, ResolvedRefSpec>> = LazyLock::new(|| {
+  use SupportLang as L;
+  let all = [
+    L::Rust,
+    L::Python,
+    L::Go,
+    L::JavaScript,
+    L::TypeScript,
+    L::Tsx,
+    L::C,
+    L::Cpp,
+    L::Java,
+    L::CSharp,
+    L::Kotlin,
+    L::Swift,
+    L::Ruby,
+    L::Php,
+    L::Dart,
+    L::Scala,
+    L::Lua,
+    L::Bash,
+    L::Elixir,
+    L::Haskell,
+    L::Solidity,
+    L::Nix,
+    L::Hcl,
+  ];
+  all
+    .into_iter()
+    .filter_map(|lang| Some((lang, ResolvedRefSpec::build(lang, ref_spec(lang)?))))
+    .collect()
+});
+
+/// The kind-id-resolved extraction spec for `lang`, if it has one.
+pub(crate) fn resolved_ref_spec(lang: SupportLang) -> Option<&'static ResolvedRefSpec> {
+  RESOLVED_SPECS.get(&lang)
+}
 
 /// Reference-extraction spec for a language. Pure-structural languages (CSS, HTML, JSON,
 /// Markdown, YAML) have no call/import semantics and return `None`.
@@ -476,96 +741,319 @@ pub(crate) fn ref_spec(lang: SupportLang) -> Option<&'static RefSpec> {
   }
 }
 
-/// Emit `calls` and `imports` references from the parse tree.
-pub(crate) fn extract_references(
-  root: SgNode<'_>,
-  spec: &RefSpec,
+/// Innermost-containing-span lookups for offsets arriving in non-decreasing (document) order —
+/// exactly the fused walk's emission order, since pre-order visit starts never decrease. An
+/// active-span stack advances with the offsets, so a whole file costs O(spans + lookups)
+/// instead of the previous O(lookups × spans) rescan (~1M range checks per index of this
+/// repo). The answer is still "minimum-length span containing the offset" — computed over the
+/// (tiny) active set, which by the monotonic contract equals the containing set — so the
+/// semantics match the specification implementation's linear scan for any span shape.
+struct SpanCursor<'a> {
+  spans: &'a [(Range<usize>, NodeId)],
+  /// Next span (spans are in document order) not yet considered for activation.
+  next: usize,
+  /// Indices of admitted spans; stale (already-ended) entries are retired lazily.
+  active: Vec<usize>,
+}
+
+impl<'a> SpanCursor<'a> {
+  fn new(spans: &'a [(Range<usize>, NodeId)]) -> Self {
+    Self {
+      spans,
+      next: 0,
+      active: Vec::new(),
+    }
+  }
+
+  /// The innermost definition containing `offset`. Offsets must be non-decreasing across
+  /// calls (the walk's document order guarantees this).
+  fn enclosing(&mut self, offset: usize) -> Option<NodeId> {
+    while let Some(&top) = self.active.last() {
+      if self.spans[top].0.end <= offset {
+        self.active.pop();
+      } else {
+        break;
+      }
+    }
+    while self.next < self.spans.len() && self.spans[self.next].0.start <= offset {
+      if self.spans[self.next].0.end > offset {
+        self.active.push(self.next);
+      }
+      self.next += 1;
+    }
+    self
+      .active
+      .iter()
+      .map(|&i| &self.spans[i])
+      .filter(|(range, _)| range.contains(&offset))
+      .min_by_key(|(range, _)| range.end - range.start)
+      .map(|(_, id)| id.to_owned())
+  }
+}
+
+/// A walk emission awaiting the post-pass: definite references pass through in visit order;
+/// type-use candidates wait for the complete binder set (a `type_parameters` declaration may
+/// be visited after uses of its binder, so the shadow filter can only run once the walk ends).
+enum Pending<'t> {
+  Ready(RawRef<'t>),
+  TypeUse {
+    from: NodeId,
+    name: Cow<'t, str>,
+    start: u32,
+    end: u32,
+  },
+}
+
+/// Emit `calls` and `imports` references from the parse tree — one fused traversal (§12):
+/// each node costs a single dense kind-id table lookup that dispatches import / type /
+/// implements / call handling, and type-parameter binder collection rides the same walk
+/// instead of a second full pass. `entities` maps each local definition id in `def_spans` to
+/// its entity path — the source of enclosing-owner names for `self.`/`Self::` attribution.
+pub(crate) fn extract_references<'t>(
+  root: SgNode<'t>,
+  resolved: &ResolvedRefSpec,
   def_spans: &[(Range<usize>, NodeId)],
-  path: &str,
-  out: &mut Vec<Reference>,
+  entities: &[String],
+  out: &mut Vec<RawRef<'t>>,
 ) {
+  let spec = resolved.spec;
+  // Generic type-parameter binders: (declaring item's span, binder name). Mentions of a binder
+  // inside its declaring span are local bindings, not type uses.
+  let mut binders: Vec<(Range<usize>, Cow<'t, str>)> = Vec::new();
   // Definition-head calls suppressed by a SkipDefinition rule (`def foo(x)` → `foo(x)`).
   let mut suppressed: HashSet<usize> = HashSet::new();
-  // Dedup for type/implements references: one edge per (from, name, kind) per file.
-  let mut seen: HashSet<(u64, String, u8)> = HashSet::new();
-  let mut stack = vec![root];
-  while let Some(node) = stack.pop() {
-    for child in node.children() {
-      stack.push(child);
-    }
-    let kind_cow = node.kind();
-    let kind = kind_cow.as_ref();
-
-    let mut is_import_node = false;
-    for ispec in spec.imports.iter().filter(|i| i.kind == kind) {
-      is_import_node = true;
-      emit_imports(&node, ispec, def_spans, path, out);
-    }
-    if is_import_node {
+  // Dedup for implements references: one edge per (from, name) per file — borrowed keys, so
+  // deduplication itself allocates nothing.
+  let mut seen_impls: HashSet<(u64, Cow<'t, str>)> = HashSet::new();
+  let mut pending: Vec<Pending<'t>> = Vec::new();
+  let mut span_cursor = SpanCursor::new(def_spans);
+  // Single-cursor pre-order (document order): `children()` allocates a fresh tree cursor per
+  // call, so the previous stack walk paid one C-side cursor malloc per visited node (~350k per
+  // index of this repo); `dfs()` streams the whole file over ONE cursor. Anonymous token
+  // leaves still stream past, but a skipped iterator step is free where a cursor was not.
+  for node in root.dfs() {
+    if !node.is_named() {
       continue;
     }
-
-    if spec.types.contains(&kind) {
-      emit_type_use(&node, spec, def_spans, path, &mut seen, out);
-      continue;
+    let kind_id = node.kind_id();
+    if resolved.declares_type_params(kind_id) {
+      collect_binders_in(&node, &mut binders);
     }
-    if let Some(ispec) = spec.implements.iter().find(|s| s.kind == kind) {
-      emit_implements(&node, ispec, def_spans, path, &mut seen, out);
-      continue;
-    }
-
-    let Some(cspec) = spec.calls.iter().find(|c| c.kind == kind) else {
-      continue;
-    };
-    if suppressed.remove(&node.node_id()) || is_chain_link(&node, spec) {
-      continue;
-    }
-    let Some(mut callee) = select(&node, &cspec.callee) else {
-      continue;
-    };
-    // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
-    // chain yields one reference, attributed at the outermost node.
-    while let Some(inner) = spec
-      .calls
-      .iter()
-      .find(|c| c.kind == callee.kind().as_ref())
-      .and_then(|c| select(&callee, &c.callee))
-    {
-      callee = inner;
-    }
-    let Some(name) = callee_name(&callee) else {
-      continue;
-    };
-    let range = node.range();
-    match spec.text_rules.iter().find(|(text, _)| *text == name) {
-      Some((_, TextAction::SkipDefinition)) => {
-        if let Some(args) = node.children().find(|c| c.kind().as_ref() == "arguments") {
-          if let Some(head) = args.children().find(|c| c.is_named()) {
-            if spec.calls.iter().any(|c| c.kind == head.kind().as_ref()) {
-              suppressed.insert(head.node_id());
+    match resolved.chain_at(kind_id) {
+      Chain::None => {}
+      Chain::Import => {
+        for (ispec, &id) in spec.imports.iter().zip(&resolved.import_kind_ids) {
+          if id == kind_id {
+            emit_imports(&node, ispec, def_spans, &mut pending);
+          }
+        }
+      }
+      Chain::Type => stage_type_use(&node, spec, &mut span_cursor, &mut pending),
+      Chain::Implements(idx) => emit_implements(
+        &node,
+        &spec.implements[idx as usize],
+        spec,
+        &mut span_cursor,
+        &mut seen_impls,
+        &mut pending,
+      ),
+      Chain::Call(idx) => {
+        let cspec = &spec.calls[idx as usize];
+        if suppressed.remove(&node.node_id()) || is_chain_link(&node, spec) {
+          continue;
+        }
+        let Some(mut callee) = select(&node, &cspec.callee) else {
+          continue;
+        };
+        // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
+        // chain yields one reference, attributed at the outermost node.
+        while let Some(inner) = spec
+          .calls
+          .iter()
+          .find(|c| c.kind == callee.kind().as_ref())
+          .and_then(|c| select(&callee, &c.callee))
+        {
+          callee = inner;
+        }
+        let Some(name) = callee_name(&callee) else {
+          continue;
+        };
+        let range = node.range();
+        match spec
+          .text_rules
+          .iter()
+          .find(|(text, _)| name.as_ref() == *text)
+        {
+          Some((_, TextAction::SkipDefinition)) => {
+            if let Some(args) = node.children().find(|c| c.kind().as_ref() == "arguments") {
+              if let Some(head) = args.children().find(|c| c.is_named()) {
+                if spec.calls.iter().any(|c| c.kind == head.kind().as_ref()) {
+                  suppressed.insert(head.node_id());
+                }
+              }
+            }
+          }
+          Some((_, TextAction::ImportFirstArg)) => {
+            if let (Some(arg), Some(from)) =
+              (first_argument(&node), outermost(def_spans, range.start))
+            {
+              if let Some(import) = import_arg_name(&arg) {
+                pending.push(Pending::Ready(RawRef::plain(
+                  from,
+                  import,
+                  RefKind::Import,
+                  range.start as u32,
+                  range.end as u32,
+                )));
+              }
+            }
+          }
+          None => {
+            if let Some(from) = span_cursor.enclosing(range.start) {
+              let (form, qualifier) = classify_call(&node, cspec, &callee, spec, entities, from);
+              pending.push(Pending::Ready(RawRef {
+                from,
+                name,
+                kind: RefKind::Call,
+                start: range.start as u32,
+                end: range.end as u32,
+                qualifier,
+                form,
+              }));
             }
           }
         }
       }
-      Some((_, TextAction::ImportFirstArg)) => {
-        if let (Some(arg), Some(from)) = (first_argument(&node), outermost(def_spans, range.start))
-        {
-          if let Some(import) = import_arg_name(&arg) {
-            out.push(
-              Reference::new(from, path, import, RefKind::Import)
-                .with_evidence(range.start as u32, range.end as u32),
-            );
-          }
+    }
+  }
+
+  // Post-pass in visit order: binder-shadowed type uses drop; survivors dedup per
+  // (enclosing definition, name) — the same outcome the two-walk version produced.
+  let mut seen_types: HashSet<(u64, Cow<'t, str>)> = HashSet::new();
+  for entry in pending {
+    match entry {
+      Pending::Ready(reference) => out.push(reference),
+      Pending::TypeUse {
+        from,
+        name,
+        start,
+        end,
+      } => {
+        let shadowed = binders
+          .iter()
+          .any(|(scope, binder)| *binder == name && scope.contains(&(start as usize)));
+        if !shadowed && seen_types.insert((from.raw(), name.clone())) {
+          out.push(RawRef::plain(from, name, RefKind::Type, start, end));
         }
       }
-      None => {
-        if let Some(from) = enclosing(def_spans, range.start) {
-          out.push(
-            Reference::new(from, path, name, RefKind::Call)
-              .with_evidence(range.start as u32, range.end as u32),
-          );
-        }
-      }
+    }
+  }
+}
+
+/// Fields tried, in order, for a member access's receiver expression across grammars
+/// (Rust `field_expression.value`, JS `member_expression.object`, Go
+/// `selector_expression.operand`, C/C++ `field_expression.argument`,
+/// C# `member_access_expression.expression`, Python `attribute.object`).
+const RECEIVER_FIELDS: &[&str] = &["value", "object", "operand", "argument", "expression"];
+
+/// Classify a call's syntactic form and extract its qualifier evidence (§3.3):
+/// - a static path (`Kg::load`) yields `Static` + the path's final namespace segment;
+/// - a self-receiver (`self.helper()`, `Self::helper()`) yields the enclosing item's name —
+///   receiver typing the grammar *does* guarantee;
+/// - any other member access yields `Method` with no qualifier: a variable name is not
+///   namespace evidence, and resolution must not treat it as such.
+fn classify_call<'t>(
+  call: &SgNode<'t>,
+  cspec: &CallSpec,
+  callee: &SgNode<'t>,
+  spec: &RefSpec,
+  entities: &[String],
+  from: NodeId,
+) -> (RefForm, Option<Cow<'t, str>>) {
+  let owner = || owner_of_entity(entities, from).map(Cow::Owned);
+  let qualifier_of = |node: &SgNode<'t>| -> Option<Cow<'t, str>> {
+    let text = callee_name(node).or_else(|| {
+      let trimmed = trim_cow(node.text(), str::trim);
+      (!trimmed.is_empty() && !trimmed.contains(char::is_whitespace)).then_some(trimmed)
+    })?;
+    if text.as_ref() == "Self" || spec.self_receivers.contains(&text.as_ref()) {
+      return owner();
+    }
+    // Module-relative path heads (`crate::`, `super::`) name no owner we can check.
+    (!matches!(text.as_ref(), "crate" | "super")).then_some(text)
+  };
+
+  // Call-node-level fields first (Java/PHP/Ruby put receiver/scope beside the callee).
+  if let Some(scope_field) = cspec.scope_field {
+    if let Some(scope) = call.field(scope_field) {
+      return (RefForm::Static, qualifier_of(&scope));
+    }
+  }
+  if let Some(receiver_field) = cspec.receiver_field {
+    if let Some(receiver) = call.field(receiver_field) {
+      return (RefForm::Method, self_receiver_owner(&receiver, spec, owner));
+    }
+    return (RefForm::Bare, None);
+  }
+
+  let callee_kind_cow = callee.kind();
+  let callee_kind = callee_kind_cow.as_ref();
+  if spec.static_callee_kinds.contains(&callee_kind) {
+    let scope = callee.field("path").or_else(|| callee.field("scope"));
+    return (RefForm::Static, scope.as_ref().and_then(qualifier_of));
+  }
+  if spec.method_callee_kinds.contains(&callee_kind) {
+    let receiver = RECEIVER_FIELDS.iter().find_map(|f| callee.field(f));
+    let qualifier = receiver.and_then(|r| self_receiver_owner(&r, spec, owner));
+    return (RefForm::Method, qualifier);
+  }
+  (RefForm::Bare, None)
+}
+
+/// The enclosing item's name iff the receiver is a self keyword; other receivers are opaque.
+fn self_receiver_owner<'t>(
+  receiver: &SgNode<'_>,
+  spec: &RefSpec,
+  owner: impl FnOnce() -> Option<Cow<'t, str>>,
+) -> Option<Cow<'t, str>> {
+  let text = receiver.text();
+  spec
+    .self_receivers
+    .contains(&text.trim())
+    .then(owner)
+    .flatten()
+}
+
+/// The top-level item owning an already-resolved enclosing definition (`Kg.load` → `Kg`).
+fn owner_of_entity(entities: &[String], from: NodeId) -> Option<String> {
+  let entity = entities.get(from.raw() as usize)?;
+  let owner = entity.split('.').next().unwrap_or(entity);
+  (!owner.is_empty()).then(|| owner.to_string())
+}
+
+/// Leaf kinds a type-parameter binder name can be.
+const BINDER_LEAF_KINDS: &[&str] = &["type_identifier", "identifier", "simple_identifier"];
+
+/// Collect the binders declared by one type-parameter node (`type_parameters`, …): each
+/// parameter's *binder* name (the declared name only — never its bounds or defaults, which are
+/// real type uses) scoped to the declaring item's full span. Runs inside the fused walk when
+/// the dispatch table flags the node's kind.
+fn collect_binders_in<'t>(node: &SgNode<'t>, binders: &mut Vec<(Range<usize>, Cow<'t, str>)>) {
+  // The suppression scope is the whole declaring item (fn/struct/impl…, including its body).
+  let scope = node.parent().map_or_else(|| node.range(), |p| p.range());
+  for param in node.children().filter(|c| c.is_named()) {
+    let binder = if BINDER_LEAF_KINDS.contains(&param.kind().as_ref()) {
+      Some(param)
+    } else {
+      // `constrained_type_parameter` (Rust `T: Clone`) binds its `left`; named forms
+      // (`type_parameter name: …`) bind their `name`.
+      param
+        .field("name")
+        .or_else(|| param.field("left"))
+        .filter(|n| BINDER_LEAF_KINDS.contains(&n.kind().as_ref()))
+    };
+    if let Some(binder) = binder {
+      binders.push((scope.clone(), trim_cow(binder.text(), str::trim)));
     }
   }
 }
@@ -573,15 +1061,15 @@ pub(crate) fn extract_references(
 /// Leaf kinds an implements construct's targets reduce to.
 const IMPL_TARGET_KINDS: &[&str] = &["type_identifier", "identifier", "constant", "alias"];
 
-/// A type-identifier leaf marks a type USE unless it is a definition's own name or sits inside
-/// an implements construct (which emits `implements`, not `of_type`).
-fn emit_type_use(
-  node: &SgNode<'_>,
+/// A type-identifier leaf marks a type USE unless it is a definition's own name, sits inside
+/// an implements construct (which emits `implements`, not `of_type`), or is a language
+/// placeholder (`Self`, `_`). Survivors are *staged*: binder shadowing and per-definition
+/// dedup run in the post-pass, once the walk has seen every `type_parameters` declaration.
+fn stage_type_use<'t>(
+  node: &SgNode<'t>,
   spec: &RefSpec,
-  def_spans: &[(Range<usize>, NodeId)],
-  path: &str,
-  seen: &mut HashSet<(u64, String, u8)>,
-  out: &mut Vec<Reference>,
+  span_cursor: &mut SpanCursor<'_>,
+  pending: &mut Vec<Pending<'t>>,
 ) {
   let Some(parent) = node.parent() else {
     return;
@@ -601,37 +1089,40 @@ fn emit_type_use(
     ancestor = a.parent();
   }
   let range = node.range();
-  let (Some(name), Some(from)) = (callee_name(node), enclosing(def_spans, range.start)) else {
+  let (Some(name), Some(from)) = (callee_name(node), span_cursor.enclosing(range.start)) else {
     return;
   };
-  if seen.insert((from.raw(), name.clone(), 0)) {
-    out.push(
-      Reference::new(from, path, name, RefKind::Type)
-        .with_evidence(range.start as u32, range.end as u32),
-    );
+  if spec.type_placeholders.contains(&name.as_ref()) {
+    return;
   }
+  pending.push(Pending::TypeUse {
+    from,
+    name,
+    start: range.start as u32,
+    end: range.end as u32,
+  });
 }
 
 /// Emit an `implements` reference per implemented type: the construct's target selector (or the
 /// node itself) is reduced to a name directly when possible, else to its type leaves.
-fn emit_implements(
-  node: &SgNode<'_>,
+fn emit_implements<'t>(
+  node: &SgNode<'t>,
   ispec: &ImplSpec,
-  def_spans: &[(Range<usize>, NodeId)],
-  path: &str,
-  seen: &mut HashSet<(u64, String, u8)>,
-  out: &mut Vec<Reference>,
+  spec: &RefSpec,
+  span_cursor: &mut SpanCursor<'_>,
+  seen: &mut HashSet<(u64, Cow<'t, str>)>,
+  pending: &mut Vec<Pending<'t>>,
 ) {
   let range = node.range();
-  let Some(from) = enclosing(def_spans, range.start) else {
+  let Some(from) = span_cursor.enclosing(range.start) else {
     return;
   };
-  let targets: Vec<SgNode<'_>> = match &ispec.target {
+  let targets: Vec<SgNode<'t>> = match &ispec.target {
     Some(sel) => select_all(node, sel),
     None => vec![node.clone()],
   };
   for target in targets {
-    let names: Vec<String> = if let Some(name) = callee_name(&target) {
+    let names: Vec<Cow<'t, str>> = if let Some(name) = callee_name(&target) {
       vec![name]
     } else {
       first_descendants_of_kinds(&target, IMPL_TARGET_KINDS)
@@ -640,11 +1131,17 @@ fn emit_implements(
         .collect()
     };
     for name in names {
-      if seen.insert((from.raw(), name.clone(), 1)) {
-        out.push(
-          Reference::new(from, path, name, RefKind::Implements)
-            .with_evidence(range.start as u32, range.end as u32),
-        );
+      if spec.type_placeholders.contains(&name.as_ref()) {
+        continue;
+      }
+      if seen.insert((from.raw(), name.clone())) {
+        pending.push(Pending::Ready(RawRef::plain(
+          from,
+          name,
+          RefKind::Implements,
+          range.start as u32,
+          range.end as u32,
+        )));
       }
     }
   }
@@ -711,12 +1208,11 @@ fn first_descendants_of_kinds<'t>(node: &SgNode<'t>, kinds: &[&str]) -> Vec<SgNo
   found
 }
 
-fn emit_imports(
-  node: &SgNode<'_>,
+fn emit_imports<'t>(
+  node: &SgNode<'t>,
   ispec: &ImportSpec,
   def_spans: &[(Range<usize>, NodeId)],
-  path: &str,
-  out: &mut Vec<Reference>,
+  pending: &mut Vec<Pending<'t>>,
 ) {
   let range = node.range();
   let Some(from) = outermost(def_spans, range.start) else {
@@ -729,10 +1225,13 @@ fn emit_imports(
       callee_name(&target)
     };
     if let Some(name) = name {
-      out.push(
-        Reference::new(from, path, name, RefKind::Import)
-          .with_evidence(range.start as u32, range.end as u32),
-      );
+      pending.push(Pending::Ready(RawRef::plain(
+        from,
+        name,
+        RefKind::Import,
+        range.start as u32,
+        range.end as u32,
+      )));
     }
   }
 }
@@ -759,18 +1258,27 @@ fn first_argument<'t>(node: &SgNode<'t>) -> Option<SgNode<'t>> {
 
 /// The imported name carried by a call argument: an identifier/module (navigator) or a
 /// string/path literal (delimiter-stripped, verbatim).
-fn import_arg_name(arg: &SgNode<'_>) -> Option<String> {
+fn import_arg_name<'t>(arg: &SgNode<'t>) -> Option<Cow<'t, str>> {
   callee_name(arg).or_else(|| literal_import_name(arg))
 }
 
 /// Strip string delimiters only; keep the module string verbatim (`./util`, `fmt`,
 /// `package:foo/bar.dart`). Path-like names are honestly unresolvable against symbol tables.
-fn literal_import_name(node: &SgNode<'_>) -> Option<String> {
-  let text = node.text();
-  let trimmed = text
-    .trim()
-    .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '<' | '>'));
-  (!trimmed.is_empty() && !trimmed.contains(char::is_whitespace)).then(|| trimmed.to_string())
+fn literal_import_name<'t>(node: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  let trimmed = trim_cow(node.text(), |s| {
+    s.trim()
+      .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '<' | '>'))
+  });
+  (!trimmed.is_empty() && !trimmed.contains(char::is_whitespace)).then_some(trimmed)
+}
+
+/// Apply a borrowing trim to a `Cow`: a borrowed cow narrows to a sub-slice borrow (no
+/// allocation); an owned cow re-owns only the trimmed text.
+fn trim_cow<'t>(cow: Cow<'t, str>, trim: impl Fn(&str) -> &str) -> Cow<'t, str> {
+  match cow {
+    Cow::Borrowed(s) => Cow::Borrowed(trim(s)),
+    Cow::Owned(s) => Cow::Owned(trim(&s).to_string()),
+  }
 }
 
 /// Fields tried, in order, to navigate a callee/import expression toward its identifier.
@@ -830,18 +1338,18 @@ const DESCEND_KINDS: &[&str] = &[
 
 /// The rightmost identifier of a callee/import expression — one universal navigator; unmatched
 /// kinds return `None` (no guessing).
-fn callee_name(node: &SgNode<'_>) -> Option<String> {
+fn callee_name<'t>(node: &SgNode<'t>) -> Option<Cow<'t, str>> {
   let kind_cow = node.kind();
   let kind = kind_cow.as_ref();
   // Elixir module references keep their dotted form (`Foo.Bar`), unlike path-style rightmost.
   if kind == "alias" {
-    return Some(node.text().into_owned());
+    return Some(node.text());
   }
   if LEAF_KINDS.contains(&kind) {
     if let Some(last) = node.children().filter(|c| c.is_named()).last() {
       return callee_name(&last);
     }
-    return Some(node.text().into_owned());
+    return Some(node.text());
   }
   for field in NAV_FIELDS {
     if let Some(child) = node.field(field) {
@@ -857,6 +1365,7 @@ fn callee_name(node: &SgNode<'_>) -> Option<String> {
 }
 
 /// The innermost (smallest) definition span containing `offset` — for call attribution.
+#[cfg(test)] // production lookups go through `SpanCursor`; this is the specification oracle's
 fn enclosing(def_spans: &[(Range<usize>, NodeId)], offset: usize) -> Option<NodeId> {
   def_spans
     .iter()
@@ -865,8 +1374,16 @@ fn enclosing(def_spans: &[(Range<usize>, NodeId)], offset: usize) -> Option<Node
     .map(|(_, id)| *id)
 }
 
-/// The outermost (largest) definition span containing `offset` — the file, for import attribution.
+/// The outermost (largest) definition span containing `offset` — the file, for import
+/// attribution. The production layout always leads with the whole-file span (`0..usize::MAX`),
+/// which trivially wins the max — answered in O(1) when that shape holds, with the general
+/// scan kept for arbitrary span sets.
 fn outermost(def_spans: &[(Range<usize>, NodeId)], offset: usize) -> Option<NodeId> {
+  if let Some((range, id)) = def_spans.first() {
+    if range.start == 0 && range.end == usize::MAX {
+      return Some(*id);
+    }
+  }
   def_spans
     .iter()
     .filter(|(range, _)| range.contains(&offset))
@@ -879,13 +1396,33 @@ mod tests {
   use super::*;
   use vorpal_language::LanguageExt;
 
-  fn refs_for(lang: SupportLang, src: &str) -> Vec<(String, RefKind)> {
-    let spec = ref_spec(lang).expect("language has a ref spec");
+  /// Owned mirror of [`RawRef`] for helpers that outlive their parse tree.
+  struct OwnedRef {
+    name: String,
+    kind: RefKind,
+  }
+
+  fn full_refs_for(lang: SupportLang, src: &str) -> Vec<OwnedRef> {
+    let spec = resolved_ref_spec(lang).expect("language has a ref spec");
     let grep = lang.grep(src);
     let spans = vec![(0..usize::MAX, NodeId::new(0))];
+    let entities = vec![String::new()];
     let mut out = Vec::new();
-    extract_references(grep.root(), spec, &spans, "test", &mut out);
-    let mut refs: Vec<(String, RefKind)> = out.into_iter().map(|r| (r.name, r.kind)).collect();
+    extract_references(grep.root(), spec, &spans, &entities, &mut out);
+    out
+      .into_iter()
+      .map(|r| OwnedRef {
+        name: r.name.into_owned(),
+        kind: r.kind,
+      })
+      .collect()
+  }
+
+  fn refs_for(lang: SupportLang, src: &str) -> Vec<(String, RefKind)> {
+    let mut refs: Vec<(String, RefKind)> = full_refs_for(lang, src)
+      .into_iter()
+      .map(|r| (r.name, r.kind))
+      .collect();
     refs.sort_by(|a, b| a.0.cmp(&b.0));
     refs
   }
@@ -985,6 +1522,570 @@ mod tests {
       refs.contains(&("helper".to_string(), RefKind::Call)),
       "{refs:?}"
     );
+  }
+
+  #[test]
+  fn rust_static_and_self_calls_carry_qualifier_evidence() {
+    let src = "impl Kg {\n  fn a(&self) {\n    self.helper();\n    Self::assoc();\n    Manifest::scan();\n    Vec::new();\n    plain();\n    value.method();\n  }\n}\n";
+    let spec = resolved_ref_spec(SupportLang::Rust).unwrap();
+    let grep = SupportLang::Rust.grep(src);
+    // Mimic extract_product's local layout: file + the `Kg` impl item spanning the source.
+    let spans = vec![
+      (0..usize::MAX, NodeId::new(0)),
+      (0..src.len(), NodeId::new(1)),
+    ];
+    let entities = vec![String::new(), "Kg".to_string()];
+    let mut out = Vec::new();
+    extract_references(grep.root(), spec, &spans, &entities, &mut out);
+
+    let find = |name: &str| out.iter().find(|r| r.name == name).expect(name);
+    let helper = find("helper");
+    assert_eq!(helper.form, RefForm::Method, "{helper:?}");
+    assert_eq!(helper.qualifier.as_deref(), Some("Kg"), "self → owner");
+    let assoc = find("assoc");
+    assert_eq!(assoc.form, RefForm::Static, "{assoc:?}");
+    assert_eq!(assoc.qualifier.as_deref(), Some("Kg"), "Self → owner");
+    let scan = find("scan");
+    assert_eq!(scan.form, RefForm::Static, "{scan:?}");
+    assert_eq!(scan.qualifier.as_deref(), Some("Manifest"));
+    let new = find("new");
+    assert_eq!(new.form, RefForm::Static, "{new:?}");
+    assert_eq!(new.qualifier.as_deref(), Some("Vec"));
+    let plain = find("plain");
+    assert_eq!(plain.form, RefForm::Bare, "{plain:?}");
+    assert_eq!(plain.qualifier, None);
+    let method = find("method");
+    assert_eq!(method.form, RefForm::Method, "{method:?}");
+    assert_eq!(
+      method.qualifier, None,
+      "a value receiver is not namespace evidence"
+    );
+  }
+
+  #[test]
+  fn generic_type_parameters_are_binders_not_type_uses() {
+    let refs = refs_for(
+      SupportLang::Rust,
+      "fn convert<T: Clone, U>(x: T, y: U) -> Style {\n  render(x)\n}\n",
+    );
+    assert!(
+      refs.iter().all(|(name, _)| name != "T" && name != "U"),
+      "bound type params must not be uses: {refs:?}"
+    );
+    assert!(
+      refs.contains(&("Clone".to_string(), RefKind::Type)),
+      "trait bounds are real type uses: {refs:?}"
+    );
+    assert!(
+      refs.contains(&("Style".to_string(), RefKind::Type)),
+      "{refs:?}"
+    );
+
+    let refs = refs_for(
+      SupportLang::TypeScript,
+      "function pick<T>(x: T, s: Widget): T { return x; }\n",
+    );
+    assert!(
+      refs.iter().all(|(name, _)| name != "T"),
+      "TS type params are binders: {refs:?}"
+    );
+    assert!(
+      refs.contains(&("Widget".to_string(), RefKind::Type)),
+      "{refs:?}"
+    );
+  }
+
+  #[test]
+  fn placeholder_probe_java_var_swift_self_go_blank() {
+    // Grammar probes: if a grammar surfaces these placeholders as type leaves, they must be
+    // suppressed like Rust's `Self`/`_` — a failure here means the placeholder table needs the
+    // entry, not that the assertion is wrong.
+    let refs = refs_for(
+      SupportLang::Java,
+      "class A { void m() { var x = compute(); } }\n",
+    );
+    assert!(
+      refs.iter().all(|(name, _)| name != "var"),
+      "Java `var` is inference, not a type use: {refs:?}"
+    );
+
+    let refs = refs_for(
+      SupportLang::Swift,
+      "class A { func make() -> Self { return helper() } }\n",
+    );
+    assert!(
+      refs.iter().all(|(name, _)| name != "Self"),
+      "Swift `Self` is the enclosing type, not a use: {refs:?}"
+    );
+
+    let refs = refs_for(SupportLang::Go, "func f() {\n  var _ = g()\n}\n");
+    assert!(
+      refs.iter().all(|(name, _)| name != "_"),
+      "Go blank identifier is not a type use: {refs:?}"
+    );
+  }
+
+  #[test]
+  fn go_type_parameters_are_binders() {
+    let refs = refs_for(
+      SupportLang::Go,
+      "func Map[T any](x T, w Widget) T {\n  return x\n}\n",
+    );
+    assert!(
+      refs.iter().all(|(name, _)| name != "T"),
+      "Go type params are binders: {refs:?}"
+    );
+    assert!(
+      refs.contains(&("Widget".to_string(), RefKind::Type)),
+      "{refs:?}"
+    );
+  }
+
+  #[test]
+  fn rust_type_placeholders_are_never_uses() {
+    let refs = refs_for(
+      SupportLang::Rust,
+      "impl Widget {\n  fn build() -> Self {\n    let x: Vec<_> = source();\n    Self { x }\n  }\n}\n",
+    );
+    assert!(
+      refs.iter().all(|(name, _)| name != "Self" && name != "_"),
+      "Self/_ are placeholders, not definitions: {refs:?}"
+    );
+  }
+
+  /// Explicit-stack pre-order in *document order* (reversed child pushes) — the same visit
+  /// order the fused walk's single-cursor `dfs()` produces, so outputs compare order-exactly.
+  fn push_children<'t>(stack: &mut Vec<SgNode<'t>>, node: &SgNode<'t>) {
+    let children: Vec<_> = node.children().collect();
+    for child in children.into_iter().rev() {
+      stack.push(child);
+    }
+  }
+
+  /// The pre-fusion two-walk, string-dispatch algorithm, kept verbatim as the behavioral
+  /// specification: the fused kind-id walk must reproduce its output reference-for-reference,
+  /// in order, for any input.
+  fn reference_impl<'t>(
+    root: SgNode<'t>,
+    resolved: &ResolvedRefSpec,
+    def_spans: &[(Range<usize>, NodeId)],
+    entities: &[String],
+    out: &mut Vec<RawRef<'t>>,
+  ) {
+    let spec = resolved.spec;
+    let mut binders: Vec<(Range<usize>, Cow<'t, str>)> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+      push_children(&mut stack, &node);
+      if spec.type_params.contains(&node.kind().as_ref()) {
+        collect_binders_in(&node, &mut binders);
+      }
+    }
+
+    let mut suppressed: HashSet<usize> = HashSet::new();
+    let mut seen: HashSet<(u64, Cow<'t, str>, u8)> = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+      push_children(&mut stack, &node);
+      let kind_cow = node.kind();
+      let kind = kind_cow.as_ref();
+
+      let mut is_import_node = false;
+      for ispec in spec.imports.iter().filter(|i| i.kind == kind) {
+        is_import_node = true;
+        let range = node.range();
+        if let Some(from) = outermost(def_spans, range.start) {
+          for target in select_all(&node, &ispec.target) {
+            let name = if ispec.string_target {
+              literal_import_name(&target)
+            } else {
+              callee_name(&target)
+            };
+            if let Some(name) = name {
+              out.push(RawRef::plain(
+                from,
+                name,
+                RefKind::Import,
+                range.start as u32,
+                range.end as u32,
+              ));
+            }
+          }
+        }
+      }
+      if is_import_node {
+        continue;
+      }
+
+      if spec.types.contains(&kind) {
+        let Some(parent) = node.parent() else {
+          continue;
+        };
+        if parent
+          .field("name")
+          .is_some_and(|name| name.node_id() == node.node_id())
+        {
+          continue;
+        }
+        let mut skip = false;
+        let mut ancestor = Some(parent);
+        for _ in 0..2 {
+          let Some(a) = ancestor else { break };
+          if spec.implements.iter().any(|s| s.kind == a.kind().as_ref()) {
+            skip = true;
+            break;
+          }
+          ancestor = a.parent();
+        }
+        if skip {
+          continue;
+        }
+        let range = node.range();
+        let (Some(name), Some(from)) = (callee_name(&node), enclosing(def_spans, range.start))
+        else {
+          continue;
+        };
+        if spec.type_placeholders.contains(&name.as_ref()) {
+          continue;
+        }
+        if binders
+          .iter()
+          .any(|(scope, binder)| *binder == name && scope.contains(&range.start))
+        {
+          continue;
+        }
+        if seen.insert((from.raw(), name.clone(), 0)) {
+          out.push(RawRef::plain(
+            from,
+            name,
+            RefKind::Type,
+            range.start as u32,
+            range.end as u32,
+          ));
+        }
+        continue;
+      }
+
+      if let Some(ispec) = spec.implements.iter().find(|s| s.kind == kind) {
+        let range = node.range();
+        let Some(from) = enclosing(def_spans, range.start) else {
+          continue;
+        };
+        let targets: Vec<SgNode<'t>> = match &ispec.target {
+          Some(sel) => select_all(&node, sel),
+          None => vec![node.clone()],
+        };
+        for target in targets {
+          let names: Vec<Cow<'t, str>> = if let Some(name) = callee_name(&target) {
+            vec![name]
+          } else {
+            first_descendants_of_kinds(&target, IMPL_TARGET_KINDS)
+              .iter()
+              .filter_map(callee_name)
+              .collect()
+          };
+          for name in names {
+            if spec.type_placeholders.contains(&name.as_ref()) {
+              continue;
+            }
+            if seen.insert((from.raw(), name.clone(), 1)) {
+              out.push(RawRef::plain(
+                from,
+                name,
+                RefKind::Implements,
+                range.start as u32,
+                range.end as u32,
+              ));
+            }
+          }
+        }
+        continue;
+      }
+
+      let Some(cspec) = spec.calls.iter().find(|c| c.kind == kind) else {
+        continue;
+      };
+      if suppressed.remove(&node.node_id()) || is_chain_link(&node, spec) {
+        continue;
+      }
+      let Some(mut callee) = select(&node, &cspec.callee) else {
+        continue;
+      };
+      while let Some(inner) = spec
+        .calls
+        .iter()
+        .find(|c| c.kind == callee.kind().as_ref())
+        .and_then(|c| select(&callee, &c.callee))
+      {
+        callee = inner;
+      }
+      let Some(name) = callee_name(&callee) else {
+        continue;
+      };
+      let range = node.range();
+      match spec
+        .text_rules
+        .iter()
+        .find(|(text, _)| name.as_ref() == *text)
+      {
+        Some((_, TextAction::SkipDefinition)) => {
+          if let Some(args) = node.children().find(|c| c.kind().as_ref() == "arguments") {
+            if let Some(head) = args.children().find(|c| c.is_named()) {
+              if spec.calls.iter().any(|c| c.kind == head.kind().as_ref()) {
+                suppressed.insert(head.node_id());
+              }
+            }
+          }
+        }
+        Some((_, TextAction::ImportFirstArg)) => {
+          if let (Some(arg), Some(from)) =
+            (first_argument(&node), outermost(def_spans, range.start))
+          {
+            if let Some(import) = import_arg_name(&arg) {
+              out.push(RawRef::plain(
+                from,
+                import,
+                RefKind::Import,
+                range.start as u32,
+                range.end as u32,
+              ));
+            }
+          }
+        }
+        None => {
+          if let Some(from) = enclosing(def_spans, range.start) {
+            let (form, qualifier) = classify_call(&node, cspec, &callee, spec, entities, from);
+            out.push(RawRef {
+              from,
+              name,
+              kind: RefKind::Call,
+              start: range.start as u32,
+              end: range.end as u32,
+              qualifier,
+              form,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  fn assert_fused_matches_reference(
+    lang: SupportLang,
+    src: &str,
+    def_spans: &[(Range<usize>, NodeId)],
+    entities: &[String],
+    context: &str,
+  ) {
+    let Some(resolved) = resolved_ref_spec(lang) else {
+      return;
+    };
+    let grep = lang.grep(src);
+    let mut fused = Vec::new();
+    extract_references(grep.root(), resolved, def_spans, entities, &mut fused);
+    let mut reference = Vec::new();
+    reference_impl(grep.root(), resolved, def_spans, entities, &mut reference);
+    assert_eq!(fused, reference, "fused walk diverged on {context}");
+  }
+
+  #[test]
+  fn fused_walk_matches_reference_implementation_on_battery() {
+    use SupportLang as L;
+    let battery: &[(SupportLang, &str)] = &[
+      (
+        L::Rust,
+        "impl<T: Clone> Kg<T> {\n  fn a(&self) -> Self {\n    self.helper();\n    Self::assoc();\n    Manifest::scan();\n    Vec::new();\n    plain();\n    value.method();\n    let x: Style = util::mk();\n    x\n  }\n}\nimpl Widget for Kg<u8> {}\nuse std::collections::HashMap;\n",
+      ),
+      (
+        L::TypeScript,
+        "import { x } from \"./util\";\nconst y = require(\"lodash\");\nfunction pick<T>(v: T, s: Widget): T { return v; }\nclass A extends Base implements Iface { m() { this.n(); other.p(); } }\n",
+      ),
+      (
+        L::Elixir,
+        "defmodule Foo do\n  import Enum\n  alias Foo.Bar\n  def run(x) do\n    baz(x)\n  end\nend\n",
+      ),
+      (L::Haskell, "main = combine alpha beta\n"),
+      (
+        L::Go,
+        "import \"fmt\"\nfunc Map[T any](x T, w Widget) T {\n  fmt.Println(x)\n  helper()\n  return x\n}\n",
+      ),
+      (
+        L::Java,
+        "import util.Helper;\nclass A extends B implements C {\n  void m() { var x = compute(); this.n(); obj.p(); }\n}\n",
+      ),
+      (
+        L::Python,
+        "from util import helper\nimport os\nclass A(Base):\n  def m(self):\n    self.n()\n    helper()\n    obj.p()\n",
+      ),
+      (
+        L::Php,
+        "<?php\nuse App\\Util;\nclass A { function m() { $this->n(); Util::stat(); helper(); $o->p(); } }\n",
+      ),
+      (L::C, "#include <stdio.h>\nvoid f(void) { g(); s.h(); }\n"),
+      (
+        L::Solidity,
+        "import {A} from \"./a.sol\";\ncontract C { function f() public { g(); } }\n",
+      ),
+      (L::Ruby, "require 'json'\nobj.call_me\nhelper\n"),
+      (L::Bash, "source ./lib.sh\nhelper arg\n"),
+      (L::Kotlin, "fun main() {\n  greet(1)\n  obj.method()\n}\n"),
+      (L::Swift, "func main() {\n  greet(1)\n  obj.method()\n}\n"),
+      (L::Lua, "require 'mod'\nhelper()\nobj:method()\n"),
+      (L::Nix, "let f = import ./x.nix; in f { a = helper 1; }\n"),
+      (L::Hcl, "locals {\n  a = upper(\"x\")\n}\n"),
+    ];
+    let spans = vec![(0..usize::MAX, NodeId::new(0))];
+    let entities = vec![String::new()];
+    for (lang, src) in battery {
+      assert_fused_matches_reference(*lang, src, &spans, &entities, &format!("{lang:?} snippet"));
+    }
+  }
+
+  #[test]
+  fn fused_walk_matches_reference_implementation_on_this_workspace() {
+    // Real-world sweep: every handled source file in this workspace, with the production
+    // definition layout (items + members), so owner attribution paths are exercised too.
+    let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .parent()
+      .expect("crates dir");
+    let extractor = crate::OutlineExtractor::new().expect("default rules compile");
+    let mut checked = 0usize;
+    for entry in ignore::Walk::new(crates_root) {
+      let Ok(entry) = entry else { continue };
+      if !entry.file_type().is_some_and(|t| t.is_file()) {
+        continue;
+      }
+      let path = entry.path().to_string_lossy().into_owned();
+      let Some(lang) = SupportLang::from_path(&path) else {
+        continue;
+      };
+      if resolved_ref_spec(lang).is_none() {
+        continue;
+      }
+      let Ok(source) = std::fs::read_to_string(entry.path()) else {
+        continue;
+      };
+      let Some(product) = extractor.extract_product(&path, &source) else {
+        continue;
+      };
+      let (entities, spans) = crate::outline_extractor::local_layout(&product.items);
+      assert_fused_matches_reference(lang, &source, &spans, &entities, &path);
+      checked += 1;
+    }
+    assert!(checked > 100, "swept only {checked} files — sweep broken?");
+  }
+
+  /// Stage-split throughput over this workspace — the standing §12/§7.5 measurement, kept as
+  /// an ignored test so it compiles with the crate and cannot drift from the real pipeline.
+  /// Run: `cargo test --release -p vorpal-ingest --ignored bench_extraction -- --nocapture`
+  #[test]
+  #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+  fn bench_extraction_stages() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .parent()
+      .and_then(std::path::Path::parent)
+      .expect("repo root");
+    let extractor = crate::OutlineExtractor::new().expect("rules compile");
+    let mut files: Vec<(String, SupportLang, String)> = Vec::new();
+    for entry in ignore::Walk::new(repo_root) {
+      let Ok(entry) = entry else { continue };
+      if !entry.file_type().is_some_and(|t| t.is_file()) {
+        continue;
+      }
+      let path = entry.path().to_string_lossy().into_owned();
+      if !extractor.handles(&path) {
+        continue;
+      }
+      let Some(lang) = SupportLang::from_path(&path) else {
+        continue;
+      };
+      if let Ok(source) = std::fs::read_to_string(entry.path()) {
+        files.push((path, lang, source));
+      }
+    }
+    let bytes: usize = files.iter().map(|(_, _, s)| s.len()).sum();
+    eprintln!("{} files, {bytes} bytes", files.len());
+
+    let time = |label: &str, f: &dyn Fn() -> usize| {
+      let mut best = f64::MAX;
+      let mut touched = 0;
+      for _ in 0..3 {
+        let t = std::time::Instant::now();
+        touched = f();
+        best = best.min(t.elapsed().as_secs_f64());
+      }
+      eprintln!(
+        "{label:<22} {:>8.1} ms   {:>6.1} MB/s   (touched {touched})",
+        best * 1e3,
+        bytes as f64 / 1e6 / best
+      );
+    };
+
+    time("parse only", &|| {
+      files
+        .iter()
+        .map(|(_, lang, source)| lang.grep(source).root().range().len())
+        .sum()
+    });
+    time("full extract_product", &|| {
+      files
+        .iter()
+        .filter_map(|(path, _, source)| extractor.extract_product(path, source))
+        .map(|p| p.items.len() + p.refs.len())
+        .sum()
+    });
+
+    let dir = std::env::temp_dir().join("vorpal-bench-products");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let products: Vec<(String, crate::FileProduct)> = files
+      .iter()
+      .filter_map(|(path, _, source)| {
+        Some((path.clone(), extractor.extract_product(path, source)?))
+      })
+      .collect();
+    time("save products", &|| {
+      for (path, product) in &products {
+        crate::save_product(&dir.join(crate::cache_file_name(path)), product).unwrap();
+      }
+      products.len()
+    });
+    time("replay products", &|| {
+      products
+        .iter()
+        .map(|(path, _)| {
+          let p = crate::load_product(&dir.join(crate::cache_file_name(path))).unwrap();
+          p.items.len() + p.refs.len()
+        })
+        .sum()
+    });
+    let total: u64 = std::fs::read_dir(&dir)
+      .unwrap()
+      .flatten()
+      .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+      .sum();
+    eprintln!("products cache        {:>8.1} KB", total as f64 / 1e3);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    time("apply (serial)", &|| {
+      let mut writer = vorpal_kg::KgWriter::new();
+      let mut references = Vec::new();
+      for (path, product) in &products {
+        crate::pipeline::apply_product(path, product.clone(), &mut writer, &mut references);
+      }
+      writer.node_count() + references.len()
+    });
+    time("apply (sharded)", &|| {
+      let cloned: Vec<_> = products.clone();
+      let (writer, references) = crate::apply_products_sharded(cloned);
+      writer.node_count() + references.len()
+    });
+    time("apply+link (sharded)", &|| {
+      let cloned: Vec<_> = products.clone();
+      let (writer, references) = crate::apply_products_sharded(cloned);
+      let (kg, stats) = crate::link_writer(writer, &references, &vorpal_resolve::Resolver::new());
+      kg.node_count() + stats.resolved as usize
+    });
   }
 
   #[test]

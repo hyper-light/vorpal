@@ -11,6 +11,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+rayon.workspace = true
 vorpal-kg.workspace = true
 
 [dev-dependencies]

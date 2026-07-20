@@ -4,7 +4,10 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
+
+use ignore::WalkState;
 
 /// One file's identity by cheap `stat` metadata (no content read).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,31 +25,70 @@ pub struct Manifest {
 
 impl Manifest {
   /// Walk `root` (respecting `.gitignore`), `stat` each file the predicate accepts, and record
-  /// its size + mtime. No file contents are read.
-  pub fn scan(root: &Path, handled: impl Fn(&str) -> bool) -> io::Result<Self> {
-    let mut entries = Vec::new();
-    for entry in ignore::Walk::new(root) {
-      let entry = entry.map_err(io::Error::other)?;
-      if !entry.file_type().is_some_and(|t| t.is_file()) {
-        continue;
-      }
-      let path = entry.path();
-      let path_str = path.to_string_lossy();
-      if !handled(&path_str) {
-        continue;
-      }
-      let meta = fs::metadata(path)?;
-      let mtime_ns = meta
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-      entries.push(FileStat {
-        path: path_str.into_owned(),
-        size: meta.len(),
-        mtime_ns,
+  /// its size + mtime. No file contents are read. The walk + stats run on the parallel walker
+  /// (§7.5 — the stat sweep is the entire cost of a no-change re-index); the final sort keeps
+  /// the manifest deterministic regardless of arrival order. Error semantics match the serial
+  /// walk: the first walk/stat error aborts the scan.
+  pub fn scan(root: &Path, handled: impl Fn(&str) -> bool + Sync) -> io::Result<Self> {
+    let entries = Mutex::new(Vec::new());
+    let first_error: Mutex<Option<io::Error>> = Mutex::new(None);
+    ignore::WalkBuilder::new(root)
+      .threads(
+        std::thread::available_parallelism()
+          .map(|n| n.get())
+          .unwrap_or(1)
+          .min(16),
+      )
+      .build_parallel()
+      .run(|| {
+        Box::new(|result| {
+          let entry = match result {
+            Ok(entry) => entry,
+            Err(err) => {
+              first_error
+                .lock()
+                .unwrap()
+                .get_or_insert(io::Error::other(err));
+              return WalkState::Quit;
+            }
+          };
+          if !entry.file_type().is_some_and(|t| t.is_file()) {
+            return WalkState::Continue;
+          }
+          let path_str = entry.path().to_string_lossy();
+          if !handled(&path_str) {
+            return WalkState::Continue;
+          }
+          let meta = match entry.path().metadata() {
+            Ok(meta) => meta,
+            Err(err) => {
+              first_error.lock().unwrap().get_or_insert(err);
+              return WalkState::Quit;
+            }
+          };
+          let modified = match meta.modified() {
+            Ok(modified) => modified,
+            Err(err) => {
+              first_error.lock().unwrap().get_or_insert(err);
+              return WalkState::Quit;
+            }
+          };
+          let mtime_ns = modified
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+          entries.lock().unwrap().push(FileStat {
+            path: path_str.into_owned(),
+            size: meta.len(),
+            mtime_ns,
+          });
+          WalkState::Continue
+        })
       });
+    if let Some(err) = first_error.into_inner().unwrap() {
+      return Err(err);
     }
+    let mut entries = entries.into_inner().unwrap();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Self { entries })
   }

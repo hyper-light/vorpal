@@ -21,9 +21,41 @@ pub struct NodeView<'a> {
   pub exported: bool,
 }
 
+/// Directory positions of the node segment's columns, resolved once at construction so point
+/// access (`kg.node` in every hot loop) is allocation-free: no name hashing, no per-field
+/// directory scan (measured: 6 heap allocations per `node()` call before this cache).
+struct NodeColumns {
+  kind: usize,
+  name_off: usize,
+  name_len: usize,
+  path_off: usize,
+  path_len: usize,
+  sig_off: usize,
+  sig_len: usize,
+  content_hash: usize,
+  flags: usize,
+}
+
+impl NodeColumns {
+  fn resolve(segment: &Segment) -> Option<Self> {
+    Some(Self {
+      kind: segment.column_index("kind")?,
+      name_off: segment.column_index("name_off")?,
+      name_len: segment.column_index("name_len")?,
+      path_off: segment.column_index("path_off")?,
+      path_len: segment.column_index("path_len")?,
+      sig_off: segment.column_index("sig_off")?,
+      sig_len: segment.column_index("sig_len")?,
+      content_hash: segment.column_index("content_hash")?,
+      flags: segment.column_index("flags")?,
+    })
+  }
+}
+
 /// A queryable knowledge graph: a node segment (SoA columns) + string heap + compacted graph.
 pub struct Kg {
   nodes: Segment,
+  cols: NodeColumns,
   heap: Vec<u8>,
   graph: Graph,
   directory: SegmentDirectory,
@@ -35,13 +67,17 @@ impl Kg {
     heap: Vec<u8>,
     graph: Graph,
     directory: SegmentDirectory,
-  ) -> Self {
-    Self {
+  ) -> Result<Self, SegmentError> {
+    let cols = NodeColumns::resolve(&nodes).ok_or(SegmentError::Corrupt(
+      "node segment missing a required column",
+    ))?;
+    Ok(Self {
       nodes,
+      cols,
       heap,
       graph,
       directory,
-    }
+    })
   }
 
   pub fn node_count(&self) -> usize {
@@ -55,22 +91,22 @@ impl Kg {
   /// Resolve a node's attributes (§3.3). Reads HOT columns (`base + row·stride`) + the heap.
   pub fn node(&self, id: NodeId) -> Option<NodeView<'_>> {
     let (_segment, row) = self.directory.locate(id)?;
-    let kind = SymbolKind::from_tag(self.nodes.column("kind")?.get_u8(row)?);
-    let content_hash = self.nodes.column("content_hash")?.get_u64(row)?;
-    let exported = self.nodes.column("flags")?.get_u8(row)? & 1 != 0;
+    let kind = SymbolKind::from_tag(self.nodes.column_at(self.cols.kind)?.get_u8(row)?);
+    let content_hash = self.nodes.column_at(self.cols.content_hash)?.get_u64(row)?;
+    let exported = self.nodes.column_at(self.cols.flags)?.get_u8(row)? & 1 != 0;
     Some(NodeView {
       kind,
-      name: self.heap_str("name", row)?,
-      path: self.heap_str("path", row)?,
-      signature: self.heap_str("sig", row)?,
+      name: self.heap_str(self.cols.name_off, self.cols.name_len, row)?,
+      path: self.heap_str(self.cols.path_off, self.cols.path_len, row)?,
+      signature: self.heap_str(self.cols.sig_off, self.cols.sig_len, row)?,
       content_hash,
       exported,
     })
   }
 
-  fn heap_str(&self, field: &str, row: u64) -> Option<&str> {
-    let off = self.nodes.column(&format!("{field}_off"))?.get_u32(row)? as usize;
-    let len = self.nodes.column(&format!("{field}_len"))?.get_u32(row)? as usize;
+  fn heap_str(&self, off_col: usize, len_col: usize, row: u64) -> Option<&str> {
+    let off = self.nodes.column_at(off_col)?.get_u32(row)? as usize;
+    let len = self.nodes.column_at(len_col)?.get_u32(row)? as usize;
     std::str::from_utf8(self.heap.get(off..off + len)?).ok()
   }
 
@@ -216,7 +252,17 @@ impl Kg {
     let graph = rebuild_graph(row_count as u32, &edge_bytes);
     let mut directory = SegmentDirectory::new();
     directory.insert(0, row_count, 0);
-    Ok(Self::new(nodes, heap, graph, directory))
+    Self::new(nodes, heap, graph, directory)
+  }
+
+  /// The node count of a persisted index, from the segment header alone — no string heap read,
+  /// no edge-list read, no CSR rebuild. This is all the whole-tree-unchanged fast path needs,
+  /// so a no-change re-index does not pay a graph load to report a number.
+  pub fn peek_node_count(dir: &Path) -> Result<usize, SegmentError> {
+    let nodes_path = dir.join("nodes.vseg");
+    let size = fs::metadata(&nodes_path)?.len();
+    let policy = ResourcePolicy::probe(CorpusProbe::new(size, 1));
+    Ok(Segment::open_file(&nodes_path, &policy)?.row_count() as usize)
   }
 }
 

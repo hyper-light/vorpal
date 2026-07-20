@@ -52,7 +52,7 @@ fn resolves_and_links_cross_file_calls_into_the_graph() {
 
   let (kg, stats) = ing.link_and_seal(&Resolver::new());
   assert_eq!(stats.resolved, 1);
-  assert_eq!(stats.unresolved, 0);
+  assert_eq!(stats.unresolved(), 0);
 
   let caller = find(&kg, "caller");
   let target = find(&kg, "target");
@@ -74,7 +74,7 @@ fn unresolved_reference_produces_no_edge() {
   ing.ingest_source("a.rs", "caller->missing"); // `missing` is defined nowhere
   let (kg, stats) = ing.link_and_seal(&Resolver::new());
 
-  assert_eq!(stats.unresolved, 1);
+  assert_eq!(stats.unresolved(), 1);
   assert_eq!(stats.resolved, 0);
   let caller = find(&kg, "caller");
   assert!(

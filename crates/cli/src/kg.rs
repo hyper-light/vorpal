@@ -100,8 +100,14 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
     println!("unchanged — reused existing index ({} nodes)", report.nodes);
   } else {
     println!(
-      "parsed {} files ({} replayed from cache) → {} nodes, {} calls resolved, {} unresolved",
-      report.indexed, report.skipped, report.nodes, report.resolved, report.unresolved
+      "parsed {} files ({} replayed from cache) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",
+      report.indexed,
+      report.skipped,
+      report.nodes,
+      report.resolved,
+      report.ambiguous,
+      report.external,
+      report.masked
     );
   }
   println!("index: {}", out.display());
