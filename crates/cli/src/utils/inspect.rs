@@ -95,6 +95,18 @@ impl FileTrace {
   pub fn add_skipped(&self) {
     self.files_skipped.fetch_add(1, Ordering::AcqRel);
   }
+  pub fn scanned(&self) -> usize {
+    self.files_scanned.load(Ordering::Acquire)
+  }
+  pub fn skipped(&self) -> usize {
+    self.files_skipped.load(Ordering::Acquire)
+  }
+  /// Fold a remote node's terminal stats into this trace so `--inspect` reports the same counts
+  /// a local run would (docs/REMOTE.md §3.4).
+  pub fn add_remote(&self, scanned: usize, skipped: usize) {
+    self.files_scanned.fetch_add(scanned, Ordering::AcqRel);
+    self.files_skipped.fetch_add(skipped, Ordering::AcqRel);
+  }
 }
 
 pub struct TraceInfo<T, W: Write> {

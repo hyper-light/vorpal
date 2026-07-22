@@ -47,7 +47,7 @@ pub trait PathWorker: Worker {
     false
   }
 
-  fn run_path<P: Printer>(self, printer: P) -> Result<ExitCode>
+  fn run_path<P: Printer + 'static>(self, printer: P) -> Result<ExitCode>
   where
     Self: Sized + 'static,
   {
@@ -96,7 +96,9 @@ impl<T> Items<T> {
   }
 }
 
-fn filter_result(result: Result<DirEntry, ignore::Error>) -> Option<PathBuf> {
+/// Keep only files from a walk result, stripping one leading `./` for display. Shared with the
+/// remote agent/stream drivers so display paths cannot drift between local and remote (I1).
+pub(crate) fn filter_result(result: Result<DirEntry, ignore::Error>) -> Option<PathBuf> {
   let entry = match result {
     Ok(entry) => entry,
     Err(err) => {
@@ -115,18 +117,70 @@ fn filter_result(result: Result<DirEntry, ignore::Error>) -> Option<PathBuf> {
   }
 }
 
-fn run_worker<W: PathWorker + ?Sized + 'static, P: Printer>(
+/// How the producer→consumer channel is sized. The local walk keeps today's effectively-unbounded
+/// channel (behavior-preserving); remote producers use a real window so the printer's drain rate
+/// paces the network end-to-end and nothing buffers the whole corpus.
+#[derive(Clone, Copy)]
+pub enum ChannelCap {
+  Unbounded,
+  Window(usize),
+}
+
+/// The sending half handed to a [`Produce`] implementation — unbounded and windowed channels have
+/// different sender types in std, unified here so producers are agnostic.
+pub enum ItemSink<T> {
+  Unbounded(mpsc::Sender<T>),
+  Bounded(mpsc::SyncSender<T>),
+}
+
+impl<T> Clone for ItemSink<T> {
+  fn clone(&self) -> Self {
+    match self {
+      ItemSink::Unbounded(tx) => ItemSink::Unbounded(tx.clone()),
+      ItemSink::Bounded(tx) => ItemSink::Bounded(tx.clone()),
+    }
+  }
+}
+
+impl<T> ItemSink<T> {
+  /// Send one item; `Err` means the consumer hung up and the producer should stop.
+  pub fn send(&self, item: T) -> Result<(), mpsc::SendError<T>> {
+    match self {
+      ItemSink::Unbounded(tx) => tx.send(item),
+      ItemSink::Bounded(tx) => tx.send(item),
+    }
+  }
+}
+
+/// A pluggable producer: anything that can feed `P::Processed` items into the sync channel drained
+/// by [`Worker::consume_items`]. The consumer side — `Items`, every printer, and the exit-code
+/// logic — is shared verbatim between local walks and remote fan-out (§3, `docs/REMOTE.md`).
+pub trait Produce<P: Printer>: Send + 'static {
+  /// Channel sizing; local stays unbounded, remote uses a window.
+  fn channel_cap(&self) -> ChannelCap {
+    ChannelCap::Unbounded
+  }
+  fn produce(self: Box<Self>, tx: ItemSink<P::Processed>, processor: P::Processor) -> Result<()>;
+}
+
+/// The current local producer: a parallel filesystem walk driving `produce_item`. This is the
+/// pre-existing `run_worker` spawn body, moved verbatim behind [`Produce`].
+pub struct LocalWalkProducer<W: PathWorker + ?Sized> {
   worker: Arc<W>,
-  printer: P,
-) -> Result<ExitCode> {
-  let (tx, rx) = mpsc::channel();
-  let w = worker.clone();
-  let walker = worker.build_walk()?;
-  let processor = printer.get_processor();
-  // walker run will block the thread
-  std::thread::spawn(move || {
-    let tx = tx;
-    let processor = processor;
+  walker: WalkParallel,
+}
+
+impl<W: PathWorker + ?Sized> LocalWalkProducer<W> {
+  /// Builds the walk up front so discovery errors surface synchronously, exactly as before.
+  pub fn try_new(worker: Arc<W>) -> Result<Self> {
+    let walker = worker.build_walk()?;
+    Ok(Self { worker, walker })
+  }
+}
+
+impl<W: PathWorker + ?Sized + 'static, P: Printer + 'static> Produce<P> for LocalWalkProducer<W> {
+  fn produce(self: Box<Self>, tx: ItemSink<P::Processed>, processor: P::Processor) -> Result<()> {
+    let LocalWalkProducer { worker: w, walker } = *self;
     walker.run(|| {
       let tx = tx.clone();
       let w = w.clone();
@@ -153,8 +207,46 @@ fn run_worker<W: PathWorker + ?Sized + 'static, P: Printer>(
         WalkState::Continue
       })
     });
+    Ok(())
+  }
+}
+
+/// Drives any producer against the existing single-threaded consumer + printer. The producer runs
+/// on its own thread (the walker / remote reactor blocks it); `consume_items` runs on the caller's
+/// thread and owns all printing and exit-code decisions, untouched.
+pub fn run_producer<W, P>(
+  worker: Arc<W>,
+  producer: Box<dyn Produce<P>>,
+  printer: P,
+) -> Result<ExitCode>
+where
+  W: Worker + ?Sized + 'static,
+  P: Printer + 'static,
+{
+  let processor = printer.get_processor();
+  let (sink, rx) = match producer.channel_cap() {
+    ChannelCap::Unbounded => {
+      let (tx, rx) = mpsc::channel();
+      (ItemSink::Unbounded(tx), rx)
+    }
+    ChannelCap::Window(n) => {
+      let (tx, rx) = mpsc::sync_channel(n.max(1));
+      (ItemSink::Bounded(tx), rx)
+    }
+  };
+  // producer run will block its thread (walker or remote reactor)
+  std::thread::spawn(move || {
+    let _ = producer.produce(sink, processor);
   });
   worker.consume_items(Items(rx), printer)
+}
+
+fn run_worker<W: PathWorker + ?Sized + 'static, P: Printer + 'static>(
+  worker: Arc<W>,
+  printer: P,
+) -> Result<ExitCode> {
+  let producer = LocalWalkProducer::try_new(worker.clone())?;
+  run_producer(worker, Box::new(producer), printer)
 }
 
 pub struct MaxItemCounter(AtomicUsize);

@@ -33,7 +33,13 @@ vorpal-language.workspace = true
 vorpal-lsp.workspace = true
 vorpal-mcp.workspace = true
 vorpal-outline.workspace = true
+vorpal-wire = { workspace = true, features = ["tokio"] }
+vorpal-transport = { workspace = true, features = ["ssh"] }
+vorpal-loader = { workspace = true, features = ["keygen"] }
 tree-sitter.workspace = true
+blake3.workspace = true
+rayon.workspace = true
+base64 = "0.22"
 
 ansi_term = "0.12.1"
 anyhow.workspace = true
@@ -54,14 +60,23 @@ serde_yaml.workspace = true
 serde-sarif = "0.8.0"
 similar = { version = "3.0.0", features = ["inline"] }
 smallvec = "1.13.2"
-tokio = { version = "1.37.0", features = ["rt-multi-thread", "io-std"] }
+tokio = { version = "1.37.0", features = ["rt-multi-thread", "io-std", "io-util", "sync", "time", "macros"] }
 clap_complete = "4.5.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tikv-jemallocator = "0.7.0"
+tikv-jemalloc-sys = "0.7.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2.0.14"
 predicates = "3.1.0"
 tempfile = "3.10.1"
+# In-process SSH server for the remote-stream / SSH differential tests (a hermetic "VM").
+russh = { version = "0.54", default-features = false, features = ["ring", "flate2"] }
+rand_core = { version = "0.6.4", features = ["getrandom", "std"] }
+tokio = { version = "1.37", features = ["full"] }
 
 # Support cargo bininstall, https://github.com/hyper-light/vorpal/issues/1742
 [package.metadata.binstall]

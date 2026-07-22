@@ -1,8 +1,8 @@
 //! The reference model (use sites to be resolved).
 
-use std::sync::Arc;
-
 use vorpal_kg::{EdgeType, NodeId};
+
+use crate::intern::{self, NameId};
 
 /// What a reference is, which fixes the edge kind it resolves to (§3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,39 +49,51 @@ pub enum RefForm {
 }
 
 /// One reference occurrence: node `from` (in file `from_path`) mentions `name` at `evidence`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A plain-old-data record: names, paths, and qualifiers are process-interned ids
+/// ([`crate::intern`]), so millions of references cost ~40 bytes each with zero per-reference
+/// heap — at kernel scale this replaced ~700 MB of owned strings — and resolution compares
+/// integers. Constructors still take `&str` and intern internally, so call sites read
+/// unchanged; use [`intern::text_of`] when the text is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reference {
   /// The node the reference occurs in (a function, method, …).
   pub from: NodeId,
-  /// The file the reference occurs in — the intra-file scope key. Shared, not owned: at
-  /// kernel scale a graph carries millions of references, and one `Arc<str>` per *file*
-  /// (8-byte clones per reference) replaces what was a duplicated path `String` per
-  /// reference — roughly a gigabyte of pure duplication on the Linux tree.
-  pub from_path: Arc<str>,
-  /// The referenced name (simple, e.g. `parse`; qualified names carry a `.`).
-  pub name: String,
+  /// The file the reference occurs in — the intra-file scope key (interned path).
+  pub from_path: NameId,
+  /// The referenced name (simple, e.g. `parse`), interned.
+  pub name: NameId,
   pub kind: RefKind,
   /// Byte span of the reference in `from_path`, kept as evidence.
   pub evidence: (u32, u32),
   /// The qualifying namespace/receiver the grammar provides, when any: `Kg::load` → `Kg`;
   /// `self.helper()` / `Self::helper()` → the enclosing item's name. `None` for bare names and
   /// for receivers whose type the syntax does not reveal.
-  pub qualifier: Option<String>,
+  pub qualifier: Option<NameId>,
   /// The syntactic shape (see [`RefForm`]).
   pub form: RefForm,
 }
 
 impl Reference {
-  pub fn new(
-    from: NodeId,
-    from_path: impl Into<Arc<str>>,
-    name: impl Into<String>,
-    kind: RefKind,
-  ) -> Self {
+  pub fn new(from: NodeId, from_path: &str, name: &str, kind: RefKind) -> Self {
     Self {
       from,
-      from_path: from_path.into(),
-      name: name.into(),
+      from_path: intern::intern(from_path),
+      name: intern::intern(name),
+      kind,
+      evidence: (0, 0),
+      qualifier: None,
+      form: RefForm::Bare,
+    }
+  }
+
+  /// [`Reference::new`] with an already-interned path — apply loops intern each file's path
+  /// once instead of re-hashing it per reference.
+  pub fn with_interned_path(from: NodeId, from_path: NameId, name: &str, kind: RefKind) -> Self {
+    Self {
+      from,
+      from_path,
+      name: intern::intern(name),
       kind,
       evidence: (0, 0),
       qualifier: None,
@@ -94,8 +106,14 @@ impl Reference {
     self
   }
 
-  pub fn with_qualifier(mut self, qualifier: Option<String>) -> Self {
-    self.qualifier = qualifier;
+  pub fn with_qualifier(self, qualifier: Option<String>) -> Self {
+    self.with_qualifier_ref(qualifier.as_deref())
+  }
+
+  /// [`Reference::with_qualifier`] over a borrowed qualifier — the view-replay path, which
+  /// interns straight from mapped bytes without an owned intermediate.
+  pub fn with_qualifier_ref(mut self, qualifier: Option<&str>) -> Self {
+    self.qualifier = qualifier.map(intern::intern);
     self
   }
 

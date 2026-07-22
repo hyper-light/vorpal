@@ -134,29 +134,149 @@ impl<E: FileExtractor> Ingestor<E> {
   /// buffered reference, inject the resolved edges, then seal. Returns the graph and resolution
   /// stats. Unresolvable references produce no edge — they are counted, never faked.
   pub fn link_and_seal(self, resolver: &Resolver) -> (Kg, ResolveStats) {
-    link_writer(self.writer, &self.references, resolver)
+    link_writer(self.writer, self.references, resolver)
   }
 }
 
 /// The global linking tail shared by [`Ingestor::link_and_seal`] and the sharded commit path:
 /// symbol table from the writer's definitions, resolve every reference, inject the resolved
-/// edges, seal.
+/// edges, seal. Takes the references by value so the ~hundreds of MB of reference strings —
+/// and the symbol table — are freed **before** seal allocates the segment buffer: at kernel
+/// scale those two corpses pinned ~1 GB through the peak-memory moment for nothing.
+/// Where the (rebased) reference stream goes during a streamed apply: RAM for callers that
+/// want the vector, or the disk spill for bulk builds — at kernel scale the in-RAM vector
+/// was ~220 MB of peak footprint that resolution only ever reads once, sequentially.
+enum RefSink<'a> {
+  Ram(&'a mut Vec<Reference>),
+  Spill(&'a mut vorpal_resolve::RefSpillWriter),
+}
+
+impl RefSink<'_> {
+  fn consume(&mut self, shard_references: Vec<Reference>, id_base: u64) -> io::Result<()> {
+    let rebased = shard_references.into_iter().map(|mut reference| {
+      reference.from = NodeId::new(reference.from.raw() + id_base);
+      reference
+    });
+    match self {
+      RefSink::Ram(references) => {
+        references.extend(rebased);
+        Ok(())
+      }
+      RefSink::Spill(writer) => {
+        for reference in rebased {
+          writer.push(&reference)?;
+        }
+        Ok(())
+      }
+    }
+  }
+}
+
+/// Merge one completed shard into the global writer, rebasing its buffered references by
+/// the id base the absorb assigns — the single absorption step both the rolling path and
+/// the leftover tail share, so their outputs are identical by construction.
+fn absorb_shard(
+  writer: &mut KgWriter,
+  sink: &mut RefSink<'_>,
+  shard_writer: KgWriter,
+  shard_references: Vec<Reference>,
+) -> io::Result<()> {
+  let id_base = writer.absorb(shard_writer);
+  sink.consume(shard_references, id_base)
+}
+
+/// Emit a phase stamp to stderr when `VORPAL_PHASE_TRACE` is set — for correlating RSS
+/// timelines with pipeline phases during memory profiling.
+pub fn phase_trace(label: &str) {
+  vorpal_kg::phase_stamp(label);
+}
+
+/// Hand freed-but-retained allocator pages back to the OS at a phase boundary. On macOS the
+/// default malloc keeps freed pages dirty in per-thread magazines, so a build's peak
+/// footprint reads as (largest phase) + (every earlier phase's retained garbage) even when
+/// the live set shrank between phases. One `malloc_zone_pressure_relief` sweep at each seam
+/// makes the footprint track the live set instead. Elsewhere this is a no-op — the peak
+/// figures we publish are honest live-set peaks, not allocator accidents.
+pub fn release_freed_pages() {
+  #[cfg(target_os = "macos")]
+  {
+    unsafe extern "C" {
+      fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    unsafe {
+      malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+  }
+}
+
 pub fn link_writer(
   mut writer: KgWriter,
-  references: &[Reference],
+  references: Vec<Reference>,
   resolver: &Resolver,
 ) -> (Kg, ResolveStats) {
+  phase_trace("link: table build start");
   let table = build_symbol_table(&writer);
-  let (edges, stats) = resolve_all(&table, references, resolver);
+  // The table build's transients (per-shard pair vectors, the finalize sort buffer) just
+  // died — return their pages before resolution allocates the edge lists.
+  release_freed_pages();
+  phase_trace("link: resolve start");
+  let (edges, stats) = resolve_all(&table, &references, resolver);
+  phase_trace("link: resolve done");
+  drop(table);
+  drop(references);
+  // The largest transient of the run (references + table) just died — return its pages
+  // before compaction and seal allocate theirs.
+  release_freed_pages();
   for edge in &edges {
     writer.add_edge(edge.from, edge.to, edge.edge);
   }
-  (writer.seal(), stats)
+  drop(edges);
+  phase_trace("link: seal start");
+  let kg = writer.seal();
+  release_freed_pages();
+  phase_trace("link: seal done");
+  (kg, stats)
+}
+
+/// [`link_writer`] over a spilled reference stream: the same table build, resolution, and
+/// seal, with references streamed off disk in bounded chunks (identical output — chunking is
+/// invisible to per-reference resolution) and the spill deleted once resolved.
+pub fn link_writer_spilled(
+  mut writer: KgWriter,
+  spill: vorpal_resolve::RefSpill,
+  resolver: &Resolver,
+) -> io::Result<(Kg, ResolveStats)> {
+  phase_trace("link: table build start");
+  let table = build_symbol_table(&writer);
+  release_freed_pages();
+  phase_trace("link: resolve start");
+  // Edges stream straight into the writer's edge log, in resolution order — the collected
+  // edge vector was ~90 MB alive under the seal at kernel scale.
+  let stats = {
+    let writer = &mut writer;
+    vorpal_resolve::resolve_all_spilled_into(&table, &spill, resolver, |edge| {
+      writer.add_edge(edge.from, edge.to, edge.edge);
+    })?
+  };
+  phase_trace("link: resolve done");
+  drop(table);
+  let _ = spill.remove();
+  // The link transients (spill chunks + table) just died — return their pages before
+  // compaction and seal allocate theirs.
+  release_freed_pages();
+  phase_trace("link: seal start");
+  let kg = writer.seal();
+  release_freed_pages();
+  phase_trace("link: seal done");
+  Ok((kg, stats))
 }
 
 /// Fewer files than this per shard and the fan-out overhead outweighs the win: small trees
 /// take the single-writer path outright.
 const MIN_FILES_PER_SHARD: usize = 16;
+
+/// Upper bound on files per streaming shard (see `stream_apply_impl`'s sizing comment).
+const SHARD_CAP_FILES: usize = 64;
 
 /// §7.5 **sharded single-writer commit** over pre-extracted products: partition the
 /// (path-sorted) product list into contiguous shards, apply each shard in its own private
@@ -223,26 +343,67 @@ pub(crate) fn apply_product(
   references: &mut Vec<Reference>,
 ) {
   let crate::FileProduct { items, refs, .. } = product;
-  writer.ingest_file(path, &items);
+  apply_parts(
+    path,
+    &items,
+    refs.iter().map(|r| crate::product::RefView {
+      from_entity_index: r.from_entity_index,
+      name: &r.name,
+      kind: r.kind,
+      start: r.start,
+      end: r.end,
+      qualifier: r.qualifier.as_deref(),
+      form: r.form,
+    }),
+    writer,
+    references,
+  );
+}
+
+/// Apply a pack-replayed product straight from its mapped bytes: decode to views, apply —
+/// no owned strings anywhere on the path (the replay profile showed decode's per-string
+/// allocations as a top cost).
+pub(crate) fn apply_product_view(
+  path: &str,
+  view: &crate::ProductView<'_>,
+  writer: &mut KgWriter,
+  references: &mut Vec<Reference>,
+) {
+  apply_parts(
+    path,
+    &view.items,
+    view.refs.iter().copied(),
+    writer,
+    references,
+  );
+}
+
+/// The single application kernel both product forms share.
+fn apply_parts<'a>(
+  path: &str,
+  items: &[vorpal_outline::model::OutlineItem<'_>],
+  refs: impl Iterator<Item = crate::product::RefView<'a>>,
+  writer: &mut KgWriter,
+  references: &mut Vec<Reference>,
+) {
+  // Identity lookups below are scoped to this file's entities, and each path lands exactly
+  // once (manifest invariant) — so the previous files' identity keys are dead weight.
+  writer.forget_identity_scope();
+  writer.ingest_file(path, items);
   // References carry entity *indices* into the file's local layout; resolve them through the
   // recomputed layout (an out-of-range index — a corrupt product — simply drops the ref).
-  let (entities, _spans) = crate::outline_extractor::local_layout(&items);
-  // One shared path per file; every reference clones the Arc, not the string.
-  let shared_path: std::sync::Arc<str> = std::sync::Arc::from(path);
+  let (entities, _spans) = crate::outline_extractor::local_layout(items);
+  // Intern the file's path once; every reference carries the 4-byte id.
+  let path_id = vorpal_resolve::intern::intern(path);
   for r in refs {
     let Some(entity) = entities.get(r.from_entity_index as usize) else {
       continue;
     };
     if let Some(from) = writer.entity_id(path, entity) {
       references.push(
-        Reference::new(
-          from,
-          std::sync::Arc::clone(&shared_path),
-          r.name,
-          crate::product::tag_refkind(r.kind),
-        )
+        Reference::with_interned_path(from, path_id, r.name, crate::product::tag_refkind(r.kind))
           .with_evidence(r.start, r.end)
-          .with_qualifier(r.qualifier)
+          .with_qualifier_ref(r.qualifier)
           .with_form(crate::product::tag_refform(r.form)),
       );
     }
@@ -251,6 +412,13 @@ pub(crate) fn apply_product(
 
 /// Below this many definitions the table builds serially — fan-out costs more than it saves.
 const MIN_DEFS_PER_SHARD: usize = 4096;
+
+/// The owner id for members whose owner's name no reference ever interned: a reserved,
+/// unparseable string (control character) that can never equal a real qualifier, preserving
+/// "is a member" without admitting a match.
+fn unmatchable_owner() -> vorpal_resolve::NameId {
+  vorpal_resolve::intern::intern("\u{1}vorpal:unreferenced-owner")
+}
 
 fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
   // Derive each member's owner row from the containment edges (`Kg` for `Kg.load`) — the
@@ -277,6 +445,7 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
   // insertion produced (pinned by test). Small graphs build serially.
   let insert_range = |range: std::ops::Range<usize>| {
     let mut table = SymbolTable::new();
+    table.reserve(range.len());
     for row in range {
       let (id, name, path, kind, exported) = writer.definition(row).expect("row < node_count");
       if kind == SymbolKind::File {
@@ -285,15 +454,20 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
       } else if kind != SymbolKind::Import {
         // Import/alias nodes are wiring, not definitions: offering them as resolution targets
         // let a `use foo` in one file steal call edges meant for the real `foo`.
+        // Owners resolve by `peek`: an owner name no reference ever interned can never match
+        // a qualifier, but member-ness must survive — the unmatchable sentinel keeps such
+        // members out of the top-level (module-stem) matching path.
         let owner = owner_of[row]
           .and_then(|src| writer.definition(src as usize))
-          .map(|(_, owner_name, _, _, _)| owner_name.to_owned());
-        table.insert(
+          .map(|(_, owner_name, _, _, _)| {
+            vorpal_resolve::intern::peek(owner_name).unwrap_or_else(unmatchable_owner)
+          });
+        table.insert_if_referenced(
           name,
           Symbol {
             id,
             kind,
-            path: path.to_owned(),
+            path: vorpal_resolve::intern::intern(path),
             exported,
             owner,
           },
@@ -304,9 +478,12 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
   };
 
   if node_count <= MIN_DEFS_PER_SHARD {
-    return insert_range(0..node_count);
+    let mut table = insert_range(0..node_count);
+    table.finalize();
+    return table;
   }
   use rayon::prelude::*;
+  vorpal_kg::phase_stamp("table: owner pass done");
   let threads = rayon::current_num_threads().max(1);
   let shard_size = node_count.div_ceil(threads * 2).max(MIN_DEFS_PER_SHARD);
   let starts: Vec<usize> = (0..node_count).step_by(shard_size).collect();
@@ -314,10 +491,9 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
     .par_iter()
     .map(|&start| insert_range(start..(start + shard_size).min(node_count)))
     .collect();
-  let mut table = SymbolTable::new();
-  for shard in shards {
-    table.absorb(shard);
-  }
+  vorpal_kg::phase_stamp("table: shards built");
+  let table = SymbolTable::from_shards(shards);
+  vorpal_kg::phase_stamp("table: finalized");
   table
 }
 
@@ -351,24 +527,34 @@ mod sharded_table_tests {
       if kind == SymbolKind::File {
         table.insert_file(path, id);
       } else if kind != SymbolKind::Import {
-        let owner = owner_of[id.raw() as usize].map(|src| names[src as usize].clone());
-        table.insert(
+        let owner = owner_of[id.raw() as usize].map(|src| {
+          vorpal_resolve::intern::peek(&names[src as usize]).unwrap_or_else(unmatchable_owner)
+        });
+        table.insert_if_referenced(
           name,
           Symbol {
             id,
             kind,
-            path: path.to_owned(),
+            path: vorpal_resolve::intern::intern(path),
             exported,
             owner,
           },
         );
       }
     });
+    table.finalize();
     table
   }
 
   #[test]
   fn sharded_table_build_equals_the_serial_specification() {
+    // Referenced-only inserts key off the interner: intern every name this corpus uses (as
+    // reference construction would have during commit) so the oracle exercises real,
+    // non-empty tables regardless of what other tests interned first.
+    for j in 0..4usize {
+      vorpal_resolve::intern::intern(&format!("Item{j}"));
+      vorpal_resolve::intern::intern(&format!("member_{j}"));
+    }
     // A writer big enough to force multiple shards (> MIN_DEFS_PER_SHARD definitions), with
     // files, items, members (owners), imports, duplicate names, and privates.
     let mut writer = KgWriter::new();
@@ -519,11 +705,25 @@ pub struct ExtractScratch {
 }
 
 impl ExtractScratch {
+  /// Retained-capacity bound per buffer. Reuse makes the common case allocation-free, but an
+  /// unbounded buffer pins the *largest file the worker ever saw* for the rest of the run —
+  /// across a pool of workers on a corpus with 10–20 MB generated headers, hundreds of MB of
+  /// dead high-water. Oversized buffers are released after use; the next giant file simply
+  /// reallocates (rare by construction — that's what makes the buffer *scratch*).
+  const RETAIN_LIMIT: usize = 2 * 1024 * 1024;
+
   /// Read `path` into the reused source buffer (replacing its contents), UTF-8-validated
   /// exactly like `fs::read_to_string`.
   pub fn read_source(&mut self, path: &Path) -> io::Result<&str> {
     use std::io::Read;
     self.source.clear();
+    if self.source.capacity() > Self::RETAIN_LIMIT {
+      self.source.shrink_to(Self::RETAIN_LIMIT);
+    }
+    if self.encode.capacity() > Self::RETAIN_LIMIT {
+      self.encode.clear();
+      self.encode.shrink_to(Self::RETAIN_LIMIT);
+    }
     std::fs::File::open(path)?.read_to_string(&mut self.source)?;
     Ok(&self.source)
   }
@@ -535,6 +735,10 @@ pub enum StreamWork {
   Parsed(String, crate::FileProduct),
   /// Replayed from the incremental cache.
   Replayed(String, crate::FileProduct),
+  /// Replayed from the products pack: only the path travels — the committer decodes views
+  /// straight out of the mapped pack and applies without materializing a product. The
+  /// producer must have validated the entry (stamps + a full view decode).
+  ReplayedPacked(String),
   /// Not extractable (unreadable, unsupported) — skipped, exactly like the batch path.
   Skipped,
 }
@@ -557,6 +761,10 @@ enum Slot {
     parsed: bool,
     reserved: u64,
   },
+  Packed {
+    path: String,
+    reserved: u64,
+  },
   Skipped,
 }
 
@@ -569,7 +777,8 @@ enum Slot {
 /// assigned its manifest-order sequence number up front; each shard's committer applies its
 /// entries in sequence order (a reorder buffer absorbs out-of-order arrivals — bounded by the
 /// byte budget, and the reason a straggler can never deadlock its shard); shard writers are
-/// absorbed in shard order at the end. Pinned byte-for-byte by test, including under a
+/// absorbed in shard order as they complete (rolling prefix absorption — the merged
+/// writer grows during commit rather than doubling at the end). Pinned byte-for-byte by test, including under a
 /// deliberately starved budget.
 ///
 /// Workers are scoped threads borrowing `work` and the caller's state by `&` — no `'static`,
@@ -585,13 +794,72 @@ pub fn stream_apply<F>(
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
+  let mut references = Vec::new();
+  let (writer, stats) = stream_apply_impl(
+    entries,
+    budget_bytes,
+    work,
+    RefSink::Ram(&mut references),
+    None,
+    None,
+  )?;
+  Ok((writer, references, stats))
+}
+
+/// [`stream_apply`] with the reference stream spilled to `spill_path` instead of buffered in
+/// RAM — the bulk-build configuration. Resolve the result with
+/// [`vorpal_resolve::resolve_all_spilled`] (or [`link_writer_spilled`]), which streams the
+/// file back in bounded chunks and deletes it.
+pub fn stream_apply_spilled<F>(
+  entries: &[crate::FileStat],
+  budget_bytes: u64,
+  spill_path: &std::path::Path,
+  heap_stream_path: Option<&std::path::Path>,
+  pack: Option<&crate::PackReader>,
+  work: F,
+) -> io::Result<(KgWriter, vorpal_resolve::RefSpill, StreamStats)>
+where
+  F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
+{
+  let mut spill_writer = vorpal_resolve::RefSpillWriter::create(spill_path)?;
+  let (writer, stats) = stream_apply_impl(
+    entries,
+    budget_bytes,
+    work,
+    RefSink::Spill(&mut spill_writer),
+    heap_stream_path,
+    pack,
+  )?;
+  Ok((writer, spill_writer.finish()?, stats))
+}
+
+fn stream_apply_impl<F>(
+  entries: &[crate::FileStat],
+  budget_bytes: u64,
+  work: F,
+  mut sink: RefSink<'_>,
+  heap_stream_path: Option<&std::path::Path>,
+  pack: Option<&crate::PackReader>,
+) -> io::Result<(KgWriter, StreamStats)>
+where
+  F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
+{
   let threads = std::thread::available_parallelism()
     .map(|n| n.get())
     .unwrap_or(1);
-  let shard_size = entries
-    .len()
-    .div_ceil((threads * 2).max(1))
-    .max(MIN_FILES_PER_SHARD);
+  // Shards are deliberately small: sequential admission keeps the in-flight window narrow,
+  // and with a handful of huge shards only one or two committers were ever active — the
+  // replay profile showed every worker blocked on a full committer channel while one
+  // committer applied a 2,267-file shard serially. Capping shards at 64 files spreads the
+  // active window across every committer; output bytes are shard-size-independent (pinned
+  // by the streamed≡batch identity tests). Env-tunable for experiments.
+  let shard_size = entries.len().div_ceil((threads * 2).max(1)).clamp(
+    MIN_FILES_PER_SHARD,
+    std::env::var("VORPAL_SHARD_CAP")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(SHARD_CAP_FILES),
+  );
 
   // Small trees: one thread, one writer, zero fan-out — the same output by definition.
   if entries.len() <= shard_size {
@@ -609,12 +877,21 @@ where
           replayed += 1;
           apply_product(&path, product, &mut writer, &mut references);
         }
+        StreamWork::ReplayedPacked(path) => {
+          if let Some(view) = pack
+            .and_then(|p| p.get(&path))
+            .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
+          {
+            apply_product_view(&path, &view, &mut writer, &mut references);
+            replayed += 1;
+          }
+        }
         StreamWork::Skipped => {}
       }
     }
+    sink.consume(references, 0)?;
     return Ok((
       writer,
-      references,
       StreamStats {
         parsed,
         replayed,
@@ -624,7 +901,9 @@ where
   }
 
   let num_shards = entries.len().div_ceil(shard_size);
-  let committers = num_shards.min((threads / 4).max(1));
+  // Half the workers commit: replay-heavy runs are apply-bound, and with threads/4 the
+  // committers were the throughput ceiling once shards got small enough to keep them all fed.
+  let committers = num_shards.min((threads / 2).max(1));
   let budget = ByteBudget::new(budget_bytes);
   let abort = std::sync::atomic::AtomicBool::new(false);
   let first_error: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
@@ -642,6 +921,22 @@ where
     .map(|_| crossbeam_channel::bounded::<(usize, Slot)>(64))
     .unzip();
 
+  let total_sequences = entries.len();
+  let mut writer = KgWriter::new();
+  if let Some(path) = heap_stream_path {
+    // The merged heap writes through to disk as shards absorb (~140 MB at kernel scale that
+    // never touches anonymous memory); the link pass reads it back through a zero-copy map.
+    writer.stream_heap_to(path)?;
+  }
+  let mut holdback: std::collections::BTreeMap<usize, (KgWriter, Vec<Reference>)> =
+    std::collections::BTreeMap::new();
+  let mut next_absorb = 0usize;
+  // First sink (spill IO) error: aborts absorption, surfaced after the scope joins.
+  let mut sink_error: Option<io::Error> = None;
+  // Committers → caller: completed shards, for rolling prefix absorption. Unbounded so a
+  // committer never blocks handing off a finished shard.
+  let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>)>();
+
   let outputs = std::thread::scope(|scope| {
     // Committers: each owns its assigned shards' writers outright (single writer per shard)
     // and drains its channel unconditionally into per-shard reorder buffers — receiving never
@@ -652,6 +947,7 @@ where
       .enumerate()
       .map(|(committer_index, slot_rx)| {
         let budget = &budget;
+        let done_tx = done_tx.clone();
         scope.spawn(move || {
           let owned_shards: Vec<usize> =
             (committer_index..num_shards).step_by(committers).collect();
@@ -694,8 +990,31 @@ where
                     replayed += 1;
                   }
                 }
+                Slot::Packed { path, reserved } => {
+                  // Decode views straight out of the mapped pack and apply — validated by
+                  // the producer, so a failure here is disk rot; the file is then absent
+                  // from this build rather than fatal.
+                  if let Some(view) = pack
+                    .and_then(|p| p.get(&path))
+                    .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
+                  {
+                    let (writer, references) = writers.get_mut(&shard).expect("owned shard");
+                    apply_product_view(&path, &view, writer, references);
+                    replayed += 1;
+                  }
+                  budget.release(reserved);
+                }
                 Slot::Skipped => {}
               }
+            }
+            // Shard complete? Hand it off for rolling prefix absorption — the merged
+            // writer grows while commit continues, instead of every shard coexisting
+            // with its merged copy in one final doubling spike.
+            let shard_end = ((shard + 1) * shard_size).min(total_sequences);
+            if *expected == shard_end
+              && let Some((shard_writer, shard_references)) = writers.remove(&shard)
+            {
+              let _ = done_tx.send((shard, shard_writer, shard_references));
             }
           }
           (writers, parsed, replayed)
@@ -736,6 +1055,7 @@ where
                 parsed: false,
                 reserved,
               },
+              Ok(StreamWork::ReplayedPacked(path)) => Slot::Packed { path, reserved },
               Ok(StreamWork::Skipped) => {
                 budget.release(reserved);
                 Slot::Skipped
@@ -757,8 +1077,27 @@ where
     drop(work_rx);
     drop(slot_txs);
 
+    // Rolling prefix absorption, on the calling thread: shard k merges as soon as shards
+    // 0..k have merged and k is complete — same order and rebases as absorb-at-the-end,
+    // bit-identical output (pinned by test), but shard writers die while commit is still
+    // running.
+    let mut roll_in = |shard, shard_writer, shard_references| {
+      holdback.insert(shard, (shard_writer, shard_references));
+      while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
+        if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
+          && sink_error.is_none()
+        {
+          sink_error = Some(err);
+        }
+        next_absorb += 1;
+      }
+    };
+
     // Admission, on the calling thread: manifest order, budget-gated.
     for (sequence, entry) in entries.iter().enumerate() {
+      while let Ok((shard, shard_writer, shard_references)) = done_rx.try_recv() {
+        roll_in(shard, shard_writer, shard_references);
+      }
       if abort.load(std::sync::atomic::Ordering::Acquire) {
         break;
       }
@@ -768,6 +1107,12 @@ where
       }
     }
     drop(work_tx);
+    // Drop the caller's sender so the drain below ends when the committers exit.
+    drop(done_tx);
+    phase_trace("stream: admission done, draining completions");
+    while let Ok((shard, shard_writer, shard_references)) = done_rx.recv() {
+      roll_in(shard, shard_writer, shard_references);
+    }
 
     for handle in worker_handles {
       let _ = handle.join();
@@ -783,29 +1128,34 @@ where
     return Err(err);
   }
 
-  // Ordered absorption, exactly as the batch path: shard 0..n, id and reference rebase.
-  let mut by_shard: std::collections::BTreeMap<usize, (KgWriter, Vec<Reference>)> =
-    std::collections::BTreeMap::new();
   let (mut parsed, mut replayed) = (0u64, 0u64);
-  for (writers, shard_parsed, shard_replayed) in outputs {
+  for (leftover, shard_parsed, shard_replayed) in outputs {
     parsed += shard_parsed;
     replayed += shard_replayed;
-    for (shard, writer_and_refs) in writers {
-      by_shard.insert(shard, writer_and_refs);
+    // Leftovers exist only when admission aborted mid-run; fold them in anyway so the
+    // (discarded) result is still built deterministically.
+    for (shard, writer_and_refs) in leftover {
+      holdback.insert(shard, writer_and_refs);
     }
   }
-  let mut writer = KgWriter::new();
-  let mut references = Vec::new();
-  for (_, (shard_writer, shard_references)) in by_shard {
-    let id_base = writer.absorb(shard_writer);
-    references.extend(shard_references.into_iter().map(|mut reference| {
-      reference.from = NodeId::new(reference.from.raw() + id_base);
-      reference
-    }));
+  phase_trace("stream: absorb tail");
+  while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
+    if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
+      && sink_error.is_none()
+    {
+      sink_error = Some(err);
+    }
+    next_absorb += 1;
   }
+  if let Some(err) = sink_error {
+    return Err(err);
+  }
+  // The writer has absorbed its last shard: return growth slack before link stacks the
+  // table and edge transients on top, and reopen a streamed heap for the link pass's reads.
+  writer.shrink_to_fit();
+  writer.finalize_streamed_heap()?;
   Ok((
     writer,
-    references,
     StreamStats {
       parsed,
       replayed,

@@ -45,7 +45,7 @@ pub enum Heading {
 }
 
 impl Heading {
-  fn should_print(&self) -> bool {
+  pub(crate) fn should_print(&self) -> bool {
     use Heading as H;
     match self {
       H::Always => true,

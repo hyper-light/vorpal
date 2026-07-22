@@ -17,3 +17,4 @@ vorpal-kg.workspace = true
 ignore.workspace = true
 notify = "8"
 serde_json = "1"
+tikv-jemallocator = "0.7.0"

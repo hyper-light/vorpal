@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use vorpal_ingest::{
   FileProduct, FileStat, OutlineExtractor, Resolver, StreamWork, apply_products_sharded,
-  link_writer, stream_apply,
+  link_writer, link_writer_spilled, stream_apply, stream_apply_spilled,
 };
 
 fn corpus() -> Vec<(String, String)> {
@@ -69,10 +69,10 @@ fn assert_identical_to_batch(budget: u64, tag: &str) {
     "budget must bound in-flight bytes: peak {} > budget {budget} ({tag})",
     stats.peak_in_flight_bytes
   );
-  let (streamed_kg, streamed_stats) = link_writer(writer, &references, &Resolver::new());
+  let (streamed_kg, streamed_stats) = link_writer(writer, references, &Resolver::new());
 
   let (writer, references) = apply_products_sharded(products);
-  let (batch_kg, batch_stats) = link_writer(writer, &references, &Resolver::new());
+  let (batch_kg, batch_stats) = link_writer(writer, references, &Resolver::new());
 
   assert_eq!(streamed_stats, batch_stats, "{tag}");
   let base = std::env::temp_dir().join(format!("vorpal-streamed-eq-{tag}-{}", std::process::id()));
@@ -80,7 +80,7 @@ fn assert_identical_to_batch(budget: u64, tag: &str) {
   let _ = fs::remove_dir_all(&base);
   streamed_kg.save(&a).unwrap();
   batch_kg.save(&b).unwrap();
-  for file in ["nodes.vseg", "strings.heap", "edges.bin"] {
+  for file in ["nodes.vseg", "strings.heap", "graph.bin"] {
     assert_eq!(
       fs::read(a.join(file)).unwrap(),
       fs::read(b.join(file)).unwrap(),
@@ -122,7 +122,7 @@ fn skips_advance_order_without_perturbing_the_rest() {
   })
   .expect("stream succeeds");
   assert_eq!(stats.replayed, 80);
-  let (streamed_kg, streamed_stats) = link_writer(writer, &references, &Resolver::new());
+  let (streamed_kg, streamed_stats) = link_writer(writer, references, &Resolver::new());
 
   // Batch over exactly the non-skipped products.
   let kept: Vec<_> = products
@@ -132,7 +132,7 @@ fn skips_advance_order_without_perturbing_the_rest() {
     .map(|(_, product)| product)
     .collect();
   let (writer, references) = apply_products_sharded(kept);
-  let (batch_kg, batch_stats) = link_writer(writer, &references, &Resolver::new());
+  let (batch_kg, batch_stats) = link_writer(writer, references, &Resolver::new());
 
   assert_eq!(streamed_stats, batch_stats);
   assert_eq!(streamed_kg.node_count(), batch_kg.node_count());
@@ -160,4 +160,67 @@ fn first_error_aborts_the_stream_without_hanging() {
     Ok(_) => panic!("injected failure must surface"),
   };
   assert!(err.to_string().contains("injected"), "{err}");
+}
+
+/// The spilled configuration (references on disk between commit and resolve) must be
+/// byte-identical to the in-RAM path: same graph bytes, same stats, spill file gone after.
+#[test]
+fn spilled_references_are_byte_identical_to_the_ram_path() {
+  let files = corpus();
+  let products = extracted(&files);
+  let by_path: HashMap<String, FileProduct> = products.iter().cloned().collect();
+  let entries = entries_for(&files);
+
+  let base = std::env::temp_dir().join(format!("vorpal-spill-eq-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&base).unwrap();
+  let spill_path = base.join(".refs.spill");
+
+  // Exercise the disk-streamed heap too: the merged writer's strings must round-trip
+  // identically through write-through + map-back.
+  let heap_stream = base.join("strings.heap.tmp");
+  let (writer, spill, stats) = stream_apply_spilled(
+    &entries,
+    64 * 1024 * 1024,
+    &spill_path,
+    Some(&heap_stream),
+    None,
+    |entry, _scratch| {
+      Ok(StreamWork::Parsed(
+        entry.path.clone(),
+        by_path[&entry.path].clone(),
+      ))
+    },
+  )
+  .expect("spilled stream succeeds");
+  assert_eq!(stats.parsed, 120);
+  assert!(spill.count() > 0, "corpus produces references");
+  let (spilled_kg, spilled_stats) =
+    link_writer_spilled(writer, spill, &Resolver::new()).expect("spilled link succeeds");
+  assert!(
+    !spill_path.exists(),
+    "spill is deleted once resolution has streamed it"
+  );
+
+  let (writer, references, _) = stream_apply(&entries, 64 * 1024 * 1024, |entry, _scratch| {
+    Ok(StreamWork::Parsed(
+      entry.path.clone(),
+      by_path[&entry.path].clone(),
+    ))
+  })
+  .expect("stream succeeds");
+  let (ram_kg, ram_stats) = link_writer(writer, references, &Resolver::new());
+
+  assert_eq!(spilled_stats, ram_stats);
+  let (a, b) = (base.join("spilled"), base.join("ram"));
+  spilled_kg.save(&a).unwrap();
+  ram_kg.save(&b).unwrap();
+  for file in ["nodes.vseg", "strings.heap", "graph.bin"] {
+    assert_eq!(
+      fs::read(a.join(file)).unwrap(),
+      fs::read(b.join(file)).unwrap(),
+      "{file} diverged between spilled and RAM reference paths"
+    );
+  }
+  let _ = fs::remove_dir_all(&base);
 }

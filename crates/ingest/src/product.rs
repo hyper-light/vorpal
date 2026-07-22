@@ -308,7 +308,7 @@ fn encode_product(product: &FileProduct) -> Vec<u8> {
 }
 
 /// [`encode_product`] into a caller-owned buffer (appended; clear first for a fresh encoding).
-fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
+pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
   let rollback = buf.len();
   buf.extend_from_slice(PRODUCT_MAGIC);
   push_u32(buf, product.version);
@@ -401,9 +401,28 @@ impl<'a> Reader<'a> {
   }
 
   fn entry(&mut self) -> io::Result<OutlineEntry<'static>> {
+    let entry = self.entry_view()?;
+    let ast_kind: &'static str = match entry.ast_kind {
+      std::borrow::Cow::Borrowed(kind) => intern_kind(kind),
+      std::borrow::Cow::Owned(kind) => intern_kind(&kind),
+    };
+    Ok(OutlineEntry {
+      role: entry.role,
+      symbol_type: entry.symbol_type,
+      name: entry.name.into_owned().into(),
+      range: entry.range,
+      signature: entry.signature.into_owned().into(),
+      ast_kind: std::borrow::Cow::Borrowed(ast_kind),
+    })
+  }
+
+  /// [`Reader::entry`] borrowing name/signature straight from the encoded bytes — the
+  /// pack-replay decode, which materializes no strings at all (`ast_kind` was already an
+  /// interned static).
+  fn entry_view(&mut self) -> io::Result<OutlineEntry<'a>> {
     let role = tag_role(self.u8()?)?;
     let symbol_type = tag_symbol_type(self.u8()?)?;
-    let name = self.str()?;
+    let name = self.str_borrowed()?;
     let byte_start = self.u32()? as usize;
     let byte_end = self.u32()? as usize;
     let start = SourcePosition {
@@ -414,24 +433,175 @@ impl<'a> Reader<'a> {
       line: self.u32()? as usize,
       column: self.u32()? as usize,
     };
-    let signature = self.str()?;
+    let signature = self.str_borrowed()?;
     let ast_kind = intern_kind(self.str_borrowed()?);
     Ok(OutlineEntry {
       role,
       symbol_type,
-      name: name.into(),
+      name: std::borrow::Cow::Borrowed(name),
       range: SourceRange {
         byte_offset: byte_start..byte_end,
         start,
         end,
       },
-      signature: signature.into(),
+      signature: std::borrow::Cow::Borrowed(signature),
       ast_kind: std::borrow::Cow::Borrowed(ast_kind),
     })
   }
 }
 
-fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
+/// A product decoded as **views into its encoded bytes** — the pack-replay form. No owned
+/// strings: names, signatures, and qualifiers borrow the mapped pack; only the small view
+/// vectors allocate. Item strings ride in `OutlineItem<'a>`'s existing `Cow` lifetime.
+pub struct ProductView<'a> {
+  pub source_size: u64,
+  pub source_mtime_ns: u64,
+  pub items: Vec<OutlineItem<'a>>,
+  pub refs: Vec<RefView<'a>>,
+}
+
+/// One reference occurrence as a borrowed view (see [`ProductRef`] for field semantics).
+#[derive(Clone, Copy)]
+pub struct RefView<'a> {
+  pub from_entity_index: u32,
+  pub name: &'a str,
+  pub kind: u8,
+  pub start: u32,
+  pub end: u32,
+  pub qualifier: Option<&'a str>,
+  pub form: u8,
+}
+
+/// The stat stamp of an encoded product, read from its fixed header — magic and format
+/// version checked, nothing decoded. `None` for foreign or torn bytes (treat as cache miss).
+pub fn peek_product_stamps(bytes: &[u8]) -> Option<(u64, u64)> {
+  if bytes.len() < 24 || &bytes[0..4] != PRODUCT_MAGIC {
+    return None;
+  }
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
+    return None;
+  }
+  Some((
+    u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+    u64::from_le_bytes(bytes[16..24].try_into().ok()?),
+  ))
+}
+
+/// Validate an encoded product without materializing anything: the exact walk
+/// [`decode_product_view`] performs — every bounds check, tag check, and UTF-8 check —
+/// with zero allocations. The pack-replay producer runs this so a corrupt entry still
+/// falls back to a re-parse, while the (validated) real decode happens once, at apply.
+pub fn validate_product(bytes: &[u8]) -> bool {
+  fn walk_entry(r: &mut Reader<'_>) -> io::Result<()> {
+    tag_role(r.u8()?)?;
+    tag_symbol_type(r.u8()?)?;
+    r.str_borrowed()?;
+    for _ in 0..6 {
+      r.u32()?;
+    }
+    r.str_borrowed()?;
+    r.str_borrowed()?;
+    Ok(())
+  }
+  fn walk(bytes: &[u8]) -> io::Result<()> {
+    let mut r = Reader { bytes, off: 0 };
+    if r.take(4)? != PRODUCT_MAGIC {
+      return Err(corrupt("bad product magic"));
+    }
+    if r.u32()? != PRODUCT_FORMAT_VERSION {
+      return Err(corrupt("product from a different format generation"));
+    }
+    r.u64()?;
+    r.u64()?;
+    for _ in 0..r.count()? {
+      walk_entry(&mut r)?;
+      r.u8()?;
+      for _ in 0..r.count()? {
+        walk_entry(&mut r)?;
+        r.u8()?;
+      }
+    }
+    for _ in 0..r.count()? {
+      r.u32()?;
+      r.str_borrowed()?;
+      r.u8()?;
+      r.u32()?;
+      r.u32()?;
+      r.u8()?;
+      if r.u8()? != 0 {
+        r.str_borrowed()?;
+      }
+    }
+    Ok(())
+  }
+  walk(bytes).is_ok()
+}
+
+/// Decode a product as views over `bytes` (see [`ProductView`]). Same validation as
+/// [`decode_product`]; allocates only the item/ref vectors.
+pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
+  let mut r = Reader { bytes, off: 0 };
+  if r.take(4)? != PRODUCT_MAGIC {
+    return Err(corrupt("bad product magic"));
+  }
+  let version = r.u32()?;
+  if version != PRODUCT_FORMAT_VERSION {
+    return Err(corrupt("product from a different format generation"));
+  }
+  let source_size = r.u64()?;
+  let source_mtime_ns = r.u64()?;
+  let item_count = r.count()?;
+  let mut items = Vec::with_capacity(item_count);
+  for _ in 0..item_count {
+    let entry = r.entry_view()?;
+    let flags = r.u8()?;
+    let member_count = r.count()?;
+    let mut members = Vec::with_capacity(member_count);
+    for _ in 0..member_count {
+      let entry = r.entry_view()?;
+      let is_public = r.u8()? & 1 != 0;
+      members.push(OutlineMember { entry, is_public });
+    }
+    items.push(OutlineItem {
+      entry,
+      is_import: flags & 1 != 0,
+      is_exported: flags & 2 != 0,
+      members,
+    });
+  }
+  let ref_count = r.count()?;
+  let mut refs = Vec::with_capacity(ref_count);
+  for _ in 0..ref_count {
+    let from_entity_index = r.u32()?;
+    let name = r.str_borrowed()?;
+    let kind = r.u8()?;
+    let start = r.u32()?;
+    let end = r.u32()?;
+    let form = r.u8()?;
+    let qualifier = if r.u8()? != 0 {
+      Some(r.str_borrowed()?)
+    } else {
+      None
+    };
+    refs.push(RefView {
+      from_entity_index,
+      name,
+      kind,
+      start,
+      end,
+      qualifier,
+      form,
+    });
+  }
+  Ok(ProductView {
+    source_size,
+    source_mtime_ns,
+    items,
+    refs,
+  })
+}
+
+pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
   let mut r = Reader { bytes, off: 0 };
   if r.take(4)? != PRODUCT_MAGIC {
     return Err(corrupt("bad product magic"));

@@ -31,6 +31,14 @@ pub struct Server {
 impl Server {
   pub fn new(index_dir: PathBuf) -> Self {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
+    // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
+    // start building it now instead of on the first semantic search.
+    if index_dir.join("nodes.vseg").exists() {
+      let warm_dir = index_dir.clone();
+      std::thread::spawn(move || {
+        let _ = vorpal_index::warm_ann(&warm_dir);
+      });
+    }
     Self {
       index_dir,
       kg: None,
@@ -55,6 +63,14 @@ impl Server {
     match rebuilt {
       Ok(kg) => {
         self.kg = Some(kg);
+        // Warm the vector tier in the background so the *next* semantic search never pays
+        // the build. Best-effort: a failure just means the search that needs it builds it
+        // (and reports its own error); the in-process build lock prevents duplicate work
+        // if a search arrives mid-warm.
+        let index_dir = self.index_dir.clone();
+        std::thread::spawn(move || {
+          let _ = vorpal_index::warm_ann(&index_dir);
+        });
         Ok(())
       }
       Err(err) => {

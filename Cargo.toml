@@ -31,14 +31,18 @@ vorpal-index = { path = "crates/index", version = "0.1.0" }
 vorpal-ingest = { path = "crates/ingest", version = "0.1.0" }
 vorpal-kg = { path = "crates/kg", version = "0.1.0" }
 vorpal-language = { path = "crates/language", version = "0.1.0" }
+vorpal-loader = { path = "crates/loader", version = "0.1.0" }
 vorpal-lsp = { path = "crates/lsp", version = "0.1.0" }
 vorpal-mcp = { path = "crates/mcp", version = "0.1.0" }
 vorpal-mem = { path = "crates/mem", version = "0.1.0" }
 vorpal-outline = { path = "crates/outline", version = "0.1.0" }
 vorpal-resolve = { path = "crates/resolve", version = "0.1.0" }
 vorpal-segment = { path = "crates/segment", version = "0.1.0" }
+vorpal-transport = { path = "crates/transport", version = "0.1.0" }
+vorpal-wire = { path = "crates/wire", version = "0.1.0" }
 
 bit-set = { version = "0.10.0" }
+blake3 = "1.8"
 ignore = { version = "0.4.22" }
 regex = { version = "1.10.4" }
 serde = { version = "1.0.200", features = ["derive"] }

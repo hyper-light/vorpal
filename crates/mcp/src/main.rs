@@ -3,6 +3,25 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// Same allocator policy as `vorpal-index`: jemalloc with immediate page return, so a
+/// long-lived daemon's RSS tracks its live set instead of its high-water mark.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+mod jemalloc_conf {
+  #[repr(transparent)]
+  pub struct SyncPtr(#[allow(dead_code)] *const u8);
+  unsafe impl Sync for SyncPtr {}
+  #[unsafe(export_name = "_rjem_malloc_conf")]
+  pub static MALLOC_CONF: SyncPtr = SyncPtr(
+    c"narenas:8,dirty_decay_ms:0,muzzy_decay_ms:0"
+      .as_ptr()
+      .cast(),
+  );
+}
+
 const USAGE: &str = "usage: vorpal-mcp <index-dir>
 Serves vorpal knowledge-graph queries as MCP tools over stdio.
 <index-dir> holds the persisted index (created by the 'index' tool if absent).";

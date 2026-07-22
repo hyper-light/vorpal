@@ -90,10 +90,74 @@ jobs:
           path: app-${{ matrix.target }}.zip
           if-no-files-found: error
 
+  # The remote-fleet stage-0 loader + the signed agent (docs/REMOTE.md §2, §6). The agent is the
+  # musl `vorpal` binary run as `__agent`; the loader verifies its Ed25519 signature over the
+  # blake3 hash and execs it from a memfd (zero on-disk residue). When the repo has a signing key,
+  # the loader embeds the matching public key and a pre-signed `.vld` stream is shipped; otherwise
+  # the loader is built to accept `--pubkey` at runtime and only the blake3 pin is recorded.
+  agent-bundle:
+    name: Agent bundle ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    env:
+      SIGNING_KEY: ${{ secrets.VORPAL_AGENT_SIGNING_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agent-${{ matrix.target }}
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Derive the loader's embedded public key (only when a signing key is configured)
+        id: pubkey
+        run: |
+          if [ -n "${SIGNING_KEY}" ]; then
+            pub=$(cargo run -q -p vorpal-loader --features keygen --bin vorpal-sign -- pubkey --key-hex "${SIGNING_KEY}")
+            echo "hex=${pub}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the stage-0 loader (musl; public key embedded when available)
+        env:
+          VORPAL_LOADER_PUBKEY_HEX: ${{ steps.pubkey.outputs.hex }}
+        run: cargo build --release -p vorpal-loader --bin vorpal-loader --target ${{ matrix.target }}
+      - name: Build the agent (the musl vorpal binary, launched as `__agent`)
+        run: cargo build --release -p vorpal --bin vorpal --target ${{ matrix.target }}
+      - name: Sign the agent (if keyed) and record its blake3 pin
+        run: |
+          set -euo pipefail
+          agent="target/${{ matrix.target }}/release/vorpal"
+          if [ -n "${SIGNING_KEY}" ]; then
+            cargo run -q -p vorpal-loader --features keygen --bin vorpal-sign -- sign \
+              --key-hex "${SIGNING_KEY}" --agent "$agent" \
+              --out "agent-${{ matrix.target }}.vld" \
+              --manifest "agent-${{ matrix.target }}.json"
+          else
+            hash=$(cargo run -q -p vorpal-loader --features keygen --bin vorpal-sign -- hash --agent "$agent")
+            printf '{\n  "target": "%s",\n  "blake3": "%s",\n  "signed": false\n}\n' \
+              "${{ matrix.target }}" "$hash" > "agent-${{ matrix.target }}.json"
+          fi
+          cp "target/${{ matrix.target }}/release/vorpal-loader" "vorpal-loader-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-bundle-${{ matrix.target }}
+          path: |
+            vorpal-loader-${{ matrix.target }}
+            agent-${{ matrix.target }}.json
+            agent-${{ matrix.target }}.vld
+          if-no-files-found: warn
+
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, test]
+    needs: [build, agent-bundle, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -103,7 +167,12 @@ jobs:
           path: artifacts
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/app-*.zip
+          # The CLI zips, plus the fleet stage-0 loaders, signed agents, and blake3 pins.
+          files: |
+            artifacts/**/app-*.zip
+            artifacts/**/vorpal-loader-*
+            artifacts/**/agent-*.json
+            artifacts/**/agent-*.vld
           generate_release_notes: true
 
   publish-cli-npm:

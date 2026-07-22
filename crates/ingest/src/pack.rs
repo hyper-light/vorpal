@@ -1,0 +1,357 @@
+//! The products pack: every cached extraction product in **one appendable file**, mapped
+//! zero-copy at replay.
+//!
+//! The loose-file cache paid one `open(2)` per product; at kernel scale that is 72k opens
+//! per re-index, and macOS serializes enough of the open path that even 18 threads only
+//! doubled throughput — the replay was syscall-bound, not byte-bound. The pack replaces it
+//! for index runs: one mmap, per-entry slices, no opens. Loose files remain the write path
+//! for *search-banked* products (concurrent scan processes must not contend on one file) and
+//! are consolidated into the pack — then deleted — by the next index run.
+//!
+//! Layout (`products.pack`): magic + version, then length-prefixed records
+//! `[path_len u32][path][body_len u32][body]` where `body` is the ordinary product codec.
+//! The sidecar (`products.idx`) is `magic + version + covered_len u64 + count u64` plus
+//! `[path_len u32][path][off u64][len u32]` per live entry — **an optimization, not a
+//! source of truth**: a run killed after appending but before the sidecar lands loses no
+//! work, because open() scans any records beyond `covered_len` (bounds-checked; a torn tail
+//! record simply ends the scan) and products remain self-validating at decode time. Pack
+//! bytes are a cache: entry content is deterministic, entry order is arrival order.
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use vorpal_mem::{AccessPattern, CorpusProbe, Hotness, MappedStore, ResourcePolicy, StoreKind};
+
+pub const PACK_FILE: &str = "products.pack";
+pub const PACK_INDEX: &str = "products.idx";
+const PACK_MAGIC: &[u8; 4] = b"VPPK";
+const IDX_MAGIC: &[u8; 4] = b"VPPI";
+const PACK_VERSION: u32 = 1;
+
+/// A live entry: body offset + length within the pack.
+type Entry = (u64, u32);
+
+/// Read side: the mapped pack plus its live-entry index.
+pub struct PackReader {
+  store: Arc<MappedStore>,
+  index: HashMap<Box<str>, Entry>,
+}
+
+impl PackReader {
+  /// Open the pack under `dir`, if present and well-formed. Uses the sidecar when its
+  /// covered length is consistent, then scans any appended tail; scans the whole pack when
+  /// the sidecar is missing or invalid (the killed-run recovery path).
+  pub fn open(dir: &Path) -> Option<PackReader> {
+    let pack_path = dir.join(PACK_FILE);
+    let store = Arc::new(
+      MappedStore::map_file(
+        &pack_path,
+        StoreKind::VectorsFull,
+        AccessPattern::Sequential,
+        Hotness::Hot,
+        &ResourcePolicy::probe(CorpusProbe::new(0, 0)),
+      )
+      .ok()?,
+    );
+    let bytes = store.as_bytes();
+    if bytes.len() < 8 || &bytes[0..4] != PACK_MAGIC {
+      return None;
+    }
+    if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PACK_VERSION {
+      return None;
+    }
+
+    let mut index = HashMap::new();
+    let mut scan_from = 8usize;
+    if let Some((entries, covered)) = read_sidecar(&dir.join(PACK_INDEX), bytes.len()) {
+      index = entries;
+      scan_from = covered;
+    }
+    // Recovery / tail scan: pick up records the sidecar has not seen. A torn final record
+    // fails a bounds check and ends the scan; whatever decoded cleanly is kept.
+    let mut at = scan_from;
+    while at + 8 <= bytes.len() {
+      let path_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+      let Some(path_end) = (at + 4)
+        .checked_add(path_len)
+        .filter(|&e| e + 4 <= bytes.len())
+      else {
+        break;
+      };
+      let Ok(path) = std::str::from_utf8(&bytes[at + 4..path_end]) else {
+        break;
+      };
+      let body_len = u32::from_le_bytes(bytes[path_end..path_end + 4].try_into().unwrap()) as usize;
+      let body_at = path_end + 4;
+      let Some(body_end) = body_at.checked_add(body_len).filter(|&e| e <= bytes.len()) else {
+        break;
+      };
+      index.insert(path.into(), (body_at as u64, body_len as u32));
+      at = body_end;
+    }
+    Some(PackReader { store, index })
+  }
+
+  /// The cached product bytes for `path`, if packed. Decode + stamp validation stay the
+  /// caller's job — exactly as with a loose file's bytes.
+  pub fn get(&self, path: &str) -> Option<&[u8]> {
+    let &(off, len) = self.index.get(path)?;
+    self
+      .store
+      .as_bytes()
+      .get(off as usize..off as usize + len as usize)
+  }
+
+  fn entry(&self, path: &str) -> Option<Entry> {
+    self.index.get(path).copied()
+  }
+}
+
+fn read_sidecar(path: &Path, pack_len: usize) -> Option<(HashMap<Box<str>, Entry>, usize)> {
+  let bytes = fs::read(path).ok()?;
+  if bytes.len() < 24 || &bytes[0..4] != IDX_MAGIC {
+    return None;
+  }
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PACK_VERSION {
+    return None;
+  }
+  let covered = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+  if covered > pack_len {
+    return None; // sidecar from a different pack generation
+  }
+  let count = u64::from_le_bytes(bytes[16..24].try_into().ok()?) as usize;
+  let mut entries = HashMap::with_capacity(count);
+  let mut at = 24usize;
+  for _ in 0..count {
+    let path_len = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+    let path = std::str::from_utf8(bytes.get(at + 4..at + 4 + path_len)?).ok()?;
+    let off_at = at + 4 + path_len;
+    let off = u64::from_le_bytes(bytes.get(off_at..off_at + 8)?.try_into().ok()?);
+    let len = u32::from_le_bytes(bytes.get(off_at + 8..off_at + 12)?.try_into().ok()?);
+    if off as usize + len as usize > pack_len {
+      return None;
+    }
+    entries.insert(path.into(), (off, len));
+    at = off_at + 12;
+  }
+  Some((entries, covered))
+}
+
+/// One message from the extraction pipeline to the pack thread: a freshly encoded product
+/// (new parse, or a loose file being consolidated). Products replayed straight from the
+/// pack send **nothing** — their entries are carried into the new sidecar in bulk at
+/// [`PackWriter::finish`], from the live path set. At kernel scale the per-file reuse
+/// message was 72k sends against one channel; the profile showed every worker blocked on it.
+pub struct PackMsg {
+  pub path: String,
+  pub body: Vec<u8>,
+}
+
+/// Append side: owns the pack file for the duration of one index run. Feed it with
+/// [`PackWriter::sink`] clones from any thread; call [`PackWriter::finish`] after the
+/// pipeline ends to flush, (maybe) compact, and publish the sidecar atomically.
+pub struct PackWriter {
+  dir: PathBuf,
+  rx: crossbeam_channel::Receiver<PackMsg>,
+  tx: Option<crossbeam_channel::Sender<PackMsg>>,
+  reader: Option<Arc<PackReader>>,
+}
+
+impl PackWriter {
+  pub fn new(dir: &Path, reader: Option<Arc<PackReader>>) -> Self {
+    let (tx, rx) = crossbeam_channel::bounded(1024);
+    Self {
+      dir: dir.to_path_buf(),
+      rx,
+      tx: Some(tx),
+      reader,
+    }
+  }
+
+  pub fn sink(&self) -> crossbeam_channel::Sender<PackMsg> {
+    self.tx.as_ref().expect("sink before finish").clone()
+  }
+
+  /// Drain every append, carry pack entries for every path in `live` that was not
+  /// re-appended, then publish the sidecar (`.tmp` + rename). Compacts first when dead
+  /// bytes exceed live bytes. Call only after every [`PackWriter::sink`] clone is dropped.
+  pub fn finish(mut self, live: impl IntoIterator<Item = String>) -> io::Result<()> {
+    drop(self.tx.take());
+    let pack_path = self.dir.join(PACK_FILE);
+    let create = !pack_path.exists()
+      || fs::read(&pack_path)
+        .map(|b| b.len() < 8 || &b[0..4] != PACK_MAGIC)
+        .unwrap_or(true);
+    let mut file = fs::OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(&pack_path)?;
+    if create {
+      use std::io::Seek;
+      file.set_len(0)?;
+      file.seek(io::SeekFrom::Start(0))?;
+      file.write_all(PACK_MAGIC)?;
+      file.write_all(&PACK_VERSION.to_le_bytes())?;
+    }
+    let mut at = file.metadata()?.len();
+    let mut out = BufWriter::with_capacity(1 << 20, file);
+
+    let mut entries: Vec<(String, Entry)> = Vec::new();
+    let mut appended: std::collections::HashSet<Box<str>> = std::collections::HashSet::new();
+    while let Ok(PackMsg { path, body }) = self.rx.recv() {
+      out.write_all(&(path.len() as u32).to_le_bytes())?;
+      out.write_all(path.as_bytes())?;
+      out.write_all(&(body.len() as u32).to_le_bytes())?;
+      out.write_all(&body)?;
+      let body_at = at + 4 + path.len() as u64 + 4;
+      appended.insert(path.as_str().into());
+      entries.push((path, (body_at, body.len() as u32)));
+      at = body_at + body.len() as u64;
+    }
+    out.flush()?;
+    drop(out);
+    // Bulk reuse: every live path not re-appended keeps its existing pack entry.
+    if let Some(reader) = &self.reader {
+      for path in live {
+        if !appended.contains(path.as_str()) {
+          if let Some(entry) = reader.entry(&path) {
+            entries.push((path, entry));
+          }
+        }
+      }
+    }
+
+    // Compaction: rewrite live records when the pack has grown past twice its live bytes.
+    let live: u64 = entries.iter().map(|(_, (_, len))| *len as u64).sum();
+    let _ = live; // trigger below re-reads the file length
+    let pack_len = fs::metadata(&pack_path)?.len();
+    if pack_len > 16 + 2 * live.max(1) {
+      let old = fs::read(&pack_path)?;
+      let tmp = self.dir.join("products.pack.tmp");
+      let mut out = BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
+      out.write_all(PACK_MAGIC)?;
+      out.write_all(&PACK_VERSION.to_le_bytes())?;
+      let mut new_at = 8u64;
+      for (path, entry) in entries.iter_mut() {
+        let (off, len) = *entry;
+        let body = old
+          .get(off as usize..(off + len as u64) as usize)
+          .ok_or_else(|| io::Error::other("pack entry out of bounds during compaction"))?;
+        out.write_all(&(path.len() as u32).to_le_bytes())?;
+        out.write_all(path.as_bytes())?;
+        out.write_all(&(len).to_le_bytes())?;
+        out.write_all(body)?;
+        *entry = (new_at + 4 + path.len() as u64 + 4, len);
+        new_at = entry.0 + len as u64;
+      }
+      out.flush()?;
+      drop(out);
+      fs::rename(&tmp, &pack_path)?;
+    }
+
+    let covered = fs::metadata(&pack_path)?.len();
+    let idx_tmp = self.dir.join("products.idx.tmp");
+    let mut idx = BufWriter::with_capacity(1 << 20, fs::File::create(&idx_tmp)?);
+    idx.write_all(IDX_MAGIC)?;
+    idx.write_all(&PACK_VERSION.to_le_bytes())?;
+    idx.write_all(&covered.to_le_bytes())?;
+    idx.write_all(&(entries.len() as u64).to_le_bytes())?;
+    for (path, (off, len)) in &entries {
+      idx.write_all(&(path.len() as u32).to_le_bytes())?;
+      idx.write_all(path.as_bytes())?;
+      idx.write_all(&off.to_le_bytes())?;
+      idx.write_all(&len.to_le_bytes())?;
+    }
+    idx.flush()?;
+    drop(idx);
+    fs::rename(&idx_tmp, self.dir.join(PACK_INDEX))?;
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("vorpal-pack-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  #[test]
+  fn appends_reads_reuses_and_recovers() {
+    let dir = scratch_dir("basic");
+    let writer = PackWriter::new(&dir, None);
+    let sink = writer.sink();
+    sink
+      .send(PackMsg {
+        path: "a.rs".into(),
+        body: b"alpha-bytes".to_vec(),
+      })
+      .unwrap();
+    sink
+      .send(PackMsg {
+        path: "b.rs".into(),
+        body: b"beta".to_vec(),
+      })
+      .unwrap();
+    drop(sink);
+    writer.finish(Vec::new()).unwrap();
+
+    let reader = PackReader::open(&dir).unwrap();
+    assert_eq!(reader.get("a.rs"), Some(&b"alpha-bytes"[..]));
+    assert_eq!(reader.get("b.rs"), Some(&b"beta"[..]));
+    assert_eq!(reader.get("missing.rs"), None);
+
+    // Second generation: reuse a, replace b, and survive without a sidecar.
+    let reader = Arc::new(reader);
+    let writer = PackWriter::new(&dir, Some(reader.clone()));
+    let sink = writer.sink();
+    sink
+      .send(PackMsg {
+        path: "b.rs".into(),
+        body: b"beta-v2".to_vec(),
+      })
+      .unwrap();
+    drop(sink);
+    // `a.rs` is carried by the bulk-reuse path: live but not re-appended.
+    writer
+      .finish(vec!["a.rs".to_string(), "b.rs".to_string()])
+      .unwrap();
+    fs::remove_file(dir.join(PACK_INDEX)).unwrap(); // killed-run recovery: no sidecar
+    let recovered = PackReader::open(&dir).unwrap();
+    assert_eq!(recovered.get("a.rs"), Some(&b"alpha-bytes"[..]));
+    assert_eq!(recovered.get("b.rs"), Some(&b"beta-v2"[..]));
+
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn torn_tail_record_is_dropped_not_fatal() {
+    let dir = scratch_dir("torn");
+    let writer = PackWriter::new(&dir, None);
+    let sink = writer.sink();
+    sink
+      .send(PackMsg {
+        path: "ok.rs".into(),
+        body: b"whole".to_vec(),
+      })
+      .unwrap();
+    drop(sink);
+    writer.finish(Vec::new()).unwrap();
+    // Simulate a crash mid-append: a half-written record after the covered length.
+    let mut bytes = fs::read(dir.join(PACK_FILE)).unwrap();
+    bytes.extend_from_slice(&(9u32).to_le_bytes());
+    bytes.extend_from_slice(b"torn"); // path shorter than declared
+    fs::write(dir.join(PACK_FILE), &bytes).unwrap();
+    fs::remove_file(dir.join(PACK_INDEX)).unwrap();
+    let reader = PackReader::open(&dir).unwrap();
+    assert_eq!(reader.get("ok.rs"), Some(&b"whole"[..]));
+    let _ = fs::remove_dir_all(&dir);
+  }
+}

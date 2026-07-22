@@ -72,7 +72,7 @@ impl InputArgs {
     }
   }
 
-  fn build_globs(&self) -> Result<Override> {
+  pub(crate) fn build_globs(&self) -> Result<Override> {
     let cwd = std::env::current_dir()?;
     let mut builder = OverrideBuilder::new(cwd);
     for glob in &self.globs {
@@ -257,6 +257,27 @@ pub struct NoIgnore {
   disregard_exclude: bool,
 }
 
+/// The effective per-category walk settings the `--no-ignore` flags resolve to. This is the
+/// **single source** of that mapping (including `Vcs` disabling all git-flavored categories): the
+/// real walk (`NoIgnore::walk`) and stream-mode discovery reconstruction
+/// (`remote::discovery::WalkConfig`) both derive from it, so `--no-ignore` semantics cannot drift
+/// between them (docs/REMOTE.md I1).
+#[derive(Clone, Copy, Debug)]
+pub struct WalkIgnore {
+  /// Filter hidden files/dirs.
+  pub hidden: bool,
+  /// Consult ignore files in parent directories.
+  pub parents: bool,
+  /// Respect `.ignore` files.
+  pub dot_ignore: bool,
+  /// Respect `.gitignore` files.
+  pub git_ignore: bool,
+  /// Respect `.git/info/exclude`.
+  pub git_exclude: bool,
+  /// Respect the global gitignore.
+  pub git_global: bool,
+}
+
 impl NoIgnore {
   pub fn disregard(ignores: &[IgnoreFile]) -> Self {
     let mut ret = NoIgnore::default();
@@ -274,19 +295,32 @@ impl NoIgnore {
     ret
   }
 
+  /// Resolve the `--no-ignore` flags to their effective per-category settings.
+  pub fn effective(&self) -> WalkIgnore {
+    WalkIgnore {
+      hidden: !self.disregard_hidden,
+      parents: !self.disregard_parent,
+      dot_ignore: !self.disregard_dot,
+      git_ignore: !self.disregard_vcs,
+      git_exclude: !self.disregard_vcs && !self.disregard_exclude,
+      git_global: !self.disregard_vcs && !self.disregard_global,
+    }
+  }
+
   pub fn walk(&self, path: &[PathBuf]) -> WalkBuilder {
     let mut paths = path.iter();
     let mut builder = WalkBuilder::new(paths.next().expect("non empty"));
     for path in paths {
       builder.add(path);
     }
+    let e = self.effective();
     builder
-      .hidden(!self.disregard_hidden)
-      .parents(!self.disregard_parent)
-      .ignore(!self.disregard_dot)
-      .git_global(!self.disregard_vcs && !self.disregard_global)
-      .git_ignore(!self.disregard_vcs)
-      .git_exclude(!self.disregard_vcs && !self.disregard_exclude);
+      .hidden(e.hidden)
+      .parents(e.parents)
+      .ignore(e.dot_ignore)
+      .git_global(e.git_global)
+      .git_ignore(e.git_ignore)
+      .git_exclude(e.git_exclude);
     builder
   }
 }

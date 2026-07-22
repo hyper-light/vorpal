@@ -21,3 +21,29 @@ pub use writer::{KgWriter, NodeDef};
 
 pub use vorpal_graph::{EdgeLog, EdgeType};
 pub use vorpal_segment::NodeId;
+
+/// Phase stamp for RSS-timeline profiling, active only under `VORPAL_PHASE_TRACE`.
+pub fn phase_stamp(label: &str) {
+  if std::env::var_os("VORPAL_PHASE_TRACE").is_some() {
+    #[cfg(feature = "alloc-stats")]
+    let stats = {
+      use tikv_jemalloc_ctl::{epoch, stats};
+      epoch::advance().ok();
+      format!(
+        " [alloc={}MB active={}MB resident={}MB]",
+        stats::allocated::read().unwrap_or(0) / 1048576,
+        stats::active::read().unwrap_or(0) / 1048576,
+        stats::resident::read().unwrap_or(0) / 1048576
+      )
+    };
+    #[cfg(not(feature = "alloc-stats"))]
+    let stats = "";
+    eprintln!(
+      "[phase {:.3}s] {label}{stats}",
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+    );
+  }
+}

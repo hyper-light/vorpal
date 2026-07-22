@@ -14,18 +14,23 @@
 
 mod manifest;
 mod outline_extractor;
+mod pack;
 mod pipeline;
 mod product;
 mod references;
 
 pub use manifest::{FileStat, Manifest};
 pub use outline_extractor::OutlineExtractor;
+pub use pack::{PackMsg, PackReader, PackWriter};
 pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,
-  StreamWork, apply_products_sharded, link_writer, stream_apply,
+  StreamWork, apply_products_sharded, link_writer, link_writer_spilled, release_freed_pages,
+  stream_apply, stream_apply_spilled,
 };
 pub use product::{
-  FileProduct, ProductRef, cache_file_name, load_product, save_product, save_product_with,
+  FileProduct, ProductRef, ProductView, RefView, cache_file_name, decode_product,
+  decode_product_view, encode_product_into, load_product, peek_product_stamps, save_product,
+  save_product_with, validate_product,
 };
 pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
 pub use vorpal_resolve::{RefKind, Reference, ResolveStats, Resolver};

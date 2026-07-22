@@ -71,6 +71,9 @@ pub enum ErrorContext {
   CannotInferShell,
   // Interactive
   ExitInteractiveEditing,
+  // Remote (docs/REMOTE.md)
+  RemoteInvalid(String),
+  RemoteIncomplete(String),
 }
 
 impl ErrorContext {
@@ -94,6 +97,11 @@ impl ErrorContext {
       UnrecognizableLanguage(_) => 33,
       CustomLanguage => 79,
       OpenEditor | StartLanguageServer => 126,
+      // docs/REMOTE.md §3.4: "clean, no error matches" must be provably distinct from "a node
+      // died" — reserved exit code 4 (precedence above DiagnosticError is enforced at the
+      // aggregation site).
+      RemoteIncomplete(_) => 4,
+      RemoteInvalid(_) => 8,
       // soft error
       PatternHasError | ExitInteractiveEditing => 0,
     }
@@ -309,6 +317,16 @@ impl ErrorMessage {
       ExitInteractiveEditing => Self::new(
         "Interactive editing exited.",
         "Your accepted edit has been saved.",
+        None,
+      ),
+      RemoteInvalid(detail) => Self::new(
+        format!("Invalid remote invocation: {detail}"),
+        "Check the --remote target list and remote flags. See docs/REMOTE.md for supported targets and modes.",
+        None,
+      ),
+      RemoteIncomplete(detail) => Self::new(
+        format!("Remote scan incomplete: {detail}"),
+        "One or more remote nodes failed before finishing, so results may be partial. Re-run, or pass --remote-allow-partial to accept partial results.",
         None,
       ),
     }

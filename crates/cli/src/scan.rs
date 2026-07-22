@@ -11,6 +11,7 @@ use vorpal_config::{
 use vorpal_core::{NodeMatch, tree_sitter::StrDoc};
 use vorpal_language::SupportLang;
 
+use crate::remote::CountedProduce;
 use crate::config::{ProjectConfig, read_rule_file, with_rule_stats};
 use crate::lang::SgLang;
 use crate::print::{
@@ -18,7 +19,9 @@ use crate::print::{
   PrintProcessor, Printer, ReportStyle, SimpleFile,
 };
 use crate::utils::RuleOverwrite;
-use crate::utils::{ContextArgs, InputArgs, OutputArgs, OverwriteArgs, filter_file_rule};
+use crate::utils::{
+  ContextArgs, InputArgs, LangPrefilters, OutputArgs, OverwriteArgs, filter_file_rule,
+};
 use crate::utils::{ErrorContext as EC, MaxItemCounter};
 use crate::utils::{FileTrace, ScanTrace};
 use crate::utils::{Items, PathWorker, StdInWorker, Worker};
@@ -46,16 +49,16 @@ pub struct ScanArg {
   ///
   /// Supported formats: GitHub Action, SARIF (Static Analysis Results Interchange Format).
   #[clap(long, conflicts_with = "json", conflicts_with = "interactive")]
-  format: Option<Platform>,
+  pub(crate) format: Option<Platform>,
 
   #[clap(long, default_value = "rich", conflicts_with = "json")]
-  report_style: ReportStyle,
+  pub(crate) report_style: ReportStyle,
 
   /// Include rule metadata in the json output.
   ///
   /// This flags requires --json output. Default is false.
   #[clap(long, requires = "json")]
-  include_metadata: bool,
+  pub(crate) include_metadata: bool,
 
   /// severity related options
   #[clap(flatten)]
@@ -63,19 +66,32 @@ pub struct ScanArg {
 
   /// input related options
   #[clap(flatten)]
-  input: InputArgs,
+  pub(crate) input: InputArgs,
   /// output related options
   #[clap(flatten)]
-  output: OutputArgs,
+  pub(crate) output: OutputArgs,
   /// context related options
   #[clap(flatten)]
-  context: ContextArgs,
+  pub(crate) context: ContextArgs,
+
+  /// remote fan-out options (see docs/REMOTE.md)
+  #[clap(flatten)]
+  pub(crate) remote: crate::remote::RemoteArgs,
 
   /// Show at most NUM results and stop running once the limit is reached.
   ///
   /// Useful for big codebase to fail scan/search fast.
   #[clap(long, conflicts_with = "interactive", value_name = "NUM")]
-  max_results: Option<u16>,
+  pub(crate) max_results: Option<u16>,
+}
+
+/// The non-interactive printer a scan resolves to (see [`ScanArg::printer_kind`]). Interactive
+/// editing is a separate, local-only path handled where `Colored` is built.
+pub(crate) enum ScanPrinterKind {
+  FilesWithMatches,
+  Cloud(Platform),
+  Json(crate::print::JsonStyle),
+  Colored,
 }
 
 impl ScanArg {
@@ -83,34 +99,96 @@ impl ScanArg {
   fn include_all_rules(&self) -> bool {
     self.overwrite.include_all_rules() && self.rule.is_none() && self.inline_rules.is_none()
   }
+
+  /// Whether rules come from the project (vs `--rule`/`--inline-rules`, which compile against
+  /// empty global utils) — decides if a remote job ships the project's util YAMLs.
+  pub(crate) fn uses_project_rules(&self) -> bool {
+    self.rule.is_none() && self.inline_rules.is_none()
+  }
+
+  /// Which non-interactive printer this scan selects. The **single source** of that selection:
+  /// the local dispatch (`run_with_config`), the remote dispatch (`remote::scan_remote_dispatch`),
+  /// and the wire `PrinterSpec` builder (`remote::spec`) all branch on this, so the processor the
+  /// agent reconstructs cannot diverge from what a local run prints (docs/REMOTE.md §1). Adding a
+  /// printer is then a compile error at each site until handled, not a silent divergence.
+  pub(crate) fn printer_kind(&self) -> ScanPrinterKind {
+    if self.output.files_with_matches {
+      ScanPrinterKind::FilesWithMatches
+    } else if let Some(format) = &self.format {
+      ScanPrinterKind::Cloud(format.clone())
+    } else if let Some(json) = self.output.json {
+      ScanPrinterKind::Json(json)
+    } else {
+      ScanPrinterKind::Colored
+    }
+  }
+
+  /// Agent-side (`__agent`) construction: only walk inputs and the local result cap matter here —
+  /// rules and printer decisions arrive resolved via the wire job (docs/REMOTE.md §1).
+  pub(crate) fn for_remote_agent(
+    input: InputArgs,
+    output: OutputArgs,
+    context: ContextArgs,
+    max_results: Option<u16>,
+  ) -> Self {
+    Self {
+      rule: None,
+      inline_rules: None,
+      format: None,
+      report_style: ReportStyle::Rich,
+      include_metadata: false,
+      overwrite: OverwriteArgs {
+        filter: None,
+        error: None,
+        warning: None,
+        info: None,
+        hint: None,
+        off: None,
+      },
+      input,
+      output,
+      context,
+      remote: Default::default(),
+      max_results,
+    }
+  }
 }
 
 pub fn run_with_config(arg: ScanArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
   let project_trace = arg.output.inspect.project_trace();
   project_trace.print_project(&project)?;
+  if arg.remote.is_remote() {
+    // Remote fan-out has its own printer dispatch: every non-interactive printer's output is a
+    // relocatable fragment; interactive editing is local-only and rejected there.
+    return crate::remote::scan_remote_dispatch(arg, project);
+  }
   let context = arg.context.get();
-  if arg.output.files_with_matches {
-    let printer = FileNamePrinter::stdout(arg.output.color);
-    return run_scan(arg, printer, project);
-  }
-  if let Some(format) = &arg.format {
-    let printer = CloudPrinter::stdout(format.clone());
-    return run_scan(arg, printer, project);
-  }
-  if let Some(json) = arg.output.json {
-    let printer = JSONPrinter::stdout(json).include_metadata(arg.include_metadata);
-    return run_scan(arg, printer, project);
-  }
-  let printer = ColoredPrinter::stdout(arg.output.color)
-    .style(arg.report_style)
-    .context(context);
-  let interactive = arg.output.needs_interactive();
-  if interactive {
-    let from_stdin = arg.input.stdin;
-    let printer = InteractivePrinter::new(printer, arg.output.update_all, from_stdin)?;
-    run_scan(arg, printer, project)
-  } else {
-    run_scan(arg, printer, project)
+  match arg.printer_kind() {
+    ScanPrinterKind::FilesWithMatches => {
+      let printer = FileNamePrinter::stdout(arg.output.color);
+      run_scan(arg, printer, project)
+    }
+    ScanPrinterKind::Cloud(format) => {
+      let printer = CloudPrinter::stdout(format);
+      run_scan(arg, printer, project)
+    }
+    ScanPrinterKind::Json(json) => {
+      let printer = JSONPrinter::stdout(json).include_metadata(arg.include_metadata);
+      run_scan(arg, printer, project)
+    }
+    ScanPrinterKind::Colored => {
+      let printer = ColoredPrinter::stdout(arg.output.color)
+        .style(arg.report_style)
+        .context(context);
+      // Interactive editing is the one local-only branch (it edits files); remote rejects it.
+      if arg.output.needs_interactive() {
+        let from_stdin = arg.input.stdin;
+        let printer = InteractivePrinter::new(printer, arg.output.update_all, from_stdin)?;
+        run_scan(arg, printer, project)
+      } else {
+        run_scan(arg, printer, project)
+      }
+    }
   }
 }
 
@@ -129,9 +207,11 @@ fn run_scan<P: Printer + 'static>(
   }
 }
 
-struct ScanWithConfig {
+pub(crate) struct ScanWithConfig {
   arg: ScanArg,
   configs: RuleCollection<SgLang>,
+  /// §12 pre-parse gate, built once from every rule's required literals.
+  prefilters: LangPrefilters,
   unused_suppression_rule: RuleConfig<SgLang>,
   no_suppress_all_rule: RuleConfig<SgLang>,
   trace: ScanTrace,
@@ -141,7 +221,7 @@ struct ScanWithConfig {
   max_item_counter: Option<MaxItemCounter>,
 }
 impl ScanWithConfig {
-  fn try_new(arg: ScanArg, project: Result<ProjectConfig>) -> Result<Self> {
+  pub(crate) fn try_new(arg: ScanArg, project: Result<ProjectConfig>) -> Result<Self> {
     let overwrite = RuleOverwrite::new(&arg.overwrite)?;
     let unused_suppression_rule = unused_suppression_rule_config(&arg, &overwrite);
     let no_suppress_all_rule = no_suppress_all_rule_config(&overwrite);
@@ -168,9 +248,11 @@ impl ScanWithConfig {
       .canonicalize()
       .or_else(|_| std::env::current_dir())?;
     let max_item_counter = arg.max_results.map(MaxItemCounter::new);
+    let prefilters = LangPrefilters::build(&configs);
     Ok(Self {
       arg,
       configs,
+      prefilters,
       unused_suppression_rule,
       no_suppress_all_rule,
       trace,
@@ -244,14 +326,56 @@ impl PathWorker for ScanWithConfig {
     path: &Path,
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
-    let items = filter_file_rule(path, &self.configs, &self.trace)?;
+    Ok(self.produce_counted::<P>(path, processor)?.into_iter().map(|(f, _)| f).collect())
+  }
+
+  fn should_stop(&self) -> bool {
+    match &self.max_item_counter {
+      Some(max) => max.reached_max(),
+      None => false,
+    }
+  }
+}
+
+impl crate::remote::CountedProduce for ScanWithConfig {
+  fn produce_counted<P: Printer>(
+    &self,
+    path: &Path,
+    processor: &P::Processor,
+  ) -> Result<Vec<(P::Processed, u32)>> {
+    let items = filter_file_rule(path, &self.configs, &self.trace, Some(&self.prefilters))?;
+    if items.is_empty() {
+      return Ok(vec![]);
+    }
+    // use path relative to project director
+    let abs_path = path.canonicalize()?;
+    let normalized_path = abs_path.strip_prefix(&self.proj_dir).unwrap_or(path);
+    let ret = self.render_items::<P>(path, normalized_path, items, processor)?;
+    if !ret.is_empty() {
+      // Scan feeds the index too (§3.4): rule matches bank the file's extraction product.
+      let _ = vorpal_index::warm_product_cache(path);
+    }
+    Ok(ret)
+  }
+}
+
+impl ScanWithConfig {
+  /// The scan/render loop shared by the filesystem path (`produce_item`) and the remote streaming
+  /// path (`produce_item_from_content`): identical matching, suppression, `--max-results`
+  /// claiming, severity accounting, and rendering. Each rendered fragment is returned with the
+  /// **number of matches** it contains, so an agent can report an accurate `Rendered.match_count`
+  /// (docs/REMOTE.md §3.1); local callers drop the count.
+  fn render_items<P: Printer>(
+    &self,
+    path: &Path,
+    normalized_path: &Path,
+    items: smallvec::SmallVec<[crate::utils::Vorpal; 1]>,
+    processor: &P::Processor,
+  ) -> Result<Vec<(P::Processed, u32)>> {
     let mut error_count = 0usize;
     let mut ret = vec![];
     for grep in items {
       let file_content = grep.source();
-      // use path relative to project director
-      let abs_path = path.canonicalize()?;
-      let normalized_path = abs_path.strip_prefix(&self.proj_dir).unwrap_or(path);
       let rules = self
         .configs
         .get_rule_from_lang(normalized_path, *grep.lang());
@@ -263,8 +387,9 @@ impl PathWorker for ScanWithConfig {
       let scanned = combined.scan(&grep, /* separate_fix*/ interactive);
       if interactive {
         let diffs = scanned.diffs;
+        let count = diffs.len() as u32;
         let processed = match_rule_diff_on_file(path, diffs, processor)?;
-        ret.push(processed);
+        ret.push((processed, count));
       }
       for (rule, matches) in scanned.matches {
         // Atomically reserve slots for matches, truncating if needed
@@ -287,22 +412,97 @@ impl PathWorker for ScanWithConfig {
           error_count = error_count.saturating_add(match_count);
         }
         let processed = match_rule_on_file(path, matches, rule, file_content, processor)?;
-        ret.push(processed);
+        ret.push((processed, match_count as u32));
       }
     }
     self.error_count.fetch_add(error_count, Ordering::AcqRel);
-    if !ret.is_empty() {
-      // Scan feeds the index too (§3.4): rule matches bank the file's extraction product.
-      let _ = vorpal_index::warm_product_cache(path);
-    }
     Ok(ret)
   }
 
-  fn should_stop(&self) -> bool {
-    match &self.max_item_counter {
-      Some(max) => max.reached_max(),
-      None => false,
+  /// Remote streaming mode (§3.3): run the exact scan pipeline on content that arrived over the
+  /// wire. `normalized_path` is the project-relative path for rule `files:`/`ignores:` glob
+  /// matching, computed lexically by the coordinator (no filesystem access here).
+  pub(crate) fn produce_item_from_content<P: Printer>(
+    &self,
+    display_path: &Path,
+    normalized_path: &Path,
+    content: String,
+    processor: &P::Processor,
+  ) -> Result<Vec<P::Processed>> {
+    let items = crate::utils::filter_source_rule(
+      display_path,
+      crate::utils::Source::Memory(content),
+      &self.configs,
+      &self.trace,
+      Some(&self.prefilters),
+    )?;
+    Ok(
+      self
+        .render_items::<P>(display_path, normalized_path, items, processor)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect(),
+    )
+  }
+
+  /// Agent-side construction from a wire job: the rule set arrives pre-resolved (post-overwrite)
+  /// and pre-compiled by the caller; everything else mirrors `try_new`.
+  pub(crate) fn from_remote_parts(
+    arg: ScanArg,
+    configs: RuleCollection<SgLang>,
+    unused_suppression_rule: RuleConfig<SgLang>,
+    no_suppress_all_rule: RuleConfig<SgLang>,
+    proj_dir: PathBuf,
+  ) -> Self {
+    let max_item_counter = arg.max_results.map(MaxItemCounter::new);
+    let prefilters = LangPrefilters::build(&configs);
+    let trace = arg.output.inspect.scan_trace(crate::utils::RuleTrace {
+      file_trace: Default::default(),
+      effective_rule_count: configs.total_rule_count(),
+      skipped_rule_count: 0,
+    });
+    Self {
+      arg,
+      configs,
+      prefilters,
+      unused_suppression_rule,
+      no_suppress_all_rule,
+      trace,
+      proj_dir,
+      error_count: AtomicUsize::new(0),
+      max_item_counter,
     }
+  }
+
+  pub(crate) fn scan_arg(&self) -> &ScanArg {
+    &self.arg
+  }
+
+  pub(crate) fn rule_collection(&self) -> &RuleCollection<SgLang> {
+    &self.configs
+  }
+
+  /// Resolved severities of the two synthesized suppression rules — part of the post-overwrite
+  /// rule semantics a remote agent must reproduce.
+  pub(crate) fn suppression_severities(&self) -> (Severity, Severity) {
+    (
+      self.unused_suppression_rule.severity.clone(),
+      self.no_suppress_all_rule.severity.clone(),
+    )
+  }
+
+  pub(crate) fn project_dir(&self) -> &Path {
+    &self.proj_dir
+  }
+
+  /// Fold a remote node's error-severity match count into the same counter local scanning uses,
+  /// so the exit-code decision in `consume_items` is identical (§3.4).
+  pub(crate) fn add_remote_error_count(&self, count: usize) {
+    self.error_count.fetch_add(count, Ordering::AcqRel);
+  }
+
+  pub(crate) fn local_error_count(&self) -> usize {
+    self.error_count.load(Ordering::Acquire)
   }
 }
 
@@ -499,6 +699,7 @@ rule:
         after: 0,
         context: 0,
       },
+      remote: Default::default(),
       format: None,
       max_results: None,
     }

@@ -16,6 +16,7 @@
 
 mod embed;
 mod index;
+mod qmatrix;
 mod quant;
 mod vamana;
 

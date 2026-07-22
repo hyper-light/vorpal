@@ -2,6 +2,7 @@
 
 use vorpal_kg::{EdgeType, NodeId};
 
+use crate::intern::{self, NameId};
 use crate::reference::{RefForm, RefKind, Reference};
 use crate::table::{Symbol, SymbolTable};
 
@@ -92,6 +93,18 @@ impl Resolver {
   /// 5. a single visible definition binds; multiple bind approximately only where the form
   ///    tolerates it (bare names); none is unresolved.
   pub fn resolve(&self, table: &SymbolTable, reference: &Reference) -> Resolution {
+    self.resolve_with(table, reference, &mut ResolveScratch::default())
+  }
+
+  /// [`Resolver::resolve`] with caller-owned scratch buffers — batch resolution reuses one
+  /// scratch across a whole chunk instead of allocating fresh candidate vectors per
+  /// reference (~4 allocations × millions of references otherwise).
+  fn resolve_with(
+    &self,
+    table: &SymbolTable,
+    reference: &Reference,
+    scratch: &mut ResolveScratch,
+  ) -> Resolution {
     let edge = reference.kind.edge();
     if reference.kind == RefKind::Import {
       if let Some(target) = resolve_import_path(table, reference) {
@@ -103,7 +116,7 @@ impl Resolver {
         };
       }
     }
-    let candidates = table.candidates(&reference.name);
+    let candidates = table.candidates(reference.name);
     if candidates.is_empty() {
       return Resolution {
         target: None,
@@ -113,15 +126,26 @@ impl Resolver {
       };
     }
 
-    if let Some(qualifier) = reference.qualifier.as_deref() {
-      let refined: Vec<&Symbol> = candidates
-        .iter()
-        .filter(|s| qualifier_matches(s, qualifier, reference.form))
-        .collect();
-      if !refined.is_empty() {
+    if let Some(qualifier) = reference.qualifier {
+      scratch.refined.clear();
+      scratch.refined.extend(
+        candidates
+          .iter()
+          .filter(|s| qualifier_matches(s, qualifier, reference.form))
+          .copied(),
+      );
+      if !scratch.refined.is_empty() {
         // The qualifier corroborates these candidates; among them, a multi-way tie (e.g. two
         // `impl Kg` blocks defining `load`) is genuine ambiguity — labeled, tolerated.
-        return finish(&refined, reference, edge, candidates.len(), true);
+        return finish(
+          &scratch.refined,
+          reference,
+          edge,
+          candidates.len(),
+          true,
+          &mut scratch.local,
+          &mut scratch.visible,
+        );
       }
       if reference.form != RefForm::Bare {
         // The grammar names an owner/namespace and nothing in the tree matches it: the target
@@ -136,36 +160,60 @@ impl Resolver {
       }
     }
 
-    let all: Vec<&Symbol> = candidates.iter().collect();
     // Bare names may take a labeled approximate pick on a tie; member accesses on untyped
     // values carry no evidence beyond the name, so only a unique match binds.
     let guess_on_tie = reference.form != RefForm::Method;
-    finish(&all, reference, edge, candidates.len(), guess_on_tie)
+    finish(
+      candidates,
+      reference,
+      edge,
+      candidates.len(),
+      guess_on_tie,
+      &mut scratch.local,
+      &mut scratch.visible,
+    )
   }
+}
+
+/// Reusable candidate buffers for [`Resolver::resolve_with`] — cleared per reference, sized
+/// by the largest candidate set a chunk encounters.
+#[derive(Default)]
+struct ResolveScratch {
+  refined: Vec<Symbol>,
+  local: Vec<Symbol>,
+  visible: Vec<Symbol>,
 }
 
 /// Shared tail of resolution: local-first, then cross-file visibility, then pick.
 fn finish(
-  set: &[&Symbol],
+  set: &[Symbol],
   reference: &Reference,
   edge: EdgeType,
   candidates: usize,
   guess_on_tie: bool,
+  local: &mut Vec<Symbol>,
+  visible: &mut Vec<Symbol>,
 ) -> Resolution {
-  let local: Vec<&Symbol> = set
-    .iter()
-    .copied()
-    .filter(|s| s.path == *reference.from_path)
-    .collect();
+  local.clear();
+  local.extend(
+    set
+      .iter()
+      .filter(|s| s.path == reference.from_path)
+      .copied(),
+  );
   if !local.is_empty() {
-    return pick(&local, edge, Confidence::LOCAL, candidates, guess_on_tie);
+    return pick(local, edge, Confidence::LOCAL, candidates, guess_on_tie);
   }
 
-  let visible: Vec<&Symbol> = set
-    .iter()
-    .copied()
-    .filter(|s| s.exported || privately_visible(&s.path, &reference.from_path))
-    .collect();
+  // Resolve the reference's path text once per reference, not once per candidate.
+  let from_path_text = intern::text_of(reference.from_path);
+  visible.clear();
+  visible.extend(
+    set
+      .iter()
+      .filter(|s| s.exported || privately_visible(intern::text_of(s.path), from_path_text))
+      .copied(),
+  );
   if visible.is_empty() {
     // Definitions exist, but all are private to other files → not visible here.
     return Resolution {
@@ -176,7 +224,7 @@ fn finish(
     };
   }
   pick(
-    &visible,
+    visible,
     edge,
     Confidence::CROSS_FILE,
     candidates,
@@ -188,10 +236,13 @@ fn finish(
 /// that name, or — for static paths only — it is a top-level definition in a module file named
 /// `q` (`util::helper` → `…/util.rs`). Method receivers never module-match: a variable that
 /// happens to share a file's name is coincidence, not namespace evidence.
-fn qualifier_matches(symbol: &Symbol, q: &str, form: RefForm) -> bool {
-  match symbol.owner.as_deref() {
+fn qualifier_matches(symbol: &Symbol, q: NameId, form: RefForm) -> bool {
+  match symbol.owner {
     Some(owner) => owner == q,
-    None => form == RefForm::Static && module_stem_matches(&symbol.path, q),
+    None => {
+      form == RefForm::Static
+        && module_stem_matches(intern::text_of(symbol.path), intern::text_of(q))
+    }
   }
 }
 
@@ -248,17 +299,19 @@ fn privately_visible(def_path: &str, from_path: &str) -> bool {
 /// Java's `Helper` must not be hijacked to a coincidentally-named `Helper.java` file node when
 /// precise symbol resolution is available.
 fn resolve_import_path(table: &SymbolTable, reference: &Reference) -> Option<NodeId> {
-  if !reference.name.contains(['/', '.']) {
+  let name = intern::text_of(reference.name);
+  if !name.contains(['/', '.']) {
     return None;
   }
-  if let Some(id) = table.file(&reference.name) {
+  if let Some(id) = table.file(name) {
     return Some(id);
   }
-  let joined = join_normalize(parent_dir(&reference.from_path), &reference.name);
+  let from_path = intern::text_of(reference.from_path);
+  let joined = join_normalize(parent_dir(from_path), name);
   if let Some(id) = table.file(&joined) {
     return Some(id);
   }
-  let ext = extension(&reference.from_path)?;
+  let ext = extension(from_path)?;
   table.file(&format!("{joined}.{ext}"))
 }
 
@@ -302,7 +355,7 @@ fn extension(path: &str) -> Option<&str> {
 /// deterministic min-id target at `AMBIGUOUS` when the reference's form tolerates it, and no
 /// edge at all when it does not.
 fn pick(
-  set: &[&Symbol],
+  set: &[Symbol],
   edge: EdgeType,
   unique: Confidence,
   candidates: usize,
@@ -361,13 +414,105 @@ pub fn resolve_all(
     .par_chunks(chunk_size)
     .map(|chunk| resolve_chunk(table, chunk, resolver))
     .collect();
-  let mut edges = Vec::with_capacity(references.len());
+  // Reserve what actually resolved, not one slot per reference — at kernel scale roughly
+  // half of all references yield edges, and the difference is ~80 MB of dead reservation.
+  let total: usize = shards.iter().map(|(edges, _)| edges.len()).sum();
+  let mut edges = Vec::with_capacity(total);
   let mut stats = ResolveStats::default();
   for (shard_edges, shard_stats) in shards {
     edges.extend(shard_edges);
     stats += shard_stats;
   }
   (edges, stats)
+}
+
+/// [`resolve_all`] over a [`crate::RefSpill`] instead of an in-RAM slice: chunks stream off
+/// disk through a bounded channel into a worker pool, and edge lists concatenate in chunk
+/// order — output identical to `resolve_all` on the same references (chunking is invisible:
+/// resolution is a pure per-reference read of the immutable table). In-flight memory is a
+/// few chunks, not the whole reference stream.
+pub fn resolve_all_spilled(
+  table: &SymbolTable,
+  spill: &crate::RefSpill,
+  resolver: &Resolver,
+) -> std::io::Result<(Vec<ResolvedEdge>, ResolveStats)> {
+  let mut edges = Vec::new();
+  let stats = resolve_all_spilled_into(table, spill, resolver, |edge| edges.push(*edge))?;
+  Ok((edges, stats))
+}
+
+/// [`resolve_all_spilled`] delivering edges through `sink` — in exactly the order the
+/// collected form would have held them — instead of materializing the edge vector (~90 MB
+/// alive under the seal at kernel scale). Chunks stream to a worker pool through a bounded
+/// channel; the sink runs on the calling thread, fed by a rolling in-order drain of
+/// finished chunks (the absorb-holdback pattern).
+pub fn resolve_all_spilled_into(
+  table: &SymbolTable,
+  spill: &crate::RefSpill,
+  resolver: &Resolver,
+  mut sink: impl FnMut(&ResolvedEdge),
+) -> std::io::Result<ResolveStats> {
+  let threads = std::thread::available_parallelism()
+    .map(|n| n.get())
+    .unwrap_or(1);
+  let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, Vec<Reference>)>(threads * 2);
+  let (out_tx, out_rx) = crossbeam_channel::unbounded::<(usize, Vec<ResolvedEdge>, ResolveStats)>();
+
+  let mut stats = ResolveStats::default();
+  {
+    let sink = &mut sink;
+    let stats = &mut stats;
+    std::thread::scope(|scope| -> std::io::Result<()> {
+      for _ in 0..threads {
+        let work_rx = work_rx.clone();
+        let out_tx = out_tx.clone();
+        scope.spawn(move || {
+          while let Ok((index, chunk)) = work_rx.recv() {
+            let (edges, stats) = resolve_chunk(table, &chunk, resolver);
+            if out_tx.send((index, edges, stats)).is_err() {
+              break;
+            }
+          }
+        });
+      }
+      drop(work_rx);
+      drop(out_tx);
+
+      let mut holdback: std::collections::BTreeMap<usize, (Vec<ResolvedEdge>, ResolveStats)> =
+        std::collections::BTreeMap::new();
+      let mut next_out = 0usize;
+
+      for (sent, chunk) in spill.chunks()?.enumerate() {
+        if work_tx.send((sent, chunk?)).is_err() {
+          break;
+        }
+        while let Ok((index, chunk_edges, chunk_stats)) = out_rx.try_recv() {
+          holdback.insert(index, (chunk_edges, chunk_stats));
+        }
+        while let Some((chunk_edges, chunk_stats)) = holdback.remove(&next_out) {
+          for edge in &chunk_edges {
+            sink(edge);
+          }
+          *stats += chunk_stats;
+          next_out += 1;
+        }
+      }
+      drop(work_tx);
+
+      while let Ok((index, chunk_edges, chunk_stats)) = out_rx.recv() {
+        holdback.insert(index, (chunk_edges, chunk_stats));
+        while let Some((chunk_edges, chunk_stats)) = holdback.remove(&next_out) {
+          for edge in &chunk_edges {
+            sink(edge);
+          }
+          *stats += chunk_stats;
+          next_out += 1;
+        }
+      }
+      Ok(())
+    })?;
+  }
+  Ok(stats)
 }
 
 /// The serial kernel: resolve one contiguous run of references in order.
@@ -378,8 +523,9 @@ fn resolve_chunk(
 ) -> (Vec<ResolvedEdge>, ResolveStats) {
   let mut edges = Vec::new();
   let mut stats = ResolveStats::default();
+  let mut scratch = ResolveScratch::default();
   for reference in references {
-    let resolution = resolver.resolve(table, reference);
+    let resolution = resolver.resolve_with(table, reference, &mut scratch);
     match resolution.target {
       Some(to) => {
         if resolution.confidence <= Confidence::AMBIGUOUS {
@@ -409,6 +555,7 @@ fn resolve_chunk(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::intern;
   use crate::reference::{RefForm, RefKind, Reference};
   use crate::table::{Symbol, SymbolTable};
   use vorpal_kg::SymbolKind;
@@ -417,9 +564,9 @@ mod tests {
     Symbol {
       id: NodeId::new(id),
       kind: SymbolKind::Function,
-      path: path.to_owned(),
+      path: intern::intern(path),
       exported,
-      owner: owner.map(str::to_owned),
+      owner: owner.map(intern::intern),
     }
   }
 
@@ -434,6 +581,7 @@ mod tests {
     table.insert("new", symbol(2, "b.rs", true, Some("Manifest")));
 
     // `Kg::new()` → exactly the Kg member, despite two visible `new`s.
+    table.finalize();
     let r = Resolver::new().resolve(
       &table,
       &call("new", "c.rs")
@@ -460,6 +608,7 @@ mod tests {
     table.insert("helper", symbol(1, "src/util.rs", true, None));
     table.insert("helper", symbol(2, "src/other.rs", true, None));
 
+    table.finalize();
     let r = Resolver::new().resolve(
       &table,
       &call("helper", "src/a.rs")
@@ -485,6 +634,7 @@ mod tests {
     table.insert("map", symbol(2, "b.rs", true, Some("Grid")));
 
     // `x.map()` with two visible candidates: no edge, counted as masked.
+    table.finalize();
     let r = Resolver::new().resolve(&table, &call("map", "c.rs").with_form(RefForm::Method));
     assert_eq!(r.target, None);
 
@@ -496,6 +646,7 @@ mod tests {
     // A unique candidate binds for methods too.
     let mut unique = SymbolTable::new();
     unique.insert("map", symbol(7, "a.rs", true, Some("Chart")));
+    unique.finalize();
     let r = Resolver::new().resolve(&unique, &call("map", "c.rs").with_form(RefForm::Method));
     assert_eq!(r.target, Some(NodeId::new(7)));
   }
@@ -509,6 +660,7 @@ mod tests {
     );
 
     // `output/tests.rs` is a descendant module of `output.rs` → private is visible.
+    table.finalize();
     let r = Resolver::new().resolve(
       &table,
       &call("print_text_to", "src/outline/output/tests.rs"),
@@ -517,12 +669,14 @@ mod tests {
     assert_eq!(r.confidence, Confidence::CROSS_FILE);
 
     // A sibling file is not.
+    table.finalize();
     let r = Resolver::new().resolve(&table, &call("print_text_to", "src/outline/other.rs"));
     assert_eq!(r.target, None);
 
     // Carrier files own their directory subtree.
     let mut lib = SymbolTable::new();
     lib.insert("internal", symbol(2, "crates/x/src/lib.rs", false, None));
+    lib.finalize();
     let r = Resolver::new().resolve(&lib, &call("internal", "crates/x/src/deep/nested.rs"));
     assert_eq!(r.target, Some(NodeId::new(2)));
     let r = Resolver::new().resolve(&lib, &call("internal", "crates/y/src/a.rs"));
@@ -535,6 +689,7 @@ mod tests {
     table.insert("Helper", symbol(1, "src/com/x/Helper.java", false, None));
 
     // Same package (directory) → visible.
+    table.finalize();
     let r = Resolver::new().resolve(&table, &call("Helper", "src/com/x/Main.java"));
     assert_eq!(r.target, Some(NodeId::new(1)));
 
@@ -583,6 +738,7 @@ mod tests {
     assert!(references.len() > 4096, "must exercise the sharded path");
 
     let resolver = Resolver::new();
+    table.finalize();
     let (sharded_edges, sharded_stats) = resolve_all(&table, &references, &resolver);
 
     // The serial specification: one resolver call per reference, in order.
@@ -627,6 +783,7 @@ mod tests {
       call("hidden", "b.rs"),  // exists, not visible → masked
       call("hidden", "a.rs"),  // same file → resolved
     ];
+    table.finalize();
     let (edges, stats) = resolve_all(&table, &refs, &Resolver::new());
     assert_eq!(edges.len(), 1);
     assert_eq!(stats.resolved, 1);

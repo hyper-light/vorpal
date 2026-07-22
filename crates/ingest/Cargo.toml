@@ -17,8 +17,9 @@ vorpal-core.workspace = true
 vorpal-language.workspace = true
 vorpal-resolve.workspace = true
 
-blake3 = "1"
+blake3.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-utils.workspace = true
 ignore.workspace = true
 rayon.workspace = true
+vorpal-mem.workspace = true

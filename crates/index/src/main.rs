@@ -3,6 +3,33 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+/// jemalloc with prompt page return: at kernel scale, roughly 45% of the default macOS
+/// allocator's peak footprint was freed-but-retained magazine pages (2.05 GB observed vs a
+/// ~0.95 GB live set). jemalloc's decay returns those pages while running, and its
+/// thread-local caches are also simply faster under the pipeline's multithreaded churn.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Compiled-in jemalloc tuning (overridable at runtime via `_RJEM_MALLOC_CONF`): zero decay
+/// returns freed pages to the OS immediately — a bulk pipeline's phases hand memory back
+/// instead of stacking retained garbage under the next phase's live set — and a bounded
+/// arena count stops 4×ncpu arenas from each holding a retention tail (~140 MB spread at
+/// kernel scale). Measured on the Linux tree: default malloc 2.05 GB peak → this config
+/// 1.13 GB, equal wall time.
+#[cfg(not(target_env = "msvc"))]
+mod jemalloc_conf {
+  #[repr(transparent)]
+  pub struct SyncPtr(#[allow(dead_code)] *const u8);
+  unsafe impl Sync for SyncPtr {}
+  #[unsafe(export_name = "_rjem_malloc_conf")]
+  pub static MALLOC_CONF: SyncPtr = SyncPtr(
+    c"narenas:8,dirty_decay_ms:0,muzzy_decay_ms:0"
+      .as_ptr()
+      .cast(),
+  );
+}
+
 use vorpal_index::{build_index, graph_query, search_index};
 
 const USAGE: &str = "usage:
@@ -15,7 +42,25 @@ const USAGE: &str = "usage:
   vorpal-index node         <index-dir> <name>      nodes matching a name
   vorpal-index search       <index-dir> <query> [k] hybrid search (name + semantic + graph, RRF)";
 
+/// Route tree-sitter's C-side allocations through jemalloc too. Without this the parser's
+/// tree memory lives in the macOS default zone — outside jemalloc's decay policy — and
+/// freed-but-retained tree pages (~150–250 MB at kernel scale) ride under the link phase's
+/// peak. One allocator, one policy.
+#[cfg(not(target_env = "msvc"))]
+fn unify_parser_allocator() {
+  unsafe {
+    tree_sitter::set_allocator(
+      Some(tikv_jemalloc_sys::malloc),
+      Some(tikv_jemalloc_sys::calloc),
+      Some(tikv_jemalloc_sys::realloc),
+      Some(tikv_jemalloc_sys::free),
+    );
+  }
+}
+
 fn main() -> ExitCode {
+  #[cfg(not(target_env = "msvc"))]
+  unify_parser_allocator();
   match run() {
     Ok(()) => ExitCode::SUCCESS,
     Err(err) => {

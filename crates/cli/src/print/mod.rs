@@ -14,7 +14,7 @@ use clap::ValueEnum;
 use std::borrow::Cow;
 use std::path::Path;
 
-pub use cloud_print::{CloudPrinter, Platform};
+pub use cloud_print::{CloudOutput, CloudPrinter, Platform};
 pub use codespan_reporting::files::SimpleFile;
 use codespan_reporting::term::termcolor::ColorChoice;
 use colored_print::PrintStyles;
@@ -41,6 +41,70 @@ pub trait PrintProcessor<Output>: Send + Sync + 'static {
     diffs: Vec<(Diff, &RuleConfig<SgLang>)>,
     path: &Path,
   ) -> Result<Output>;
+}
+
+/// A `Printer::Processed` value that can cross the wire (§3, `docs/REMOTE.md`): rendered on a
+/// remote agent, decoded on the coordinator, and fed into the *same* consumer channel a local run
+/// uses. Every non-interactive printer's `Processed` is already a fully-rendered, relocatable
+/// value, so these impls are pure byte moves — no printer logic changes.
+///
+/// The bound is applied at the remote entry points (`P::Processed: WireFragment`), not on
+/// `Printer` itself: the interactive printer's payload holds borrowed diffs and is excluded from
+/// `--remote` by construction.
+pub trait WireFragment: Sized + Send + 'static {
+  /// Append the encoded fragment to `out` (runs on the agent).
+  fn encode(&self, out: &mut Vec<u8>);
+  /// Decode a fragment received from a node (runs on the coordinator).
+  fn decode(bytes: &[u8]) -> Result<Self>;
+}
+
+/// JSON printer fragments are already rendered bytes.
+impl WireFragment for Vec<u8> {
+  fn encode(&self, out: &mut Vec<u8>) {
+    out.extend_from_slice(self);
+  }
+  fn decode(bytes: &[u8]) -> Result<Self> {
+    Ok(bytes.to_vec())
+  }
+}
+
+/// Colored / file-name fragments: a `termcolor::Buffer` is a byte buffer with ANSI codes already
+/// baked in (or absent) — `process` only ever calls `as_slice`, so a no-color buffer carrying the
+/// original bytes verbatim is indistinguishable from the agent-side original.
+impl WireFragment for codespan_reporting::term::termcolor::Buffer {
+  fn encode(&self, out: &mut Vec<u8>) {
+    out.extend_from_slice(self.as_slice());
+  }
+  fn decode(bytes: &[u8]) -> Result<Self> {
+    use std::io::Write;
+    let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+    buf.write_all(bytes)?;
+    Ok(buf)
+  }
+}
+
+/// Cloud fragments: GitHub annotations are rendered bytes; SARIF results are serde values that the
+/// coordinator's `after_print` folds into one log, so they travel as JSON.
+impl WireFragment for CloudOutput {
+  fn encode(&self, out: &mut Vec<u8>) {
+    match self {
+      CloudOutput::GitHub(bytes) => {
+        out.push(0);
+        out.extend_from_slice(bytes);
+      }
+      CloudOutput::Sarif(results) => {
+        out.push(1);
+        serde_json::to_writer(out, results).expect("sarif results serialize to JSON");
+      }
+    }
+  }
+  fn decode(bytes: &[u8]) -> Result<Self> {
+    match bytes.split_first() {
+      Some((0, rest)) => Ok(CloudOutput::GitHub(rest.to_vec())),
+      Some((1, rest)) => Ok(CloudOutput::Sarif(serde_json::from_slice(rest)?)),
+      _ => Err(anyhow::anyhow!("malformed cloud fragment")),
+    }
+  }
 }
 
 pub trait Printer {

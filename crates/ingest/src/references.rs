@@ -2083,7 +2083,7 @@ mod tests {
     time("apply+link (sharded)", &|| {
       let cloned: Vec<_> = products.clone();
       let (writer, references) = crate::apply_products_sharded(cloned);
-      let (kg, stats) = crate::link_writer(writer, &references, &vorpal_resolve::Resolver::new());
+      let (kg, stats) = crate::link_writer(writer, references, &vorpal_resolve::Resolver::new());
       kg.node_count() + stats.resolved as usize
     });
   }

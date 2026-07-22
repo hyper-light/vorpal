@@ -6,10 +6,13 @@ mod lsp;
 mod new;
 mod outline;
 mod print;
+mod remote;
 mod run;
 mod scan;
 mod utils;
 mod verify;
+
+pub use remote::agent::{is_agent_invocation, run_agent};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -80,6 +83,11 @@ enum Commands {
 }
 
 pub fn execute_main() -> Result<ExitCode> {
+  // The hidden `__agent` mode turns this binary into a fleet agent driven over stdin/stdout
+  // (docs/REMOTE.md). It is spawned by a coordinator (loopback in R0), never used by hand.
+  if is_agent_invocation(std::env::args()) {
+    return run_agent();
+  }
   match main_with_args(std::env::args()) {
     Err(error) => exit_with_error(error),
     ok => ok,

@@ -16,6 +16,7 @@ version.workspace = true
 [dependencies]
 bit-set.workspace = true
 regex.workspace = true
+regex-syntax = "0.8"
 thiserror.workspace = true
 tree-sitter = { workspace = true, optional = true }
 

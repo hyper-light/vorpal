@@ -27,13 +27,83 @@ pub struct NodeDef<'a> {
   pub content_hash: u64,
 }
 
+/// Where the writer's string heap lives. Shard writers and small trees build in RAM; the
+/// merged writer of a streaming commit writes **through to disk** as shards absorb — the
+/// concatenated heap (~140 MB at kernel scale) never occupies anonymous memory, and the
+/// link pass reads it back through a zero-copy map. `Streaming` is write-only by
+/// construction: every read happens after `finalize_streamed_heap` flips it to `Mapped`.
+enum HeapStore {
+  Ram(Vec<u8>),
+  Streaming {
+    out: std::io::BufWriter<std::fs::File>,
+    len: u64,
+    path: std::path::PathBuf,
+  },
+  Mapped {
+    column: vorpal_mem::PodColumn<u8>,
+    path: std::path::PathBuf,
+  },
+}
+
+impl Default for HeapStore {
+  fn default() -> Self {
+    HeapStore::Ram(Vec::new())
+  }
+}
+
+impl HeapStore {
+  fn len(&self) -> u64 {
+    match self {
+      HeapStore::Ram(bytes) => bytes.len() as u64,
+      HeapStore::Streaming { len, .. } => *len,
+      HeapStore::Mapped { column, .. } => column.len() as u64,
+    }
+  }
+
+  fn append(&mut self, bytes: &[u8]) {
+    // Heap offsets are u32 columns; a >4 GiB heap needs a format change, not silent wrap.
+    assert!(
+      self.len() + bytes.len() as u64 <= u32::MAX as u64,
+      "string heap exceeds the u32 offset space"
+    );
+    match self {
+      HeapStore::Ram(heap) => heap.extend_from_slice(bytes),
+      HeapStore::Streaming { out, len, .. } => {
+        use std::io::Write;
+        out.write_all(bytes).expect("streamed heap write failed");
+        *len += bytes.len() as u64;
+      }
+      HeapStore::Mapped { .. } => panic!("append to a finalized writer heap"),
+    }
+  }
+
+  fn bytes(&self) -> &[u8] {
+    match self {
+      HeapStore::Ram(heap) => heap,
+      HeapStore::Mapped { column, .. } => column,
+      HeapStore::Streaming { .. } => {
+        panic!("read from a streaming writer heap before finalize_streamed_heap")
+      }
+    }
+  }
+}
+
+impl std::fmt::Debug for HeapStore {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "HeapStore(len={})", self.len())
+  }
+}
+
 /// Accumulates interned nodes (SoA columns + string heap) and edges, then seals a queryable
 /// [`Kg`]. Ids are dense and assignment-ordered, so a column row index equals its id.
 #[derive(Default)]
 pub struct KgWriter {
   canonical: CanonicalIndex,
+  /// The current file's path with its interned heap location — one heap copy per file, shared
+  /// by every node of that file.
+  shared_path: Option<(String, (u32, u32))>,
   edges: EdgeLog,
-  heap: Vec<u8>,
+  heap: HeapStore,
   kind: Vec<u8>,
   name_off: Vec<u32>,
   name_len: Vec<u32>,
@@ -98,6 +168,11 @@ impl KgWriter {
     items: &[OutlineItem<'_>],
   ) -> Vec<(Range<usize>, NodeId)> {
     let mut spans = Vec::new();
+    // Intern the path bytes once for this whole file: every node of the file shares one heap
+    // copy via identical (offset, len) column entries — reader-compatible, and it removes the
+    // dominant heap duplication (at kernel scale, ~130 MB of repeated path strings for
+    // ~3.5 MB of unique paths).
+    self.shared_path_for(path);
     let file_id = self.define(NodeDef {
       kind: SymbolKind::File,
       name: path,
@@ -148,6 +223,72 @@ impl KgWriter {
     spans
   }
 
+  /// Release growth slack on every column, the string heap, and the edge log. Vec doubling
+  /// leaves up to 2× capacity behind — ~150 MB of dead pages at kernel scale — and a writer
+  /// that has absorbed its last shard keeps that slack alive through the whole link phase
+  /// unless it is returned here.
+  pub fn shrink_to_fit(&mut self) {
+    self.kind.shrink_to_fit();
+    self.name_off.shrink_to_fit();
+    self.name_len.shrink_to_fit();
+    self.path_off.shrink_to_fit();
+    self.path_len.shrink_to_fit();
+    self.sig_off.shrink_to_fit();
+    self.sig_len.shrink_to_fit();
+    self.content_hash.shrink_to_fit();
+    self.flags.shrink_to_fit();
+    if let HeapStore::Ram(heap) = &mut self.heap {
+      heap.shrink_to_fit();
+    }
+    self.edges.shrink_to_fit();
+  }
+
+  /// Switch the (empty) heap to write-through mode: every appended string byte goes to
+  /// `path` instead of anonymous memory. The streaming commit calls this on its merged
+  /// writer before the first absorb; reads become possible after
+  /// [`KgWriter::finalize_streamed_heap`].
+  pub fn stream_heap_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+    assert_eq!(self.heap.len(), 0, "stream_heap_to on a non-empty heap");
+    self.heap = HeapStore::Streaming {
+      out: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?),
+      len: 0,
+      path: path.to_path_buf(),
+    };
+    Ok(())
+  }
+
+  /// Flush the streamed heap and reopen it as a zero-copy map, making reads (the link
+  /// pass's `definition` lookups) legal again. No-op for RAM heaps.
+  pub fn finalize_streamed_heap(&mut self) -> std::io::Result<()> {
+    if let HeapStore::Streaming { out, len, path } = &mut self.heap {
+      use std::io::Write;
+      out.flush()?;
+      let path = std::mem::take(path);
+      let len = *len as usize;
+      // Drop the writer handle before mapping.
+      let placeholder = HeapStore::Ram(Vec::new());
+      drop(std::mem::replace(&mut self.heap, placeholder));
+      let store = std::sync::Arc::new(vorpal_mem::MappedStore::map_file(
+        &path,
+        vorpal_mem::StoreKind::VectorsFull,
+        vorpal_mem::AccessPattern::Random,
+        vorpal_mem::Hotness::Hot,
+        &vorpal_mem::ResourcePolicy::probe(vorpal_mem::CorpusProbe::new(0, 0)),
+      )?);
+      let column = vorpal_mem::PodColumn::from_mapped_le(&store, 0, len, u8::from_le_bytes)?;
+      self.heap = HeapStore::Mapped { column, path };
+    }
+    Ok(())
+  }
+
+  /// Forget canonical-identity keys accumulated so far, keeping the id counter (new
+  /// definitions continue receiving fresh dense ids). Sound only when no already-applied
+  /// `(path, entity)` will be defined or looked up again on this writer — the product-apply
+  /// invariant (each path lands exactly once). Turns the identity map from corpus-sized into
+  /// file-sized during bulk builds.
+  pub fn forget_identity_scope(&mut self) {
+    self.canonical.forget_keys();
+  }
   /// The interned id for an entity (`entity_path` within `path`), if defined — the stable-key
   /// lookup replayed extraction products use to re-attribute their references.
   pub fn entity_id(&self, path: &str, entity_path: &str) -> Option<NodeId> {
@@ -177,7 +318,7 @@ impl KgWriter {
   pub fn absorb(&mut self, other: KgWriter) -> u64 {
     let id_base = self.kind.len() as u64;
     let heap_base = self.heap.len() as u32;
-    self.heap.extend_from_slice(&other.heap);
+    self.heap.append(other.heap.bytes());
     self.kind.extend_from_slice(&other.kind);
     self
       .name_off
@@ -229,40 +370,93 @@ impl KgWriter {
   }
 
   fn push_str(&mut self, s: &str) -> (u32, u32) {
+    if let Some(&(off, len)) = self
+      .shared_path
+      .as_ref()
+      .filter(|(text, _)| text == s)
+      .map(|(_, at)| at)
+    {
+      return (off, len);
+    }
     let off = self.heap.len() as u32;
-    self.heap.extend_from_slice(s.as_bytes());
+    self.heap.append(s.as_bytes());
     (off, s.len() as u32)
   }
 
+  /// Register `path` as the current file's shared heap string: subsequent `push_str` calls
+  /// with the same text reuse one heap copy instead of appending a duplicate per node.
+  fn shared_path_for(&mut self, path: &str) {
+    let off = self.heap.len() as u32;
+    self.heap.append(path.as_bytes());
+    self.shared_path = Some((path.to_owned(), (off, path.len() as u32)));
+  }
+
   fn heap_str(&self, off: u32, len: u32) -> &str {
-    std::str::from_utf8(&self.heap[off as usize..(off + len) as usize]).unwrap_or("")
+    std::str::from_utf8(&self.heap.bytes()[off as usize..(off + len) as usize]).unwrap_or("")
   }
 
   /// Seal the accumulated nodes into a `.vseg` node segment + string heap and compact the edges
   /// into CSR/CSC (§9.3), returning a queryable graph.
+  ///
+  /// Columns stream into the segment one at a time — each is taken out of the writer, copied,
+  /// and freed before the next is touched — so peak transient memory during seal is one
+  /// column's worth, not a second full copy of every column at once. The edge log is likewise
+  /// dropped as soon as the compacted graph exists.
   pub fn seal(mut self) -> Kg {
+    crate::phase_stamp("seal: columns");
     let n = self.kind.len() as u32;
     self.canonical.seal();
+    drop(std::mem::take(&mut self.canonical));
 
     let mut builder = SegmentBuilder::new(0);
-    builder.add_u8("kind", &self.kind).unwrap();
-    builder.add_u32("name_off", &self.name_off).unwrap();
-    builder.add_u32("name_len", &self.name_len).unwrap();
-    builder.add_u32("path_off", &self.path_off).unwrap();
-    builder.add_u32("path_len", &self.path_len).unwrap();
-    builder.add_u32("sig_off", &self.sig_off).unwrap();
-    builder.add_u32("sig_len", &self.sig_len).unwrap();
-    builder.add_u64("content_hash", &self.content_hash).unwrap();
-    builder.add_u8("flags", &self.flags).unwrap();
+    let kind = std::mem::take(&mut self.kind);
+    builder.add_u8("kind", &kind).unwrap();
+    drop(kind);
+    let name_off = std::mem::take(&mut self.name_off);
+    builder.add_u32("name_off", &name_off).unwrap();
+    drop(name_off);
+    let name_len = std::mem::take(&mut self.name_len);
+    builder.add_u32("name_len", &name_len).unwrap();
+    drop(name_len);
+    let path_off = std::mem::take(&mut self.path_off);
+    builder.add_u32("path_off", &path_off).unwrap();
+    drop(path_off);
+    let path_len = std::mem::take(&mut self.path_len);
+    builder.add_u32("path_len", &path_len).unwrap();
+    drop(path_len);
+    let sig_off = std::mem::take(&mut self.sig_off);
+    builder.add_u32("sig_off", &sig_off).unwrap();
+    drop(sig_off);
+    let sig_len = std::mem::take(&mut self.sig_len);
+    builder.add_u32("sig_len", &sig_len).unwrap();
+    drop(sig_len);
+    let content_hash = std::mem::take(&mut self.content_hash);
+    builder.add_u64("content_hash", &content_hash).unwrap();
+    drop(content_hash);
+    let flags = std::mem::take(&mut self.flags);
+    builder.add_u8("flags", &flags).unwrap();
+    drop(flags);
     let nodes = Segment::open_owned(builder.build().unwrap()).unwrap();
 
-    let graph = Graph::compact(n, &self.edges);
+    crate::phase_stamp("seal: compact");
+    let edges = std::mem::take(&mut self.edges);
+    let graph = Graph::compact(n, &edges);
+    drop(edges);
+    crate::phase_stamp("seal: kg assemble");
 
     let mut directory = SegmentDirectory::new();
     directory.insert(0, n as u64, 0);
 
-    Kg::new(nodes, self.heap, graph, directory)
-      .expect("sealed segment carries every column the builder just wrote")
+    match self.heap {
+      HeapStore::Ram(heap) => Kg::new(nodes, heap, graph, directory),
+      HeapStore::Mapped { column, path } => {
+        Kg::with_heap_column(nodes, column, Some(path), graph, directory)
+      }
+      HeapStore::Streaming { .. } => {
+        unreachable!("finalize_streamed_heap runs before seal on the streaming path")
+      }
+    }
+    .expect("sealed segment carries every column the builder just wrote")
   }
 }
 

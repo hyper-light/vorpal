@@ -6,13 +6,17 @@ mod print_diff;
 mod rule_overwrite;
 mod worker;
 
-pub use args::{ContextArgs, InputArgs, OutputArgs, OverwriteArgs};
+pub use args::{ContextArgs, IgnoreFile, InputArgs, NoIgnore, OutputArgs, OverwriteArgs, WalkIgnore};
 pub use debug_query::DebugFormat;
 pub use error_context::{ErrorContext, exit_with_error};
 pub use inspect::{FileTrace, Granularity, RuleTrace, RunTrace, ScanTrace};
 pub use print_diff::DiffStyles;
 pub use rule_overwrite::RuleOverwrite;
-pub use worker::{Items, MaxItemCounter, PathWorker, StdInWorker, Worker};
+pub use worker::{
+  ChannelCap, ItemSink, Items, MaxItemCounter, PathWorker, Produce, StdInWorker, Worker,
+  run_producer,
+};
+pub(crate) use worker::filter_result;
 
 use crate::lang::SgLang;
 
@@ -37,7 +41,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-type Vorpal = vorpal_core::Vorpal<StrDoc<SgLang>>;
+pub(crate) type Vorpal = vorpal_core::Vorpal<StrDoc<SgLang>>;
 
 fn read_char() -> Result<char> {
   loop {
@@ -108,9 +112,27 @@ impl fmt::Display for EmptyFile {
 
 impl std::error::Error for EmptyFile {}
 
+/// Where file content comes from: the local filesystem (today's path) or memory (content that
+/// arrived over the wire in remote streaming mode, §3.3 of `docs/REMOTE.md`). `read_file` is the
+/// single byte-acquisition chokepoint of the match pipeline; everything downstream of it is
+/// filesystem-agnostic.
+///
+/// `Memory` owns its `String` so it is consumed straight into the parser (`lang.grep`) with no
+/// re-copy — a stream-mode scan of a billion-LOC corpus must not memcpy every file twice.
+pub enum Source {
+  Fs,
+  Memory(String),
+}
+
 pub(crate) fn read_file(path: &Path) -> Result<String> {
   let file_content =
     read_to_string(path).with_context(|| format!("Cannot read file {}", path.to_string_lossy()))?;
+  validate_content(file_content)
+}
+
+/// Apply the exact size/emptiness gates `read_file` applies, so in-memory content is accepted or
+/// rejected byte-for-byte like local content (discovery parity would otherwise silently drift).
+fn validate_content(file_content: String) -> Result<String> {
   // skip large files or empty file
   if file_too_large(&file_content) {
     Err(anyhow!("File is too large"))
@@ -118,6 +140,14 @@ pub(crate) fn read_file(path: &Path) -> Result<String> {
     Err(EmptyFile.into())
   } else {
     Ok(file_content)
+  }
+}
+
+fn read_source(path: &Path, source: Source) -> Result<String> {
+  match source {
+    Source::Fs => read_file(path),
+    // Already owned — validate in place, no second allocation.
+    Source::Memory(content) => validate_content(content),
   }
 }
 
@@ -132,15 +162,95 @@ fn collect_file_stats(
   Ok(())
 }
 
+/// The in-source suppression marker (`vorpal-ignore` comments): a file containing it must
+/// always be scanned — suppression bookkeeping (used/unused directives) is part of scan
+/// output even when no rule matches the file.
+const SUPPRESSION_MARKER: &str = "vorpal-ignore";
+
+/// Per-language OR-of-rules prefilters for the scan path (§12): a file parses only when some
+/// rule of one of its languages may still match by literal evidence. A rule without
+/// extractable literals keeps its whole language always-parsing (vacuously matching
+/// prefilter), so skipping stays a pure necessary condition; a language with no rules at all
+/// can never produce a match and is skipped outright. Files carrying the suppression marker
+/// are always scanned regardless, so `vorpal-ignore` accounting never misses a directive.
+pub struct LangPrefilters {
+  by_lang: std::collections::HashMap<SgLang, Vec<Prefilter>>,
+  suppression: memchr::memmem::Finder<'static>,
+}
+
+impl LangPrefilters {
+  pub fn build(configs: &RuleCollection<SgLang>) -> Self {
+    let mut by_lang: std::collections::HashMap<SgLang, Vec<Prefilter>> =
+      std::collections::HashMap::new();
+    configs.for_each_rule(|rule| {
+      by_lang
+        .entry(rule.language)
+        .or_default()
+        .push(Prefilter::from_literals(rule.matcher.required_literals()));
+    });
+    Self {
+      by_lang,
+      suppression: memchr::memmem::Finder::new(SUPPRESSION_MARKER.as_bytes()).into_owned(),
+    }
+  }
+
+  /// Whether any rule of `lang` may match `content` — vacuously true for literal-less rules.
+  fn lang_may_match(&self, lang: SgLang, content: &str) -> bool {
+    match self.by_lang.get(&lang) {
+      Some(prefilters) => prefilters.iter().any(|p| p.may_match(content)),
+      // No rules for this language: nothing can ever match it.
+      None => false,
+    }
+  }
+
+  /// Whether the file (root language + any injectable languages) can possibly affect scan
+  /// output — by matching a rule, or by carrying suppression directives that must be tracked.
+  pub fn may_match(&self, lang: SgLang, content: &str) -> bool {
+    if self.suppression.find(content.as_bytes()).is_some() {
+      return true;
+    }
+    if self.lang_may_match(lang, content) {
+      return true;
+    }
+    lang
+      .injectable_sg_langs()
+      .into_iter()
+      .flatten()
+      .any(|injected| self.lang_may_match(injected, content))
+  }
+}
+
 pub fn filter_file_rule(
   path: &Path,
   configs: &RuleCollection<SgLang>,
   trace: &ScanTrace,
+  prefilters: Option<&LangPrefilters>,
+) -> Result<SmallVec<[Vorpal; 1]>> {
+  filter_source_rule(path, Source::Fs, configs, trace, prefilters)
+}
+
+/// `filter_file_rule` generalized over the byte source; `Source::Fs` is bit-identical to the
+/// original, `Source::Memory` runs the same pipeline on remotely-streamed content.
+pub fn filter_source_rule(
+  path: &Path,
+  source: Source,
+  configs: &RuleCollection<SgLang>,
+  trace: &ScanTrace,
+  prefilters: Option<&LangPrefilters>,
 ) -> Result<SmallVec<[Vorpal; 1]>> {
   let Some(lang) = SgLang::from_path(path) else {
     return Ok(smallvec![]);
   };
-  let file_content = read_file(path)?;
+  let file_content = read_source(path, source)?;
+  // §12 pre-parse gate: skip files no rule can match by literal evidence. The file still gets
+  // its per-file rule-count trace entry (`--inspect` parity with the pre-prefilter pipeline);
+  // only the parse is skipped.
+  if let Some(prefilters) = prefilters {
+    if !prefilters.may_match(lang, &file_content) {
+      collect_file_stats(path, lang, configs, trace)?;
+      return Ok(smallvec![]);
+    }
+  }
   let grep = lang.grep(file_content);
   collect_file_stats(path, lang, configs, trace)?;
   let mut ret = smallvec![grep.clone()];
@@ -167,7 +277,10 @@ pub struct Prefilter {
 
 impl Prefilter {
   pub fn for_rule(rule: &Rule) -> Self {
-    let mut literals = rule.required_literals();
+    Self::from_literals(rule.required_literals())
+  }
+
+  fn from_literals(mut literals: Vec<&str>) -> Self {
     literals.sort_unstable();
     literals.dedup();
     literals.sort_by_key(|l| std::cmp::Reverse(l.len()));
@@ -178,6 +291,7 @@ impl Prefilter {
       .collect();
     Self { finders }
   }
+
 
   /// True when every required literal occurs in `content` (vacuously true with no literals).
   pub fn may_match(&self, content: &str) -> bool {
@@ -190,13 +304,26 @@ impl Prefilter {
 
 // sub_matchers are the injected languages
 // e.g. js/css in html
+#[cfg(test)]
 pub fn filter_file_pattern<'a>(
   path: &Path,
   lang: SgLang,
   root_matcher: Option<&'a Rule>,
   sub_matchers: &'a [(SgLang, Rule)],
 ) -> Result<SmallVec<[MatchUnit<&'a Rule>; 1]>> {
-  let file_content = read_file(path)?;
+  filter_source_pattern(path, Source::Fs, lang, root_matcher, sub_matchers)
+}
+
+/// `filter_file_pattern` generalized over the byte source (see [`Source`]). The pattern `run`
+/// commands drive this directly through `filter_source_pattern`.
+pub fn filter_source_pattern<'a>(
+  path: &Path,
+  source: Source,
+  lang: SgLang,
+  root_matcher: Option<&'a Rule>,
+  sub_matchers: &'a [(SgLang, Rule)],
+) -> Result<SmallVec<[MatchUnit<&'a Rule>; 1]>> {
+  let file_content = read_source(path, source)?;
   // §12 fast path: consult required literals BEFORE parsing. Injected-language matchers are
   // checked against the whole file (injected regions are substrings of it — sound). A file no
   // candidate matcher can match never reaches tree-sitter.
@@ -279,6 +406,23 @@ mod test {
     let root = SgLang::Builtin(SupportLang::Html).grep("<script lang=xxx>alert(123)</script>");
     let docs = root.get_injections(|s| SgLang::from_str(s).ok());
     assert_eq!(docs.len(), 0);
+  }
+
+  #[test]
+  fn prefilter_ignores_constraint_literals_on_possibly_unbound_vars() {
+    use vorpal_config::from_yaml_string;
+    use vorpal_language::SupportLang;
+    // `bar()` matches without binding $A, so the constraint's literal is NOT a necessary
+    // condition; a prefilter that unions constraint literals would silently skip this file.
+    let yaml = "id: t\nlanguage: Rust\nrule: {any: [{pattern: 'foo($A)'}, {pattern: 'bar()'}]}\nconstraints: {A: {regex: zzz_special}}";
+    let configs = from_yaml_string(yaml, &Default::default()).expect("rule parses");
+    let collection = RuleCollection::try_new(configs).expect("collection builds");
+    let prefilters = LangPrefilters::build(&collection);
+    let lang = SgLang::Builtin(SupportLang::Rust);
+    assert!(
+      prefilters.may_match(lang, "fn t() { bar(); }"),
+      "constraint literals must not gate files where the constrained var can be unbound"
+    );
   }
 
   #[test]

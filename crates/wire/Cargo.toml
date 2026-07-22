@@ -1,0 +1,27 @@
+[package]
+name = "vorpal-wire"
+description = "Vorpal fleet wire protocol: framing, messages, and version-stable hashing"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Async frame I/O over tokio streams — pulled in by the coordinator/transport layer, kept out of
+# the grammar-sliced agent binary (which speaks the protocol with the blocking `io` module).
+tokio = ["dep:tokio"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = "1.0"
+postcard = { version = "1.0", features = ["use-std"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3.workspace = true
+thiserror = { workspace = true }
+tokio = { version = "1.37", optional = true, default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+# The async-IO tests need a runtime + the test macro; the library itself only needs io-util.
+tokio = { version = "1.37", features = ["io-util", "macros", "rt", "io-std"] }

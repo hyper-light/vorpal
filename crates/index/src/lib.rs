@@ -20,11 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-use rayon::prelude::*;
 use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, tokenize};
 use vorpal_ingest::{
-  ExtractScratch, Manifest, OutlineExtractor, Resolver, StreamWork, cache_file_name, link_writer,
-  load_product, save_product, save_product_with, stream_apply,
+  ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
+  StreamWork, cache_file_name, decode_product, encode_product_into, link_writer_spilled,
+  load_product, peek_product_stamps, save_product, stream_apply_spilled, validate_product,
 };
 use vorpal_kg::{Kg, NodeId};
 
@@ -59,6 +59,15 @@ impl IndexReport {
 /// under this regardless of corpus size. Sized to feed every worker generously; the essential
 /// output (the graph under construction) is not part of transit and scales with the corpus.
 fn stream_budget_bytes() -> u64 {
+  // Tunable for memory-vs-throughput experiments; the default keeps every worker fed with
+  // lookahead without letting decoded products pile up ahead of the committers.
+  if let Some(mb) = std::env::var("VORPAL_STREAM_BUDGET_MB")
+    .ok()
+    .and_then(|v| v.parse::<u64>().ok())
+    .filter(|&mb| mb > 0)
+  {
+    return mb * 1024 * 1024;
+  }
   let threads = std::thread::available_parallelism()
     .map(|n| n.get() as u64)
     .unwrap_or(1);
@@ -78,7 +87,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   if let Ok(prior) = Manifest::load(&manifest_path) {
     if manifest.unchanged_since(&prior)
       && out.join("strings.heap").exists()
-      && out.join("edges.bin").exists()
+      && out.join("graph.bin").exists()
     {
       if let Ok(nodes) = Kg::peek_node_count(out) {
         return Ok(IndexReport {
@@ -106,14 +115,61 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   let products_dir = out.join("products");
   fs::create_dir_all(&products_dir)?;
 
-  let (writer, references, stream) = stream_apply(
+  // Product cache, two tiers (§3.4): the **pack** (one mapped file — replay pays zero opens;
+  // the loose-file cache cost one `open` per product, 72k of them at kernel scale, and macOS
+  // serializes the open path) plus **loose files**, still written by search banking (separate
+  // processes must not contend on the pack) and consolidated — then deleted — here. Loose
+  // wins over pack on lookup: it is only ever fresher.
+  let pack_reader = PackReader::open(out).map(Arc::new);
+  let loose: HashSet<OsString> = fs::read_dir(&products_dir)
+    .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
+    .unwrap_or_default();
+  let pack_writer = PackWriter::new(out, pack_reader.clone());
+  let pack_sink = pack_writer.sink();
+  let live_paths: Vec<String> = manifest.entries().iter().map(|e| e.path.clone()).collect();
+  let pack_thread = std::thread::spawn(move || pack_writer.finish(live_paths));
+  let send_fatal =
+    |_| std::io::Error::other("product pack writer failed; see the join error for the cause");
+
+  // References spill to disk between commit and resolve — they are written once and read
+  // once, sequentially; buffering them in RAM only raised the peak footprint (~220 MB at
+  // kernel scale).
+  let spill_path = out.join(".refs.spill");
+  let heap_stream = out.join("strings.heap.tmp");
+  let stream_result = stream_apply_spilled(
     manifest.entries(),
     stream_budget_bytes(),
+    &spill_path,
+    Some(&heap_stream),
+    pack_reader.as_deref(),
     |entry, scratch: &mut ExtractScratch| {
-      let cache = products_dir.join(cache_file_name(&entry.path));
-      if let Ok(product) = load_product(&cache) {
-        if product.source_size == entry.size && product.source_mtime_ns == entry.mtime_ns {
-          return Ok(StreamWork::Replayed(entry.path.clone(), product));
+      let cache_name = cache_file_name(&entry.path);
+      if loose.contains(&OsString::from(&cache_name)) {
+        if let Ok(bytes) = fs::read(products_dir.join(&cache_name)) {
+          if let Ok(product) = decode_product(&bytes) {
+            if product.source_size == entry.size && product.source_mtime_ns == entry.mtime_ns {
+              pack_sink
+                .send(PackMsg {
+                  path: entry.path.clone(),
+                  body: bytes,
+                })
+                .map_err(send_fatal)?;
+              return Ok(StreamWork::Replayed(entry.path.clone(), product));
+            }
+          }
+        }
+      }
+      if let Some(reader) = &pack_reader {
+        if let Some(bytes) = reader.get(&entry.path) {
+          // Stamp peek + full view-decode validation here (cheap: no owned strings), so a
+          // corrupt entry still falls through to a re-parse; the committer then decodes the
+          // validated views again straight from the map and applies them — the product
+          // itself never crosses the channel and never materializes.
+          if peek_product_stamps(bytes) == Some((entry.size, entry.mtime_ns))
+            && validate_product(bytes)
+          {
+            return Ok(StreamWork::ReplayedPacked(entry.path.clone()));
+          }
         }
       }
       // Changed, new, or cache-missing: re-parse (unreadable files are skipped, not fatal).
@@ -125,30 +181,39 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
       };
       product.source_size = entry.size;
       product.source_mtime_ns = entry.mtime_ns;
-      save_product_with(&cache, &product, &mut scratch.encode)?;
+      scratch.encode.clear();
+      encode_product_into(&product, &mut scratch.encode);
+      // Move the encoded bytes into the message — cloning re-copied every parsed product
+      // (half a gigabyte on a cold kernel build); the scratch buffer regrows on next use.
+      pack_sink
+        .send(PackMsg {
+          path: entry.path.clone(),
+          body: std::mem::take(&mut scratch.encode),
+        })
+        .map_err(send_fatal)?;
       Ok(StreamWork::Parsed(entry.path.clone(), product))
     },
-  )?;
+  );
+  drop(pack_sink);
+  let pack_result = pack_thread.join().expect("pack writer panicked");
+  let (writer, spilled_refs, stream) = stream_result?;
+  pack_result?;
+  // Extraction/commit scratch (products in transit, per-worker buffers, shard canonicals)
+  // is dead now — hand its pages back before the link pass allocates the table and edges.
+  vorpal_ingest::release_freed_pages();
   let (reparsed, replayed) = (stream.parsed, stream.replayed);
 
-  // Cache hygiene: drop products of files no longer in the tree.
-  let expected: HashSet<OsString> = manifest
-    .entries()
-    .iter()
-    .map(|e| OsString::from(cache_file_name(&e.path)))
-    .collect();
-  if let Ok(dir) = fs::read_dir(&products_dir) {
-    for file in dir.flatten() {
-      if !expected.contains(&file.file_name()) {
-        let _ = fs::remove_file(file.path());
-      }
-    }
+  // Loose-file hygiene: everything snapshotted above is now consolidated in the pack (or
+  // superseded by a re-parse, or stale) — delete it. Files banked by searches *during* this
+  // run are not in the snapshot and survive untouched.
+  for name in &loose {
+    let _ = fs::remove_file(products_dir.join(name));
   }
 
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve) = link_writer(writer, &references, &Resolver::new());
+  let (kg, resolve) = link_writer_spilled(writer, spilled_refs, &Resolver::new())?;
   // Embeddings stay off the commit hot path (§3.4): the graph persists now; the ANN tier is
   // built lazily by the first search and validated by stamp, so incremental re-indexes never
   // pay a full vector-graph rebuild (at kernel scale that rebuild dominated the whole run).
@@ -184,42 +249,69 @@ fn ann_stamp_of(index_dir: &Path) -> io::Result<u64> {
 
 /// Build the ANN tier iff its stamp no longer matches the persisted graph (or it does not
 /// exist). Queries call this before touching `ann.bin`; `vorpal index` never does.
+/// Build the ANN tier now if it is stale — the daemon calls this eagerly (in the
+/// background, right after an index refresh) so interactive searches stop paying the
+/// build; a search that arrives mid-build serializes on the same lock and proceeds the
+/// moment the tier is fresh.
+pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+  ensure_ann(index_dir)
+}
+
 fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+  // One build at a time per process: an eager background warm and a foreground search must
+  // not both build (duplicate work, racing writes). Late entrants re-check freshness under
+  // the lock and find the first builder's work done.
+  static ANN_BUILD: Mutex<()> = Mutex::new(());
+  let _guard = ANN_BUILD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
   let stamp_path = index_dir.join("ann.stamp");
   let current = ann_stamp_of(index_dir)?;
   let fresh = fs::read(&stamp_path)
     .ok()
     .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
     .is_some_and(|stored| stored == current)
-    && index_dir.join("ann.bin").exists();
+    // The stamp hashes graph content, not file format or embedder shape: a format bump or a
+    // dimension change must also invalidate, so an older index rebuilds instead of failing
+    // to parse (or silently mismatching the query embedding).
+    && AnnIndex::is_current_format(&index_dir.join("ann.bin"), LexicalEmbedder::default().dim());
   if fresh {
     return Ok(());
   }
   let kg = Kg::load(index_dir)?;
   build_ann(&kg, index_dir).map_err(|err| err as Box<dyn Error>)?;
-  fs::write(&stamp_path, current.to_le_bytes())?;
+  let stamp_tmp = index_dir.join("ann.stamp.tmp");
+  fs::write(&stamp_tmp, current.to_le_bytes())?;
+  fs::rename(&stamp_tmp, &stamp_path)?;
   Ok(())
 }
 
 fn build_ann(kg: &Kg, out: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+  vorpal_kg::phase_stamp("ann: build start");
   let embedder = LexicalEmbedder::default();
   let dim = embedder.dim();
   let n = kg.node_count();
-  // One flat row-major matrix, rows embedded in place in parallel: no per-row heap vector
-  // (at kernel scale the per-row form allocated millions of 1 KB vectors before flattening).
-  let mut vectors = vec![0.0f32; n * dim];
-  vectors
-    .par_chunks_mut(dim)
-    .enumerate()
-    .for_each(|(i, row)| {
-      if let Some(view) = kg.node(NodeId::new(i as u64)) {
-        let basename = view.path.rsplit('/').next().unwrap_or(view.path);
-        let parts = [view.name, view.name, view.signature, basename];
-        embedder.embed_parts_into(&parts, row);
-      }
-    });
-  let ids: Vec<u64> = (0..n as u64).collect();
-  AnnIndex::build_flat(dim, ids, vectors, None).save(&out.join("ann.bin"))?;
+  // Import nodes are wiring, not semantic targets — the resolver never offers them as
+  // definitions, and in search they only duplicated the names of what they import (12% of
+  // kernel rows). They stay reachable through the exact-name channel, which scans every
+  // KG node; only the vector tier skips them.
+  let ids: Vec<u64> = (0..n as u64)
+    .filter(|&i| {
+      kg.node(NodeId::new(i))
+        .is_some_and(|view| view.kind != vorpal_kg::SymbolKind::Import)
+    })
+    .collect();
+  let row_ids = ids.clone();
+  // Rows embed straight into the index's storage (i8 codes at scale, in parallel): the
+  // full-precision matrix never materializes — 2.9 GB of pure transient at kernel scale.
+  let index = AnnIndex::build_rows(dim, ids, |i, row| {
+    if let Some(view) = kg.node(NodeId::new(row_ids[i])) {
+      let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+      let parts = [view.name, view.name, view.signature, basename];
+      embedder.embed_parts_into(&parts, row);
+    }
+  });
+  vorpal_kg::phase_stamp("ann: save start");
+  index.save(&out.join("ann.bin"))?;
+  vorpal_kg::phase_stamp("ann: done");
   Ok(())
 }
 
@@ -378,30 +470,62 @@ pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, B
   let embedder = LexicalEmbedder::default();
   let pool = (k * 4).max(50);
 
-  let semantic: Vec<u64> = ann
-    .search(&embedder.embed(query), pool)
-    .into_iter()
-    .map(|(id, _)| id)
-    .collect();
+  // Retrieve a generous pool on the (quantized, at scale) index, then re-score every
+  // candidate at full precision by re-embedding its parts — approximation chooses the pool,
+  // never the final semantic order (§10's rerank bar).
+  let semantic: Vec<u64> = {
+    let query_vec = embedder.embed(query);
+    let mut scored: Vec<(f32, u64)> = ann
+      .search(&query_vec, pool * 2)
+      .into_iter()
+      .map(|(id, approx)| {
+        let Some(view) = kg.node(NodeId::new(id)) else {
+          return (approx, id);
+        };
+        let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+        let parts = [view.name, view.name, view.signature, basename];
+        let mut row = vec![0.0f32; embedder.dim()];
+        embedder.embed_parts_into(&parts, &mut row);
+        let exact = row
+          .iter()
+          .zip(&query_vec)
+          .map(|(x, y)| (x - y) * (x - y))
+          .sum::<f32>();
+        (exact, id)
+      })
+      .collect();
+    scored.sort_by(|a, b| {
+      (a.0, a.1)
+        .partial_cmp(&(b.0, b.1))
+        .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored.truncate(pool);
+    scored.into_iter().map(|(_, id)| id).collect()
+  };
 
   let query_tokens = tokenize(query);
-  let mut named: Vec<(u64, (u8, usize))> = Vec::new();
-  for i in 0..kg.node_count() as u64 {
-    let Some(view) = kg.node(NodeId::new(i)) else {
-      continue;
-    };
-    let name_tokens = tokenize(view.name);
-    let tier = if view.name == query {
-      0
-    } else if !query_tokens.is_empty() && name_tokens == query_tokens {
-      1
-    } else if !query_tokens.is_empty() && query_tokens.iter().all(|t| name_tokens.contains(t)) {
-      2
-    } else {
-      continue;
-    };
-    named.push((i, (tier, view.name.len())));
-  }
+  // Parallel scan over the node rows; per-row work is pure, and the indexed flatten keeps
+  // ascending-id order, so the collected list is identical to the serial loop's.
+  let mut named: Vec<(u64, (u8, usize))> = {
+    use rayon::prelude::*;
+    (0..kg.node_count() as u64)
+      .into_par_iter()
+      .filter_map(|i| {
+        let view = kg.node(NodeId::new(i))?;
+        let name_tokens = tokenize(view.name);
+        let tier = if view.name == query {
+          0
+        } else if !query_tokens.is_empty() && name_tokens == query_tokens {
+          1
+        } else if !query_tokens.is_empty() && query_tokens.iter().all(|t| name_tokens.contains(t)) {
+          2
+        } else {
+          return None;
+        };
+        Some((i, (tier, view.name.len())))
+      })
+      .collect()
+  };
   named.sort_by_key(|&(id, key)| (key, id));
   named.truncate(pool);
   let named: Vec<u64> = named.into_iter().map(|(id, _)| id).collect();

@@ -10,7 +10,7 @@ Point it at a repository and ask real questions:
 
 ```console
 $ vorpal index .
-parsed 355 files (0 replayed from cache) → 9772 nodes; refs: 10582 resolved, 1502 ambiguous, 7691 external, 8767 masked
+parsed 355 files (0 replayed from cache) → 9795 nodes; refs: 10619 resolved, 1508 ambiguous, 7748 external, 8826 masked
 index: ./.vorpal/index
 
 $ vorpal graph callers resolve_import_path
@@ -22,9 +22,9 @@ DefRefStub [Struct] ./crates/ingest/tests/linking.rs
 StubExtractor [Struct] ./crates/ingest/tests/pipeline.rs
 
 $ vorpal search "stat manifest change detection"
-0.0167  manifest::{FileStat, Manifest} [Import] ./crates/ingest/src/lib.rs
-0.0164  FileStat [Struct] ./crates/ingest/src/manifest.rs
-0.0161  Manifest [Struct] ./crates/ingest/src/manifest.rs
+0.0167  FileStat [Struct] ./crates/ingest/src/manifest.rs
+0.0164  Manifest [Struct] ./crates/ingest/src/manifest.rs
+0.0161  manifest [Module] ./crates/ingest/src/lib.rs
 
 $ vorpal mcp          # serve all of the above to agents over MCP (stdio)
 ```
@@ -84,8 +84,13 @@ $ vorpal outline src/    # symbols, members, imports/exports per file
 Pattern syntax, rule schema (`kind`, `inside`, `has`, `all`/`any`/`not`, constraints,
 transformations), and utilities follow the ast-grep model — if you know ast-grep, you know this
 half of vorpal. Files that cannot possibly match are skipped **before parsing** via a SIMD
-literal prefilter derived from your pattern (a per-token AND over required literals), so
-searches with any fixed text in them stay fast on large trees.
+literal prefilter derived from your pattern — and, for YAML/inline rules, from `regex`
+constraints too (a conservative required-literal analysis of the parsed regex: `[A-Z]+_SUSPEND`
+requires `_SUSPEND`). Both `run` and `scan` consult it, so searches with any fixed text stay
+fast on large trees: finding every `^[A-Z]+_SUSPEND$` **identifier** in the Linux kernel
+(63,775 C files) takes **1.1 s** — parity with `rg -n -w` on the same machine — while
+returning AST nodes instead of text lines (383 identifiers; ripgrep's extra lines are
+comments, strings, and docs).
 
 **Search feeds the index.** In a tree that has a `.vorpal` index, every file a `run` or `scan`
 matches banks its extraction product into the index's cache as a side effect — the parse the
@@ -122,10 +127,10 @@ short-circuits entirely:
 
 ```console
 $ vorpal index .                     # again, after touching one file
-parsed 1 files (354 replayed from cache) → 9772 nodes; refs: 10582 resolved, 1502 ambiguous, 7691 external, 8767 masked
+parsed 1 files (354 replayed from cache) → 9795 nodes; refs: 10619 resolved, 1508 ambiguous, 7748 external, 8826 masked
 
 $ vorpal index .                     # again, no changes
-unchanged — reused existing index (9772 nodes)
+unchanged — reused existing index (9795 nodes)
 ```
 
 Every reference is accounted for in one of four buckets, and an edge is only ever created on
@@ -321,7 +326,7 @@ The index directory (default `<src>/.vorpal/index` — hidden, so it never index
 nodes.vseg      columnar node segment (mmap cold-open, blake3 + xxh3 integrity)
 strings.heap    names / paths / signatures
 edges.bin       edge list (rebuilt into CSR/CSC on load)
-ann.bin         vector index (ids, vectors, tier structure)
+ann.bin         vector index (ids, vectors, tier structure; built lazily by the first search)
 manifest.bin    stat manifest driving incremental re-index
 products/       per-file extraction product cache (.vpb binary, keyed by blake3(path))
 ```
@@ -340,7 +345,27 @@ Apple Silicon; wall-clock for the whole CLI invocation including process start):
 | Re-index after touching one file | 0.03 s (1 parsed, 350 replayed) |
 | Re-index, nothing changed | 0.01 s |
 | `vorpal run` structural search, no-match pattern | 0.017 s |
+| `vorpal scan`, regex rule `^[A-Z]+_SUSPEND$` over the **Linux kernel** | 1.1 s — ripgrep parity, structural results |
 | Graph / search queries | milliseconds (mmap cold-open + in-memory graph) |
+
+At kernel scale (Linux 7.2-rc4: 72,541 files, ~30M LOC → 2.74M nodes, 6.8M references;
+Apple M5 Max, 18 cores): cold index **6.7 s** at a **0.54–0.57 GB** peak footprint
+(references spill to disk between commit and resolution, resolved edges stream straight
+into the writer, and the merged string heap **writes through to disk** as shards absorb —
+the link pass reads it back through a zero-copy map; products append to a single **pack
+file** — the loose-file cache cost 72k `open(2)`s per run; small commit shards keep every
+committer busy; jemalloc with immediate page return keeps the footprint tracking the live
+set), one-file incremental re-index **1.25 s**, unchanged re-index **0.10 s**. Index
+artifacts land via tmp + rename, so a rebuild never truncates a file a live reader still
+has mapped. The vector tier builds lazily on the first `search`: **~14 s** for 2.4M
+definition rows (1.2 GB peak — per-row i8 quantization with exact SDOT integer dot products;
+Import nodes are wiring and stay out of the vector tier, while remaining reachable through
+the exact-name channel; a full-precision rerank of the candidate pool keeps final ordering
+exact), stamp-validated thereafter — graph queries never pay for embeddings, and incremental
+re-indexes never rebuild the vector graph. **Every persisted tier — node columns, string
+heap, graph CSR, and the quantized vector index — opens by `mmap`, zero-copy**: a warm
+search is **0.05 s** end to end, and a graph query (`callers kmalloc` → 2,440 results) is
+**0.01 s**, both including process start; only the pages a query touches ever load.
 
 In-process (the MCP daemon and library callers skip process start): a cold full index of this
 repository is ~57 ms, and a no-change re-validation by polling is ~6 ms — ~3 ms of which is

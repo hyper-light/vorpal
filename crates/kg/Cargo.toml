@@ -16,3 +16,8 @@ vorpal-segment.workspace = true
 vorpal-graph.workspace = true
 vorpal-canonical.workspace = true
 vorpal-outline.workspace = true
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"], optional = true }
+rayon.workspace = true
+
+[features]
+alloc-stats = ["dep:tikv-jemalloc-ctl"]

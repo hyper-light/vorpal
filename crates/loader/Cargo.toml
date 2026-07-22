@@ -1,0 +1,35 @@
+[package]
+name = "vorpal-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The stage-0 loader is both a tiny library (framing + Ed25519/blake3 sign+verify, used by the
+# coordinator to sign the agent) and the pushed binary (verify + zero-residue exec on the node).
+[lib]
+name = "vorpal_loader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vorpal-loader"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = { workspace = true }
+# Verify + sign only in the default build (keeps the pushed binary small); key generation is
+# behind the `keygen` feature so the multi-MB agent's launcher stays lean.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# Enabled by the coordinator (CLI) to mint per-session ephemeral signing keys.
+keygen = ["dep:rand_core", "ed25519-dalek/rand_core"]
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+tempfile = "3"

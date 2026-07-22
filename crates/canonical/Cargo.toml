@@ -13,4 +13,4 @@ version.workspace = true
 [dependencies]
 vorpal-segment.workspace = true
 
-blake3 = "1"
+blake3.workspace = true

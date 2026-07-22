@@ -13,3 +13,4 @@ version.workspace = true
 [dependencies]
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rayon.workspace = true
+vorpal-mem.workspace = true

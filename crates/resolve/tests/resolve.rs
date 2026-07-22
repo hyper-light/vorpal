@@ -15,7 +15,7 @@ fn sym(id: u64, kind: SymbolKind, path: &str, exported: bool) -> Symbol {
   Symbol {
     id: NodeId::new(id),
     kind,
-    path: path.to_string(),
+    path: vorpal_resolve::intern::intern(path),
     exported,
     owner: None,
   }
@@ -27,6 +27,7 @@ fn resolves_local_definition_with_highest_confidence() {
   table.insert("foo", sym(1, SymbolKind::Function, "a.rs", false));
   let reference = Reference::new(NodeId::new(0), "a.rs", "foo", RefKind::Call);
 
+  table.finalize();
   let res = Resolver::new().resolve(&table, &reference);
   assert_eq!(res.target, Some(NodeId::new(1)));
   assert_eq!(res.confidence, Confidence::LOCAL);
@@ -39,6 +40,7 @@ fn resolves_exported_cross_file_definition() {
   table.insert("bar", sym(2, SymbolKind::Function, "b.rs", true));
   let reference = Reference::new(NodeId::new(0), "a.rs", "bar", RefKind::Call);
 
+  table.finalize();
   let res = Resolver::new().resolve(&table, &reference);
   assert_eq!(res.target, Some(NodeId::new(2)));
   assert_eq!(res.confidence, Confidence::CROSS_FILE);
@@ -50,6 +52,7 @@ fn private_cross_file_definition_is_not_visible() {
   table.insert("secret", sym(3, SymbolKind::Function, "b.rs", false));
   let reference = Reference::new(NodeId::new(0), "a.rs", "secret", RefKind::Call);
 
+  table.finalize();
   let res = Resolver::new().resolve(&table, &reference);
   assert_eq!(
     res.target, None,
@@ -69,6 +72,7 @@ fn local_definition_wins_over_exported_elsewhere() {
   table.insert("dup", sym(6, SymbolKind::Function, "a.rs", false));
   let reference = Reference::new(NodeId::new(0), "a.rs", "dup", RefKind::Call);
 
+  table.finalize();
   let res = Resolver::new().resolve(&table, &reference);
   assert_eq!(res.target, Some(NodeId::new(6)), "same-file binding wins");
   assert_eq!(res.confidence, Confidence::LOCAL);
@@ -81,6 +85,7 @@ fn ambiguous_exported_is_labeled_and_deterministic() {
   table.insert("amb", sym(4, SymbolKind::Function, "b.rs", true));
   let reference = Reference::new(NodeId::new(0), "a.rs", "amb", RefKind::Call);
 
+  table.finalize();
   let res = Resolver::new().resolve(&table, &reference);
   assert_eq!(
     res.target,
@@ -98,6 +103,7 @@ fn path_imports_resolve_to_file_nodes() {
 
   // `./util` from a sibling file resolves via the importer's own extension.
   let reference = Reference::new(NodeId::new(0), "src/a.ts", "./util", RefKind::Import);
+  table.finalize();
   let res = Resolver::new().resolve(&table, &reference);
   assert_eq!(res.target, Some(NodeId::new(7)));
   assert_eq!(res.confidence, Confidence::CROSS_FILE);
@@ -149,6 +155,7 @@ fn resolve_all_reports_stats_and_labeled_edges() {
     Reference::new(NodeId::new(0), "a.rs", "missing", RefKind::Call),
   ];
 
+  table.finalize();
   let (edges, stats) = resolve_all(&table, &refs, &Resolver::new());
   assert_eq!(stats.resolved, 1);
   assert_eq!(stats.ambiguous, 1);
@@ -226,5 +233,10 @@ fn resolves_a_call_across_files_in_a_real_kg() {
   assert_eq!(res.confidence, Confidence::CROSS_FILE);
 
   // File nodes are not resolution targets.
-  assert_eq!(table.candidates("a.rs").len(), 0);
+  assert_eq!(
+    table
+      .candidates(vorpal_resolve::intern::intern("a.rs"))
+      .len(),
+    0
+  );
 }

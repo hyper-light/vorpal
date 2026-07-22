@@ -45,7 +45,7 @@ fn sharded_apply_is_byte_identical_to_serial_apply() {
 
   // Sharded: parallel per-shard writers, ordered absorption, same global link.
   let (writer, references) = apply_products_sharded(products);
-  let (sharded_kg, sharded_stats) = link_writer(writer, &references, &Resolver::new());
+  let (sharded_kg, sharded_stats) = link_writer(writer, references, &Resolver::new());
 
   assert_eq!(
     serial_stats, sharded_stats,
@@ -59,7 +59,7 @@ fn sharded_apply_is_byte_identical_to_serial_apply() {
   let _ = fs::remove_dir_all(&base);
   serial_kg.save(&a).unwrap();
   sharded_kg.save(&b).unwrap();
-  for file in ["nodes.vseg", "strings.heap", "edges.bin"] {
+  for file in ["nodes.vseg", "strings.heap", "graph.bin"] {
     let serial_bytes = fs::read(a.join(file)).unwrap();
     let sharded_bytes = fs::read(b.join(file)).unwrap();
     assert_eq!(serial_bytes, sharded_bytes, "{file} diverged");

@@ -15,14 +15,25 @@ id: cpp-function
 language: Cpp
 role: item
 symbolType: function
+# The function declarator may sit under pointer/reference wrappers (`void *f()`,
+# `Widget &g()`) — without the descend branch those definitions were silently absent. The
+# name node binds whole (identifier, qualified_identifier, operator_name, destructor_name),
+# preserving qualified spellings like `Widget::method`.
 rule:
   kind: function_definition
   has:
     field: declarator
-    kind: function_declarator
-    has:
-      field: declarator
-      pattern: $NAME
+    any:
+      - kind: function_declarator
+        has:
+          field: declarator
+          pattern: $NAME
+      - has:
+          kind: function_declarator
+          stopBy: end
+          has:
+            field: declarator
+            pattern: $NAME
 name: $NAME
 isExported: true
 ---
@@ -30,33 +41,48 @@ id: cpp-class
 language: Cpp
 role: item
 symbolType: class
+# Type references and forward declarations are not definitions: require the body.
 rule:
   kind: class_specifier
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
 name: $NAME
 ---
 id: cpp-struct
 language: Cpp
 role: item
 symbolType: struct
+# Type references and forward declarations are not definitions: require the body.
 rule:
   kind: struct_specifier
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
 name: $NAME
 ---
 id: cpp-enum
 language: Cpp
 role: item
 symbolType: enum
+# Type references and forward declarations are not definitions: require the body.
 rule:
   kind: enum_specifier
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: enumerator_list
 name: $NAME
 ---
 id: cpp-concept
@@ -75,14 +101,27 @@ language: Cpp
 role: member
 parentRuleIds: [cpp-class, cpp-struct]
 symbolType: method
+# A method's function declarator names a *field identifier directly* (possibly under
+# pointer/reference wrappers for pointer-returning methods). A function-pointer member
+# (`int (*cb)(int);`) fails that test — its declarator is parenthesized — and correctly
+# falls through to the field rule instead of becoming a method named `(*cb)`.
 rule:
   kind: field_declaration
   has:
     field: declarator
-    kind: function_declarator
-    has:
-      field: declarator
-      pattern: $NAME
+    any:
+      - kind: function_declarator
+        has:
+          field: declarator
+          kind: field_identifier
+          pattern: $NAME
+      - has:
+          kind: function_declarator
+          stopBy: end
+          has:
+            field: declarator
+            kind: field_identifier
+            pattern: $NAME
 name: $NAME
 isPublic: false
 ---
@@ -107,15 +146,35 @@ language: Cpp
 role: member
 parentRuleIds: [cpp-class, cpp-struct]
 symbolType: field
+# The name is the field identifier inside the declarator (pointer fields were `*cursor`).
+# The exclusion mirrors the method rule exactly: anything the method rule claims — a
+# function declarator naming a field identifier directly, wrapped or not — is not a field;
+# function-pointer members don't fit that shape and stay fields.
 rule:
   kind: field_declaration
   has:
     field: declarator
-    pattern: $NAME
+    any:
+      - kind: field_identifier
+        pattern: $NAME
+      - has:
+          kind: field_identifier
+          stopBy: end
+          pattern: $NAME
   not:
     has:
       field: declarator
-      kind: function_declarator
+      any:
+        - kind: function_declarator
+          has:
+            field: declarator
+            kind: field_identifier
+        - has:
+            kind: function_declarator
+            stopBy: end
+            has:
+              field: declarator
+              kind: field_identifier
 name: $NAME
 isPublic: false
 ---

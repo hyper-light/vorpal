@@ -15,12 +15,19 @@
 //! `imports` / `of_type`, differing only by [`RefKind`]. Feed a [`SymbolTable`] (built from a
 //! [`vorpal_kg::Kg`] via [`SymbolTable::from_kg`]) plus [`Reference`]s to [`resolve_all`].
 
+pub mod intern;
 mod reference;
 mod resolver;
+pub mod spill;
 mod table;
 
+pub use intern::NameId;
 pub use reference::{RefForm, RefKind, Reference};
-pub use resolver::{Confidence, Resolution, ResolveStats, ResolvedEdge, Resolver, resolve_all};
+pub use resolver::{
+  Confidence, Resolution, ResolveStats, ResolvedEdge, Resolver, resolve_all, resolve_all_spilled,
+  resolve_all_spilled_into,
+};
+pub use spill::{RefSpill, RefSpillWriter};
 pub use table::{Symbol, SymbolTable};
 
 pub use vorpal_kg::{EdgeType, NodeId, SymbolKind};

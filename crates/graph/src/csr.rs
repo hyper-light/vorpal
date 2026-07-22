@@ -3,16 +3,16 @@
 //! Built by GVEL-style counting-scatter (degree histogram → prefix sum → scatter, §11.2): one
 //! pass to count, one to place, keeping the `etype` column in step with `targets`.
 
-use vorpal_mem::prefetch_read;
+use vorpal_mem::{PodColumn, prefetch_read};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DirectedCsr {
   /// `row_offsets[u]..row_offsets[u + 1]` bounds node `u`'s slice; length `node_count + 1`.
-  row_offsets: Vec<u64>,
+  row_offsets: PodColumn<u64>,
   /// The other endpoint per edge (dst for out-CSR, src for in-CSC).
-  targets: Vec<u32>,
+  targets: PodColumn<u32>,
   /// Edge label per edge, aligned 1:1 with `targets`.
-  etypes: Vec<u16>,
+  etypes: PodColumn<u16>,
 }
 
 impl DirectedCsr {
@@ -39,10 +39,36 @@ impl DirectedCsr {
       cursor[k] += 1;
     }
     Self {
+      row_offsets: PodColumn::from_vec(row_offsets),
+      targets: PodColumn::from_vec(targets),
+      etypes: PodColumn::from_vec(out_etypes),
+    }
+  }
+
+  /// Assemble from already-built columns (the mapped load path).
+  pub(crate) fn from_columns(
+    row_offsets: PodColumn<u64>,
+    targets: PodColumn<u32>,
+    etypes: PodColumn<u16>,
+  ) -> Self {
+    debug_assert_eq!(targets.len(), etypes.len());
+    Self {
       row_offsets,
       targets,
-      etypes: out_etypes,
+      etypes,
     }
+  }
+
+  pub(crate) fn row_offsets(&self) -> &[u64] {
+    &self.row_offsets
+  }
+
+  pub(crate) fn raw_targets(&self) -> &[u32] {
+    &self.targets
+  }
+
+  pub(crate) fn raw_etypes(&self) -> &[u16] {
+    &self.etypes
   }
 
   pub(crate) fn total_edges(&self) -> usize {

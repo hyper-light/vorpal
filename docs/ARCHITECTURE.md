@@ -406,7 +406,13 @@ the future if a component needs wait-free *reclamation* (not just wait-free read
 > amortize to zero per file); contents that escape are copied exactly once, and the parse
 > tree itself remains in tree-sitter's allocator. What still scales with the corpus is the
 > essential output — the graph under construction — whose bounding is §9/§11 segment-spill
-> territory, not §7.5's.
+> territory, not §7.5's. The vector tier's Vamana construction is the §5 ParlayANN-style
+> deterministic batch-parallel build (doubling-prefix rounds; frozen-graph parallel proposals;
+> per-target parallel back-edge merges preserving serial per-target semantics), its beam
+> search runs on a sorted-array beam with no hashing and no per-hop sort, and — per §3.4 —
+> embeddings are off the commit hot path entirely: `ann.bin` is built lazily by the first
+> search and validated by an xxh3 stamp of the node segment, so incremental re-indexes never
+> rebuild the vector graph (measured on the Linux kernel: one-file re-index 168 s → 9.5 s).
 
 Pipeline `discover → read(mmap)+blake3 → hash-skip → parse → extract → chunk → (embed) → flush`
 as **fixed-capacity stages joined by bounded MPMC queues** (`crossbeam-queue::ArrayQueue`, or

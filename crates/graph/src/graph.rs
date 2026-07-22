@@ -1,6 +1,12 @@
 //! The compacted graph: CSR (out) + CSC (in), the read form (§9.3).
 
+use vorpal_mem::PodColumn;
+
 use crate::csr::DirectedCsr;
+
+/// "VGPH" — the graph section file's magic.
+const GRAPH_MAGIC: u32 = 0x5647_5048;
+const GRAPH_VERSION: u32 = 1;
 use crate::edge::{EdgeLog, EdgeType};
 
 /// A sealed, compacted directed graph over dense `u32` node ids, with both traversal directions
@@ -79,6 +85,97 @@ impl Graph {
     self
       .out
       .for_each_prefetched(u, distance, |dst, et| f(dst, EdgeType(et)));
+  }
+
+  /// Persist both directions as one aligned, little-endian section file (`graph.bin`):
+  /// header, u64 offset sections, u32 target sections, u16 edge-type sections — in that
+  /// order, so every section is naturally aligned for the zero-copy mapped open. The bytes
+  /// are a pure function of the compacted graph, so persisted output stays bit-identical.
+  pub fn write_to<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+    let e = self.out.total_edges() as u64;
+    out.write_all(&GRAPH_MAGIC.to_le_bytes())?;
+    out.write_all(&GRAPH_VERSION.to_le_bytes())?;
+    out.write_all(&self.node_count.to_le_bytes())?;
+    out.write_all(&0u32.to_le_bytes())?; // pad: keeps the u64 sections 8-aligned
+    out.write_all(&e.to_le_bytes())?;
+    for column in [self.out.row_offsets(), self.inc.row_offsets()] {
+      if cfg!(target_endian = "little") {
+        out.write_all(bytemuck::cast_slice(column))?;
+      } else {
+        for &x in column {
+          out.write_all(&x.to_le_bytes())?;
+        }
+      }
+    }
+    for column in [self.out.raw_targets(), self.inc.raw_targets()] {
+      if cfg!(target_endian = "little") {
+        out.write_all(bytemuck::cast_slice(column))?;
+      } else {
+        for &x in column {
+          out.write_all(&x.to_le_bytes())?;
+        }
+      }
+    }
+    for column in [self.out.raw_etypes(), self.inc.raw_etypes()] {
+      if cfg!(target_endian = "little") {
+        out.write_all(bytemuck::cast_slice(column))?;
+      } else {
+        for &x in column {
+          out.write_all(&x.to_le_bytes())?;
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// Zero-copy open of a [`Graph::write_to`] file: sections become mapped columns; pages
+  /// fault in as queries touch them. The mapping stays alive for the graph's lifetime.
+  pub fn open_mapped(store: std::sync::Arc<vorpal_mem::MappedStore>) -> std::io::Result<Self> {
+    let bytes = store.as_bytes();
+    let header = |at: usize| -> std::io::Result<u32> {
+      bytes
+        .get(at..at + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        .ok_or_else(|| std::io::Error::other("truncated graph file"))
+    };
+    if header(0)? != GRAPH_MAGIC {
+      return Err(std::io::Error::other("bad graph file magic"));
+    }
+    if header(4)? != GRAPH_VERSION {
+      return Err(std::io::Error::other("unsupported graph file version"));
+    }
+    let n = header(8)? as usize;
+    let e = bytes
+      .get(16..24)
+      .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+      .ok_or_else(|| std::io::Error::other("truncated graph file"))? as usize;
+
+    let offsets_len = (n + 1) * 8;
+    let targets_len = e * 4;
+    let etypes_len = e * 2;
+    let mut at = 24usize;
+    let mut take = |len: usize| {
+      let section = at;
+      at += len;
+      section
+    };
+    let out_offsets =
+      PodColumn::from_mapped_le(&store, take(offsets_len), offsets_len, u64::from_le_bytes)?;
+    let in_offsets =
+      PodColumn::from_mapped_le(&store, take(offsets_len), offsets_len, u64::from_le_bytes)?;
+    let out_targets =
+      PodColumn::from_mapped_le(&store, take(targets_len), targets_len, u32::from_le_bytes)?;
+    let in_targets =
+      PodColumn::from_mapped_le(&store, take(targets_len), targets_len, u32::from_le_bytes)?;
+    let out_etypes =
+      PodColumn::from_mapped_le(&store, take(etypes_len), etypes_len, u16::from_le_bytes)?;
+    let in_etypes =
+      PodColumn::from_mapped_le(&store, take(etypes_len), etypes_len, u16::from_le_bytes)?;
+    Ok(Self {
+      node_count: n as u32,
+      out: DirectedCsr::from_columns(out_offsets, out_targets, out_etypes),
+      inc: DirectedCsr::from_columns(in_offsets, in_targets, in_etypes),
+    })
   }
 
   /// All out-edges as `(src, dst, etype)` triples (for compaction / relabel rebuilds).

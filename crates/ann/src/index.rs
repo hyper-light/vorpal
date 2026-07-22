@@ -4,8 +4,11 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use vorpal_mem::PodColumn;
+
+use crate::qmatrix::QuantMatrix;
 use crate::quant::SignQuantizer;
-use crate::vamana::{BuildParams, Vamana, greedy_search};
+use crate::vamana::{Adjacency, BuildParams, Vamana, VisitStamps, greedy_search};
 use crate::{l2_sq, normalize};
 
 /// Which search tier a corpus of `n` vectors gets (§8.1's ConfigForN philosophy: data-derived,
@@ -36,22 +39,16 @@ impl AnnConfig {
 }
 
 const VAMANA_R: usize = 32;
-const VAMANA_L_BUILD: usize = 64;
+const VAMANA_L_BUILD: usize = 48;
 const VAMANA_ALPHA: f32 = 1.2;
 const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-const MAGIC: u32 = 0x414E_4E31; // "ANN1"
-
-/// One length-checked section slice, advancing the read offset.
-fn take_bulk<'a>(bytes: &'a [u8], off: &mut usize, len: usize) -> io::Result<&'a [u8]> {
-  let end = off
-    .checked_add(len)
-    .ok_or_else(|| io::Error::other("truncated ann index"))?;
-  let section = bytes
-    .get(*off..end)
-    .ok_or_else(|| io::Error::other("truncated ann index"))?;
-  *off = end;
-  Ok(section)
-}
+/// "ANN4" — v2 moved the Vamana tier's vectors to per-row-scaled i8 codes (4× smaller,
+/// integer-exact distances; flat tiers still store f32); v3 dropped Import nodes from the
+/// row set (wiring, not semantic targets); v4 lays the Vamana tier out as aligned sections
+/// with a CSR adjacency so queries **mmap it zero-copy** — a warm search stopped reading
+/// three-quarters of a gigabyte up front. Older files fail the magic check and are rebuilt
+/// (the ANN tier is a cache — see `ensure_ann`).
+const MAGIC: u32 = 0x414E_4E34;
 
 /// Decode a packed little-endian section into a typed vec: a straight `pod_collect` on LE
 /// targets, the per-element decoder elsewhere.
@@ -73,13 +70,42 @@ fn read_le_slice<T: bytemuck::Pod, const W: usize>(
 /// acceleration structure, and the caller's stable id per row.
 pub struct AnnIndex {
   dim: usize,
+  /// Full-precision rows — flat tiers only (empty for Vamana, whose rows live in `quant`).
   vectors: Vec<f32>,
-  ids: Vec<u64>,
+  ids: PodColumn<u64>,
   config: AnnConfig,
   codes: Vec<u64>,
   code_words: usize,
-  graph: Vec<Vec<u32>>,
+  /// i8 rows + scale algebra — the Vamana tier's only vector storage.
+  quant: Option<QuantMatrix>,
+  /// Vamana adjacency: per-node lists when just built, CSR columns when loaded (mapped).
+  graph: AnnGraphStore,
   medoid: u32,
+}
+
+/// The Vamana graph's storage form. Both expose identical rows via [`Adjacency`].
+enum AnnGraphStore {
+  Lists(Vec<Vec<u32>>),
+  Csr {
+    offsets: PodColumn<u64>,
+    targets: PodColumn<u32>,
+  },
+}
+
+impl AnnGraphStore {
+  fn adjacency(&self) -> Adjacency<'_> {
+    match self {
+      AnnGraphStore::Lists(lists) => Adjacency::Lists(lists),
+      AnnGraphStore::Csr { offsets, targets } => Adjacency::Csr { offsets, targets },
+    }
+  }
+
+  fn edge_count(&self) -> usize {
+    match self {
+      AnnGraphStore::Lists(lists) => lists.iter().map(Vec::len).sum(),
+      AnnGraphStore::Csr { targets, .. } => targets.len(),
+    }
+  }
 }
 
 impl AnnIndex {
@@ -122,31 +148,69 @@ impl AnnIndex {
       (Vec::new(), 0)
     };
 
-    let (graph, medoid) = if config == AnnConfig::Vamana {
-      let vamana = Vamana::build(
-        &vectors,
-        dim,
-        &BuildParams {
-          r: VAMANA_R,
-          l_build: VAMANA_L_BUILD,
-          alpha: VAMANA_ALPHA,
-          seed: BUILD_SEED,
-        },
-      );
-      (vamana.graph, vamana.medoid)
-    } else {
-      (Vec::new(), 0)
-    };
+    if config == AnnConfig::Vamana {
+      let quant = QuantMatrix::from_rows(n, dim, |i, row: &mut [f32]| {
+        row.copy_from_slice(&vectors[i * dim..(i + 1) * dim])
+      });
+      drop(vectors);
+      return Self::build_vamana(dim, ids, quant);
+    }
 
     AnnIndex {
       dim,
       vectors,
-      ids,
+      ids: PodColumn::from_vec(ids),
       config,
       codes,
       code_words,
-      graph,
-      medoid,
+      quant: None,
+      graph: AnnGraphStore::Lists(Vec::new()),
+      medoid: 0,
+    }
+  }
+
+  /// Build the large tier by embedding rows straight into i8 codes — the full-precision
+  /// matrix never materializes (2.9 GB of pure transient at kernel scale). `fill` writes row
+  /// `i`'s (pre-normalized) embedding into its scratch slice.
+  pub fn build_rows<F: Fn(usize, &mut [f32]) + Sync>(
+    dim: usize,
+    ids: Vec<u64>,
+    fill: F,
+  ) -> AnnIndex {
+    let n = ids.len();
+    if AnnConfig::for_n(n) != AnnConfig::Vamana {
+      // Small corpus: materializing f32 rows is cheap and keeps the exact flat scan.
+      let mut vectors = vec![0.0f32; n * dim];
+      vectors
+        .chunks_mut(dim)
+        .enumerate()
+        .for_each(|(i, row): (usize, &mut [f32])| fill(i, row));
+      return Self::build_flat(dim, ids, vectors, None);
+    }
+    let quant = QuantMatrix::from_rows(n, dim, fill);
+    Self::build_vamana(dim, ids, quant)
+  }
+
+  fn build_vamana(dim: usize, ids: Vec<u64>, quant: QuantMatrix) -> AnnIndex {
+    let vamana = Vamana::build(
+      &quant,
+      &BuildParams {
+        r: VAMANA_R,
+        l_build: VAMANA_L_BUILD,
+        alpha: VAMANA_ALPHA,
+        seed: BUILD_SEED,
+      },
+    );
+    AnnIndex {
+      dim,
+      vectors: Vec::new(),
+      ids: PodColumn::from_vec(ids),
+      config: AnnConfig::Vamana,
+      codes: Vec::new(),
+      code_words: 0,
+      quant: Some(quant),
+      graph: AnnGraphStore::Lists(vamana.graph),
+      medoid: vamana.medoid,
     }
   }
 
@@ -191,11 +255,32 @@ impl AnnIndex {
         by_hamming.into_iter().map(|(i, _)| i).collect()
       }
       AnnConfig::Vamana => {
-        let l = (k * 8).clamp(64, n);
-        greedy_search(&self.graph, self.medoid, &self.vectors, self.dim, &q, l)
+        // Traversal and candidate ranking both run on the i8 codes: distances are exact
+        // functions of the codes, so the ordering is deterministic; callers wanting
+        // full-precision final ordering re-score the returned pool (§10's rerank seam).
+        let quant = self.quant.as_ref().expect("vamana tier carries codes");
+        let query = quant.quantize_query(&q);
+        let l = (k * 16).clamp(64, n);
+        let mut stamps = VisitStamps::new(n);
+        let adjacency = self.graph.adjacency();
+        let mut pool = greedy_search(
+          &adjacency,
+          self.medoid,
+          l,
+          &mut stamps,
+          |i| quant.dist_to_query(i, &query),
+          |i| quant.prefetch_row(i),
+        );
+        pool.sort_by(|a, b| {
+          (a.1, a.0)
+            .partial_cmp(&(b.1, b.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        pool.truncate(k);
+        return pool
           .into_iter()
-          .map(|(i, _)| i)
-          .collect()
+          .map(|(i, d)| (self.ids[i as usize], d))
+          .collect();
       }
     };
 
@@ -212,18 +297,23 @@ impl AnnIndex {
     ranked
   }
 
-  /// Persist: little-endian sections (header, ids, vectors, codes, CSR graph), **streamed**
-  /// through a buffered writer — at millions of nodes the bulk sections span gigabytes, and
-  /// building the whole file in memory first doubled peak RSS for nothing. Bulk sections are
-  /// single slice writes on little-endian targets (the format is LE either way; only the
-  /// fallback loops per element).
+  /// Persist, little-endian throughout. The Vamana tier writes **aligned sections** in
+  /// alignment order (header, u64 ids, u64 CSR offsets, f32 scale algebra, u32 CSR targets,
+  /// i8 codes) so `load` maps the file zero-copy; flat tiers write their small owned
+  /// sections behind the same header. Streamed through a buffered writer — the bulk
+  /// sections span hundreds of megabytes.
   pub fn save(&self, path: &Path) -> io::Result<()> {
     use std::io::Write;
-    let file = fs::File::create(path)?;
+    let n = self.len();
+    // Land via tmp + rename: a daemon may be serving searches from a map of the previous
+    // ann.bin, and truncating a mapped file faults its readers. Rename swaps the directory
+    // entry; the old inode survives until its last map drops.
+    let tmp = path.with_extension("bin.tmp");
+    let file = fs::File::create(&tmp)?;
     let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
     out.write_all(&MAGIC.to_le_bytes())?;
     out.write_all(&(self.dim as u32).to_le_bytes())?;
-    out.write_all(&(self.len() as u64).to_le_bytes())?;
+    out.write_all(&(n as u64).to_le_bytes())?;
     let config_tag: u32 = match self.config {
       AnnConfig::FlatExact => 0,
       AnnConfig::FlatQuantized => 1,
@@ -232,89 +322,166 @@ impl AnnIndex {
     out.write_all(&config_tag.to_le_bytes())?;
     out.write_all(&(self.code_words as u32).to_le_bytes())?;
     out.write_all(&self.medoid.to_le_bytes())?;
-    if cfg!(target_endian = "little") {
-      out.write_all(bytemuck::cast_slice(&self.ids))?;
-      out.write_all(bytemuck::cast_slice(&self.vectors))?;
-      out.write_all(bytemuck::cast_slice(&self.codes))?;
-    } else {
-      for &id in &self.ids {
-        out.write_all(&id.to_le_bytes())?;
-      }
-      for &x in &self.vectors {
-        out.write_all(&x.to_le_bytes())?;
-      }
-      for &w in &self.codes {
-        out.write_all(&w.to_le_bytes())?;
-      }
-    }
-    out.write_all(&(self.graph.len() as u64).to_le_bytes())?;
-    for neighbors in &self.graph {
-      out.write_all(&(neighbors.len() as u32).to_le_bytes())?;
+    out.write_all(&0u32.to_le_bytes())?; // pad: the u64 sections that follow stay 8-aligned
+    out.write_all(&(self.graph.edge_count() as u64).to_le_bytes())?; // header = 40 bytes
+
+    fn write_le<T: bytemuck::Pod, W: std::io::Write, const B: usize>(
+      out: &mut W,
+      column: &[T],
+      encode: fn(&T) -> [u8; B],
+    ) -> io::Result<()> {
       if cfg!(target_endian = "little") {
-        out.write_all(bytemuck::cast_slice(neighbors))?;
+        out.write_all(bytemuck::cast_slice(column))
       } else {
-        for &nb in neighbors {
-          out.write_all(&nb.to_le_bytes())?;
+        for x in column {
+          out.write_all(&encode(x))?;
         }
+        Ok(())
       }
     }
-    out.flush()
+
+    write_le(&mut out, &self.ids, |x: &u64| x.to_le_bytes())?;
+    match &self.quant {
+      Some(quant) => {
+        // CSR offsets from either storage form — identical bytes by construction.
+        match &self.graph {
+          AnnGraphStore::Lists(lists) => {
+            let mut offset = 0u64;
+            out.write_all(&offset.to_le_bytes())?;
+            for row in lists {
+              offset += row.len() as u64;
+              out.write_all(&offset.to_le_bytes())?;
+            }
+          }
+          AnnGraphStore::Csr { offsets, .. } => {
+            write_le(&mut out, offsets, |x: &u64| x.to_le_bytes())?;
+          }
+        }
+        write_le(&mut out, &quant.scales, |x: &f32| x.to_le_bytes())?;
+        write_le(&mut out, &quant.snorm, |x: &f32| x.to_le_bytes())?;
+        match &self.graph {
+          AnnGraphStore::Lists(lists) => {
+            for row in lists {
+              write_le(&mut out, row, |x: &u32| x.to_le_bytes())?;
+            }
+          }
+          AnnGraphStore::Csr { targets, .. } => {
+            write_le(&mut out, targets, |x: &u32| x.to_le_bytes())?;
+          }
+        }
+        out.write_all(bytemuck::cast_slice(&quant.codes))?;
+      }
+      None => {
+        write_le(&mut out, &self.vectors, |x: &f32| x.to_le_bytes())?;
+        write_le(&mut out, &self.codes, |x: &u64| x.to_le_bytes())?;
+        // Flat tiers have no graph; the header's edge count is 0.
+      }
+    }
+    out.flush()?;
+    drop(out);
+    #[cfg(windows)]
+    let _ = fs::remove_file(path);
+    fs::rename(&tmp, path)
+  }
+
+  /// Whether the file at `path` exists, carries this build's format magic, **and** was built
+  /// at `dim` — the cheap pre-check freshness logic uses to force a rebuild across format
+  /// bumps *and* embedder-dimension changes (a query hashed into `d` buckets probing an index
+  /// hashed into `d'` buckets would be silently meaningless).
+  pub fn is_current_format(path: &Path, dim: usize) -> bool {
+    let mut header = [0u8; 8];
+    std::fs::File::open(path)
+      .and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut header)
+      })
+      .map(|_| {
+        u32::from_le_bytes(header[0..4].try_into().expect("4 bytes")) == MAGIC
+          && u32::from_le_bytes(header[4..8].try_into().expect("4 bytes")) as usize == dim
+      })
+      .unwrap_or(false)
   }
 
   pub fn load(path: &Path) -> io::Result<AnnIndex> {
-    let bytes = fs::read(path)?;
-    let mut off = 0usize;
-    let take32 = |bytes: &[u8], off: &mut usize| -> io::Result<u32> {
-      let end = *off + 4;
-      let v = bytes
-        .get(*off..end)
-        .ok_or_else(|| io::Error::other("truncated ann index"))?;
-      *off = end;
-      Ok(u32::from_le_bytes(v.try_into().expect("4 bytes")))
+    // Header (32 bytes) from a plain read; the Vamana tier then maps the file and views its
+    // sections zero-copy, so open cost is O(1) and pages fault in as the beam touches them.
+    let store = std::sync::Arc::new(vorpal_mem::MappedStore::map_file(
+      path,
+      vorpal_mem::StoreKind::AnnCodes,
+      vorpal_mem::AccessPattern::Random,
+      vorpal_mem::Hotness::Hot,
+      &vorpal_mem::ResourcePolicy::probe(vorpal_mem::CorpusProbe::new(0, 0)),
+    )?);
+    let bytes = store.as_bytes();
+    let take32 = |at: usize| -> io::Result<u32> {
+      bytes
+        .get(at..at + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        .ok_or_else(|| io::Error::other("truncated ann index"))
     };
-    let take64 = |bytes: &[u8], off: &mut usize| -> io::Result<u64> {
-      let end = *off + 8;
-      let v = bytes
-        .get(*off..end)
-        .ok_or_else(|| io::Error::other("truncated ann index"))?;
-      *off = end;
-      Ok(u64::from_le_bytes(v.try_into().expect("8 bytes")))
+    let take64 = |at: usize| -> io::Result<u64> {
+      bytes
+        .get(at..at + 8)
+        .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+        .ok_or_else(|| io::Error::other("truncated ann index"))
     };
-
-    if take32(&bytes, &mut off)? != MAGIC {
+    if take32(0)? != MAGIC {
       return Err(io::Error::other("bad ann index magic"));
     }
-    let dim = take32(&bytes, &mut off)? as usize;
-    let n = take64(&bytes, &mut off)? as usize;
-    let config = match take32(&bytes, &mut off)? {
+    let dim = take32(4)? as usize;
+    let n = take64(8)? as usize;
+    let config = match take32(16)? {
       0 => AnnConfig::FlatExact,
       1 => AnnConfig::FlatQuantized,
       2 => AnnConfig::Vamana,
       other => return Err(io::Error::other(format!("bad ann config tag {other}"))),
     };
-    let code_words = take32(&bytes, &mut off)? as usize;
-    let medoid = take32(&bytes, &mut off)?;
-    // Bulk sections: one length-checked slice each, then a single unaligned LE copy — the
-    // element-at-a-time loops made cold `search` pay a bounds check + push per float.
-    let ids: Vec<u64> = read_le_slice(take_bulk(&bytes, &mut off, n * 8)?, u64::from_le_bytes);
-    let vectors: Vec<f32> = read_le_slice(
-      take_bulk(&bytes, &mut off, n * dim * 4)?,
-      f32::from_le_bytes,
-    );
+    let code_words = take32(20)? as usize;
+    let medoid = take32(24)?;
+    let edges = take64(32)? as usize;
+
+    let mut at = 40usize;
+    let mut take = |len: usize| {
+      let section = at;
+      at += len;
+      section
+    };
+    let ids = PodColumn::from_mapped_le(&store, take(n * 8), n * 8, u64::from_le_bytes)?;
+    if config == AnnConfig::Vamana {
+      let offsets =
+        PodColumn::from_mapped_le(&store, take((n + 1) * 8), (n + 1) * 8, u64::from_le_bytes)?;
+      let scales = PodColumn::from_mapped_le(&store, take(n * 4), n * 4, f32::from_le_bytes)?;
+      let snorm = PodColumn::from_mapped_le(&store, take(n * 4), n * 4, f32::from_le_bytes)?;
+      let targets =
+        PodColumn::from_mapped_le(&store, take(edges * 4), edges * 4, u32::from_le_bytes)?;
+      let padded = dim.next_multiple_of(16);
+      let codes = PodColumn::from_mapped_le(&store, take(n * padded), n * padded, |b: [u8; 1]| {
+        b[0] as i8
+      })?;
+      return Ok(AnnIndex {
+        dim,
+        vectors: Vec::new(),
+        ids,
+        config,
+        codes: Vec::new(),
+        code_words: 0,
+        quant: Some(QuantMatrix::from_columns(dim, scales, snorm, codes)),
+        graph: AnnGraphStore::Csr { offsets, targets },
+        medoid,
+      });
+    }
+    // Flat tiers: small corpora — owned decoded sections, exactly as before.
+    let section = |at: usize, len: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(at..at + len)
+        .ok_or_else(|| io::Error::other("truncated ann index"))
+    };
+    let vectors: Vec<f32> =
+      read_le_slice(section(take(n * dim * 4), n * dim * 4)?, f32::from_le_bytes);
     let codes: Vec<u64> = read_le_slice(
-      take_bulk(&bytes, &mut off, n * code_words * 8)?,
+      section(take(n * code_words * 8), n * code_words * 8)?,
       u64::from_le_bytes,
     );
-    let graph_len = take64(&bytes, &mut off)? as usize;
-    let mut graph = Vec::with_capacity(graph_len);
-    for _ in 0..graph_len {
-      let degree = take32(&bytes, &mut off)? as usize;
-      let mut neighbors = Vec::with_capacity(degree);
-      for _ in 0..degree {
-        neighbors.push(take32(&bytes, &mut off)?);
-      }
-      graph.push(neighbors);
-    }
     Ok(AnnIndex {
       dim,
       vectors,
@@ -322,7 +489,8 @@ impl AnnIndex {
       config,
       codes,
       code_words,
-      graph,
+      quant: None,
+      graph: AnnGraphStore::Lists(Vec::new()),
       medoid,
     })
   }

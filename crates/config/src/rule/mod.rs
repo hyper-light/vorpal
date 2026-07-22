@@ -259,10 +259,12 @@ impl Rule {
   /// sufficient — so file scanning can skip the parse when one is absent (§12 prefilter).
   /// Composition: `all` requires the union of its branches; `any` only what EVERY branch
   /// requires (intersection); relational rules' targets must exist somewhere in the file;
-  /// `not` and rules we cannot analyze (kind/regex/nth-child/range/matches) require nothing.
+  /// `regex` contributes the substrings every regex match provably contains; `not` and rules
+  /// we cannot analyze (kind/nth-child/range/matches) require nothing.
   pub fn required_literals(&self) -> Vec<&str> {
     match self {
       Rule::Pattern(p) => p.required_literals(),
+      Rule::Regex(r) => r.required_literals().iter().map(String::as_str).collect(),
       Rule::Inside(inside) => inside.required_literals(),
       Rule::Has(has) => has.required_literals(),
       Rule::Precedes(precedes) => precedes.required_literals(),

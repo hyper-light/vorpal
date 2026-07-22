@@ -15,4 +15,7 @@ rayon.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 vorpal-ann.workspace = true
 vorpal-ingest.workspace = true
-vorpal-kg.workspace = true
+vorpal-kg = { workspace = true, features = ["alloc-stats"] }
+tikv-jemallocator = "0.7.0"
+tree-sitter.workspace = true
+tikv-jemalloc-sys = "0.7.1"

@@ -65,6 +65,11 @@ pub struct ProjectConfig {
   pub test_configs: Option<Vec<TestConfig>>,
   /// util rules directories
   pub util_dirs: Option<Vec<PathBuf>>,
+  /// The language environment registered at setup, retained so a remote job can ship it and an
+  /// agent can reproduce the exact same registration (docs/REMOTE.md §2, I2).
+  pub custom_languages: Option<HashMap<String, CustomLang>>,
+  pub language_globs: Option<LanguageGlobs>,
+  pub language_injections: Vec<SerializableInjection>,
 }
 
 impl ProjectConfig {
@@ -107,6 +112,9 @@ impl ProjectConfig {
       outline_rules,
       test_configs: sg_config.test_configs.take(),
       util_dirs: sg_config.util_dirs.take(),
+      custom_languages: sg_config.custom_languages.clone(),
+      language_globs: sg_config.language_globs.clone(),
+      language_injections: sg_config.language_injections.clone(),
     };
     // sg_config will not use rule dirs and test configs anymore
     register_custom_language(&config.project_dir, sg_config)?;
@@ -248,6 +256,34 @@ pub fn with_rule_stats(
     skipped_rule_count: total_rule_count - effective_rule_count,
   };
   Ok((collection, trace))
+}
+
+/// Collect the raw util-rule YAML files that `find_rules` compiles into `GlobalRules`, sorted by
+/// path for deterministic shipping. A remote job carries these verbatim so the agent registers
+/// global utils through the exact code path a local scan uses (docs/REMOTE.md §1).
+pub fn collect_util_yaml(config: &ProjectConfig) -> Result<Vec<String>> {
+  let Some(mut walker) = build_util_walker(&config.project_dir, &config.util_dirs) else {
+    return Ok(vec![]);
+  };
+  let mut files = vec![];
+  let walker = walker.types(config_file_type()).build();
+  for entry in walker {
+    let config_file = entry.with_context(|| EC::WalkRuleDir(PathBuf::new()))?;
+    // file_type is None only if it is stdin, safe to panic here
+    if !config_file
+      .file_type()
+      .expect("file type should be available for non-stdin")
+      .is_file()
+    {
+      continue;
+    }
+    files.push(config_file.path().to_path_buf());
+  }
+  files.sort();
+  files
+    .iter()
+    .map(|p| read_to_string(p).map_err(Into::into))
+    .collect()
 }
 
 pub fn read_rule_file(path: &Path, global_rules: &GlobalRules) -> Result<Vec<RuleConfig<SgLang>>> {

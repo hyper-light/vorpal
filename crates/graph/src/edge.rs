@@ -51,6 +51,13 @@ impl EdgeLog {
     self.etypes.clear();
   }
 
+  /// Release growth slack (capacity beyond length) back to the allocator.
+  pub fn shrink_to_fit(&mut self) {
+    self.srcs.shrink_to_fit();
+    self.dsts.shrink_to_fit();
+    self.etypes.shrink_to_fit();
+  }
+
   pub(crate) fn srcs(&self) -> &[u32] {
     &self.srcs
   }

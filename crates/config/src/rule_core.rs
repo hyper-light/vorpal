@@ -122,6 +122,20 @@ pub struct RuleCore {
 }
 
 impl RuleCore {
+  /// Substrings every match of this rule must contain (§12 prefilter feed): the main rule's
+  /// required literals only.
+  ///
+  /// Metavariable constraints are deliberately **excluded**: `match_constraints` enforces a
+  /// constraint only when its variable is actually bound in a match (`single_matched`), so for a
+  /// rule where the variable can be unbound — an `any:` branch that never mentions it, a var
+  /// appearing only under `not:`, or a `$$$` multi-capture (never constraint-checked) — the
+  /// constraint's literals are *not* necessary conditions, and using them to skip files silently
+  /// drops real matches. Including them would require proving the variable is bound in every
+  /// match, which no current rule analysis provides.
+  pub fn required_literals(&self) -> Vec<&str> {
+    self.rule.required_literals()
+  }
+
   #[inline]
   pub fn new(rule: Rule) -> Self {
     let kinds = rule.potential_kinds();

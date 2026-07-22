@@ -18,6 +18,7 @@
 
 pub mod arena;
 pub mod csr;
+pub mod pod;
 pub mod policy;
 pub mod prefetch;
 pub mod probe;
@@ -25,6 +26,7 @@ pub mod store;
 
 pub use arena::BatchArena;
 pub use csr::Csr;
+pub use pod::PodColumn;
 pub use policy::{AccessPattern, Hotness, PagePolicy, ResourcePolicy, StorePolicy};
 pub use prefetch::{prefetch_read, prefetch_read_nta, prefetch_slice_ahead};
 pub use probe::{CorpusProbe, HardwareProbe, StoreKind};

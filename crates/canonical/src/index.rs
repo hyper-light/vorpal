@@ -101,6 +101,16 @@ impl CanonicalIndex {
     }
   }
 
+  /// Drop every stored key while preserving the id counter: later assignments stay dense and
+  /// never collide with ids already handed out, but previously seen keys are no longer
+  /// deduplicated or resolvable. For pipelines whose identity lookups are scoped to the file
+  /// being applied (one product per path — the batch/stream invariant), calling this at each
+  /// file boundary caps the live map at one file's entities instead of the whole corpus.
+  pub fn forget_keys(&mut self) {
+    self.hot.clear();
+    self.sealed.clear();
+  }
+
   /// Resolve a key to its id, if interned.
   pub fn lookup(&self, key: &CanonicalKey) -> Option<NodeId> {
     self.current(key.as_bytes()).map(|e| NodeId::new(e.id))

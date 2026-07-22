@@ -14,3 +14,4 @@ version.workspace = true
 vorpal-mem.workspace = true
 
 bit-set.workspace = true
+bytemuck = "1.25.2"

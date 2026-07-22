@@ -15,14 +15,37 @@ id: c-function
 language: C
 role: item
 symbolType: function
+# The declarator chain may wrap the function declarator in pointer declarators
+# (`void *kmalloc(...)`) — without the descend branch every pointer-returning function
+# definition was silently absent from the graph. The name is the identifier at the function
+# declarator's own declarator, descending through parenthesized/pointer wrappers.
 rule:
   kind: function_definition
   has:
     field: declarator
-    kind: function_declarator
-    has:
-      field: declarator
-      pattern: $NAME
+    any:
+      - kind: function_declarator
+        has:
+          field: declarator
+          any:
+            - kind: identifier
+              pattern: $NAME
+            - has:
+                kind: identifier
+                stopBy: end
+                pattern: $NAME
+      - has:
+          kind: function_declarator
+          stopBy: end
+          has:
+            field: declarator
+            any:
+              - kind: identifier
+                pattern: $NAME
+              - has:
+                  kind: identifier
+                  stopBy: end
+                  pattern: $NAME
 name: $NAME
 isExported: true
 ---
@@ -30,11 +53,17 @@ id: c-struct
 language: C
 role: item
 symbolType: struct
+# `struct pool` appears as a *type reference* far more often than as a definition; requiring
+# the body keeps references and forward declarations from minting phantom struct nodes.
 rule:
   kind: struct_specifier
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
 name: $NAME
 ---
 id: c-union
@@ -43,9 +72,13 @@ role: item
 symbolType: struct
 rule:
   kind: union_specifier
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
 name: $NAME
 ---
 id: c-enum
@@ -54,25 +87,43 @@ role: item
 symbolType: enum
 rule:
   kind: enum_specifier
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: enumerator_list
 name: $NAME
 ---
 id: c-global-variable
 language: C
 role: item
 symbolType: variable
+# The name is the first identifier inside the declarator — not the declarator's text, which
+# dragged along pointers (`*p`), array suffixes (`arr[8]`), and initializers (`x = 3`). The
+# function-declarator exclusion descends too, so pointer-returning prototypes
+# (`void *f(int);`) no longer surface as garbage-named variables.
 rule:
   all:
     - kind: declaration
     - has:
         field: declarator
-        pattern: $NAME
+        any:
+          - kind: identifier
+            pattern: $NAME
+          - has:
+              kind: identifier
+              stopBy: end
+              pattern: $NAME
     - not:
         has:
           field: declarator
-          kind: function_declarator
+          any:
+            - kind: function_declarator
+            - has:
+                kind: function_declarator
+                stopBy: end
     - not:
         inside:
           kind: compound_statement
@@ -85,11 +136,20 @@ language: C
 role: member
 parentRuleIds: [c-struct, c-union]
 symbolType: field
+# The name is the field identifier inside the declarator, descending through
+# pointer/array/function-pointer wrappers — binding the whole declarator produced
+# `*allocation`, `buf[4]`, and `(*cb)(int)`.
 rule:
   kind: field_declaration
   has:
     field: declarator
-    pattern: $NAME
+    any:
+      - kind: field_identifier
+        pattern: $NAME
+      - has:
+          kind: field_identifier
+          stopBy: end
+          pattern: $NAME
 name: $NAME
 isPublic: true
 ---

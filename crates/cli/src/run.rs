@@ -14,8 +14,9 @@ use crate::print::{
   ColoredPrinter, Diff, FileNamePrinter, Heading, InteractivePrinter, JSONPrinter, PrintProcessor,
   Printer,
 };
+use crate::remote::CountedProduce;
 use crate::utils::ErrorContext as EC;
-use crate::utils::{ContextArgs, InputArgs, MatchUnit, OutputArgs, filter_file_pattern};
+use crate::utils::{ContextArgs, InputArgs, MatchUnit, OutputArgs, Source, filter_source_pattern};
 use crate::utils::{DebugFormat, FileTrace, RunTrace};
 use crate::utils::{Items, PathWorker, StdInWorker, Worker};
 
@@ -29,7 +30,29 @@ fn lang_help() -> String {
 const LANG_HELP_LONG: &str = "The language of the pattern. For full language list, visit https://vorpal.github.io/reference/languages.html";
 
 #[derive(Clone)]
-struct Strictness(MatchStrictness);
+pub(crate) struct Strictness(MatchStrictness);
+
+impl Strictness {
+  /// Stable wire name (the clap value name), for shipping `--strictness` to a remote agent.
+  pub(crate) fn wire_name(&self) -> &'static str {
+    use MatchStrictness as M;
+    match self.0 {
+      M::Cst => "cst",
+      M::Smart => "smart",
+      M::Ast => "ast",
+      M::Relaxed => "relaxed",
+      M::Signature => "signature",
+      M::Template => "template",
+    }
+  }
+
+  pub(crate) fn from_wire_name(name: &str) -> Option<Self> {
+    Self::value_variants()
+      .iter()
+      .find(|v| v.wire_name() == name)
+      .cloned()
+  }
+}
 impl ValueEnum for Strictness {
   fn value_variants<'a>() -> &'a [Self] {
     use MatchStrictness as M;
@@ -44,26 +67,26 @@ impl ValueEnum for Strictness {
   }
   fn to_possible_value(&self) -> Option<PossibleValue> {
     use MatchStrictness as M;
-    Some(match &self.0 {
-      M::Cst => PossibleValue::new("cst").help("Match all nodes exactly"),
-      M::Smart => PossibleValue::new("smart").help("Match all nodes except source trivial nodes"),
-      M::Ast => PossibleValue::new("ast").help("Match only ast nodes"),
-      M::Relaxed => PossibleValue::new("relaxed").help("Match ast nodes except comments"),
-      M::Signature => {
-        PossibleValue::new("signature").help("Match ast nodes except comments, without text")
-      }
-      M::Template => PossibleValue::new("template")
-        .help("Similar to smart but match text only, node kinds are ignored"),
-    })
+    // The clap value name IS the wire name (single source): renaming one cannot silently break
+    // the other's contract with `RunJob.strictness`.
+    let help = match &self.0 {
+      M::Cst => "Match all nodes exactly",
+      M::Smart => "Match all nodes except source trivial nodes",
+      M::Ast => "Match only ast nodes",
+      M::Relaxed => "Match ast nodes except comments",
+      M::Signature => "Match ast nodes except comments, without text",
+      M::Template => "Similar to smart but match text only, node kinds are ignored",
+    };
+    Some(PossibleValue::new(self.wire_name()).help(help))
   }
 }
 
 #[derive(Args)]
 #[group(required = true)]
-struct MatcherArg {
+pub(crate) struct MatcherArg {
   /// AST pattern to match.
   #[clap(short, long, value_name = "PATTERN")]
-  pattern: Option<String>,
+  pub(crate) pattern: Option<String>,
   /// AST kind to extract sub-part of pattern to match.
   ///
   /// selector defines the sub-syntax node kind that is the actual matcher of the pattern.
@@ -74,7 +97,7 @@ struct MatcherArg {
     requires = "pattern",
     conflicts_with = "kind"
   )]
-  selector: Option<String>,
+  pub(crate) selector: Option<String>,
 
   /// The strictness of the pattern.
   ///
@@ -85,13 +108,13 @@ struct MatcherArg {
     requires = "pattern",
     conflicts_with = "kind"
   )]
-  strictness: Option<Strictness>,
+  pub(crate) strictness: Option<Strictness>,
   /// AST kind to match.
   ///
   /// It accepts ESQuery style selector.
   /// See https://vorpal.github.io/guide/rule-config/atomic-rule.html#esquery-style-kind
   #[clap(short, long, value_name = "KIND", conflicts_with = "pattern")]
-  kind: Option<String>,
+  pub(crate) kind: Option<String>,
 }
 
 impl MatcherArg {
@@ -124,15 +147,15 @@ impl MatcherArg {
 pub struct RunArg {
   // search pattern related options
   #[clap(flatten)]
-  matcher: MatcherArg,
+  pub(crate) matcher: MatcherArg,
 
   /// String to replace the matched AST node.
   #[clap(short, long, value_name = "FIX", required_if_eq("update_all", "true"))]
-  rewrite: Option<String>,
+  pub(crate) rewrite: Option<String>,
 
   /// The language of the pattern query.
   #[clap(short, long, help(lang_help()), long_help=LANG_HELP_LONG)]
-  lang: Option<SgLang>,
+  pub(crate) lang: Option<SgLang>,
 
   /// Print query pattern's tree-sitter AST. Requires lang be set explicitly.
   #[clap(
@@ -147,15 +170,19 @@ pub struct RunArg {
 
   /// input related options
   #[clap(flatten)]
-  input: InputArgs,
+  pub(crate) input: InputArgs,
 
   /// output related options
   #[clap(flatten)]
-  output: OutputArgs,
+  pub(crate) output: OutputArgs,
 
   /// context related options
   #[clap(flatten)]
-  context: ContextArgs,
+  pub(crate) context: ContextArgs,
+
+  /// remote fan-out options (see docs/REMOTE.md)
+  #[clap(flatten)]
+  pub(crate) remote: crate::remote::RemoteArgs,
 
   /// Controls whether to print the file name as heading.
   ///
@@ -164,10 +191,37 @@ pub struct RunArg {
   /// The default value `auto` is to use heading when printing to a terminal
   /// and to disable heading when piping to another program or redirected to files.
   #[clap(long, default_value = "auto", value_name = "WHEN")]
-  heading: Heading,
+  pub(crate) heading: Heading,
 }
 
 impl RunArg {
+  /// Agent-side (`__agent`) construction from a wire job: matcher inputs and walk inputs only;
+  /// printing decisions arrive resolved via the shipped `PrinterSpec` (docs/REMOTE.md §1).
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn for_remote_agent(
+    pattern: Option<String>,
+    selector: Option<String>,
+    strictness: Option<Strictness>,
+    kind: Option<String>,
+    rewrite: Option<String>,
+    lang: Option<SgLang>,
+    input: InputArgs,
+    output: OutputArgs,
+    context: ContextArgs,
+  ) -> Self {
+    Self {
+      matcher: MatcherArg { pattern, selector, strictness, kind },
+      rewrite,
+      lang,
+      debug_query: None,
+      input,
+      output,
+      context,
+      remote: Default::default(),
+      heading: Heading::Never,
+    }
+  }
+
   fn build_matcher(&self, lang: SgLang) -> Result<Rule> {
     self.matcher.build_matcher(lang)
   }
@@ -193,25 +247,54 @@ impl RunArg {
 pub fn run_with_pattern(arg: RunArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
   let proj = arg.output.inspect.project_trace();
   proj.print_project(&project)?;
+  if arg.remote.is_remote() {
+    // Remote fan-out has its own printer dispatch (interactive editing is local-only).
+    return crate::remote::run_remote_dispatch(arg, project);
+  }
   let context = arg.context.get();
-  if arg.output.files_with_matches {
-    let printer = FileNamePrinter::stdout(arg.output.color);
-    return run_pattern_with_printer(arg, printer);
+  match arg.printer_kind() {
+    RunPrinterKind::FilesWithMatches => {
+      let printer = FileNamePrinter::stdout(arg.output.color);
+      run_pattern_with_printer(arg, printer)
+    }
+    RunPrinterKind::Json(json) => {
+      let printer = JSONPrinter::stdout(json).context(context);
+      run_pattern_with_printer(arg, printer)
+    }
+    RunPrinterKind::Colored => {
+      let printer = ColoredPrinter::stdout(arg.output.color)
+        .heading(arg.heading)
+        .context(context);
+      // Interactive editing is the one local-only branch; remote rejects it.
+      if arg.output.needs_interactive() {
+        let from_stdin = arg.input.stdin;
+        let printer = InteractivePrinter::new(printer, arg.output.update_all, from_stdin)?;
+        run_pattern_with_printer(arg, printer)
+      } else {
+        run_pattern_with_printer(arg, printer)
+      }
+    }
   }
-  if let Some(json) = arg.output.json {
-    let printer = JSONPrinter::stdout(json).context(context);
-    return run_pattern_with_printer(arg, printer);
-  }
-  let printer = ColoredPrinter::stdout(arg.output.color)
-    .heading(arg.heading)
-    .context(context);
-  let interactive = arg.output.needs_interactive();
-  if interactive {
-    let from_stdin = arg.input.stdin;
-    let printer = InteractivePrinter::new(printer, arg.output.update_all, from_stdin)?;
-    run_pattern_with_printer(arg, printer)
-  } else {
-    run_pattern_with_printer(arg, printer)
+}
+
+/// The non-interactive printer a search resolves to. Single source of the selection shared by the
+/// local dispatch, the remote dispatch, and the wire `PrinterSpec` builder (see
+/// [`crate::scan::ScanPrinterKind`] for the rationale).
+pub(crate) enum RunPrinterKind {
+  FilesWithMatches,
+  Json(crate::print::JsonStyle),
+  Colored,
+}
+
+impl RunArg {
+  pub(crate) fn printer_kind(&self) -> RunPrinterKind {
+    if self.output.files_with_matches {
+      RunPrinterKind::FilesWithMatches
+    } else if let Some(json) = self.output.json {
+      RunPrinterKind::Json(json)
+    } else {
+      RunPrinterKind::Colored
+    }
   }
 }
 
@@ -226,9 +309,9 @@ fn run_pattern_with_printer(arg: RunArg, printer: impl Printer + 'static) -> Res
   }
 }
 
-struct RunWithInferredLang {
-  arg: RunArg,
-  trace: RunTrace,
+pub(crate) struct RunWithInferredLang {
+  pub(crate) arg: RunArg,
+  pub(crate) trace: RunTrace,
 }
 impl Worker for RunWithInferredLang {
   fn consume_items<P: Printer>(
@@ -249,6 +332,12 @@ impl Worker for RunWithInferredLang {
   }
 }
 
+impl RunWithInferredLang {
+  pub(crate) fn run_arg(&self) -> &RunArg {
+    &self.arg
+  }
+}
+
 impl PathWorker for RunWithInferredLang {
   fn build_walk(&self) -> Result<WalkParallel> {
     self.arg.input.walk()
@@ -262,6 +351,34 @@ impl PathWorker for RunWithInferredLang {
     path: &Path,
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
+    Ok(self.produce_counted::<P>(path, processor)?.into_iter().map(|(f, _)| f).collect())
+  }
+}
+
+impl crate::remote::CountedProduce for RunWithInferredLang {
+  fn produce_counted<P: Printer>(
+    &self,
+    path: &Path,
+    processor: &P::Processor,
+  ) -> Result<Vec<(P::Processed, u32)>> {
+    let ret = self.produce_from_source::<P>(path, Source::Fs, processor)?;
+    if !ret.is_empty() {
+      // Search feeds the index (§3.4): this file was walked, read, and matched — bank its
+      // extraction product so the next `vorpal index` replays it instead of re-parsing.
+      // Best-effort by design: search output must never depend on cache writability.
+      let _ = vorpal_index::warm_product_cache(path);
+    }
+    Ok(ret)
+  }
+}
+
+impl RunWithInferredLang {
+  fn produce_from_source<P: Printer>(
+    &self,
+    path: &Path,
+    source: Source,
+    processor: &P::Processor,
+  ) -> Result<Vec<(P::Processed, u32)>> {
     let Some(lang) = SgLang::from_path(path) else {
       return Ok(vec![]);
     };
@@ -276,7 +393,7 @@ impl PathWorker for RunWithInferredLang {
       })
       .collect::<Vec<_>>();
 
-    let items = filter_file_pattern(path, lang, Some(&matcher), &sub_matchers)?;
+    let items = filter_source_pattern(path, source, lang, Some(&matcher), &sub_matchers)?;
     let mut ret = Vec::with_capacity(items.len());
     let rewrite_str = self.arg.rewrite.as_ref();
 
@@ -295,17 +412,27 @@ impl PathWorker for RunWithInferredLang {
       };
       ret.push(processed);
     }
-    if !ret.is_empty() {
-      // Search feeds the index (§3.4): this file was walked, read, and matched — bank its
-      // extraction product so the next `vorpal index` replays it instead of re-parsing.
-      // Best-effort by design: search output must never depend on cache writability.
-      let _ = vorpal_index::warm_product_cache(path);
-    }
     Ok(ret)
+  }
+
+  /// Remote streaming mode: the same pattern pipeline over wire-delivered content (§3.3).
+  pub(crate) fn produce_item_from_content<P: Printer>(
+    &self,
+    path: &Path,
+    content: String,
+    processor: &P::Processor,
+  ) -> Result<Vec<P::Processed>> {
+    Ok(
+      self
+        .produce_from_source::<P>(path, Source::Memory(content), processor)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect(),
+    )
   }
 }
 
-struct RunWithSpecificLang {
+pub(crate) struct RunWithSpecificLang {
   arg: RunArg,
   rule: Rule,
   rewrite: Option<Fixer>,
@@ -313,7 +440,7 @@ struct RunWithSpecificLang {
 }
 
 impl RunWithSpecificLang {
-  fn new(arg: RunArg, stats: RunTrace) -> Result<Self> {
+  pub(crate) fn new(arg: RunArg, stats: RunTrace) -> Result<Self> {
     let lang = arg.lang.ok_or(anyhow::anyhow!(EC::LanguageNotSpecified))?;
     // do not unwrap result here
     let pattern_ret = arg.build_matcher(lang);
@@ -329,6 +456,10 @@ impl RunWithSpecificLang {
       rewrite,
       stats,
     })
+  }
+
+  pub(crate) fn run_arg(&self) -> &RunArg {
+    &self.arg
   }
 }
 
@@ -369,6 +500,32 @@ impl PathWorker for RunWithSpecificLang {
     path: &Path,
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
+    Ok(self.produce_counted::<P>(path, processor)?.into_iter().map(|(f, _)| f).collect())
+  }
+}
+
+impl crate::remote::CountedProduce for RunWithSpecificLang {
+  fn produce_counted<P: Printer>(
+    &self,
+    path: &Path,
+    processor: &P::Processor,
+  ) -> Result<Vec<(P::Processed, u32)>> {
+    let ret = self.produce_from_source::<P>(path, Source::Fs, processor)?;
+    if !ret.is_empty() {
+      // Search feeds the index (§3.4): bank the matched file's extraction product.
+      let _ = vorpal_index::warm_product_cache(path);
+    }
+    Ok(ret)
+  }
+}
+
+impl RunWithSpecificLang {
+  fn produce_from_source<P: Printer>(
+    &self,
+    path: &Path,
+    source: Source,
+    processor: &P::Processor,
+  ) -> Result<Vec<(P::Processed, u32)>> {
     let arg = &self.arg;
     let pattern = &self.rule;
     let lang = arg.lang.expect("must present");
@@ -383,7 +540,7 @@ impl PathWorker for RunWithSpecificLang {
       let rule = arg.build_matcher(lang)?;
       (None, vec![(lang, rule)])
     };
-    let filtered = filter_file_pattern(path, path_lang, root_matcher, &sub_matchers)?;
+    let filtered = filter_source_pattern(path, source, path_lang, root_matcher, &sub_matchers)?;
     let mut ret = Vec::with_capacity(filtered.len());
     for unit in filtered {
       let Some(processed) = match_one_file(processor, &unit, &self.rewrite)? else {
@@ -391,11 +548,23 @@ impl PathWorker for RunWithSpecificLang {
       };
       ret.push(processed);
     }
-    if !ret.is_empty() {
-      // Search feeds the index (§3.4): bank the matched file's extraction product.
-      let _ = vorpal_index::warm_product_cache(path);
-    }
     Ok(ret)
+  }
+
+  /// Remote streaming mode: the same pattern pipeline over wire-delivered content (§3.3).
+  pub(crate) fn produce_item_from_content<P: Printer>(
+    &self,
+    path: &Path,
+    content: String,
+    processor: &P::Processor,
+  ) -> Result<Vec<P::Processed>> {
+    Ok(
+      self
+        .produce_from_source::<P>(path, Source::Memory(content), processor)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect(),
+    )
   }
 }
 
@@ -423,11 +592,14 @@ impl StdInWorker for RunWithSpecificLang {
     Ok(vec![processed])
   }
 }
+/// Render one file's matches. Returns the rendered fragment paired with the **match count** it
+/// contains (`None` when the file has no matches), so a remote agent can report an accurate
+/// `Rendered.match_count`; local callers ignore the count.
 fn match_one_file<T, P: PrintProcessor<T>>(
   processor: &P,
   match_unit: &MatchUnit<impl Matcher>,
   rewrite: &Option<Fixer>,
-) -> Result<Option<T>> {
+) -> Result<Option<(T, u32)>> {
   let MatchUnit {
     path,
     grep,
@@ -435,17 +607,18 @@ fn match_one_file<T, P: PrintProcessor<T>>(
   } = match_unit;
 
   let root = grep.root();
-  let mut matches = root.find_all(matcher).peekable();
-  if matches.peek().is_none() {
+  let matches: Vec<_> = root.find_all(matcher).collect();
+  if matches.is_empty() {
     return Ok(None);
   }
+  let count = matches.len() as u32;
   let ret = if let Some(rewrite) = rewrite {
-    let diffs = matches.map(|m| Diff::generate(m, matcher, rewrite));
+    let diffs = matches.into_iter().map(|m| Diff::generate(m, matcher, rewrite));
     processor.print_diffs(diffs.collect(), path)?
   } else {
-    processor.print_matches(matches.collect(), path)?
+    processor.print_matches(matches, path)?
   };
-  Ok(Some(ret))
+  Ok(Some((ret, count)))
 }
 
 #[cfg(test)]
@@ -492,6 +665,7 @@ mod test {
         after: 0,
         context: 0,
       },
+      remote: Default::default(),
     }
   }
 

@@ -4,11 +4,33 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use vorpal_graph::{Direction, EdgeLog, EdgeType, Graph, reachable};
+use vorpal_graph::{Direction, EdgeType, Graph, reachable};
 use vorpal_mem::{CorpusProbe, ResourcePolicy};
 use vorpal_segment::{NodeId, Segment, SegmentDirectory, SegmentError};
 
 use crate::model::SymbolKind;
+
+/// Write `name` under `dir` through a `.tmp` sibling, then atomically swap it in.
+fn write_via_tmp(
+  dir: &Path,
+  name: &str,
+  write: impl FnOnce(&mut std::io::BufWriter<fs::File>) -> io::Result<()>,
+) -> io::Result<()> {
+  use std::io::Write;
+  let tmp = dir.join(format!("{name}.tmp"));
+  let mut out = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
+  write(&mut out)?;
+  out.flush()?;
+  drop(out);
+  replace_file(&tmp, &dir.join(name))
+}
+
+/// Atomic-replace rename (POSIX semantics; Windows needs the destination cleared first).
+fn replace_file(tmp: &Path, dest: &Path) -> io::Result<()> {
+  #[cfg(windows)]
+  let _ = fs::remove_file(dest);
+  fs::rename(tmp, dest)
+}
 
 /// A resolved node's attributes, borrowing the string heap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +78,10 @@ impl NodeColumns {
 pub struct Kg {
   nodes: Segment,
   cols: NodeColumns,
-  heap: Vec<u8>,
+  heap: vorpal_mem::PodColumn<u8>,
+  /// Where the heap bytes already live on disk, when they do (streamed commit or load) —
+  /// lets `save` rename or skip instead of rewriting a file readers may have mapped.
+  heap_file: Option<std::path::PathBuf>,
   graph: Graph,
   directory: SegmentDirectory,
 }
@@ -68,6 +93,24 @@ impl Kg {
     graph: Graph,
     directory: SegmentDirectory,
   ) -> Result<Self, SegmentError> {
+    Self::with_heap_column(
+      nodes,
+      vorpal_mem::PodColumn::from_vec(heap),
+      None,
+      graph,
+      directory,
+    )
+  }
+
+  /// Construct over an already-built heap column — the streamed-commit and load paths, where
+  /// the heap bytes live on disk (`heap_file`) and the column is a zero-copy map of them.
+  pub(crate) fn with_heap_column(
+    nodes: Segment,
+    heap: vorpal_mem::PodColumn<u8>,
+    heap_file: Option<std::path::PathBuf>,
+    graph: Graph,
+    directory: SegmentDirectory,
+  ) -> Result<Self, SegmentError> {
     let cols = NodeColumns::resolve(&nodes).ok_or(SegmentError::Corrupt(
       "node segment missing a required column",
     ))?;
@@ -75,6 +118,7 @@ impl Kg {
       nodes,
       cols,
       heap,
+      heap_file,
       graph,
       directory,
     })
@@ -176,7 +220,11 @@ impl Kg {
   /// All nodes whose display name equals `name` (a linear scan; the resident name/FTS index is
   /// §3.2's job). The query surface a CLI/MCP exposes builds on this.
   pub fn nodes_named(&self, name: &str) -> Vec<NodeId> {
+    use rayon::prelude::*;
+    // Parallel scan over the node rows; the indexed collect keeps ascending-id order, so the
+    // result is identical to the serial scan.
     (0..self.node_count() as u64)
+      .into_par_iter()
       .map(NodeId::new)
       .filter(|&id| self.node(id).is_some_and(|view| view.name == name))
       .collect()
@@ -222,37 +270,77 @@ impl Kg {
   /// Persist the graph to `dir`: the node `.vseg` segment, the string heap, and the edge list.
   /// Sealed segments are immutable, so this is a plain write (§9.7).
   pub fn save(&self, dir: &Path) -> io::Result<()> {
+    use std::io::Write;
+    crate::phase_stamp("kg save: segments");
     fs::create_dir_all(dir)?;
-    fs::write(dir.join("nodes.vseg"), self.nodes.bytes())?;
-    fs::write(dir.join("strings.heap"), &self.heap)?;
-
-    let edges: Vec<(u32, u32, u16)> = self.graph.out_edges().collect();
-    let mut buf = Vec::with_capacity(8 + edges.len() * 10);
-    buf.extend_from_slice(&(edges.len() as u64).to_le_bytes());
-    for (src, dst, etype) in edges {
-      buf.extend_from_slice(&src.to_le_bytes());
-      buf.extend_from_slice(&dst.to_le_bytes());
-      buf.extend_from_slice(&etype.to_le_bytes());
+    // Every artifact lands via tmp + rename: a rebuild must never truncate a file a live
+    // reader — this process's daemon, or another process — still has mapped (truncating a
+    // mapped file makes later reads fault). Rename swaps the directory entry; the old inode
+    // survives until its last map goes away.
+    write_via_tmp(dir, "nodes.vseg", |out| out.write_all(self.nodes.bytes()))?;
+    let heap_final = dir.join("strings.heap");
+    match &self.heap_file {
+      // Streamed commit: the bytes are already in the tmp file — publish it.
+      Some(existing) if *existing == dir.join("strings.heap.tmp") => {
+        replace_file(existing, &heap_final)?;
+      }
+      // Loaded from this very directory: identical bytes are already in place.
+      Some(existing) if *existing == heap_final => {}
+      _ => write_via_tmp(dir, "strings.heap", |out| out.write_all(&self.heap[..]))?,
     }
-    fs::write(dir.join("edges.bin"), &buf)?;
+
+    crate::phase_stamp("kg save: graph");
+    // Both CSR directions persist as one aligned section file the load path maps zero-copy —
+    // the edge-list form forced every open to re-run compaction (~64 ms at kernel scale).
+    write_via_tmp(dir, "graph.bin", |out| self.graph.write_to(out))?;
+    crate::phase_stamp("kg save: done");
     Ok(())
   }
 
   /// Cold-open a persisted graph: **mmap** the node segment (§9.1 — no heap load of the columns),
   /// read the string heap, and rebuild the CSR/CSC from the edge list.
   pub fn load(dir: &Path) -> Result<Self, SegmentError> {
+    crate::phase_stamp("kg load: nodes");
     let nodes_path = dir.join("nodes.vseg");
     let size = fs::metadata(&nodes_path)?.len();
     let policy = ResourcePolicy::probe(CorpusProbe::new(size, 1));
     let nodes = Segment::open_file(&nodes_path, &policy)?;
-    let heap = fs::read(dir.join("strings.heap"))?;
-    let edge_bytes = fs::read(dir.join("edges.bin"))?;
-
+    crate::phase_stamp("kg load: map heap + graph");
+    let heap_store = std::sync::Arc::new(
+      vorpal_mem::MappedStore::map_file(
+        &dir.join("strings.heap"),
+        vorpal_mem::StoreKind::VectorsFull,
+        vorpal_mem::AccessPattern::Random,
+        vorpal_mem::Hotness::Hot,
+        &policy,
+      )
+      .map_err(SegmentError::from)?,
+    );
+    let heap_len = heap_store.as_bytes().len();
+    let heap = vorpal_mem::PodColumn::from_mapped_le(&heap_store, 0, heap_len, u8::from_le_bytes)
+      .map_err(SegmentError::from)?;
+    let graph_store = std::sync::Arc::new(
+      vorpal_mem::MappedStore::map_file(
+        &dir.join("graph.bin"),
+        vorpal_mem::StoreKind::EdgesCsr,
+        vorpal_mem::AccessPattern::Random,
+        vorpal_mem::Hotness::Hot,
+        &policy,
+      )
+      .map_err(SegmentError::from)?,
+    );
+    let graph = Graph::open_mapped(graph_store).map_err(SegmentError::from)?;
+    crate::phase_stamp("kg load: done");
     let row_count = nodes.row_count();
-    let graph = rebuild_graph(row_count as u32, &edge_bytes);
     let mut directory = SegmentDirectory::new();
     directory.insert(0, row_count, 0);
-    Self::new(nodes, heap, graph, directory)
+    Self::with_heap_column(
+      nodes,
+      heap,
+      Some(dir.join("strings.heap")),
+      graph,
+      directory,
+    )
   }
 
   /// The node count of a persisted index, from the segment header alone — no string heap read,
@@ -264,25 +352,6 @@ impl Kg {
     let policy = ResourcePolicy::probe(CorpusProbe::new(size, 1));
     Ok(Segment::open_file(&nodes_path, &policy)?.row_count() as usize)
   }
-}
-
-fn rebuild_graph(node_count: u32, bytes: &[u8]) -> Graph {
-  let mut log = EdgeLog::new();
-  if bytes.len() >= 8 {
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let mut off = 8usize;
-    for _ in 0..count {
-      if off + 10 > bytes.len() {
-        break;
-      }
-      let src = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-      let dst = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
-      let etype = u16::from_le_bytes(bytes[off + 8..off + 10].try_into().unwrap());
-      log.push(src, dst, EdgeType(etype));
-      off += 10;
-    }
-  }
-  Graph::compact(node_count, &log)
 }
 
 fn is_containment(e: EdgeType) -> bool {
