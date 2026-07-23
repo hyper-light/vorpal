@@ -17,18 +17,30 @@ use crate::Rng;
 use crate::qmatrix::{QuantMatrix, QuantQuery};
 
 pub(crate) struct Vamana {
-  /// Out-neighbors per node, each list ≤ `r`.
-  pub graph: Vec<Vec<u32>>,
+  /// Out-neighbors as one fixed-capacity slab: node `i`'s row is
+  /// `flat[i·cap .. i·cap + lens[i]]`. Never materialized as per-row vectors — the slab is
+  /// the build form, the search form, and what the CSR save walks.
+  pub flat: Vec<u32>,
+  pub lens: Vec<u8>,
+  pub cap: usize,
   pub medoid: u32,
 }
 
 /// Adjacency access for beam search: per-node lists during construction, CSR sections
 /// (typically zero-copy mapped) after load. Same rows either way.
 pub(crate) enum Adjacency<'a> {
-  Lists(&'a [Vec<u32>]),
   Csr {
     offsets: &'a [u64],
     targets: &'a [u32],
+  },
+  /// Fixed-capacity rows in one contiguous slab — the under-construction form. One
+  /// allocation for the whole graph instead of one `Vec` per row: traversal stops chasing
+  /// millions of scattered heap pointers across as many heap pages (the fault profile's
+  /// second spike, after the stamp churn).
+  FlatCap {
+    flat: &'a [u32],
+    lens: &'a [u8],
+    cap: usize,
   },
 }
 
@@ -36,17 +48,20 @@ impl Adjacency<'_> {
   #[inline]
   pub fn is_empty(&self) -> bool {
     match self {
-      Adjacency::Lists(lists) => lists.is_empty(),
       Adjacency::Csr { offsets, .. } => offsets.len() <= 1,
+      Adjacency::FlatCap { lens, .. } => lens.is_empty(),
     }
   }
 
   #[inline]
   pub fn row(&self, u: u32) -> &[u32] {
     match self {
-      Adjacency::Lists(lists) => &lists[u as usize],
       Adjacency::Csr { offsets, targets } => {
         &targets[offsets[u as usize] as usize..offsets[u as usize + 1] as usize]
+      }
+      Adjacency::FlatCap { flat, lens, cap } => {
+        let at = u as usize * cap;
+        &flat[at..at + lens[u as usize] as usize]
       }
     }
   }
@@ -67,8 +82,8 @@ pub(crate) type Scored = (u32, f32);
 /// scans this replaces were O(beam × degree × visited) id compares per search — at kernel
 /// scale, a second quadratic cost rivaling the distance work itself.
 pub(crate) struct VisitStamps {
-  epoch: u32,
-  mark: Vec<u32>,
+  epoch: u16,
+  mark: Vec<u16>,
 }
 
 impl VisitStamps {
@@ -80,6 +95,8 @@ impl VisitStamps {
   }
 
   fn begin(&mut self) {
+    // u16 epochs halve the resident mark array (~4.6 MB/million rows); the wrap-around
+    // clear runs once per 65k searches per instance — noise.
     self.epoch = match self.epoch.checked_add(1) {
       Some(e) => e,
       None => {
@@ -159,7 +176,9 @@ impl Vamana {
     let n = matrix.len();
     if n == 0 {
       return Self {
-        graph: Vec::new(),
+        flat: Vec::new(),
+        lens: Vec::new(),
+        cap: params.r,
         medoid: 0,
       };
     }
@@ -186,10 +205,11 @@ impl Vamana {
         .unwrap_or(0)
     };
 
-    let mut vamana = Self {
-      graph: vec![Vec::new(); n],
-      medoid,
-    };
+    // The under-construction graph is one contiguous slab of fixed-capacity rows (`r`
+    // slots + a length byte per node): the per-row `Vec` form cost one heap allocation per
+    // node, re-cloned on every swap-in, and scattered traversal over ~n heap pages.
+    let mut flat: Vec<u32> = vec![0; n * params.r];
+    let mut lens: Vec<u8> = vec![0; n];
 
     // Seeded random insertion order, processed in doubling-prefix rounds. One α pass:
     // DiskANN's classic build runs α=1 then α>1, but the α=1 pass exists to refine reach
@@ -201,6 +221,10 @@ impl Vamana {
       order.swap(i, rng.below(i + 1));
     }
     let threads = rayon::current_num_threads().max(1);
+    // Reused stamp arrays, bounded by in-flight task count; dropped with the build. A fresh
+    // zero-filled ~9 MB array per task per round re-faulted its pages on every allocation
+    // under immediate-decay jemalloc — ~700k minor faults per kernel-scale build.
+    let stamp_pool: std::sync::Mutex<Vec<VisitStamps>> = std::sync::Mutex::new(Vec::new());
     for alpha in [params.alpha] {
       let mut start = 0usize;
       let mut round = 1usize;
@@ -214,12 +238,20 @@ impl Vamana {
         let proposals: Vec<(u32, Vec<u32>)> = batch
           .par_chunks(chunk)
           .flat_map_iter(|points| {
-            let mut stamps = VisitStamps::new(n);
+            let mut stamps = stamp_pool
+              .lock()
+              .unwrap_or_else(|poisoned| poisoned.into_inner())
+              .pop()
+              .unwrap_or_else(|| VisitStamps::new(n));
             let mut out = Vec::with_capacity(points.len());
             for &p in points {
               let visited = greedy_search(
-                &Adjacency::Lists(&vamana.graph),
-                vamana.medoid,
+                &Adjacency::FlatCap {
+                  flat: &flat,
+                  lens: &lens,
+                  cap: params.r,
+                },
+                medoid,
                 params.l_build,
                 &mut stamps,
                 |x| matrix.dist_sq(x, p),
@@ -231,6 +263,10 @@ impl Vamana {
                 robust_prune(matrix, p, candidates, alpha, params.r, params.l_build),
               ));
             }
+            stamp_pool
+              .lock()
+              .unwrap_or_else(|poisoned| poisoned.into_inner())
+              .push(stamps);
             out
           })
           .collect();
@@ -239,7 +275,9 @@ impl Vamana {
         // each target), and then every target runs the exact per-addition push-and-prune loop
         // the serial build ran — independently, in parallel — before its final list swaps in.
         for (p, pruned) in &proposals {
-          vamana.graph[*p as usize] = pruned.clone();
+          let at = *p as usize * params.r;
+          flat[at..at + pruned.len()].copy_from_slice(pruned);
+          lens[*p as usize] = pruned.len() as u8;
         }
         let mut additions: std::collections::HashMap<u32, Vec<u32>> =
           std::collections::HashMap::new();
@@ -257,7 +295,8 @@ impl Vamana {
         let merged: Vec<(u32, Vec<u32>)> = targets
           .into_par_iter()
           .map(|(b, incoming)| {
-            let mut neighbors = vamana.graph[b as usize].clone();
+            let at = b as usize * params.r;
+            let mut neighbors: Vec<u32> = flat[at..at + lens[b as usize] as usize].to_vec();
             for p in incoming {
               if !neighbors.contains(&p) {
                 neighbors.push(p);
@@ -274,13 +313,20 @@ impl Vamana {
           })
           .collect();
         for (b, neighbors) in merged {
-          vamana.graph[b as usize] = neighbors;
+          let at = b as usize * params.r;
+          flat[at..at + neighbors.len()].copy_from_slice(&neighbors);
+          lens[b as usize] = neighbors.len() as u8;
         }
         start += round;
         round *= 2;
       }
     }
-    vamana
+    Self {
+      flat,
+      lens,
+      cap: params.r,
+      medoid,
+    }
   }
 }
 

@@ -85,7 +85,12 @@ pub struct AnnIndex {
 
 /// The Vamana graph's storage form. Both expose identical rows via [`Adjacency`].
 enum AnnGraphStore {
-  Lists(Vec<Vec<u32>>),
+  /// Freshly built: the construction slab (fixed-capacity rows + lengths).
+  Flat {
+    flat: Vec<u32>,
+    lens: Vec<u8>,
+    cap: usize,
+  },
   Csr {
     offsets: PodColumn<u64>,
     targets: PodColumn<u32>,
@@ -95,14 +100,18 @@ enum AnnGraphStore {
 impl AnnGraphStore {
   fn adjacency(&self) -> Adjacency<'_> {
     match self {
-      AnnGraphStore::Lists(lists) => Adjacency::Lists(lists),
+      AnnGraphStore::Flat { flat, lens, cap } => Adjacency::FlatCap {
+        flat,
+        lens,
+        cap: *cap,
+      },
       AnnGraphStore::Csr { offsets, targets } => Adjacency::Csr { offsets, targets },
     }
   }
 
   fn edge_count(&self) -> usize {
     match self {
-      AnnGraphStore::Lists(lists) => lists.iter().map(Vec::len).sum(),
+      AnnGraphStore::Flat { lens, .. } => lens.iter().map(|&l| l as usize).sum(),
       AnnGraphStore::Csr { targets, .. } => targets.len(),
     }
   }
@@ -164,7 +173,11 @@ impl AnnIndex {
       codes,
       code_words,
       quant: None,
-      graph: AnnGraphStore::Lists(Vec::new()),
+      graph: AnnGraphStore::Flat {
+        flat: Vec::new(),
+        lens: Vec::new(),
+        cap: 0,
+      },
       medoid: 0,
     }
   }
@@ -209,7 +222,11 @@ impl AnnIndex {
       codes: Vec::new(),
       code_words: 0,
       quant: Some(quant),
-      graph: AnnGraphStore::Lists(vamana.graph),
+      graph: AnnGraphStore::Flat {
+        flat: vamana.flat,
+        lens: vamana.lens,
+        cap: vamana.cap,
+      },
       medoid: vamana.medoid,
     }
   }
@@ -345,11 +362,11 @@ impl AnnIndex {
       Some(quant) => {
         // CSR offsets from either storage form — identical bytes by construction.
         match &self.graph {
-          AnnGraphStore::Lists(lists) => {
+          AnnGraphStore::Flat { lens, .. } => {
             let mut offset = 0u64;
             out.write_all(&offset.to_le_bytes())?;
-            for row in lists {
-              offset += row.len() as u64;
+            for &len in lens {
+              offset += len as u64;
               out.write_all(&offset.to_le_bytes())?;
             }
           }
@@ -360,9 +377,12 @@ impl AnnIndex {
         write_le(&mut out, &quant.scales, |x: &f32| x.to_le_bytes())?;
         write_le(&mut out, &quant.snorm, |x: &f32| x.to_le_bytes())?;
         match &self.graph {
-          AnnGraphStore::Lists(lists) => {
-            for row in lists {
-              write_le(&mut out, row, |x: &u32| x.to_le_bytes())?;
+          AnnGraphStore::Flat { flat, lens, cap } => {
+            for (i, &len) in lens.iter().enumerate() {
+              let at = i * cap;
+              write_le(&mut out, &flat[at..at + len as usize], |x: &u32| {
+                x.to_le_bytes()
+              })?;
             }
           }
           AnnGraphStore::Csr { targets, .. } => {
@@ -490,7 +510,11 @@ impl AnnIndex {
       codes,
       code_words,
       quant: None,
-      graph: AnnGraphStore::Lists(Vec::new()),
+      graph: AnnGraphStore::Flat {
+        flat: Vec::new(),
+        lens: Vec::new(),
+        cap: 0,
+      },
       medoid,
     })
   }
