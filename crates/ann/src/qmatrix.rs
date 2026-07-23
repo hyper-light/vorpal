@@ -170,7 +170,19 @@ fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
       unsafe { dot_i8_neon(a, b) }
     }
   }
-  #[cfg(not(target_arch = "aarch64"))]
+  #[cfg(target_arch = "x86_64")]
+  {
+    if cfg!(target_feature = "avx2") || is_x86_feature_detected!("avx2") {
+      // SAFETY: avx2 verified; lengths are equal multiples of 16 by construction.
+      return unsafe { dot_i8_avx2(a, b) };
+    }
+    if is_x86_feature_detected!("sse4.1") {
+      // SAFETY: sse4.1 verified; same length invariants.
+      return unsafe { dot_i8_sse41(a, b) };
+    }
+    dot_i8_scalar(a, b)
+  }
+  #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
   dot_i8_scalar(a, b)
 }
 
@@ -242,6 +254,62 @@ fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
   a.iter().zip(b).map(|(&x, &y)| x as i32 * y as i32).sum()
 }
 
+/// AVX2 inner loop: sign-extend 16 i8 lanes to i16, `madd_epi16` multiplies and pair-sums
+/// into i32 lanes — every step exact (i16×i16 products are i32 arithmetic by definition;
+/// per-lane accumulation stays far below i32 range at these magnitudes), so this returns
+/// the same integer as the scalar path on any input.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
+  use core::arch::x86_64::*;
+  debug_assert_eq!(a.len(), b.len());
+  debug_assert_eq!(a.len() % 16, 0);
+  unsafe {
+    let mut acc = _mm256_setzero_si256();
+    let mut pa = a.as_ptr();
+    let mut pb = b.as_ptr();
+    for _ in 0..a.len() / 16 {
+      let va = _mm256_cvtepi8_epi16(_mm_loadu_si128(pa as *const __m128i));
+      let vb = _mm256_cvtepi8_epi16(_mm_loadu_si128(pb as *const __m128i));
+      acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
+      pa = pa.add(16);
+      pb = pb.add(16);
+    }
+    let hi = _mm256_extracti128_si256(acc, 1);
+    let lo = _mm256_castsi256_si128(acc);
+    let sum4 = _mm_add_epi32(hi, lo);
+    let sum2 = _mm_add_epi32(sum4, _mm_shuffle_epi32(sum4, 0b00_00_11_10));
+    let sum1 = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 0b00_00_00_01));
+    _mm_cvtsi128_si32(sum1)
+  }
+}
+
+/// SSE4.1 variant of the same exact arithmetic, for the pre-AVX2 x86 tail (and for
+/// Rosetta, which exposes SSE4.1 but not AVX2 — this path is what x86 test runs on Apple
+/// Silicon actually execute).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn dot_i8_sse41(a: &[i8], b: &[i8]) -> i32 {
+  use core::arch::x86_64::*;
+  debug_assert_eq!(a.len(), b.len());
+  debug_assert_eq!(a.len() % 16, 0);
+  unsafe {
+    let mut acc = _mm_setzero_si128();
+    let mut pa = a.as_ptr();
+    let mut pb = b.as_ptr();
+    for _ in 0..a.len() / 8 {
+      let va = _mm_cvtepi8_epi16(_mm_loadl_epi64(pa as *const __m128i));
+      let vb = _mm_cvtepi8_epi16(_mm_loadl_epi64(pb as *const __m128i));
+      acc = _mm_add_epi32(acc, _mm_madd_epi16(va, vb));
+      pa = pa.add(8);
+      pb = pb.add(8);
+    }
+    let sum2 = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, 0b00_00_11_10));
+    let sum1 = _mm_add_epi32(sum2, _mm_shuffle_epi32(sum2, 0b00_00_00_01));
+    _mm_cvtsi128_si32(sum1)
+  }
+}
+
 /// NEON inner loop: widening i8×i8→i16 multiplies, pairwise-accumulated into i32 lanes —
 /// every step exact (products ≤ 127² fit i16; accumulation is i32), so this returns the
 /// same integer as the scalar path on any input.
@@ -305,6 +373,23 @@ mod tests {
             unsafe { dot_i8_sdot(&a, &b) },
             reference,
             "sdot path diverged at len {len}"
+          );
+        }
+      }
+      #[cfg(target_arch = "x86_64")]
+      {
+        if is_x86_feature_detected!("avx2") {
+          assert_eq!(
+            unsafe { dot_i8_avx2(&a, &b) },
+            reference,
+            "avx2 path diverged at len {len}"
+          );
+        }
+        if is_x86_feature_detected!("sse4.1") {
+          assert_eq!(
+            unsafe { dot_i8_sse41(&a, &b) },
+            reference,
+            "sse4.1 path diverged at len {len}"
           );
         }
       }
