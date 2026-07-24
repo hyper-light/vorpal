@@ -15,7 +15,7 @@ mod kg;
 mod model;
 mod writer;
 
-pub use kg::{Kg, NodeView};
+pub use kg::{Kg, NodeView, SymbolSelector};
 pub use model::SymbolKind;
 pub use writer::{KgWriter, NodeDef};
 

@@ -11,13 +11,13 @@ use vorpal_config::{
 use vorpal_core::{NodeMatch, tree_sitter::StrDoc};
 use vorpal_language::SupportLang;
 
-use crate::remote::CountedProduce;
 use crate::config::{ProjectConfig, read_rule_file, with_rule_stats};
 use crate::lang::SgLang;
 use crate::print::{
   CloudPrinter, ColoredPrinter, Diff, FileNamePrinter, InteractivePrinter, JSONPrinter, Platform,
   PrintProcessor, Printer, ReportStyle, SimpleFile,
 };
+use crate::remote::CountedProduce;
 use crate::utils::RuleOverwrite;
 use crate::utils::{
   ContextArgs, InputArgs, LangPrefilters, OutputArgs, OverwriteArgs, filter_file_rule,
@@ -326,7 +326,13 @@ impl PathWorker for ScanWithConfig {
     path: &Path,
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
-    Ok(self.produce_counted::<P>(path, processor)?.into_iter().map(|(f, _)| f).collect())
+    Ok(
+      self
+        .produce_counted::<P>(path, processor)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect(),
+    )
   }
 
   fn should_stop(&self) -> bool {

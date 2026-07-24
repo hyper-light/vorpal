@@ -138,7 +138,15 @@ impl AgentModeProducer {
     on_done: Option<DoneSink>,
     global_max: Option<Arc<MaxItemCounter>>,
   ) -> Self {
-    Self { targets, job, agent_binary, ssh, outcomes, on_done, global_max }
+    Self {
+      targets,
+      job,
+      agent_binary,
+      ssh,
+      outcomes,
+      on_done,
+      global_max,
+    }
   }
 }
 
@@ -152,7 +160,15 @@ where
   }
 
   fn produce(self: Box<Self>, tx: ItemSink<P::Processed>, _processor: P::Processor) -> Result<()> {
-    let AgentModeProducer { targets, job, agent_binary, ssh, on_done, outcomes, global_max } = *self;
+    let AgentModeProducer {
+      targets,
+      job,
+      agent_binary,
+      ssh,
+      on_done,
+      outcomes,
+      global_max,
+    } = *self;
     let job = Arc::new(job);
     let on_done = on_done.map(Arc::new);
     let agent_binary = Arc::new(agent_binary);
@@ -262,7 +278,10 @@ pub(crate) async fn dial_transport(
     }
     Target::Ssh(uri) => {
       let transport = connect_ssh(uri, ssh).await?;
-      Ok((Box::new(transport), format!("node[{idx}] ssh://{}:{}", uri.host, uri.port)))
+      Ok((
+        Box::new(transport),
+        format!("node[{idx}] ssh://{}:{}", uri.host, uri.port),
+      ))
     }
     Target::K8s(k) => {
       let transport =
@@ -272,7 +291,10 @@ pub(crate) async fn dial_transport(
     }
     Target::Docker(d) => {
       let transport = CommandTransport::docker(&d.container);
-      Ok((Box::new(transport), format!("node[{idx}] docker://{}", d.container)))
+      Ok((
+        Box::new(transport),
+        format!("node[{idx}] docker://{}", d.container),
+      ))
     }
   }
 }
@@ -292,7 +314,11 @@ async fn agent_launch_for(
   match target {
     // The loopback agent's behavior is driven entirely by the wire protocol on its stdio, and the
     // `AGENT_ARG` is already baked into the subprocess argv, so the exec spec is empty.
-    Target::Loopback => Ok(LaunchPlan { launch: ExecSpec::argv(Vec::<String>::new()), provisioned: None, preamble: None }),
+    Target::Loopback => Ok(LaunchPlan {
+      launch: ExecSpec::argv(Vec::<String>::new()),
+      provisioned: None,
+      preamble: None,
+    }),
     // Every exec-capable remote (SSH, k8s, docker) launches the agent identically: push it if
     // `--push-agent` (optionally via the zero-residue `--loader`), else assume it is installed.
     Target::Ssh(_) | Target::K8s(_) | Target::Docker(_) => {
@@ -316,11 +342,17 @@ async fn agent_launch_for(
           .map_err(|e| anyhow!("node probe failed: {e}"))?
           .landing
           .ok_or_else(|| {
-            anyhow!("no writable+executable landing spot on the node (noexec?); use --remote-mode stream")
+            anyhow!(
+              "no writable+executable landing spot on the node (noexec?); use --remote-mode stream"
+            )
           })?,
       };
-      let agent_bytes = std::fs::read(local_bin)
-        .map_err(|e| anyhow!("cannot read --push-agent binary {}: {e}", local_bin.display()))?;
+      let agent_bytes = std::fs::read(local_bin).map_err(|e| {
+        anyhow!(
+          "cannot read --push-agent binary {}: {e}",
+          local_bin.display()
+        )
+      })?;
       // A per-node unique suffix without `rand`: pid ⊕ index.
       let unique = (std::process::id() as u64) << 16 ^ idx as u64;
 
@@ -331,9 +363,10 @@ async fn agent_launch_for(
           .map_err(|e| anyhow!("cannot read --loader binary {}: {e}", loader_bin.display()))?;
         let (signing_key, verifying_key) = vorpal_loader::generate_keypair();
         let pubkey_hex = vorpal_loader::verifying_key_to_hex(&verifying_key);
-        let prov = vorpal_transport::push_agent(transport, &landing, "vorpal-loader", unique, &loader_bytes)
-          .await
-          .map_err(|e| anyhow!("pushing the loader failed: {e}"))?;
+        let prov =
+          vorpal_transport::push_agent(transport, &landing, "vorpal-loader", unique, &loader_bytes)
+            .await
+            .map_err(|e| anyhow!("pushing the loader failed: {e}"))?;
         // `loader --pubkey <hex> -- vorpal-agent __agent`; the loader verifies then execs the agent
         // with this argv. The signed agent stream is written to stdin before the handshake.
         let launch = ExecSpec::argv([
@@ -345,14 +378,23 @@ async fn agent_launch_for(
           AGENT_ARG.to_string(),
         ]);
         let preamble = vorpal_loader::sign_payload(&agent_bytes, &signing_key, false);
-        Ok(LaunchPlan { launch, provisioned: Some(prov), preamble: Some(preamble) })
+        Ok(LaunchPlan {
+          launch,
+          provisioned: Some(prov),
+          preamble: Some(preamble),
+        })
       } else {
         // Plain push: land the agent, chmod +x, exec it directly (residue until cleanup).
-        let prov = vorpal_transport::push_agent(transport, &landing, "vorpal", unique, &agent_bytes)
-          .await
-          .map_err(|e| anyhow!("pushing the agent failed: {e}"))?;
+        let prov =
+          vorpal_transport::push_agent(transport, &landing, "vorpal", unique, &agent_bytes)
+            .await
+            .map_err(|e| anyhow!("pushing the agent failed: {e}"))?;
         let launch = ExecSpec::argv([prov.remote_path.clone(), AGENT_ARG.to_string()]);
-        Ok(LaunchPlan { launch, provisioned: Some(prov), preamble: None })
+        Ok(LaunchPlan {
+          launch,
+          provisioned: Some(prov),
+          preamble: None,
+        })
       }
     }
   }
@@ -376,7 +418,10 @@ pub async fn connect_ssh(
   let auth = if let Some(var) = &ssh.password_env {
     let password = std::env::var(var)
       .map_err(|_| anyhow!("--ssh-password-env {var} is not set in the environment"))?;
-    SshAuth::Password { user, password: Redacted(password) }
+    SshAuth::Password {
+      user,
+      password: Redacted(password),
+    }
   } else {
     let path = ssh.key.clone().or_else(default_ssh_key).ok_or_else(|| {
       anyhow!("no ssh credentials: pass --ssh-key <path> or --ssh-password-env <VAR>")
@@ -386,14 +431,23 @@ pub async fn connect_ssh(
       .as_ref()
       .and_then(|v| std::env::var(v).ok())
       .map(Redacted);
-    SshAuth::KeyFile { user, path, passphrase }
+    SshAuth::KeyFile {
+      user,
+      path,
+      passphrase,
+    }
   };
 
   // Dev-tool default: trust-on-first-use (a warning is logged). Operators can pin keys later.
   let verifier = HostKeyVerifier::AcceptAny;
-  SshTransport::connect(SshConfig { host: uri.host.clone(), port: uri.port, auth, verifier })
-    .await
-    .map_err(|e| anyhow!("{e}"))
+  SshTransport::connect(SshConfig {
+    host: uri.host.clone(),
+    port: uri.port,
+    auth,
+    verifier,
+  })
+  .await
+  .map_err(|e| anyhow!("{e}"))
 }
 
 /// The first existing default private key in `~/.ssh`.
@@ -488,7 +542,16 @@ where
 
   fn produce(self: Box<Self>, tx: ItemSink<P::Processed>, processor: P::Processor) -> Result<()> {
     let NegotiatingProducer {
-      targets, job, stream_worker, agent_binary, ssh, outcomes, on_done, global_max, policy, ..
+      targets,
+      job,
+      stream_worker,
+      agent_binary,
+      ssh,
+      outcomes,
+      on_done,
+      global_max,
+      policy,
+      ..
     } = *self;
     let job = Arc::new(job);
     let on_done = on_done.map(Arc::new);
@@ -539,8 +602,15 @@ where
 
         match route {
           Route::Agent(landing) => {
-            match agent_launch_for(&target, &*transport, idx, &agent_binary, &ssh, landing.as_ref())
-              .await
+            match agent_launch_for(
+              &target,
+              &*transport,
+              idx,
+              &agent_binary,
+              &ssh,
+              landing.as_ref(),
+            )
+            .await
             {
               Ok(plan) => {
                 let node: session::NodeSession<P> = session::NodeSession {
@@ -619,7 +689,13 @@ impl StreamModeProducer {
     agent_binary: Option<PathBuf>,
     outcomes: NodeOutcomes,
   ) -> Self {
-    Self { targets, worker, ssh, agent_binary, outcomes }
+    Self {
+      targets,
+      worker,
+      ssh,
+      agent_binary,
+      outcomes,
+    }
   }
 }
 
@@ -633,7 +709,13 @@ where
   }
 
   fn produce(self: Box<Self>, tx: ItemSink<P::Processed>, processor: P::Processor) -> Result<()> {
-    let StreamModeProducer { targets, worker, ssh, agent_binary, outcomes } = *self;
+    let StreamModeProducer {
+      targets,
+      worker,
+      ssh,
+      agent_binary,
+      outcomes,
+    } = *self;
     if targets.is_empty() {
       return Ok(());
     }
@@ -651,7 +733,10 @@ where
     // A non-loopback node's filesystem is remote: reconstruct discovery from the node's tree over
     // the transport and fetch surviving files' content — the coordinator runs the same match
     // pipeline on it (§3.3). Driven on a dedicated tokio runtime (transports are async).
-    let remote: Vec<Target> = targets.into_iter().filter(|t| !matches!(t, Target::Loopback)).collect();
+    let remote: Vec<Target> = targets
+      .into_iter()
+      .filter(|t| !matches!(t, Target::Loopback))
+      .collect();
     if !remote.is_empty() {
       let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -660,7 +745,8 @@ where
       rt.block_on(async {
         for (idx, target) in remote.iter().enumerate() {
           if let Err(e) =
-            super::remote_stream::stream_remote::<P>(target, idx, &ssh, &worker, &tx, &processor).await
+            super::remote_stream::stream_remote::<P>(target, idx, &ssh, &worker, &tx, &processor)
+              .await
           {
             outcomes.record_failure(format!("stream node[{idx}]: {e}"));
           }
@@ -683,8 +769,8 @@ where
   P: Printer,
   P::Processed: WireFragment,
 {
-  use rayon::prelude::*;
   use super::discovery::{GlobalIgnore, WalkConfig, reconstruct_local};
+  use rayon::prelude::*;
 
   let (input, types, langs_types_all) = stream_walk_inputs(worker)?;
   // The same glob builder the local walk uses (`InputArgs::build_globs`) — the override matcher
@@ -702,7 +788,12 @@ where
   // then fan the surviving files out across the rayon pool for parse+match.
   let mut files = Vec::new();
   for root in &input.input.paths {
-    files.extend(reconstruct_local(root, input.input.follow, &cfg, &GlobalIgnore::LocalMachine)?);
+    files.extend(reconstruct_local(
+      root,
+      input.input.follow,
+      &cfg,
+      &GlobalIgnore::LocalMachine,
+    )?);
   }
 
   // `try_for_each_init` clones the sink once per worker thread and short-circuits the whole
@@ -755,7 +846,14 @@ where
     Ok(c) => c,
     Err(_) => return StreamStep::Continue,
   };
-  match_stream_content::<P>(worker, display_path, content, /* warm */ true, processor, tx)
+  match_stream_content::<P>(
+    worker,
+    display_path,
+    content,
+    /* warm */ true,
+    processor,
+    tx,
+  )
 }
 
 /// Match already-acquired content and forward its items — shared by the loopback path (content
@@ -826,7 +924,10 @@ where
 /// the project prefix. On loopback the file exists, so this equals the local computation exactly.
 fn normalize_for_scan(display_path: &std::path::Path, proj_dir: &std::path::Path) -> PathBuf {
   match display_path.canonicalize() {
-    Ok(abs) => abs.strip_prefix(proj_dir).map(Path::to_path_buf).unwrap_or_else(|_| display_path.to_path_buf()),
+    Ok(abs) => abs
+      .strip_prefix(proj_dir)
+      .map(Path::to_path_buf)
+      .unwrap_or_else(|_| display_path.to_path_buf()),
     Err(_) => display_path.to_path_buf(),
   }
 }
@@ -836,7 +937,9 @@ use std::path::Path;
 /// Extract the walk inputs (roots, language types, no-ignore flags) from whichever worker drives
 /// this stream, so discovery reconstruction sees the same configuration the real walk would. The
 /// bool is "no type restriction" (inferred-lang run walks every file).
-pub fn stream_walk_inputs(worker: &StreamWorker) -> Result<(StreamInput, ignore::types::Types, bool)> {
+pub fn stream_walk_inputs(
+  worker: &StreamWorker,
+) -> Result<(StreamInput, ignore::types::Types, bool)> {
   use crate::lang::SgLang;
   use std::collections::HashSet;
   match worker {
@@ -859,7 +962,11 @@ pub fn stream_walk_inputs(worker: &StreamWorker) -> Result<(StreamInput, ignore:
     StreamWorker::RunInferred(run) => {
       // Inferred-lang run walks all files (`InputArgs::walk`), no type restriction.
       let input = StreamInput::from_input(run.run_arg().input.clone());
-      Ok((input, ignore::types::TypesBuilder::new().build().unwrap(), true))
+      Ok((
+        input,
+        ignore::types::TypesBuilder::new().build().unwrap(),
+        true,
+      ))
     }
   }
 }

@@ -6,17 +6,19 @@ mod print_diff;
 mod rule_overwrite;
 mod worker;
 
-pub use args::{ContextArgs, IgnoreFile, InputArgs, NoIgnore, OutputArgs, OverwriteArgs, WalkIgnore};
+pub use args::{
+  ContextArgs, IgnoreFile, InputArgs, NoIgnore, OutputArgs, OverwriteArgs, WalkIgnore,
+};
 pub use debug_query::DebugFormat;
 pub use error_context::{ErrorContext, exit_with_error};
 pub use inspect::{FileTrace, Granularity, RuleTrace, RunTrace, ScanTrace};
 pub use print_diff::DiffStyles;
 pub use rule_overwrite::RuleOverwrite;
+pub(crate) use worker::filter_result;
 pub use worker::{
   ChannelCap, ItemSink, Items, MaxItemCounter, PathWorker, Produce, StdInWorker, Worker,
   run_producer,
 };
-pub(crate) use worker::filter_result;
 
 use crate::lang::SgLang;
 
@@ -291,7 +293,6 @@ impl Prefilter {
       .collect();
     Self { finders }
   }
-
 
   /// True when every required literal occurs in `content` (vacuously true with no literals).
   pub fn may_match(&self, content: &str) -> bool {

@@ -10,6 +10,9 @@
 //! order-preserving collect keeps the product list — and therefore node-id assignment — exactly
 //! as deterministic as the serial loop was.
 
+pub mod annfiles;
+pub mod autowarm;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
@@ -238,13 +241,56 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
 /// hasher) into the adaptive ANN index persisted beside the graph. Rows embed in parallel with
 /// no per-node intermediate text; the order-preserving collect keeps the index bit-identical to
 /// the serial build.
-/// The ANN freshness stamp: xxh3 of the node segment bytes. Any node change (name,
-/// signature, count, order) changes the segment, which invalidates the stamp — necessary-
-/// condition semantics, same as every other cache in the pipeline.
-fn ann_stamp_of(index_dir: &Path) -> io::Result<u64> {
-  Ok(xxhash_rust::xxh3::xxh3_64(&fs::read(
-    index_dir.join("nodes.vseg"),
-  )?))
+/// The ANN freshness stamp: xxh3 of the node segment bytes of the **loaded** graph. Any node
+/// change (name, signature, count, order) changes the segment, which invalidates the stamp —
+/// necessary-condition semantics, same as every other cache in the pipeline. Hashing the
+/// loaded mapping (never re-reading `nodes.vseg`) pins every freshness decision to the
+/// generation actually in hand.
+fn stamp_of(kg: &Kg) -> u64 {
+  xxhash_rust::xxh3::xxh3_64(kg.node_segment_bytes())
+}
+
+/// The vector tier's row set: every non-Import node id, ascending. Import nodes are wiring,
+/// not semantic targets (they stay reachable through the exact-name channel); build and
+/// fallback must agree on this filter or cold results would resurface import noise.
+fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
+  (0..kg.node_count() as u64)
+    .filter(|&i| {
+      kg.node(NodeId::new(i))
+        .is_some_and(|view| view.kind != vorpal_kg::SymbolKind::Import)
+    })
+    .collect()
+}
+
+/// Embed node `id`'s parts into `row` — the one embedding recipe (name double-weighted,
+/// signature, file basename) shared by the index build, the cold fallback, and the rerank.
+fn embed_node_into(kg: &Kg, embedder: &LexicalEmbedder, id: u64, row: &mut [f32]) {
+  if let Some(view) = kg.node(NodeId::new(id)) {
+    let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+    let parts = [view.name, view.name, view.signature, basename];
+    embedder.embed_parts_into(&parts, row);
+  } else {
+    row.fill(0.0);
+  }
+}
+
+/// The `(dim, base_stamp)` of the persisted ann.bin header, if present and current-format —
+/// exposed for coherence tests and diagnostics.
+pub fn peek_ann_header(index_dir: &Path) -> Option<(usize, u64)> {
+  AnnIndex::peek_header(&index_dir.join("ann.bin"))
+}
+
+/// Whether the persisted vector tier matches `current_stamp` (and this build's format and
+/// embedder shape). Read-only — never blocks on, or triggers, a build.
+fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
+  fs::read(index_dir.join("ann.stamp"))
+    .ok()
+    .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
+    .is_some_and(|stored| stored == current_stamp)
+    // The bin's own header must carry the same generation: a rebuild window can rename the
+    // new bin before the new stamp lands, and the stamp file alone cannot see that.
+    && AnnIndex::peek_header(&index_dir.join("ann.bin"))
+      .is_some_and(|(bin_dim, bin_stamp)| bin_dim == dim && bin_stamp == current_stamp)
 }
 
 /// Build the ANN tier iff its stamp no longer matches the persisted graph (or it does not
@@ -254,6 +300,21 @@ fn ann_stamp_of(index_dir: &Path) -> io::Result<u64> {
 /// build; a search that arrives mid-build serializes on the same lock and proceeds the
 /// moment the tier is fresh.
 pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+  // Cross-process exclusion: concurrent warms (a daemon thread + a detached CLI child, or
+  // two cold CLIs) must not build twice. The loser skips entirely — whoever asked has
+  // already been served by the fallback tier, and the winner's commit flips freshness.
+  // fd-lock is advisory and released by the OS on process death, so a crashed warm never
+  // wedges the tier.
+  let lock_path = index_dir.join("ann.build.lock");
+  let lock_file = fs::OpenOptions::new()
+    .create(true)
+    .truncate(false)
+    .write(true)
+    .open(&lock_path)?;
+  let mut lock = fd_lock::RwLock::new(lock_file);
+  let Ok(_guard) = lock.try_write() else {
+    return Ok(());
+  };
   ensure_ann(index_dir)
 }
 
@@ -262,55 +323,45 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   // not both build (duplicate work, racing writes). Late entrants re-check freshness under
   // the lock and find the first builder's work done.
   static ANN_BUILD: Mutex<()> = Mutex::new(());
-  let _guard = ANN_BUILD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-  let stamp_path = index_dir.join("ann.stamp");
-  let current = ann_stamp_of(index_dir)?;
-  let fresh = fs::read(&stamp_path)
-    .ok()
-    .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
-    .is_some_and(|stored| stored == current)
-    // The stamp hashes graph content, not file format or embedder shape: a format bump or a
-    // dimension change must also invalidate, so an older index rebuilds instead of failing
-    // to parse (or silently mismatching the query embedding).
-    && AnnIndex::is_current_format(&index_dir.join("ann.bin"), LexicalEmbedder::default().dim());
-  if fresh {
+  let _guard = ANN_BUILD
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  // Load first, stamp the loaded bytes: the stamp this build writes must describe the KG it
+  // actually embedded, even if `nodes.vseg` is replaced underneath us mid-decision.
+  let kg = Kg::load(index_dir)?;
+  let current = stamp_of(&kg);
+  if ann_is_fresh(index_dir, current, LexicalEmbedder::default().dim()) {
     return Ok(());
   }
-  let kg = Kg::load(index_dir)?;
-  build_ann(&kg, index_dir).map_err(|err| err as Box<dyn Error>)?;
+  build_ann(&kg, index_dir, current).map_err(|err| err as Box<dyn Error>)?;
+  // Commit order: ann.bin → ann.files (both inside build_ann) → ann.stamp. The stamp is the
+  // commit point; a crash anywhere earlier leaves a mismatch that routes searches to the
+  // exhaustive fallback until the next warm heals it.
+  let stamp_path = index_dir.join("ann.stamp");
   let stamp_tmp = index_dir.join("ann.stamp.tmp");
   fs::write(&stamp_tmp, current.to_le_bytes())?;
   fs::rename(&stamp_tmp, &stamp_path)?;
   Ok(())
 }
 
-fn build_ann(kg: &Kg, out: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn build_ann(kg: &Kg, out: &Path, base_stamp: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
   vorpal_kg::phase_stamp("ann: build start");
   let embedder = LexicalEmbedder::default();
   let dim = embedder.dim();
-  let n = kg.node_count();
-  // Import nodes are wiring, not semantic targets — the resolver never offers them as
-  // definitions, and in search they only duplicated the names of what they import (12% of
-  // kernel rows). They stay reachable through the exact-name channel, which scans every
-  // KG node; only the vector tier skips them.
-  let ids: Vec<u64> = (0..n as u64)
-    .filter(|&i| {
-      kg.node(NodeId::new(i))
-        .is_some_and(|view| view.kind != vorpal_kg::SymbolKind::Import)
-    })
-    .collect();
+  let ids = semantic_row_ids(kg);
   let row_ids = ids.clone();
   // Rows embed straight into the index's storage (i8 codes at scale, in parallel): the
   // full-precision matrix never materializes — 2.9 GB of pure transient at kernel scale.
   let index = AnnIndex::build_rows(dim, ids, |i, row| {
-    if let Some(view) = kg.node(NodeId::new(row_ids[i])) {
-      let basename = view.path.rsplit('/').next().unwrap_or(view.path);
-      let parts = [view.name, view.name, view.signature, basename];
-      embedder.embed_parts_into(&parts, row);
-    }
+    embed_node_into(kg, &embedder, row_ids[i], row)
   });
   vorpal_kg::phase_stamp("ann: save start");
-  index.save(&out.join("ann.bin"))?;
+  index
+    .with_base_stamp(base_stamp)
+    .save(&out.join("ann.bin"))?;
+  // The per-file identity map for this generation — what lets a later search remap
+  // unchanged files and overlay changed ones instead of rebuilding (§ overlay).
+  annfiles::save(out, base_stamp, &annfiles::file_runs_of(kg))?;
   vorpal_kg::phase_stamp("ann: done");
   Ok(())
 }
@@ -464,28 +515,71 @@ fn rrf_fuse(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32)> {
 /// 3. **graph**: the candidates from (1)+(2) ranked by in-degree — heavily called/referenced
 ///    symbols outrank dead-weight lookalikes.
 pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, Box<dyn Error>> {
-  ensure_ann(index_dir)?;
   let kg = Kg::load(index_dir)?;
-  let ann = AnnIndex::load(&index_dir.join("ann.bin"))?;
+  let current_stamp = stamp_of(&kg);
   let embedder = LexicalEmbedder::default();
   let pool = (k * 4).max(50);
+  let query_vec = embedder.embed(query);
 
-  // Retrieve a generous pool on the (quantized, at scale) index, then re-score every
-  // candidate at full precision by re-embedding its parts — approximation chooses the pool,
-  // never the final semantic order (§10's rerank bar).
-  let semantic: Vec<u64> = {
-    let query_vec = embedder.embed(query);
-    let mut scored: Vec<(f32, u64)> = ann
-      .search(&query_vec, pool * 2)
+  // Semantic candidate pool, by tier — a search NEVER waits on an ANN build:
+  // 1. **Base-fresh**: the persisted tier matches this KG generation → beam search.
+  // 2. **Overlay**: the base is one or more edits behind, but `ann.files` reconciles —
+  //    unchanged files' candidates remap to current ids, changed/new files' rows score
+  //    exactly, dead rows tombstone. Milliseconds, and recall for edited code is exact.
+  // 3. **Fallback**: anything else — no base, torn artifacts, overlay too large — takes the
+  //    fused exhaustive scan (~0.2s at kernel scale, exact recall) and kicks a detached
+  //    background warm. Correctness never depends on which tier answered.
+  let take = pool * 2;
+  let candidates: Vec<u64> = if ann_is_fresh(index_dir, current_stamp, embedder.dim()) {
+    AnnIndex::load(&index_dir.join("ann.bin"))?
+      .search(&query_vec, take)
       .into_iter()
-      .map(|(id, approx)| {
-        let Some(view) = kg.node(NodeId::new(id)) else {
-          return (approx, id);
-        };
-        let basename = view.path.rsplit('/').next().unwrap_or(view.path);
-        let parts = [view.name, view.name, view.signature, basename];
+      .map(|(id, _)| id)
+      .collect()
+  } else if let Some(overlay) = annfiles::OverlayView::assemble(index_dir, &kg, embedder.dim()) {
+    autowarm::maybe_spawn(index_dir);
+    // Overfetch by the dead-row count (bounded) so tombstoning cannot starve the pool.
+    let bump = (overlay.tombstoned_nodes as usize).min(take);
+    let mut ids: Vec<u64> = AnnIndex::load(&index_dir.join("ann.bin"))?
+      .search(&query_vec, take + bump)
+      .into_iter()
+      .filter_map(|(base_id, _)| overlay.remap(base_id))
+      .collect();
+    let overlay_hits = vorpal_ann::exhaustive_semantic(
+      embedder.dim(),
+      &overlay.overlay_ids,
+      |i, row| embed_node_into(&kg, &embedder, overlay.overlay_ids[i], row),
+      &query_vec,
+      take,
+    );
+    // Disjoint by construction (remap targets are unchanged files; overlay ids are
+    // changed/new files) — a plain union; the exact rerank below orders everything.
+    ids.extend(overlay_hits.into_iter().map(|(id, _)| id));
+    ids
+  } else {
+    // Kick a detached warm so the *next* search takes the fast tier — gated (registered
+    // binaries only, opt-out, once per process) and best-effort; see `autowarm`.
+    autowarm::maybe_spawn(index_dir);
+    let ids = semantic_row_ids(&kg);
+    let scored = vorpal_ann::exhaustive_semantic(
+      embedder.dim(),
+      &ids,
+      |i, row| embed_node_into(&kg, &embedder, ids[i], row),
+      &query_vec,
+      take,
+    );
+    scored.into_iter().map(|(id, _)| id).collect()
+  };
+
+  // Re-score every candidate at full precision by re-embedding its parts against the
+  // *current* KG — approximation chooses the pool, never the final semantic order (§10's
+  // rerank bar), and rendering can never serve stale content.
+  let semantic: Vec<u64> = {
+    let mut scored: Vec<(f32, u64)> = candidates
+      .into_iter()
+      .map(|id| {
         let mut row = vec![0.0f32; embedder.dim()];
-        embedder.embed_parts_into(&parts, &mut row);
+        embed_node_into(&kg, &embedder, id, &mut row);
         let exact = row
           .iter()
           .zip(&query_vec)
@@ -494,11 +588,7 @@ pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, B
         (exact, id)
       })
       .collect();
-    scored.sort_by(|a, b| {
-      (a.0, a.1)
-        .partial_cmp(&(b.0, b.1))
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     scored.truncate(pool);
     scored.into_iter().map(|(_, id)| id).collect()
   };
@@ -558,22 +648,137 @@ pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, B
 
 /// Run one graph query verb against a persisted index and render the results — the shared
 /// implementation behind the `vorpal-index` binary and the `vorpal graph` subcommand.
+/// How a graph query names its target symbol — the CLI/MCP argument surface over
+/// [`vorpal_kg::SymbolSelector`]. `merge_all` restores the historical union-over-namesakes
+/// behavior explicitly; without it, an ambiguous name yields the candidate list instead.
+#[derive(Debug, Clone, Default)]
+pub struct GraphTarget {
+  pub name: String,
+  pub id: Option<u64>,
+  pub path_suffix: Option<String>,
+  pub kind: Option<String>,
+  pub merge_all: bool,
+  /// Suffix every result line with its node id (scripting/agents; default keeps the
+  /// human-stable format).
+  pub show_ids: bool,
+}
+
 pub fn graph_query(index_dir: &Path, verb: &str, name: &str) -> Result<String, Box<dyn Error>> {
+  graph_query_selected(
+    index_dir,
+    verb,
+    &GraphTarget {
+      name: name.to_string(),
+      ..GraphTarget::default()
+    },
+  )
+}
+
+/// Run one graph verb against a selected target. Identity contract (IMPROVEMENTS §1): a
+/// name that matches several definitions is answered with the **candidates**, not a silent
+/// union — refine with `id`/`path_suffix`/`kind`, or pass `merge_all` to union explicitly.
+pub fn graph_query_selected(
+  index_dir: &Path,
+  verb: &str,
+  target: &GraphTarget,
+) -> Result<String, Box<dyn Error>> {
   let kg = Kg::load(index_dir)?;
-  let ids = match verb {
-    "callers" => kg.callers_of(name),
-    "refs" | "references" => kg.references_to(name),
-    "importers" => kg.importers_of(name),
-    "implementors" => kg.implementors_of(name),
-    "typeusers" => kg.users_of_type(name),
-    "node" => kg.nodes_named(name),
+  let kind = match target.kind.as_deref() {
+    Some(text) => Some(
+      vorpal_kg::SymbolKind::parse(text)
+        .ok_or_else(|| format!("unknown symbol kind '{text}'"))?,
+    ),
+    None => None,
+  };
+  let selector = vorpal_kg::SymbolSelector {
+    id: target.id,
+    name: (!target.name.is_empty()).then_some(target.name.as_str()),
+    path_suffix: target.path_suffix.as_deref(),
+    kind,
+  };
+  let matches = kg.select(&selector);
+  if matches.is_empty() {
+    return Ok(format!("(no symbol matches '{}')\n", target.name));
+  }
+
+  let edge = match verb {
+    "callers" => Some(vorpal_kg::EdgeType::CALLS),
+    "refs" | "references" => Some(vorpal_kg::EdgeType::REFERENCES),
+    "importers" => Some(vorpal_kg::EdgeType::IMPORTS),
+    "implementors" => Some(vorpal_kg::EdgeType::IMPLEMENTS),
+    "typeusers" => Some(vorpal_kg::EdgeType::OF_TYPE),
+    "node" => None,
     other => return Err(format!("unknown graph verb '{other}'").into()),
   };
+
+  // `node` is a listing verb: every match IS the answer (ids attached — this verb exists to
+  // discover identities for refinement).
+  let Some(edge) = edge else {
+    return Ok(render_candidates(&kg, &matches));
+  };
+
+  if matches.len() > 1 && !target.merge_all {
+    let mut out = format!(
+      "ambiguous: '{}' matches {} definitions — refine with --path/--kind/--id, or --all to merge:\n",
+      target.name,
+      matches.len()
+    );
+    out.push_str(&render_candidates(&kg, &matches));
+    return Ok(out);
+  }
+
+  let mut ids: Vec<NodeId> = Vec::new();
+  for &target_id in &matches {
+    for from in kg.incoming_of(target_id, edge) {
+      ids.push(from);
+    }
+  }
+  ids.sort_unstable_by_key(|n| n.raw());
+  ids.dedup();
   Ok(if ids.is_empty() {
-    format!("(no results for '{name}')\n")
+    format!("(no results for '{}')\n", target.name)
+  } else if target.show_ids {
+    let mut out = String::new();
+    for &id in &ids {
+      if let Some(view) = kg.node(id) {
+        let _ = writeln!(
+          out,
+          "{} [{:?}] {} (id {})",
+          view.name,
+          view.kind,
+          view.path,
+          id.raw()
+        );
+      }
+    }
+    out
   } else {
     format_nodes(&kg, &ids)
   })
+}
+
+/// Render selector candidates with their identities — enough to refine to exactly one.
+fn render_candidates(kg: &Kg, ids: &[NodeId]) -> String {
+  let mut out = String::new();
+  for &id in ids {
+    if let Some(view) = kg.node(id) {
+      let signature = if view.signature.is_empty() {
+        String::new()
+      } else {
+        format!("  {}", view.signature)
+      };
+      let _ = writeln!(
+        out,
+        "id {}  {} [{:?}] {}{}",
+        id.raw(),
+        view.name,
+        view.kind,
+        view.path,
+        signature
+      );
+    }
+  }
+  out
 }
 
 /// Render nodes as `name [Kind] path` lines.

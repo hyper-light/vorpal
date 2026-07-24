@@ -83,6 +83,11 @@ enum Commands {
 }
 
 pub fn execute_main() -> Result<ExitCode> {
+  // Hidden `__warm-ann` mode: the detached background ANN warm re-enters through this
+  // sentinel (same pre-clap pattern as `__agent` below); registering marks this binary as
+  // allowed to *spawn* such children after a cold search.
+  vorpal_index::autowarm::run_if_sentinel();
+  vorpal_index::autowarm::register();
   // The hidden `__agent` mode turns this binary into a fleet agent driven over stdin/stdout
   // (docs/REMOTE.md). It is spawned by a coordinator (loopback in R0), never used by hand.
   if is_agent_invocation(std::env::args()) {

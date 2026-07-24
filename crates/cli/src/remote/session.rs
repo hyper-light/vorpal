@@ -138,8 +138,14 @@ where
       .await
       .map_err(|e| anyhow!("exec agent failed: {e}"))?;
     let killer = proc.killer();
-    let mut stdin = proc.stdin.take().ok_or_else(|| anyhow!("agent stdin unavailable"))?;
-    let stdout = proc.stdout.take().ok_or_else(|| anyhow!("agent stdout unavailable"))?;
+    let mut stdin = proc
+      .stdin
+      .take()
+      .ok_or_else(|| anyhow!("agent stdin unavailable"))?;
+    let stdout = proc
+      .stdout
+      .take()
+      .ok_or_else(|| anyhow!("agent stdout unavailable"))?;
     // A stage-0 loader consumes the signed-agent preamble from stdin, verifies it, and execs the
     // agent — which then reads the wire frames the `AsyncFrameWriter` writes next from the same pipe.
     if let Some(bytes) = preamble {
@@ -148,7 +154,10 @@ where
         .write_all(bytes)
         .await
         .map_err(|e| anyhow!("{label}: writing loader preamble failed: {e}"))?;
-      stdin.flush().await.map_err(|e| anyhow!("{label}: flushing loader preamble failed: {e}"))?;
+      stdin
+        .flush()
+        .await
+        .map_err(|e| anyhow!("{label}: flushing loader preamble failed: {e}"))?;
     }
     let mut writer = AsyncFrameWriter::new(stdin);
     let mut reader = AsyncFrameReader::new(stdout, vorpal_wire::DEFAULT_MAX_FRAME);
@@ -185,13 +194,19 @@ where
       }
       Err(_) => {
         killer.kill().await;
-        return Err(anyhow!("{label}: agent did not complete handshake within the deadline"));
+        return Err(anyhow!(
+          "{label}: agent did not complete handshake within the deadline"
+        ));
       }
     }
 
     // --- Job + Assign ---
-    writer.write_message(0, &Message::Job((**job).clone())).await?;
-    writer.write_message(0, &Message::Assign(Assign::SelfEnumerate)).await?;
+    writer
+      .write_message(0, &Message::Job((**job).clone()))
+      .await?;
+    writer
+      .write_message(0, &Message::Assign(Assign::SelfEnumerate))
+      .await?;
 
     // --- Drain results until Done/Bye ---
     // Every steady-state read is bounded by the deadline: a live-but-quiet agent pulses heartbeats
@@ -218,7 +233,9 @@ where
         None => return Err(anyhow!("{label}: agent closed the stream unexpectedly")),
       };
       match msg {
-        Message::Result(ResultFrame::Rendered { bytes, match_count, .. }) => {
+        Message::Result(ResultFrame::Rendered {
+          bytes, match_count, ..
+        }) => {
           // Global `--max-results` (§3.1): once the cross-node cap is reached, stop forwarding.
           if global_max.as_ref().is_some_and(|c| c.reached_max()) {
             break;
@@ -248,7 +265,10 @@ where
       }
     }
 
-    let status = proc.wait().await.map_err(|e| anyhow!("{label}: wait failed: {e}"))?;
+    let status = proc
+      .wait()
+      .await
+      .map_err(|e| anyhow!("{label}: wait failed: {e}"))?;
     if failed {
       return Err(anyhow!("{label}: agent reported job failure"));
     }
@@ -278,7 +298,9 @@ fn verify_welcome(welcome: &vorpal_wire::Welcome, ours: SemVer) -> Result<()> {
     ));
   }
   if welcome.caps.grammar_fingerprint != fingerprint::builtin_fingerprint() {
-    return Err(anyhow!("agent grammar fingerprint differs from coordinator (I2) — refusing agent mode"));
+    return Err(anyhow!(
+      "agent grammar fingerprint differs from coordinator (I2) — refusing agent mode"
+    ));
   }
   Ok(())
 }

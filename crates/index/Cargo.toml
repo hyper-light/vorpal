@@ -19,3 +19,7 @@ vorpal-kg = { workspace = true, features = ["alloc-stats"] }
 tikv-jemallocator = "0.7.0"
 tree-sitter.workspace = true
 tikv-jemalloc-sys = "0.7.1"
+fd-lock = "4.0.4"
+
+[dev-dependencies]
+fd-lock = "4.0.4"

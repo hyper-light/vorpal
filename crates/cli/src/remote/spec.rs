@@ -120,7 +120,9 @@ fn walk_params(input: &InputArgs) -> Result<WalkParams> {
     .iter()
     .map(|p| {
       p.to_str().map(str::to_owned).ok_or_else(|| {
-        anyhow!(EC::RemoteInvalid(format!("non-UTF-8 path {p:?} cannot cross the wire")))
+        anyhow!(EC::RemoteInvalid(format!(
+          "non-UTF-8 path {p:?} cannot cross the wire"
+        )))
       })
     })
     .collect::<Result<Vec<_>>>()?;
@@ -138,8 +140,8 @@ fn walk_params(input: &InputArgs) -> Result<WalkParams> {
 /// `get_processor` reads); `styles_colored` mirrors `PrintStyles::from(choice)`.
 fn resolve_color(color: crate::print::ColorArg) -> (bool, bool) {
   let choice: ColorChoice = color.into();
-  let buffer_color = codespan_reporting::term::termcolor::StandardStream::stdout(choice)
-    .supports_color();
+  let buffer_color =
+    codespan_reporting::term::termcolor::StandardStream::stdout(choice).supports_color();
   let styles_colored = color.should_use_color();
   (buffer_color, styles_colored)
 }
@@ -150,9 +152,14 @@ fn scan_printer_spec(arg: &ScanArg) -> PrinterSpec {
   match arg.printer_kind() {
     ScanPrinterKind::FilesWithMatches => {
       let (buffer_color, styles_colored) = resolve_color(arg.output.color);
-      PrinterSpec::FileName { buffer_color, styles_colored }
+      PrinterSpec::FileName {
+        buffer_color,
+        styles_colored,
+      }
     }
-    ScanPrinterKind::Cloud(format) => PrinterSpec::Cloud { platform: platform_to_wire(&format) },
+    ScanPrinterKind::Cloud(format) => PrinterSpec::Cloud {
+      platform: platform_to_wire(&format),
+    },
     ScanPrinterKind::Json(json) => PrinterSpec::Json {
       style: json_style_to_wire(json),
       // scan constructs its JSON printer without context (matches `run_with_config`)
@@ -177,7 +184,10 @@ fn run_printer_spec(arg: &RunArg) -> PrinterSpec {
   match arg.printer_kind() {
     RunPrinterKind::FilesWithMatches => {
       let (buffer_color, styles_colored) = resolve_color(arg.output.color);
-      PrinterSpec::FileName { buffer_color, styles_colored }
+      PrinterSpec::FileName {
+        buffer_color,
+        styles_colored,
+      }
     }
     RunPrinterKind::Json(json) => PrinterSpec::Json {
       style: json_style_to_wire(json),
@@ -209,7 +219,11 @@ pub(crate) fn build_scan_job(
   let proj_dir = worker
     .project_dir()
     .to_str()
-    .ok_or_else(|| anyhow!(EC::RemoteInvalid("non-UTF-8 project dir cannot cross the wire".into())))?
+    .ok_or_else(|| {
+      anyhow!(EC::RemoteInvalid(
+        "non-UTF-8 project dir cannot cross the wire".into()
+      ))
+    })?
     .to_string();
   Ok(JobSpec {
     job_id: std::process::id() as u64,
@@ -238,7 +252,11 @@ pub(crate) fn build_run_job(arg: &RunArg, lang_env: &LangEnv) -> Result<JobSpec>
     kind: JobKind::Run(RunJob {
       pattern: arg.matcher.pattern.clone(),
       selector: arg.matcher.selector.clone(),
-      strictness: arg.matcher.strictness.as_ref().map(|s| s.wire_name().to_string()),
+      strictness: arg
+        .matcher
+        .strictness
+        .as_ref()
+        .map(|s| s.wire_name().to_string()),
       kind: arg.matcher.kind.clone(),
       rewrite: arg.rewrite.clone(),
       lang: arg.lang.map(|l| l.to_string()),
@@ -261,7 +279,12 @@ pub(crate) fn input_args_from_walk(walk: &WalkParams) -> InputArgs {
   InputArgs {
     paths: walk.paths.iter().map(Into::into).collect(),
     follow: walk.follow_links,
-    no_ignore: walk.no_ignore.iter().copied().map(no_ignore_from_wire).collect(),
+    no_ignore: walk
+      .no_ignore
+      .iter()
+      .copied()
+      .map(no_ignore_from_wire)
+      .collect(),
     stdin: false,
     globs: walk.globs.clone(),
     threads: walk.threads as usize,
@@ -280,7 +303,11 @@ fn neutral_output_args() -> crate::utils::OutputArgs {
 }
 
 fn neutral_context_args() -> crate::utils::ContextArgs {
-  crate::utils::ContextArgs { before: 0, after: 0, context: 0 }
+  crate::utils::ContextArgs {
+    before: 0,
+    after: 0,
+    context: 0,
+  }
 }
 
 /// Rebuild the `ScanArg` an agent-side `ScanWithConfig` needs. Only walk inputs, the local
@@ -310,7 +337,9 @@ pub(crate) fn run_arg_from_job(job: &JobSpec, run: &RunJob) -> Result<RunArg> {
   };
   let lang = match &run.lang {
     Some(name) => Some(
-      name.parse::<SgLang>().map_err(|e| anyhow!("unknown language `{name}` in job: {e}"))?,
+      name
+        .parse::<SgLang>()
+        .map_err(|e| anyhow!("unknown language `{name}` in job: {e}"))?,
     ),
     None => None,
   };
@@ -339,34 +368,58 @@ pub(crate) enum AgentPrinter {
 /// A writer whose `supports_color()` matches the coordinator's, so `get_processor` bakes the same
 /// color decision into fragments.
 fn color_carrier(buffer_color: bool) -> Buffer {
-  if buffer_color { Buffer::ansi() } else { Buffer::no_color() }
+  if buffer_color {
+    Buffer::ansi()
+  } else {
+    Buffer::no_color()
+  }
 }
 
 fn style_choice(styles_colored: bool) -> ColorChoice {
-  if styles_colored { ColorChoice::AlwaysAnsi } else { ColorChoice::Never }
+  if styles_colored {
+    ColorChoice::AlwaysAnsi
+  } else {
+    ColorChoice::Never
+  }
 }
 
 pub(crate) fn printer_from_spec(spec: &PrinterSpec) -> AgentPrinter {
   match *spec {
-    PrinterSpec::Json { style, context, include_metadata } => AgentPrinter::Json(
+    PrinterSpec::Json {
+      style,
+      context,
+      include_metadata,
+    } => AgentPrinter::Json(
       JSONPrinter::new(std::io::sink(), json_style_from_wire(style))
         .context(context)
         .include_metadata(include_metadata),
     ),
-    PrinterSpec::Colored { buffer_color, styles_colored, heading, report_style, context } => {
-      AgentPrinter::Colored(
-        ColoredPrinter::new(color_carrier(buffer_color))
-          .color(style_choice(styles_colored))
-          .style(report_style_from_wire(report_style))
-          .heading(if heading { Heading::Always } else { Heading::Never })
-          .context(context),
-      )
-    }
-    PrinterSpec::FileName { buffer_color, styles_colored } => AgentPrinter::FileName(
+    PrinterSpec::Colored {
+      buffer_color,
+      styles_colored,
+      heading,
+      report_style,
+      context,
+    } => AgentPrinter::Colored(
+      ColoredPrinter::new(color_carrier(buffer_color))
+        .color(style_choice(styles_colored))
+        .style(report_style_from_wire(report_style))
+        .heading(if heading {
+          Heading::Always
+        } else {
+          Heading::Never
+        })
+        .context(context),
+    ),
+    PrinterSpec::FileName {
+      buffer_color,
+      styles_colored,
+    } => AgentPrinter::FileName(
       FileNamePrinter::new(color_carrier(buffer_color)).color(style_choice(styles_colored)),
     ),
-    PrinterSpec::Cloud { platform } => {
-      AgentPrinter::Cloud(CloudPrinter::new(std::io::sink(), platform_from_wire(platform)))
-    }
+    PrinterSpec::Cloud { platform } => AgentPrinter::Cloud(CloudPrinter::new(
+      std::io::sink(),
+      platform_from_wire(platform),
+    )),
   }
 }

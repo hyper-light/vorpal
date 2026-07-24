@@ -76,7 +76,9 @@ pub fn encode_scan_rules(
 /// the exact local code path.
 pub fn decode_scan_rules(payload: &RulePayload) -> Result<RuleCollection<SgLang>> {
   if !payload.verify() {
-    return Err(anyhow!("rule payload digest mismatch — refusing to scan with unverified rules"));
+    return Err(anyhow!(
+      "rule payload digest mismatch — refusing to scan with unverified rules"
+    ));
   }
   let doc: serde_json::Value =
     serde_json::from_slice(&payload.bytes).context("malformed rule payload")?;
@@ -86,7 +88,9 @@ pub fn decode_scan_rules(payload: &RulePayload) -> Result<RuleCollection<SgLang>
     .ok_or_else(|| anyhow!("rule payload missing `globals`"))?;
   let mut utils: Vec<SerializableGlobalRule<SgLang>> = Vec::with_capacity(globals_yaml.len());
   for y in globals_yaml {
-    let yaml = y.as_str().ok_or_else(|| anyhow!("global util must be a YAML string"))?;
+    let yaml = y
+      .as_str()
+      .ok_or_else(|| anyhow!("global util must be a YAML string"))?;
     utils.push(vorpal_config::from_str(yaml).context(EC::InvalidGlobalUtils)?);
   }
   let globals: GlobalRules =
@@ -214,7 +218,10 @@ utils:
     // Re-encoding the decoded collection must produce the identical canonical bytes — this is
     // the round-trip fidelity the digest scheme rests on.
     let payload2 = encode_scan_rules(&decoded, vec![]).expect("re-encodes");
-    assert_eq!(payload.bytes, payload2.bytes, "canonical rule bytes must be stable");
+    assert_eq!(
+      payload.bytes, payload2.bytes,
+      "canonical rule bytes must be stable"
+    );
     assert_eq!(payload.digest, payload2.digest);
   }
 
@@ -224,15 +231,17 @@ utils:
     let mut payload = encode_scan_rules(&collection, vec![]).expect("encodes");
     let last = payload.bytes.len() - 1;
     payload.bytes[last] ^= 0x01;
-    assert!(decode_scan_rules(&payload).is_err(), "digest mismatch must refuse");
+    assert!(
+      decode_scan_rules(&payload).is_err(),
+      "digest mismatch must refuse"
+    );
   }
 
   #[test]
   fn global_utils_ship_and_resolve() {
     // A rule referencing a global util compiles on the agent only if globals travel with it.
-    let globals_yaml = vec![
-      "id: is-some\nlanguage: Rust\nrule: { pattern: Some($A) }\n".to_string(),
-    ];
+    let globals_yaml =
+      vec!["id: is-some\nlanguage: Rust\nrule: { pattern: Some($A) }\n".to_string()];
     let utils: Vec<SerializableGlobalRule<SgLang>> = globals_yaml
       .iter()
       .map(|y| vorpal_config::from_str(y).expect("global parses"))

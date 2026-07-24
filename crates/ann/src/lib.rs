@@ -18,11 +18,13 @@ mod embed;
 mod index;
 mod qmatrix;
 mod quant;
+mod scan;
 mod vamana;
 
 pub use embed::{Embedder, LexicalEmbedder, tokenize};
 pub use index::{AnnConfig, AnnIndex};
 pub use quant::SignQuantizer;
+pub use scan::exhaustive_semantic;
 
 /// Squared L2 distance. On unit-normalized vectors this orders identically to cosine distance.
 pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {

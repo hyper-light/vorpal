@@ -27,10 +27,10 @@ use crate::run::{RunWithInferredLang, RunWithSpecificLang};
 use crate::scan::ScanWithConfig;
 use crate::utils::PathWorker;
 
+use super::CountedProduce;
 use super::fingerprint;
 use super::rules_wire::{self, LangEnv};
 use super::spec::{self, AgentPrinter};
-use super::CountedProduce;
 
 /// True when this process was launched as an agent (argv[1] == [`super::AGENT_ARG`]).
 pub fn is_agent_invocation<I: Iterator<Item = String>>(mut args: I) -> bool {
@@ -53,7 +53,10 @@ pub fn run_agent() -> Result<ExitCode> {
     let remote_err = err
       .downcast::<RemoteError>()
       .unwrap_or_else(|e| RemoteError::Fatal(e.to_string()));
-    let _ = writer.lock().unwrap().write_message(0, &Message::Bye(remote_err));
+    let _ = writer
+      .lock()
+      .unwrap()
+      .write_message(0, &Message::Bye(remote_err));
   }
   Ok(ExitCode::SUCCESS)
 }
@@ -114,10 +117,11 @@ fn cgroup_cpu_budget() -> Option<usize> {
 }
 
 fn recv<R: io::Read>(reader: &mut FrameReader<R>) -> Result<Message> {
-  reader
-    .read_message()?
-    .map(|(_ch, msg)| msg)
-    .ok_or_else(|| anyhow!(RemoteError::Fatal("coordinator closed the stream early".into())))
+  reader.read_message()?.map(|(_ch, msg)| msg).ok_or_else(|| {
+    anyhow!(RemoteError::Fatal(
+      "coordinator closed the stream early".into()
+    ))
+  })
 }
 
 fn handshake_and_run<R: io::Read>(
@@ -139,7 +143,10 @@ fn handshake_and_run<R: io::Read>(
     },
     host: host_info(),
   };
-  writer.lock().unwrap().write_message(0, &Message::Welcome(welcome))?;
+  writer
+    .lock()
+    .unwrap()
+    .write_message(0, &Message::Welcome(welcome))?;
 
   // --- Job ---
   let Message::Job(job) = recv(reader)? else {
@@ -185,10 +192,14 @@ fn handshake_and_run<R: io::Read>(
     stats
   });
   let stats = stats?;
-  writer
-    .lock()
-    .unwrap()
-    .write_message(0, &Message::Done(Done { epoch: 0, outcome: Outcome::Complete, stats }))?;
+  writer.lock().unwrap().write_message(
+    0,
+    &Message::Done(Done {
+      epoch: 0,
+      outcome: Outcome::Complete,
+      stats,
+    }),
+  )?;
   Ok(())
 }
 
@@ -226,9 +237,17 @@ fn heartbeat_loop(stop: &AtomicBool, writer: &Mutex<FrameWriter<Stdout>>) {
       break;
     }
     seq += 1;
-    let beat = Telemetry::Heartbeat { seq, monotonic_ms: started.elapsed().as_millis() as u64 };
+    let beat = Telemetry::Heartbeat {
+      seq,
+      monotonic_ms: started.elapsed().as_millis() as u64,
+    };
     // A write error means the coordinator went away — nothing left to keep alive.
-    if writer.lock().unwrap().write_message(0, &Message::Telemetry(beat)).is_err() {
+    if writer
+      .lock()
+      .unwrap()
+      .write_message(0, &Message::Telemetry(beat))
+      .is_err()
+    {
       break;
     }
   }
@@ -237,7 +256,9 @@ fn heartbeat_loop(stop: &AtomicBool, writer: &Mutex<FrameWriter<Stdout>>) {
 /// Test-only: sleep for `VORPAL_AGENT_TEST_STALL_MS` before running the job, to exercise the
 /// coordinator's heartbeat/read-deadline handling deterministically (unset in normal operation).
 fn maybe_test_stall() {
-  if let Some(ms) = std::env::var("VORPAL_AGENT_TEST_STALL_MS").ok().and_then(|v| v.parse::<u64>().ok())
+  if let Some(ms) = std::env::var("VORPAL_AGENT_TEST_STALL_MS")
+    .ok()
+    .and_then(|v| v.parse::<u64>().ok())
   {
     std::thread::sleep(Duration::from_millis(ms));
   }
@@ -274,7 +295,9 @@ fn host_info() -> vorpal_wire::HostInfo {
   vorpal_wire::HostInfo {
     arch: std::env::consts::ARCH.into(),
     os: std::env::consts::OS.into(),
-    nproc: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1),
+    nproc: std::thread::available_parallelism()
+      .map(|n| n.get() as u32)
+      .unwrap_or(1),
     hostname: hostname().unwrap_or_default(),
   }
 }
@@ -293,10 +316,8 @@ fn run_scan_job(
   let no_suppress = spec::severity_from_name(&scan.no_suppress_all_severity)?;
   // The two synthesized suppression rules, rebuilt from their resolved severities (the same
   // `CombinedScan` constructors the local scan uses).
-  let unused_rule = vorpal_config::CombinedScan::unused_config(
-    unused,
-    vorpal_language::SupportLang::Rust.into(),
-  );
+  let unused_rule =
+    vorpal_config::CombinedScan::unused_config(unused, vorpal_language::SupportLang::Rust.into());
   let no_suppress_rule = vorpal_config::CombinedScan::no_suppress_all_config(
     no_suppress,
     vorpal_language::SupportLang::Rust.into(),
@@ -384,11 +405,7 @@ where
 /// (same discovery, same production, same error handling — a production error is a skip, exactly
 /// as locally), but each rendered item is framed and streamed instead of channel-sent, tagged
 /// with its true match count so the coordinator can enforce a global `--max-results` (§3.1).
-fn drive<W, P>(
-  worker: Arc<W>,
-  printer: P,
-  writer: &Arc<Mutex<FrameWriter<Stdout>>>,
-) -> Result<u64>
+fn drive<W, P>(worker: Arc<W>, printer: P, writer: &Arc<Mutex<FrameWriter<Stdout>>>) -> Result<u64>
 where
   W: PathWorker + CountedProduce + 'static,
   P: Printer,
@@ -429,7 +446,12 @@ where
         }
         matched.fetch_add(u64::from(count), Ordering::AcqRel);
         let n = seq.fetch_add(1, Ordering::AcqRel);
-        let frame = ResultFrame::Rendered { seq: n, epoch: 0, match_count: count, bytes };
+        let frame = ResultFrame::Rendered {
+          seq: n,
+          epoch: 0,
+          match_count: count,
+          bytes,
+        };
         let mut w = writer.lock().unwrap();
         if let Err(e) = w.write_message(1, &Message::Result(frame)) {
           *write_err.lock().unwrap() = Some(e.to_string());

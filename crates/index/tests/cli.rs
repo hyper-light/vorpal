@@ -251,3 +251,396 @@ fn warm_product_cache_never_creates_index_state() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+/// A cold search (no ann.bin) must serve real results without building or creating any
+/// vector-tier state — the fused exhaustive fallback, not a blocking build.
+#[test]
+fn cold_search_serves_without_ann_bin() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-coldscan-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(
+    src.join("resolver.rs"),
+    "pub fn resolve_import_path(path: &str) -> bool {\n  !path.is_empty()\n}\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("other.rs"),
+    "pub fn unrelated_helper() -> u32 {\n  1\n}\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  assert!(
+    !out.join("ann.bin").exists(),
+    "index run must not build the vector tier"
+  );
+  let rendered = search_index(&out, "import path resolution", 3).unwrap();
+  assert!(
+    rendered
+      .lines()
+      .next()
+      .unwrap_or("")
+      .contains("resolve_import_path"),
+    "cold fallback should rank the descriptive match first:\n{rendered}"
+  );
+  assert!(
+    !out.join("ann.bin").exists(),
+    "a cold search must not create vector-tier state as a side effect"
+  );
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// At flat-exact scale the warm tier IS an exhaustive scan, so cold and warm searches must
+/// render byte-identical output — the strongest cross-tier gate available.
+#[test]
+fn cold_scan_matches_warm_flat_exact_results() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-coldeq-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  for i in 0..12 {
+    fs::write(
+      src.join(format!("mod_{i}.rs")),
+      format!(
+        "pub fn helper_{i}(value: u32) -> u32 {{\n  value + {i}\n}}\npub struct Widget{i} {{ pub field: u32 }}\n"
+      ),
+    )
+    .unwrap();
+  }
+  build_index(&src, &out).unwrap();
+
+  let cold_a = search_index(&out, "widget helper value", 5).unwrap();
+  let cold_b = search_index(&out, "widget helper value", 5).unwrap();
+  assert_eq!(cold_a, cold_b, "cold scan must be deterministic");
+
+  vorpal_index::warm_ann(&out).unwrap();
+  assert!(out.join("ann.bin").exists());
+  let warm = search_index(&out, "widget helper value", 5).unwrap();
+  assert_eq!(
+    cold_a, warm,
+    "flat-exact warm results must equal the cold scan byte-for-byte"
+  );
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// The cross-process build lock: a second warm attempted while the first holds the lock
+/// must skip (return Ok, build nothing) rather than double-build.
+#[test]
+fn build_lock_excludes_second_builder() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-lock-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn locked_symbol() -> u32 { 3 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+
+  // Hold the lock as "another process" would, then ask for a warm: it must skip.
+  let lock_file = std::fs::OpenOptions::new()
+    .create(true)
+    .truncate(false)
+    .write(true)
+    .open(out.join("ann.build.lock"))
+    .unwrap();
+  let mut lock = fd_lock::RwLock::new(lock_file);
+  let guard = lock.try_write().unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+  assert!(
+    !out.join("ann.bin").exists(),
+    "a lock-skipped warm must not build or write anything"
+  );
+  drop(guard);
+
+  // Lock released: the warm proceeds and commits.
+  vorpal_index::warm_ann(&out).unwrap();
+  assert!(out.join("ann.bin").exists());
+  assert!(out.join("ann.stamp").exists());
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// Unregistered processes (this test binary) must never spawn a detached warm — a cold
+/// search in a test may not leave background work behind.
+#[test]
+fn autowarm_never_spawns_unregistered() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-nospawn-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn spawnless_symbol() -> u32 { 4 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+
+  let _ = search_index(&out, "spawnless symbol", 3).unwrap();
+  // Give any (incorrect) spawned child a moment, then verify nothing built the tier.
+  std::thread::sleep(std::time::Duration::from_millis(300));
+  assert!(
+    !out.join("ann.bin").exists(),
+    "an unregistered process must not have spawned a background warm"
+  );
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// `ann.files` invariants: ranges partition the node-id space in order, the digest reacts
+/// to content changes, stays put across no-op rebuilds, and both artifacts carry the same
+/// generation stamp as the header of ann.bin.
+#[test]
+fn ann_files_partition_and_stamp_cohere() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-annfiles-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn alpha_fn() -> u32 { 1 }\n").unwrap();
+  fs::write(src.join("b.rs"), "pub fn beta_fn() -> u32 { 2 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+
+  let kg = Kg::load(&out).unwrap();
+  let (files_stamp, runs) = vorpal_index::annfiles::load(&out).unwrap();
+  // Partition: sorted, contiguous, exactly covering [0, node_count).
+  let mut expected_start = 0u64;
+  for run in &runs {
+    assert_eq!(
+      run.start, expected_start,
+      "runs must be contiguous in id order"
+    );
+    expected_start += run.len as u64;
+  }
+  assert_eq!(
+    expected_start,
+    kg.node_count() as u64,
+    "runs must cover every node"
+  );
+  assert_eq!(runs.len(), 2);
+
+  // Generation coherence: bin header stamp == files stamp == stamp file.
+  let (_dim, bin_stamp) = vorpal_index::peek_ann_header(&out).unwrap();
+  assert_eq!(bin_stamp, files_stamp);
+  let stored = u64::from_le_bytes(fs::read(out.join("ann.stamp")).unwrap().try_into().unwrap());
+  assert_eq!(stored, files_stamp);
+
+  // Digest stability: rebuild with no changes → identical bytes.
+  let before = fs::read(out.join("ann.files")).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+  assert_eq!(
+    before,
+    fs::read(out.join("ann.files")).unwrap(),
+    "no-op warm must not rewrite"
+  );
+
+  // Digest sensitivity: change one file, re-index, re-warm → that run's digest changes,
+  // the other's does not.
+  std::thread::sleep(std::time::Duration::from_millis(1100));
+  fs::write(src.join("a.rs"), "pub fn alpha_fn_changed() -> u32 { 9 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+  let (_, runs_after) = vorpal_index::annfiles::load(&out).unwrap();
+  let digest_of = |runs: &[vorpal_index::annfiles::FileRun], suffix: &str| {
+    runs
+      .iter()
+      .find(|r| r.path.ends_with(suffix))
+      .unwrap()
+      .digest
+  };
+  assert_ne!(digest_of(&runs, "a.rs"), digest_of(&runs_after, "a.rs"));
+  assert_eq!(digest_of(&runs, "b.rs"), digest_of(&runs_after, "b.rs"));
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// The overlay path end-to-end: after an edit + re-index (base now stale), a search must
+/// find the new symbol (exact overlay), never return the deleted one (tombstones), and
+/// still find symbols from unchanged files whose ids SHIFTED (remap) — all without any
+/// ANN rebuild.
+#[test]
+fn overlay_search_serves_edits_without_rebuild() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-overlay-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  // aa.rs sorts first: editing it shifts every later file's node ids. The filler files keep
+  // the edit under the overlay-size threshold so the OVERLAY path (not the fallback) serves
+  // — asserted directly on OverlayView below.
+  fs::write(src.join("aa.rs"), "pub fn doomed_symbol() -> u32 { 1 }\n").unwrap();
+  fs::write(
+    src.join("mm.rs"),
+    "pub fn middle_helper(v: u32) -> u32 { v }\n",
+  )
+  .unwrap();
+  for i in 0..40 {
+    fs::write(
+      src.join(format!("pp_{i:02}.rs")),
+      format!("pub fn padding_fn_{i}(v: u32) -> u32 {{ v + {i} }}\n"),
+    )
+    .unwrap();
+  }
+  fs::write(
+    src.join("zz.rs"),
+    "pub fn tail_anchor_symbol() -> u32 { 3 }\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+  let ann_before = fs::read(out.join("ann.bin")).unwrap();
+
+  // Edit the first file: replace the doomed symbol with two fresh ones (range LENGTH grows,
+  // so later files' ids shift and aa.rs is overlay by construction).
+  std::thread::sleep(std::time::Duration::from_millis(1100));
+  fs::write(
+    src.join("aa.rs"),
+    "pub fn fresh_overlay_symbol() -> u32 { 7 }\npub fn second_fresh_symbol() -> u32 { 8 }\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  // Prove the overlay path is live for this state: the view assembles, covers exactly the
+  // edited file's rows, and remaps a shifted unchanged-file id correctly.
+  {
+    let kg = Kg::load(&out).unwrap();
+    let view = vorpal_index::annfiles::OverlayView::assemble(&out, &kg, 256)
+      .expect("edit is under the size threshold: the overlay path must engage");
+    assert!(
+      view.tombstoned_nodes > 0,
+      "the edited file's base rows must be dead"
+    );
+    assert!(
+      !view.overlay_ids.is_empty(),
+      "the edited file's current rows must be overlay candidates"
+    );
+    // aa.rs grew by one node, so every later id shifted by +1: base id N must remap to N+1
+    // for a node in an unchanged file (pick one well past aa.rs's range).
+    let probe = (kg.node_count() as u64) - 2;
+    assert_eq!(
+      view.remap(probe - 1),
+      Some(probe),
+      "unchanged-file ids must remap by the exact shift"
+    );
+  }
+
+  let fresh = search_index(&out, "fresh overlay symbol", 3).unwrap();
+  assert!(
+    fresh
+      .lines()
+      .next()
+      .unwrap_or("")
+      .contains("fresh_overlay_symbol"),
+    "edited-file symbol must be immediately searchable:\n{fresh}"
+  );
+  let doomed = search_index(&out, "doomed symbol", 5).unwrap();
+  assert!(
+    !doomed.contains("doomed_symbol"),
+    "deleted symbol must never surface:\n{doomed}"
+  );
+  let shifted = search_index(&out, "tail anchor symbol", 3).unwrap();
+  assert!(
+    shifted
+      .lines()
+      .next()
+      .unwrap_or("")
+      .contains("tail_anchor_symbol"),
+    "unchanged-file symbol must survive the id shift via remap:\n{shifted}"
+  );
+  // And all of it without touching the base artifact.
+  assert_eq!(
+    ann_before,
+    fs::read(out.join("ann.bin")).unwrap(),
+    "overlay search must not rebuild or rewrite the base"
+  );
+
+  // Determinism: same state, same bytes.
+  assert_eq!(
+    search_index(&out, "tail anchor symbol", 3).unwrap(),
+    shifted,
+    "overlay search must be deterministic"
+  );
+
+  // Deleted file: remove zz.rs entirely — its symbol must vanish, others still fine.
+  fs::remove_file(src.join("zz.rs")).unwrap();
+  build_index(&src, &out).unwrap();
+  let gone = search_index(&out, "tail anchor symbol", 5).unwrap();
+  assert!(
+    !gone.contains("tail_anchor_symbol"),
+    "deleted file's symbols must vanish:\n{gone}"
+  );
+  let still = search_index(&out, "middle helper", 3).unwrap();
+  assert!(
+    still.contains("middle_helper"),
+    "surviving files still searchable:\n{still}"
+  );
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// Torn artifact combinations must never produce wrong results — every mismatch routes to
+/// the exhaustive fallback, whose output is the reference by definition.
+#[test]
+fn torn_artifacts_route_to_fallback() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-torn-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn torn_case_symbol() -> u32 { 1 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+  let reference = search_index(&out, "torn case symbol", 3).unwrap();
+
+  // Corrupt ann.files (bad magic) → overlay refused; fresh base still fine.
+  fs::write(out.join("ann.files"), b"XXXXGARBAGE").unwrap();
+  assert_eq!(
+    search_index(&out, "torn case symbol", 3).unwrap(),
+    reference
+  );
+
+  // Stale stamp (wrong generation) + garbage files → fallback; results still correct.
+  fs::write(out.join("ann.stamp"), 0xDEAD_BEEF_u64.to_le_bytes()).unwrap();
+  assert_eq!(
+    search_index(&out, "torn case symbol", 3).unwrap(),
+    reference
+  );
+
+  // Truncated bin header + stale stamp → fallback; still correct.
+  fs::write(out.join("ann.bin"), b"short").unwrap();
+  assert_eq!(
+    search_index(&out, "torn case symbol", 3).unwrap(),
+    reference
+  );
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// Past the overlay-size ceiling (a huge fraction of files changed), assemble must refuse
+/// and the search must take the exhaustive fallback — correct either way.
+#[test]
+fn overlay_size_threshold_falls_back() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-ovthresh-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn thresh_alpha() -> u32 { 1 }\n").unwrap();
+  fs::write(src.join("b.rs"), "pub fn thresh_beta() -> u32 { 2 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+
+  // Rewrite half the corpus: way past 15% of nodes.
+  std::thread::sleep(std::time::Duration::from_millis(1100));
+  fs::write(
+    src.join("a.rs"),
+    "pub fn thresh_alpha_two() -> u32 { 3 }\npub fn thresh_alpha_three() -> u32 { 4 }\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  let kg = Kg::load(&out).unwrap();
+  assert!(
+    vorpal_index::annfiles::OverlayView::assemble(&out, &kg, 256).is_none(),
+    "an oversized overlay must refuse assembly"
+  );
+  // And the search still answers correctly (fallback).
+  let rendered = search_index(&out, "thresh alpha two", 3).unwrap();
+  assert!(rendered.contains("thresh_alpha_two"), "{rendered}");
+  let _ = fs::remove_dir_all(&base);
+}

@@ -65,8 +65,13 @@ impl WalkConfig {
   /// shipped-snapshot reconstruction will use.
   #[cfg_attr(not(test), allow(dead_code))]
   pub fn from_flags(overrides: Override, types: Option<Types>, no_ignore: &[NoIgnore]) -> Self {
-    let ignore_files: Vec<IgnoreFile> = no_ignore.iter().copied().map(wire_to_ignore_file).collect();
-    Self::from_walk_ignore(overrides, types, crate::utils::NoIgnore::disregard(&ignore_files).effective())
+    let ignore_files: Vec<IgnoreFile> =
+      no_ignore.iter().copied().map(wire_to_ignore_file).collect();
+    Self::from_walk_ignore(
+      overrides,
+      types,
+      crate::utils::NoIgnore::disregard(&ignore_files).effective(),
+    )
   }
 
   /// Build directly from resolved [`WalkIgnore`] settings.
@@ -168,7 +173,11 @@ fn read_dir_facts(dir: &Path) -> DirFacts {
       // Worktree: `.git` is a file containing `gitdir: <path>`.
       let contents = read_file_opt(&git)?;
       let rel = contents.strip_prefix("gitdir:")?.trim();
-      let gitdir = if Path::new(rel).is_absolute() { PathBuf::from(rel) } else { dir.join(rel) };
+      let gitdir = if Path::new(rel).is_absolute() {
+        PathBuf::from(rel)
+      } else {
+        dir.join(rel)
+      };
       // A worktree gitdir may point at a commondir indirection.
       match read_file_opt(&gitdir.join("commondir")) {
         Some(common) => {
@@ -271,8 +280,16 @@ fn descend(
     let joined = st.root.join(&rel);
     let query = strip_dot_slash(&joined);
     let abs_query = st.canonical.as_ref().map(|base| base.join(&rel));
-    if is_skipped(query, abs_query.as_deref(), is_dir, hidden, levels, st.ancestors, st.global, st.cfg)
-    {
+    if is_skipped(
+      query,
+      abs_query.as_deref(),
+      is_dir,
+      hidden,
+      levels,
+      st.ancestors,
+      st.global,
+      st.cfg,
+    ) {
       // Pruned: an ignored directory is never descended (the perf crux) and an ignored file is
       // never emitted.
       continue;
@@ -315,7 +332,11 @@ fn build_matcher(root: &Path, file_name: &str, content: &str) -> Option<Gitignor
     // Match `GitignoreBuilder::add` exactly: the first line is stripped of a UTF-8 BOM
     // (`trim_start_matches`, i.e. all leading BOMs) — Windows editors commonly write one, and
     // without the strip the first pattern compiles as `\u{feff}pattern` and never matches (I1).
-    let line = if i == 0 { line.trim_start_matches('\u{feff}') } else { line };
+    let line = if i == 0 {
+      line.trim_start_matches('\u{feff}')
+    } else {
+      line
+    };
     // I/O-shaped errors are ignored by the crate; malformed globs are skipped the same way.
     let _ = builder.add_line(from.clone(), line);
   }
@@ -582,9 +603,21 @@ pub fn reconstruct_snapshot(
     })
     .collect();
   let mut out = Vec::new();
-  let root_facts = snapshot.dirs.get(Path::new("")).cloned().unwrap_or_default();
+  let root_facts = snapshot
+    .dirs
+    .get(Path::new(""))
+    .cloned()
+    .unwrap_or_default();
   let mut levels = vec![facts_to_level(&snapshot.root, &root_facts, cfg)];
-  walk_snapshot(snapshot, Path::new(""), &mut levels, &ancestors, &global, cfg, &mut out);
+  walk_snapshot(
+    snapshot,
+    Path::new(""),
+    &mut levels,
+    &ancestors,
+    &global,
+    cfg,
+    &mut out,
+  );
   out
 }
 
@@ -604,9 +637,20 @@ fn walk_snapshot(
   for entry in children {
     let joined = snapshot.root.join(&entry.rel);
     let query = strip_dot_slash(&joined);
-    let abs_query = snapshot.canonical.as_ref().map(|base| base.join(&entry.rel));
-    if is_skipped(query, abs_query.as_deref(), entry.is_dir, entry.hidden, levels, ancestors, global, cfg)
-    {
+    let abs_query = snapshot
+      .canonical
+      .as_ref()
+      .map(|base| base.join(&entry.rel));
+    if is_skipped(
+      query,
+      abs_query.as_deref(),
+      entry.is_dir,
+      entry.hidden,
+      levels,
+      ancestors,
+      global,
+      cfg,
+    ) {
       continue;
     }
     if entry.is_dir {
@@ -719,7 +763,11 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir_all(root.join(".git")).unwrap(); // require_git wants a repo
-    write(root, ".gitignore", "target/\n*.log\n!keep.log\nsub/deep.rs\n");
+    write(
+      root,
+      ".gitignore",
+      "target/\n*.log\n!keep.log\nsub/deep.rs\n",
+    );
     write(root, "main.rs", "fn main() {}\n");
     write(root, "kept.rs", "fn kept() {}\n");
     write(root, "a.log", "log\n");
@@ -742,7 +790,11 @@ mod tests {
     fs::create_dir_all(root.join("nested/.git")).unwrap();
     write(root, "nested/.gitignore", "inner.rs\n");
     write(root, "nested/inner.rs", "fn inner_ignored() {}\n");
-    write(root, "nested/outer.log", "outer pattern does not cross the boundary\n");
+    write(
+      root,
+      "nested/outer.log",
+      "outer pattern does not cross the boundary\n",
+    );
     dir
   }
 
@@ -780,7 +832,11 @@ mod tests {
     let dir = fixture();
     write(dir.path(), "area/.keep", "");
     write(dir.path(), "area/app.rs", "fn app() {}\n");
-    write(dir.path(), "area/note.log", "ignored by the ROOT .gitignore\n");
+    write(
+      dir.path(),
+      "area/note.log",
+      "ignored by the ROOT .gitignore\n",
+    );
     assert_parity(&dir.path().join("area"), &[], &[], false);
     assert_parity(&dir.path().join("area"), &[NoIgnore::Parent], &[], false);
   }
@@ -868,7 +924,9 @@ mod tests {
     assert_parity(root, &[], &[], true);
     let files = reconstructed(root, &[], &[], true);
     assert!(
-      files.iter().all(|p| !p.to_string_lossy().contains("/self/")),
+      files
+        .iter()
+        .all(|p| !p.to_string_lossy().contains("/self/")),
       "no duplicated tree under the self link: {files:?}"
     );
   }

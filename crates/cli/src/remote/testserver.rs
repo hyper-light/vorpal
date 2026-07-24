@@ -20,7 +20,9 @@ struct BridgeServer;
 impl server::Server for BridgeServer {
   type Handler = BridgeHandler;
   fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> BridgeHandler {
-    BridgeHandler { stdins: Arc::new(Mutex::new(HashMap::new())) }
+    BridgeHandler {
+      stdins: Arc::new(Mutex::new(HashMap::new())),
+    }
   }
 }
 
@@ -69,7 +71,11 @@ impl server::Handler for BridgeHandler {
         match stdout.read(&mut buf).await {
           Ok(0) | Err(_) => break,
           Ok(n) => {
-            if handle.data(channel, CryptoVec::from(&buf[..n])).await.is_err() {
+            if handle
+              .data(channel, CryptoVec::from(&buf[..n]))
+              .await
+              .is_err()
+            {
               break;
             }
           }
@@ -110,7 +116,10 @@ impl server::Handler for BridgeHandler {
 pub async fn start() -> (std::net::SocketAddr, PublicKey) {
   let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).unwrap();
   let pubkey = key.public_key().clone();
-  let config = Arc::new(server::Config { keys: vec![key], ..Default::default() });
+  let config = Arc::new(server::Config {
+    keys: vec![key],
+    ..Default::default()
+  });
   let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
   let addr = listener.local_addr().unwrap();
   tokio::spawn(async move {

@@ -410,9 +410,31 @@ the future if a component needs wait-free *reclamation* (not just wait-free read
 > deterministic batch-parallel build (doubling-prefix rounds; frozen-graph parallel proposals;
 > per-target parallel back-edge merges preserving serial per-target semantics), its beam
 > search runs on a sorted-array beam with no hashing and no per-hop sort, and — per §3.4 —
-> embeddings are off the commit hot path entirely: `ann.bin` is built lazily by the first
-> search and validated by an xxh3 stamp of the node segment, so incremental re-indexes never
-> rebuild the vector graph (measured on the Linux kernel: one-file re-index 168 s → 9.5 s).
+> embeddings are off the commit hot path entirely: `ann.bin` is built lazily and validated
+> by an xxh3 stamp of the node segment, so incremental re-indexes never rebuild the vector
+> graph (measured on the Linux kernel: one-file re-index 168 s → 1.2 s). **No search ever
+> waits on that build** — the query path is a three-tier freshness decision, every artifact
+> checked against the stamp of the *loaded* KG bytes:
+>
+> 1. **Base-fresh** (`ann.stamp` == bin header `base_stamp` (ANN5) == live stamp): beam
+>    search over the mmapped tier — the fast path.
+> 2. **Overlay** (base is ≥1 edits behind, but `ann.files` — the per-file
+>    `(path, id-range, xxh3 of (kind, content_hash) rows)` map written beside the base —
+>    reconciles against the live KG): unchanged files' beam candidates remap by per-file id
+>    offset, changed/new files' rows are embedded and scored *exactly* (FreshDiskANN-style
+>    tombstones route around deleted rows; the dead-row count bumps the beam overfetch), and
+>    the union feeds the ordinary exact rerank. Refused above ~15% changed rows.
+> 3. **Fallback** (anything else — no tier, torn artifact combination, oversized overlay): a
+>    fused exhaustive scan (embed → score → discard per row; exact recall; ~0.33 s at kernel
+>    scale), which then spawns a **detached, file-locked background warm** (argv-sentinel
+>    re-entry, registered binaries only, `VORPAL_NO_AUTOWARM=1` veto) so the next search
+>    takes tier 1.
+>
+> Determinism contract: base artifacts (`ann.bin`, `ann.files`) are bit-identical across
+> rebuilds and land via tmp+rename (never truncating a mapped file); tiers 1 and 3 coincide
+> byte-for-byte at flat-exact scale, tier 3 ⊇ tier 1 in recall at Vamana scale, and tier 2's
+> rankings converge to tier 1's at compaction — hash-gates must compare like state with like
+> state.
 
 Pipeline `discover → read(mmap)+blake3 → hash-skip → parse → extract → chunk → (embed) → flush`
 as **fixed-capacity stages joined by bounded MPMC queues** (`crossbeam-queue::ArrayQueue`, or

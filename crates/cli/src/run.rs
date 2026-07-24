@@ -210,7 +210,12 @@ impl RunArg {
     context: ContextArgs,
   ) -> Self {
     Self {
-      matcher: MatcherArg { pattern, selector, strictness, kind },
+      matcher: MatcherArg {
+        pattern,
+        selector,
+        strictness,
+        kind,
+      },
       rewrite,
       lang,
       debug_query: None,
@@ -351,7 +356,13 @@ impl PathWorker for RunWithInferredLang {
     path: &Path,
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
-    Ok(self.produce_counted::<P>(path, processor)?.into_iter().map(|(f, _)| f).collect())
+    Ok(
+      self
+        .produce_counted::<P>(path, processor)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect(),
+    )
   }
 }
 
@@ -500,7 +511,13 @@ impl PathWorker for RunWithSpecificLang {
     path: &Path,
     processor: &P::Processor,
   ) -> Result<Vec<P::Processed>> {
-    Ok(self.produce_counted::<P>(path, processor)?.into_iter().map(|(f, _)| f).collect())
+    Ok(
+      self
+        .produce_counted::<P>(path, processor)?
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect(),
+    )
   }
 }
 
@@ -613,7 +630,9 @@ fn match_one_file<T, P: PrintProcessor<T>>(
   }
   let count = matches.len() as u32;
   let ret = if let Some(rewrite) = rewrite {
-    let diffs = matches.into_iter().map(|m| Diff::generate(m, matcher, rewrite));
+    let diffs = matches
+      .into_iter()
+      .map(|m| Diff::generate(m, matcher, rewrite));
     processor.print_diffs(diffs.collect(), path)?
   } else {
     processor.print_matches(matches, path)?

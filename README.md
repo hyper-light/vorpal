@@ -88,7 +88,7 @@ literal prefilter derived from your pattern — and, for YAML/inline rules, from
 constraints too (a conservative required-literal analysis of the parsed regex: `[A-Z]+_SUSPEND`
 requires `_SUSPEND`). Both `run` and `scan` consult it, so searches with any fixed text stay
 fast on large trees: finding every `^[A-Z]+_SUSPEND$` **identifier** in the Linux kernel
-(63,775 C files) takes **1.1 s** — parity with `rg -n -w` on the same machine — while
+(63,775 C files) takes **1.0 s** — faster than `rg -n -w` (1.04–1.16 s) on the same machine — while
 returning AST nodes instead of text lines (383 identifiers; ripgrep's extra lines are
 comments, strings, and docs).
 
@@ -345,7 +345,7 @@ Apple Silicon; wall-clock for the whole CLI invocation including process start):
 | Re-index after touching one file | 0.03 s (1 parsed, 350 replayed) |
 | Re-index, nothing changed | 0.01 s |
 | `vorpal run` structural search, no-match pattern | 0.017 s |
-| `vorpal scan`, regex rule `^[A-Z]+_SUSPEND$` over the **Linux kernel** | 1.1 s — ripgrep parity, structural results |
+| `vorpal scan`, regex rule `^[A-Z]+_SUSPEND$` over the **Linux kernel** | 1.0 s — faster than ripgrep, structural results |
 | Graph / search queries | milliseconds (mmap cold-open + in-memory graph) |
 
 At kernel scale (Linux 7.2-rc4: 72,541 files, ~30M LOC → 2.74M nodes, 6.8M references;
@@ -366,6 +366,18 @@ re-indexes never rebuild the vector graph. **Every persisted tier — node colum
 heap, graph CSR, and the quantized vector index — opens by `mmap`, zero-copy**: a warm
 search is **0.05 s** end to end, and a graph query (`callers kmalloc` → 2,440 results) is
 **0.01 s**, both including process start; only the pages a query touches ever load.
+
+**No search ever waits on that build.** A cold search (no vector tier yet) serves in
+**0.33 s** via a fused exhaustive scan — embed each row into per-worker scratch, score,
+discard; *exact* recall, a strict superset of the beam — then kicks the real build in a
+detached background process (file-locked, one builder per index; `VORPAL_NO_AUTOWARM=1`
+opts out), so the next search takes the fast tier. After an edit + re-index, searches serve
+in **0.09 s** from the sealed base **plus a vector overlay**: unchanged files' candidates
+remap to their new node ids, changed files' rows are scored exactly (better-than-beam recall
+precisely where you just edited), deleted rows are tombstoned — reconciled through the
+`ann.files` per-file digest map, with any torn or mismatched artifact combination routing to
+the exhaustive fallback. Base artifacts stay bit-identical and deterministic; overlay-tier
+rankings converge to the post-compaction ranking when the background warm lands.
 
 In-process (the MCP daemon and library callers skip process start): a cold full index of this
 repository is ~57 ms, and a no-change re-validation by polling is ~6 ms — ~3 ms of which is

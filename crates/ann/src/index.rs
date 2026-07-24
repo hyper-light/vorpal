@@ -42,13 +42,14 @@ const VAMANA_R: usize = 32;
 const VAMANA_L_BUILD: usize = 48;
 const VAMANA_ALPHA: f32 = 1.2;
 const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-/// "ANN4" — v2 moved the Vamana tier's vectors to per-row-scaled i8 codes (4× smaller,
+/// "ANN5" — v2 moved the Vamana tier's vectors to per-row-scaled i8 codes (4× smaller,
 /// integer-exact distances; flat tiers still store f32); v3 dropped Import nodes from the
 /// row set (wiring, not semantic targets); v4 lays the Vamana tier out as aligned sections
-/// with a CSR adjacency so queries **mmap it zero-copy** — a warm search stopped reading
-/// three-quarters of a gigabyte up front. Older files fail the magic check and are rebuilt
-/// (the ANN tier is a cache — see `ensure_ann`).
-const MAGIC: u32 = 0x414E_4E34;
+/// with a CSR adjacency so queries **mmap it zero-copy**; v5 stamps the header with the
+/// **generation of the KG the build embedded** (`base_stamp`), so a torn rebuild window can
+/// never pair one generation's bin with another generation's sidecars. Older files fail the
+/// magic check and are rebuilt (the ANN tier is a cache — see `ensure_ann`).
+const MAGIC: u32 = 0x414E_4E35;
 
 /// Decode a packed little-endian section into a typed vec: a straight `pod_collect` on LE
 /// targets, the per-element decoder elsewhere.
@@ -69,6 +70,8 @@ fn read_le_slice<T: bytemuck::Pod, const W: usize>(
 /// The sealed vector index: full-precision vectors (rerank ground truth) plus the tier's
 /// acceleration structure, and the caller's stable id per row.
 pub struct AnnIndex {
+  /// xxh3 of the node segment this index was built from — generation identity (v5).
+  base_stamp: u64,
   dim: usize,
   /// Full-precision rows — flat tiers only (empty for Vamana, whose rows live in `quant`).
   vectors: Vec<f32>,
@@ -120,6 +123,19 @@ impl AnnGraphStore {
 impl AnnIndex {
   /// Build from `(stable id, vector)` rows; vectors are unit-normalized on the way in. The tier
   /// follows `AnnConfig::for_n` unless overridden (tests exercise every tier at any size).
+  /// Generation identity: the stamp of the KG this index embeds (0 for indexes built via
+  /// the id/vector constructors outside an index directory, e.g. tests and library use).
+  pub fn base_stamp(&self) -> u64 {
+    self.base_stamp
+  }
+
+  /// Set the generation stamp on a freshly built index (builder-style; the persistence
+  /// layer writes it into the v5 header).
+  pub fn with_base_stamp(mut self, base_stamp: u64) -> Self {
+    self.base_stamp = base_stamp;
+    self
+  }
+
   pub fn build(dim: usize, rows: Vec<(u64, Vec<f32>)>, config: Option<AnnConfig>) -> AnnIndex {
     let n = rows.len();
     let mut ids = Vec::with_capacity(n);
@@ -166,6 +182,7 @@ impl AnnIndex {
     }
 
     AnnIndex {
+      base_stamp: 0,
       dim,
       vectors,
       ids: PodColumn::from_vec(ids),
@@ -215,6 +232,7 @@ impl AnnIndex {
       },
     );
     AnnIndex {
+      base_stamp: 0,
       dim,
       vectors: Vec::new(),
       ids: PodColumn::from_vec(ids),
@@ -340,7 +358,8 @@ impl AnnIndex {
     out.write_all(&(self.code_words as u32).to_le_bytes())?;
     out.write_all(&self.medoid.to_le_bytes())?;
     out.write_all(&0u32.to_le_bytes())?; // pad: the u64 sections that follow stay 8-aligned
-    out.write_all(&(self.graph.edge_count() as u64).to_le_bytes())?; // header = 40 bytes
+    out.write_all(&(self.graph.edge_count() as u64).to_le_bytes())?;
+    out.write_all(&self.base_stamp.to_le_bytes())?; // header = 48 bytes
 
     fn write_le<T: bytemuck::Pod, W: std::io::Write, const B: usize>(
       out: &mut W,
@@ -409,17 +428,27 @@ impl AnnIndex {
   /// bumps *and* embedder-dimension changes (a query hashed into `d` buckets probing an index
   /// hashed into `d'` buckets would be silently meaningless).
   pub fn is_current_format(path: &Path, dim: usize) -> bool {
-    let mut header = [0u8; 8];
+    Self::peek_header(path).is_some_and(|(header_dim, _)| header_dim == dim)
+  }
+
+  /// The `(dim, base_stamp)` of a v5 file at `path`, from its 48-byte header alone — `None`
+  /// for missing, foreign, or older-format files. The generation check that makes torn
+  /// bin/sidecar combinations detectable without loading anything.
+  pub fn peek_header(path: &Path) -> Option<(usize, u64)> {
+    let mut header = [0u8; 48];
     std::fs::File::open(path)
       .and_then(|mut f| {
         use std::io::Read;
         f.read_exact(&mut header)
       })
-      .map(|_| {
-        u32::from_le_bytes(header[0..4].try_into().expect("4 bytes")) == MAGIC
-          && u32::from_le_bytes(header[4..8].try_into().expect("4 bytes")) as usize == dim
-      })
-      .unwrap_or(false)
+      .ok()?;
+    if u32::from_le_bytes(header[0..4].try_into().expect("4 bytes")) != MAGIC {
+      return None;
+    }
+    Some((
+      u32::from_le_bytes(header[4..8].try_into().expect("4 bytes")) as usize,
+      u64::from_le_bytes(header[40..48].try_into().expect("8 bytes")),
+    ))
   }
 
   pub fn load(path: &Path) -> io::Result<AnnIndex> {
@@ -459,8 +488,9 @@ impl AnnIndex {
     let code_words = take32(20)? as usize;
     let medoid = take32(24)?;
     let edges = take64(32)? as usize;
+    let base_stamp = take64(40)?;
 
-    let mut at = 40usize;
+    let mut at = 48usize;
     let mut take = |len: usize| {
       let section = at;
       at += len;
@@ -479,6 +509,7 @@ impl AnnIndex {
         b[0] as i8
       })?;
       return Ok(AnnIndex {
+        base_stamp,
         dim,
         vectors: Vec::new(),
         ids,
@@ -503,6 +534,7 @@ impl AnnIndex {
       u64::from_le_bytes,
     );
     Ok(AnnIndex {
+      base_stamp,
       dim,
       vectors,
       ids,

@@ -61,6 +61,9 @@ fn unify_parser_allocator() {
 fn main() -> ExitCode {
   #[cfg(not(target_env = "msvc"))]
   unify_parser_allocator();
+  // Detached-warm re-entry + spawn permission — before any argument handling.
+  vorpal_index::autowarm::run_if_sentinel();
+  vorpal_index::autowarm::register();
   match run() {
     Ok(()) => ExitCode::SUCCESS,
     Err(err) => {

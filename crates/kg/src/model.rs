@@ -28,6 +28,34 @@ pub enum SymbolKind {
 }
 
 impl SymbolKind {
+  /// Parse a user-facing kind name (case-insensitive `Debug` spelling: `function`,
+  /// `enummember`, …) — the CLI/MCP selector's `kind` filter.
+  pub fn parse(text: &str) -> Option<Self> {
+    let lower = text.to_ascii_lowercase();
+    [
+      Self::File,
+      Self::Module,
+      Self::Package,
+      Self::Class,
+      Self::Struct,
+      Self::Interface,
+      Self::Enum,
+      Self::EnumMember,
+      Self::Function,
+      Self::Method,
+      Self::Constructor,
+      Self::Field,
+      Self::Property,
+      Self::Variable,
+      Self::Constant,
+      Self::Import,
+      Self::TypeParameter,
+      Self::Other,
+    ]
+    .into_iter()
+    .find(|kind| format!("{kind:?}").to_ascii_lowercase() == lower)
+  }
+
   pub fn tag(self) -> u8 {
     self as u8
   }

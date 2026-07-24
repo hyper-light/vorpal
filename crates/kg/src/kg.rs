@@ -5,10 +5,61 @@ use std::io;
 use std::path::Path;
 
 use vorpal_graph::{Direction, EdgeType, Graph, reachable};
-use vorpal_mem::{CorpusProbe, ResourcePolicy};
+use vorpal_mem::{AccessPattern, CorpusProbe, Hotness, MappedStore, ResourcePolicy, StoreKind};
 use vorpal_segment::{NodeId, Segment, SegmentDirectory, SegmentError};
 
 use crate::model::SymbolKind;
+
+/// One stable way to say *which* symbol a query means — shared by the library, CLI, MCP,
+/// and bindings. Display names are ergonomics, not identity: a bare-name selector that
+/// matches several definitions is **ambiguous**, and query surfaces present the candidates
+/// instead of silently merging their neighborhoods.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SymbolSelector<'a> {
+  /// Dense node id — exact identity within one index generation.
+  pub id: Option<u64>,
+  /// Display name (used via the persisted name index).
+  pub name: Option<&'a str>,
+  /// Path filter: the node's file path must end with this suffix.
+  pub path_suffix: Option<&'a str>,
+  /// Symbol kind filter.
+  pub kind: Option<crate::SymbolKind>,
+}
+
+/// "VNI1" — the persisted name index's magic.
+const NAMES_MAGIC: u32 = 0x564E_4931;
+
+/// Map `names.idx` under `dir` if present and shaped for exactly `node_count` rows; `None`
+/// (scan fallback) otherwise — an older index dir simply lacks the sidecar.
+fn open_names_index(
+  dir: &Path,
+  policy: &ResourcePolicy,
+  node_count: usize,
+) -> Option<(vorpal_mem::PodColumn<u64>, vorpal_mem::PodColumn<u64>)> {
+  let store = std::sync::Arc::new(
+    MappedStore::map_file(
+      &dir.join("names.idx"),
+      StoreKind::Canonical,
+      AccessPattern::Random,
+      Hotness::Hot,
+      policy,
+    )
+    .ok()?,
+  );
+  let bytes = store.as_bytes();
+  if bytes.len() < 8 || bytes[0..4] != NAMES_MAGIC.to_le_bytes() {
+    return None;
+  }
+  let count = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+  if count != node_count || bytes.len() != 8 + count * 16 {
+    return None; // foreign generation or torn write: scan fallback stays correct
+  }
+  let hashes =
+    vorpal_mem::PodColumn::from_mapped_le(&store, 8, count * 8, u64::from_le_bytes).ok()?;
+  let ids = vorpal_mem::PodColumn::from_mapped_le(&store, 8 + count * 8, count * 8, u64::from_le_bytes)
+    .ok()?;
+  Some((hashes, ids))
+}
 
 /// Write `name` under `dir` through a `.tmp` sibling, then atomically swap it in.
 fn write_via_tmp(
@@ -79,6 +130,10 @@ pub struct Kg {
   nodes: Segment,
   cols: NodeColumns,
   heap: vorpal_mem::PodColumn<u8>,
+  /// Persisted name index (`names.idx`): `(xxh3(name), id)` pairs sorted by `(hash, id)`,
+  /// mapped zero-copy. `None` for index dirs written before the sidecar existed — lookups
+  /// fall back to the parallel scan.
+  names: Option<(vorpal_mem::PodColumn<u64>, vorpal_mem::PodColumn<u64>)>,
   /// Where the heap bytes already live on disk, when they do (streamed commit or load) —
   /// lets `save` rename or skip instead of rewriting a file readers may have mapped.
   heap_file: Option<std::path::PathBuf>,
@@ -119,6 +174,7 @@ impl Kg {
       cols,
       heap,
       heap_file,
+      names: None,
       graph,
       directory,
     })
@@ -126,6 +182,13 @@ impl Kg {
 
   pub fn node_count(&self) -> usize {
     self.nodes.row_count() as usize
+  }
+
+  /// The sealed node segment's raw bytes. The ANN freshness stamp is `xxh3` of exactly these
+  /// bytes; hashing the *loaded* mapping (instead of re-reading `nodes.vseg`) pins the stamp
+  /// to the generation actually being served — no load/hash race with a concurrent rebuild.
+  pub fn node_segment_bytes(&self) -> &[u8] {
+    self.nodes.bytes()
   }
 
   pub fn is_empty(&self) -> bool {
@@ -217,9 +280,22 @@ impl Kg {
       .collect()
   }
 
-  /// All nodes whose display name equals `name` (a linear scan; the resident name/FTS index is
-  /// §3.2's job). The query surface a CLI/MCP exposes builds on this.
+  /// All nodes whose display name equals `name`, ascending by id. Served by the persisted
+  /// `names.idx` when the index dir carries one (two binary searches + per-hit string
+  /// verification against hash collisions); the parallel scan fallback returns the identical
+  /// list for older dirs.
   pub fn nodes_named(&self, name: &str) -> Vec<NodeId> {
+    if let Some((hashes, ids)) = &self.names {
+      let hash = xxhash_rust::xxh3::xxh3_64(name.as_bytes());
+      let lo = hashes.partition_point(|&h| h < hash);
+      let hi = hashes.partition_point(|&h| h <= hash);
+      // Pairs were sorted by (hash, id): ids within one hash's run are ascending.
+      return ids[lo..hi]
+        .iter()
+        .map(|&i| NodeId::new(i))
+        .filter(|&id| self.node(id).is_some_and(|view| view.name == name))
+        .collect();
+    }
     use rayon::prelude::*;
     // Parallel scan over the node rows; the indexed collect keeps ascending-id order, so the
     // result is identical to the serial scan.
@@ -255,6 +331,51 @@ impl Kg {
     self.incoming_named(name, EdgeType::OF_TYPE)
   }
 
+  /// Nodes matching `selector`, ascending by id. `id` short-circuits (validated in range);
+  /// `name` uses the persisted name index; `path_suffix` and `kind` filter either way. A
+  /// selector with no fields matches nothing (never "everything" by accident).
+  pub fn select(&self, selector: &SymbolSelector<'_>) -> Vec<NodeId> {
+    if let Some(id) = selector.id {
+      return match self.node(NodeId::new(id)) {
+        Some(view)
+          if selector.name.is_none_or(|n| view.name == n)
+            && selector.kind.is_none_or(|k| view.kind == k)
+            && selector.path_suffix.is_none_or(|p| view.path.ends_with(p)) =>
+        {
+          vec![NodeId::new(id)]
+        }
+        _ => Vec::new(),
+      };
+    }
+    let Some(name) = selector.name else {
+      return Vec::new();
+    };
+    self
+      .nodes_named(name)
+      .into_iter()
+      .filter(|&id| {
+        self.node(id).is_some_and(|view| {
+          selector.kind.is_none_or(|k| view.kind == k)
+            && selector.path_suffix.is_none_or(|p| view.path.ends_with(p))
+        })
+      })
+      .collect()
+  }
+
+  /// In-neighbors of `id` over one edge type, ascending, deduplicated — the id-precise form
+  /// of the `callers`/`references`/… verbs (name-based forms union this over namesakes).
+  pub fn incoming_of(&self, id: NodeId, edge: EdgeType) -> Vec<NodeId> {
+    let mut found: Vec<NodeId> = self
+      .in_neighbors(id)
+      .into_iter()
+      .filter(|&(_, kind)| kind == edge)
+      .map(|(from, _)| from)
+      .collect();
+    found.sort_unstable_by_key(|n| n.raw());
+    found.dedup();
+    found
+  }
+
   fn incoming_named(&self, name: &str, edge: EdgeType) -> Vec<NodeId> {
     let mut found = Vec::new();
     for target in self.nodes_named(name) {
@@ -288,6 +409,29 @@ impl Kg {
       Some(existing) if *existing == heap_final => {}
       _ => write_via_tmp(dir, "strings.heap", |out| out.write_all(&self.heap[..]))?,
     }
+
+    // The persisted name index: `(xxh3(name), id)` pairs sorted by `(hash, id)` — exact-name
+    // lookup becomes two binary searches over a mapped column instead of a 2.7M-row scan.
+    // Bytes are a pure function of the node table (sorted, fixed-width): bit-identical.
+    write_via_tmp(dir, "names.idx", |out| {
+      let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
+        .filter_map(|i| {
+          self
+            .node(NodeId::new(i))
+            .map(|view| (xxhash_rust::xxh3::xxh3_64(view.name.as_bytes()), i))
+        })
+        .collect();
+      pairs.sort_unstable();
+      out.write_all(&NAMES_MAGIC.to_le_bytes())?;
+      out.write_all(&(pairs.len() as u32).to_le_bytes())?;
+      for &(hash, _) in &pairs {
+        out.write_all(&hash.to_le_bytes())?;
+      }
+      for &(_, id) in &pairs {
+        out.write_all(&id.to_le_bytes())?;
+      }
+      Ok(())
+    })?;
 
     crate::phase_stamp("kg save: graph");
     // Both CSR directions persist as one aligned section file the load path maps zero-copy —

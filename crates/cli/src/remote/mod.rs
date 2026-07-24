@@ -191,13 +191,15 @@ fn parse_ssh_uri(rest: &str) -> Result<SshUri> {
     _ => (None, rest),
   };
   let bad_port = |p: &str| {
-    anyhow::anyhow!(EC::RemoteInvalid(format!("invalid ssh port `{p}` in `ssh://{rest}`")))
+    anyhow::anyhow!(EC::RemoteInvalid(format!(
+      "invalid ssh port `{p}` in `ssh://{rest}`"
+    )))
   };
   let (host, port) = if let Some(after) = hostport.strip_prefix('[') {
     // Bracketed IPv6: `[addr]` or `[addr]:port`.
-    let (addr, tail) = after
-      .split_once(']')
-      .ok_or_else(|| anyhow::anyhow!(EC::RemoteInvalid(format!("unclosed `[` in `ssh://{rest}`"))))?;
+    let (addr, tail) = after.split_once(']').ok_or_else(|| {
+      anyhow::anyhow!(EC::RemoteInvalid(format!("unclosed `[` in `ssh://{rest}`")))
+    })?;
     let port = match tail.strip_prefix(':') {
       Some(p) => p.parse::<u16>().map_err(|_| bad_port(p))?,
       None if tail.is_empty() => 22,
@@ -211,7 +213,9 @@ fn parse_ssh_uri(rest: &str) -> Result<SshUri> {
     }
   };
   if host.is_empty() {
-    return Err(anyhow::anyhow!(EC::RemoteInvalid(format!("missing host in `ssh://{rest}`"))));
+    return Err(anyhow::anyhow!(EC::RemoteInvalid(format!(
+      "missing host in `ssh://{rest}`"
+    ))));
   }
   Ok(SshUri { user, host, port })
 }
@@ -219,17 +223,27 @@ fn parse_ssh_uri(rest: &str) -> Result<SshUri> {
 /// Parse `k8s://[namespace/]pod[/container]` (1–3 slash-separated components: `pod`, `ns/pod`, or
 /// `ns/pod/container`).
 fn parse_k8s_uri(rest: &str) -> Result<K8sTarget> {
-  let parts: Vec<&str> = rest.trim_matches('/').split('/').filter(|p| !p.is_empty()).collect();
+  let parts: Vec<&str> = rest
+    .trim_matches('/')
+    .split('/')
+    .filter(|p| !p.is_empty())
+    .collect();
   let invalid = || {
     anyhow::anyhow!(EC::RemoteInvalid(format!(
       "invalid k8s target `k8s://{rest}` (expected `[namespace/]pod[/container]`)"
     )))
   };
   match parts.as_slice() {
-    [pod] => Ok(K8sTarget { namespace: None, pod: (*pod).to_string(), container: None }),
-    [ns, pod] => {
-      Ok(K8sTarget { namespace: Some((*ns).to_string()), pod: (*pod).to_string(), container: None })
-    }
+    [pod] => Ok(K8sTarget {
+      namespace: None,
+      pod: (*pod).to_string(),
+      container: None,
+    }),
+    [ns, pod] => Ok(K8sTarget {
+      namespace: Some((*ns).to_string()),
+      pod: (*pod).to_string(),
+      container: None,
+    }),
     [ns, pod, ctr] => Ok(K8sTarget {
       namespace: Some((*ns).to_string()),
       pod: (*pod).to_string(),
@@ -251,7 +265,6 @@ fn ssh_dial_opts(remote: &RemoteArgs) -> producer::SshDialOpts {
   }
 }
 
-
 pub(crate) fn parse_targets(raw: &[String]) -> Result<Vec<Target>> {
   let mut targets: Vec<Target> = Vec::with_capacity(raw.len());
   for t in raw {
@@ -265,9 +278,13 @@ pub(crate) fn parse_targets(raw: &[String]) -> Result<Vec<Target>> {
     } else if let Some(rest) = t.strip_prefix("docker://") {
       let container = rest.trim_matches('/');
       if container.is_empty() {
-        return Err(anyhow::anyhow!(EC::RemoteInvalid(format!("missing container in `{t}`"))));
+        return Err(anyhow::anyhow!(EC::RemoteInvalid(format!(
+          "missing container in `{t}`"
+        ))));
       }
-      Target::Docker(DockerTarget { container: container.to_string() })
+      Target::Docker(DockerTarget {
+        container: container.to_string(),
+      })
     } else {
       return Err(anyhow::anyhow!(EC::RemoteInvalid(format!(
         "unsupported target `{trimmed}` (supported: `loopback://`, `ssh://[user@]host[:port]`, `k8s://[ns/]pod[/ctr]`, `docker://container`; vsock/containerd arrive in later phases)"
@@ -292,7 +309,9 @@ fn reject_unsupported_flags(interactive: bool, stdin: bool) -> Result<()> {
     )));
   }
   if stdin {
-    return Err(anyhow::anyhow!(EC::RemoteInvalid("--stdin conflicts with --remote".into())));
+    return Err(anyhow::anyhow!(EC::RemoteInvalid(
+      "--stdin conflicts with --remote".into()
+    )));
   }
   Ok(())
 }
@@ -469,11 +488,31 @@ where
   if arg.lang.is_some() {
     let worker = Arc::new(crate::run::RunWithSpecificLang::new(arg, trace)?);
     let stream_worker = producer::StreamWorker::RunSpecific(worker.clone());
-    drive_remote(worker, stream_worker, printer, mode, targets, job, agent_binary, ssh, outcome)
+    drive_remote(
+      worker,
+      stream_worker,
+      printer,
+      mode,
+      targets,
+      job,
+      agent_binary,
+      ssh,
+      outcome,
+    )
   } else {
     let worker = Arc::new(crate::run::RunWithInferredLang { arg, trace });
     let stream_worker = producer::StreamWorker::RunInferred(worker.clone());
-    drive_remote(worker, stream_worker, printer, mode, targets, job, agent_binary, ssh, outcome)
+    drive_remote(
+      worker,
+      stream_worker,
+      printer,
+      mode,
+      targets,
+      job,
+      agent_binary,
+      ssh,
+      outcome,
+    )
   }
 }
 
@@ -533,8 +572,13 @@ where
       run_producer(worker, Box::new(producer), printer)
     }
     RemoteMode::Stream => {
-      let producer =
-        producer::StreamModeProducer::new(targets, stream_worker, ssh, agent_binary, outcome.clone());
+      let producer = producer::StreamModeProducer::new(
+        targets,
+        stream_worker,
+        ssh,
+        agent_binary,
+        outcome.clone(),
+      );
       run_producer(worker, Box::new(producer), printer)
     }
   };
@@ -557,7 +601,10 @@ mod tests {
       parse_targets(&["loopback:".into(), "loopback://".into()]).unwrap(),
       vec![Target::Loopback]
     );
-    assert!(parse_targets(&["vsock://3:9000".into()]).is_err(), "vsock arrives in a later phase");
+    assert!(
+      parse_targets(&["vsock://3:9000".into()]).is_err(),
+      "vsock arrives in a later phase"
+    );
   }
 
   #[test]
@@ -565,20 +612,36 @@ mod tests {
     let one = |s: &str| parse_targets(&[s.to_string()]).unwrap().pop().unwrap();
     assert_eq!(
       one("ssh://host"),
-      Target::Ssh(SshUri { user: None, host: "host".into(), port: 22 })
+      Target::Ssh(SshUri {
+        user: None,
+        host: "host".into(),
+        port: 22
+      })
     );
     assert_eq!(
       one("ssh://alice@host:2222"),
-      Target::Ssh(SshUri { user: Some("alice".into()), host: "host".into(), port: 2222 })
+      Target::Ssh(SshUri {
+        user: Some("alice".into()),
+        host: "host".into(),
+        port: 2222
+      })
     );
     // Bracketed IPv6, with and without a port.
     assert_eq!(
       one("ssh://[::1]:22"),
-      Target::Ssh(SshUri { user: None, host: "::1".into(), port: 22 })
+      Target::Ssh(SshUri {
+        user: None,
+        host: "::1".into(),
+        port: 22
+      })
     );
     assert_eq!(
       one("ssh://user@[fe80::1]"),
-      Target::Ssh(SshUri { user: Some("user".into()), host: "fe80::1".into(), port: 22 })
+      Target::Ssh(SshUri {
+        user: Some("user".into()),
+        host: "fe80::1".into(),
+        port: 22
+      })
     );
     assert!(parse_targets(&["ssh://host:notaport".into()]).is_err());
     assert!(parse_targets(&["ssh://".into()]).is_err(), "missing host");
@@ -590,11 +653,19 @@ mod tests {
     // k8s: pod / ns/pod / ns/pod/container.
     assert_eq!(
       one("k8s://web-0"),
-      Target::K8s(K8sTarget { namespace: None, pod: "web-0".into(), container: None })
+      Target::K8s(K8sTarget {
+        namespace: None,
+        pod: "web-0".into(),
+        container: None
+      })
     );
     assert_eq!(
       one("k8s://prod/web-0"),
-      Target::K8s(K8sTarget { namespace: Some("prod".into()), pod: "web-0".into(), container: None })
+      Target::K8s(K8sTarget {
+        namespace: Some("prod".into()),
+        pod: "web-0".into(),
+        container: None
+      })
     );
     assert_eq!(
       one("k8s://prod/web-0/app"),
@@ -604,9 +675,23 @@ mod tests {
         container: Some("app".into()),
       })
     );
-    assert_eq!(one("docker://mybox"), Target::Docker(DockerTarget { container: "mybox".into() }));
-    assert!(parse_targets(&["k8s://a/b/c/d".into()]).is_err(), "too many k8s components");
-    assert!(parse_targets(&["k8s://".into()]).is_err(), "empty k8s target");
-    assert!(parse_targets(&["docker://".into()]).is_err(), "empty docker container");
+    assert_eq!(
+      one("docker://mybox"),
+      Target::Docker(DockerTarget {
+        container: "mybox".into()
+      })
+    );
+    assert!(
+      parse_targets(&["k8s://a/b/c/d".into()]).is_err(),
+      "too many k8s components"
+    );
+    assert!(
+      parse_targets(&["k8s://".into()]).is_err(),
+      "empty k8s target"
+    );
+    assert!(
+      parse_targets(&["docker://".into()]).is_err(),
+      "empty docker container"
+    );
   }
 }

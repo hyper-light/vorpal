@@ -168,7 +168,10 @@ async fn enumerate_remote(
 
 fn parse_snapshot(root: &Path, stdout: &[u8]) -> Result<RemoteSnapshot> {
   let text = String::from_utf8_lossy(stdout);
-  let mut snap = RemoteSnapshot { root: root.to_path_buf(), ..Default::default() };
+  let mut snap = RemoteSnapshot {
+    root: root.to_path_buf(),
+    ..Default::default()
+  };
   // Collect entries and facts, then assemble.
   let mut dirs_seen: Vec<PathBuf> = Vec::new();
   let mut files: Vec<PathBuf> = Vec::new();
@@ -182,16 +185,25 @@ fn parse_snapshot(root: &Path, stdout: &[u8]) -> Result<RemoteSnapshot> {
 
   let b64 = base64::engine::general_purpose::STANDARD;
   let decode = |s: &str| -> Option<String> {
-    b64.decode(s.as_bytes()).ok().and_then(|b| String::from_utf8(b).ok())
+    b64
+      .decode(s.as_bytes())
+      .ok()
+      .and_then(|b| String::from_utf8(b).ok())
   };
   // rel = a find path like "./a/b" → "a/b"; "." → "" (the root).
   let rel_of = |p: &str| -> PathBuf {
     let p = p.strip_prefix("./").unwrap_or(p);
-    if p == "." { PathBuf::new() } else { PathBuf::from(p) }
+    if p == "." {
+      PathBuf::new()
+    } else {
+      PathBuf::from(p)
+    }
   };
 
   for line in text.lines() {
-    let Some((tag, rest)) = line.split_once(' ').or(Some((line, ""))) else { continue };
+    let Some((tag, rest)) = line.split_once(' ').or(Some((line, ""))) else {
+      continue;
+    };
     match tag {
       "K" => {
         snap.kind = match rest {
@@ -203,7 +215,8 @@ fn parse_snapshot(root: &Path, stdout: &[u8]) -> Result<RemoteSnapshot> {
       "C" => snap.canonical = Some(PathBuf::from(rest)),
       "D" => dirs_seen.push(rel_of(rest)),
       "F" => files.push(rel_of(rest)),
-      "L" => { /* unfollowed symlink: neither dir nor file → never emitted (no-follow default) */ }
+      "L" => { /* unfollowed symlink: neither dir nor file → never emitted (no-follow default) */
+      }
       "G" | "J" => {
         // marker path like "./sub/.git" → the dir containing it.
         if let Some(dir) = rel_of(rest).parent() {
@@ -230,7 +243,9 @@ fn parse_snapshot(root: &Path, stdout: &[u8]) -> Result<RemoteSnapshot> {
       "X" => {
         if let Some((p, data)) = rest.split_once(' ') {
           // p is the ".git" dir; the exclude belongs to its parent dir.
-          if let (Some(dir), Some(content)) = (rel_of(p).parent().map(Path::to_path_buf), decode(data)) {
+          if let (Some(dir), Some(content)) =
+            (rel_of(p).parent().map(Path::to_path_buf), decode(data))
+          {
             git_exclude.insert(dir, content);
           }
         }
@@ -238,7 +253,10 @@ fn parse_snapshot(root: &Path, stdout: &[u8]) -> Result<RemoteSnapshot> {
       "A" => {
         if let Some((dir, hg)) = rest.rsplit_once(' ') {
           let dir = PathBuf::from(dir);
-          let facts = DirFacts { has_git: hg == "1", ..Default::default() };
+          let facts = DirFacts {
+            has_git: hg == "1",
+            ..Default::default()
+          };
           ancestor_ix.insert(dir.clone(), ancestors.len());
           ancestors.push((dir, facts));
         }
@@ -305,7 +323,11 @@ fn parse_snapshot(root: &Path, stdout: &[u8]) -> Result<RemoteSnapshot> {
 /// Hidden = the basename starts with `.` (remote nodes are POSIX; the Windows attribute bit does
 /// not apply). Mirrors `discovery::entry_is_hidden` on non-Windows.
 fn is_hidden_rel(rel: &Path) -> bool {
-  rel.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('.')).unwrap_or(false)
+  rel
+    .file_name()
+    .and_then(|n| n.to_str())
+    .map(|n| n.starts_with('.'))
+    .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,14 +375,23 @@ where
     .exec(&spec)
     .await
     .map_err(|e| anyhow!("remote content fetch failed: {e}"))?;
-  let mut stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin for content fetch"))?;
+  let mut stdin = proc
+    .stdin
+    .take()
+    .ok_or_else(|| anyhow!("no stdin for content fetch"))?;
   {
     use tokio::io::AsyncWriteExt;
-    stdin.write_all(rel_list.as_bytes()).await.map_err(|e| anyhow!("{e}"))?;
+    stdin
+      .write_all(rel_list.as_bytes())
+      .await
+      .map_err(|e| anyhow!("{e}"))?;
     stdin.flush().await.ok();
     stdin.shutdown().await.ok();
   }
-  let mut stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout for content fetch"))?;
+  let mut stdout = proc
+    .stdout
+    .take()
+    .ok_or_else(|| anyhow!("no stdout for content fetch"))?;
 
   // Parse the length-prefixed stream.
   let mut reader = FramedReader::new(&mut stdout);
@@ -402,7 +433,10 @@ struct FramedReader<'a, R: tokio::io::AsyncRead + Unpin> {
 
 impl<'a, R: tokio::io::AsyncRead + Unpin> FramedReader<'a, R> {
   fn new(reader: &'a mut R) -> Self {
-    Self { reader, buf: Vec::new() }
+    Self {
+      reader,
+      buf: Vec::new(),
+    }
   }
 
   /// Ensure at least one full line is buffered; return the next line (without the newline), or None
@@ -418,12 +452,19 @@ impl<'a, R: tokio::io::AsyncRead + Unpin> FramedReader<'a, R> {
         if parts.next() != Some("F") {
           continue;
         }
-        let size: u64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let size: u64 = parts
+          .next()
+          .and_then(|s| s.trim().parse().ok())
+          .unwrap_or(0);
         let rel = parts.next().unwrap_or("").to_string();
         return Ok(Some((rel, size)));
       }
       let mut chunk = [0u8; 64 * 1024];
-      let n = self.reader.read(&mut chunk).await.map_err(|e| anyhow!("{e}"))?;
+      let n = self
+        .reader
+        .read(&mut chunk)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
       if n == 0 {
         return Ok(None);
       }
@@ -435,7 +476,11 @@ impl<'a, R: tokio::io::AsyncRead + Unpin> FramedReader<'a, R> {
     let size = size as usize;
     while self.buf.len() < size {
       let mut chunk = [0u8; 64 * 1024];
-      let n = self.reader.read(&mut chunk).await.map_err(|e| anyhow!("{e}"))?;
+      let n = self
+        .reader
+        .read(&mut chunk)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
       if n == 0 {
         break;
       }
@@ -452,7 +497,11 @@ impl<'a, R: tokio::io::AsyncRead + Unpin> FramedReader<'a, R> {
     remaining -= drop_now;
     while remaining > 0 {
       let mut chunk = [0u8; 64 * 1024];
-      let n = self.reader.read(&mut chunk).await.map_err(|e| anyhow!("{e}"))?;
+      let n = self
+        .reader
+        .read(&mut chunk)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
       if n == 0 {
         break;
       }
@@ -499,7 +548,11 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join(".git")).unwrap();
-    write(root, ".gitignore", "target/\n*.log\n!keep.log\nsub/deep.rs\n");
+    write(
+      root,
+      ".gitignore",
+      "target/\n*.log\n!keep.log\nsub/deep.rs\n",
+    );
     write(root, "main.rs", "fn main() {}\n");
     write(root, "a.log", "log\n");
     write(root, "keep.log", "kept\n");
@@ -512,7 +565,11 @@ mod tests {
     std::fs::create_dir_all(root.join("nested/.git")).unwrap();
     write(root, "nested/.gitignore", "inner.rs\n");
     write(root, "nested/inner.rs", "inner ignored\n");
-    write(root, "nested/outer.log", "outer *.log stops at the boundary\n");
+    write(
+      root,
+      "nested/outer.log",
+      "outer *.log stops at the boundary\n",
+    );
     dir
   }
 
@@ -533,18 +590,28 @@ mod tests {
     let transport = SshTransport::connect(SshConfig {
       host: addr.ip().to_string(),
       port: addr.port(),
-      auth: SshAuth::Password { user: "t".into(), password: Redacted("x".into()) },
+      auth: SshAuth::Password {
+        user: "t".into(),
+        password: Redacted("x".into()),
+      },
       verifier: HostKeyVerifier::Pinned(vec![pubkey]),
     })
     .await
     .expect("connect");
 
-    let snapshot = enumerate_remote(&transport, &root, &root_str).await.expect("enumerate");
+    let snapshot = enumerate_remote(&transport, &root, &root_str)
+      .await
+      .expect("enumerate");
     let cfg = cfg();
     let remote: BTreeSet<PathBuf> =
-      reconstruct_snapshot(&snapshot, &cfg, &GlobalIgnore::LocalMachine).into_iter().collect();
+      reconstruct_snapshot(&snapshot, &cfg, &GlobalIgnore::LocalMachine)
+        .into_iter()
+        .collect();
     let local: BTreeSet<PathBuf> =
-      reconstruct_local(&root, false, &cfg, &GlobalIgnore::LocalMachine).unwrap().into_iter().collect();
+      reconstruct_local(&root, false, &cfg, &GlobalIgnore::LocalMachine)
+        .unwrap()
+        .into_iter()
+        .collect();
 
     assert_eq!(
       remote, local,
@@ -553,7 +620,10 @@ mod tests {
     // Sanity: gitignored files are absent, kept files present.
     assert!(local.iter().any(|p| p.ends_with("main.rs")));
     assert!(local.iter().any(|p| p.ends_with("keep.log")));
-    assert!(!local.iter().any(|p| p.ends_with("build.rs")), "target/ must be ignored");
+    assert!(
+      !local.iter().any(|p| p.ends_with("build.rs")),
+      "target/ must be ignored"
+    );
   }
 
   fn scan_worker(root: &Path, rule_yaml: &str) -> std::sync::Arc<crate::scan::ScanWithConfig> {
@@ -579,7 +649,11 @@ mod tests {
       color: crate::print::ColorArg::Never,
       inspect: Default::default(),
     };
-    let context = crate::utils::ContextArgs { before: 0, after: 0, context: 0 };
+    let context = crate::utils::ContextArgs {
+      before: 0,
+      after: 0,
+      context: 0,
+    };
     let arg = crate::scan::ScanArg::for_remote_agent(input, output, context, None);
     std::sync::Arc::new(crate::scan::ScanWithConfig::from_remote_parts(
       arg,
@@ -594,7 +668,12 @@ mod tests {
   fn sorted_json(frags: &[Vec<u8>]) -> Vec<String> {
     let mut v: Vec<String> = frags
       .iter()
-      .flat_map(|b| String::from_utf8_lossy(b).lines().map(str::to_owned).collect::<Vec<_>>())
+      .flat_map(|b| {
+        String::from_utf8_lossy(b)
+          .lines()
+          .map(str::to_owned)
+          .collect::<Vec<_>>()
+      })
       .filter(|l| !l.trim().is_empty())
       .collect();
     v.sort();
@@ -611,7 +690,11 @@ mod tests {
 
     // Add matchable content to a non-ignored and an ignored file.
     write(&root, "main.rs", "fn main() { a().unwrap(); }\n");
-    write(&root, "sub/ok.rs", "fn ok() { b().unwrap(); c().unwrap(); }\n");
+    write(
+      &root,
+      "sub/ok.rs",
+      "fn ok() { b().unwrap(); c().unwrap(); }\n",
+    );
     write(&root, "target/build.rs", "fn t() { gone().unwrap(); }\n"); // gitignored
     let rule = "id: u\nlanguage: Rust\nrule: {pattern: $X.unwrap()}\n";
 
@@ -632,8 +715,15 @@ mod tests {
     let ssh_worker = StreamWorker::Scan(scan_worker(&root, rule));
     let printer2 = JSONPrinter::new(std::io::sink(), JsonStyle::Stream);
     let (tx2, rx2) = std::sync::mpsc::channel::<Vec<u8>>();
-    let uri = super::super::SshUri { user: Some("t".into()), host: addr.ip().to_string(), port: addr.port() };
-    let ssh = SshDialOpts { password_env: Some("VORPAL_TEST_SSH_PW".into()), ..Default::default() };
+    let uri = super::super::SshUri {
+      user: Some("t".into()),
+      host: addr.ip().to_string(),
+      port: addr.port(),
+    };
+    let ssh = SshDialOpts {
+      password_env: Some("VORPAL_TEST_SSH_PW".into()),
+      ..Default::default()
+    };
     // SAFETY: single-threaded test setup; the password is consumed immediately by the connect.
     unsafe { std::env::set_var("VORPAL_TEST_SSH_PW", "x") };
     let _ = &pubkey; // TOFU (AcceptAny) is used by connect_ssh; the pin is exercised elsewhere.
@@ -656,7 +746,10 @@ mod tests {
     );
     // Sanity: three unwrap matches (main.rs 1 + sub/ok.rs 2), gitignored target/ absent.
     let joined = String::from_utf8_lossy(&over_ssh.concat()).to_string();
-    assert!(!joined.contains("build.rs"), "gitignored file must not be scanned");
+    assert!(
+      !joined.contains("build.rs"),
+      "gitignored file must not be scanned"
+    );
     assert_eq!(sorted_json(&over_ssh).len(), 3);
   }
 
@@ -677,13 +770,20 @@ mod tests {
     // `produce()` builds its own runtime and `block_on`s, so it cannot run inside `#[tokio::test]`.
     // A kept-alive multi-thread runtime hosts the in-process SSH bridge; the producer's own runtime
     // dials it over a real localhost socket (cross-runtime is fine — it's a TCP connection).
-    let setup = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let setup = tokio::runtime::Builder::new_multi_thread()
+      .enable_all()
+      .build()
+      .unwrap();
     let (addr, _pubkey) = setup.block_on(testserver::start());
 
     let dir = fixture();
     let root = dir.path().canonicalize().unwrap();
     write(&root, "main.rs", "fn main() { a().unwrap(); }\n");
-    write(&root, "sub/ok.rs", "fn ok() { b().unwrap(); c().unwrap(); }\n");
+    write(
+      &root,
+      "sub/ok.rs",
+      "fn ok() { b().unwrap(); c().unwrap(); }\n",
+    );
     write(&root, "target/build.rs", "fn t() { gone().unwrap(); }\n"); // gitignored
     let rule = "id: u\nlanguage: Rust\nrule: {pattern: $X.unwrap()}\n";
 
@@ -708,10 +808,16 @@ mod tests {
       host: addr.ip().to_string(),
       port: addr.port(),
     };
-    let ssh = SshDialOpts { password_env: Some("VORPAL_TEST_SSH_PW_AUTO".into()), ..Default::default() };
+    let ssh = SshDialOpts {
+      password_env: Some("VORPAL_TEST_SSH_PW_AUTO".into()),
+      ..Default::default()
+    };
     // SAFETY: single-threaded test setup; the password is consumed immediately by the connect.
     unsafe { std::env::set_var("VORPAL_TEST_SSH_PW_AUTO", "x") };
-    let no_exec = RemotePolicy { allow_push_exec: false, ..Default::default() };
+    let no_exec = RemotePolicy {
+      allow_push_exec: false,
+      ..Default::default()
+    };
     let producer = NegotiatingProducer::<JSONPrinter<std::io::Sink>>::new(
       vec![Target::Ssh(uri)],
       job,
@@ -736,9 +842,16 @@ mod tests {
       sorted_json(&loopback),
       "auto-demoted-to-stream output must equal loopback-stream output"
     );
-    assert_eq!(sorted_json(&auto).len(), 3, "three unwrap matches, gitignored target/ excluded");
+    assert_eq!(
+      sorted_json(&auto).len(),
+      3,
+      "three unwrap matches, gitignored target/ excluded"
+    );
     let joined = String::from_utf8_lossy(&auto.concat()).to_string();
-    assert!(!joined.contains("build.rs"), "gitignored file must not be scanned");
+    assert!(
+      !joined.contains("build.rs"),
+      "gitignored file must not be scanned"
+    );
   }
 
   #[tokio::test]
@@ -753,7 +866,10 @@ mod tests {
     let transport = SshTransport::connect(SshConfig {
       host: addr.ip().to_string(),
       port: addr.port(),
-      auth: SshAuth::Password { user: "t".into(), password: Redacted("x".into()) },
+      auth: SshAuth::Password {
+        user: "t".into(),
+        password: Redacted("x".into()),
+      },
       verifier: HostKeyVerifier::Pinned(vec![pubkey]),
     })
     .await
