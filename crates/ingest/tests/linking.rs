@@ -29,6 +29,7 @@ impl FileExtractor for DefRefStub {
       signature: "",
       exported: true,
       content_hash: 0,
+      span: (0, 0),
     });
     if let Some(callee) = callee {
       references.push(Reference::new(id, path, callee, RefKind::Call));
@@ -61,7 +62,7 @@ fn resolves_and_links_cross_file_calls_into_the_graph() {
   assert!(
     kg.out_neighbors(caller)
       .iter()
-      .any(|&(to, e)| to == target && e == EdgeType::CALLS),
+      .any(|&(to, e)| to == target && e.base() == EdgeType::CALLS),
     "expected caller --calls--> target"
   );
   // ...so the §11.5 transitive-callers closure over resolved edges includes `caller`.

@@ -42,7 +42,7 @@ fn extracts_and_resolves_real_rust_calls() {
   assert!(
     kg.out_neighbors(run)
       .iter()
-      .any(|&(to, e)| to == helper && e == EdgeType::CALLS),
+      .any(|&(to, e)| to == helper && e.base() == EdgeType::CALLS),
     "expected run --calls--> helper"
   );
   // Transitive callers of `helper` (§11.5) include `run`.
@@ -52,6 +52,6 @@ fn extracts_and_resolves_real_rust_calls() {
     !kg
       .out_neighbors(helper)
       .iter()
-      .any(|&(_, e)| e == EdgeType::CALLS)
+      .any(|&(_, e)| e.base() == EdgeType::CALLS)
   );
 }

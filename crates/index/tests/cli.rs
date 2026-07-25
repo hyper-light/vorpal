@@ -644,3 +644,224 @@ fn overlay_size_threshold_falls_back() {
   assert!(rendered.contains("thresh_alpha_two"), "{rendered}");
   let _ = fs::remove_dir_all(&base);
 }
+
+/// IMPROVEMENTS §1 acceptance: same-named definitions are selectable independently;
+/// ambiguous names yield candidates (never a silent merged neighborhood); --all merges
+/// explicitly; and the persisted name index agrees with the scan fallback.
+#[test]
+fn symbol_selector_disambiguates_namesakes() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-selector-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  // Two same-named `shared_fn` definitions in different files, each with a distinct caller.
+  fs::write(
+    src.join("alpha.rs"),
+    "pub fn shared_fn() -> u32 { 1 }\npub fn alpha_caller() -> u32 { shared_fn() }\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("beta.rs"),
+    "pub fn shared_fn() -> u32 { 2 }\npub fn beta_caller() -> u32 { shared_fn() }\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  // Bare name is ambiguous → candidates with ids, no merged callers.
+  let ambiguous = vorpal_index::graph_query(&out, "callers", "shared_fn").unwrap();
+  assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+  assert!(
+    ambiguous.contains("alpha.rs") && ambiguous.contains("beta.rs"),
+    "{ambiguous}"
+  );
+  assert!(
+    !ambiguous.contains("alpha_caller") && !ambiguous.contains("beta_caller"),
+    "candidates only — no silently merged results:\n{ambiguous}"
+  );
+
+  // Path refinement selects exactly one definition.
+  let alpha_only = vorpal_index::graph_query_selected(
+    &out,
+    "callers",
+    &vorpal_index::GraphTarget {
+      name: "shared_fn".into(),
+      path_suffix: Some("alpha.rs".into()),
+      ..vorpal_index::GraphTarget::default()
+    },
+  )
+  .unwrap();
+  assert!(alpha_only.contains("alpha_caller"), "{alpha_only}");
+  assert!(!alpha_only.contains("beta_caller"), "{alpha_only}");
+
+  // Id refinement (ids discovered via the `node` verb) selects the beta definition.
+  let listing = vorpal_index::graph_query(&out, "node", "shared_fn").unwrap();
+  let beta_id: u64 = listing
+    .lines()
+    .find(|l| l.contains("beta.rs"))
+    .and_then(|l| l.strip_prefix("id "))
+    .and_then(|l| l.split_whitespace().next())
+    .and_then(|n| n.parse().ok())
+    .expect("node listing carries ids");
+  let beta_only = vorpal_index::graph_query_selected(
+    &out,
+    "callers",
+    &vorpal_index::GraphTarget {
+      name: "shared_fn".into(),
+      id: Some(beta_id),
+      ..vorpal_index::GraphTarget::default()
+    },
+  )
+  .unwrap();
+  assert!(beta_only.contains("beta_caller"), "{beta_only}");
+  assert!(!beta_only.contains("alpha_caller"), "{beta_only}");
+
+  // Explicit merge restores the historical union.
+  let merged = vorpal_index::graph_query_selected(
+    &out,
+    "callers",
+    &vorpal_index::GraphTarget {
+      name: "shared_fn".into(),
+      merge_all: true,
+      ..vorpal_index::GraphTarget::default()
+    },
+  )
+  .unwrap();
+  assert!(
+    merged.contains("alpha_caller") && merged.contains("beta_caller"),
+    "{merged}"
+  );
+
+  // names.idx: the persisted index and the scan fallback agree exactly.
+  let kg = Kg::load(&out).unwrap();
+  assert!(out.join("names.idx").exists());
+  let indexed = kg.nodes_named("shared_fn");
+  assert_eq!(indexed.len(), 2);
+  fs::remove_file(out.join("names.idx")).unwrap();
+  let scanned = Kg::load(&out).unwrap().nodes_named("shared_fn");
+  assert_eq!(indexed, scanned, "index and scan fallback must agree");
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// IMPROVEMENTS §6 acceptance: an edit that preserves byte length and restores the mtime —
+/// invisible to stat — is caught by content-digest validation, both in the racy window
+/// (automatic) and under VORPAL_VERIFY_CACHE=1 (everywhere).
+#[test]
+fn same_size_restored_mtime_edit_is_caught() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-racy-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  let file = src.join("victim.rs");
+  fs::write(&file, "pub fn victim_one() -> u32 { 1 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+
+  // Same byte length, different content; restore the original mtime exactly.
+  let original_mtime = fs::metadata(&file).unwrap().modified().unwrap();
+  fs::write(&file, "pub fn victim_two() -> u32 { 2 }\n").unwrap();
+  let handle = fs::OpenOptions::new().write(true).open(&file).unwrap();
+  handle
+    .set_times(fs::FileTimes::new().set_modified(original_mtime))
+    .unwrap();
+  drop(handle);
+  assert_eq!(
+    fs::metadata(&file).unwrap().modified().unwrap(),
+    original_mtime,
+    "mtime restoration is the attack precondition"
+  );
+
+  // Within seconds of the previous index, the racy window verifies digests automatically.
+  let report = build_index(&src, &out).unwrap();
+  assert_eq!(
+    report.indexed, 1,
+    "racy-window digest check must force a re-parse"
+  );
+  let renamed = search_index(&out, "victim two", 3).unwrap();
+  assert!(renamed.contains("victim_two"), "{renamed}");
+
+  // Outside the window, VORPAL_VERIFY_CACHE=1 verifies everything: repeat the attack and
+  // check the paranoid mode catches it too (window may or may not still apply; the env
+  // makes it unconditional).
+  let original_mtime = fs::metadata(&file).unwrap().modified().unwrap();
+  fs::write(&file, "pub fn victim_ten() -> u32 { 3 }\n").unwrap();
+  let handle = fs::OpenOptions::new().write(true).open(&file).unwrap();
+  handle
+    .set_times(fs::FileTimes::new().set_modified(original_mtime))
+    .unwrap();
+  drop(handle);
+  unsafe { std::env::set_var("VORPAL_VERIFY_CACHE", "1") };
+  let report = build_index(&src, &out).unwrap();
+  unsafe { std::env::remove_var("VORPAL_VERIFY_CACHE") };
+  assert_eq!(
+    report.indexed, 1,
+    "verify mode must catch the stat-invisible edit"
+  );
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// IMPROVEMENTS §5 fixture-matrix seed: cross-file call resolution and evidence labels,
+/// per major language family, end-to-end (extract → resolve → link → query). Each language
+/// asserts (a) the caller resolves, and (b) the edge carries a non-structural confidence
+/// label through the query surface.
+#[test]
+fn resolution_matrix_across_languages() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-matrix-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+
+  // Rust: cross-file exported call.
+  fs::write(src.join("rs_def.rs"), "pub fn rust_target() -> u32 { 1 }\n").unwrap();
+  fs::write(
+    src.join("rs_use.rs"),
+    "pub fn rust_caller() -> u32 { rust_target() }\n",
+  )
+  .unwrap();
+  // Python: cross-file call.
+  fs::write(src.join("py_def.py"), "def py_target():\n    return 1\n").unwrap();
+  fs::write(
+    src.join("py_use.py"),
+    "def py_caller():\n    return py_target()\n",
+  )
+  .unwrap();
+  // TypeScript: cross-file exported call.
+  fs::write(
+    src.join("ts_def.ts"),
+    "export function tsTarget(): number { return 1 }\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("ts_use.ts"),
+    "export function tsCaller(): number { return tsTarget() }\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  for (target, caller) in [
+    ("rust_target", "rust_caller"),
+    ("py_target", "py_caller"),
+    ("tsTarget", "tsCaller"),
+  ] {
+    let rendered = vorpal_index::graph_query_selected(
+      &out,
+      "callers",
+      &vorpal_index::GraphTarget {
+        name: target.into(),
+        show_ids: true,
+        ..vorpal_index::GraphTarget::default()
+      },
+    )
+    .unwrap();
+    assert!(
+      rendered.contains(caller),
+      "{target}: caller must resolve cross-file:\n{rendered}"
+    );
+    assert!(
+      rendered.contains("cross-file") || rendered.contains("local"),
+      "{target}: the edge must carry a resolution-confidence label:\n{rendered}"
+    );
+  }
+  let _ = fs::remove_dir_all(&base);
+}

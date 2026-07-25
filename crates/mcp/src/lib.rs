@@ -11,6 +11,7 @@
 //! transport later without touching the tool logic.
 
 mod server;
+mod tools;
 mod watch;
 
 pub use server::Server;

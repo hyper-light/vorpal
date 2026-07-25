@@ -25,6 +25,9 @@ pub struct NodeDef<'a> {
   pub signature: &'a str,
   pub exported: bool,
   pub content_hash: u64,
+  /// Byte range of the definition in `path` (`(0, 0)` when unknown, e.g. File nodes) —
+  /// persisted so query surfaces can fetch the defining source verbatim.
+  pub span: (u32, u32),
 }
 
 /// Where the writer's string heap lives. Shard writers and small trees build in RAM; the
@@ -113,6 +116,8 @@ pub struct KgWriter {
   sig_len: Vec<u32>,
   content_hash: Vec<u64>,
   flags: Vec<u8>,
+  span_start: Vec<u32>,
+  span_end: Vec<u32>,
 }
 
 impl KgWriter {
@@ -144,6 +149,8 @@ impl KgWriter {
       self.sig_len.push(sig_len);
       self.content_hash.push(def.content_hash);
       self.flags.push(u8::from(def.exported));
+      self.span_start.push(def.span.0);
+      self.span_end.push(def.span.1);
     }
     id
   }
@@ -181,6 +188,7 @@ impl KgWriter {
       signature: "",
       exported: true,
       content_hash: content_hash(&[path]),
+      span: (0, 0),
     });
     // The file node is the outermost enclosing scope, so file-level references (e.g. imports)
     // attribute to it when no smaller item/member span contains them.
@@ -198,6 +206,7 @@ impl KgWriter {
         signature,
         exported: item.is_exported,
         content_hash: content_hash(&[name, signature]),
+        span: clamp_span(&item.entry.range.byte_offset),
       });
       self.add_edge(file_id, item_id, EdgeType::DEFINES);
       spans.push((item.entry.range.byte_offset.clone(), item_id));
@@ -215,6 +224,7 @@ impl KgWriter {
           signature: msig,
           exported: member.is_public,
           content_hash: content_hash(&[&entity_path, msig]),
+          span: clamp_span(&member.entry.range.byte_offset),
         });
         self.add_edge(item_id, member_id, mkind.containment_edge());
         spans.push((member.entry.range.byte_offset.clone(), member_id));
@@ -237,6 +247,8 @@ impl KgWriter {
     self.sig_len.shrink_to_fit();
     self.content_hash.shrink_to_fit();
     self.flags.shrink_to_fit();
+    self.span_start.shrink_to_fit();
+    self.span_end.shrink_to_fit();
     if let HeapStore::Ram(heap) = &mut self.heap {
       heap.shrink_to_fit();
     }
@@ -334,6 +346,8 @@ impl KgWriter {
     self.sig_len.extend_from_slice(&other.sig_len);
     self.content_hash.extend_from_slice(&other.content_hash);
     self.flags.extend_from_slice(&other.flags);
+    self.span_start.extend_from_slice(&other.span_start);
+    self.span_end.extend_from_slice(&other.span_end);
     for (src, dst, etype) in other.edges.iter() {
       self
         .edges
@@ -436,6 +450,12 @@ impl KgWriter {
     let flags = std::mem::take(&mut self.flags);
     builder.add_u8("flags", &flags).unwrap();
     drop(flags);
+    let span_start = std::mem::take(&mut self.span_start);
+    builder.add_u32("span_start", &span_start).unwrap();
+    drop(span_start);
+    let span_end = std::mem::take(&mut self.span_end);
+    builder.add_u32("span_end", &span_end).unwrap();
+    drop(span_end);
     let nodes = Segment::open_owned(builder.build().unwrap()).unwrap();
 
     crate::phase_stamp("seal: compact");
@@ -462,6 +482,14 @@ impl KgWriter {
 
 fn qualified(owner: &str, member: &str) -> String {
   format!("{owner}.{member}")
+}
+
+/// Clamp a byte range to the u32 column space (files past 4 GiB store a saturated span).
+fn clamp_span(range: &Range<usize>) -> (u32, u32) {
+  (
+    range.start.min(u32::MAX as usize) as u32,
+    range.end.min(u32::MAX as usize) as u32,
+  )
 }
 
 fn content_hash(parts: &[&str]) -> u64 {

@@ -83,15 +83,63 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   let manifest = Manifest::scan(src, |p| extractor.handles(p))?;
   let manifest_path = out.join("manifest.bin");
 
+  // Staged cache validation (IMPROVEMENTS §6): stat (size+mtime) is the cheap hint; the v6
+  // content digest is the identity. Digests are verified (a) always under
+  // `VORPAL_VERIFY_CACHE=1` and (b) automatically for files in the **racy window** — mtime
+  // within 2s of the previous manifest's write, where an edit can restore size+mtime within
+  // timestamp granularity (the git racily-clean hazard). Both gates also suppress the
+  // whole-tree reuse fast path below, which is otherwise stat-only.
+  let verify_all = std::env::var_os("VORPAL_VERIFY_CACHE").is_some_and(|v| v == "1");
+  let prior_manifest_ns: u64 = fs::metadata(&manifest_path)
+    .and_then(|m| m.modified())
+    .ok()
+    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+    .map(|d| d.as_nanos() as u64)
+    .unwrap_or(0);
+  // Racy files get their digests verified *inside* the fast path (reading only those few
+  // files against the pack's stored digests) — an immediate no-change re-index keeps its
+  // 0.1s reuse, while a stat-invisible racy edit falls through to a rebuild.
+  let racy_files_verify = || -> bool {
+    let racy: Vec<&vorpal_ingest::FileStat> = manifest
+      .entries()
+      .iter()
+      .filter(|e| e.mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000)
+      .collect();
+    if racy.is_empty() {
+      return true;
+    }
+    let Some(pack) = PackReader::open(out) else {
+      return false;
+    };
+    racy.iter().all(|entry| {
+      let stored = pack
+        .get(&entry.path)
+        .and_then(vorpal_ingest::peek_product_digest);
+      match (stored, fs::read(&entry.path)) {
+        (Some(digest), Ok(bytes)) => xxhash_rust::xxh3::xxh3_64(&bytes) == digest,
+        _ => false,
+      }
+    })
+  };
+
   // Whole-tree fast path: nothing changed → reuse the persisted index without touching a file.
   // The report only needs the node count, read from the segment header — no heap read, no edge
   // read, no CSR rebuild. An unreadable/corrupt index falls through to a rebuild instead of
   // wedging every subsequent run on the same error.
   if let Ok(prior) = Manifest::load(&manifest_path) {
     if manifest.unchanged_since(&prior)
+      && !verify_all
       && out.join("strings.heap").exists()
       && out.join("graph.bin").exists()
+      && racy_files_verify()
     {
+      // Backfill: index dirs written before the name-index sidecar existed gain it here,
+      // once — sublinear name lookup without forcing a rebuild.
+      if !out.join("names.idx").exists() {
+        if let Ok(kg) = Kg::load(out) {
+          let _ = kg.write_names_index(out);
+        }
+      }
       if let Ok(nodes) = Kg::peek_node_count(out) {
         return Ok(IndexReport {
           reused: true,
@@ -117,6 +165,17 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // per-shard application keeps the output bit-identical to the batch path.
   let products_dir = out.join("products");
   fs::create_dir_all(&products_dir)?;
+
+  let digest_must_match = move |entry_mtime_ns: u64, stored_digest: Option<u64>, path: &Path| {
+    let racy = entry_mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000;
+    if !verify_all && !racy {
+      return true;
+    }
+    match (stored_digest, fs::read(path)) {
+      (Some(stored), Ok(bytes)) => xxhash_rust::xxh3::xxh3_64(&bytes) == stored,
+      _ => false,
+    }
+  };
 
   // Product cache, two tiers (§3.4): the **pack** (one mapped file — replay pays zero opens;
   // the loose-file cache cost one `open` per product, 72k of them at kernel scale, and macOS
@@ -150,7 +209,14 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
       if loose.contains(&OsString::from(&cache_name)) {
         if let Ok(bytes) = fs::read(products_dir.join(&cache_name)) {
           if let Ok(product) = decode_product(&bytes) {
-            if product.source_size == entry.size && product.source_mtime_ns == entry.mtime_ns {
+            if product.source_size == entry.size
+              && product.source_mtime_ns == entry.mtime_ns
+              && digest_must_match(
+                entry.mtime_ns,
+                Some(product.source_xxh3),
+                Path::new(&entry.path),
+              )
+            {
               pack_sink
                 .send(PackMsg {
                   path: entry.path.clone(),
@@ -169,6 +235,11 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
           // validated views again straight from the map and applies them — the product
           // itself never crosses the channel and never materializes.
           if peek_product_stamps(bytes) == Some((entry.size, entry.mtime_ns))
+            && digest_must_match(
+              entry.mtime_ns,
+              vorpal_ingest::peek_product_digest(bytes),
+              Path::new(&entry.path),
+            )
             && validate_product(bytes)
           {
             return Ok(StreamWork::ReplayedPacked(entry.path.clone()));
@@ -490,14 +561,24 @@ const RRF_K: f32 = 60.0;
 
 /// Fuse ranked candidate lists by RRF: `score(d) = Σ 1/(K + rank_in_list)`. Ties break by id for
 /// determinism. Lists may overlap and have different lengths; absence from a list adds nothing.
-fn rrf_fuse(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32)> {
-  let mut scores: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
-  for list in lists {
+/// [`rrf_fuse`] with provenance: each fused hit carries its per-channel rank (0-based;
+/// `None` where a channel did not surface it) — §11's "expose which rankers contributed".
+fn rrf_fuse_explained(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32, Vec<Option<usize>>)> {
+  let mut scores: std::collections::HashMap<u64, (f32, Vec<Option<usize>>)> =
+    std::collections::HashMap::new();
+  for (channel, list) in lists.iter().enumerate() {
     for (rank, &id) in list.iter().enumerate() {
-      *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + rank as f32);
+      let entry = scores
+        .entry(id)
+        .or_insert_with(|| (0.0, vec![None; lists.len()]));
+      entry.0 += 1.0 / (RRF_K + rank as f32);
+      entry.1[channel] = Some(rank);
     }
   }
-  let mut ranked: Vec<(u64, f32)> = scores.into_iter().collect();
+  let mut ranked: Vec<(u64, f32, Vec<Option<usize>>)> = scores
+    .into_iter()
+    .map(|(id, (score, ranks))| (id, score, ranks))
+    .collect();
   ranked.sort_by(|a, b| {
     b.1
       .partial_cmp(&a.1)
@@ -515,6 +596,26 @@ fn rrf_fuse(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32)> {
 /// 3. **graph**: the candidates from (1)+(2) ranked by in-degree — heavily called/referenced
 ///    symbols outrank dead-weight lookalikes.
 pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, Box<dyn Error>> {
+  search_index_impl(index_dir, query, k, false)
+}
+
+/// [`search_index`] with ranking provenance: each line gains `(id N; name#r vector#r graph#r)`
+/// — the node id (for `fetch_span`/selector refinement) and each contributing channel's
+/// 1-based rank. The plain renderer stays byte-stable for humans and captured docs.
+pub fn search_index_explained(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+) -> Result<String, Box<dyn Error>> {
+  search_index_impl(index_dir, query, k, true)
+}
+
+fn search_index_impl(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+  explain: bool,
+) -> Result<String, Box<dyn Error>> {
   let kg = Kg::load(index_dir)?;
   let current_stamp = stamp_of(&kg);
   let embedder = LexicalEmbedder::default();
@@ -632,15 +733,30 @@ pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, B
     )
   });
 
-  let ranked = rrf_fuse(&[named, semantic, by_degree], k);
+  let ranked = rrf_fuse_explained(&[named, semantic, by_degree], k);
   let mut out = String::new();
-  for (row, score) in ranked {
+  for (row, score, ranks) in ranked {
     if let Some(view) = kg.node(NodeId::new(row)) {
-      let _ = writeln!(
-        out,
-        "{score:.4}  {} [{:?}] {}",
-        view.name, view.kind, view.path
-      );
+      if explain {
+        let channels = ["name", "vector", "graph"];
+        let mut provenance = format!("id {row}");
+        for (channel, rank) in channels.iter().zip(&ranks) {
+          if let Some(rank) = rank {
+            let _ = write!(provenance, "; {channel}#{}", rank + 1);
+          }
+        }
+        let _ = writeln!(
+          out,
+          "{score:.4}  {} [{:?}] {}  ({provenance})",
+          view.name, view.kind, view.path
+        );
+      } else {
+        let _ = writeln!(
+          out,
+          "{score:.4}  {} [{:?}] {}",
+          view.name, view.kind, view.path
+        );
+      }
     }
   }
   Ok(out)
@@ -683,10 +799,15 @@ pub fn graph_query_selected(
   target: &GraphTarget,
 ) -> Result<String, Box<dyn Error>> {
   let kg = Kg::load(index_dir)?;
+  graph_query_on(&kg, verb, target)
+}
+
+/// [`graph_query_selected`] over an already-loaded graph — the daemon path, which serves
+/// from its warm cached [`Kg`] instead of re-opening artifacts per tool call.
+pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<String, Box<dyn Error>> {
   let kind = match target.kind.as_deref() {
     Some(text) => Some(
-      vorpal_kg::SymbolKind::parse(text)
-        .ok_or_else(|| format!("unknown symbol kind '{text}'"))?,
+      vorpal_kg::SymbolKind::parse(text).ok_or_else(|| format!("unknown symbol kind '{text}'"))?,
     ),
     None => None,
   };
@@ -698,7 +819,10 @@ pub fn graph_query_selected(
   };
   let matches = kg.select(&selector);
   if matches.is_empty() {
-    return Ok(format!("(no symbol matches '{}')\n", target.name));
+    return Ok(format!(
+      "(no results for '{}' — no symbol matches that selector)\n",
+      target.name
+    ));
   }
 
   let edge = match verb {
@@ -714,7 +838,7 @@ pub fn graph_query_selected(
   // `node` is a listing verb: every match IS the answer (ids attached — this verb exists to
   // discover identities for refinement).
   let Some(edge) = edge else {
-    return Ok(render_candidates(&kg, &matches));
+    return Ok(render_candidates(kg, &matches));
   };
 
   if matches.len() > 1 && !target.merge_all {
@@ -723,38 +847,52 @@ pub fn graph_query_selected(
       target.name,
       matches.len()
     );
-    out.push_str(&render_candidates(&kg, &matches));
+    out.push_str(&render_candidates(kg, &matches));
     return Ok(out);
   }
 
-  let mut ids: Vec<NodeId> = Vec::new();
+  let mut hits: Vec<(NodeId, u8)> = Vec::new();
   for &target_id in &matches {
-    for from in kg.incoming_of(target_id, edge) {
-      ids.push(from);
+    for (from, confidence) in kg.incoming_with_confidence(target_id, edge) {
+      hits.push((from, confidence));
     }
   }
-  ids.sort_unstable_by_key(|n| n.raw());
-  ids.dedup();
-  Ok(if ids.is_empty() {
+  hits.sort_unstable_by_key(|&(n, c)| (n.raw(), std::cmp::Reverse(c)));
+  hits.dedup_by_key(|&mut (n, _)| n);
+  Ok(if hits.is_empty() {
     format!("(no results for '{}')\n", target.name)
   } else if target.show_ids {
+    // Identity + evidence mode: each result carries its node id and the edge's resolution
+    // confidence label — approximate edges are visibly approximate (IMPROVEMENTS §5).
     let mut out = String::new();
-    for &id in &ids {
+    for &(id, confidence) in &hits {
       if let Some(view) = kg.node(id) {
         let _ = writeln!(
           out,
-          "{} [{:?}] {} (id {})",
+          "{} [{:?}] {} (id {}; {})",
           view.name,
           view.kind,
           view.path,
-          id.raw()
+          id.raw(),
+          confidence_label(confidence)
         );
       }
     }
     out
   } else {
-    format_nodes(&kg, &ids)
+    let ids: Vec<NodeId> = hits.iter().map(|&(id, _)| id).collect();
+    format_nodes(kg, &ids)
   })
+}
+
+/// Human label for a packed edge confidence (values from `vorpal_resolve::Confidence`).
+fn confidence_label(confidence: u8) -> &'static str {
+  match confidence {
+    100.. => "local",
+    41..=99 => "cross-file",
+    1..=40 => "approx",
+    0 => "structural",
+  }
 }
 
 /// Render selector candidates with their identities — enough to refine to exactly one.
@@ -794,7 +932,14 @@ pub fn format_nodes(kg: &Kg, ids: &[NodeId]) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::rrf_fuse;
+  use super::rrf_fuse_explained;
+
+  fn rrf_fuse(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32)> {
+    rrf_fuse_explained(lists, k)
+      .into_iter()
+      .map(|(id, score, _)| (id, score))
+      .collect()
+  }
 
   #[test]
   fn rrf_fuses_and_breaks_ties_deterministically() {

@@ -93,6 +93,8 @@ fn initialize_handshake_and_tool_listing() {
       "implementors",
       "type_users",
       "reachable",
+      "structural_search",
+      "fetch_span",
       "search"
     ]
   );

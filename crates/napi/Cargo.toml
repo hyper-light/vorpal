@@ -17,6 +17,8 @@ vorpal-core.workspace = true
 vorpal-config.workspace = true
 vorpal-language = { path = "../language", features = ["napi-lang"], default-features = false }
 vorpal-dynamic.workspace = true
+vorpal-index.workspace = true
+vorpal-kg.workspace = true
 
 napi = { version = "3.7.0", features = ["serde-json", "napi4", "error_anyhow"] }
 napi-derive = "3.4.0"

@@ -42,13 +42,17 @@ Every output above is a verbatim capture from running vorpal on its own reposito
 - **Honest resolution** — cross-file references resolve with scope precedence and confidence
   labels (`LOCAL` > exported `CROSS_FILE` > labeled `AMBIGUOUS`). Unresolvable references are
   *counted, never faked*: no phantom edges, ever.
-- **Hybrid search** — one query fuses exact/token name matching, lexical-embedding similarity,
-  and graph in-degree via reciprocal rank fusion. Querying a symbol by name always surfaces it;
-  among same-named symbols, the most-called wins.
+- **Hybrid lexical/graph retrieval** — one query fuses exact/token name matching,
+  lexical-embedding similarity (deterministic feature hashing — honest about being token
+  similarity, not a learned model; the `Embedder` trait accepts neural adapters), and graph
+  in-degree via reciprocal rank fusion, with per-channel provenance available on every hit.
+  Querying a symbol by name always surfaces it; among same-named symbols, the most-called wins.
 - **Incremental by construction** — per-file extraction products are cached; re-indexing
   re-parses only changed files and always re-links the whole graph, so removals and renames can
   never leave stale nodes behind. An unchanged tree re-indexes in milliseconds.
-- **Agent-native** — `vorpal mcp` serves the whole surface as MCP tools over stdio.
+- **Agent-native** — `vorpal mcp` serves graph queries (with unambiguous symbol selectors),
+  hybrid search with ranking provenance, structural pattern search, and verbatim
+  definition-source fetch as MCP tools over stdio.
 - **28 languages** — one extraction pipeline, tree-sitter grammars compiled in. No regex
   fallbacks, no per-language plugins to install.
 - **Adaptive at both ends** — data-derived configuration everywhere (index tiers, page policy,

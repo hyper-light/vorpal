@@ -1,7 +1,10 @@
 # ast-grep Improvement Plan — Speed, Code-First Intelligence, Semantic Depth
 
 > **Audience:** an autonomous Opus 4.8 coding agent picking up this work cold.
-> **Status:** design / proposal. No code written yet.
+> **Status:** HISTORICAL — this was the original design proposal; the bulk of it has since
+> been implemented (index, knowledge graph, resolver, prefilter, MCP daemon, ANN tier,
+> bindings). Current status lives in `docs/IMPROVEMENTS.md`'s status matrix and
+> `docs/ARCHITECTURE.md`'s per-section status blocks; measurements live in `README.md`.
 > **Prepared:** 2026-06-29.
 > **Repos referenced:**
 > - `ast-grep` (Rust workspace): `/Users/adalundhe/Documents/Projects/ast-grep`

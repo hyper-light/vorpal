@@ -1,6 +1,8 @@
 # Vorpal Improvements: Gaps Relative to ast-grep
 
-> - **Assessment date:** 2026-07-20
+> - **Assessment date:** 2026-07-20 · **Status refresh:** 2026-07-25 (see the
+>   Proposed-versus-implemented table — items closed since assessment are marked with the
+>   shipped mechanism and date)
 > - **Vorpal baseline:** the current repository worktree, originally copied and rebranded from
 >   ast-grep v0.44.0.
 > - **ast-grep baseline:** v0.44.1 plus public upstream proposals available on the assessment date.
@@ -385,23 +387,25 @@ reimplementing upstream work.
 
 ## Proposed-versus-implemented status
 
-| Capability from the plans | Status in the assessed tree | Missing contract |
+| Capability from the plans | Status (refresh 2026-07-25) | Missing contract |
 |---|---|---|
-| Structural ast-grep-compatible engine | **Implemented** | Ongoing upstream parity process |
+| Structural ast-grep-compatible engine | **Implemented** | Ongoing upstream parity process (`docs/UPSTREAM.md` ledger started 2026-07-24) |
 | Literal prefilter for patterns and required regex literals | **Implemented** | Cross-version benchmarks and false-negative guard corpus |
 | Default outline rules for 28 languages | **Implemented** | Published construct/relation coverage matrix |
-| Persistent graph and mmap cold-open | **Implemented** | Unambiguous selectors, edge evidence in query results, scale measurements |
+| Persistent graph and mmap cold-open | **Implemented** | ~~Selectors~~ (`SymbolSelector` + ambiguity-preserving queries, 2026-07-24); edge evidence in results still open; kernel-scale measurements published in README |
+| Unambiguous symbol identity (§1) | **Implemented** (2026-07-24) | `SymbolSelector` across library/CLI/MCP/bindings; persisted `names.idx` (sublinear lookup); ambiguity returns candidates; `--all` merges explicitly |
+| Content-identity cache validation (§6) | **Implemented** (2026-07-24) | Product v6 `source_xxh3`; racy-mtime-window auto-verification; `VORPAL_VERIFY_CACHE=1` full verification; same-size/restored-mtime attack test |
 | Cross-file resolution | **Partial** | Complete scopes/bindings, receiver/type precision, language coverage |
-| Bounded streaming ingest | **Partial** | Content-hash identity and end-to-end corpus-sized memory accounting |
-| Incremental indexing | **Partial** | Content validation and affected-subgraph linking |
-| Hybrid name/vector/graph retrieval | **Partial** | Filters, provenance, evaluation, learned-model adapters if "semantic" is retained |
-| Built-in MCP daemon and watcher | **Partial** | Structural tools, document fetch, selectors, pagination, shared parse |
-| Segmented/custom storage | **Partial** | Compression, canonical on-disk index, atomic generations, compaction |
-| Graph-backed rules and scoped symbol metavariables | **Proposed** | Matcher/index context and confidence semantics |
-| Repository APIs in Node/Python/WASM | **Proposed** | Stable handle and refresh semantics |
-| Zero-copy mmap scan path | **Proposed** | Borrowed input abstraction and benchmarks |
-| Advanced disk ANN/filtered ANN stack | **Proposed** | Retrieval corpus and evidence that simpler tiers are insufficient |
-| Remote/fleet execution | **Prototype/proposed** | Stable wire vectors, transport, agent, orchestration, compatibility suite |
+| Bounded streaming ingest | **Implemented** | Kernel-scale accounting published (0.55 GB cold peak); content identity now in the cache contract |
+| Incremental indexing | **Implemented** (linking measured-deferred) | Full re-link measured at ~0.7 s within the 1.2 s kernel incremental — affected-subgraph linking deferred until re-link cost is material (>30 s scale) |
+| Hybrid name/vector/graph retrieval | **Implemented** | Per-channel RRF provenance shipped (`search_index_explained`, MCP default); README renamed to "hybrid lexical/graph retrieval"; learned-model adapters remain optional future work |
+| Built-in MCP daemon and watcher | **Implemented** | `structural_search`, `fetch_span` (persisted definition spans), selector params, limits (2026-07-25); rule-testing and shared-parse still open |
+| Segmented/custom storage | **Implemented** | mmap zero-copy graph CSR/CSC + ANN5 + name index; tmp+rename atomic artifact swaps; generation-stamped coherence gates; compression deferred until decode cost wins end-to-end |
+| Graph-backed rules and scoped symbol metavariables | **Proposed** (staged) | Deliberately AFTER selector + resolution evidence bake — a semantic predicate surface built on ambiguous identity would inherit its bugs |
+| Repository APIs in Node/Python/WASM | **Implemented (Node/Python)** (2026-07-25) | `index_build`/`index_search`/`index_graph`/`index_node` in `vorpal-py` and `vorpal-napi`; WASM deferred (no filesystem index story) |
+| Zero-copy mmap scan path | **Closed — profiled, not justified** | Extraction is parse-dominated at kernel scale; input copies immaterial |
+| Advanced disk ANN/filtered ANN stack | **Implemented (measured subset)** | i8-quantized mmap Vamana + exhaustive fallback + edit overlay; partitioned build measured *slower* at in-RAM scale (26 s vs 12 s) and rejected — the evidence-first process this table asked for |
+| Remote/fleet execution | **Prototype** | Wire vectors green; transport/agent/orchestration in active development (separate lane) |
 | Billion-line operational scale | **Proposed target** | Reproducible resource model and large-corpus validation |
 
 ## Recommended delivery sequence

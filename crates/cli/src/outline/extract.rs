@@ -141,7 +141,9 @@ pub fn stream_paths(
     return Ok(());
   }
   let walker = outline_walk(&arg.input, arg.lang, &extractors)?;
-  let (tx, rx) = mpsc::channel();
+  // Bounded queue, matching upstream ast-grep 0.44.1: parallel extraction backpressures on
+  // the (serial) emitter instead of buffering an unbounded backlog of extracted files.
+  let (tx, rx) = mpsc::sync_channel(256);
   let lang = arg.lang;
   let producer = thread::spawn(move || {
     walker.run(|| {

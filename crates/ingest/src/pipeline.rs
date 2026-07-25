@@ -228,7 +228,11 @@ pub fn link_writer(
   // before compaction and seal allocate theirs.
   release_freed_pages();
   for edge in &edges {
-    writer.add_edge(edge.from, edge.to, edge.edge);
+    writer.add_edge(
+      edge.from,
+      edge.to,
+      edge.edge.with_confidence(edge.confidence),
+    );
   }
   drop(edges);
   phase_trace("link: seal start");
@@ -255,7 +259,11 @@ pub fn link_writer_spilled(
   let stats = {
     let writer = &mut writer;
     vorpal_resolve::resolve_all_spilled_into(&table, &spill, resolver, |edge| {
-      writer.add_edge(edge.from, edge.to, edge.edge);
+      writer.add_edge(
+        edge.from,
+        edge.to,
+        edge.edge.with_confidence(edge.confidence),
+      );
     })?
   };
   phase_trace("link: resolve done");
@@ -427,8 +435,9 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
   let node_count = writer.node_count();
   let mut owner_of: Vec<Option<u32>> = vec![None; node_count];
   for (src, dst, etype) in writer.edge_log().iter() {
-    let containment =
-      etype == EdgeType::DEFINES || etype == EdgeType::HAS_METHOD || etype == EdgeType::HAS_FIELD;
+    let containment = etype.base() == EdgeType::DEFINES
+      || etype.base() == EdgeType::HAS_METHOD
+      || etype.base() == EdgeType::HAS_FIELD;
     if containment
       && writer
         .definition(src as usize)
@@ -513,8 +522,9 @@ mod sharded_table_tests {
     });
     let mut owner_of: Vec<Option<u32>> = vec![None; names.len()];
     for (src, dst, etype) in writer.edge_log().iter() {
-      let containment =
-        etype == EdgeType::DEFINES || etype == EdgeType::HAS_METHOD || etype == EdgeType::HAS_FIELD;
+      let containment = etype.base() == EdgeType::DEFINES
+        || etype.base() == EdgeType::HAS_METHOD
+        || etype.base() == EdgeType::HAS_FIELD;
       if containment
         && kinds.get(src as usize).copied() != Some(SymbolKind::File)
         && (dst as usize) < owner_of.len()
@@ -568,6 +578,7 @@ mod sharded_table_tests {
         signature: "",
         exported: true,
         content_hash: i as u64,
+        span: (0, 0),
       });
       for j in 0..4usize {
         let item_name = format!("Item{j}");
@@ -583,6 +594,7 @@ mod sharded_table_tests {
           signature: "sig",
           exported: j % 3 != 0,
           content_hash: (i * 10 + j) as u64,
+          span: (0, 0),
         });
         writer.add_edge(file_id, item_id, EdgeType::DEFINES);
         let member_name = format!("member_{j}");
@@ -595,6 +607,7 @@ mod sharded_table_tests {
           signature: "msig",
           exported: true,
           content_hash: (i * 100 + j) as u64,
+          span: (0, 0),
         });
         writer.add_edge(item_id, member_id, EdgeType::HAS_METHOD);
       }
@@ -607,6 +620,7 @@ mod sharded_table_tests {
         signature: "",
         exported: false,
         content_hash: i as u64 + 7,
+        span: (0, 0),
       });
     }
     assert!(

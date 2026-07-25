@@ -30,7 +30,7 @@ mod jemalloc_conf {
   );
 }
 
-use vorpal_index::{build_index, graph_query, search_index};
+use vorpal_index::{build_index, search_index};
 
 const USAGE: &str = "usage:
   vorpal-index index        <src-dir> <index-dir>   build + persist a knowledge graph
@@ -99,8 +99,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       verb @ ("callers" | "refs" | "importers" | "implementors" | "typeusers" | "node"),
       index,
       name,
+      rest @ ..,
     ] => {
-      print!("{}", graph_query(Path::new(index), verb, name)?);
+      // Optional trailing selector flag: `--all` merges across same-named definitions
+      // (the historical union); the richer selector surface lives on the `vorpal` CLI.
+      let target = vorpal_index::GraphTarget {
+        name: (*name).to_string(),
+        merge_all: rest == ["--all"],
+        ..vorpal_index::GraphTarget::default()
+      };
+      if !rest.is_empty() && rest != ["--all"] {
+        eprintln!("{USAGE}");
+        return Err("invalid arguments".into());
+      }
+      print!(
+        "{}",
+        vorpal_index::graph_query_selected(Path::new(index), verb, &target)?
+      );
       Ok(())
     }
     ["search", index, query] => print_search(index, query, 10),

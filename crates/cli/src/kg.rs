@@ -58,6 +58,21 @@ pub struct GraphArg {
   verb: GraphVerb,
   /// Exact symbol name.
   name: String,
+  /// Refine to definitions whose file path ends with this suffix.
+  #[clap(long, value_name = "SUFFIX")]
+  path: Option<String>,
+  /// Refine to one symbol kind (function, method, struct, field, …).
+  #[clap(long, value_name = "KIND")]
+  kind: Option<String>,
+  /// Query exactly this node id (from `graph node <name>` or an ambiguity listing).
+  #[clap(long, value_name = "ID")]
+  id: Option<u64>,
+  /// Merge results across ALL same-named definitions (the pre-selector behavior).
+  #[clap(long)]
+  all: bool,
+  /// Append each result's node id (stable within this index generation).
+  #[clap(long)]
+  ids: bool,
   /// Index directory (default: `./.vorpal/index`).
   #[clap(long)]
   index: Option<PathBuf>,
@@ -116,7 +131,15 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
 
 pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
   let dir = index_dir(arg.index);
-  let rendered = vorpal_index::graph_query(&dir, arg.verb.as_str(), &arg.name)
+  let target = vorpal_index::GraphTarget {
+    name: arg.name,
+    id: arg.id,
+    path_suffix: arg.path,
+    kind: arg.kind,
+    merge_all: arg.all,
+    show_ids: arg.ids,
+  };
+  let rendered = vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
     .map_err(boxed)
     .with_context(|| missing_index_hint(&dir))?;
   print!("{rendered}");

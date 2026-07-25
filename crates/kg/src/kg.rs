@@ -56,8 +56,9 @@ fn open_names_index(
   }
   let hashes =
     vorpal_mem::PodColumn::from_mapped_le(&store, 8, count * 8, u64::from_le_bytes).ok()?;
-  let ids = vorpal_mem::PodColumn::from_mapped_le(&store, 8 + count * 8, count * 8, u64::from_le_bytes)
-    .ok()?;
+  let ids =
+    vorpal_mem::PodColumn::from_mapped_le(&store, 8 + count * 8, count * 8, u64::from_le_bytes)
+      .ok()?;
   Some((hashes, ids))
 }
 
@@ -92,6 +93,8 @@ pub struct NodeView<'a> {
   pub signature: &'a str,
   pub content_hash: u64,
   pub exported: bool,
+  /// Definition byte range in `path`; `(0, 0)` when unknown (File nodes, pre-span segments).
+  pub span: (u32, u32),
 }
 
 /// Directory positions of the node segment's columns, resolved once at construction so point
@@ -107,6 +110,10 @@ struct NodeColumns {
   sig_len: usize,
   content_hash: usize,
   flags: usize,
+  /// Definition byte spans — `None` on segments written before the columns existed
+  /// (spans then read as `(0, 0)`: "unknown").
+  span_start: Option<usize>,
+  span_end: Option<usize>,
 }
 
 impl NodeColumns {
@@ -121,6 +128,8 @@ impl NodeColumns {
       sig_len: segment.column_index("sig_len")?,
       content_hash: segment.column_index("content_hash")?,
       flags: segment.column_index("flags")?,
+      span_start: segment.column_index("span_start"),
+      span_end: segment.column_index("span_end"),
     })
   }
 }
@@ -201,6 +210,13 @@ impl Kg {
     let kind = SymbolKind::from_tag(self.nodes.column_at(self.cols.kind)?.get_u8(row)?);
     let content_hash = self.nodes.column_at(self.cols.content_hash)?.get_u64(row)?;
     let exported = self.nodes.column_at(self.cols.flags)?.get_u8(row)? & 1 != 0;
+    let span = match (self.cols.span_start, self.cols.span_end) {
+      (Some(start_col), Some(end_col)) => (
+        self.nodes.column_at(start_col)?.get_u32(row)?,
+        self.nodes.column_at(end_col)?.get_u32(row)?,
+      ),
+      _ => (0, 0),
+    };
     Some(NodeView {
       kind,
       name: self.heap_str(self.cols.name_off, self.cols.name_len, row)?,
@@ -208,6 +224,7 @@ impl Kg {
       signature: self.heap_str(self.cols.sig_off, self.cols.sig_len, row)?,
       content_hash,
       exported,
+      span,
     })
   }
 
@@ -364,11 +381,25 @@ impl Kg {
 
   /// In-neighbors of `id` over one edge type, ascending, deduplicated — the id-precise form
   /// of the `callers`/`references`/… verbs (name-based forms union this over namesakes).
+  /// [`Kg::incoming_of`] carrying each in-edge's packed resolution confidence — what query
+  /// surfaces render as evidence labels (IMPROVEMENTS §5: confidence queryable per edge).
+  pub fn incoming_with_confidence(&self, id: NodeId, edge: EdgeType) -> Vec<(NodeId, u8)> {
+    let mut found: Vec<(NodeId, u8)> = self
+      .in_neighbors(id)
+      .into_iter()
+      .filter(|&(_, kind)| kind.base() == edge.base())
+      .map(|(from, kind)| (from, kind.confidence()))
+      .collect();
+    found.sort_unstable_by_key(|&(n, _)| n.raw());
+    found.dedup();
+    found
+  }
+
   pub fn incoming_of(&self, id: NodeId, edge: EdgeType) -> Vec<NodeId> {
     let mut found: Vec<NodeId> = self
       .in_neighbors(id)
       .into_iter()
-      .filter(|&(_, kind)| kind == edge)
+      .filter(|&(_, kind)| kind.base() == edge.base())
       .map(|(from, _)| from)
       .collect();
     found.sort_unstable_by_key(|n| n.raw());
@@ -380,7 +411,7 @@ impl Kg {
     let mut found = Vec::new();
     for target in self.nodes_named(name) {
       for (from, kind) in self.in_neighbors(target) {
-        if kind == edge && !found.contains(&from) {
+        if kind.base() == edge.base() && !found.contains(&from) {
           found.push(from);
         }
       }
@@ -410,9 +441,23 @@ impl Kg {
       _ => write_via_tmp(dir, "strings.heap", |out| out.write_all(&self.heap[..]))?,
     }
 
-    // The persisted name index: `(xxh3(name), id)` pairs sorted by `(hash, id)` — exact-name
-    // lookup becomes two binary searches over a mapped column instead of a 2.7M-row scan.
-    // Bytes are a pure function of the node table (sorted, fixed-width): bit-identical.
+    self.write_names_index(dir)?;
+
+    crate::phase_stamp("kg save: graph");
+    // Both CSR directions persist as one aligned section file the load path maps zero-copy —
+    // the edge-list form forced every open to re-run compaction (~64 ms at kernel scale).
+    write_via_tmp(dir, "graph.bin", |out| self.graph.write_to(out))?;
+    crate::phase_stamp("kg save: done");
+    Ok(())
+  }
+
+  /// Persist the name index sidecar (`names.idx`): `(xxh3(name), id)` pairs sorted by
+  /// `(hash, id)` — exact-name lookup becomes two binary searches over a mapped column
+  /// instead of a full node scan. Bytes are a pure function of the node table (sorted,
+  /// fixed-width): bit-identical across rebuilds. Also used to backfill dirs written before
+  /// the sidecar existed.
+  pub fn write_names_index(&self, dir: &Path) -> io::Result<()> {
+    use std::io::Write;
     write_via_tmp(dir, "names.idx", |out| {
       let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
         .filter_map(|i| {
@@ -431,14 +476,7 @@ impl Kg {
         out.write_all(&id.to_le_bytes())?;
       }
       Ok(())
-    })?;
-
-    crate::phase_stamp("kg save: graph");
-    // Both CSR directions persist as one aligned section file the load path maps zero-copy —
-    // the edge-list form forced every open to re-run compaction (~64 ms at kernel scale).
-    write_via_tmp(dir, "graph.bin", |out| self.graph.write_to(out))?;
-    crate::phase_stamp("kg save: done");
-    Ok(())
+    })
   }
 
   /// Cold-open a persisted graph: **mmap** the node segment (§9.1 — no heap load of the columns),
@@ -478,13 +516,15 @@ impl Kg {
     let row_count = nodes.row_count();
     let mut directory = SegmentDirectory::new();
     directory.insert(0, row_count, 0);
-    Self::with_heap_column(
+    let mut kg = Self::with_heap_column(
       nodes,
       heap,
       Some(dir.join("strings.heap")),
       graph,
       directory,
-    )
+    )?;
+    kg.names = open_names_index(dir, &policy, kg.node_count());
+    Ok(kg)
   }
 
   /// The node count of a persisted index, from the segment header alone — no string heap read,
@@ -500,7 +540,7 @@ impl Kg {
 
 fn is_containment(e: EdgeType) -> bool {
   matches!(
-    e,
+    e.base(),
     EdgeType::DEFINES | EdgeType::HAS_METHOD | EdgeType::HAS_FIELD
   )
 }

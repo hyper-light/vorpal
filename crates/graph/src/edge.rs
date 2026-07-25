@@ -5,6 +5,23 @@
 pub struct EdgeType(pub u16);
 
 impl EdgeType {
+  /// The label with resolution confidence packed into the high byte (`0` = structural /
+  /// unlabeled). The low byte remains the edge *type*; every type comparison must go
+  /// through [`EdgeType::base`].
+  pub fn with_confidence(self, confidence: u8) -> EdgeType {
+    EdgeType((self.0 & 0x00FF) | ((confidence as u16) << 8))
+  }
+
+  /// The bare edge type, confidence stripped — what type dispatch compares.
+  pub fn base(self) -> EdgeType {
+    EdgeType(self.0 & 0x00FF)
+  }
+
+  /// The packed resolution confidence (`0` for structural edges).
+  pub fn confidence(self) -> u8 {
+    (self.0 >> 8) as u8
+  }
+
   pub const DEFINES: EdgeType = EdgeType(0);
   pub const CALLS: EdgeType = EdgeType(1);
   pub const REFERENCES: EdgeType = EdgeType(2);

@@ -132,9 +132,11 @@ impl OutlineExtractor {
     Some(FileProduct {
       version: product::PRODUCT_FORMAT_VERSION,
       // The never-matching default stamp: persisting callers stat the source and stamp the
-      // product; an unstamped product can never replay.
+      // product; an unstamped product can never replay. The content digest is stamped from
+      // the exact bytes extraction saw — the identity staged validation trusts.
       source_size: 0,
       source_mtime_ns: 0,
+      source_xxh3: xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
       items: items.into_iter().map(product::own_item).collect(),
       refs,
     })

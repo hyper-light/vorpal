@@ -435,6 +435,15 @@ the future if a component needs wait-free *reclamation* (not just wait-free read
 > byte-for-byte at flat-exact scale, tier 3 ⊇ tier 1 in recall at Vamana scale, and tier 2's
 > rankings converge to tier 1's at compaction — hash-gates must compare like state with like
 > state.
+>
+> **Cache-validation contract (products, IMPROVEMENTS §6):** stat (size + mtime) is the
+> cheap replay hint; the v6 product header's `source_xxh3` is the content identity. Digests
+> are verified automatically for files in the *racy window* (mtime within 2s of the previous
+> manifest write — the git racily-clean hazard, where an edit can restore size+mtime within
+> timestamp granularity), and for everything under `VORPAL_VERIFY_CACHE=1`. The whole-tree
+> reuse fast path verifies racy files' digests against the pack before short-circuiting.
+> Format generations (`PRODUCT_FORMAT_VERSION`) are part of the key: extraction-affecting
+> changes bump it, and foreign-generation products are cache misses, never errors.
 
 Pipeline `discover → read(mmap)+blake3 → hash-skip → parse → extract → chunk → (embed) → flush`
 as **fixed-capacity stages joined by bounded MPMC queues** (`crossbeam-queue::ArrayQueue`, or

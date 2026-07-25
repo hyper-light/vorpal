@@ -153,27 +153,67 @@ impl Server {
       }
       "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
         let name = str_arg("name")?;
-        let kg = self.kg()?;
-        let ids = match tool {
-          "node" => kg.nodes_named(&name),
-          "callers" => kg.callers_of(&name),
-          "references" => kg.references_to(&name),
-          "implementors" => kg.implementors_of(&name),
-          "type_users" => kg.users_of_type(&name),
-          _ => kg.importers_of(&name),
+        // Symbol identity contract (IMPROVEMENTS §1): ambiguous names return the candidate
+        // list (with node ids) instead of silently merging namesake neighborhoods; refine
+        // with `path`/`kind`/`id`, or pass `all: true` to merge explicitly.
+        let target = vorpal_index::GraphTarget {
+          name,
+          id: args.get("id").and_then(Value::as_u64),
+          path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
+          kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
+          merge_all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+          show_ids: true,
         };
-        Ok(render(kg, &name, &ids))
+        let verb = match tool {
+          "type_users" => "typeusers",
+          "references" => "refs",
+          other => other,
+        };
+        // `self.kg()` keeps the daemon contract: freshness revalidation, the warm cached
+        // graph, and the "run the 'index' tool first" error when nothing is indexed yet.
+        let kg = self.kg()?;
+        vorpal_index::graph_query_on(kg, verb, &target).map_err(|err| err.to_string())
       }
       "search" => {
         let query = str_arg("query")?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let rendered =
-          vorpal_index::search_index(&self.index_dir, &query, k).map_err(|err| err.to_string())?;
+        // Agents get ranking provenance by default: which channels (name/vector/graph)
+        // placed each hit, at which rank — §11's "expose which rankers contributed."
+        let rendered = vorpal_index::search_index_explained(&self.index_dir, &query, k)
+          .map_err(|err| err.to_string())?;
         Ok(if rendered.is_empty() {
           format!("(no results for '{query}')")
         } else {
           rendered
         })
+      }
+      "structural_search" => {
+        let pattern = str_arg("pattern")?;
+        let lang = str_arg("lang")?;
+        let path = args.get("path").and_then(Value::as_str);
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+        let root = self
+          .watch
+          .as_ref()
+          .map(|w| w.src().to_path_buf())
+          .ok_or_else(|| {
+            "structural_search needs a watched source tree (daemon started on a default \
+             <src>/.vorpal/index location)"
+              .to_string()
+          })?;
+        crate::tools::structural_search(&root, &pattern, &lang, path, limit.clamp(1, 1000))
+      }
+      "fetch_span" => {
+        let id = args
+          .get("id")
+          .and_then(Value::as_u64)
+          .ok_or_else(|| "missing required argument: id".to_string())?;
+        let max_bytes = args
+          .get("max_bytes")
+          .and_then(Value::as_u64)
+          .unwrap_or(16_384) as usize;
+        let kg = self.kg()?;
+        crate::tools::fetch_span(kg, id, max_bytes.clamp(64, 262_144))
       }
       "reachable" => {
         let name = str_arg("name")?;
@@ -236,7 +276,13 @@ fn initialize(params: &Value) -> Value {
 }
 
 fn tools_list() -> Value {
-  let name_only = json!({"name": {"type": "string", "description": "Exact symbol name"}});
+  let name_only = json!({
+    "name": {"type": "string", "description": "Exact symbol name"},
+    "path": {"type": "string", "description": "Refine: definition file path must end with this suffix"},
+    "kind": {"type": "string", "description": "Refine: symbol kind (function, method, struct, field, …)"},
+    "id": {"type": "integer", "description": "Query exactly this node id (from `node` output or an ambiguity listing)"},
+    "all": {"type": "boolean", "description": "Merge results across ALL same-named definitions instead of listing candidates"}
+  });
   json!({"tools": [
     tool(
       "index",
@@ -260,6 +306,28 @@ fn tools_list() -> Value {
         "direction": {"type": "string", "enum": ["in", "out"]}
       }),
       &["name", "direction"],
+    ),
+    tool(
+      "structural_search",
+      "ast-grep-style structural pattern search over the watched source tree: real code with \
+       metavariables ($X, $$$ARGS), matched on the AST — returns path:line + matched text.",
+      json!({
+        "pattern": {"type": "string", "description": "Structural pattern (e.g. 'foo($A, $B)')"},
+        "lang": {"type": "string", "description": "Language of the pattern (rust, c, python, …)"},
+        "path": {"type": "string", "description": "Only search files whose path ends with this suffix"},
+        "limit": {"type": "integer", "description": "Max matches (default 100, cap 1000)"}
+      }),
+      &["pattern", "lang"],
+    ),
+    tool(
+      "fetch_span",
+      "The defining source of a graph node, verbatim: pass a node id (from any graph tool's \
+       output or an ambiguity listing) and get back path:line plus the definition's bytes.",
+      json!({
+        "id": {"type": "integer", "description": "Node id"},
+        "max_bytes": {"type": "integer", "description": "Clamp returned source (default 16384)"}
+      }),
+      &["id"],
     ),
     tool(
       "search",

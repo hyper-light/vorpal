@@ -23,3 +23,4 @@ crossbeam-utils.workspace = true
 ignore.workspace = true
 rayon.workspace = true
 vorpal-mem.workspace = true
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }

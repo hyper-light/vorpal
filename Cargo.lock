@@ -3816,6 +3816,7 @@ dependencies = [
  "vorpal-mem",
  "vorpal-outline",
  "vorpal-resolve",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3906,8 +3907,10 @@ dependencies = [
  "notify",
  "serde_json",
  "tikv-jemallocator",
+ "vorpal-core",
  "vorpal-index",
  "vorpal-kg",
+ "vorpal-language",
 ]
 
 [[package]]
@@ -3933,6 +3936,8 @@ dependencies = [
  "vorpal-config",
  "vorpal-core",
  "vorpal-dynamic",
+ "vorpal-index",
+ "vorpal-kg",
  "vorpal-language",
 ]
 
@@ -3961,6 +3966,8 @@ dependencies = [
  "vorpal-config",
  "vorpal-core",
  "vorpal-dynamic",
+ "vorpal-index",
+ "vorpal-kg",
  "vorpal-language",
 ]
 
