@@ -56,3 +56,12 @@ crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
 dashmap = "6.0.0"
 rayon = "1.10.0"
+
+# Vendored grammars — utter control over the exact parser bytes vorpal ships (and the
+# ability to fix a grammar ourselves, e.g. PEP 810 lazy imports, without waiting on upstream
+# maintainers). Overrides the crates.io grammar with our in-tree copy; consumers reference
+# `tree_sitter_python` unchanged. Grammars are updated deliberately, per vorpal release —
+# one binary, one version, one deterministic parser set. See docs/UPSTREAM.md for the sync
+# ledger.
+[patch.crates-io]
+tree-sitter-python = { path = "grammars/tree-sitter-python" }

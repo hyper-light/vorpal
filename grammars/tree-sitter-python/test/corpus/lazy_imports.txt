@@ -1,0 +1,138 @@
+================================================================================
+Lazy import statements (PEP 810)
+================================================================================
+
+lazy import os
+lazy import os.path as p
+lazy import a, b
+
+--------------------------------------------------------------------------------
+
+(module
+  (import_statement
+    (lazy)
+    (dotted_name
+      (identifier)))
+  (import_statement
+    (lazy)
+    (aliased_import
+      (dotted_name
+        (identifier)
+        (identifier))
+      (identifier)))
+  (import_statement
+    (lazy)
+    (dotted_name
+      (identifier))
+    (dotted_name
+      (identifier))))
+
+================================================================================
+Lazy import-from statements (PEP 810)
+================================================================================
+
+lazy from typing import IO
+lazy from collections import OrderedDict as OD
+lazy from . import sibling
+lazy from .pkg import (a, b, c)
+
+--------------------------------------------------------------------------------
+
+(module
+  (import_from_statement
+    (lazy)
+    (dotted_name
+      (identifier))
+    (dotted_name
+      (identifier)))
+  (import_from_statement
+    (lazy)
+    (dotted_name
+      (identifier))
+    (aliased_import
+      (dotted_name
+        (identifier))
+      (identifier)))
+  (import_from_statement
+    (lazy)
+    (relative_import
+      (import_prefix))
+    (dotted_name
+      (identifier)))
+  (import_from_statement
+    (lazy)
+    (relative_import
+      (import_prefix)
+      (dotted_name
+        (identifier)))
+    (dotted_name
+      (identifier))
+    (dotted_name
+      (identifier))
+    (dotted_name
+      (identifier))))
+
+================================================================================
+lazy remains a valid identifier (PEP 810 soft keyword)
+================================================================================
+
+lazy = 1
+x = lazy + 1
+def lazy(): pass
+class lazy: pass
+obj.lazy = 5
+foo(lazy=1)
+import mod as lazy
+from pkg import lazy
+global lazy
+lazy
+
+--------------------------------------------------------------------------------
+
+(module
+  (expression_statement
+    (assignment
+      (identifier)
+      (integer)))
+  (expression_statement
+    (assignment
+      (identifier)
+      (binary_operator
+        (identifier)
+        (integer))))
+  (function_definition
+    (identifier)
+    (parameters)
+    (block
+      (pass_statement)))
+  (class_definition
+    (identifier)
+    (block
+      (pass_statement)))
+  (expression_statement
+    (assignment
+      (attribute
+        (identifier)
+        (identifier))
+      (integer)))
+  (expression_statement
+    (call
+      (identifier)
+      (argument_list
+        (keyword_argument
+          (identifier)
+          (integer)))))
+  (import_statement
+    (aliased_import
+      (dotted_name
+        (identifier))
+      (identifier)))
+  (import_from_statement
+    (dotted_name
+      (identifier))
+    (dotted_name
+      (identifier)))
+  (global_statement
+    (identifier))
+  (expression_statement
+    (identifier)))
