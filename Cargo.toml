@@ -64,4 +64,30 @@ rayon = "1.10.0"
 # one binary, one version, one deterministic parser set. See docs/UPSTREAM.md for the sync
 # ledger.
 [patch.crates-io]
+tree-sitter-bash = { path = "grammars/tree-sitter-bash" }
+tree-sitter-c = { path = "grammars/tree-sitter-c" }
+tree-sitter-c-sharp = { path = "grammars/tree-sitter-c-sharp" }
+tree-sitter-cpp = { path = "grammars/tree-sitter-cpp" }
+tree-sitter-css = { path = "grammars/tree-sitter-css" }
+tree-sitter-dart = { path = "grammars/tree-sitter-dart" }
+tree-sitter-elixir = { path = "grammars/tree-sitter-elixir" }
+tree-sitter-go = { path = "grammars/tree-sitter-go" }
+tree-sitter-haskell = { path = "grammars/tree-sitter-haskell" }
+tree-sitter-hcl = { path = "grammars/tree-sitter-hcl" }
+tree-sitter-html = { path = "grammars/tree-sitter-html" }
+tree-sitter-java = { path = "grammars/tree-sitter-java" }
+tree-sitter-javascript = { path = "grammars/tree-sitter-javascript" }
+tree-sitter-json = { path = "grammars/tree-sitter-json" }
+tree-sitter-kotlin-sg = { path = "grammars/tree-sitter-kotlin-sg" }
+tree-sitter-lua = { path = "grammars/tree-sitter-lua" }
+tree-sitter-md = { path = "grammars/tree-sitter-md" }
+tree-sitter-nix = { path = "grammars/tree-sitter-nix" }
+tree-sitter-php = { path = "grammars/tree-sitter-php" }
 tree-sitter-python = { path = "grammars/tree-sitter-python" }
+tree-sitter-ruby = { path = "grammars/tree-sitter-ruby" }
+tree-sitter-rust = { path = "grammars/tree-sitter-rust" }
+tree-sitter-scala = { path = "grammars/tree-sitter-scala" }
+tree-sitter-solidity = { path = "grammars/tree-sitter-solidity" }
+tree-sitter-swift = { path = "grammars/tree-sitter-swift" }
+tree-sitter-typescript = { path = "grammars/tree-sitter-typescript" }
+tree-sitter-yaml = { path = "grammars/tree-sitter-yaml" }

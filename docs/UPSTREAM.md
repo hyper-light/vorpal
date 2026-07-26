@@ -42,10 +42,13 @@ accident. This ledger records where and why the trees diverge.
 
 # Tree-sitter grammar ledger
 
-A *separate* upstream from ast-grep: the per-language tree-sitter parsers. Most are consumed
-straight from crates.io (pinned in `crates/language/Cargo.toml`). Some are **vendored** into
-`grammars/<name>/` and injected via `[patch.crates-io]` in the workspace `Cargo.toml`, so we own
-the exact parser bytes and can carry local fixes without waiting on an upstream release.
+A *separate* upstream from ast-grep: the per-language tree-sitter parsers. **All** are now
+**vendored** into `grammars/<name>/` and injected via `[patch.crates-io]` in the workspace
+`Cargo.toml`, so we own the exact parser bytes and can carry local fixes without waiting on an
+upstream release. Each was copied from its published crate at the resolved version (the
+`.cargo_vcs_info.json` in each records the upstream commit); vendoring is **byte-identical** to
+crates.io except where a local patch is noted, so `vorpal grammars`' `global grammar stamp` is
+unchanged and no product cache was invalidated by the move.
 
 The compiled-in reality is inspectable at runtime with **`vorpal grammars`** (ABI, declared
 semver, node/state counts, and the generation **digest**). That digest — a fingerprint of the
@@ -66,29 +69,37 @@ binary agree.
 
 ## Vendored grammars
 
-| Language | Path | Version | Upstream commit | Local patches |
-|---|---|---|---|---|
-| Python | `grammars/tree-sitter-python` | 0.25.0 | `293fdc02038ee2bf0e2e206711b69c90ac0d413f` | **PEP 810 lazy imports** — `lazy` soft keyword before `import`/`from` via an external-scanner context token (`src/scanner.c`), `optional($.lazy)` on both import rules, `+test/corpus/lazy_imports.txt`. See [[vendored-grammars-pep810]]. |
+All under `grammars/<crate>/`, patched into the workspace. `Local patches` is "—" unless noted.
 
-## From crates.io (pinned, not vendored)
-
-Pinned in `crates/language/Cargo.toml`; vendor-on-demand when a fix is needed.
-
-| Language | Crate version | | Language | Crate version |
-|---|---|---|---|---|
-| Bash | 0.25.0 | | Elixir | 0.3.0 |
-| C | 0.24.0 | | Go | 0.25.0 |
-| C++ | 0.23.0 | | Haskell | 0.23.0 |
-| C# | 0.23.0 | | HCL | 1.1.0 |
-| CSS | 0.25.0 | | HTML | 0.23.0 |
-| Dart | 0.2.0 | | Java | 0.23.0 |
-| JavaScript | 0.25.0 | | Ruby | 0.23.0 |
-| JSON | 0.24.8 | | Rust | 0.24.0 |
-| Kotlin | 0.4.1 (`-sg`) | | Scala | 0.26.0 |
-| Lua | 0.5.0 | | Solidity | 1.2.11 |
-| Markdown | 0.5.3 | | Swift | 0.7.0 |
-| Nix | 0.3.0 | | TypeScript/TSX | 0.23.2 |
-| PHP | 0.24.0 | | YAML | 0.7.0 |
+| Crate | Version | Upstream commit | Local patches |
+|---|---|---|---|
+| tree-sitter-bash | 0.25.1 | `a06c2e4415e9` | — |
+| tree-sitter-c | 0.24.2 | `b780e47fc780` | — (macro-recovery work reverted; see Planned) |
+| tree-sitter-c-sharp | 0.23.5 | `cac6d5fb595f` | — |
+| tree-sitter-cpp | 0.23.4 | `f41e1a044c8a` | — |
+| tree-sitter-css | 0.25.0 | `dda5cfc5722c` | — |
+| tree-sitter-dart | 0.2.0 | `b57d734c84f5` | — |
+| tree-sitter-elixir | 0.3.5 | `e2d9e6e0e76b` | — |
+| tree-sitter-go | 0.25.0 | `1547678a9da5` | — |
+| tree-sitter-haskell | 0.23.1 | `c30d812bc908` | — |
+| tree-sitter-hcl | 1.1.0 | `009def4ae38e` | — |
+| tree-sitter-html | 0.23.2 | `5a5ca8551a17` | — |
+| tree-sitter-java | 0.23.5 | `94703d5a6bed` | — |
+| tree-sitter-javascript | 0.25.0 | `44c892e0be05` | — |
+| tree-sitter-json | 0.24.8 | `ee35a6ebefce` | — |
+| tree-sitter-kotlin-sg | 0.4.1 | `1a6f9b1ee112` | — (crate `tree-sitter-kotlin-sg`, imported as `tree-sitter-kotlin`) |
+| tree-sitter-lua | 0.5.0 | `10fe0054734e` | — |
+| tree-sitter-md | 0.5.3 | `f969cd3ae3f9` | — (block + inline parsers) |
+| tree-sitter-nix | 0.3.0 | `ea1d87f7996b` | — |
+| tree-sitter-php | 0.24.2 | `5b5627faaa29` | — (php + php_only parsers) |
+| tree-sitter-python | 0.25.0 | `293fdc02038e` | **PEP 810 lazy imports** — `lazy` soft keyword before `import`/`from` via an external-scanner context token (`src/scanner.c`), `optional($.lazy)` on both import rules, `+test/corpus/lazy_imports.txt`. See [[vendored-grammars-pep810]]. |
+| tree-sitter-ruby | 0.23.1 | `71bd32fb7607` | — |
+| tree-sitter-rust | 0.24.2 | `e2bee853694a` | — |
+| tree-sitter-scala | 0.26.0 | `38950b525c9d` | — |
+| tree-sitter-solidity | 1.2.13 | `4e938a46c703` | — |
+| tree-sitter-swift | 0.7.3 | `b8b22bffbb34` | — |
+| tree-sitter-typescript | 0.23.2 | `f975a621f4e7` | — (typescript + tsx parsers) |
+| tree-sitter-yaml | 0.7.2 | `7708026449be` | — |
 
 ## Planned
 
