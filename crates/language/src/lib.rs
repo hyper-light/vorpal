@@ -531,6 +531,40 @@ pub fn global_grammar_stamp() -> u64 {
   })
 }
 
+/// Human-facing facts about one compiled-in grammar, for `vorpal grammars`. Everything here is
+/// read from the linked parser at runtime — no build metadata — so it always reflects exactly
+/// what this binary will parse with.
+#[derive(Debug, Clone)]
+pub struct GrammarInfo {
+  pub lang: SupportLang,
+  /// The grammar's own name, as compiled in (usually the language's canonical id).
+  pub name: Option<&'static str>,
+  /// tree-sitter ABI version of the generated parser.
+  pub abi_version: usize,
+  /// Grammar semver declared in the source `tree-sitter.json`, if the author provided it.
+  pub semver: Option<(u8, u8, u8)>,
+  pub node_kinds: usize,
+  pub parse_states: usize,
+  /// The generation digest the product cache keys on (see [`grammar_digest`]).
+  pub digest: u64,
+}
+
+/// Runtime facts about `lang`'s compiled-in grammar (see [`GrammarInfo`]).
+pub fn grammar_info(lang: SupportLang) -> GrammarInfo {
+  let ts = lang.get_ts_language();
+  GrammarInfo {
+    lang,
+    name: ts.name(),
+    abi_version: ts.abi_version(),
+    semver: ts
+      .metadata()
+      .map(|m| (m.major_version, m.minor_version, m.patch_version)),
+    node_kinds: ts.node_kind_count(),
+    parse_states: ts.parse_state_count(),
+    digest: grammar_digest(lang),
+  }
+}
+
 fn compute_grammar_digest(lang: SupportLang) -> u64 {
   let ts = lang.get_ts_language();
   let mut h = xxhash_rust::xxh3::Xxh3::new();
