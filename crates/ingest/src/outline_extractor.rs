@@ -104,6 +104,9 @@ impl OutlineExtractor {
     // product before it drops. Reference extraction runs even without outline rules (the file
     // node is the only definition span).
     let grep = lang.grep(source);
+    // Graceful-degradation telemetry (all languages): note when tree-sitter could not fully
+    // parse this file, so definitions it dropped are surfaced as a count, never hidden.
+    let parse_errors = grep.root().dfs().any(|node| node.is_error());
     let items: Vec<OutlineItem<'_>> = combined
       .map(|c| c.extract(grep.root()).collect())
       .unwrap_or_default();
@@ -137,6 +140,7 @@ impl OutlineExtractor {
       source_size: 0,
       source_mtime_ns: 0,
       source_xxh3: xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
+      parse_errors,
       items: items.into_iter().map(product::own_item).collect(),
       refs,
     })

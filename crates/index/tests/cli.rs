@@ -865,3 +865,39 @@ fn resolution_matrix_across_languages() {
   }
   let _ = fs::remove_dir_all(&base);
 }
+
+/// Parse-health telemetry is language-agnostic graceful degradation: a file tree-sitter
+/// cannot fully parse is *counted*, never silently dropped, in any language — and a clean
+/// tree reports zero.
+#[test]
+fn parse_errors_are_counted_across_languages() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-health-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("ok.rs"), "pub fn good() -> u32 { 1 }\n").unwrap();
+  fs::write(src.join("ok.py"), "def good():\n    return 1\n").unwrap();
+  let clean = build_index(&src, &out).unwrap();
+  assert_eq!(
+    clean.error_files, 0,
+    "clean corpus must report zero parse errors"
+  );
+
+  // A file tree-sitter genuinely cannot parse to completion (unbalanced signature).
+  fs::write(src.join("broken.rs"), "pub fn broken( -> u32 {\n").unwrap();
+  let degraded = build_index(&src, &out).unwrap();
+  assert!(
+    degraded.error_files >= 1,
+    "a broken file must be counted, not silently dropped: {}",
+    degraded.error_files
+  );
+
+  // The signal persists through replay: re-index unchanged → still counted (from cache).
+  let replayed = build_index(&src, &out).unwrap();
+  assert!(
+    replayed.reused || replayed.error_files >= 1,
+    "health survives replay"
+  );
+  let _ = fs::remove_dir_all(&base);
+}

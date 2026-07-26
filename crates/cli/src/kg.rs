@@ -124,6 +124,13 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
       report.external,
       report.masked
     );
+    if report.error_files > 0 {
+      println!(
+        "note: {} files had parse errors (some definitions may be missing) — tree-sitter \
+         could not fully parse them",
+        report.error_files
+      );
+    }
   }
   println!("index: {}", out.display());
   Ok(ExitCode::SUCCESS)

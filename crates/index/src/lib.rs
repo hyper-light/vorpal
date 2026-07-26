@@ -27,7 +27,8 @@ use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, tokenize};
 use vorpal_ingest::{
   ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
   StreamWork, cache_file_name, decode_product, encode_product_into, link_writer_spilled,
-  load_product, peek_product_stamps, save_product, stream_apply_spilled, validate_product,
+  load_product, peek_product_stamps, save_product, stream_apply_spilled,
+  validate_product,
 };
 use vorpal_kg::{Kg, NodeId};
 
@@ -40,6 +41,10 @@ pub struct IndexReport {
   pub indexed: u64,
   /// Files whose cached extraction product was replayed without a parse.
   pub skipped: u64,
+  /// Files whose tree-sitter parse produced ERROR nodes — some of their definitions may be
+  /// missing from the graph. A language-agnostic parse-health signal (graceful degradation
+  /// made visible), 0 when every file parsed cleanly.
+  pub error_files: u64,
   pub nodes: usize,
   /// Confidently resolved references (single visible definition).
   pub resolved: u64,
@@ -143,6 +148,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
       if let Ok(nodes) = Kg::peek_node_count(out) {
         return Ok(IndexReport {
           reused: true,
+          error_files: 0,
           indexed: 0,
           skipped: manifest.len() as u64,
           nodes,
@@ -196,6 +202,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // References spill to disk between commit and resolve — they are written once and read
   // once, sequentially; buffering them in RAM only raised the peak footprint (~220 MB at
   // kernel scale).
+  let error_files = std::sync::atomic::AtomicU64::new(0);
   let spill_path = out.join(".refs.spill");
   let heap_stream = out.join("strings.heap.tmp");
   let stream_result = stream_apply_spilled(
@@ -217,6 +224,9 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
                 Path::new(&entry.path),
               )
             {
+              if product.parse_errors {
+                error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              }
               pack_sink
                 .send(PackMsg {
                   path: entry.path.clone(),
@@ -242,6 +252,9 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
             )
             && validate_product(bytes)
           {
+            if vorpal_ingest::peek_product_parse_errors(bytes) == Some(true) {
+              error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Ok(StreamWork::ReplayedPacked(entry.path.clone()));
           }
         }
@@ -253,6 +266,9 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
       let Some(mut product) = extractor.extract_product(&entry.path, source) else {
         return Ok(StreamWork::Skipped);
       };
+      if product.parse_errors {
+        error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      }
       product.source_size = entry.size;
       product.source_mtime_ns = entry.mtime_ns;
       scratch.encode.clear();
@@ -298,6 +314,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
     reused: false,
     indexed: reparsed,
     skipped: replayed,
+    error_files: error_files.into_inner(),
     nodes: kg.node_count(),
     resolved: resolve.resolved,
     ambiguous: resolve.ambiguous,

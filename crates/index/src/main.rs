@@ -92,6 +92,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
           report.external,
           report.masked
         );
+        if report.error_files > 0 {
+          println!(
+            "note: {} files had parse errors (some definitions may be missing)",
+            report.error_files
+          );
+        }
       }
       Ok(())
     }
