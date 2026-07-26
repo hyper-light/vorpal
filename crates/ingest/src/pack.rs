@@ -14,8 +14,16 @@
 //! `[path_len u32][path][off u64][len u32]` per live entry — **an optimization, not a
 //! source of truth**: a run killed after appending but before the sidecar lands loses no
 //! work, because open() scans any records beyond `covered_len` (bounds-checked; a torn tail
-//! record simply ends the scan) and products remain self-validating at decode time. Pack
-//! bytes are a cache: entry content is deterministic, entry order is arrival order.
+//! record simply ends the scan) and products remain self-validating at decode time.
+//!
+//! **Determinism.** Records stream to the tail in arrival order *during* a run, but every
+//! publish rewrites both files in **canonical order — live entries sorted by path** — so the
+//! pack and sidecar are a pure function of the `(path, body)` set, independent of worker
+//! completion order or incremental history. Two independent indexes of the same corpus
+//! therefore produce byte-identical `products.pack`/`products.idx`. The rewrite is skipped
+//! only when nothing changed (no appends, no dead bytes): the previous publish already left
+//! the file canonical, so a no-change re-index stays a metadata check. Reads are
+//! order-agnostic (they build a map), so the tail-scan recovery path is unaffected.
 
 use std::collections::HashMap;
 use std::fs;
@@ -29,7 +37,10 @@ pub const PACK_FILE: &str = "products.pack";
 pub const PACK_INDEX: &str = "products.idx";
 const PACK_MAGIC: &[u8; 4] = b"VPPK";
 const IDX_MAGIC: &[u8; 4] = b"VPPI";
-const PACK_VERSION: u32 = 1;
+// v2: publishes are canonically ordered (entries sorted by path). v1 packs were written in
+// arrival order; bumping the version retires them so the first index under this build rebuilds
+// a canonical pack rather than inheriting a stale, unsorted layout.
+const PACK_VERSION: u32 = 2;
 
 /// A live entry: body offset + length within the pack.
 type Entry = (u64, u32);
@@ -224,11 +235,22 @@ impl PackWriter {
       }
     }
 
-    // Compaction: rewrite live records when the pack has grown past twice its live bytes.
-    let live: u64 = entries.iter().map(|(_, (_, len))| *len as u64).sum();
-    let _ = live; // trigger below re-reads the file length
+    // Canonical order: sort live entries by path so the published bytes are a pure function
+    // of the (path, body) set — independent of worker completion order and incremental
+    // history. Paths are unique per entry (one product per file; reuse skips re-appended
+    // paths), so this is a total, machine-independent order.
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Rewrite the pack in that order whenever content changed — any append this run, or dead
+    // bytes / a non-canonical layout left by an older generation (detected as a size that
+    // differs from the exact canonical length). A pure no-change re-index hits neither and
+    // keeps the previous canonical file untouched, so it stays a metadata-only check.
+    let canonical_len: u64 = 8 + entries
+      .iter()
+      .map(|(path, (_, len))| 4 + path.len() as u64 + 4 + *len as u64)
+      .sum::<u64>();
     let pack_len = fs::metadata(&pack_path)?.len();
-    if pack_len > 16 + 2 * live.max(1) {
+    if !appended.is_empty() || pack_len != canonical_len {
       let old = fs::read(&pack_path)?;
       let tmp = self.dir.join("products.pack.tmp");
       let mut out = BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
@@ -328,6 +350,65 @@ mod tests {
     assert_eq!(recovered.get("a.rs"), Some(&b"alpha-bytes"[..]));
     assert_eq!(recovered.get("b.rs"), Some(&b"beta-v2"[..]));
 
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn publish_is_byte_identical_regardless_of_arrival_order() {
+    // Determinism contract: the same (path, body) set produces byte-identical pack + sidecar
+    // no matter the order records arrive in. This is what makes indexes fleet-coherent.
+    let products = [
+      ("z/last.rs", b"zzz".as_slice()),
+      ("a/first.rs", b"aaaa".as_slice()),
+      ("m/mid.rs", b"mm".as_slice()),
+      ("a/second.rs", b"a2".as_slice()),
+    ];
+    let build = |tag: &str, order: &[usize]| -> (Vec<u8>, Vec<u8>) {
+      let dir = scratch_dir(tag);
+      let writer = PackWriter::new(&dir, None);
+      let sink = writer.sink();
+      for &i in order {
+        sink
+          .send(PackMsg {
+            path: products[i].0.into(),
+            body: products[i].1.to_vec(),
+          })
+          .unwrap();
+      }
+      drop(sink);
+      writer.finish(Vec::new()).unwrap();
+      let pack = fs::read(dir.join(PACK_FILE)).unwrap();
+      let idx = fs::read(dir.join(PACK_INDEX)).unwrap();
+      let _ = fs::remove_dir_all(&dir);
+      (pack, idx)
+    };
+    let (pack_a, idx_a) = build("order-a", &[0, 1, 2, 3]);
+    let (pack_b, idx_b) = build("order-b", &[3, 2, 1, 0]);
+    let (pack_c, idx_c) = build("order-c", &[2, 0, 3, 1]);
+    assert_eq!(pack_a, pack_b, "pack differs by arrival order");
+    assert_eq!(pack_a, pack_c, "pack differs by arrival order");
+    assert_eq!(idx_a, idx_b, "sidecar differs by arrival order");
+    assert_eq!(idx_a, idx_c, "sidecar differs by arrival order");
+    // And the canonical order is genuinely sorted: first live record is a/first.rs.
+    let first = &pack_a[12..12 + "a/first.rs".len()];
+    assert_eq!(first, b"a/first.rs");
+
+    // A reused-entry publish (second generation, no re-append) must reproduce the same bytes.
+    let dir = scratch_dir("reuse-canonical");
+    let w1 = PackWriter::new(&dir, None);
+    let s1 = w1.sink();
+    for &i in &[1usize, 3, 0, 2] {
+      s1.send(PackMsg { path: products[i].0.into(), body: products[i].1.to_vec() }).unwrap();
+    }
+    drop(s1);
+    w1.finish(Vec::new()).unwrap();
+    let gen1 = fs::read(dir.join(PACK_FILE)).unwrap();
+    let reader = Arc::new(PackReader::open(&dir).unwrap());
+    let w2 = PackWriter::new(&dir, Some(reader));
+    drop(w2.sink()); // no appends: everything is carried by bulk reuse
+    w2.finish(products.iter().map(|(p, _)| p.to_string())).unwrap();
+    let gen2 = fs::read(dir.join(PACK_FILE)).unwrap();
+    assert_eq!(gen1, gen2, "no-change reuse re-publish is not byte-stable");
     let _ = fs::remove_dir_all(&dir);
   }
 
