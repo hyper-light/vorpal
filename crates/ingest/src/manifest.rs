@@ -21,7 +21,16 @@ pub struct FileStat {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Manifest {
   entries: Vec<FileStat>,
+  /// A digest over the grammar set this manifest was written under (see
+  /// [`crate::global_grammar_stamp`]). The whole-tree fast path reuses the persisted index only
+  /// when this still matches, so editing/bumping any grammar forces a re-index even when no file
+  /// changed. `0` on manifests written before the field existed — which never equals a real
+  /// stamp, so they correctly force a rebuild.
+  grammar_stamp: u64,
 }
+
+const MANIFEST_MAGIC: &[u8; 4] = b"VMAN";
+const MANIFEST_VERSION: u32 = 1;
 
 impl Manifest {
   /// Walk `root` (respecting `.gitignore`), `stat` each file the predicate accepts, and record
@@ -90,7 +99,21 @@ impl Manifest {
     }
     let mut entries = entries.into_inner().unwrap();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Self { entries })
+    Ok(Self {
+      entries,
+      grammar_stamp: 0,
+    })
+  }
+
+  /// Record the grammar-set digest this manifest was built under. Callers set this to
+  /// [`crate::global_grammar_stamp`] before saving / before the fast-path comparison.
+  pub fn set_grammar_stamp(&mut self, stamp: u64) {
+    self.grammar_stamp = stamp;
+  }
+
+  /// The grammar-set digest recorded for this manifest (`0` if none).
+  pub fn grammar_stamp(&self) -> u64 {
+    self.grammar_stamp
   }
 
   pub fn len(&self) -> usize {
@@ -122,6 +145,9 @@ impl Manifest {
 
   pub fn save(&self, path: &Path) -> io::Result<()> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(MANIFEST_MAGIC);
+    buf.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
+    buf.extend_from_slice(&self.grammar_stamp.to_le_bytes());
     buf.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
     for entry in &self.entries {
       buf.extend_from_slice(&(entry.path.len() as u32).to_le_bytes());
@@ -135,11 +161,18 @@ impl Manifest {
   pub fn load(path: &Path) -> io::Result<Self> {
     let bytes = fs::read(path)?;
     let mut entries = Vec::new();
-    if bytes.len() < 8 {
+    // A pre-versioning manifest (no magic), a torn write, or a foreign file loads as the default
+    // (empty, grammar_stamp 0) — which never matches the current tree/grammar, so the fast path
+    // correctly falls through to a rebuild instead of trusting stale bytes.
+    if bytes.len() < 24 || &bytes[0..4] != MANIFEST_MAGIC {
       return Ok(Self::default());
     }
-    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let mut off = 8usize;
+    if u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != MANIFEST_VERSION {
+      return Ok(Self::default());
+    }
+    let grammar_stamp = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let mut off = 24usize;
     for _ in 0..count {
       if off + 4 > bytes.len() {
         break;
@@ -161,6 +194,9 @@ impl Manifest {
         mtime_ns,
       });
     }
-    Ok(Self { entries })
+    Ok(Self {
+      entries,
+      grammar_stamp,
+    })
   }
 }

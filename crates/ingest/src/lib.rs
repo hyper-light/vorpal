@@ -30,8 +30,24 @@ pub use pipeline::{
 pub use product::{
   FileProduct, ProductRef, ProductView, RefView, cache_file_name, decode_product,
   decode_product_view, encode_product_into, load_product, peek_product_digest,
-  peek_product_parse_errors, peek_product_stamps, save_product, save_product_with,
+  peek_product_grammar_digest, peek_product_parse_errors, peek_product_stamps, save_product,
+  save_product_with,
   validate_product,
 };
 pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
 pub use vorpal_resolve::{RefKind, Reference, ResolveStats, Resolver};
+
+/// The grammar-generation digest for the language of `path`, or `None` if the path maps to no
+/// supported language. The product-cache replay gate compares this against the digest a cached
+/// product was stamped with, so editing a grammar invalidates exactly its language's products.
+pub fn grammar_digest_for_path(path: &str) -> Option<u64> {
+  use vorpal_language::Language;
+  vorpal_language::SupportLang::from_path(path).map(vorpal_language::grammar_digest)
+}
+
+/// A single digest over every supported grammar — the coarse stamp the whole-tree fast path
+/// records in the manifest, so editing any grammar forces a re-index (which then re-parses,
+/// via [`grammar_digest_for_path`], only the files whose language actually changed).
+pub fn global_grammar_stamp() -> u64 {
+  vorpal_language::global_grammar_stamp()
+}

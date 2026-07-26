@@ -492,6 +492,77 @@ impl LanguageExt for SupportLang {
   }
 }
 
+/// A digest of a language's compiled grammar generation. It fingerprints the parser's
+/// observable structure — ABI version, declared semver, node/field/state counts, and the full
+/// ordered list of node-kind and field names — so any grammar edit that adds, removes, renames,
+/// or restructures productions changes the digest. This is the identity the product cache keys
+/// on: a cached product carries the digest of the grammar that produced it, and replays only
+/// while that still matches the linked grammar (so editing a grammar — e.g. adding PEP 810's
+/// `lazy` node — invalidates exactly the stale products, not the whole cache).
+///
+/// It is a structural fingerprint, not a hash of the grammar source: the rare edit that changes
+/// parse *actions* without changing any count or name (a pure precedence tweak) can escape it.
+/// Such edits do not change the node/field surface products are built from, so the residual risk
+/// is negligible; a `PRODUCT_FORMAT_VERSION` bump remains the escape hatch for anything subtler.
+pub fn grammar_digest(lang: SupportLang) -> u64 {
+  use std::sync::OnceLock;
+  static CACHE: OnceLock<Vec<u64>> = OnceLock::new();
+  let all = SupportLang::all_langs();
+  let digests = CACHE.get_or_init(|| all.iter().map(|l| compute_grammar_digest(*l)).collect());
+  all
+    .iter()
+    .position(|l| *l == lang)
+    .map(|i| digests[i])
+    .unwrap_or(0)
+}
+
+/// A single digest over **every** supported grammar, in `all_langs` order — the coarse stamp the
+/// whole-tree fast path checks so that editing any grammar forces a re-index that then re-parses
+/// (via the per-file [`grammar_digest`] gate) only the files whose language actually changed.
+pub fn global_grammar_stamp() -> u64 {
+  use std::sync::OnceLock;
+  static STAMP: OnceLock<u64> = OnceLock::new();
+  *STAMP.get_or_init(|| {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    for lang in SupportLang::all_langs() {
+      h.update(&grammar_digest(*lang).to_le_bytes());
+    }
+    h.digest()
+  })
+}
+
+fn compute_grammar_digest(lang: SupportLang) -> u64 {
+  let ts = lang.get_ts_language();
+  let mut h = xxhash_rust::xxh3::Xxh3::new();
+  if let Some(name) = ts.name() {
+    h.update(name.as_bytes());
+  }
+  h.update(&(ts.abi_version() as u64).to_le_bytes());
+  if let Some(md) = ts.metadata() {
+    h.update(&[md.major_version, md.minor_version, md.patch_version]);
+  }
+  let node_kinds = ts.node_kind_count();
+  let fields = ts.field_count();
+  h.update(&(node_kinds as u64).to_le_bytes());
+  h.update(&(ts.parse_state_count() as u64).to_le_bytes());
+  h.update(&(fields as u64).to_le_bytes());
+  // Node-kind and field names, in id order — captures additions, removals, and renames.
+  for id in 0..node_kinds as u16 {
+    if let Some(name) = ts.node_kind_for_id(id) {
+      h.update(name.as_bytes());
+      h.update(&[u8::from(ts.node_kind_is_named(id))]);
+    }
+    h.update(&[0xff]); // delimiter so distinct name boundaries can't collide
+  }
+  for id in 1..=fields as u16 {
+    if let Some(name) = ts.field_name_for_id(id) {
+      h.update(name.as_bytes());
+    }
+    h.update(&[0xff]);
+  }
+  h.digest()
+}
+
 fn extensions(lang: SupportLang) -> &'static [&'static str] {
   use SupportLang::*;
   match lang {
@@ -622,6 +693,32 @@ mod test {
     assert_eq!(from_extension(path), Some(SupportLang::Markdown));
     let path = Path::new("README.markdown");
     assert_eq!(from_extension(path), Some(SupportLang::Markdown));
+  }
+
+  #[test]
+  fn grammar_digest_is_stable_and_per_language() {
+    // Determinism: the digest is a pure function of the linked grammar, so it must be identical
+    // on every call within a process — the product cache would never hit otherwise.
+    for lang in SupportLang::all_langs() {
+      assert_eq!(
+        crate::grammar_digest(*lang),
+        crate::grammar_digest(*lang),
+        "{lang:?} digest is not stable"
+      );
+      assert_ne!(crate::grammar_digest(*lang), 0, "{lang:?} digest is zero");
+    }
+    // Distinctness: different grammars must not collide (else editing one could silently reuse
+    // another's cache). All supported grammars are pairwise distinct.
+    let digests: Vec<u64> = SupportLang::all_langs()
+      .iter()
+      .map(|l| crate::grammar_digest(*l))
+      .collect();
+    let mut sorted = digests.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), digests.len(), "two grammars share a digest");
+    // The global stamp folds them all in and is itself stable.
+    assert_eq!(crate::global_grammar_stamp(), crate::global_grammar_stamp());
   }
 
   // TODO: add test for file_types

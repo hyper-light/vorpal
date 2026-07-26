@@ -85,7 +85,11 @@ fn stream_budget_bytes() -> u64 {
 /// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`.
 pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>> {
   let extractor = OutlineExtractor::new()?;
-  let manifest = Manifest::scan(src, |p| extractor.handles(p))?;
+  let mut manifest = Manifest::scan(src, |p| extractor.handles(p))?;
+  // Stamp the grammar set this run indexes under, so the whole-tree fast path below reuses the
+  // persisted index only while the grammars are also unchanged (a grammar edit invalidates the
+  // stat-only reuse just as a file edit would).
+  manifest.set_grammar_stamp(vorpal_ingest::global_grammar_stamp());
   let manifest_path = out.join("manifest.bin");
 
   // Staged cache validation (IMPROVEMENTS §6): stat (size+mtime) is the cheap hint; the v6
@@ -133,6 +137,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // wedging every subsequent run on the same error.
   if let Ok(prior) = Manifest::load(&manifest_path) {
     if manifest.unchanged_since(&prior)
+      && manifest.grammar_stamp() == prior.grammar_stamp()
       && !verify_all
       && out.join("strings.heap").exists()
       && out.join("graph.bin").exists()
@@ -218,6 +223,8 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
           if let Ok(product) = decode_product(&bytes) {
             if product.source_size == entry.size
               && product.source_mtime_ns == entry.mtime_ns
+              && Some(product.grammar_digest)
+                == vorpal_ingest::grammar_digest_for_path(&entry.path)
               && digest_must_match(
                 entry.mtime_ns,
                 Some(product.source_xxh3),
@@ -245,6 +252,8 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
           // validated views again straight from the map and applies them — the product
           // itself never crosses the channel and never materializes.
           if peek_product_stamps(bytes) == Some((entry.size, entry.mtime_ns))
+            && vorpal_ingest::peek_product_grammar_digest(bytes)
+              == vorpal_ingest::grammar_digest_for_path(&entry.path)
             && digest_must_match(
               entry.mtime_ns,
               vorpal_ingest::peek_product_digest(bytes),

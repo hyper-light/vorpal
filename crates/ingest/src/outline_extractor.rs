@@ -140,6 +140,9 @@ impl OutlineExtractor {
       source_size: 0,
       source_mtime_ns: 0,
       source_xxh3: xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
+      // The grammar generation this product was extracted with — the cache invalidates a
+      // product once its language's grammar digest no longer matches.
+      grammar_digest: vorpal_language::grammar_digest(lang),
       parse_errors,
       items: items.into_iter().map(product::own_item).collect(),
       refs,

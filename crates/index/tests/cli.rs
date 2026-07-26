@@ -67,6 +67,42 @@ fn reindex_of_unchanged_tree_is_reused() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// A grammar change must defeat the whole-tree reuse fast path even when no file changed: the
+/// manifest records a digest over the grammar set, and the fast path reuses only while it still
+/// matches. (Simulated here by editing the persisted stamp — a rebuilt binary with an edited
+/// grammar produces a different stamp the same way.)
+#[test]
+fn grammar_change_defeats_reuse_fast_path() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-grammar-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("lib.rs"), "pub fn f() -> i32 {\n    1\n}\n").unwrap();
+
+  assert!(!build_index(&src, &out).unwrap().reused);
+  assert!(
+    build_index(&src, &out).unwrap().reused,
+    "unchanged tree + unchanged grammar is reused"
+  );
+
+  // The manifest is `VMAN`(4) + version(4) + grammar_stamp(8) + ...; flip the stamp to stand in
+  // for a grammar edit. The next index must fall through to a rebuild rather than trust the
+  // stat-only fast path.
+  let manifest_path = out.join("manifest.bin");
+  let mut bytes = fs::read(&manifest_path).unwrap();
+  assert_eq!(&bytes[0..4], b"VMAN", "manifest carries the versioned header");
+  bytes[8] ^= 0xFF;
+  fs::write(&manifest_path, &bytes).unwrap();
+
+  assert!(
+    !build_index(&src, &out).unwrap().reused,
+    "a changed grammar stamp must force a re-index"
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn semantic_search_finds_definitions_by_description() {
   let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));
