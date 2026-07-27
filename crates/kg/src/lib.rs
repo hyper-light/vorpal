@@ -19,7 +19,7 @@ pub use kg::{Kg, NodeView, SymbolSelector};
 pub use model::SymbolKind;
 pub use writer::{KgWriter, NodeDef, layout_entity_paths};
 
-pub use vorpal_graph::{EdgeLog, EdgeType};
+pub use vorpal_graph::{Direction, EdgeLog, EdgeType};
 pub use vorpal_segment::NodeId;
 
 /// Phase stamp for RSS-timeline profiling, active only under `VORPAL_PHASE_TRACE`.

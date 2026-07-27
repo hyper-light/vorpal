@@ -9,6 +9,7 @@
 
 use bit_set::BitSet;
 
+use crate::edge::EdgeType;
 use crate::graph::Graph;
 
 /// Which edge direction to follow: `Out` = what a seed reaches (`refsTo`/`defines`-transitive),
@@ -50,6 +51,54 @@ fn neighbors_dir(graph: &Graph, node: u32, dir: Direction) -> &[u32] {
 /// through a cycle — and then still excluded, since the result is "reachable, not the source").
 pub fn reachable(graph: &Graph, seeds: &[u32], dir: Direction) -> BitSet {
   reachable_strategy(graph, seeds, dir, Strategy::Auto)
+}
+
+/// Reachable from `seeds` following **only** edges whose base type is in `allowed`, up to
+/// `max_depth` hops in `dir` (`None` = unbounded). Unlike [`reachable`], traversal is confined to
+/// one relation set, so "transitive callers of X" cannot leak across containment, import, or type
+/// edges. Edge-type comparison ignores the confidence byte (`EdgeType::base`). Push-only BFS:
+/// a relation-filtered frontier from a single seed is small in practice, so the
+/// direction-optimizing pull path is unnecessary (and pull would need per-edge reverse types).
+pub fn reachable_typed(
+  graph: &Graph,
+  seeds: &[u32],
+  dir: Direction,
+  allowed: &[EdgeType],
+  max_depth: Option<u32>,
+) -> BitSet {
+  let n = graph.node_count();
+  let mut visited = BitSet::with_capacity(n);
+  let mut frontier: Vec<u32> = Vec::new();
+  for &s in seeds {
+    if (s as usize) < n && visited.insert(s as usize) {
+      frontier.push(s);
+    }
+  }
+  let allowed_bases: Vec<u16> = allowed.iter().map(|e| e.base().0).collect();
+  let mut depth = 0u32;
+  while !frontier.is_empty() && max_depth.is_none_or(|md| depth < md) {
+    let mut next: Vec<u32> = Vec::new();
+    for &u in &frontier {
+      let (targets, types) = match dir {
+        Direction::Out => (graph.out_targets(u), graph.out_edge_types(u)),
+        Direction::In => (graph.in_targets(u), graph.in_edge_types(u)),
+      };
+      for (&v, &et) in targets.iter().zip(types) {
+        if !allowed_bases.contains(&EdgeType(et).base().0) {
+          continue;
+        }
+        if (v as usize) < n && visited.insert(v as usize) {
+          next.push(v);
+        }
+      }
+    }
+    frontier = next;
+    depth += 1;
+  }
+  for &s in seeds {
+    visited.remove(s as usize);
+  }
+  visited
 }
 
 /// Like [`reachable`], but with an explicit [`Strategy`] (used to verify push ≡ pull).

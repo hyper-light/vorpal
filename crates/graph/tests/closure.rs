@@ -1,7 +1,7 @@
 //! Transitive closure (§11.5): correctness + push ≡ pull equivalence.
 
 use vorpal_graph::closure::reachable_strategy;
-use vorpal_graph::{Direction, EdgeLog, EdgeType, Graph, Strategy, reachable};
+use vorpal_graph::{Direction, EdgeLog, EdgeType, Graph, Strategy, reachable, reachable_typed};
 
 fn graph(node_count: u32, edges: &[(u32, u32)]) -> Graph {
   let mut log = EdgeLog::new();
@@ -9,6 +9,45 @@ fn graph(node_count: u32, edges: &[(u32, u32)]) -> Graph {
     log.push(a, b, EdgeType::CALLS);
   }
   Graph::compact(node_count, &log)
+}
+
+#[test]
+fn typed_traversal_does_not_cross_other_edge_types() {
+  // A container `0` DEFINES callable `1`; `1` CALLS `2` CALLS `3`; and `2` also HAS_METHOD `4`.
+  let mut log = EdgeLog::new();
+  log.push(0, 1, EdgeType::DEFINES);
+  log.push(1, 2, EdgeType::CALLS);
+  log.push(2, 3, EdgeType::CALLS);
+  log.push(2, 4, EdgeType::HAS_METHOD);
+  let g = Graph::compact(5, &log);
+
+  let via = |seed: u32, dir, ets: &[EdgeType], depth| {
+    let mut v: Vec<u32> = reachable_typed(&g, &[seed], dir, ets, depth)
+      .iter()
+      .map(|i| i as u32)
+      .collect();
+    v.sort_unstable();
+    v
+  };
+
+  // Transitive callees of 1 via CALLS: {2, 3} — never the DEFINES parent or the HAS_METHOD child.
+  assert_eq!(via(1, Direction::Out, &[EdgeType::CALLS], None), vec![2, 3]);
+  // The unfiltered closure, by contrast, leaks across HAS_METHOD to include 4.
+  let mut unfiltered: Vec<u32> = reachable(&g, &[1], Direction::Out)
+    .iter()
+    .map(|i| i as u32)
+    .collect();
+  unfiltered.sort_unstable();
+  assert_eq!(unfiltered, vec![2, 3, 4], "unfiltered closure crosses edge types");
+  // Depth bound: one CALLS hop from 1 reaches only 2.
+  assert_eq!(via(1, Direction::Out, &[EdgeType::CALLS], Some(1)), vec![2]);
+  // Transitive callers of 3 via CALLS (direction in): {1, 2}, not the DEFINES root 0.
+  assert_eq!(via(3, Direction::In, &[EdgeType::CALLS], None), vec![1, 2]);
+  // A relation not present yields nothing.
+  assert_eq!(
+    via(1, Direction::Out, &[EdgeType::IMPORTS], None),
+    Vec::<u32>::new()
+  );
 }
 
 fn ids(g: &Graph, seed: u32, dir: Direction) -> Vec<u32> {

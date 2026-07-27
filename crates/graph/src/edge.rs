@@ -31,6 +31,40 @@ impl EdgeType {
   pub const OVERRIDES: EdgeType = EdgeType(6);
   pub const HAS_METHOD: EdgeType = EdgeType(7);
   pub const HAS_FIELD: EdgeType = EdgeType(8);
+
+  /// The user-facing relation name (the spelling accepted by [`EdgeType::from_name`] and shown
+  /// in traversal results). Confidence is ignored — this reports the base type.
+  pub fn name(self) -> &'static str {
+    match self.base() {
+      EdgeType::DEFINES => "defines",
+      EdgeType::CALLS => "calls",
+      EdgeType::REFERENCES => "references",
+      EdgeType::IMPORTS => "imports",
+      EdgeType::IMPLEMENTS => "implements",
+      EdgeType::OF_TYPE => "of_type",
+      EdgeType::OVERRIDES => "overrides",
+      EdgeType::HAS_METHOD => "has_method",
+      EdgeType::HAS_FIELD => "has_field",
+      _ => "unknown",
+    }
+  }
+
+  /// Parse a relation name (case-insensitive) into its edge type — the vocabulary a
+  /// relation-filtered traversal accepts. `None` for an unknown name.
+  pub fn from_name(name: &str) -> Option<EdgeType> {
+    match name.to_ascii_lowercase().as_str() {
+      "defines" => Some(EdgeType::DEFINES),
+      "calls" => Some(EdgeType::CALLS),
+      "references" => Some(EdgeType::REFERENCES),
+      "imports" => Some(EdgeType::IMPORTS),
+      "implements" => Some(EdgeType::IMPLEMENTS),
+      "of_type" => Some(EdgeType::OF_TYPE),
+      "overrides" => Some(EdgeType::OVERRIDES),
+      "has_method" => Some(EdgeType::HAS_METHOD),
+      "has_field" => Some(EdgeType::HAS_FIELD),
+      _ => None,
+    }
+  }
 }
 
 /// Append-only edge log: struct-of-arrays so a compaction pass streams columns (§9.3, §11.2).

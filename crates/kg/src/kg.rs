@@ -297,6 +297,24 @@ impl Kg {
       .collect()
   }
 
+  /// Nodes reachable from `id` **restricted to the given edge types**, up to `max_depth` hops
+  /// (`None` = unbounded), following out-edges (what `id` reaches) or in-edges (what reaches
+  /// `id`). This is the relation-specific traversal: e.g. transitive callers are
+  /// `reachable_via(id, In, &[EdgeType::CALLS], depth)` and can never cross a containment or
+  /// import edge, unlike the unfiltered [`Kg::reachable_out`]/[`Kg::reachable_in`].
+  pub fn reachable_via(
+    &self,
+    id: NodeId,
+    dir: Direction,
+    edge_types: &[EdgeType],
+    max_depth: Option<u32>,
+  ) -> Vec<NodeId> {
+    vorpal_graph::reachable_typed(&self.graph, &[id.raw() as u32], dir, edge_types, max_depth)
+      .iter()
+      .map(|u| NodeId::new(u as u64))
+      .collect()
+  }
+
   /// All nodes whose display name equals `name`, ascending by id. Served by the persisted
   /// `names.idx` when the index dir carries one (two binary searches + per-hit string
   /// verification against hash collisions); the parallel scan fallback returns the identical

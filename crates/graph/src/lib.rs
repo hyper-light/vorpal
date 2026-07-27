@@ -20,7 +20,7 @@ pub mod store;
 
 mod csr;
 
-pub use closure::{Direction, Strategy, reachable};
+pub use closure::{Direction, Strategy, reachable, reachable_typed};
 pub use edge::{EdgeLog, EdgeType};
 pub use graph::Graph;
 pub use relabel::{ForwardingTable, avg_edge_id_span, bfs_locality_order};

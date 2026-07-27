@@ -218,20 +218,45 @@ impl Server {
       "reachable" => {
         let name = str_arg("name")?;
         let direction = str_arg("direction")?;
-        if direction != "in" && direction != "out" {
-          return Err(format!(
-            "direction must be \"in\" or \"out\", got '{direction}'"
-          ));
-        }
+        let dir = match direction.as_str() {
+          "in" => vorpal_kg::Direction::In,
+          "out" => vorpal_kg::Direction::Out,
+          other => {
+            return Err(format!("direction must be \"in\" or \"out\", got '{other}'"));
+          }
+        };
+        // Relation-specific: traversal follows only the requested edge types, so "transitive
+        // callers" (direction=in, relations=[calls]) can never leak across containment, import,
+        // or type edges. Defaults to `calls` — the canonical transitive-reachability relation —
+        // when the caller does not specify. `max_depth` bounds the hops (0/absent = unbounded).
+        let relations: Vec<vorpal_kg::EdgeType> = match args.get("relations") {
+          Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for it in items {
+              let s = it
+                .as_str()
+                .ok_or_else(|| "relations must be strings".to_string())?;
+              out.push(
+                vorpal_kg::EdgeType::from_name(s).ok_or_else(|| format!("unknown relation '{s}'"))?,
+              );
+            }
+            if out.is_empty() {
+              vec![vorpal_kg::EdgeType::CALLS]
+            } else {
+              out
+            }
+          }
+          Some(_) => return Err("relations must be an array of relation names".to_string()),
+          None => vec![vorpal_kg::EdgeType::CALLS],
+        };
+        let max_depth = match args.get("max_depth").and_then(Value::as_u64) {
+          Some(0) | None => None,
+          Some(d) => Some(d as u32),
+        };
         let kg = self.kg()?;
         let mut ids: Vec<NodeId> = Vec::new();
         for seed in kg.nodes_named(&name) {
-          let set = if direction == "in" {
-            kg.reachable_in(seed)
-          } else {
-            kg.reachable_out(seed)
-          };
-          for id in set {
+          for id in kg.reachable_via(seed, dir, &relations, max_depth) {
             if !ids.contains(&id) {
               ids.push(id);
             }
@@ -299,11 +324,16 @@ fn tools_list() -> Value {
     tool("type_users", "Definitions using a type in fields, params, returns, or annotations (incoming `of_type` edges).", name_only.clone(), &["name"]),
     tool(
       "reachable",
-      "Transitive closure from a symbol: direction \"in\" = everything reaching it \
-       (transitive callers/containers), \"out\" = everything it reaches.",
+      "Relation-specific transitive closure from a symbol. direction \"in\" = everything reaching \
+       it, \"out\" = everything it reaches; `relations` restricts which edge types the traversal \
+       may follow (default [\"calls\"]) so, e.g., transitive callers never cross a containment or \
+       import edge. `max_depth` bounds the hops (0/absent = unbounded).",
       json!({
         "name": {"type": "string", "description": "Exact symbol name"},
-        "direction": {"type": "string", "enum": ["in", "out"]}
+        "direction": {"type": "string", "enum": ["in", "out"]},
+        "relations": {"type": "array", "items": {"type": "string"},
+          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides (default [\"calls\"])"},
+        "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"}
       }),
       &["name", "direction"],
     ),
