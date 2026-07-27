@@ -150,31 +150,26 @@ impl OutlineExtractor {
   }
 }
 
-/// Local definition layout mirroring `KgWriter`'s identity convention: index 0 = the file
-/// (entity ""), then items (entity = name) and members (entity = owner.member), each with its
-/// byte span for reference attribution.
+/// Local definition layout for reference attribution: index 0 = the file, then items and their
+/// members in the same order as the graph writer. Entity paths come from
+/// [`vorpal_kg::layout_entity_paths`] — the single identity authority — so a reference resolves
+/// to exactly the node the writer created, overloads included. Spans are built in lockstep so
+/// each entity index maps to its byte range.
 pub(crate) fn local_layout(
   items: &[OutlineItem<'_>],
 ) -> (Vec<String>, Vec<(std::ops::Range<usize>, NodeId)>) {
-  let mut entities: Vec<String> = vec![String::new()];
+  let entities = vorpal_kg::layout_entity_paths(items);
   let mut spans: Vec<(std::ops::Range<usize>, NodeId)> = vec![(0..usize::MAX, NodeId::new(0))];
+  let mut idx = 1u64;
   for item in items {
-    entities.push(item.entry.name.to_string());
-    spans.push((
-      item.entry.range.byte_offset.clone(),
-      NodeId::new(entities.len() as u64 - 1),
-    ));
+    spans.push((item.entry.range.byte_offset.clone(), NodeId::new(idx)));
+    idx += 1;
     for member in &item.members {
-      entities.push(product::member_entity_path(
-        &item.entry.name,
-        &member.entry.name,
-      ));
-      spans.push((
-        member.entry.range.byte_offset.clone(),
-        NodeId::new(entities.len() as u64 - 1),
-      ));
+      spans.push((member.entry.range.byte_offset.clone(), NodeId::new(idx)));
+      idx += 1;
     }
   }
+  debug_assert_eq!(entities.len(), spans.len(), "layout entity/span count mismatch");
   (entities, spans)
 }
 

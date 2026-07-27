@@ -175,6 +175,10 @@ impl KgWriter {
     items: &[OutlineItem<'_>],
   ) -> Vec<(Range<usize>, NodeId)> {
     let mut spans = Vec::new();
+    // Entity paths in layout order (index 0 = file), disambiguated so overloads and same-name
+    // different-kind siblings stay distinct. `ingest_file_with_spans` and `local_layout` both
+    // source identity from this one function, so their conventions can never drift apart.
+    let entity_paths = layout_entity_paths(items);
     // Intern the path bytes once for this whole file: every node of the file shares one heap
     // copy via identical (offset, len) column entries — reader-compatible, and it removes the
     // dominant heap duplication (at kernel scale, ~130 MB of repeated path strings for
@@ -194,18 +198,21 @@ impl KgWriter {
     // attribute to it when no smaller item/member span contains them.
     spans.push((0..usize::MAX, file_id));
 
+    let mut next = 1usize; // walks `entity_paths` in lockstep with the item/member traversal
     for item in items {
       let name = item.entry.name.as_ref();
       let signature = item.entry.signature.as_ref();
       let kind = SymbolKind::from_symbol_type(item.entry.symbol_type, item.is_import);
+      let item_entity = entity_paths[next].as_str();
+      next += 1;
       let item_id = self.define(NodeDef {
         kind,
         name,
-        entity_path: name,
+        entity_path: item_entity,
         path,
         signature,
         exported: item.is_exported,
-        content_hash: content_hash(&[name, signature]),
+        content_hash: content_hash(&[item_entity, signature]),
         span: clamp_span(&item.entry.range.byte_offset),
       });
       self.add_edge(file_id, item_id, EdgeType::DEFINES);
@@ -215,15 +222,16 @@ impl KgWriter {
         let mname = member.entry.name.as_ref();
         let msig = member.entry.signature.as_ref();
         let mkind = SymbolKind::from_symbol_type(member.entry.symbol_type, false);
-        let entity_path = qualified(name, mname);
+        let member_entity = entity_paths[next].as_str();
+        next += 1;
         let member_id = self.define(NodeDef {
           kind: mkind,
           name: mname,
-          entity_path: &entity_path,
+          entity_path: member_entity,
           path,
           signature: msig,
           exported: member.is_public,
-          content_hash: content_hash(&[&entity_path, msig]),
+          content_hash: content_hash(&[member_entity, msig]),
           span: clamp_span(&member.entry.range.byte_offset),
         });
         self.add_edge(item_id, member_id, mkind.containment_edge());
@@ -480,8 +488,59 @@ impl KgWriter {
   }
 }
 
-fn qualified(owner: &str, member: &str) -> String {
-  format!("{owner}.{member}")
+/// The within-file entity paths for a file's outline, in **layout order**: index 0 is the file
+/// (entity `""`), then each item immediately followed by its members — exactly the order
+/// [`KgWriter::ingest_file_with_spans`] walks and `local_layout` reproduces for reference
+/// attribution. Same-named siblings are disambiguated by their **signature**, so overloads
+/// (`f(int)` vs `f(str)`, `T.m()` vs `T.m(x)`) never collapse onto one identity. Both the writer
+/// (which keys node identity on the entity path) and reference attribution consume this, keeping
+/// the two conventions in lockstep.
+pub fn layout_entity_paths(items: &[OutlineItem<'_>]) -> Vec<String> {
+  let mut out = Vec::with_capacity(1 + items.iter().map(|i| 1 + i.members.len()).sum::<usize>());
+  out.push(String::new()); // the file node
+  for item in items {
+    let kind = SymbolKind::from_symbol_type(item.entry.symbol_type, item.is_import);
+    out.push(disambiguated_entity_path(
+      None,
+      item.entry.name.as_ref(),
+      kind,
+      item.entry.signature.as_ref(),
+    ));
+    for member in &item.members {
+      let mkind = SymbolKind::from_symbol_type(member.entry.symbol_type, false);
+      out.push(disambiguated_entity_path(
+        Some(item.entry.name.as_ref()),
+        member.entry.name.as_ref(),
+        mkind,
+        member.entry.signature.as_ref(),
+      ));
+    }
+  }
+  out
+}
+
+/// One entity path: the owner-qualified name, plus a signature discriminator **only for
+/// overloadable (callable) kinds with a non-empty signature**. This splits overloads (`f(int)`
+/// vs `f(str)`, `T.m()` vs `T.m(x)`) while leaving non-callables — types, `impl` blocks, fields,
+/// imports — on their bare name, so `impl Reader` still merges into `struct Reader` and a
+/// re-opened type keeps one identity. `0x1f` (unit separator) cannot appear in a source
+/// identifier or an extracted signature, so it can never shift a component boundary and collide
+/// two distinct entities.
+fn disambiguated_entity_path(
+  owner: Option<&str>,
+  name: &str,
+  kind: SymbolKind,
+  signature: &str,
+) -> String {
+  let base = match owner {
+    Some(o) => format!("{o}.{name}"),
+    None => name.to_string(),
+  };
+  if kind.is_overloadable() && !signature.is_empty() {
+    format!("{base}\u{1f}{signature}")
+  } else {
+    base
+  }
 }
 
 /// Clamp a byte range to the u32 column space (files past 4 GiB store a saturated span).

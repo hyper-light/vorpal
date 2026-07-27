@@ -17,7 +17,7 @@ mod writer;
 
 pub use kg::{Kg, NodeView, SymbolSelector};
 pub use model::SymbolKind;
-pub use writer::{KgWriter, NodeDef};
+pub use writer::{KgWriter, NodeDef, layout_entity_paths};
 
 pub use vorpal_graph::{EdgeLog, EdgeType};
 pub use vorpal_segment::NodeId;

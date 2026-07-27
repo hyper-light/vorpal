@@ -110,11 +110,6 @@ pub(crate) fn tag_refform(tag: u8) -> RefForm {
   }
 }
 
-/// The entity path of a member within its item — must match `KgWriter`'s identity convention.
-pub(crate) fn member_entity_path(owner: &str, member: &str) -> String {
-  format!("{owner}.{member}")
-}
-
 /// Detach an extracted item from its parse tree (owned strings) for caching.
 pub(crate) fn own_item(item: OutlineItem<'_>) -> OutlineItem<'static> {
   OutlineItem {

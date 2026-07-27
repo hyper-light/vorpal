@@ -60,6 +60,17 @@ impl SymbolKind {
     self as u8
   }
 
+  /// Whether two same-named declarations of this kind can legitimately coexist and must be kept
+  /// distinct by signature — i.e. callables that overload. Non-callable kinds (types, fields,
+  /// imports, …) treat one name as one entity, so a `struct` and its `impl` block, or a type and
+  /// a re-opened declaration, still share a single identity.
+  pub fn is_overloadable(self) -> bool {
+    matches!(
+      self,
+      SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor
+    )
+  }
+
   pub fn from_tag(tag: u8) -> Self {
     match tag {
       0 => SymbolKind::File,

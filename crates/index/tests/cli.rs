@@ -103,6 +103,30 @@ fn grammar_change_defeats_reuse_fast_path() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// Same-named overloads must each become their own graph node — signature (and kind)
+/// disambiguate identity — rather than collapsing onto one canonical key.
+#[test]
+fn overloaded_definitions_stay_distinct() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-overload-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(
+    src.join("o.cpp"),
+    "int area(int side) { return side * side; }\n\
+     int area(int w, int h) { return w * h; }\n\
+     double area(double r) { return 3.14 * r * r; }\n",
+  )
+  .unwrap();
+
+  let report = build_index(&src, &out).unwrap();
+  // 1 file node + 3 distinct overloads; a collapse would yield 2.
+  assert_eq!(report.nodes, 4, "overloads did not stay distinct: {report:?}");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn semantic_search_finds_definitions_by_description() {
   let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));
