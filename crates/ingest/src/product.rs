@@ -44,9 +44,11 @@ pub struct FileProduct {
   /// behind staged cache validation (stat is the cheap hint; this digest is the truth used
   /// in the racy-mtime window and under `VORPAL_VERIFY_CACHE=1`).
   pub source_xxh3: u64,
-  /// Digest of the grammar generation this product was extracted with
-  /// ([`vorpal_language::grammar_digest`]). A product replays only while it matches the linked
-  /// grammar's current digest, so editing a grammar invalidates exactly its stale products.
+  /// The extraction-identity digest this product was produced under: the language's grammar
+  /// generation folded with the outline-rule digest (see [`crate::extraction_identity`]). A
+  /// product replays only while it still matches, so editing *either* the grammar or the
+  /// extraction rules invalidates exactly its stale products. (Field name is historical — it
+  /// began as grammar-only in v8.)
   pub grammar_digest: u64,
   /// The parse still contained tree-sitter ERROR nodes: some definitions in this file may be
   /// missing from the graph. Language-agnostic graceful-degradation telemetry — surfaced in

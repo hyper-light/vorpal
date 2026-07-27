@@ -85,11 +85,15 @@ fn stream_budget_bytes() -> u64 {
 /// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`.
 pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>> {
   let extractor = OutlineExtractor::new()?;
+  // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
+  // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
+  // it, so editing a grammar OR an outline rule invalidates reuse just as a file edit would.
+  let rules_digest = extractor.rules_digest();
   let mut manifest = Manifest::scan(src, |p| extractor.handles(p))?;
-  // Stamp the grammar set this run indexes under, so the whole-tree fast path below reuses the
-  // persisted index only while the grammars are also unchanged (a grammar edit invalidates the
-  // stat-only reuse just as a file edit would).
-  manifest.set_grammar_stamp(vorpal_ingest::global_grammar_stamp());
+  manifest.set_grammar_stamp(vorpal_ingest::extraction_identity(
+    vorpal_ingest::global_grammar_stamp(),
+    rules_digest,
+  ));
   let manifest_path = out.join("manifest.bin");
 
   // Staged cache validation (IMPROVEMENTS §6): stat (size+mtime) is the cheap hint; the v6
@@ -224,7 +228,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
             if product.source_size == entry.size
               && product.source_mtime_ns == entry.mtime_ns
               && Some(product.grammar_digest)
-                == vorpal_ingest::grammar_digest_for_path(&entry.path)
+                == vorpal_ingest::extraction_identity_for_path(&entry.path, rules_digest)
               && digest_must_match(
                 entry.mtime_ns,
                 Some(product.source_xxh3),
@@ -253,7 +257,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
           // itself never crosses the channel and never materializes.
           if peek_product_stamps(bytes) == Some((entry.size, entry.mtime_ns))
             && vorpal_ingest::peek_product_grammar_digest(bytes)
-              == vorpal_ingest::grammar_digest_for_path(&entry.path)
+              == vorpal_ingest::extraction_identity_for_path(&entry.path, rules_digest)
             && digest_must_match(
               entry.mtime_ns,
               vorpal_ingest::peek_product_digest(bytes),

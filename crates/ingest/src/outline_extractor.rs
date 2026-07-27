@@ -31,6 +31,10 @@ static DEFAULT_EXTRACTORS: OnceLock<Result<Arc<LangExtractors>, String>> = OnceL
 /// against parsed files. Language is chosen from the file extension (§3.1 "all languages").
 pub struct OutlineExtractor {
   by_lang: Arc<LangExtractors>,
+  /// Digest of the exact outline-rule source this extractor was compiled from. Folded into each
+  /// product's identity so editing an extraction rule invalidates products it produced — the
+  /// grammar digest alone cannot see a rule change.
+  rules_digest: u64,
 }
 
 impl OutlineExtractor {
@@ -39,19 +43,28 @@ impl OutlineExtractor {
     let by_lang = DEFAULT_EXTRACTORS
       .get_or_init(|| compile_rules(DEFAULT_OUTLINE_RULES).map(Arc::new))
       .clone()?;
-    Ok(Self { by_lang })
+    Ok(Self {
+      by_lang,
+      rules_digest: xxhash_rust::xxh3::xxh3_64(DEFAULT_OUTLINE_RULES.as_bytes()),
+    })
   }
 
   /// Compile an arbitrary outline-rule YAML document (bundled or user-supplied).
   pub fn from_rules(rules_yaml: &str) -> Result<Self, String> {
     Ok(Self {
       by_lang: Arc::new(compile_rules(rules_yaml)?),
+      rules_digest: xxhash_rust::xxh3::xxh3_64(rules_yaml.as_bytes()),
     })
   }
 
   /// How many languages have compiled extractors.
   pub fn languages(&self) -> usize {
     self.by_lang.len()
+  }
+
+  /// The digest of the outline rules this extractor uses — a component of product identity.
+  pub fn rules_digest(&self) -> u64 {
+    self.rules_digest
   }
 }
 
@@ -140,9 +153,12 @@ impl OutlineExtractor {
       source_size: 0,
       source_mtime_ns: 0,
       source_xxh3: xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
-      // The grammar generation this product was extracted with — the cache invalidates a
-      // product once its language's grammar digest no longer matches.
-      grammar_digest: vorpal_language::grammar_digest(lang),
+      // Extraction identity: the language's grammar generation folded with the outline-rule
+      // digest, so the cache invalidates a product once either the parser or the rules change.
+      grammar_digest: crate::extraction_identity(
+        vorpal_language::grammar_digest(lang),
+        self.rules_digest,
+      ),
       parse_errors,
       items: items.into_iter().map(product::own_item).collect(),
       refs,
@@ -189,5 +205,29 @@ impl FileExtractor for OutlineExtractor {
     if let Some(prod) = self.extract_product(path, source) {
       crate::pipeline::apply_product(path, prod, writer, references);
     }
+  }
+}
+
+#[cfg(test)]
+mod identity_tests {
+  use super::OutlineExtractor;
+  use crate::extraction_identity as id;
+
+  #[test]
+  fn extraction_identity_distinguishes_grammar_and_rules() {
+    assert_ne!(id(1, 2), id(1, 3), "a rules change must change identity");
+    assert_ne!(id(1, 2), id(4, 2), "a grammar change must change identity");
+    assert_ne!(id(1, 2), id(2, 1), "combine is order-sensitive, not a plain XOR");
+    assert_eq!(id(7, 9), id(7, 9), "deterministic");
+  }
+
+  #[test]
+  fn rules_digest_is_source_derived_and_stable() {
+    // The default extractor and one compiled from the same default source agree; the digest is
+    // a pure function of the rule bytes, so it is stable and non-zero.
+    let a = OutlineExtractor::new().unwrap();
+    let b = OutlineExtractor::from_rules(vorpal_outline::DEFAULT_OUTLINE_RULES).unwrap();
+    assert_eq!(a.rules_digest(), b.rules_digest());
+    assert_ne!(a.rules_digest(), 0);
   }
 }

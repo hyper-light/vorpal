@@ -45,6 +45,23 @@ pub fn grammar_digest_for_path(path: &str) -> Option<u64> {
   vorpal_language::SupportLang::from_path(path).map(vorpal_language::grammar_digest)
 }
 
+/// The full extraction-identity a product is keyed on: its language's grammar generation folded
+/// with the outline-rule digest that extracted it. A change to *either* — the parser or the
+/// extraction rules — yields a different identity, so the stale product re-parses. Returns `None`
+/// when the path maps to no supported language.
+pub fn extraction_identity_for_path(path: &str, rules_digest: u64) -> Option<u64> {
+  grammar_digest_for_path(path).map(|g| extraction_identity(g, rules_digest))
+}
+
+/// Combine a grammar digest and a rules digest into one product-identity digest (order-fixed
+/// xxh3, so it never accidentally cancels the way a XOR could).
+pub fn extraction_identity(grammar_digest: u64, rules_digest: u64) -> u64 {
+  let mut buf = [0u8; 16];
+  buf[..8].copy_from_slice(&grammar_digest.to_le_bytes());
+  buf[8..].copy_from_slice(&rules_digest.to_le_bytes());
+  xxhash_rust::xxh3::xxh3_64(&buf)
+}
+
 /// A single digest over every supported grammar — the coarse stamp the whole-tree fast path
 /// records in the manifest, so editing any grammar forces a re-index (which then re-parses,
 /// via [`grammar_digest_for_path`], only the files whose language actually changed).
