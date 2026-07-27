@@ -889,3 +889,193 @@ rule:
     selector: property_identifier
 name: $NAME
 isPublic: true
+
+---
+
+id: ts-export-namespace
+language: TypeScript
+role: item
+symbolType: module
+rule:
+  kind: export_statement
+  has:
+    field: declaration
+    any:
+      - kind: internal_module
+        has:
+          field: name
+          pattern: $NAME
+      - kind: ambient_declaration
+        has:
+          kind: internal_module
+          stopBy: neighbor
+          has:
+            field: name
+            pattern: $NAME
+name: $NAME
+isExported: true
+
+---
+
+id: ts-namespace
+language: TypeScript
+role: item
+symbolType: module
+rule:
+  any:
+    - kind: internal_module
+      has:
+        field: name
+        pattern: $NAME
+    - kind: ambient_declaration
+      has:
+        kind: internal_module
+        stopBy: neighbor
+        has:
+          field: name
+          pattern: $NAME
+name: $NAME
+isExported:
+  any:
+    - kind: ambient_declaration
+    - inside:
+        kind: export_statement
+        stopBy: neighbor
+
+---
+
+id: ts-export-ambient-module
+language: TypeScript
+role: item
+symbolType: module
+rule:
+  kind: export_statement
+  has:
+    field: declaration
+    kind: ambient_declaration
+    has:
+      kind: module
+      stopBy: neighbor
+      has:
+        field: name
+        kind: string
+        has:
+          kind: string_fragment
+          pattern: $NAME
+name: $NAME
+isExported: true
+
+---
+
+id: ts-ambient-module
+language: TypeScript
+role: item
+symbolType: module
+rule:
+  kind: ambient_declaration
+  has:
+    kind: module
+    stopBy: neighbor
+    has:
+      field: name
+      kind: string
+      has:
+        kind: string_fragment
+        pattern: $NAME
+name: $NAME
+isExported: true
+
+---
+
+id: tsx-export-namespace
+language: Tsx
+role: item
+symbolType: module
+rule:
+  kind: export_statement
+  has:
+    field: declaration
+    any:
+      - kind: internal_module
+        has:
+          field: name
+          pattern: $NAME
+      - kind: ambient_declaration
+        has:
+          kind: internal_module
+          stopBy: neighbor
+          has:
+            field: name
+            pattern: $NAME
+name: $NAME
+isExported: true
+
+---
+
+id: tsx-namespace
+language: Tsx
+role: item
+symbolType: module
+rule:
+  any:
+    - kind: internal_module
+      has:
+        field: name
+        pattern: $NAME
+    - kind: ambient_declaration
+      has:
+        kind: internal_module
+        stopBy: neighbor
+        has:
+          field: name
+          pattern: $NAME
+name: $NAME
+isExported:
+  any:
+    - kind: ambient_declaration
+    - inside:
+        kind: export_statement
+        stopBy: neighbor
+
+---
+
+id: tsx-export-ambient-module
+language: Tsx
+role: item
+symbolType: module
+rule:
+  kind: export_statement
+  has:
+    field: declaration
+    kind: ambient_declaration
+    has:
+      kind: module
+      stopBy: neighbor
+      has:
+        field: name
+        kind: string
+        has:
+          kind: string_fragment
+          pattern: $NAME
+name: $NAME
+isExported: true
+
+---
+
+id: tsx-ambient-module
+language: Tsx
+role: item
+symbolType: module
+rule:
+  kind: ambient_declaration
+  has:
+    kind: module
+    stopBy: neighbor
+    has:
+      field: name
+      kind: string
+      has:
+        kind: string_fragment
+        pattern: $NAME
+name: $NAME
+isExported: true

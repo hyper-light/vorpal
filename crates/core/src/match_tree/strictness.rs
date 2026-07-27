@@ -24,7 +24,7 @@ pub(crate) enum MatchOneNode {
 }
 
 fn skip_comment(n: &Node<impl Doc>) -> bool {
-  n.kind().contains("comment")
+  n.is_extra()
 }
 
 fn skip_comment_or_unnamed(n: &Node<impl Doc>) -> bool {
@@ -50,8 +50,8 @@ impl MatchStrictness {
   fn should_skip_comment(&self) -> bool {
     use MatchStrictness as M;
     match self {
-      M::Cst | M::Smart | M::Ast => false,
-      M::Relaxed | M::Signature | M::Template => true,
+      M::Cst | M::Ast => false,
+      M::Smart | M::Relaxed | M::Signature | M::Template => true,
     }
   }
 
@@ -102,11 +102,7 @@ impl MatchStrictness {
   }
 
   pub(crate) fn should_skip_cand_for_metavar<D: Doc>(&self, candidate: &Node<D>) -> bool {
-    use MatchStrictness as M;
-    match self {
-      M::Cst | M::Ast | M::Smart => false,
-      M::Relaxed | M::Signature | M::Template => skip_comment(candidate),
-    }
+    self.should_skip_comment() && skip_comment(candidate)
   }
 
   // TODO: this is a method for working around trailing nodes after pattern is matched

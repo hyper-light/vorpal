@@ -1,7 +1,7 @@
 # Upstream (ast-grep) synchronization ledger
 
-> **Base:** ast-grep **v0.44.0** (release tarball; the fork predates commit-pinning — pin the
-> exact commit at the next sync). **Last reconciliation:** 2026-07-24 against v0.44.1.
+> **Base:** ast-grep **v0.44.0** (release tarball; the fork predates commit-pinning).
+> **Last reconciliation:** 2026-07-26 against **v0.45.0** (`5d439d9bb92d5ba9e7dba8343348c4597e7a1fbc`).
 
 Vorpal's structural engine (`crates/core`, `crates/config`, `crates/language`, `crates/cli`'s
 run/scan/test/LSP surfaces, and the napi/pyo3/wasm bindings) is a rebranded fork of ast-grep.
@@ -15,6 +15,23 @@ accident. This ledger records where and why the trees diverge.
 3. Changes we cannot adopt get a row in the divergence table with a reason.
 4. Differential fixtures (`vorpal run`/`scan`/`outline` golden outputs) guard the shared
    behavior; intentional differences get their own fixtures.
+
+## Reconciled against v0.45.0
+
+Behavioral commits between the base and v0.45.0, classified. Adopted changes match upstream
+byte-for-byte where the surrounding code had not diverged.
+
+| Upstream commit | Change | Status |
+|---|---|---|
+| `a18c29c8` | Smart-strictness skips trivia via `SgNode::is_extra` instead of a `kind().contains("comment")` heuristic | **Adopted** — `is_extra` added to `core/{node,source,tree_sitter}`, `strictness.rs` now identical to upstream |
+| `ada747d0` | Smart strictness ignores comments by default (moved to the skip-trivia group) | **Adopted** — same `strictness.rs` |
+| `94bc9582` | Stop consulting ignore files outside `ruleDirs`/`utilDirs` (`.parents(false)`) | **Adopted** — `cli/src/config.rs`, both walker sites |
+| `63e94c48` + `4f75c214` | Outline recognizes TypeScript `namespace` and ambient `declare module` (incl. `ambient_declaration` wrapping), TS + TSX | **Adopted** — 8 rules appended to `outline/src/default_rules/typescript.yml`; verified extracting `export namespace` and `declare module "x"` |
+| `07080186` | Bump `ignore` crate to 0.4.27 | **Not applicable** — dependency version, tracked by the workspace lockfile |
+| `sg` deprecation, MSRV/dep bumps | CLI alias + toolchain | **Intentional divergence** — vorpal ships its own CLI identity (`vorpal`/`vp`); MSRV governed locally |
+
+Differential fixtures comparing vorpal against the pinned ast-grep binary across
+`run`/`scan`/`test`/outline/JSON/edits are still to be added (the `#1` "Done when" bar).
 
 ## Reconciled against v0.44.1
 

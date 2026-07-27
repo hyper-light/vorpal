@@ -189,6 +189,9 @@ impl<'r> SgNode<'r> for Node<'r> {
   fn is_named(&self) -> bool {
     Node::is_named(self)
   }
+  fn is_extra(&self) -> bool {
+    Node::is_extra(self)
+  }
   /// N.B. it is different from is_named && is_leaf
   /// if a node has no named children.
   fn is_named_leaf(&self) -> bool {

@@ -150,6 +150,11 @@ impl<'r, D: Doc> Node<'r, D> {
   pub fn is_named(&self) -> bool {
     self.inner.is_named()
   }
+  /// A node the grammar marks as `extra` (comments and other floating trivia that may appear
+  /// anywhere). Strictness modes skip these instead of guessing from the kind name.
+  pub fn is_extra(&self) -> bool {
+    self.inner.is_extra()
+  }
   pub fn is_missing(&self) -> bool {
     self.inner.is_missing()
   }

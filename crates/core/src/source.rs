@@ -102,6 +102,11 @@ pub trait SgNode<'r>: Clone {
   fn is_named(&self) -> bool {
     true
   }
+  /// Whether the grammar marks this node as `extra` (comments / floating trivia). Defaults to
+  /// `false`; tree-sitter-backed nodes override it.
+  fn is_extra(&self) -> bool {
+    false
+  }
   /// N.B. it is different from is_named && is_leaf
   /// if a node has no named children.
   fn is_named_leaf(&self) -> bool {
