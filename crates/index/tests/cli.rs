@@ -127,6 +127,44 @@ fn overloaded_definitions_stay_distinct() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// A reader must refuse an index whose graph and node segment came from different builds (what a
+/// reader opening mid-rebuild could observe), rather than serve out-of-bounds/cross-generation
+/// results.
+#[test]
+fn mixed_generation_index_is_rejected() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-mixed-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&base);
+  let ssrc = base.join("ssrc");
+  let small = base.join("small");
+  fs::create_dir_all(&ssrc).unwrap();
+  fs::write(ssrc.join("a.rs"), "pub fn a() -> i32 {\n    1\n}\n").unwrap();
+  build_index(&ssrc, &small).unwrap();
+  assert!(Kg::load(&small).is_ok(), "a coherent index loads");
+
+  // A larger corpus → a different (bigger) node universe in its graph.
+  let lsrc = base.join("lsrc");
+  let large = base.join("large");
+  fs::create_dir_all(&lsrc).unwrap();
+  for i in 0..24 {
+    fs::write(
+      lsrc.join(format!("f{i}.rs")),
+      format!("pub fn f{i}() -> i32 {{\n    {i}\n}}\n"),
+    )
+    .unwrap();
+  }
+  build_index(&lsrc, &large).unwrap();
+
+  // Splice the large graph onto the small index: graph.node_count no longer matches the node
+  // segment — a mixed generation the coherence gate must reject.
+  fs::copy(large.join("graph.bin"), small.join("graph.bin")).unwrap();
+  assert!(
+    Kg::load(&small).is_err(),
+    "mixed graph/node-segment generation must be rejected"
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn semantic_search_finds_definitions_by_description() {
   let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));

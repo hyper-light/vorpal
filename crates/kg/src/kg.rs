@@ -541,6 +541,16 @@ impl Kg {
       graph,
       directory,
     )?;
+    // Cross-segment coherence gate: the graph and the node segment must describe the same node
+    // universe. A mismatch means the mapped files come from different index generations — a
+    // reader that opened while a rebuild was mid-rename. Refuse to serve rather than return
+    // out-of-bounds neighbors or cross-generation nodes; the caller treats it as "no index" and
+    // rebuilds. (The name index already self-validates its count and falls back to a scan.)
+    if kg.graph.node_count() != kg.node_count() {
+      return Err(SegmentError::Corrupt(
+        "graph and node segment describe different node universes (mixed index generation)",
+      ));
+    }
     kg.names = open_names_index(dir, &policy, kg.node_count());
     Ok(kg)
   }
