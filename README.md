@@ -122,12 +122,17 @@ in-flight byte ceiling, extracted by scoped workers with reused per-worker buffe
 committed straight into per-shard writers — a product exists in memory only between
 extraction and application, so peak transient memory is set by the budget, not the corpus.
 
-Re-runs are incremental: each cached extraction product is **self-validating** — it records
-the stat (size, mtime) of the source it was extracted from and replays only while that still
-matches. It makes no difference *which run* wrote a product: a completed index, an interrupted
-one (killed runs lose no work), or a search that banked its matches. Everything else re-parses,
-and the graph is always re-linked from the complete product set. A fully unchanged tree
-short-circuits entirely:
+Re-runs are incremental: each cached extraction product is **self-validating**. Stat (size,
+mtime) is the cheap hint; a product also carries the **content digest** (`xxh3`) of the exact
+source it was extracted from — verified for files in the racy-mtime window and under
+`VORPAL_VERIFY_CACHE=1` — and the **grammar-generation digest** of the parser that produced it,
+so editing a grammar invalidates exactly that language's products. A product replays only when
+those gates agree. It makes no difference *which run* wrote a product: a completed index, an
+interrupted one (killed runs lose no work), or a search that banked its matches. Everything else
+re-parses, and the graph is always re-linked from the complete product set. A fully unchanged
+tree short-circuits entirely (a stat-based fast path; a same-size, same-mtime content edit
+outside the racy window is the one case it can miss — run with `VORPAL_VERIFY_CACHE=1` for a
+content-authoritative pass):
 
 ```console
 $ vorpal index .                     # again, after touching one file
@@ -232,17 +237,22 @@ The daemon holds the graph **warm** across calls — one mmap cold-open, then ev
 served from memory. The `index` tool builds or refreshes the index in place (near-instant when
 the tree is unchanged), so an agent can bootstrap from an empty directory.
 
+Graph tools accept unambiguous symbol **selectors** — refine `name` with `path` (file-suffix),
+`kind`, or an exact node `id`, or pass `all` to merge across same-named definitions.
+
 | Tool | Arguments | Returns |
 |---|---|---|
 | `index` | `src` | Build/refresh the index, keep it warm |
-| `node` | `name` | Nodes matching an exact symbol name |
-| `callers` | `name` | Direct callers (incoming `calls`) |
-| `references` | `name` | Direct referrers (incoming `references`) |
-| `importers` | `name` | Files importing the symbol (incoming `imports`) |
-| `implementors` | `name` | Types implementing/extending it (incoming `implements`) |
-| `type_users` | `name` | Definitions using it as a type (incoming `of_type`) |
-| `reachable` | `name`, `direction: "in"\|"out"` | Transitive closure (e.g. all transitive callers) |
-| `search` | `query`, `k?` | Hybrid search, top-k with scores |
+| `node` | `name` (+ selectors) | Nodes matching an exact symbol name |
+| `callers` | `name` (+ selectors) | Direct callers (incoming `calls`) |
+| `references` | `name` (+ selectors) | Direct referrers (incoming `references`) |
+| `importers` | `name` (+ selectors) | Files importing the symbol (incoming `imports`) |
+| `implementors` | `name` (+ selectors) | Types implementing/extending it (incoming `implements`) |
+| `type_users` | `name` (+ selectors) | Definitions using it as a type (incoming `of_type`) |
+| `reachable` | `name`, `direction: "in"\|"out"`, `relations?`, `max_depth?` | Relation-specific transitive closure (default `relations: ["calls"]`, so transitive callers never cross a non-call edge) |
+| `structural_search` | `pattern`, `lang`, `path?`, `limit?` | ast-grep-style AST pattern match over the source tree (`$X`, `$$$ARGS`) → `path:line` + matched text |
+| `fetch_span` | `id`, `max_bytes?` | The verbatim defining source of a graph node |
+| `search` | `query`, `k?` | Hybrid search, top-k with a per-channel score breakdown (name / lexical-vector / graph prior, RRF) |
 
 A raw session, if you want to script it:
 
@@ -329,10 +339,13 @@ The index directory (default `<src>/.vorpal/index` — hidden, so it never index
 ```
 nodes.vseg      columnar node segment (mmap cold-open, blake3 + xxh3 integrity)
 strings.heap    names / paths / signatures
-edges.bin       edge list (rebuilt into CSR/CSC on load)
-ann.bin         vector index (ids, vectors, tier structure; built lazily by the first search)
-manifest.bin    stat manifest driving incremental re-index
-products/       per-file extraction product cache (.vpb binary, keyed by blake3(path))
+graph.bin       mmap CSR/CSC code graph (containment, calls, references, imports, implements, of_type)
+names.idx       persisted name index: sorted (xxh3(name), id) pairs — name lookup by binary search
+ann.bin         vector index (i8-quantized Vamana; built lazily by the first search, plus an edit overlay)
+manifest.bin    stat + grammar-generation stamp driving incremental re-index
+products.pack   per-file extraction product cache in one mmap-replayed file, canonically path-sorted
+products.idx    sidecar: path → (offset, len) into products.pack (an optimization; the pack self-recovers)
+products/       loose products banked by concurrent `search` processes, consolidated into the pack on the next index
 ```
 
 The full architecture — storage format, adaptive memory model, concurrency plan, and the

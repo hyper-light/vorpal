@@ -103,9 +103,10 @@ All under `grammars/<crate>/`, patched into the workspace. `Local patches` is "â
 
 ## Planned
 
-- **tree-sitter-c**: vendor + add a name-agnostic recovery production for function-like macros in
-  specifier position (`IDENT(args)` before a type/declarator, e.g. `__alloc_size(1)`), which
-  currently produce an unrecoverable ERROR and drop the function. Validate on non-kernel
-  macro-heavy corpora before landing.
-- Vendor the remaining grammars as concrete fixes arise (the cache-key + this ledger make it
-  turnkey).
+- **tree-sitter-c macro recovery** (the grammar itself is already vendored, as-is): add a
+  name-agnostic recovery production for function-like macros in specifier position (`IDENT(args)`
+  before a type/declarator, e.g. `__alloc_size(1)`), which currently produce an unrecoverable
+  ERROR and drop the function. A leading-position-only prototype passed the upstream corpus but
+  regressed real CPython C at scale (ref-resolution shifted), so it was reverted; a real fix needs
+  position-specific handling (leading / between-type-and-declarator / trailing) each validated on
+  a large non-kernel C corpus before landing. Prototype kept in scratch.
