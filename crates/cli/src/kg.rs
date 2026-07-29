@@ -126,9 +126,9 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
     );
     if report.error_files > 0 {
       println!(
-        "note: {} files had parse errors (some definitions may be missing) — tree-sitter \
-         could not fully parse them",
-        report.error_files
+        "note: {} files had parse errors ({} ERROR nodes total; some definitions may be \
+         missing) — tree-sitter could not fully parse them",
+        report.error_files, report.error_nodes
       );
     }
   }

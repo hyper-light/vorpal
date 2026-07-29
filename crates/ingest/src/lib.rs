@@ -30,7 +30,7 @@ pub use pipeline::{
 pub use product::{
   FileProduct, ProductRef, ProductView, RefView, cache_file_name, decode_product,
   decode_product_view, encode_product_into, load_product, peek_product_digest,
-  peek_product_grammar_digest, peek_product_parse_errors, peek_product_stamps, save_product,
+  peek_product_error_nodes, peek_product_grammar_digest, peek_product_stamps, save_product,
   save_product_with,
   validate_product,
 };

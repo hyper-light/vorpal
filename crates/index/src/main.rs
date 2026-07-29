@@ -94,8 +94,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         if report.error_files > 0 {
           println!(
-            "note: {} files had parse errors (some definitions may be missing)",
-            report.error_files
+            "note: {} files had parse errors ({} ERROR nodes total; some definitions may be missing)",
+            report.error_files, report.error_nodes
           );
         }
       }

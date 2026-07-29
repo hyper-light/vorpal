@@ -117,9 +117,10 @@ impl OutlineExtractor {
     // product before it drops. Reference extraction runs even without outline rules (the file
     // node is the only definition span).
     let grep = lang.grep(source);
-    // Graceful-degradation telemetry (all languages): note when tree-sitter could not fully
-    // parse this file, so definitions it dropped are surfaced as a count, never hidden.
-    let parse_errors = grep.root().dfs().any(|node| node.is_error());
+    // Graceful-degradation telemetry (all languages): count the tree-sitter ERROR nodes this
+    // parse produced (0 = clean), so definitions it dropped are surfaced with a "how bad"
+    // magnitude, never hidden.
+    let error_nodes = grep.root().dfs().filter(|node| node.is_error()).count() as u32;
     let items: Vec<OutlineItem<'_>> = combined
       .map(|c| c.extract(grep.root()).collect())
       .unwrap_or_default();
@@ -159,7 +160,7 @@ impl OutlineExtractor {
         vorpal_language::grammar_digest(lang),
         self.rules_digest,
       ),
-      parse_errors,
+      error_nodes,
       items: items.into_iter().map(product::own_item).collect(),
       refs,
     })

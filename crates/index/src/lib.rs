@@ -45,6 +45,9 @@ pub struct IndexReport {
   /// missing from the graph. A language-agnostic parse-health signal (graceful degradation
   /// made visible), 0 when every file parsed cleanly.
   pub error_files: u64,
+  /// Total tree-sitter ERROR nodes across all files — the magnitude behind `error_files`, so a
+  /// corpus with one badly-broken file reads differently from one with many lightly-broken files.
+  pub error_nodes: u64,
   pub nodes: usize,
   /// Confidently resolved references (single visible definition).
   pub resolved: u64,
@@ -158,6 +161,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
         return Ok(IndexReport {
           reused: true,
           error_files: 0,
+          error_nodes: 0,
           indexed: 0,
           skipped: manifest.len() as u64,
           nodes,
@@ -212,6 +216,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // once, sequentially; buffering them in RAM only raised the peak footprint (~220 MB at
   // kernel scale).
   let error_files = std::sync::atomic::AtomicU64::new(0);
+  let error_nodes = std::sync::atomic::AtomicU64::new(0);
   let spill_path = out.join(".refs.spill");
   let heap_stream = out.join("strings.heap.tmp");
   let stream_result = stream_apply_spilled(
@@ -235,8 +240,9 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
                 Path::new(&entry.path),
               )
             {
-              if product.parse_errors {
+              if product.error_nodes > 0 {
                 error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                error_nodes.fetch_add(product.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
               }
               pack_sink
                 .send(PackMsg {
@@ -265,8 +271,10 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
             )
             && validate_product(bytes)
           {
-            if vorpal_ingest::peek_product_parse_errors(bytes) == Some(true) {
+            let ec = vorpal_ingest::peek_product_error_nodes(bytes).unwrap_or(0);
+            if ec > 0 {
               error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              error_nodes.fetch_add(ec as u64, std::sync::atomic::Ordering::Relaxed);
             }
             return Ok(StreamWork::ReplayedPacked(entry.path.clone()));
           }
@@ -279,8 +287,9 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
       let Some(mut product) = extractor.extract_product(&entry.path, source) else {
         return Ok(StreamWork::Skipped);
       };
-      if product.parse_errors {
+      if product.error_nodes > 0 {
         error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        error_nodes.fetch_add(product.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
       }
       product.source_size = entry.size;
       product.source_mtime_ns = entry.mtime_ns;
@@ -349,6 +358,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
     indexed: reparsed,
     skipped: replayed,
     error_files: error_files.into_inner(),
+    error_nodes: error_nodes.into_inner(),
     nodes: kg.node_count(),
     resolved: resolve.resolved,
     ambiguous: resolve.ambiguous,

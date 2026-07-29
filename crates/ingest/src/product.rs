@@ -24,8 +24,8 @@ use vorpal_resolve::{RefForm, RefKind};
 /// The extraction-product format generation. Bumped whenever extraction output changes shape or
 /// semantics (fields, suppression rules, qualifier capture, encoding), so stale caches replay
 /// as cache misses and re-parse — staleness is structural, never silent (§3.4). v8 adds the
-/// grammar-generation digest to the header.
-pub const PRODUCT_FORMAT_VERSION: u32 = 8;
+/// grammar-generation digest to the header; v9 widens the parse-error flag to an error-node count.
+pub const PRODUCT_FORMAT_VERSION: u32 = 9;
 
 /// One file's extraction output, serializable for the on-disk product cache.
 #[derive(Debug, Clone)]
@@ -50,10 +50,11 @@ pub struct FileProduct {
   /// extraction rules invalidates exactly its stale products. (Field name is historical — it
   /// began as grammar-only in v8.)
   pub grammar_digest: u64,
-  /// The parse still contained tree-sitter ERROR nodes: some definitions in this file may be
-  /// missing from the graph. Language-agnostic graceful-degradation telemetry — surfaced in
-  /// `IndexReport::error_files`, never acted on (parsing is tree-sitter's job, not ours).
-  pub parse_errors: bool,
+  /// How many tree-sitter ERROR nodes the parse produced: `0` = clean, higher = worse (a rough
+  /// "how bad" signal, not just "did it fail"). Some definitions in this file may be missing from
+  /// the graph. Language-agnostic graceful-degradation telemetry — surfaced in
+  /// `IndexReport::{error_files, error_nodes}`, never acted on (parsing is tree-sitter's job).
+  pub error_nodes: u32,
   pub items: Vec<OutlineItem<'static>>,
   pub refs: Vec<ProductRef>,
 }
@@ -326,7 +327,7 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
   buf.extend_from_slice(&product.source_mtime_ns.to_le_bytes());
   buf.extend_from_slice(&product.source_xxh3.to_le_bytes());
   buf.extend_from_slice(&product.grammar_digest.to_le_bytes());
-  buf.push(u8::from(product.parse_errors));
+  push_u32(buf, product.error_nodes);
   push_u32(buf, product.items.len() as u32);
   for item in &product.items {
     if push_entry(buf, &item.entry).is_err() {
@@ -471,7 +472,7 @@ pub struct ProductView<'a> {
   pub source_mtime_ns: u64,
   pub source_xxh3: u64,
   pub grammar_digest: u64,
-  pub parse_errors: bool,
+  pub error_nodes: u32,
   pub items: Vec<OutlineItem<'a>>,
   pub refs: Vec<RefView<'a>>,
 }
@@ -491,7 +492,7 @@ pub struct RefView<'a> {
 /// The stat stamp of an encoded product, read from its fixed header — magic and format
 /// version checked, nothing decoded. `None` for foreign or torn bytes (treat as cache miss).
 pub fn peek_product_stamps(bytes: &[u8]) -> Option<(u64, u64)> {
-  if bytes.len() < 41 || &bytes[0..4] != PRODUCT_MAGIC {
+  if bytes.len() < 44 || &bytes[0..4] != PRODUCT_MAGIC {
     return None;
   }
   if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
@@ -506,7 +507,7 @@ pub fn peek_product_stamps(bytes: &[u8]) -> Option<(u64, u64)> {
 /// The content digest (`xxh3` of the source bytes) from the product header — the identity
 /// staged validation compares when stat alone cannot be trusted.
 pub fn peek_product_digest(bytes: &[u8]) -> Option<u64> {
-  if bytes.len() < 41 || &bytes[0..4] != PRODUCT_MAGIC {
+  if bytes.len() < 44 || &bytes[0..4] != PRODUCT_MAGIC {
     return None;
   }
   if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
@@ -518,7 +519,7 @@ pub fn peek_product_digest(bytes: &[u8]) -> Option<u64> {
 /// The grammar-generation digest from a v8 product header (offset 32) — the identity that
 /// invalidates products whose grammar has since been edited/bumped.
 pub fn peek_product_grammar_digest(bytes: &[u8]) -> Option<u64> {
-  if bytes.len() < 41 || &bytes[0..4] != PRODUCT_MAGIC {
+  if bytes.len() < 44 || &bytes[0..4] != PRODUCT_MAGIC {
     return None;
   }
   if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
@@ -527,15 +528,17 @@ pub fn peek_product_grammar_digest(bytes: &[u8]) -> Option<u64> {
   Some(u64::from_le_bytes(bytes[32..40].try_into().ok()?))
 }
 
-/// Whether a cached product recorded residual parse errors (v8 header flag at offset 40).
-pub fn peek_product_parse_errors(bytes: &[u8]) -> Option<bool> {
-  if bytes.len() < 41 || &bytes[0..4] != PRODUCT_MAGIC {
+/// The residual parse-error node count a cached product recorded (v9 header, offset 40..44).
+/// `0` = clean; the replay paths sum it into `IndexReport::error_nodes` and count files with
+/// any errors into `error_files`.
+pub fn peek_product_error_nodes(bytes: &[u8]) -> Option<u32> {
+  if bytes.len() < 44 || &bytes[0..4] != PRODUCT_MAGIC {
     return None;
   }
   if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
     return None;
   }
-  Some(bytes[40] != 0)
+  Some(u32::from_le_bytes(bytes[40..44].try_into().ok()?))
 }
 
 /// Validate an encoded product without materializing anything: the exact walk
@@ -566,7 +569,7 @@ pub fn validate_product(bytes: &[u8]) -> bool {
     r.u64()?; // source_mtime_ns
     r.u64()?; // source_xxh3
     r.u64()?; // grammar_digest
-    r.u8()?; // parse_errors
+    r.u32()?; // error_nodes
     for _ in 0..r.count()? {
       walk_entry(&mut r)?;
       r.u8()?;
@@ -606,7 +609,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
   let source_mtime_ns = r.u64()?;
   let source_xxh3 = r.u64()?;
   let grammar_digest = r.u64()?;
-  let parse_errors = r.u8()? != 0;
+  let error_nodes = r.u32()?;
   let item_count = r.count()?;
   let mut items = Vec::with_capacity(item_count);
   for _ in 0..item_count {
@@ -655,7 +658,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     source_mtime_ns,
     source_xxh3,
     grammar_digest,
-    parse_errors,
+    error_nodes,
     items,
     refs,
   })
@@ -674,7 +677,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
   let source_mtime_ns = r.u64()?;
   let source_xxh3 = r.u64()?;
   let grammar_digest = r.u64()?;
-  let parse_errors = r.u8()? != 0;
+  let error_nodes = r.u32()?;
   let item_count = r.count()?;
   let mut items = Vec::with_capacity(item_count);
   for _ in 0..item_count {
@@ -723,7 +726,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     source_mtime_ns,
     source_xxh3,
     grammar_digest,
-    parse_errors,
+    error_nodes,
     items,
     refs,
   })
@@ -828,8 +831,8 @@ mod tests {
     // A corrupt huge count fails fast instead of allocating unboundedly.
     let mut huge_count = bytes.clone();
     // item_count sits after magic(4) + version(4) + stat stamp(16) + digest(8) +
-    // grammar_digest(8) + errflag(1).
-    huge_count[41..45].copy_from_slice(&u32::MAX.to_le_bytes());
+    // grammar_digest(8) + error_nodes(4).
+    huge_count[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(decode_product(&huge_count).is_err());
   }
 }
