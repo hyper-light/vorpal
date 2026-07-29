@@ -443,8 +443,10 @@ fn verified_mode_catches_stale_banked_products() {
   // Change the other file so the whole-tree fast path cannot short-circuit the bank replay.
   fs::write(&other, "pub fn other_b() -> u32 { 9 }\n").unwrap();
 
-  // fast-stat: the stale banked product replays — the documented blind spot.
-  build_index(&src, &out).unwrap();
+  // fast-stat, selected EXPLICITLY (another test sets VORPAL_VERIFY_CACHE=1 process-wide,
+  // and this assertion is about the mode contract, not the env default): the stale banked
+  // product replays — the documented blind spot.
+  vorpal_index::build_index_with(&src, &out, vorpal_index::CacheMode::FastStat).unwrap();
   let kg = Kg::load(&out).unwrap();
   assert_eq!(
     kg.nodes_named("mode_two").len(),

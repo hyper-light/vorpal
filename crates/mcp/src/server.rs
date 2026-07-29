@@ -25,6 +25,10 @@ const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 pub struct Server {
   index_dir: PathBuf,
   kg: Option<Kg>,
+  /// The resolved generation directory the cached graph was loaded from — the artifacts a
+  /// `why` snippet is digest-verified against, so a concurrent `CURRENT` swap can never split
+  /// an answer from the pinned graph that produced its ids.
+  kg_dir: Option<PathBuf>,
   watch: Option<SourceWatch>,
 }
 
@@ -42,6 +46,7 @@ impl Server {
     Self {
       index_dir,
       kg: None,
+      kg_dir: None,
       watch,
     }
   }
@@ -59,10 +64,16 @@ impl Server {
     }
     let rebuilt = build_index(watch.src(), &self.index_dir)
       .map_err(|err| err.to_string())
-      .and_then(|_| Kg::load(&self.index_dir).map_err(|err| err.to_string()));
+      .and_then(|_| {
+        let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+        Kg::load(&dir)
+          .map(|kg| (kg, dir))
+          .map_err(|err| err.to_string())
+      });
     match rebuilt {
-      Ok(kg) => {
+      Ok((kg, dir)) => {
         self.kg = Some(kg);
+        self.kg_dir = Some(dir);
         // Warm the vector tier in the background so the *next* semantic search never pays
         // the build. Best-effort: a failure just means the search that needs it builds it
         // (and reports its own error); the in-process build lock prevents duplicate work
@@ -141,8 +152,11 @@ impl Server {
         };
         let report = vorpal_index::build_index_with(Path::new(&src), &self.index_dir, mode)
           .map_err(|err| err.to_string())?;
-        // Reload so queries serve the fresh graph (a cheap mmap cold-open).
-        self.kg = Some(Kg::load(&self.index_dir).map_err(|err| err.to_string())?);
+        // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
+        // new generation directory alongside it.
+        let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+        self.kg = Some(Kg::load(&dir).map_err(|err| err.to_string())?);
+        self.kg_dir = Some(dir);
         Ok(if report.reused {
           format!("unchanged — reused existing index ({} nodes)", report.nodes)
         } else {
@@ -236,8 +250,13 @@ impl Server {
           .get("to_id")
           .and_then(Value::as_u64)
           .ok_or_else(|| "missing required argument: to_id".to_string())?;
-        self.kg()?; // daemon contract: surface the "index first" error before path queries
-        vorpal_index::explain_edge(&self.index_dir, from_id, to_id).map_err(|err| err.to_string())
+        // Answer from the pinned graph + its generation dir: id-consistent with the queries
+        // that produced these ids, and the snippet digest-checks against the same generation.
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let kg = self.kg.as_ref().expect("pinned above");
+        vorpal_index::explain_edge_on(kg, dir.as_deref(), from_id, to_id)
+          .map_err(|err| err.to_string())
       }
       "reachable" => {
         let name = str_arg("name")?;
@@ -295,13 +314,15 @@ impl Server {
   /// The warm graph: lazily cold-open the persisted index on first query, then reuse.
   fn kg(&mut self) -> Result<&Kg, String> {
     if self.kg.is_none() {
-      let loaded = Kg::load(&self.index_dir).map_err(|err| {
+      let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+      let loaded = Kg::load(&dir).map_err(|err| {
         format!(
           "no index loaded from {} — call the 'index' tool first ({err})",
           self.index_dir.display()
         )
       })?;
       self.kg = Some(loaded);
+      self.kg_dir = Some(dir);
     }
     Ok(self.kg.as_ref().expect("just loaded"))
   }

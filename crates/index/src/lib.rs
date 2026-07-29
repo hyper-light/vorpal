@@ -1119,7 +1119,25 @@ pub fn explain_edge(
   from_id: u64,
   to_id: u64,
 ) -> Result<String, Box<dyn Error>> {
-  let kg = Kg::load(index_dir)?;
+  // Pin one generation for the whole answer: the graph, the evidence rows, and the snippet
+  // digest check all come from the directory CURRENT names right now.
+  let dir = vorpal_kg::resolve_index_dir(index_dir);
+  let kg = Kg::load(&dir)?;
+  explain_edge_on(&kg, Some(&dir), from_id, to_id)
+}
+
+/// [`explain_edge`] over an already-loaded graph — the daemon form, which answers from its
+/// pinned generation instead of re-resolving the index path (a concurrent `CURRENT` swap can
+/// never split the answer from the query that produced the ids). `artifacts_dir` is the
+/// generation directory the graph was loaded from: when given, the snippet is shown only if
+/// the file's current bytes still match the digest that generation indexed — otherwise the
+/// snippet is omitted with an explicit note, never silently inconsistent.
+pub fn explain_edge_on(
+  kg: &Kg,
+  artifacts_dir: Option<&Path>,
+  from_id: u64,
+  to_id: u64,
+) -> Result<String, Box<dyn Error>> {
   let (from, to) = (NodeId::new(from_id), NodeId::new(to_id));
   let (Some(from_view), Some(to_view)) = (kg.node(from), kg.node(to)) else {
     return Err(format!("no such node id ({from_id} and/or {to_id})").into());
@@ -1155,13 +1173,32 @@ pub fn explain_edge(
       row.span_start,
       row.span_end
     );
-    // Best-effort snippet of the current file bytes at the recorded span.
+    // Snippet, digest-verified against the pinned generation (IMPROVEMENTS 07-29 §4): shown
+    // only when the file's current bytes still match the digest this generation indexed, so
+    // the rendered token can never be silently inconsistent with the edge. Without a pack
+    // digest to check (older generation), the snippet is labeled as current-file contents.
     if let Ok(bytes) = fs::read(&from_path) {
-      let (s, e) = (row.span_start as usize, row.span_end as usize);
-      if e <= bytes.len() && s < e && e - s <= 200 {
-        if let Ok(text) = std::str::from_utf8(&bytes[s..e]) {
-          let _ = writeln!(out, "    `{}` (current file contents)", text.trim());
+      let indexed_digest = artifacts_dir
+        .and_then(|dir| PackReader::open(dir))
+        .and_then(|pack| {
+          pack
+            .get(&from_path)
+            .and_then(vorpal_ingest::peek_product_digest)
+        });
+      let (verdict, show) = match indexed_digest {
+        Some(digest) if xxhash_rust::xxh3::xxh3_64(&bytes) == digest => ("source verified", true),
+        Some(_) => ("", false),
+        None => ("current file contents", true),
+      };
+      if show {
+        let (s, e) = (row.span_start as usize, row.span_end as usize);
+        if e <= bytes.len() && s < e && e - s <= 200 {
+          if let Ok(text) = std::str::from_utf8(&bytes[s..e]) {
+            let _ = writeln!(out, "    `{}` ({verdict})", text.trim());
+          }
         }
+      } else {
+        let _ = writeln!(out, "    (file changed since indexing — snippet omitted)");
       }
     }
   }
