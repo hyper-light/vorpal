@@ -957,8 +957,8 @@ fn resolution_matrix_across_languages() {
       "{target}: caller must resolve cross-file:\n{rendered}"
     );
     assert!(
-      rendered.contains("cross-file") || rendered.contains("local"),
-      "{target}: the edge must carry a resolution-confidence label:\n{rendered}"
+      rendered.contains("constrained") || rendered.contains("exact"),
+      "{target}: the edge must carry a resolution grade:\n{rendered}"
     );
   }
   let _ = fs::remove_dir_all(&base);

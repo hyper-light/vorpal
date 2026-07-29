@@ -915,14 +915,16 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
   })
 }
 
-/// Human label for a packed edge confidence (values from `vorpal_resolve::Confidence`).
+/// The grade of a packed edge confidence. A confidence of `0` is a *structural* edge (containment
+/// like `defines`/`has_method`, certain by construction) — not an unresolved reference, which
+/// never becomes an edge; everything else carries a resolution grade from the single shared
+/// vocabulary ([`vorpal_ingest::ResolutionGrade`]), so a caller can tell an exact binding from a
+/// heuristic guess.
 fn confidence_label(confidence: u8) -> &'static str {
-  match confidence {
-    100.. => "local",
-    41..=99 => "cross-file",
-    1..=40 => "approx",
-    0 => "structural",
+  if confidence == 0 {
+    return "structural";
   }
+  vorpal_ingest::ResolutionGrade::from_confidence(vorpal_ingest::Confidence(confidence)).label()
 }
 
 /// Render selector candidates with their identities — enough to refine to exactly one.

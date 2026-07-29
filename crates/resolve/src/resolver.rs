@@ -19,6 +19,53 @@ impl Confidence {
   pub const CROSS_FILE: Confidence = Confidence(90);
   /// A single definition in the same file — the strongest binding.
   pub const LOCAL: Confidence = Confidence(100);
+
+  /// The categorical [`ResolutionGrade`] of this confidence.
+  pub fn grade(self) -> ResolutionGrade {
+    ResolutionGrade::from_confidence(self)
+  }
+}
+
+/// The explicit, ordinal grade of a resolution — the categorical view of [`Confidence`] a
+/// consumer branches on to tell a proven binding from a best guess, without interpreting a raw
+/// score. This is the single grade vocabulary shared by the CLI, MCP, and bindings (§3.3, §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResolutionGrade {
+  /// No definition was visible: no edge (or a name-only membership).
+  Unresolved,
+  /// Several definitions carried the name; the target is a deterministic best guess, not a bound
+  /// reference — approximate, and labeled as such.
+  Heuristic,
+  /// A single visible exported definition in another file: constrained to one candidate, but not
+  /// a lexical binding (no import/scope proof).
+  Constrained,
+  /// A single definition in the same file: an exact lexical binding.
+  Exact,
+}
+
+impl ResolutionGrade {
+  /// Map a confidence score to its grade using the [`Confidence`] tier constants.
+  pub fn from_confidence(c: Confidence) -> Self {
+    if c >= Confidence::LOCAL {
+      Self::Exact
+    } else if c >= Confidence::CROSS_FILE {
+      Self::Constrained
+    } else if c > Confidence::NONE {
+      Self::Heuristic
+    } else {
+      Self::Unresolved
+    }
+  }
+
+  /// A stable lowercase label for output and machine consumers.
+  pub fn label(self) -> &'static str {
+    match self {
+      Self::Exact => "exact",
+      Self::Constrained => "constrained",
+      Self::Heuristic => "heuristic",
+      Self::Unresolved => "unresolved",
+    }
+  }
 }
 
 /// The outcome of resolving one reference.
@@ -790,5 +837,21 @@ mod tests {
     assert_eq!(stats.external, 1);
     assert_eq!(stats.masked, 1);
     assert_eq!(stats.unresolved(), 2);
+  }
+}
+
+#[cfg(test)]
+mod grade_tests {
+  use super::{Confidence, ResolutionGrade};
+
+  #[test]
+  fn grade_maps_each_confidence_tier() {
+    assert_eq!(Confidence::LOCAL.grade(), ResolutionGrade::Exact);
+    assert_eq!(Confidence::CROSS_FILE.grade(), ResolutionGrade::Constrained);
+    assert_eq!(Confidence::AMBIGUOUS.grade(), ResolutionGrade::Heuristic);
+    assert_eq!(Confidence::NONE.grade(), ResolutionGrade::Unresolved);
+    // Ordered strongest-last so `>=` comparisons rank grades.
+    assert!(ResolutionGrade::Exact > ResolutionGrade::Heuristic);
+    assert_eq!(ResolutionGrade::Exact.label(), "exact");
   }
 }

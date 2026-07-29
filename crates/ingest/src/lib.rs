@@ -35,7 +35,9 @@ pub use product::{
   validate_product,
 };
 pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
-pub use vorpal_resolve::{RefKind, Reference, ResolveStats, Resolver};
+pub use vorpal_resolve::{
+  Confidence, RefKind, Reference, ResolutionGrade, ResolveStats, Resolver,
+};
 
 /// The grammar-generation digest for the language of `path`, or `None` if the path maps to no
 /// supported language. The product-cache replay gate compares this against the digest a cached

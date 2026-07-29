@@ -24,7 +24,8 @@ mod table;
 pub use intern::NameId;
 pub use reference::{RefForm, RefKind, Reference};
 pub use resolver::{
-  Confidence, Resolution, ResolveStats, ResolvedEdge, Resolver, resolve_all, resolve_all_spilled,
+  Confidence, Resolution, ResolutionGrade, ResolveStats, ResolvedEdge, Resolver, resolve_all,
+  resolve_all_spilled,
   resolve_all_spilled_into,
 };
 pub use spill::{RefSpill, RefSpillWriter};
