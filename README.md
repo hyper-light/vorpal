@@ -252,6 +252,7 @@ Graph tools accept unambiguous symbol **selectors** — refine `name` with `path
 | `reachable` | `name`, `direction: "in"\|"out"`, `relations?`, `max_depth?` | Relation-specific transitive closure (default `relations: ["calls"]`, so transitive callers never cross a non-call edge) |
 | `structural_search` | `pattern`, `lang`, `path?`, `limit?` | ast-grep-style AST pattern match over the source tree (`$X`, `$$$ARGS`) → `path:line` + matched text |
 | `fetch_span` | `id`, `max_bytes?` | The verbatim defining source of a graph node |
+| `why` | `from_id`, `to_id` | Evidence for the edge(s) between two nodes: each occurrence's edge type, resolution grade, resolver reason, candidate count, and source span |
 | `search` | `query`, `k?` | Hybrid search, top-k with a per-channel score breakdown (name / lexical-vector / graph prior, RRF) |
 
 A raw session, if you want to script it:

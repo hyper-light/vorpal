@@ -244,26 +244,43 @@ pub fn link_writer(
 
 /// [`link_writer`] over a spilled reference stream: the same table build, resolution, and
 /// seal, with references streamed off disk in bounded chunks (identical output — chunking is
-/// invisible to per-reference resolution) and the spill deleted once resolved.
+/// invisible to per-reference resolution) and the spill deleted once resolved. Also returns
+/// the per-edge evidence rows (span, resolver reason, confidence, candidate count) resolution
+/// produced — the caller persists them as the generation's `evidence.bin` sidecar (§5), so
+/// every persisted relation can answer "why does this exist?".
 pub fn link_writer_spilled(
   mut writer: KgWriter,
   spill: vorpal_resolve::RefSpill,
   resolver: &Resolver,
-) -> io::Result<(Kg, ResolveStats)> {
+) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
   phase_trace("link: table build start");
   let table = build_symbol_table(&writer);
   release_freed_pages();
   phase_trace("link: resolve start");
   // Edges stream straight into the writer's edge log, in resolution order — the collected
-  // edge vector was ~90 MB alive under the seal at kernel scale.
+  // edge vector was ~90 MB alive under the seal at kernel scale. Evidence rows are collected
+  // alongside (24 bytes per emitted edge; they must all exist before the canonical sort that
+  // makes the sidecar deterministic, so streaming them out is not an option).
+  let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::new();
   let stats = {
     let writer = &mut writer;
+    let evidence = &mut evidence;
     vorpal_resolve::resolve_all_spilled_into(&table, &spill, resolver, |edge| {
       writer.add_edge(
         edge.from,
         edge.to,
         edge.edge.with_confidence(edge.confidence),
       );
+      evidence.push(vorpal_kg::EvidenceRow {
+        from: edge.from.raw() as u32,
+        to: edge.to.raw() as u32,
+        etype: edge.edge.base().0,
+        reason: edge.reason as u8,
+        confidence: edge.confidence,
+        candidates: edge.candidates,
+        span_start: edge.span.0,
+        span_end: edge.span.1,
+      });
     })?
   };
   phase_trace("link: resolve done");
@@ -276,7 +293,7 @@ pub fn link_writer_spilled(
   let kg = writer.seal();
   release_freed_pages();
   phase_trace("link: seal done");
-  Ok((kg, stats))
+  Ok((kg, stats, evidence))
 }
 
 /// Fewer files than this per shard and the fan-out overhead outweighs the win: small trees

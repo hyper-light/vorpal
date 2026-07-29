@@ -366,7 +366,11 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve) = link_writer_spilled(writer, spilled_refs, &Resolver::new())?;
+  let (kg, resolve, evidence) = link_writer_spilled(writer, spilled_refs, &Resolver::new())?;
+  // Persist the per-edge evidence sidecar into the staged generation (§5): span, resolver
+  // reason, confidence, and candidate count per edge occurrence — canonically sorted, so it
+  // joins the generation's content identity deterministically.
+  vorpal_kg::save_evidence(&staging, evidence)?;
   // Embeddings stay off the commit hot path (§3.4): the graph persists now; the ANN tier is
   // built lazily by the first search and validated by stamp, so incremental re-indexes never
   // pay a full vector-graph rebuild (at kernel scale that rebuild dominated the whole run).
@@ -393,7 +397,8 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
 /// (sorted) order. Lazy sidecars added after commit (the ANN tier) are deliberately excluded:
 /// they are stamp-validated against the node segment, deterministic given the generation, and
 /// must not change its identity.
-const GENERATION_ARTIFACTS: [&str; 7] = [
+const GENERATION_ARTIFACTS: [&str; 8] = [
+  "evidence.bin",
   "graph.bin",
   "manifest.bin",
   "names.idx",
@@ -1050,6 +1055,65 @@ pub fn graph_query(index_dir: &Path, verb: &str, name: &str) -> Result<String, B
 /// Run one graph verb against a selected target. Identity contract (IMPROVEMENTS §1): a
 /// name that matches several definitions is answered with the **candidates**, not a silent
 /// union — refine with `id`/`path_suffix`/`kind`, or pass `merge_all` to union explicitly.
+/// Answer "why does this relation exist?" for the edge(s) `from_id → to_id` (§5): every
+/// retained occurrence's edge type, resolution grade + resolver reason, candidate count, and
+/// the source span of the referencing token — with a best-effort snippet of the *current* file
+/// bytes at that span (labeled as such; files may have drifted since indexing, exactly as with
+/// `fetch_span`).
+pub fn explain_edge(
+  index_dir: &Path,
+  from_id: u64,
+  to_id: u64,
+) -> Result<String, Box<dyn Error>> {
+  let kg = Kg::load(index_dir)?;
+  let (from, to) = (NodeId::new(from_id), NodeId::new(to_id));
+  let (Some(from_view), Some(to_view)) = (kg.node(from), kg.node(to)) else {
+    return Err(format!("no such node id ({from_id} and/or {to_id})").into());
+  };
+  let rows = kg.edge_evidence(from, to);
+  if rows.is_empty() {
+    return Ok(format!(
+      "(no recorded evidence for {} → {} — structural edges carry none, and generations \
+       written before the evidence sidecar record none)\n",
+      from_view.name, to_view.name
+    ));
+  }
+  let mut out = String::new();
+  let _ = writeln!(
+    out,
+    "{} → {}  ({} occurrence{})",
+    from_view.name,
+    to_view.name,
+    rows.len(),
+    if rows.len() == 1 { "" } else { "s" }
+  );
+  let from_path = from_view.path.to_string();
+  for row in rows {
+    let reason = vorpal_ingest::ResolveReason::from_tag(row.reason).label();
+    let grade = confidence_label(row.confidence);
+    let _ = writeln!(
+      out,
+      "  {}  [{grade}; {reason}; {} candidate{}]  {}:{}..{}",
+      vorpal_kg::EdgeType(row.etype).name(),
+      row.candidates,
+      if row.candidates == 1 { "" } else { "s" },
+      from_path,
+      row.span_start,
+      row.span_end
+    );
+    // Best-effort snippet of the current file bytes at the recorded span.
+    if let Ok(bytes) = fs::read(&from_path) {
+      let (s, e) = (row.span_start as usize, row.span_end as usize);
+      if e <= bytes.len() && s < e && e - s <= 200 {
+        if let Ok(text) = std::str::from_utf8(&bytes[s..e]) {
+          let _ = writeln!(out, "    `{}` (current file contents)", text.trim());
+        }
+      }
+    }
+  }
+  Ok(out)
+}
+
 pub fn graph_query_selected(
   index_dir: &Path,
   verb: &str,

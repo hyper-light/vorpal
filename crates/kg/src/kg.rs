@@ -181,6 +181,10 @@ pub struct Kg {
   /// Where the heap bytes already live on disk, when they do (streamed commit or load) —
   /// lets `save` rename or skip instead of rewriting a file readers may have mapped.
   heap_file: Option<std::path::PathBuf>,
+  /// Per-edge evidence sidecar (`evidence.bin`), mapped zero-copy. `None` for in-RAM graphs
+  /// and generations written before the sidecar existed — queries answer "no evidence
+  /// recorded", never an error.
+  evidence: Option<crate::evidence::EvidenceStore>,
   graph: Graph,
   directory: SegmentDirectory,
 }
@@ -219,6 +223,7 @@ impl Kg {
       heap,
       heap_file,
       names: None,
+      evidence: None,
       graph,
       directory,
     })
@@ -226,6 +231,27 @@ impl Kg {
 
   pub fn node_count(&self) -> usize {
     self.nodes.row_count() as usize
+  }
+
+  /// Every retained evidence occurrence for edges `from → to` (all edge types): the source
+  /// span of each referencing token, the resolver branch that bound it, its confidence, and
+  /// the candidate count — "why does this relation exist?" (§5). Empty when the generation
+  /// carries no sidecar or the pair has none.
+  pub fn edge_evidence(&self, from: NodeId, to: NodeId) -> Vec<crate::evidence::EvidenceRow> {
+    self
+      .evidence
+      .as_ref()
+      .map(|store| store.edges_between(from.raw() as u32, to.raw() as u32))
+      .unwrap_or_default()
+  }
+
+  /// Every retained evidence occurrence originating at `from` — the one-sided form.
+  pub fn evidence_from(&self, from: NodeId) -> Vec<crate::evidence::EvidenceRow> {
+    self
+      .evidence
+      .as_ref()
+      .map(|store| store.edges_from(from.raw() as u32))
+      .unwrap_or_default()
   }
 
   /// The sealed node segment's raw bytes. The ANN freshness stamp is `xxh3` of exactly these
@@ -588,6 +614,7 @@ impl Kg {
       ));
     }
     kg.names = open_names_index(dir, &policy, kg.node_count());
+    kg.evidence = crate::evidence::EvidenceStore::open(dir);
     Ok(kg)
   }
 

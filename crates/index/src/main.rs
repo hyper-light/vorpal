@@ -40,6 +40,7 @@ const USAGE: &str = "usage:
   vorpal-index implementors <index-dir> <name>      types implementing/extending a symbol
   vorpal-index typeusers    <index-dir> <name>      definitions using a type
   vorpal-index node         <index-dir> <name>      nodes matching a name
+  vorpal-index why          <index-dir> <from-id> <to-id>  evidence for the edge(s) from → to
   vorpal-index search       <index-dir> <query> [k] hybrid search (name + semantic + graph, RRF)";
 
 /// Route tree-sitter's C-side allocations through jemalloc too. Without this the parser's
@@ -121,6 +122,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       print!(
         "{}",
         vorpal_index::graph_query_selected(Path::new(index), verb, &target)?
+      );
+      Ok(())
+    }
+    ["why", index, from_id, to_id] => {
+      print!(
+        "{}",
+        vorpal_index::explain_edge(Path::new(index), from_id.parse()?, to_id.parse()?)?
       );
       Ok(())
     }

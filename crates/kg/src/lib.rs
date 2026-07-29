@@ -11,11 +11,13 @@
 //!
 //! [`KgWriter`] accumulates and [`KgWriter::seal`]s into a queryable [`Kg`].
 
+mod evidence;
 mod kg;
 mod model;
 mod writer;
 
 pub use kg::{Kg, NodeView, SymbolSelector, resolve_index_dir};
+pub use evidence::{EvidenceRow, EvidenceStore, save as save_evidence};
 pub use model::SymbolKind;
 pub use writer::{KgWriter, NodeDef, layout_entity_paths};
 

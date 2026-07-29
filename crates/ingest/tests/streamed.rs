@@ -195,7 +195,7 @@ fn spilled_references_are_byte_identical_to_the_ram_path() {
   .expect("spilled stream succeeds");
   assert_eq!(stats.parsed, 120);
   assert!(spill.count() > 0, "corpus produces references");
-  let (spilled_kg, spilled_stats) =
+  let (spilled_kg, spilled_stats, _evidence) =
     link_writer_spilled(writer, spill, &Resolver::new()).expect("spilled link succeeds");
   assert!(
     !spill_path.exists(),

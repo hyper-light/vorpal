@@ -36,7 +36,7 @@ pub use product::{
 };
 pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
 pub use vorpal_resolve::{
-  Confidence, RefKind, Reference, ResolutionGrade, ResolveStats, Resolver,
+  Confidence, RefKind, Reference, ResolutionGrade, ResolveReason, ResolveStats, Resolver,
 };
 
 /// The grammar-generation digest for the language of `path`, or `None` if the path maps to no

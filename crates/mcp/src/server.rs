@@ -215,6 +215,18 @@ impl Server {
         let kg = self.kg()?;
         crate::tools::fetch_span(kg, id, max_bytes.clamp(64, 262_144))
       }
+      "why" => {
+        let from_id = args
+          .get("from_id")
+          .and_then(Value::as_u64)
+          .ok_or_else(|| "missing required argument: from_id".to_string())?;
+        let to_id = args
+          .get("to_id")
+          .and_then(Value::as_u64)
+          .ok_or_else(|| "missing required argument: to_id".to_string())?;
+        self.kg()?; // daemon contract: surface the "index first" error before path queries
+        vorpal_index::explain_edge(&self.index_dir, from_id, to_id).map_err(|err| err.to_string())
+      }
       "reachable" => {
         let name = str_arg("name")?;
         let direction = str_arg("direction")?;
@@ -358,6 +370,17 @@ fn tools_list() -> Value {
         "max_bytes": {"type": "integer", "description": "Clamp returned source (default 16384)"}
       }),
       &["id"],
+    ),
+    tool(
+      "why",
+      "Evidence for the edge(s) from one node to another: each retained occurrence's edge \
+       type, resolution grade, resolver reason, candidate count, and source span — why does \
+       this relation exist?",
+      json!({
+        "from_id": {"type": "integer", "description": "Source node id (from any graph tool's id output)"},
+        "to_id": {"type": "integer", "description": "Target node id"}
+      }),
+      &["from_id", "to_id"],
     ),
     tool(
       "search",

@@ -304,6 +304,53 @@ fn legacy_flat_index_migrates_on_rebuild() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// Every persisted relation can answer "why does this relation exist?" (§5): the evidence
+/// sidecar retains span, resolver reason, grade, and candidate count per edge occurrence.
+#[test]
+fn edges_explain_why_they_exist() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-why-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("b.rs"), "pub fn target() -> i32 {\n    0\n}\n").unwrap();
+  fs::write(
+    src.join("a.rs"),
+    "pub fn caller() -> i32 {\n    target() + target()\n}\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  let kg = Kg::load(&out).unwrap();
+  let caller = kg.nodes_named("caller")[0];
+  let target = kg.nodes_named("target")[0];
+
+  // Library surface: both occurrences retained, with the exact resolver branch.
+  let rows = kg.edge_evidence(caller, target);
+  assert_eq!(rows.len(), 2, "both call sites must be retained: {rows:?}");
+  for row in &rows {
+    assert_eq!(vorpal_kg::EdgeType(row.etype), vorpal_kg::EdgeType::CALLS);
+    assert_eq!(row.reason, 6, "single visible export: {row:?}"); // VisibleExport
+    assert_eq!(row.candidates, 1);
+    assert!(row.span_start < row.span_end);
+  }
+  assert!(rows[0].span_start < rows[1].span_start, "canonical span order");
+
+  // Rendered surface: grade + reason + span, and the snippet names the referenced token.
+  let rendered =
+    vorpal_index::explain_edge(&out, caller.raw(), target.raw()).unwrap();
+  assert!(rendered.contains("calls"), "{rendered}");
+  assert!(rendered.contains("constrained"), "{rendered}");
+  assert!(rendered.contains("visible-export"), "{rendered}");
+  assert!(rendered.contains("target"), "{rendered}");
+
+  // A pair with no edge answers honestly.
+  let none = vorpal_index::explain_edge(&out, target.raw(), caller.raw()).unwrap();
+  assert!(none.contains("no recorded evidence"), "{none}");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn semantic_search_finds_definitions_by_description() {
   let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));

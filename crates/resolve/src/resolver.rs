@@ -68,6 +68,59 @@ impl ResolutionGrade {
   }
 }
 
+/// *Why* a resolution chose its target — the exact resolver branch that produced the edge,
+/// persisted per edge occurrence so every relation can answer "why does this exist?" (§5).
+/// Stored on disk as its `u8` tag; unknown future tags render as `unknown`, never fail.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveReason {
+  /// No edge was produced (unresolved/masked) — never persisted.
+  None = 0,
+  /// A path-form import matched an indexed file node exactly.
+  ImportPath = 1,
+  /// A grammar-provided qualifier corroborated a single candidate.
+  Qualified = 2,
+  /// A grammar-provided qualifier corroborated several; deterministic tie pick (approximate).
+  QualifiedTie = 3,
+  /// A single definition in the referencing file (the strongest binding).
+  Local = 4,
+  /// Several same-file definitions; deterministic tie pick (approximate).
+  LocalTie = 5,
+  /// A single cross-file definition visible here (exported, or structurally private-visible).
+  VisibleExport = 6,
+  /// Several visible cross-file candidates; deterministic tie pick (approximate).
+  VisibleTie = 7,
+}
+
+impl ResolveReason {
+  pub fn from_tag(tag: u8) -> Self {
+    match tag {
+      1 => Self::ImportPath,
+      2 => Self::Qualified,
+      3 => Self::QualifiedTie,
+      4 => Self::Local,
+      5 => Self::LocalTie,
+      6 => Self::VisibleExport,
+      7 => Self::VisibleTie,
+      _ => Self::None,
+    }
+  }
+
+  /// Stable lowercase label for output and machine consumers.
+  pub fn label(self) -> &'static str {
+    match self {
+      Self::None => "unknown",
+      Self::ImportPath => "import-path",
+      Self::Qualified => "qualifier-match",
+      Self::QualifiedTie => "qualifier-tie",
+      Self::Local => "same-file",
+      Self::LocalTie => "same-file-tie",
+      Self::VisibleExport => "visible-export",
+      Self::VisibleTie => "visible-tie",
+    }
+  }
+}
+
 /// The outcome of resolving one reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolution {
@@ -77,15 +130,24 @@ pub struct Resolution {
   pub confidence: Confidence,
   /// How many definitions carried the referenced name (for transparency).
   pub candidates: usize,
+  /// The resolver branch that produced (or declined) the target.
+  pub reason: ResolveReason,
 }
 
-/// A resolved reference ready to become a graph edge.
+/// A resolved reference ready to become a graph edge, carrying its evidence: the source span
+/// of the referencing occurrence, the resolver branch that bound it, and how many candidates
+/// carried the name — everything the persisted evidence sidecar retains per edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedEdge {
   pub from: NodeId,
   pub to: NodeId,
   pub edge: EdgeType,
   pub confidence: u8,
+  /// Byte span of the referencing occurrence within `from`'s file.
+  pub span: (u32, u32),
+  pub reason: ResolveReason,
+  /// Candidate count at resolve time (saturated to `u32`).
+  pub candidates: u32,
 }
 
 /// Counts from a resolution batch. `external + masked` is the total left without an edge.
@@ -160,6 +222,7 @@ impl Resolver {
           edge,
           confidence: Confidence::CROSS_FILE,
           candidates: 1,
+          reason: ResolveReason::ImportPath,
         };
       }
     }
@@ -170,6 +233,7 @@ impl Resolver {
         edge,
         confidence: Confidence::NONE,
         candidates: 0,
+        reason: ResolveReason::None,
       };
     }
 
@@ -190,6 +254,7 @@ impl Resolver {
           edge,
           candidates.len(),
           true,
+          true,
           &mut scratch.local,
           &mut scratch.visible,
         );
@@ -203,6 +268,7 @@ impl Resolver {
           edge,
           confidence: Confidence::NONE,
           candidates: candidates.len(),
+          reason: ResolveReason::None,
         };
       }
     }
@@ -216,6 +282,7 @@ impl Resolver {
       edge,
       candidates.len(),
       guess_on_tie,
+      false,
       &mut scratch.local,
       &mut scratch.visible,
     )
@@ -238,6 +305,7 @@ fn finish(
   edge: EdgeType,
   candidates: usize,
   guess_on_tie: bool,
+  via_qualifier: bool,
   local: &mut Vec<Symbol>,
   visible: &mut Vec<Symbol>,
 ) -> Resolution {
@@ -249,7 +317,7 @@ fn finish(
       .copied(),
   );
   if !local.is_empty() {
-    return pick(local, edge, Confidence::LOCAL, candidates, guess_on_tie);
+    return pick(local, edge, Confidence::LOCAL, candidates, guess_on_tie, via_qualifier);
   }
 
   // Resolve the reference's path text once per reference, not once per candidate.
@@ -268,6 +336,7 @@ fn finish(
       edge,
       confidence: Confidence::NONE,
       candidates,
+      reason: ResolveReason::None,
     };
   }
   pick(
@@ -276,6 +345,7 @@ fn finish(
     Confidence::CROSS_FILE,
     candidates,
     guess_on_tie,
+    via_qualifier,
   )
 }
 
@@ -407,21 +477,40 @@ fn pick(
   unique: Confidence,
   candidates: usize,
   guess_on_tie: bool,
+  via_qualifier: bool,
 ) -> Resolution {
   if set.len() == 1 {
+    // The reason names the branch that bound the target: qualifier corroboration when it
+    // narrowed the set, else the visibility tier the unique candidate came from.
+    let reason = if via_qualifier {
+      ResolveReason::Qualified
+    } else if unique >= Confidence::LOCAL {
+      ResolveReason::Local
+    } else {
+      ResolveReason::VisibleExport
+    };
     Resolution {
       target: Some(set[0].id),
       edge,
       confidence: unique,
       candidates,
+      reason,
     }
   } else if guess_on_tie {
+    let reason = if via_qualifier {
+      ResolveReason::QualifiedTie
+    } else if unique >= Confidence::LOCAL {
+      ResolveReason::LocalTie
+    } else {
+      ResolveReason::VisibleTie
+    };
     let target = set.iter().min_by_key(|s| s.id.raw()).map(|s| s.id);
     Resolution {
       target,
       edge,
       confidence: Confidence::AMBIGUOUS,
       candidates,
+      reason,
     }
   } else {
     Resolution {
@@ -429,6 +518,7 @@ fn pick(
       edge,
       confidence: Confidence::NONE,
       candidates,
+      reason: ResolveReason::None,
     }
   }
 }
@@ -585,6 +675,9 @@ fn resolve_chunk(
           to,
           edge: resolution.edge,
           confidence: resolution.confidence.0,
+          span: reference.evidence,
+          reason: resolution.reason,
+          candidates: resolution.candidates.min(u32::MAX as usize) as u32,
         });
       }
       None => {
@@ -805,6 +898,9 @@ mod tests {
             to,
             edge: resolution.edge,
             confidence: resolution.confidence.0,
+            span: reference.evidence,
+            reason: resolution.reason,
+            candidates: resolution.candidates.min(u32::MAX as usize) as u32,
           });
         }
         None => {

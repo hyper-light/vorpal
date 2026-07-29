@@ -95,6 +95,7 @@ fn initialize_handshake_and_tool_listing() {
       "reachable",
       "structural_search",
       "fetch_span",
+      "why",
       "search"
     ]
   );
