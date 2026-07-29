@@ -132,8 +132,15 @@ impl Server {
     match tool {
       "index" => {
         let src = str_arg("src")?;
-        let report =
-          build_index(Path::new(&src), &self.index_dir).map_err(|err| err.to_string())?;
+        // Explicit cache-validity mode: `verify: true` selects content-authoritative
+        // validation (immune to preserved-mtime edits); default is fast-stat.
+        let mode = if args.get("verify").and_then(Value::as_bool).unwrap_or(false) {
+          vorpal_index::CacheMode::Verified
+        } else {
+          vorpal_index::CacheMode::default()
+        };
+        let report = vorpal_index::build_index_with(Path::new(&src), &self.index_dir, mode)
+          .map_err(|err| err.to_string())?;
         // Reload so queries serve the fresh graph (a cheap mmap cold-open).
         self.kg = Some(Kg::load(&self.index_dir).map_err(|err| err.to_string())?);
         Ok(if report.reused {
@@ -331,7 +338,10 @@ fn tools_list() -> Value {
       "index",
       "Build or refresh the knowledge-graph index from a source directory (near-instant when \
        the tree is unchanged), then hold it warm for queries.",
-      json!({"src": {"type": "string", "description": "Source directory to index"}}),
+      json!({
+        "src": {"type": "string", "description": "Source directory to index"},
+        "verify": {"type": "boolean", "description": "Content-authoritative cache validation: verify every replay against current file bytes (default fast-stat trusts size+mtime outside the racy window)"}
+      }),
       &["src"],
     ),
     tool("node", "Nodes matching an exact symbol name.", name_only.clone(), &["name"]),

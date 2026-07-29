@@ -57,6 +57,8 @@ pub struct IndexReport {
   pub external: u64,
   /// References with in-tree candidates none of which is safely attributable.
   pub masked: u64,
+  /// The cache-validity mode this run used (`fast-stat` / `verified`).
+  pub cache_mode: &'static str,
 }
 
 impl IndexReport {
@@ -85,8 +87,55 @@ fn stream_budget_bytes() -> u64 {
   (threads * 8 * 1024 * 1024).clamp(32 * 1024 * 1024, 512 * 1024 * 1024)
 }
 
-/// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`.
+/// How cache validity is decided (IMPROVEMENTS 07-29 §3) — an explicit, testable product
+/// contract instead of an environment convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheMode {
+  /// Stat (path, size, mtime) is trusted outside the racy-mtime window; content digests are
+  /// verified only inside it. Fast (a no-change re-index is a metadata sweep) with one
+  /// documented blind spot: a same-size edit whose mtime is deliberately preserved, made
+  /// outside the racy window, can replay stale extraction.
+  #[default]
+  FastStat,
+  /// Content-authoritative: every replay decision verifies the stored source digest against
+  /// the file's current bytes. Reads every candidate file — slower, and immune to
+  /// preserved-mtime edits. `VORPAL_VERIFY_CACHE=1` selects this mode for any entry point
+  /// that does not pass one explicitly (CI convention).
+  Verified,
+}
+
+impl CacheMode {
+  /// The mode the environment requests when a caller passes none.
+  fn from_env() -> CacheMode {
+    if std::env::var_os("VORPAL_VERIFY_CACHE").is_some_and(|v| v == "1") {
+      CacheMode::Verified
+    } else {
+      CacheMode::FastStat
+    }
+  }
+
+  pub fn label(self) -> &'static str {
+    match self {
+      CacheMode::FastStat => "fast-stat",
+      CacheMode::Verified => "verified",
+    }
+  }
+}
+
+/// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`,
+/// with cache validity decided by [`CacheMode::from_env`] (fast-stat unless
+/// `VORPAL_VERIFY_CACHE=1`).
 pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_with(src, out, CacheMode::from_env())
+}
+
+/// [`build_index`] with an explicit [`CacheMode`] — the first-class form CLI/MCP/bindings
+/// select rather than routing through an environment variable.
+pub fn build_index_with(
+  src: &Path,
+  out: &Path,
+  cache_mode: CacheMode,
+) -> Result<IndexReport, Box<dyn Error>> {
   let extractor = OutlineExtractor::new()?;
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
@@ -112,7 +161,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // within 2s of the previous manifest's write, where an edit can restore size+mtime within
   // timestamp granularity (the git racily-clean hazard). Both gates also suppress the
   // whole-tree reuse fast path below, which is otherwise stat-only.
-  let verify_all = std::env::var_os("VORPAL_VERIFY_CACHE").is_some_and(|v| v == "1");
+  let verify_all = cache_mode == CacheMode::Verified;
   let prior_manifest_ns: u64 = fs::metadata(&manifest_path)
     .and_then(|m| m.modified())
     .ok()
@@ -169,6 +218,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
       if let Ok(nodes) = Kg::peek_node_count(&prior) {
         return Ok(IndexReport {
           reused: true,
+          cache_mode: cache_mode.label(),
           error_files: 0,
           error_nodes: 0,
           indexed: 0,
@@ -381,6 +431,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   commit_generation(out, &prior, staging)?;
   Ok(IndexReport {
     reused: false,
+    cache_mode: cache_mode.label(),
     indexed: reparsed,
     skipped: replayed,
     error_files: error_files.into_inner(),

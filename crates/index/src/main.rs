@@ -33,7 +33,7 @@ mod jemalloc_conf {
 use vorpal_index::{build_index, search_index};
 
 const USAGE: &str = "usage:
-  vorpal-index index        <src-dir> <index-dir>   build + persist a knowledge graph
+  vorpal-index index        <src-dir> <index-dir> [--verify]  build + persist a knowledge graph
   vorpal-index callers      <index-dir> <name>      direct callers of a symbol
   vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
   vorpal-index importers    <index-dir> <name>      files importing a symbol
@@ -78,8 +78,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
   let args: Vec<String> = std::env::args().skip(1).collect();
   let argv: Vec<&str> = args.iter().map(String::as_str).collect();
   match argv.as_slice() {
-    ["index", src, out] => {
-      let report = build_index(Path::new(src), Path::new(out))?;
+    ["index", src, out] | ["index", src, out, "--verify"] => {
+      let mode = if argv.last() == Some(&"--verify") {
+        vorpal_index::CacheMode::Verified
+      } else {
+        vorpal_index::CacheMode::default()
+      };
+      let report = vorpal_index::build_index_with(Path::new(src), Path::new(out), mode)?;
       if report.reused {
         println!("unchanged — reused existing index ({} nodes)", report.nodes);
       } else {

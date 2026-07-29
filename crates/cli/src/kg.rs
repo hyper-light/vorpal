@@ -20,6 +20,11 @@ pub struct IndexArg {
   /// Index directory (default: `<src>/.vorpal/index`).
   #[clap(long)]
   out: Option<PathBuf>,
+  /// Content-authoritative cache validation: verify every replay against the file's current
+  /// bytes (immune to preserved-mtime edits; reads every candidate file). Default is
+  /// fast-stat, which trusts size+mtime outside the racy window.
+  #[clap(long)]
+  verify: bool,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -112,7 +117,12 @@ fn boxed(err: Box<dyn std::error::Error>) -> anyhow::Error {
 
 pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
   let out = arg.out.unwrap_or_else(|| arg.src.join(DEFAULT_INDEX_DIR));
-  let report = vorpal_index::build_index(&arg.src, &out)
+  let mode = if arg.verify {
+    vorpal_index::CacheMode::Verified
+  } else {
+    vorpal_index::CacheMode::default()
+  };
+  let report = vorpal_index::build_index_with(&arg.src, &out, mode)
     .map_err(boxed)
     .with_context(|| format!("indexing {}", arg.src.display()))?;
   if report.reused {
@@ -135,6 +145,9 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
         report.error_files, report.error_nodes
       );
     }
+  }
+  if report.cache_mode != "fast-stat" {
+    println!("cache mode: {}", report.cache_mode);
   }
   println!("index: {}", out.display());
   Ok(ExitCode::SUCCESS)

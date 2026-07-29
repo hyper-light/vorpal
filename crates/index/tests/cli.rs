@@ -405,6 +405,65 @@ fn external_id_bookmarks_survive_rebuilds() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// Explicit cache-validity modes (IMPROVEMENTS 07-29 §3), adversarial search-fed path: a
+/// banked product whose source then suffers a preserved-mtime same-size edit replays stale
+/// under `fast-stat` outside the racy window (the documented blind spot), and `Verified`
+/// catches it — as a first-class mode, not an env var.
+#[test]
+fn verified_mode_catches_stale_banked_products() {
+  use std::time::Duration;
+  let base = std::env::temp_dir().join(format!("vorpal-index-mode-{}", std::process::id()));
+  let src = base.join("src");
+  let out = src.join(".vorpal").join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  let victim = src.join("victim.rs");
+  let other = src.join("other.rs");
+  fs::write(&victim, "pub fn mode_one() -> u32 { 1 }\n").unwrap();
+  fs::write(&other, "pub fn other_a() -> u32 { 0 }\n").unwrap();
+  // Push the victim's mtime 10s into the past so nothing here lands in the racy window
+  // (which would verify digests and hide the blind spot this test documents).
+  let past = std::time::SystemTime::now() - Duration::from_secs(10);
+  let set_past = |p: &std::path::Path| {
+    let h = fs::OpenOptions::new().write(true).open(p).unwrap();
+    h.set_times(fs::FileTimes::new().set_modified(past)).unwrap();
+  };
+  set_past(&victim);
+  let first = build_index(&src, &out).unwrap();
+  assert_eq!(first.cache_mode, "fast-stat", "default mode is reported");
+
+  // Search banks a product for v2 (same size as v1, mtime restored to the past stamp)…
+  fs::write(&victim, "pub fn mode_two() -> u32 { 2 }\n").unwrap();
+  set_past(&victim);
+  assert!(vorpal_index::warm_product_cache(&victim).unwrap(), "banked");
+  // …then the file is edited again, same size, mtime restored: the banked product's stat
+  // still matches the file, but its content does not.
+  fs::write(&victim, "pub fn mode_ten() -> u32 { 3 }\n").unwrap();
+  set_past(&victim);
+  // Change the other file so the whole-tree fast path cannot short-circuit the bank replay.
+  fs::write(&other, "pub fn other_b() -> u32 { 9 }\n").unwrap();
+
+  // fast-stat: the stale banked product replays — the documented blind spot.
+  build_index(&src, &out).unwrap();
+  let kg = Kg::load(&out).unwrap();
+  assert_eq!(
+    kg.nodes_named("mode_two").len(),
+    1,
+    "fast-stat replays the stale bank (documented blind spot)"
+  );
+  drop(kg);
+
+  // Verified: content-authoritative — the stale bank is rejected and the file re-parses.
+  let report =
+    vorpal_index::build_index_with(&src, &out, vorpal_index::CacheMode::Verified).unwrap();
+  assert_eq!(report.cache_mode, "verified", "mode is reported");
+  let kg = Kg::load(&out).unwrap();
+  assert_eq!(kg.nodes_named("mode_ten").len(), 1, "current content indexed");
+  assert!(kg.nodes_named("mode_two").is_empty(), "stale symbol gone");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn semantic_search_finds_definitions_by_description() {
   let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));

@@ -132,10 +132,17 @@ source it was extracted from — verified for files in the racy-mtime window and
 so editing a grammar invalidates exactly that language's products. A product replays only when
 those gates agree. It makes no difference *which run* wrote a product: a completed index, an
 interrupted one (killed runs lose no work), or a search that banked its matches. Everything else
-re-parses, and the graph is always re-linked from the complete product set. A fully unchanged
-tree short-circuits entirely (a stat-based fast path; a same-size, same-mtime content edit
-outside the racy window is the one case it can miss — run with `VORPAL_VERIFY_CACHE=1` for a
-content-authoritative pass):
+re-parses, and the graph is always re-linked from the complete product set.
+
+Cache validity is an explicit, named contract with two modes. **`fast-stat`** (default) trusts
+path+size+mtime outside the racy window — a fully unchanged tree short-circuits in
+milliseconds, with one documented blind spot: a same-size edit whose mtime is deliberately
+preserved, made outside the racy window, can replay stale extraction. **`verified`** is
+content-authoritative: every replay decision checks the stored source digest against the
+file's current bytes (`vorpal index --verify`, the MCP `index` tool's `verify: true`,
+`build_index_with(.., CacheMode::Verified)`, or `VORPAL_VERIFY_CACHE=1` for CI). Every build
+report states which mode ran, and both modes — including the blind spot and its capture — are
+pinned by adversarial preserved-mtime tests:
 
 ```console
 $ vorpal index .                     # again, after touching one file
