@@ -97,7 +97,14 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
     vorpal_ingest::global_grammar_stamp(),
     rules_digest,
   ));
-  let manifest_path = out.join("manifest.bin");
+  // Generation layout (IMPROVEMENTS §4): `out` is the index *root*. The live artifacts sit in
+  // an immutable, content-addressed generation dir named by `out/CURRENT`; this run reads the
+  // prior generation, stages a new one, and commits it with one atomic pointer swap — a
+  // concurrent reader sees the complete old index or the complete new one, never a mixture.
+  // A legacy flat root (no CURRENT) resolves to itself, so its artifacts still serve as the
+  // prior; the first rebuild migrates it into a generation.
+  let prior = vorpal_kg::resolve_index_dir(out);
+  let manifest_path = prior.join("manifest.bin");
 
   // Staged cache validation (IMPROVEMENTS §6): stat (size+mtime) is the cheap hint; the v6
   // content digest is the identity. Digests are verified (a) always under
@@ -124,7 +131,7 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
     if racy.is_empty() {
       return true;
     }
-    let Some(pack) = PackReader::open(out) else {
+    let Some(pack) = PackReader::open(&prior) else {
       return false;
     };
     racy.iter().all(|entry| {
@@ -142,22 +149,24 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // The report only needs the node count, read from the segment header — no heap read, no edge
   // read, no CSR rebuild. An unreadable/corrupt index falls through to a rebuild instead of
   // wedging every subsequent run on the same error.
-  if let Ok(prior) = Manifest::load(&manifest_path) {
-    if manifest.unchanged_since(&prior)
-      && manifest.grammar_stamp() == prior.grammar_stamp()
+  if let Ok(prior_manifest) = Manifest::load(&manifest_path) {
+    if manifest.unchanged_since(&prior_manifest)
+      && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
       && !verify_all
-      && out.join("strings.heap").exists()
-      && out.join("graph.bin").exists()
+      && prior.join("strings.heap").exists()
+      && prior.join("graph.bin").exists()
       && racy_files_verify()
     {
       // Backfill: index dirs written before the name-index sidecar existed gain it here,
-      // once — sublinear name lookup without forcing a rebuild.
-      if !out.join("names.idx").exists() {
-        if let Ok(kg) = Kg::load(out) {
-          let _ = kg.write_names_index(out);
+      // once — sublinear name lookup without forcing a rebuild. (An additive, self-validating
+      // sidecar — like the lazy ANN tier, it is the one kind of write an existing generation
+      // admits.)
+      if !prior.join("names.idx").exists() {
+        if let Ok(kg) = Kg::load(&prior) {
+          let _ = kg.write_names_index(&prior);
         }
       }
-      if let Ok(nodes) = Kg::peek_node_count(out) {
+      if let Ok(nodes) = Kg::peek_node_count(&prior) {
         return Ok(IndexReport {
           reused: true,
           error_files: 0,
@@ -182,8 +191,17 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // any cached product whose stamp matches replays — whoever wrote it. Read/extract errors
   // skip the file (as before); a cache-write error is fatal (as before). Sequence-ordered
   // per-shard application keeps the output bit-identical to the batch path.
+  // The loose bank lives at the *root* (outside any generation): concurrent searches feed it
+  // and every build consumes it, whichever generation is live.
   let products_dir = out.join("products");
   fs::create_dir_all(&products_dir)?;
+  // Stage the new generation in a scratch dir under `gen/`; it becomes `gen/<content-id>` at
+  // commit. Fresh per run (a crashed run's staging is swept by the next commit's GC).
+  let staging = out
+    .join("gen")
+    .join(format!(".staging-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&staging);
+  fs::create_dir_all(&staging)?;
 
   let digest_must_match = move |entry_mtime_ns: u64, stored_digest: Option<u64>, path: &Path| {
     let racy = entry_mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000;
@@ -201,11 +219,13 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // serializes the open path) plus **loose files**, still written by search banking (separate
   // processes must not contend on the pack) and consolidated — then deleted — here. Loose
   // wins over pack on lookup: it is only ever fresher.
-  let pack_reader = PackReader::open(out).map(Arc::new);
+  let pack_reader = PackReader::open(&prior).map(Arc::new);
   let loose: HashSet<OsString> = fs::read_dir(&products_dir)
     .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
     .unwrap_or_default();
-  let pack_writer = PackWriter::new(out, pack_reader.clone());
+  // The writer builds the new generation's pack in staging, copying reused bodies out of the
+  // prior generation's mapping — the prior pack is never touched.
+  let pack_writer = PackWriter::new(&staging, pack_reader.clone());
   let pack_sink = pack_writer.sink();
   let live_paths: Vec<String> = manifest.entries().iter().map(|e| e.path.clone()).collect();
   let pack_thread = std::thread::spawn(move || pack_writer.finish(live_paths));
@@ -217,8 +237,8 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // kernel scale).
   let error_files = std::sync::atomic::AtomicU64::new(0);
   let error_nodes = std::sync::atomic::AtomicU64::new(0);
-  let spill_path = out.join(".refs.spill");
-  let heap_stream = out.join("strings.heap.tmp");
+  let spill_path = staging.join(".refs.spill");
+  let heap_stream = staging.join("strings.heap.tmp");
   let stream_result = stream_apply_spilled(
     manifest.entries(),
     stream_budget_bytes(),
@@ -351,8 +371,10 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   // built lazily by the first search and validated by stamp, so incremental re-indexes never
   // pay a full vector-graph rebuild (at kernel scale that rebuild dominated the whole run).
   // The manifest is the commit point and always lands last.
-  kg.save(out)?;
-  manifest.save(&manifest_path)?;
+  kg.save(&staging)?;
+  manifest.save(&staging.join("manifest.bin"))?;
+  // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
+  commit_generation(out, &prior, staging)?;
   Ok(IndexReport {
     reused: false,
     indexed: reparsed,
@@ -365,6 +387,167 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
     external: resolve.external,
     masked: resolve.masked,
   })
+}
+
+/// The core artifact set a generation is named by — the complete persisted index, in fixed
+/// (sorted) order. Lazy sidecars added after commit (the ANN tier) are deliberately excluded:
+/// they are stamp-validated against the node segment, deterministic given the generation, and
+/// must not change its identity.
+const GENERATION_ARTIFACTS: [&str; 7] = [
+  "graph.bin",
+  "manifest.bin",
+  "names.idx",
+  "nodes.vseg",
+  "products.idx",
+  "products.pack",
+  "strings.heap",
+];
+
+/// Commit a staged generation (IMPROVEMENTS §4): name it by its **content**, atomically swap
+/// the `CURRENT` pointer, and garbage-collect superseded generations.
+///
+/// Content-addressing is what preserves the determinism contract under the generation layout:
+/// the id is a pure function of the artifact bytes, so two from-scratch builds of the same tree
+/// commit the same `gen/<id>`, and an incremental rebuild converges to the byte-identical
+/// generation a from-scratch build of the final tree produces — directory names included. A
+/// staged generation whose id already exists is byte-identical to the committed one, so staging
+/// is simply dropped and `CURRENT` repointed.
+///
+/// GC keeps two generations — the new one and the one `CURRENT` pointed at when this build
+/// began — so a reader that resolved just before the swap keeps a complete index on disk.
+/// Readers that hold an even older generation keep their mmaps (POSIX unlink semantics); only
+/// *new* opens in a collected generation fail, as a clean retryable error. A legacy flat root
+/// that served as the prior is swept the same way: its artifacts are superseded by the
+/// generation just committed from them.
+fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<()> {
+  // Sweep staging scratch that is not part of the named artifact set (spill files, tmp names)
+  // so the generation holds exactly its artifacts.
+  for entry in fs::read_dir(&staging)?.flatten() {
+    let name = entry.file_name();
+    let keep = GENERATION_ARTIFACTS
+      .iter()
+      .any(|artifact| name.as_os_str() == *artifact);
+    if !keep {
+      let path = entry.path();
+      let _ = if path.is_dir() {
+        fs::remove_dir_all(&path)
+      } else {
+        fs::remove_file(&path)
+      };
+    }
+  }
+  // Content id: stream every artifact (fixed order) through one xxh3-128.
+  let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+  for artifact in GENERATION_ARTIFACTS {
+    let path = staging.join(artifact);
+    let Ok(mut file) = fs::File::open(&path) else {
+      continue; // an artifact a smaller index legitimately lacks still yields a stable id
+    };
+    hasher.update(artifact.as_bytes());
+    let len = file.metadata()?.len();
+    hasher.update(&len.to_le_bytes());
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+      let n = io::Read::read(&mut file, &mut buf)?;
+      if n == 0 {
+        break;
+      }
+      hasher.update(&buf[..n]);
+    }
+  }
+  let id = format!("{:032x}", hasher.digest128());
+  let final_dir = root.join("gen").join(&id);
+  // Dedup guard: an existing same-id generation is byte-identical *by construction*, but only
+  // if it is still complete — a tampered or partially-deleted dir must not be trusted over the
+  // freshly staged one. Same-id ⇒ same artifact set, so presence-checking staging's artifacts
+  // against it is a sufficient completeness test.
+  let existing_is_complete = final_dir.exists()
+    && GENERATION_ARTIFACTS
+      .iter()
+      .all(|artifact| !staging.join(artifact).exists() || final_dir.join(artifact).exists());
+  if existing_is_complete {
+    fs::remove_dir_all(&staging)?;
+  } else {
+    if final_dir.exists() {
+      fs::remove_dir_all(&final_dir)?;
+    }
+    fs::rename(&staging, &final_dir)?;
+  }
+
+  // Carry the prior generation's lazy ANN tier forward (hardlink; copy as fallback) so an
+  // incremental rebuild keeps its overlay fast path: the carried tier's base stamp no longer
+  // matches the new node segment, which is exactly the condition the search-side overlay
+  // reconciles through the `ann.files` digest map — without the carry, every post-edit search
+  // would pay the exhaustive fallback until a full re-warm. Hardlinks are safe because ANN
+  // artifacts are only ever *replaced* (tmp + rename), never mutated in place: a re-warm in
+  // this generation unlinks its name without touching the prior generation's inode. Never
+  // overwrites — a generation that already warmed its own tier keeps it.
+  if prior != &final_dir {
+    for ann_file in ["ann.bin", "ann.files", "ann.stamp"] {
+      let from = prior.join(ann_file);
+      let to = final_dir.join(ann_file);
+      if from.exists() && !to.exists() && fs::hard_link(&from, &to).is_err() {
+        let _ = fs::copy(&from, &to);
+      }
+    }
+  }
+
+  // Atomic pointer swap: readers resolve CURRENT in one read; tmp + rename means they see the
+  // old pointer or the new one, never a torn write. The tmp is synced so a crash straddling
+  // the rename cannot publish a pointer whose bytes never reached disk.
+  let pointer = format!("gen/{id}\n");
+  let current_tmp = root.join("CURRENT.tmp");
+  {
+    let mut file = fs::File::create(&current_tmp)?;
+    io::Write::write_all(&mut file, pointer.as_bytes())?;
+    file.sync_all()?;
+  }
+  fs::rename(&current_tmp, root.join("CURRENT"))?;
+
+  // GC: keep the new generation and the prior one; sweep everything else under gen/ —
+  // superseded generations and dead staging dirs — skipping anything modified in the last two
+  // minutes (a concurrent build's staging must not be swept mid-flight). Errors are ignored:
+  // GC is hygiene, never correctness.
+  let keep_prior = prior.starts_with(root.join("gen")).then(|| prior.to_path_buf());
+  if let Ok(entries) = fs::read_dir(root.join("gen")) {
+    for entry in entries.flatten() {
+      let path = entry.path();
+      if path == final_dir || Some(&path) == keep_prior.as_ref() {
+        continue;
+      }
+      let recent = entry
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() < 120);
+      if !recent {
+        let _ = fs::remove_dir_all(&path);
+      }
+    }
+  }
+  // Legacy migration: when the prior was a flat root, its artifacts are now superseded by the
+  // generation committed from them — sweep the known filenames (never products/, gen/, or
+  // CURRENT) so the root holds only the generation layout.
+  if prior == root {
+    for artifact in GENERATION_ARTIFACTS {
+      let _ = fs::remove_file(root.join(artifact));
+    }
+    for scratch in [
+      "strings.heap.tmp",
+      ".refs.spill",
+      "ann.bin",
+      "ann.files",
+      "ann.stamp",
+      "ann.build.lock",
+      "products.pack.tmp",
+      "products.pack.spool",
+      "products.idx.tmp",
+    ] {
+      let _ = fs::remove_file(root.join(scratch));
+    }
+  }
+  Ok(())
 }
 
 /// Build the semantic tier over every KG node: each definition embeds its name (double-weighted),
@@ -409,7 +592,7 @@ fn embed_node_into(kg: &Kg, embedder: &LexicalEmbedder, id: u64, row: &mut [f32]
 /// The `(dim, base_stamp)` of the persisted ann.bin header, if present and current-format —
 /// exposed for coherence tests and diagnostics.
 pub fn peek_ann_header(index_dir: &Path) -> Option<(usize, u64)> {
-  AnnIndex::peek_header(&index_dir.join("ann.bin"))
+  AnnIndex::peek_header(&vorpal_kg::resolve_index_dir(index_dir).join("ann.bin"))
 }
 
 /// Whether the persisted vector tier matches `current_stamp` (and this build's format and
@@ -432,6 +615,11 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
 /// build; a search that arrives mid-build serializes on the same lock and proceeds the
 /// moment the tier is fresh.
 pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+  // Warm the generation CURRENT names right now; its artifacts land inside that generation
+  // (the ANN tier is the one stamp-validated sidecar an existing generation admits). If a
+  // rebuild supersedes it mid-warm, the work is simply for a generation about to retire —
+  // harmless, and the next search on the new generation triggers its own warm.
+  let index_dir = &vorpal_kg::resolve_index_dir(index_dir);
   // Cross-process exclusion: concurrent warms (a daemon thread + a detached CLI child, or
   // two cold CLIs) must not build twice. The loser skips entirely — whoever asked has
   // already been served by the fallback tier, and the winner's commit flips freshness.
@@ -563,11 +751,13 @@ pub fn warm_product_cache(file: &Path) -> io::Result<bool> {
   Ok(true)
 }
 
-/// The nearest ancestor directory holding an existing default-location index.
+/// The nearest ancestor directory holding an existing default-location index — a generation
+/// root (carrying `CURRENT`) or a legacy flat dir (carrying `manifest.bin` directly).
 fn find_index_root(file: &Path) -> Option<PathBuf> {
   let mut dir = file.parent()?;
   loop {
-    if dir.join(".vorpal/index/manifest.bin").is_file() {
+    let index_dir = dir.join(".vorpal/index");
+    if index_dir.join("CURRENT").is_file() || index_dir.join("manifest.bin").is_file() {
       return Some(dir.to_path_buf());
     }
     dir = dir.parent()?;
@@ -595,7 +785,9 @@ fn warm_root_for(index_root: PathBuf) -> io::Result<Option<Arc<WarmRoot>>> {
 /// this root rather than guessing keys.
 fn build_warm_root(index_root: &Path) -> io::Result<Option<WarmRoot>> {
   let index_dir = index_root.join(".vorpal").join("index");
-  let manifest = Manifest::load(&index_dir.join("manifest.bin"))?;
+  // Key spelling comes from the live generation's manifest; the bank itself stays at the
+  // root-level `products/` inbox, which every generation's build consumes.
+  let manifest = Manifest::load(&vorpal_kg::resolve_index_dir(&index_dir).join("manifest.bin"))?;
   let canonical_root = index_root.canonicalize()?;
   for entry in manifest.entries() {
     let Ok(canonical_entry) = index_root.join(&entry.path).canonicalize() else {
@@ -677,6 +869,10 @@ fn search_index_impl(
   k: usize,
   explain: bool,
 ) -> Result<String, Box<dyn Error>> {
+  // Pin one generation for the whole query: the graph AND the ANN tier both come from the
+  // directory CURRENT names right now, so a rebuild landing mid-search cannot hand this query
+  // a mixed pair (the ANN stamp would catch it, but resolving once makes it impossible).
+  let index_dir = &vorpal_kg::resolve_index_dir(index_dir);
   let kg = Kg::load(index_dir)?;
   let current_stamp = stamp_of(&kg);
   let embedder = LexicalEmbedder::default();

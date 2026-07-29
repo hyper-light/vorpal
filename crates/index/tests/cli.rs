@@ -5,6 +5,12 @@ use std::fs;
 use vorpal_index::{build_index, search_index};
 use vorpal_kg::Kg;
 
+/// The directory holding the live generation's artifacts (resolves the root's CURRENT
+/// pointer; a legacy flat root resolves to itself).
+fn live(root: &std::path::Path) -> std::path::PathBuf {
+  vorpal_kg::resolve_index_dir(root)
+}
+
 #[test]
 fn builds_persists_and_queries_an_index() {
   let base = std::env::temp_dir().join(format!("vorpal-index-cli-{}", std::process::id()));
@@ -89,7 +95,7 @@ fn grammar_change_defeats_reuse_fast_path() {
   // The manifest is `VMAN`(4) + version(4) + grammar_stamp(8) + ...; flip the stamp to stand in
   // for a grammar edit. The next index must fall through to a rebuild rather than trust the
   // stat-only fast path.
-  let manifest_path = out.join("manifest.bin");
+  let manifest_path = live(&out).join("manifest.bin");
   let mut bytes = fs::read(&manifest_path).unwrap();
   assert_eq!(&bytes[0..4], b"VMAN", "manifest carries the versioned header");
   bytes[8] ^= 0xFF;
@@ -156,11 +162,144 @@ fn mixed_generation_index_is_rejected() {
 
   // Splice the large graph onto the small index: graph.node_count no longer matches the node
   // segment — a mixed generation the coherence gate must reject.
-  fs::copy(large.join("graph.bin"), small.join("graph.bin")).unwrap();
+  fs::copy(live(&large).join("graph.bin"), live(&small).join("graph.bin")).unwrap();
   assert!(
     Kg::load(&small).is_err(),
     "mixed graph/node-segment generation must be rejected"
   );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// Content-addressed generations preserve the determinism contract at the directory level: an
+/// incremental rebuild converges to the *same generation id* — and byte-identical artifacts —
+/// as a from-scratch build of the final tree.
+#[test]
+fn incremental_generation_converges_to_from_scratch() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-conv-{}", std::process::id()));
+  let src = base.join("src");
+  let inc = base.join("inc");
+  let fresh = base.join("fresh");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn one() -> i32 {\n    1\n}\n").unwrap();
+  fs::write(src.join("b.rs"), "pub fn two() -> i32 {\n    2\n}\n").unwrap();
+
+  // v1 into `inc`, then edit + delete + add, then incremental rebuild.
+  build_index(&src, &inc).unwrap();
+  fs::write(src.join("a.rs"), "pub fn one_v2() -> i32 {\n    12\n}\n").unwrap();
+  fs::remove_file(src.join("b.rs")).unwrap();
+  fs::write(src.join("c.rs"), "pub fn three() -> i32 {\n    3\n}\n").unwrap();
+  build_index(&src, &inc).unwrap();
+  // From-scratch of the final tree into `fresh`.
+  build_index(&src, &fresh).unwrap();
+
+  let current = |root: &std::path::Path| fs::read_to_string(root.join("CURRENT")).unwrap();
+  assert_eq!(
+    current(&inc),
+    current(&fresh),
+    "incremental must converge to the from-scratch generation id"
+  );
+  // And the generation contents are byte-identical, artifact by artifact.
+  let (inc_live, fresh_live) = (live(&inc), live(&fresh));
+  let mut names: Vec<_> = fs::read_dir(&inc_live)
+    .unwrap()
+    .flatten()
+    .map(|e| e.file_name())
+    .collect();
+  names.sort();
+  for name in names {
+    assert_eq!(
+      fs::read(inc_live.join(&name)).unwrap(),
+      fs::read(fresh_live.join(&name)).unwrap(),
+      "artifact {name:?} differs between incremental and from-scratch"
+    );
+  }
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// The atomic-generation guarantee: a reader that loaded before a rebuild keeps serving its
+/// complete generation; a reader that loads after sees the complete new one — never a mixture.
+#[test]
+fn concurrent_reader_survives_rebuild() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-reader-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn alpha() -> i32 {\n    1\n}\n").unwrap();
+  build_index(&src, &out).unwrap();
+
+  // Reader pins generation 1.
+  let old_reader = Kg::load(&out).unwrap();
+  let old_nodes = old_reader.node_count();
+  assert_eq!(old_reader.nodes_named("alpha").len(), 1);
+
+  // Rebuild to generation 2 (grow the tree).
+  fs::write(src.join("b.rs"), "pub fn beta() -> i32 {\n    2\n}\n").unwrap();
+  fs::write(src.join("c.rs"), "pub fn gamma() -> i32 {\n    3\n}\n").unwrap();
+  build_index(&src, &out).unwrap();
+
+  // The pinned reader still serves its complete old generation…
+  assert_eq!(old_reader.node_count(), old_nodes);
+  assert_eq!(old_reader.nodes_named("alpha").len(), 1);
+  assert_eq!(
+    old_reader.nodes_named("beta").len(),
+    0,
+    "the old generation must not see the new tree"
+  );
+  // …and a fresh reader sees the complete new one.
+  let new_reader = Kg::load(&out).unwrap();
+  assert!(new_reader.node_count() > old_nodes);
+  assert_eq!(new_reader.nodes_named("beta").len(), 1);
+
+  // A third rebuild retires generation 1 (GC keeps {new, prior}); the pinned reader's mmaps
+  // stay valid (POSIX), so it still answers from its complete — now unlinked — generation.
+  fs::write(src.join("d.rs"), "pub fn delta() -> i32 {\n    4\n}\n").unwrap();
+  build_index(&src, &out).unwrap();
+  assert_eq!(old_reader.node_count(), old_nodes);
+  assert_eq!(old_reader.nodes_named("alpha").len(), 1);
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// A legacy flat index (artifacts at the root, no CURRENT) keeps serving reads and its next
+/// rebuild migrates it into the generation layout, sweeping the superseded flat artifacts.
+#[test]
+fn legacy_flat_index_migrates_on_rebuild() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-legacy-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn legacy_fn() -> i32 {\n    1\n}\n").unwrap();
+  build_index(&src, &out).unwrap();
+
+  // Flatten: move the live generation's artifacts to the root and drop the pointer — exactly
+  // what an index written before the generation layout looks like.
+  let gen_dir = live(&out);
+  for entry in fs::read_dir(&gen_dir).unwrap().flatten() {
+    fs::rename(entry.path(), out.join(entry.file_name())).unwrap();
+  }
+  fs::remove_file(out.join("CURRENT")).unwrap();
+  fs::remove_dir_all(out.join("gen")).unwrap();
+
+  // Legacy reads work (resolution falls back to the flat root)…
+  assert_eq!(Kg::load(&out).unwrap().nodes_named("legacy_fn").len(), 1);
+  // …an unchanged tree still takes the fast path against the flat prior…
+  assert!(build_index(&src, &out).unwrap().reused);
+  // …and a real rebuild migrates: generation layout in, flat artifacts swept.
+  fs::write(src.join("b.rs"), "pub fn newer_fn() -> i32 {\n    2\n}\n").unwrap();
+  assert!(!build_index(&src, &out).unwrap().reused);
+  assert!(out.join("CURRENT").is_file(), "migrated root gains CURRENT");
+  assert!(
+    !out.join("nodes.vseg").exists(),
+    "superseded flat artifacts are swept"
+  );
+  let kg = Kg::load(&out).unwrap();
+  assert_eq!(kg.nodes_named("legacy_fn").len(), 1);
+  assert_eq!(kg.nodes_named("newer_fn").len(), 1);
 
   let _ = fs::remove_dir_all(&base);
 }
@@ -274,7 +413,7 @@ fn products_survive_an_interrupted_run_via_their_stat_stamps() {
 
   // Simulate a run killed after products were written but before the manifest committed:
   // products are self-validating, so nothing re-parses.
-  fs::remove_file(out.join("manifest.bin")).unwrap();
+  fs::remove_file(live(&out).join("manifest.bin")).unwrap();
   let recovered = build_index(&src, &out).unwrap();
   assert!(!recovered.reused, "no manifest → no whole-tree fast path");
   assert_eq!(
@@ -416,7 +555,7 @@ fn cold_scan_matches_warm_flat_exact_results() {
   assert_eq!(cold_a, cold_b, "cold scan must be deterministic");
 
   vorpal_index::warm_ann(&out).unwrap();
-  assert!(out.join("ann.bin").exists());
+  assert!(live(&out).join("ann.bin").exists());
   let warm = search_index(&out, "widget helper value", 5).unwrap();
   assert_eq!(
     cold_a, warm,
@@ -455,8 +594,8 @@ fn build_lock_excludes_second_builder() {
 
   // Lock released: the warm proceeds and commits.
   vorpal_index::warm_ann(&out).unwrap();
-  assert!(out.join("ann.bin").exists());
-  assert!(out.join("ann.stamp").exists());
+  assert!(live(&out).join("ann.bin").exists());
+  assert!(live(&out).join("ann.stamp").exists());
   let _ = fs::remove_dir_all(&base);
 }
 
@@ -498,7 +637,7 @@ fn ann_files_partition_and_stamp_cohere() {
   vorpal_index::warm_ann(&out).unwrap();
 
   let kg = Kg::load(&out).unwrap();
-  let (files_stamp, runs) = vorpal_index::annfiles::load(&out).unwrap();
+  let (files_stamp, runs) = vorpal_index::annfiles::load(&live(&out)).unwrap();
   // Partition: sorted, contiguous, exactly covering [0, node_count).
   let mut expected_start = 0u64;
   for run in &runs {
@@ -518,15 +657,16 @@ fn ann_files_partition_and_stamp_cohere() {
   // Generation coherence: bin header stamp == files stamp == stamp file.
   let (_dim, bin_stamp) = vorpal_index::peek_ann_header(&out).unwrap();
   assert_eq!(bin_stamp, files_stamp);
-  let stored = u64::from_le_bytes(fs::read(out.join("ann.stamp")).unwrap().try_into().unwrap());
+  let stored =
+    u64::from_le_bytes(fs::read(live(&out).join("ann.stamp")).unwrap().try_into().unwrap());
   assert_eq!(stored, files_stamp);
 
   // Digest stability: rebuild with no changes → identical bytes.
-  let before = fs::read(out.join("ann.files")).unwrap();
+  let before = fs::read(live(&out).join("ann.files")).unwrap();
   vorpal_index::warm_ann(&out).unwrap();
   assert_eq!(
     before,
-    fs::read(out.join("ann.files")).unwrap(),
+    fs::read(live(&out).join("ann.files")).unwrap(),
     "no-op warm must not rewrite"
   );
 
@@ -583,7 +723,7 @@ fn overlay_search_serves_edits_without_rebuild() {
   .unwrap();
   build_index(&src, &out).unwrap();
   vorpal_index::warm_ann(&out).unwrap();
-  let ann_before = fs::read(out.join("ann.bin")).unwrap();
+  let ann_before = fs::read(live(&out).join("ann.bin")).unwrap();
 
   // Edit the first file: replace the doomed symbol with two fresh ones (range LENGTH grows,
   // so later files' ids shift and aa.rs is overlay by construction).
@@ -642,10 +782,11 @@ fn overlay_search_serves_edits_without_rebuild() {
       .contains("tail_anchor_symbol"),
     "unchanged-file symbol must survive the id shift via remap:\n{shifted}"
   );
-  // And all of it without touching the base artifact.
+  // And all of it without touching the base artifact — which the new generation carried
+  // forward from the prior one (hardlinked at commit), so the overlay engages at all.
   assert_eq!(
     ann_before,
-    fs::read(out.join("ann.bin")).unwrap(),
+    fs::read(live(&out).join("ann.bin")).unwrap(),
     "overlay search must not rebuild or rewrite the base"
   );
 
@@ -832,10 +973,10 @@ fn symbol_selector_disambiguates_namesakes() {
 
   // names.idx: the persisted index and the scan fallback agree exactly.
   let kg = Kg::load(&out).unwrap();
-  assert!(out.join("names.idx").exists());
+  assert!(live(&out).join("names.idx").exists());
   let indexed = kg.nodes_named("shared_fn");
   assert_eq!(indexed.len(), 2);
-  fs::remove_file(out.join("names.idx")).unwrap();
+  fs::remove_file(live(&out).join("names.idx")).unwrap();
   let scanned = Kg::load(&out).unwrap().nodes_named("shared_fn");
   assert_eq!(indexed, scanned, "index and scan fallback must agree");
   let _ = fs::remove_dir_all(&base);

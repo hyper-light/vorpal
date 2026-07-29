@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use vorpal_graph::{Direction, EdgeType, Graph, reachable};
 use vorpal_mem::{AccessPattern, CorpusProbe, Hotness, MappedStore, ResourcePolicy, StoreKind};
@@ -31,6 +31,41 @@ const NAMES_MAGIC: u32 = 0x564E_4931;
 
 /// Map `names.idx` under `dir` if present and shaped for exactly `node_count` rows; `None`
 /// (scan fallback) otherwise — an older index dir simply lacks the sidecar.
+/// Resolve an index root to the directory actually holding its artifacts (IMPROVEMENTS §4).
+///
+/// A generation-layout root carries a small `CURRENT` file naming the live, immutable,
+/// content-addressed generation (`gen/<id>`); artifacts live inside it and a rebuild swaps
+/// `CURRENT` atomically, so a reader always sees one complete generation — never a mixture.
+/// A legacy/flat root (no `CURRENT`) resolves to itself, so pre-generation indexes and
+/// unit tests that write artifacts directly keep working unchanged.
+///
+/// Idempotent: a resolved generation directory contains no `CURRENT`, so re-resolving is a
+/// no-op — callers may resolve defensively at any boundary. A `CURRENT` that names a missing
+/// or escaping path is ignored (treated as no index) rather than followed.
+pub fn resolve_index_dir(root: &Path) -> PathBuf {
+  let pointer = root.join("CURRENT");
+  let Ok(named) = std::fs::read_to_string(&pointer) else {
+    return root.to_path_buf();
+  };
+  let named = named.trim();
+  // The pointer must name a simple relative subpath (e.g. "gen/<id>"): no absolute paths, no
+  // parent escapes — a corrupt or hostile pointer must not redirect reads outside the root.
+  let ok_shape = !named.is_empty()
+    && !named.starts_with('/')
+    && std::path::Path::new(named)
+      .components()
+      .all(|c| matches!(c, std::path::Component::Normal(_)));
+  if !ok_shape {
+    return root.to_path_buf();
+  }
+  let target = root.join(named);
+  if target.is_dir() {
+    target
+  } else {
+    root.to_path_buf()
+  }
+}
+
 fn open_names_index(
   dir: &Path,
   policy: &ResourcePolicy,
@@ -500,6 +535,7 @@ impl Kg {
   /// Cold-open a persisted graph: **mmap** the node segment (§9.1 — no heap load of the columns),
   /// read the string heap, and rebuild the CSR/CSC from the edge list.
   pub fn load(dir: &Path) -> Result<Self, SegmentError> {
+    let dir = &resolve_index_dir(dir);
     crate::phase_stamp("kg load: nodes");
     let nodes_path = dir.join("nodes.vseg");
     let size = fs::metadata(&nodes_path)?.len();
@@ -559,6 +595,7 @@ impl Kg {
   /// no edge-list read, no CSR rebuild. This is all the whole-tree-unchanged fast path needs,
   /// so a no-change re-index does not pay a graph load to report a number.
   pub fn peek_node_count(dir: &Path) -> Result<usize, SegmentError> {
+    let dir = &resolve_index_dir(dir);
     let nodes_path = dir.join("nodes.vseg");
     let size = fs::metadata(&nodes_path)?.len();
     let policy = ResourcePolicy::probe(CorpusProbe::new(size, 1));

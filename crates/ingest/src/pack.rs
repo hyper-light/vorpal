@@ -161,9 +161,18 @@ pub struct PackMsg {
   pub body: Vec<u8>,
 }
 
-/// Append side: owns the pack file for the duration of one index run. Feed it with
-/// [`PackWriter::sink`] clones from any thread; call [`PackWriter::finish`] after the
-/// pipeline ends to flush, (maybe) compact, and publish the sidecar atomically.
+/// Where one canonical entry's body currently lives: freshly appended to this run's pack
+/// (an offset into the local file), or carried from the prior generation's pack (fetched by
+/// path through its mapped [`PackReader`]).
+enum BodySource {
+  Appended(Entry),
+  Reused,
+}
+
+/// Write side: builds **this run's** pack in `dir` (a staging/new-generation directory) —
+/// never mutating the prior generation's pack, which is only *read* through `reader`. Feed it
+/// with [`PackWriter::sink`] clones from any thread; call [`PackWriter::finish`] after the
+/// pipeline ends to publish the canonical pack + sidecar.
 pub struct PackWriter {
   dir: PathBuf,
   rx: crossbeam_channel::Receiver<PackMsg>,
@@ -186,96 +195,93 @@ impl PackWriter {
     self.tx.as_ref().expect("sink before finish").clone()
   }
 
-  /// Drain every append, carry pack entries for every path in `live` that was not
-  /// re-appended, then publish the sidecar (`.tmp` + rename). Compacts first when dead
-  /// bytes exceed live bytes. Call only after every [`PackWriter::sink`] clone is dropped.
-  pub fn finish(mut self, live: impl IntoIterator<Item = String>) -> io::Result<()> {
-    drop(self.tx.take());
-    let pack_path = self.dir.join(PACK_FILE);
-    let create = !pack_path.exists()
-      || fs::read(&pack_path)
-        .map(|b| b.len() < 8 || &b[0..4] != PACK_MAGIC)
-        .unwrap_or(true);
-    let mut file = fs::OpenOptions::new()
-      .create(true)
-      .append(true)
-      .open(&pack_path)?;
-    if create {
-      use std::io::Seek;
-      file.set_len(0)?;
-      file.seek(io::SeekFrom::Start(0))?;
-      file.write_all(PACK_MAGIC)?;
-      file.write_all(&PACK_VERSION.to_le_bytes())?;
-    }
-    let mut at = file.metadata()?.len();
+  /// Drain every append (streamed to disk as it arrives — bounded memory), carry entries for
+  /// every path in `live` that was not re-appended from the prior generation's pack, then
+  /// publish the **canonical** pack (entries sorted by path — a pure function of the
+  /// `(path, body)` set) plus its sidecar, via `.tmp` + rename. The prior pack is never
+  /// touched: reused bodies are copied out of `reader`'s mapping, so the previous generation
+  /// stays complete for any reader still holding it. Call only after every
+  /// [`PackWriter::sink`] clone is dropped.
+  pub fn finish(self, live: impl IntoIterator<Item = String>) -> io::Result<()> {
+    let mut this = self;
+    drop(this.tx.take());
+    // Fresh spool for this run's appended records (magic + version header first). A side
+    // file, not `products.pack` itself: the reader may be mapping a same-named prior pack in
+    // this very directory (legacy flat layout, tests), and truncating it in place would
+    // clobber the bodies reuse is about to copy. The canonical pack lands via tmp + rename at
+    // the end, so `products.pack` is only ever a complete prior pack or a complete new one.
+    let pack_path = this.dir.join(PACK_FILE);
+    let spool_path = this.dir.join("products.pack.spool");
+    let mut file = fs::File::create(&spool_path)?;
+    file.write_all(PACK_MAGIC)?;
+    file.write_all(&PACK_VERSION.to_le_bytes())?;
+    let mut at = 8u64;
     let mut out = BufWriter::with_capacity(1 << 20, file);
 
-    let mut entries: Vec<(String, Entry)> = Vec::new();
+    let mut entries: Vec<(String, BodySource)> = Vec::new();
     let mut appended: std::collections::HashSet<Box<str>> = std::collections::HashSet::new();
-    while let Ok(PackMsg { path, body }) = self.rx.recv() {
+    while let Ok(PackMsg { path, body }) = this.rx.recv() {
       out.write_all(&(path.len() as u32).to_le_bytes())?;
       out.write_all(path.as_bytes())?;
       out.write_all(&(body.len() as u32).to_le_bytes())?;
       out.write_all(&body)?;
       let body_at = at + 4 + path.len() as u64 + 4;
       appended.insert(path.as_str().into());
-      entries.push((path, (body_at, body.len() as u32)));
+      entries.push((path, BodySource::Appended((body_at, body.len() as u32))));
       at = body_at + body.len() as u64;
     }
     out.flush()?;
     drop(out);
-    // Bulk reuse: every live path not re-appended keeps its existing pack entry.
-    if let Some(reader) = &self.reader {
+    // Bulk reuse: every live path not re-appended carries over from the prior pack.
+    if let Some(reader) = &this.reader {
       for path in live {
-        if !appended.contains(path.as_str()) {
-          if let Some(entry) = reader.entry(&path) {
-            entries.push((path, entry));
-          }
+        if !appended.contains(path.as_str()) && reader.entry(&path).is_some() {
+          entries.push((path, BodySource::Reused));
         }
       }
     }
 
-    // Canonical order: sort live entries by path so the published bytes are a pure function
-    // of the (path, body) set — independent of worker completion order and incremental
-    // history. Paths are unique per entry (one product per file; reuse skips re-appended
-    // paths), so this is a total, machine-independent order.
+    // Canonical order: sort by path so the published bytes are a pure function of the
+    // `(path, body)` set — independent of worker completion order and incremental history
+    // (this is what makes an incremental generation converge byte-for-byte to a from-scratch
+    // build of the same tree). Paths are unique per entry (one product per file; reuse skips
+    // re-appended paths), so this is a total, machine-independent order.
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Rewrite the pack in that order whenever content changed — any append this run, or dead
-    // bytes / a non-canonical layout left by an older generation (detected as a size that
-    // differs from the exact canonical length). A pure no-change re-index hits neither and
-    // keeps the previous canonical file untouched, so it stays a metadata-only check.
-    let canonical_len: u64 = 8 + entries
-      .iter()
-      .map(|(path, (_, len))| 4 + path.len() as u64 + 4 + *len as u64)
-      .sum::<u64>();
-    let pack_len = fs::metadata(&pack_path)?.len();
-    if !appended.is_empty() || pack_len != canonical_len {
-      let old = fs::read(&pack_path)?;
-      let tmp = self.dir.join("products.pack.tmp");
-      let mut out = BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
-      out.write_all(PACK_MAGIC)?;
-      out.write_all(&PACK_VERSION.to_le_bytes())?;
-      let mut new_at = 8u64;
-      for (path, entry) in entries.iter_mut() {
-        let (off, len) = *entry;
-        let body = old
-          .get(off as usize..(off + len as u64) as usize)
-          .ok_or_else(|| io::Error::other("pack entry out of bounds during compaction"))?;
-        out.write_all(&(path.len() as u32).to_le_bytes())?;
-        out.write_all(path.as_bytes())?;
-        out.write_all(&(len).to_le_bytes())?;
-        out.write_all(body)?;
-        *entry = (new_at + 4 + path.len() as u64 + 4, len);
-        new_at = entry.0 + len as u64;
-      }
-      out.flush()?;
-      drop(out);
-      fs::rename(&tmp, &pack_path)?;
+    let spooled = fs::read(&spool_path)?;
+    let tmp = this.dir.join("products.pack.tmp");
+    let mut out = BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
+    out.write_all(PACK_MAGIC)?;
+    out.write_all(&PACK_VERSION.to_le_bytes())?;
+    let mut new_at = 8u64;
+    let mut final_entries: Vec<(String, Entry)> = Vec::with_capacity(entries.len());
+    for (path, source) in entries {
+      let body: &[u8] = match &source {
+        BodySource::Appended((off, len)) => spooled
+          .get(*off as usize..(*off + *len as u64) as usize)
+          .ok_or_else(|| io::Error::other("appended pack entry out of bounds"))?,
+        BodySource::Reused => this
+          .reader
+          .as_ref()
+          .and_then(|r| r.get(&path))
+          .ok_or_else(|| io::Error::other("reused pack entry vanished from prior pack"))?,
+      };
+      out.write_all(&(path.len() as u32).to_le_bytes())?;
+      out.write_all(path.as_bytes())?;
+      out.write_all(&(body.len() as u32).to_le_bytes())?;
+      out.write_all(body)?;
+      let body_at = new_at + 4 + path.len() as u64 + 4;
+      new_at = body_at + body.len() as u64;
+      final_entries.push((path, (body_at, body.len() as u32)));
     }
+    out.flush()?;
+    drop(out);
+    fs::rename(&tmp, &pack_path)?;
+    let _ = fs::remove_file(&spool_path);
+    let entries = final_entries;
 
     let covered = fs::metadata(&pack_path)?.len();
-    let idx_tmp = self.dir.join("products.idx.tmp");
+    let idx_tmp = this.dir.join("products.idx.tmp");
     let mut idx = BufWriter::with_capacity(1 << 20, fs::File::create(&idx_tmp)?);
     idx.write_all(IDX_MAGIC)?;
     idx.write_all(&PACK_VERSION.to_le_bytes())?;
@@ -289,7 +295,7 @@ impl PackWriter {
     }
     idx.flush()?;
     drop(idx);
-    fs::rename(&idx_tmp, self.dir.join(PACK_INDEX))?;
+    fs::rename(&idx_tmp, this.dir.join(PACK_INDEX))?;
     Ok(())
   }
 }

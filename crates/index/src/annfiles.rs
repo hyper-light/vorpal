@@ -117,6 +117,8 @@ pub fn save(dir: &Path, base_stamp: u64, runs: &[FileRun]) -> io::Result<()> {
 /// Load `ann.files` from `dir`: `(base_stamp, runs)`. `None` for missing/foreign/torn files
 /// — callers treat that exactly like a stale tier (fallback).
 pub fn load(dir: &Path) -> Option<(u64, Vec<FileRun>)> {
+  // Generation-aware: an index root resolves to its live generation; a resolved dir is a no-op.
+  let dir = &vorpal_kg::resolve_index_dir(dir);
   let bytes = fs::read(dir.join("ann.files")).ok()?;
   let u32_at = |at: usize| -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
@@ -169,6 +171,8 @@ impl OverlayView {
   /// `None` whenever the artifacts cannot be trusted or the overlay is too large — the
   /// caller falls back to the exhaustive scan, which is always correct.
   pub fn assemble(dir: &Path, kg: &Kg, dim: usize) -> Option<OverlayView> {
+    // Generation-aware: resolve an index root to its live generation (no-op when resolved).
+    let dir = &vorpal_kg::resolve_index_dir(dir);
     let (bin_dim, bin_stamp) = vorpal_ann::AnnIndex::peek_header(&dir.join("ann.bin"))?;
     if bin_dim != dim {
       return None;

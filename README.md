@@ -337,16 +337,27 @@ Design principles worth knowing before you rely on it:
 The index directory (default `<src>/.vorpal/index` — hidden, so it never indexes itself):
 
 ```
-nodes.vseg      columnar node segment (mmap cold-open, blake3 + xxh3 integrity)
-strings.heap    names / paths / signatures
-graph.bin       mmap CSR/CSC code graph (containment, calls, references, imports, implements, of_type)
-names.idx       persisted name index: sorted (xxh3(name), id) pairs — name lookup by binary search
-ann.bin         vector index (i8-quantized Vamana; built lazily by the first search, plus an edit overlay)
-manifest.bin    stat + grammar-generation stamp driving incremental re-index
-products.pack   per-file extraction product cache in one mmap-replayed file, canonically path-sorted
-products.idx    sidecar: path → (offset, len) into products.pack (an optimization; the pack self-recovers)
-products/       loose products banked by concurrent `search` processes, consolidated into the pack on the next index
+CURRENT         atomic pointer naming the live generation (tmp + rename swap)
+products/       loose products banked by concurrent `search` processes, consolidated on the next index
+gen/<id>/       one immutable generation, named by a digest of its artifact bytes:
+  nodes.vseg      columnar node segment (mmap cold-open, blake3 + xxh3 integrity)
+  strings.heap    names / paths / signatures
+  graph.bin       mmap CSR/CSC code graph (containment, calls, references, imports, implements, of_type)
+  names.idx       persisted name index: sorted (xxh3(name), id) pairs — name lookup by binary search
+  manifest.bin    stat + grammar-generation stamp driving incremental re-index
+  products.pack   per-file extraction product cache in one mmap-replayed file, canonically path-sorted
+  products.idx    sidecar: path → (offset, len) into products.pack (an optimization; the pack self-recovers)
+  ann.bin …       lazy, stamp-validated vector tier (built by the first search; carried forward
+                  across rebuilds so post-edit searches keep the overlay fast path)
 ```
+
+A rebuild stages the next generation, names it by content, and swaps `CURRENT` atomically — a
+concurrent reader sees the complete old index or the complete new one, never a mixture (readers
+that already mapped a retired generation keep serving it). Content-addressing preserves
+determinism at the directory level: an incremental rebuild commits the byte-identical
+generation — same `gen/<id>` — that a from-scratch build of the same tree produces. The two
+newest generations are kept; older ones are garbage-collected. Pre-generation (flat) index
+dirs keep working and migrate on their next rebuild.
 
 The full architecture — storage format, adaptive memory model, concurrency plan, and the
 billion-LOC scaling roadmap — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
