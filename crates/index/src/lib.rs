@@ -301,6 +301,27 @@ pub fn build_index(src: &Path, out: &Path) -> Result<IndexReport, Box<dyn Error>
   let pack_result = pack_thread.join().expect("pack writer panicked");
   let (writer, spilled_refs, stream) = stream_result?;
   pack_result?;
+  // Hard-limit gate before sealing (IMPROVEMENTS §12): node ids, graph endpoints, and string-heap
+  // offsets are all 32-bit on disk. Rather than let a corpus past those ceilings silently wrap a
+  // cast and persist a corrupt index, fail loudly and actionably. The heap grows monotonically,
+  // so a single check on its final size proves no intermediate offset wrapped.
+  const U32_CEIL: usize = u32::MAX as usize;
+  if writer.node_count() > U32_CEIL {
+    return Err(format!(
+      "index exceeds the supported node limit: {} definitions (max {U32_CEIL}); node ids are \
+       32-bit — split the corpus into multiple indexes",
+      writer.node_count()
+    )
+    .into());
+  }
+  if writer.heap_len() > U32_CEIL as u64 {
+    return Err(format!(
+      "index string heap exceeds the 4 GiB addressable limit: {} bytes (max {U32_CEIL}); \
+       names/paths/signatures use 32-bit offsets — split the corpus into multiple indexes",
+      writer.heap_len()
+    )
+    .into());
+  }
   // Extraction/commit scratch (products in transit, per-worker buffers, shard canonicals)
   // is dead now — hand its pages back before the link pass allocates the table and edges.
   vorpal_ingest::release_freed_pages();

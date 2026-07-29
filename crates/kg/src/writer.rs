@@ -391,6 +391,12 @@ impl KgWriter {
     self.kind.len()
   }
 
+  /// Current string-heap size in bytes. Names/paths/signatures are addressed with 32-bit
+  /// offsets, so this is checked against the 4 GiB ceiling before the index is sealed.
+  pub fn heap_len(&self) -> u64 {
+    self.heap.len()
+  }
+
   fn push_str(&mut self, s: &str) -> (u32, u32) {
     if let Some(&(off, len)) = self
       .shared_path

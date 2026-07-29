@@ -351,6 +351,13 @@ products/       loose products banked by concurrent `search` processes, consolid
 The full architecture — storage format, adaptive memory model, concurrency plan, and the
 billion-LOC scaling roadmap — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+**Supported limits (per index).** Node ids, graph endpoints, name-index entries, and string-heap
+offsets are 32-bit, so one index addresses up to **2³²−1 definitions** and a **4 GiB** string heap
+(names + paths + signatures); byte spans are 32-bit, so per-file offsets saturate past 4 GiB.
+A corpus beyond these ceilings is not silently truncated — the index build fails with an
+actionable error; split it across multiple indexes. (64-bit ids/offsets and sharding are a
+measured-when-needed roadmap item, not a current limit-raiser.)
+
 ## Performance
 
 Measured on this repository (351 files, ~2.8 MB of source, ~9.6k nodes; **release** builds,
