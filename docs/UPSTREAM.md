@@ -35,9 +35,20 @@ Differential fixtures comparing vorpal against the pinned ast-grep binary across
 
 ## Reconciled against v0.44.1
 
-| Upstream change | Status |
-|---|---|
-| Outline extraction: bounded `sync_channel(256)` producer queue | **Adopted** (2026-07-24, `crates/cli/src/outline/extract.rs`) |
+Complete audit of all 24 commits between `0.44.0` and `0.44.1` (2026-07-29) — the ledger has no
+unaudited window between the fork base and the declared v0.45.0 baseline.
+
+| Upstream commit | Change | Status |
+|---|---|---|
+| `fe3607ea` | Outline extraction: bounded `sync_channel(256)` producer queue | **Adopted** (2026-07-24, `crates/cli/src/outline/extract.rs`) |
+| `24a573f1` | Load custom-language outline rules from `customLanguages` config | **Already present** — `crates/cli/src/config.rs` carries the same per-custom-language `outline_rules` collection (`custom_language_outline_rules`) |
+| `07778fb3` | Outline rules for more builtin languages | **Superseded** — vorpal bundles outline defaults for all 28 supported languages (upstream covers a subset); the v0.45.0 TypeScript ambient additions were adopted separately |
+| `06e5ba27` | Map `*.bazel` files to Python | **Already present** — vorpal's Python extension list includes `bzl` and `bazel` |
+| `cd217149` / `05459688` | tree-sitter / web-tree-sitter 0.26.10 | **Adopted** — workspace is on tree-sitter 0.26.10 |
+| `1713e86f` | pyo3 dependency update | **Not applicable** — dependency versions governed by vorpal's own workspace lockfile |
+| 12 × `chore(deps)` (napi, napi-derive, oxlint ×2, terminal-light, clap_complete ×2, ignore 0.4.27, @ast-grep/napi, dprint, @napi-rs/cli, anyhow, wasm-bindgen) | Dependency bumps | **Not applicable** — same reason; vorpal pins its own versions |
+| `8e88a9e5` | actions/cache v6 | **Not applicable** — CI configuration; vorpal maintains its own workflows |
+| `26f78451` | 0.44.1 version bump | **Not applicable** |
 
 ## Intentional divergences (vorpal-side)
 
@@ -49,11 +60,15 @@ Differential fixtures comparing vorpal against the pinned ast-grep binary across
 | Repository layer | `index`/`graph`/`search`/`mcp` subcommands, knowledge graph, ANN, bindings additions | Vorpal's differentiating layer; additive |
 | Allocator | jemalloc + tree-sitter allocator unification in the binaries | Measured RSS/fault wins; no behavior change |
 
-## Known-not-yet-reconciled
+## Differential compatibility testing
 
-- Upstream `0.44.1` non-outline patches have not been case-by-case audited (this ledger
-  starts 2026-07-24); next pass should diff `crates/core`/`crates/config` against the
-  v0.44.1 tag and fill this table.
+`crates/cli/tests/differential.rs` compares vorpal's inherited structural surfaces against a
+**pinned upstream ast-grep binary** on shared fixtures (pattern `run` and rule `scan`, JSON
+outputs normalized for binary name/paths). The job is env-gated: set `VORPAL_ASTGREP_BIN` to an
+ast-grep binary built from the baseline commit (`5d439d9`, v0.45.0) to activate it; without the
+variable the tests skip loudly rather than pass silently. Intentional divergences are asserted
+as fixtures there, not prose exceptions. Every future baseline advance must (1) classify all new
+upstream commits in this ledger and (2) pass the differential job against the new pin.
 
 ---
 
