@@ -115,6 +115,12 @@ pub struct KgWriter {
   sig_off: Vec<u32>,
   sig_len: Vec<u32>,
   content_hash: Vec<u64>,
+  /// Durable external id (IMPROVEMENTS 07-29 §2): the first 128 bits of the node's canonical
+  /// key (`blake3(path, entity_path)`), split into two u64 columns. A pure function of the
+  /// symbol's logical identity, so it survives rebuilds and dense-id shifts; a move or rename
+  /// is an explicit identity transition (new key), never a silent reuse.
+  eid_lo: Vec<u64>,
+  eid_hi: Vec<u64>,
   flags: Vec<u8>,
   span_start: Vec<u32>,
   span_end: Vec<u32>,
@@ -148,6 +154,9 @@ impl KgWriter {
       self.sig_off.push(sig_off);
       self.sig_len.push(sig_len);
       self.content_hash.push(def.content_hash);
+      let kb = key.as_bytes();
+      self.eid_lo.push(u64::from_le_bytes(kb[0..8].try_into().unwrap()));
+      self.eid_hi.push(u64::from_le_bytes(kb[8..16].try_into().unwrap()));
       self.flags.push(u8::from(def.exported));
       self.span_start.push(def.span.0);
       self.span_end.push(def.span.1);
@@ -353,6 +362,8 @@ impl KgWriter {
       .extend(other.sig_off.iter().map(|off| off + heap_base));
     self.sig_len.extend_from_slice(&other.sig_len);
     self.content_hash.extend_from_slice(&other.content_hash);
+    self.eid_lo.extend_from_slice(&other.eid_lo);
+    self.eid_hi.extend_from_slice(&other.eid_hi);
     self.flags.extend_from_slice(&other.flags);
     self.span_start.extend_from_slice(&other.span_start);
     self.span_end.extend_from_slice(&other.span_end);
@@ -461,6 +472,12 @@ impl KgWriter {
     let content_hash = std::mem::take(&mut self.content_hash);
     builder.add_u64("content_hash", &content_hash).unwrap();
     drop(content_hash);
+    let eid_lo = std::mem::take(&mut self.eid_lo);
+    builder.add_u64("eid_lo", &eid_lo).unwrap();
+    drop(eid_lo);
+    let eid_hi = std::mem::take(&mut self.eid_hi);
+    builder.add_u64("eid_hi", &eid_hi).unwrap();
+    drop(eid_hi);
     let flags = std::mem::take(&mut self.flags);
     builder.add_u8("flags", &flags).unwrap();
     drop(flags);

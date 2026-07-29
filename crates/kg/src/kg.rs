@@ -24,6 +24,8 @@ pub struct SymbolSelector<'a> {
   pub path_suffix: Option<&'a str>,
   /// Symbol kind filter.
   pub kind: Option<crate::SymbolKind>,
+  /// Durable external id (128-bit, hex on the wire) — the cross-generation bookmark form.
+  pub external_id: Option<u128>,
 }
 
 /// "VNI1" — the persisted name index's magic.
@@ -127,6 +129,10 @@ pub struct NodeView<'a> {
   pub path: &'a str,
   pub signature: &'a str,
   pub content_hash: u64,
+  /// Durable external id: first 128 bits of `blake3(path, entity_path)` — stable across
+  /// rebuilds and dense-id shifts for the same logical symbol; a move/rename mints a new id
+  /// (an explicit identity transition). `None` on segments written before the columns existed.
+  pub external_id: Option<u128>,
   pub exported: bool,
   /// Definition byte range in `path`; `(0, 0)` when unknown (File nodes, pre-span segments).
   pub span: (u32, u32),
@@ -149,6 +155,9 @@ struct NodeColumns {
   /// (spans then read as `(0, 0)`: "unknown").
   span_start: Option<usize>,
   span_end: Option<usize>,
+  /// Durable external id halves — `None` on pre-eid segments (external ids then read `None`).
+  eid_lo: Option<usize>,
+  eid_hi: Option<usize>,
 }
 
 impl NodeColumns {
@@ -165,6 +174,8 @@ impl NodeColumns {
       flags: segment.column_index("flags")?,
       span_start: segment.column_index("span_start"),
       span_end: segment.column_index("span_end"),
+      eid_lo: segment.column_index("eid_lo"),
+      eid_hi: segment.column_index("eid_hi"),
     })
   }
 }
@@ -289,15 +300,52 @@ impl Kg {
       ),
       _ => (0, 0),
     };
+    let external_id = match (self.cols.eid_lo, self.cols.eid_hi) {
+      (Some(lo_col), Some(hi_col)) => {
+        let lo = self.nodes.column_at(lo_col)?.get_u64(row)? as u128;
+        let hi = self.nodes.column_at(hi_col)?.get_u64(row)? as u128;
+        Some((hi << 64) | lo)
+      }
+      _ => None,
+    };
     Some(NodeView {
       kind,
       name: self.heap_str(self.cols.name_off, self.cols.name_len, row)?,
       path: self.heap_str(self.cols.path_off, self.cols.path_len, row)?,
       signature: self.heap_str(self.cols.sig_off, self.cols.sig_len, row)?,
       content_hash,
+      external_id,
       exported,
       span,
     })
+  }
+
+  /// Nodes whose durable external id equals `eid` — how a client re-resolves a bookmarked
+  /// symbol in a later generation. Normally 0 or 1 hits (the id is `blake3(path, entity)`);
+  /// a linear column scan today, indexed if measurement ever warrants it. Empty on pre-eid
+  /// segments.
+  pub fn nodes_with_external_id(&self, eid: u128) -> Vec<NodeId> {
+    let (Some(lo_col), Some(hi_col)) = (self.cols.eid_lo, self.cols.eid_hi) else {
+      return Vec::new();
+    };
+    let (want_lo, want_hi) = (eid as u64, (eid >> 64) as u64);
+    let mut hits = Vec::new();
+    for row in 0..self.node_count() as u64 {
+      let matches = self
+        .nodes
+        .column_at(lo_col)
+        .and_then(|c| c.get_u64(row))
+        .is_some_and(|lo| lo == want_lo)
+        && self
+          .nodes
+          .column_at(hi_col)
+          .and_then(|c| c.get_u64(row))
+          .is_some_and(|hi| hi == want_hi);
+      if matches {
+        hits.push(NodeId::new(row));
+      }
+    }
+    hits
   }
 
   fn heap_str(&self, off_col: usize, len_col: usize, row: u64) -> Option<&str> {
@@ -447,12 +495,27 @@ impl Kg {
         Some(view)
           if selector.name.is_none_or(|n| view.name == n)
             && selector.kind.is_none_or(|k| view.kind == k)
-            && selector.path_suffix.is_none_or(|p| view.path.ends_with(p)) =>
+            && selector.path_suffix.is_none_or(|p| view.path.ends_with(p))
+            && selector.external_id.is_none_or(|e| view.external_id == Some(e)) =>
         {
           vec![NodeId::new(id)]
         }
         _ => Vec::new(),
       };
+    }
+    // The durable bookmark form: resolve by external id, refined by any other facets.
+    if let Some(eid) = selector.external_id {
+      return self
+        .nodes_with_external_id(eid)
+        .into_iter()
+        .filter(|&id| {
+          self.node(id).is_some_and(|view| {
+            selector.name.is_none_or(|n| view.name == n)
+              && selector.kind.is_none_or(|k| view.kind == k)
+              && selector.path_suffix.is_none_or(|p| view.path.ends_with(p))
+          })
+        })
+        .collect();
     }
     let Some(name) = selector.name else {
       return Vec::new();

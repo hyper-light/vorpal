@@ -1033,6 +1033,9 @@ fn search_index_impl(
 pub struct GraphTarget {
   pub name: String,
   pub id: Option<u64>,
+  /// Durable external id (32 hex chars) — the cross-generation bookmark form. Also accepted
+  /// on every surface as an `eid:<hex>` name.
+  pub external_id: Option<u128>,
   pub path_suffix: Option<String>,
   pub kind: Option<String>,
   pub merge_all: bool,
@@ -1132,11 +1135,21 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
     ),
     None => None,
   };
+  // `eid:<32-hex>` as a name is the durable-bookmark wire form: usable anywhere a name is
+  // accepted (CLI verbs, MCP tools) without new arguments.
+  let (name, eid_from_name) = match target.name.strip_prefix("eid:") {
+    Some(hex) => (
+      "",
+      Some(u128::from_str_radix(hex, 16).map_err(|_| format!("malformed external id '{hex}'"))?),
+    ),
+    None => (target.name.as_str(), None),
+  };
   let selector = vorpal_kg::SymbolSelector {
     id: target.id,
-    name: (!target.name.is_empty()).then_some(target.name.as_str()),
+    name: (!name.is_empty()).then_some(name),
     path_suffix: target.path_suffix.as_deref(),
     kind,
+    external_id: target.external_id.or(eid_from_name),
   };
   let matches = kg.select(&selector);
   if matches.is_empty() {
@@ -1228,14 +1241,19 @@ fn render_candidates(kg: &Kg, ids: &[NodeId]) -> String {
       } else {
         format!("  {}", view.signature)
       };
+      let eid = view
+        .external_id
+        .map(|e| format!("  eid:{e:032x}"))
+        .unwrap_or_default();
       let _ = writeln!(
         out,
-        "id {}  {} [{:?}] {}{}",
+        "id {}  {} [{:?}] {}{}{}",
         id.raw(),
         view.name,
         view.kind,
         view.path,
-        signature
+        signature,
+        eid
       );
     }
   }

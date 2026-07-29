@@ -67,6 +67,10 @@ pub struct GraphArg {
   /// Query exactly this node id (from `graph node <name>` or an ambiguity listing).
   #[clap(long, value_name = "ID")]
   id: Option<u64>,
+  /// Durable external id (32 hex chars from `graph node` output) — survives rebuilds.
+  /// Also accepted anywhere a name is, as `eid:<hex>`.
+  #[clap(long, value_name = "HEX")]
+  eid: Option<String>,
   /// Merge results across ALL same-named definitions (the pre-selector behavior).
   #[clap(long)]
   all: bool,
@@ -138,9 +142,17 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
 
 pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
   let dir = index_dir(arg.index);
+  let eid = match arg.eid.as_deref() {
+    Some(hex) => Some(
+      u128::from_str_radix(hex, 16)
+        .map_err(|_| anyhow::anyhow!("malformed external id '{hex}' (expect 32 hex chars)"))?,
+    ),
+    None => None,
+  };
   let target = vorpal_index::GraphTarget {
     name: arg.name,
     id: arg.id,
+    external_id: eid,
     path_suffix: arg.path,
     kind: arg.kind,
     merge_all: arg.all,

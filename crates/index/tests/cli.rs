@@ -351,6 +351,60 @@ fn edges_explain_why_they_exist() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// Durable external identity (IMPROVEMENTS 07-29 §2): a client can bookmark a symbol's
+/// external id, rebuild the index (shifting dense ids), and re-resolve the same logical
+/// symbol; a rename is an explicit identity transition — the old id resolves to nothing.
+#[test]
+fn external_id_bookmarks_survive_rebuilds() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-eid-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("m.rs"), "pub fn bookmark_me() -> u32 { 1 }\n").unwrap();
+
+  build_index(&src, &out).unwrap();
+  let kg = Kg::load(&out).unwrap();
+  let id_v1 = kg.nodes_named("bookmark_me")[0];
+  let eid = kg.node(id_v1).unwrap().external_id.expect("eid persisted");
+  drop(kg);
+
+  // A new file that sorts earlier shifts every dense id; the bookmark must not care.
+  fs::write(src.join("a.rs"), "pub fn earlier() -> u32 { 0 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+  let kg = Kg::load(&out).unwrap();
+  let id_v2 = kg.nodes_named("bookmark_me")[0];
+  assert_ne!(id_v1, id_v2, "dense ids shifted (fixture precondition)");
+  let resolved = kg.nodes_with_external_id(eid);
+  assert_eq!(resolved, vec![id_v2], "bookmark resolves the same logical symbol");
+  assert_eq!(kg.node(id_v2).unwrap().external_id, Some(eid), "id is stable");
+
+  // The selector wire form: `eid:<hex>` as a name resolves it on every query surface.
+  let rendered = vorpal_index::graph_query_on(
+    &kg,
+    "node",
+    &vorpal_index::GraphTarget {
+      name: format!("eid:{eid:032x}"),
+      ..vorpal_index::GraphTarget::default()
+    },
+  )
+  .unwrap();
+  assert!(rendered.contains("bookmark_me"), "{rendered}");
+  assert!(rendered.contains(&format!("eid:{eid:032x}")), "{rendered}");
+  drop(kg);
+
+  // Rename: an explicit identity transition — the old bookmark resolves to nothing.
+  fs::write(src.join("m.rs"), "pub fn bookmark_renamed() -> u32 { 1 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+  let kg = Kg::load(&out).unwrap();
+  assert!(
+    kg.nodes_with_external_id(eid).is_empty(),
+    "a renamed symbol must not silently keep the old identity"
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn semantic_search_finds_definitions_by_description() {
   let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));

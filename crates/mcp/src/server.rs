@@ -159,6 +159,11 @@ impl Server {
         let target = vorpal_index::GraphTarget {
           name,
           id: args.get("id").and_then(Value::as_u64),
+          // The durable-bookmark facet; `name: "eid:<hex>"` works too (shared wire form).
+          external_id: args
+            .get("eid")
+            .and_then(Value::as_str)
+            .and_then(|hex| u128::from_str_radix(hex, 16).ok()),
           path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
           kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
           merge_all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
@@ -318,6 +323,7 @@ fn tools_list() -> Value {
     "path": {"type": "string", "description": "Refine: definition file path must end with this suffix"},
     "kind": {"type": "string", "description": "Refine: symbol kind (function, method, struct, field, …)"},
     "id": {"type": "integer", "description": "Query exactly this node id (from `node` output or an ambiguity listing)"},
+    "eid": {"type": "string", "description": "Durable external id (32 hex chars from `node` output) — survives rebuilds; also accepted as a `name` of the form eid:<hex>"},
     "all": {"type": "boolean", "description": "Merge results across ALL same-named definitions instead of listing candidates"}
   });
   json!({"tools": [
