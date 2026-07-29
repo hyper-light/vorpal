@@ -47,7 +47,14 @@ rule:
                   stopBy: end
                   pattern: $NAME
 name: $NAME
-isExported: true
+# Internal linkage is honest visibility (§3.3): a `static` function is translation-unit-local,
+# so exporting it let the resolver fake cross-file edges to it. Direct-child check only — a
+# `static` local inside the body must not demote the function.
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
 ---
 id: c-struct
 language: C

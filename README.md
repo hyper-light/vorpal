@@ -41,7 +41,10 @@ Every output above is a verbatim capture from running vorpal on its own reposito
   AST-based — never substring matching.
 - **Honest resolution** — cross-file references resolve with scope precedence and confidence
   labels (`LOCAL` > exported `CROSS_FILE` > labeled `AMBIGUOUS`). Unresolvable references are
-  *counted, never faked*: no phantom edges, ever.
+  *counted, never faked*: no phantom edges, ever. The contract is enforced by a labelled
+  per-language evaluation suite (`crates/index/tests/resolution_eval.rs`): 100% precision and
+  recall — per edge, grade, and resolver reason — on exhaustively-labelled fixtures, with
+  externals and internal-linkage (`static`) references pinned as never-resolved.
 - **Hybrid lexical/graph retrieval** — one query fuses exact/token name matching,
   lexical-embedding similarity (deterministic feature hashing — honest about being token
   similarity, not a learned model; the `Embedder` trait accepts neural adapters), and graph

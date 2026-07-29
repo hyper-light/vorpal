@@ -245,6 +245,17 @@ impl Kg {
       .unwrap_or_default()
   }
 
+  /// The complete evidence row set — every edge occurrence resolution emitted, in canonical
+  /// order. Empty when the generation carries no sidecar. This is the population a
+  /// precision/recall evaluation measures over.
+  pub fn all_evidence(&self) -> Vec<crate::evidence::EvidenceRow> {
+    self
+      .evidence
+      .as_ref()
+      .map(|store| store.rows().collect())
+      .unwrap_or_default()
+  }
+
   /// Every retained evidence occurrence originating at `from` — the one-sided form.
   pub fn evidence_from(&self, from: NodeId) -> Vec<crate::evidence::EvidenceRow> {
     self

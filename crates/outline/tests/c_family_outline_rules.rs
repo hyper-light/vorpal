@@ -126,7 +126,7 @@ void *proto_fn(int);
   - Field public next
 - Function item exported plain_fn
 - Function item exported ptr_fn
-- Function item exported sptr_fn
+- Function item private sptr_fn
 - Variable item exported global_plain
 - Variable item exported global_init
 - Variable item exported global_ptr

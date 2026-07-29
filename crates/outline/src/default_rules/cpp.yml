@@ -11,6 +11,7 @@ name: $PATH
 isImport: true
 isExported: false
 ---
+
 id: cpp-function
 language: Cpp
 role: item
@@ -35,8 +36,14 @@ rule:
             field: declarator
             pattern: $NAME
 name: $NAME
-isExported: true
+# Internal linkage is honest visibility: `static` at namespace scope is TU-local.
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
 ---
+
 id: cpp-class
 language: Cpp
 role: item
@@ -53,6 +60,7 @@ rule:
         kind: field_declaration_list
 name: $NAME
 ---
+
 id: cpp-struct
 language: Cpp
 role: item
@@ -69,6 +77,7 @@ rule:
         kind: field_declaration_list
 name: $NAME
 ---
+
 id: cpp-enum
 language: Cpp
 role: item
@@ -85,6 +94,7 @@ rule:
         kind: enumerator_list
 name: $NAME
 ---
+
 id: cpp-concept
 language: Cpp
 role: item
@@ -96,6 +106,7 @@ rule:
     pattern: $NAME
 name: $NAME
 ---
+
 id: cpp-member-method
 language: Cpp
 role: member
@@ -125,6 +136,7 @@ rule:
 name: $NAME
 isPublic: false
 ---
+
 id: cpp-member-constructor
 language: Cpp
 role: member
@@ -141,6 +153,7 @@ rule:
 name: $NAME
 isPublic: false
 ---
+
 id: cpp-member-field
 language: Cpp
 role: member
@@ -178,6 +191,7 @@ rule:
 name: $NAME
 isPublic: false
 ---
+
 id: cpp-nested-class
 language: Cpp
 role: member
@@ -191,6 +205,7 @@ rule:
 name: $NAME
 isPublic: false
 ---
+
 id: cpp-nested-struct
 language: Cpp
 role: member
@@ -204,6 +219,7 @@ rule:
 name: $NAME
 isPublic: false
 ---
+
 id: cpp-enum-member
 language: Cpp
 role: member

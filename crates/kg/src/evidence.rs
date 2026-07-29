@@ -129,6 +129,12 @@ impl EvidenceStore {
     (lo..hi).map(|i| self.row(i)).collect()
   }
 
+  /// Every retained row, in canonical order — the complete emitted-resolution-edge list,
+  /// which is exactly the denominator a precision measurement needs.
+  pub fn rows(&self) -> impl Iterator<Item = EvidenceRow> + '_ {
+    (0..self.count).map(|i| self.row(i))
+  }
+
   pub fn len(&self) -> usize {
     self.count
   }
