@@ -21,7 +21,7 @@ pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as
 pub use model::SymbolKind;
 pub use writer::{KgWriter, NodeDef, layout_entity_paths};
 
-pub use vorpal_graph::{Direction, EdgeLog, EdgeType};
+pub use vorpal_graph::{Direction, EdgeLog, EdgeType, ReachStep};
 pub use vorpal_segment::NodeId;
 
 /// Phase stamp for RSS-timeline profiling, active only under `VORPAL_PHASE_TRACE`.

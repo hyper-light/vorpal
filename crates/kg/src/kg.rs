@@ -427,6 +427,28 @@ impl Kg {
       .collect()
   }
 
+  /// [`Kg::reachable_via`] with **paths and a grade floor**: each reached node carries its
+  /// BFS-tree parent edge (chain to reconstruct one shortest compliant path) and traversal
+  /// follows only edges at `min_confidence` or better — a positive floor excludes structural
+  /// containment (confidence 0) and every resolution edge below the grade.
+  pub fn reachable_via_paths(
+    &self,
+    id: NodeId,
+    dir: Direction,
+    edge_types: &[EdgeType],
+    max_depth: Option<u32>,
+    min_confidence: u8,
+  ) -> Vec<vorpal_graph::ReachStep> {
+    vorpal_graph::reachable_typed_paths(
+      &self.graph,
+      &[id.raw() as u32],
+      dir,
+      edge_types,
+      max_depth,
+      min_confidence,
+    )
+  }
+
   /// Nodes reachable from `id` **restricted to the given edge types**, up to `max_depth` hops
   /// (`None` = unbounded), following out-edges (what `id` reaches) or in-edges (what reaches
   /// `id`). This is the relation-specific traversal: e.g. transitive callers are

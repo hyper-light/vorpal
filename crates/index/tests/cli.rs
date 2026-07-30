@@ -466,6 +466,82 @@ fn verified_mode_catches_stale_banked_products() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// The traversal contract (IMPROVEMENTS 07-29 §6): reachable is selector-consistent (ambiguous
+/// seeds list candidates), returns each reached node WITH its path back to the seed, and a
+/// grade floor stops traversal at the first edge below it.
+#[test]
+fn reachable_returns_paths_and_respects_grade_floor() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-reach-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  // top → mid (cross-file constrained) → bottom (same-file exact); plus an ambiguous callee
+  // to give the chain a heuristic tail: mid also calls amb(), defined in TWO other files.
+  fs::write(
+    src.join("a_top.rs"),
+    "pub fn top() -> u32 { mid() }\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("b_mid.rs"),
+    "pub fn mid() -> u32 { bottom() + amb() }\npub fn bottom() -> u32 { 3 }\n",
+  )
+  .unwrap();
+  fs::write(src.join("c_amb1.rs"), "pub fn amb() -> u32 { 1 }\n").unwrap();
+  fs::write(src.join("d_amb2.rs"), "pub fn amb() -> u32 { 2 }\n").unwrap();
+  build_index(&src, &out).unwrap();
+  let kg = Kg::load(&out).unwrap();
+
+  let query = |grade: Option<&str>| {
+    vorpal_index::reachable_query_on(
+      &kg,
+      &vorpal_index::GraphTarget {
+        name: "top".into(),
+        ..vorpal_index::GraphTarget::default()
+      },
+      vorpal_index::Direction::Out,
+      &[vorpal_index::EdgeType::CALLS],
+      None,
+      vorpal_index::min_confidence_for_grade(grade).unwrap(),
+    )
+    .unwrap()
+  };
+
+  // Paths, not sets: every reached node carries its chain back to the seed.
+  let rendered = query(None);
+  assert!(rendered.contains("top -calls→ mid"), "{rendered}");
+  assert!(
+    rendered.contains("top -calls→ mid -calls→ bottom"),
+    "{rendered}"
+  );
+  assert!(rendered.contains("-calls→ amb"), "heuristic tail present:\n{rendered}");
+
+  // Grade floor `constrained`: the heuristic amb() hop is not crossed; the rest survives.
+  let floored = query(Some("constrained"));
+  assert!(floored.contains("mid"), "{floored}");
+  assert!(floored.contains("bottom"), "{floored}");
+  assert!(!floored.contains("amb"), "heuristic edge crossed the floor:\n{floored}");
+
+  // Selector consistency: an ambiguous seed lists candidates instead of unioning namesakes.
+  let ambiguous = vorpal_index::reachable_query_on(
+    &kg,
+    &vorpal_index::GraphTarget {
+      name: "amb".into(),
+      ..vorpal_index::GraphTarget::default()
+    },
+    vorpal_index::Direction::In,
+    &[vorpal_index::EdgeType::CALLS],
+    None,
+    0,
+  )
+  .unwrap();
+  assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+  assert!(ambiguous.contains("refine"), "{ambiguous}");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn semantic_search_finds_definitions_by_description() {
   let base = std::env::temp_dir().join(format!("vorpal-index-search-{}", std::process::id()));

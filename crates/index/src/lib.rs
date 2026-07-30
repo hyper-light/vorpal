@@ -30,7 +30,10 @@ use vorpal_ingest::{
   load_product, peek_product_stamps, save_product, stream_apply_spilled,
   validate_product,
 };
-use vorpal_kg::{Kg, NodeId};
+// `Kg` is imported once and re-exported for downstream surfaces (CLI) that route all graph
+// access through this crate.
+pub use vorpal_kg::{Direction, EdgeType, Kg};
+use vorpal_kg::NodeId;
 
 /// Summary of an indexing run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1276,6 +1279,122 @@ pub fn explain_absence_on(kg: &Kg, from_id: u64, name: &str) -> Result<String, B
       row.span_start,
       row.span_end
     );
+  }
+  Ok(out)
+}
+
+/// Map a grade label to the confidence floor traversal enforces (`exact` > `constrained` >
+/// `heuristic`); `None`/empty = no floor (structural edges included).
+pub fn min_confidence_for_grade(grade: Option<&str>) -> Result<u8, Box<dyn Error>> {
+  Ok(match grade.map(str::to_ascii_lowercase).as_deref() {
+    None | Some("") => 0,
+    Some("heuristic") => 1,
+    Some("constrained") => 90,
+    Some("exact") => 100,
+    Some(other) => {
+      return Err(format!("unknown grade '{other}' (exact | constrained | heuristic)").into());
+    }
+  })
+}
+
+/// The relation-specific, selector-consistent, grade-filtered traversal every surface shares
+/// (IMPROVEMENTS 07-29 §6): resolve `target` through the same selector contract as the direct
+/// graph verbs (ambiguous names list candidates), traverse only `relations` at
+/// `min_confidence`+ up to `max_depth`, and render each reached node **with its path** back to
+/// the seed — per-edge relation names included, so a traversal answer is auditable, not a bare
+/// node set.
+pub fn reachable_query_on(
+  kg: &Kg,
+  target: &GraphTarget,
+  dir: vorpal_kg::Direction,
+  relations: &[vorpal_kg::EdgeType],
+  max_depth: Option<u32>,
+  min_confidence: u8,
+) -> Result<String, Box<dyn Error>> {
+  let kind = match target.kind.as_deref() {
+    Some(text) => Some(
+      vorpal_kg::SymbolKind::parse(text).ok_or_else(|| format!("unknown symbol kind '{text}'"))?,
+    ),
+    None => None,
+  };
+  let (name, eid_from_name) = match target.name.strip_prefix("eid:") {
+    Some(hex) => (
+      "",
+      Some(u128::from_str_radix(hex, 16).map_err(|_| format!("malformed external id '{hex}'"))?),
+    ),
+    None => (target.name.as_str(), None),
+  };
+  let selector = vorpal_kg::SymbolSelector {
+    id: target.id,
+    name: (!name.is_empty()).then_some(name),
+    path_suffix: target.path_suffix.as_deref(),
+    kind,
+    external_id: target.external_id.or(eid_from_name),
+  };
+  let matches = kg.select(&selector);
+  if matches.is_empty() {
+    return Ok(format!(
+      "(no results for '{}' — no symbol matches that selector)
+",
+      target.name
+    ));
+  }
+  if matches.len() > 1 && !target.merge_all {
+    let mut out = format!(
+      "ambiguous: '{}' matches {} definitions — refine with --path/--kind/--id, or --all to merge:
+",
+      target.name,
+      matches.len()
+    );
+    out.push_str(&render_candidates(kg, &matches));
+    return Ok(out);
+  }
+
+  let mut out = String::new();
+  for &seed in &matches {
+    // Parent-edge map for path reconstruction; steps arrive in BFS order (deterministic).
+    let steps = kg.reachable_via_paths(seed, dir, relations, max_depth, min_confidence);
+    let mut parent: HashMap<u32, (u32, vorpal_kg::EdgeType)> = HashMap::new();
+    for step in &steps {
+      parent.insert(step.node, step.via);
+    }
+    let seed_raw = seed.raw() as u32;
+    let name_of = |id: u32| {
+      kg.node(NodeId::new(id as u64))
+        .map(|v| v.name.to_string())
+        .unwrap_or_else(|| format!("<{id}>"))
+    };
+    for step in &steps {
+      let Some(view) = kg.node(NodeId::new(step.node as u64)) else {
+        continue;
+      };
+      // Reconstruct the BFS path: node ← … ← seed, rendered seed-first.
+      let mut chain: Vec<String> = Vec::new();
+      let mut at = step.node;
+      while at != seed_raw {
+        let Some(&(up, edge)) = parent.get(&at) else {
+          break;
+        };
+        chain.push(format!("-{}→ {}", edge.name(), name_of(at)));
+        at = up;
+      }
+      chain.reverse();
+      let _ = writeln!(
+        out,
+        "{} [{:?}] {} (id {}; depth {}; {} {})",
+        view.name,
+        view.kind,
+        view.path,
+        step.node,
+        step.depth,
+        name_of(seed_raw),
+        chain.join(" ")
+      );
+    }
+  }
+  if out.is_empty() {
+    out = format!("(nothing reachable from '{}' under those filters)
+", target.name);
   }
   Ok(out)
 }

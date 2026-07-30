@@ -271,10 +271,20 @@ impl Server {
             return Err(format!("direction must be \"in\" or \"out\", got '{other}'"));
           }
         };
-        // Relation-specific: traversal follows only the requested edge types, so "transitive
-        // callers" (direction=in, relations=[calls]) can never leak across containment, import,
-        // or type edges. Defaults to `calls` — the canonical transitive-reachability relation —
-        // when the caller does not specify. `max_depth` bounds the hops (0/absent = unbounded).
+        // Selector-consistent (07-29 §6): same refinement contract as the direct graph tools —
+        // ambiguous names return candidates; id/eid/path/kind refine; `all` merges explicitly.
+        let target = vorpal_index::GraphTarget {
+          name,
+          id: args.get("id").and_then(Value::as_u64),
+          external_id: args
+            .get("eid")
+            .and_then(Value::as_str)
+            .and_then(|hex| u128::from_str_radix(hex, 16).ok()),
+          path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
+          kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
+          merge_all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+          show_ids: true,
+        };
         let relations: Vec<vorpal_kg::EdgeType> = match args.get("relations") {
           Some(Value::Array(items)) => {
             let mut out = Vec::new();
@@ -299,16 +309,13 @@ impl Server {
           Some(0) | None => None,
           Some(d) => Some(d as u32),
         };
+        let min_confidence = vorpal_index::min_confidence_for_grade(
+          args.get("min_grade").and_then(Value::as_str),
+        )
+        .map_err(|err| err.to_string())?;
         let kg = self.kg()?;
-        let mut ids: Vec<NodeId> = Vec::new();
-        for seed in kg.nodes_named(&name) {
-          for id in kg.reachable_via(seed, dir, &relations, max_depth) {
-            if !ids.contains(&id) {
-              ids.push(id);
-            }
-          }
-        }
-        Ok(render(kg, &name, &ids))
+        vorpal_index::reachable_query_on(kg, &target, dir, &relations, max_depth, min_confidence)
+          .map_err(|err| err.to_string())
       }
       other => Err(format!("unknown tool '{other}'")),
     }
@@ -376,16 +383,24 @@ fn tools_list() -> Value {
     tool("type_users", "Definitions using a type in fields, params, returns, or annotations (incoming `of_type` edges).", name_only.clone(), &["name"]),
     tool(
       "reachable",
-      "Relation-specific transitive closure from a symbol. direction \"in\" = everything reaching \
-       it, \"out\" = everything it reaches; `relations` restricts which edge types the traversal \
-       may follow (default [\"calls\"]) so, e.g., transitive callers never cross a containment or \
-       import edge. `max_depth` bounds the hops (0/absent = unbounded).",
+      "Relation-specific transitive traversal from a symbol, returning each reached node WITH \
+       its path back to the seed (per-edge relation names). direction \"in\" = everything \
+       reaching it, \"out\" = everything it reaches; `relations` restricts edge types (default \
+       [\"calls\"]); `min_grade` sets a resolution-grade floor; the seed uses the same selector \
+       contract as the direct graph tools (ambiguous names list candidates).",
       json!({
         "name": {"type": "string", "description": "Exact symbol name"},
         "direction": {"type": "string", "enum": ["in", "out"]},
         "relations": {"type": "array", "items": {"type": "string"},
           "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides (default [\"calls\"])"},
-        "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"}
+        "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"},
+        "min_grade": {"type": "string", "enum": ["exact", "constrained", "heuristic"],
+          "description": "Only traverse edges at this resolution grade or better (absent = include structural edges too)"},
+        "path": {"type": "string", "description": "Refine: seed's file path must end with this suffix"},
+        "kind": {"type": "string", "description": "Refine: seed's symbol kind"},
+        "id": {"type": "integer", "description": "Seed exactly this node id"},
+        "eid": {"type": "string", "description": "Seed by durable external id (32 hex chars)"},
+        "all": {"type": "boolean", "description": "Merge across ALL same-named seeds instead of listing candidates"}
       }),
       &["name", "direction"],
     ),

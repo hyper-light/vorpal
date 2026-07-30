@@ -101,6 +101,72 @@ pub fn reachable_typed(
   visited
 }
 
+/// One reached node in a [`reachable_typed_paths`] traversal: where it sits in the BFS tree —
+/// its depth, the node it was first reached from, and the (confidence-carrying) edge type that
+/// reached it. Chaining `via` links back to the seed reconstructs one shortest
+/// relation-restricted path per node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReachStep {
+  pub node: u32,
+  pub depth: u32,
+  /// `(parent, edge_type_with_confidence)` — `None` only for a seed (never emitted).
+  pub via: (u32, EdgeType),
+}
+
+/// [`reachable_typed`] with **paths and a confidence floor**: BFS restricted to `allowed` base
+/// edge types, following only edges whose packed confidence is `>= min_confidence`
+/// (`0` admits structural edges; any positive floor therefore restricts traversal to
+/// resolution-produced edges at that grade or better). Each reached node records its BFS-tree
+/// parent edge, so callers render one shortest compliant path per node instead of a bare set.
+/// Deterministic: the frontier expands in CSR order, so parents — and rendered paths — are a
+/// pure function of the graph.
+pub fn reachable_typed_paths(
+  graph: &Graph,
+  seeds: &[u32],
+  dir: Direction,
+  allowed: &[EdgeType],
+  max_depth: Option<u32>,
+  min_confidence: u8,
+) -> Vec<ReachStep> {
+  let n = graph.node_count();
+  let mut visited = BitSet::with_capacity(n);
+  let mut frontier: Vec<u32> = Vec::new();
+  for &s in seeds {
+    if (s as usize) < n && visited.insert(s as usize) {
+      frontier.push(s);
+    }
+  }
+  let allowed_bases: Vec<u16> = allowed.iter().map(|e| e.base().0).collect();
+  let mut steps: Vec<ReachStep> = Vec::new();
+  let mut depth = 0u32;
+  while !frontier.is_empty() && max_depth.is_none_or(|md| depth < md) {
+    let mut next: Vec<u32> = Vec::new();
+    for &u in &frontier {
+      let (targets, types) = match dir {
+        Direction::Out => (graph.out_targets(u), graph.out_edge_types(u)),
+        Direction::In => (graph.in_targets(u), graph.in_edge_types(u)),
+      };
+      for (&v, &et) in targets.iter().zip(types) {
+        let edge = EdgeType(et);
+        if !allowed_bases.contains(&edge.base().0) || edge.confidence() < min_confidence {
+          continue;
+        }
+        if (v as usize) < n && visited.insert(v as usize) {
+          steps.push(ReachStep {
+            node: v,
+            depth: depth + 1,
+            via: (u, edge),
+          });
+          next.push(v);
+        }
+      }
+    }
+    frontier = next;
+    depth += 1;
+  }
+  steps
+}
+
 /// Like [`reachable`], but with an explicit [`Strategy`] (used to verify push ≡ pull).
 pub fn reachable_strategy(
   graph: &Graph,

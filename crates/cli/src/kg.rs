@@ -41,6 +41,8 @@ enum GraphVerb {
   Typeusers,
   /// Nodes matching a name.
   Node,
+  /// Relation-specific transitive traversal, each reached node with its path to the seed.
+  Reachable,
 }
 
 impl GraphVerb {
@@ -52,6 +54,7 @@ impl GraphVerb {
       GraphVerb::Implementors => "implementors",
       GraphVerb::Typeusers => "typeusers",
       GraphVerb::Node => "node",
+      GraphVerb::Reachable => "reachable",
     }
   }
 }
@@ -79,6 +82,21 @@ pub struct GraphArg {
   /// Merge results across ALL same-named definitions (the pre-selector behavior).
   #[clap(long)]
   all: bool,
+  /// (reachable) Traversal direction: `in` = everything reaching the symbol (transitive
+  /// callers), `out` = everything it reaches. Default `in`.
+  #[clap(long, value_name = "in|out", default_value = "in")]
+  direction: String,
+  /// (reachable) Comma-separated edge types to follow (calls, references, imports,
+  /// implements, of_type, defines, has_method, has_field, overrides). Default `calls`.
+  #[clap(long, value_name = "RELS", default_value = "calls")]
+  relations: String,
+  /// (reachable) Maximum hops (0 = unbounded).
+  #[clap(long, value_name = "N", default_value_t = 0)]
+  depth: u32,
+  /// (reachable) Only traverse edges at this resolution grade or better
+  /// (exact | constrained | heuristic). Absent = structural edges included.
+  #[clap(long, value_name = "GRADE")]
+  min_grade: Option<String>,
   /// Append each result's node id (stable within this index generation).
   #[clap(long)]
   ids: bool,
@@ -171,9 +189,32 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     merge_all: arg.all,
     show_ids: arg.ids,
   };
-  let rendered = vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
-    .map_err(boxed)
-    .with_context(|| missing_index_hint(&dir))?;
+  let rendered = if matches!(arg.verb, GraphVerb::Reachable) {
+    let direction = match arg.direction.as_str() {
+      "in" => vorpal_index::Direction::In,
+      "out" => vorpal_index::Direction::Out,
+      other => anyhow::bail!("--direction must be `in` or `out`, got '{other}'"),
+    };
+    let mut relations = Vec::new();
+    for rel in arg.relations.split(',').filter(|r| !r.trim().is_empty()) {
+      relations.push(
+        vorpal_index::EdgeType::from_name(rel.trim())
+          .ok_or_else(|| anyhow::anyhow!("unknown relation '{rel}'"))?,
+      );
+    }
+    let max_depth = (arg.depth > 0).then_some(arg.depth);
+    let min_confidence =
+      vorpal_index::min_confidence_for_grade(arg.min_grade.as_deref()).map_err(boxed)?;
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    vorpal_index::reachable_query_on(&kg, &target, direction, &relations, max_depth, min_confidence)
+      .map_err(boxed)?
+  } else {
+    vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
+      .map_err(boxed)
+      .with_context(|| missing_index_hint(&dir))?
+  };
   print!("{rendered}");
   Ok(ExitCode::SUCCESS)
 }

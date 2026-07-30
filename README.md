@@ -259,7 +259,7 @@ Graph tools accept unambiguous symbol **selectors** — refine `name` with `path
 | `importers` | `name` (+ selectors) | Files importing the symbol (incoming `imports`) |
 | `implementors` | `name` (+ selectors) | Types implementing/extending it (incoming `implements`) |
 | `type_users` | `name` (+ selectors) | Definitions using it as a type (incoming `of_type`) |
-| `reachable` | `name`, `direction: "in"\|"out"`, `relations?`, `max_depth?` | Relation-specific transitive closure (default `relations: ["calls"]`, so transitive callers never cross a non-call edge) |
+| `reachable` | `name` (+ selectors), `direction: "in"\|"out"`, `relations?`, `max_depth?`, `min_grade?` | Relation-specific transitive traversal returning each reached node **with its path** back to the seed; a grade floor stops traversal at the first edge below it; same selector/ambiguity contract as the direct graph tools |
 | `structural_search` | `pattern`, `lang`, `path?`, `limit?` | ast-grep-style AST pattern match over the source tree (`$X`, `$$$ARGS`) → `path:line` + matched text |
 | `fetch_span` | `id`, `max_bytes?` | The verbatim defining source of a graph node |
 | `why` | `from_id`, `to_id` | Evidence for the edge(s) between two nodes: each occurrence's edge type, resolution grade, resolver reason, candidate count, and source span |

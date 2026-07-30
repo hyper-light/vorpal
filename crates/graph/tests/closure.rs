@@ -1,7 +1,10 @@
 //! Transitive closure (§11.5): correctness + push ≡ pull equivalence.
 
 use vorpal_graph::closure::reachable_strategy;
-use vorpal_graph::{Direction, EdgeLog, EdgeType, Graph, Strategy, reachable, reachable_typed};
+use vorpal_graph::{
+  Direction, EdgeLog, EdgeType, Graph, Strategy, reachable, reachable_typed,
+  reachable_typed_paths,
+};
 
 fn graph(node_count: u32, edges: &[(u32, u32)]) -> Graph {
   let mut log = EdgeLog::new();
@@ -123,4 +126,34 @@ fn push_and_pull_agree_everywhere() {
       assert_eq!(push, auto, "push≠auto dir={dir:?} seed={seed}");
     }
   }
+}
+
+#[test]
+fn typed_paths_record_parents_and_respect_confidence_floor() {
+  // 0 -CALLS(100)→ 1 -CALLS(90)→ 2 -CALLS(40)→ 3, plus 1 -HAS_METHOD→ 4.
+  let mut log = EdgeLog::new();
+  log.push(0, 1, EdgeType::CALLS.with_confidence(100));
+  log.push(1, 2, EdgeType::CALLS.with_confidence(90));
+  log.push(2, 3, EdgeType::CALLS.with_confidence(40));
+  log.push(1, 4, EdgeType::HAS_METHOD);
+  let g = Graph::compact(5, &log);
+
+  // No floor: the whole CALLS chain, each step carrying its BFS parent.
+  let steps = reachable_typed_paths(&g, &[0], Direction::Out, &[EdgeType::CALLS], None, 0);
+  let nodes: Vec<u32> = steps.iter().map(|s| s.node).collect();
+  assert_eq!(nodes, vec![1, 2, 3]);
+  assert_eq!(steps[0].via.0, 0);
+  assert_eq!(steps[1].via.0, 1);
+  assert_eq!(steps[2].via.0, 2);
+  assert_eq!(steps[2].depth, 3);
+  assert_eq!(steps[2].via.1.confidence(), 40, "edge confidence rides along");
+
+  // Grade floor at constrained (90): traversal stops before the heuristic (40) hop.
+  let steps = reachable_typed_paths(&g, &[0], Direction::Out, &[EdgeType::CALLS], None, 90);
+  let nodes: Vec<u32> = steps.iter().map(|s| s.node).collect();
+  assert_eq!(nodes, vec![1, 2], "the 40-confidence hop must not be crossed");
+
+  // A positive floor also excludes structural edges (confidence 0).
+  let steps = reachable_typed_paths(&g, &[1], Direction::Out, &[EdgeType::HAS_METHOD], None, 1);
+  assert!(steps.is_empty(), "structural edges sit below any grade floor");
 }
