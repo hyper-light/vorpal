@@ -246,17 +246,20 @@ impl Server {
           .get("from_id")
           .and_then(Value::as_u64)
           .ok_or_else(|| "missing required argument: from_id".to_string())?;
-        let to_id = args
-          .get("to_id")
-          .and_then(Value::as_u64)
-          .ok_or_else(|| "missing required argument: to_id".to_string())?;
+        let to_id = args.get("to_id").and_then(Value::as_u64);
+        let name = args.get("name").and_then(Value::as_str).map(str::to_string);
         // Answer from the pinned graph + its generation dir: id-consistent with the queries
         // that produced these ids, and the snippet digest-checks against the same generation.
         self.kg()?;
         let dir = self.kg_dir.clone();
         let kg = self.kg.as_ref().expect("pinned above");
-        vorpal_index::explain_edge_on(kg, dir.as_deref(), from_id, to_id)
-          .map_err(|err| err.to_string())
+        match (to_id, name) {
+          (Some(to_id), _) => vorpal_index::explain_edge_on(kg, dir.as_deref(), from_id, to_id)
+            .map_err(|err| err.to_string()),
+          (None, Some(name)) => vorpal_index::explain_absence_on(kg, from_id, &name)
+            .map_err(|err| err.to_string()),
+          (None, None) => Err("pass to_id (edge evidence) or name (absence evidence)".into()),
+        }
       }
       "reachable" => {
         let name = str_arg("name")?;
@@ -415,9 +418,10 @@ fn tools_list() -> Value {
        this relation exist?",
       json!({
         "from_id": {"type": "integer", "description": "Source node id (from any graph tool's id output)"},
-        "to_id": {"type": "integer", "description": "Target node id"}
+        "to_id": {"type": "integer", "description": "Target node id (edge form: why does this edge exist?)"},
+        "name": {"type": "string", "description": "Referenced name (absence form: why is there NO edge to anything with this name?)"}
       }),
-      &["from_id", "to_id"],
+      &["from_id"],
     ),
     tool(
       "search",

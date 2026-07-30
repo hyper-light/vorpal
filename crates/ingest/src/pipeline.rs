@@ -264,24 +264,54 @@ pub fn link_writer_spilled(
   let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::new();
   let stats = {
     let writer = &mut writer;
-    let evidence = &mut evidence;
-    vorpal_resolve::resolve_all_spilled_into(&table, &spill, resolver, |edge| {
-      writer.add_edge(
-        edge.from,
-        edge.to,
-        edge.edge.with_confidence(edge.confidence),
-      );
-      evidence.push(vorpal_kg::EvidenceRow {
-        from: edge.from.raw() as u32,
-        to: edge.to.raw() as u32,
-        etype: edge.edge.base().0,
-        reason: edge.reason as u8,
-        confidence: edge.confidence,
-        candidates: edge.candidates,
-        span_start: edge.span.0,
-        span_end: edge.span.1,
-      });
-    })?
+    let evidence = std::cell::RefCell::new(&mut evidence);
+    vorpal_resolve::resolve_all_spilled_into(
+      &table,
+      &spill,
+      resolver,
+      |edge| {
+        writer.add_edge(
+          edge.from,
+          edge.to,
+          edge.edge.with_confidence(edge.confidence),
+        );
+        let (alt_ids, alt_count) = edge.alternatives;
+        evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
+          from: edge.from.raw() as u32,
+          to: edge.to.raw() as u32,
+          name_hash: edge.name_hash,
+          etype: edge.edge.base().0,
+          reason: edge.reason as u8,
+          confidence: edge.confidence,
+          outcome: vorpal_kg::EvidenceOutcome::Edge,
+          candidates: edge.candidates,
+          span_start: edge.span.0,
+          span_end: edge.span.1,
+          alternatives: alt_ids[..alt_count as usize].to_vec(),
+        });
+      },
+      |unresolved| {
+        // No-edge outcomes are evidence too (07-29 §4): "why is there no edge here?" is
+        // answerable from the sidecar instead of only aggregate counts.
+        evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
+          from: unresolved.from.raw() as u32,
+          to: vorpal_kg::NO_EDGE,
+          name_hash: unresolved.name_hash,
+          etype: unresolved.etype.base().0,
+          reason: 0,
+          confidence: 0,
+          outcome: if unresolved.external {
+            vorpal_kg::EvidenceOutcome::External
+          } else {
+            vorpal_kg::EvidenceOutcome::Masked
+          },
+          candidates: unresolved.candidates,
+          span_start: unresolved.span.0,
+          span_end: unresolved.span.1,
+          alternatives: Vec::new(),
+        });
+      },
+    )?
   };
   phase_trace("link: resolve done");
   drop(table);

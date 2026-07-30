@@ -40,7 +40,7 @@ const USAGE: &str = "usage:
   vorpal-index implementors <index-dir> <name>      types implementing/extending a symbol
   vorpal-index typeusers    <index-dir> <name>      definitions using a type
   vorpal-index node         <index-dir> <name>      nodes matching a name
-  vorpal-index why          <index-dir> <from-id> <to-id>  evidence for the edge(s) from → to
+  vorpal-index why          <index-dir> <from-id> <to-id|name>  edge evidence, or why no edge to <name>
   vorpal-index search       <index-dir> <query> [k] hybrid search (name + semantic + graph, RRF)";
 
 /// Route tree-sitter's C-side allocations through jemalloc too. Without this the parser's
@@ -130,11 +130,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       );
       Ok(())
     }
-    ["why", index, from_id, to_id] => {
-      print!(
-        "{}",
-        vorpal_index::explain_edge(Path::new(index), from_id.parse()?, to_id.parse()?)?
-      );
+    ["why", index, from_id, to_or_name] => {
+      // Numeric third arg = edge form ("why does this edge exist?"); anything else is a
+      // name = absence form ("why is there no edge to anything named X?").
+      let rendered = match to_or_name.parse::<u64>() {
+        Ok(to_id) => vorpal_index::explain_edge(Path::new(index), from_id.parse()?, to_id)?,
+        Err(_) => {
+          let dir = vorpal_kg::resolve_index_dir(Path::new(index));
+          let kg = vorpal_kg::Kg::load(&dir)?;
+          vorpal_index::explain_absence_on(&kg, from_id.parse()?, to_or_name)?
+        }
+      };
+      print!("{rendered}");
       Ok(())
     }
     ["search", index, query] => print_search(index, query, 10),

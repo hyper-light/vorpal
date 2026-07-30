@@ -267,6 +267,16 @@ impl Kg {
       .unwrap_or_default()
   }
 
+  /// The no-edge occurrences at `from` whose referenced-name hash matches (low 32 bits of
+  /// xxh3 of the name) — "why is there no edge from here to anything named X?".
+  pub fn evidence_absences(&self, from: NodeId, name_hash: u32) -> Vec<crate::evidence::EvidenceRow> {
+    self
+      .evidence
+      .as_ref()
+      .map(|store| store.absences_from(from.raw() as u32, name_hash))
+      .unwrap_or_default()
+  }
+
   /// Every retained evidence occurrence originating at `from` — the one-sided form.
   pub fn evidence_from(&self, from: NodeId) -> Vec<crate::evidence::EvidenceRow> {
     self

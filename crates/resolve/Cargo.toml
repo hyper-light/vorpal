@@ -11,6 +11,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 crossbeam-channel.workspace = true
 rayon.workspace = true
 vorpal-kg.workspace = true

@@ -3926,6 +3926,7 @@ dependencies = [
  "rayon",
  "vorpal-kg",
  "vorpal-outline",
+ "xxhash-rust",
 ]
 
 [[package]]

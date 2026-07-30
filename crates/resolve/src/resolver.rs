@@ -121,6 +121,10 @@ impl ResolveReason {
   }
 }
 
+/// Cap on retained alternative-candidate identities per occurrence: enough to explain any
+/// realistic tie, bounded so a 500-way `init` collision cannot bloat the sidecar.
+pub const MAX_RETAINED_ALTERNATIVES: usize = 8;
+
 /// The outcome of resolving one reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolution {
@@ -132,6 +136,10 @@ pub struct Resolution {
   pub candidates: usize,
   /// The resolver branch that produced (or declined) the target.
   pub reason: ResolveReason,
+  /// The alternatives the chosen target beat *in the final set* (tie picks retain the tie
+  /// set minus the target, capped at [`MAX_RETAINED_ALTERNATIVES`]); unique picks have none —
+  /// their eliminations are already explained by `reason`. `(ids, count)`.
+  pub alternatives: ([u32; MAX_RETAINED_ALTERNATIVES], u8),
 }
 
 /// A resolved reference ready to become a graph edge, carrying its evidence: the source span
@@ -148,6 +156,27 @@ pub struct ResolvedEdge {
   pub reason: ResolveReason,
   /// Candidate count at resolve time (saturated to `u32`).
   pub candidates: u32,
+  /// Low 32 bits of xxh3 of the referenced name — the absence-query key, carried on edges too.
+  pub name_hash: u32,
+  /// Retained final-set alternatives (tie picks), `(ids, count)` — see [`Resolution`].
+  pub alternatives: ([u32; MAX_RETAINED_ALTERNATIVES], u8),
+}
+
+/// A reference that produced **no** edge, retained as evidence (IMPROVEMENTS 07-29 §4): the
+/// honest-resolution story completed — "why is there no edge here?" is answerable from the
+/// sidecar instead of only aggregate counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnresolvedEvidence {
+  pub from: NodeId,
+  /// Low 32 bits of xxh3 of the referenced name (the name itself lives in source, not here).
+  pub name_hash: u32,
+  /// The edge type this reference *would* have produced.
+  pub etype: EdgeType,
+  pub span: (u32, u32),
+  pub candidates: u32,
+  /// `true` = external (no definition anywhere in the tree); `false` = masked (definitions
+  /// exist but none is safely attributable).
+  pub external: bool,
 }
 
 /// Counts from a resolution batch. `external + masked` is the total left without an edge.
@@ -223,6 +252,7 @@ impl Resolver {
           confidence: Confidence::CROSS_FILE,
           candidates: 1,
           reason: ResolveReason::ImportPath,
+          alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
         };
       }
     }
@@ -234,6 +264,7 @@ impl Resolver {
         confidence: Confidence::NONE,
         candidates: 0,
         reason: ResolveReason::None,
+        alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
       };
     }
 
@@ -269,6 +300,7 @@ impl Resolver {
           confidence: Confidence::NONE,
           candidates: candidates.len(),
           reason: ResolveReason::None,
+          alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
         };
       }
     }
@@ -337,6 +369,7 @@ fn finish(
       confidence: Confidence::NONE,
       candidates,
       reason: ResolveReason::None,
+      alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
     };
   }
   pick(
@@ -495,6 +528,7 @@ fn pick(
       confidence: unique,
       candidates,
       reason,
+      alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
     }
   } else if guess_on_tie {
     let reason = if via_qualifier {
@@ -505,12 +539,23 @@ fn pick(
       ResolveReason::VisibleTie
     };
     let target = set.iter().min_by_key(|s| s.id.raw()).map(|s| s.id);
+    // Retain the tie set the pick beat — the alternatives a "why this target?" answer names.
+    let mut alts = [0u32; MAX_RETAINED_ALTERNATIVES];
+    let mut alt_count = 0u8;
+    for symbol in set {
+      if Some(symbol.id) == target || (alt_count as usize) >= MAX_RETAINED_ALTERNATIVES {
+        continue;
+      }
+      alts[alt_count as usize] = symbol.id.raw() as u32;
+      alt_count += 1;
+    }
     Resolution {
       target,
       edge,
       confidence: Confidence::AMBIGUOUS,
       candidates,
       reason,
+      alternatives: (alts, alt_count),
     }
   } else {
     Resolution {
@@ -519,6 +564,7 @@ fn pick(
       confidence: Confidence::NONE,
       candidates,
       reason: ResolveReason::None,
+      alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
     }
   }
 }
@@ -539,7 +585,8 @@ pub fn resolve_all(
   resolver: &Resolver,
 ) -> (Vec<ResolvedEdge>, ResolveStats) {
   if references.len() <= MIN_REFS_PER_SHARD {
-    return resolve_chunk(table, references, resolver);
+    let (edges, _unresolved, stats) = resolve_chunk(table, references, resolver);
+    return (edges, stats);
   }
   use rayon::prelude::*;
   let threads = rayon::current_num_threads().max(1);
@@ -547,16 +594,16 @@ pub fn resolve_all(
     .len()
     .div_ceil(threads * 2)
     .max(MIN_REFS_PER_SHARD);
-  let shards: Vec<(Vec<ResolvedEdge>, ResolveStats)> = references
+  let shards: Vec<(Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats)> = references
     .par_chunks(chunk_size)
     .map(|chunk| resolve_chunk(table, chunk, resolver))
     .collect();
   // Reserve what actually resolved, not one slot per reference — at kernel scale roughly
   // half of all references yield edges, and the difference is ~80 MB of dead reservation.
-  let total: usize = shards.iter().map(|(edges, _)| edges.len()).sum();
+  let total: usize = shards.iter().map(|(edges, _, _)| edges.len()).sum();
   let mut edges = Vec::with_capacity(total);
   let mut stats = ResolveStats::default();
-  for (shard_edges, shard_stats) in shards {
+  for (shard_edges, _unresolved, shard_stats) in shards {
     edges.extend(shard_edges);
     stats += shard_stats;
   }
@@ -574,7 +621,8 @@ pub fn resolve_all_spilled(
   resolver: &Resolver,
 ) -> std::io::Result<(Vec<ResolvedEdge>, ResolveStats)> {
   let mut edges = Vec::new();
-  let stats = resolve_all_spilled_into(table, spill, resolver, |edge| edges.push(*edge))?;
+  let stats =
+    resolve_all_spilled_into(table, spill, resolver, |edge| edges.push(*edge), |_| {})?;
   Ok((edges, stats))
 }
 
@@ -588,16 +636,24 @@ pub fn resolve_all_spilled_into(
   spill: &crate::RefSpill,
   resolver: &Resolver,
   mut sink: impl FnMut(&ResolvedEdge),
+  mut unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
+  type ChunkOut = (
+    usize,
+    Vec<ResolvedEdge>,
+    Vec<UnresolvedEvidence>,
+    ResolveStats,
+  );
   let threads = std::thread::available_parallelism()
     .map(|n| n.get())
     .unwrap_or(1);
   let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, Vec<Reference>)>(threads * 2);
-  let (out_tx, out_rx) = crossbeam_channel::unbounded::<(usize, Vec<ResolvedEdge>, ResolveStats)>();
+  let (out_tx, out_rx) = crossbeam_channel::unbounded::<ChunkOut>();
 
   let mut stats = ResolveStats::default();
   {
     let sink = &mut sink;
+    let unresolved_sink = &mut unresolved_sink;
     let stats = &mut stats;
     std::thread::scope(|scope| -> std::io::Result<()> {
       for _ in 0..threads {
@@ -605,8 +661,8 @@ pub fn resolve_all_spilled_into(
         let out_tx = out_tx.clone();
         scope.spawn(move || {
           while let Ok((index, chunk)) = work_rx.recv() {
-            let (edges, stats) = resolve_chunk(table, &chunk, resolver);
-            if out_tx.send((index, edges, stats)).is_err() {
+            let (edges, unresolved, stats) = resolve_chunk(table, &chunk, resolver);
+            if out_tx.send((index, edges, unresolved, stats)).is_err() {
               break;
             }
           }
@@ -615,20 +671,23 @@ pub fn resolve_all_spilled_into(
       drop(work_rx);
       drop(out_tx);
 
-      let mut holdback: std::collections::BTreeMap<usize, (Vec<ResolvedEdge>, ResolveStats)> =
-        std::collections::BTreeMap::new();
+      type Held = (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats);
+      let mut holdback: std::collections::BTreeMap<usize, Held> = std::collections::BTreeMap::new();
       let mut next_out = 0usize;
 
       for (sent, chunk) in spill.chunks()?.enumerate() {
         if work_tx.send((sent, chunk?)).is_err() {
           break;
         }
-        while let Ok((index, chunk_edges, chunk_stats)) = out_rx.try_recv() {
-          holdback.insert(index, (chunk_edges, chunk_stats));
+        while let Ok((index, chunk_edges, chunk_unresolved, chunk_stats)) = out_rx.try_recv() {
+          holdback.insert(index, (chunk_edges, chunk_unresolved, chunk_stats));
         }
-        while let Some((chunk_edges, chunk_stats)) = holdback.remove(&next_out) {
+        while let Some((chunk_edges, chunk_unresolved, chunk_stats)) = holdback.remove(&next_out) {
           for edge in &chunk_edges {
             sink(edge);
+          }
+          for row in &chunk_unresolved {
+            unresolved_sink(row);
           }
           *stats += chunk_stats;
           next_out += 1;
@@ -636,11 +695,14 @@ pub fn resolve_all_spilled_into(
       }
       drop(work_tx);
 
-      while let Ok((index, chunk_edges, chunk_stats)) = out_rx.recv() {
-        holdback.insert(index, (chunk_edges, chunk_stats));
-        while let Some((chunk_edges, chunk_stats)) = holdback.remove(&next_out) {
+      while let Ok((index, chunk_edges, chunk_unresolved, chunk_stats)) = out_rx.recv() {
+        holdback.insert(index, (chunk_edges, chunk_unresolved, chunk_stats));
+        while let Some((chunk_edges, chunk_unresolved, chunk_stats)) = holdback.remove(&next_out) {
           for edge in &chunk_edges {
             sink(edge);
+          }
+          for row in &chunk_unresolved {
+            unresolved_sink(row);
           }
           *stats += chunk_stats;
           next_out += 1;
@@ -657,12 +719,15 @@ fn resolve_chunk(
   table: &SymbolTable,
   references: &[Reference],
   resolver: &Resolver,
-) -> (Vec<ResolvedEdge>, ResolveStats) {
+) -> (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats) {
   let mut edges = Vec::new();
+  let mut unresolved = Vec::new();
   let mut stats = ResolveStats::default();
   let mut scratch = ResolveScratch::default();
   for reference in references {
     let resolution = resolver.resolve_with(table, reference, &mut scratch);
+    let name_hash =
+      xxhash_rust::xxh3::xxh3_64(intern::text_of(reference.name).as_bytes()) as u32;
     match resolution.target {
       Some(to) => {
         if resolution.confidence <= Confidence::AMBIGUOUS {
@@ -678,18 +743,29 @@ fn resolve_chunk(
           span: reference.evidence,
           reason: resolution.reason,
           candidates: resolution.candidates.min(u32::MAX as usize) as u32,
+          name_hash,
+          alternatives: resolution.alternatives,
         });
       }
       None => {
-        if resolution.candidates == 0 {
+        let external = resolution.candidates == 0;
+        if external {
           stats.external += 1;
         } else {
           stats.masked += 1;
         }
+        unresolved.push(UnresolvedEvidence {
+          from: reference.from,
+          name_hash,
+          etype: resolution.edge,
+          span: reference.evidence,
+          candidates: resolution.candidates.min(u32::MAX as usize) as u32,
+          external,
+        });
       }
     }
   }
-  (edges, stats)
+  (edges, unresolved, stats)
 }
 
 #[cfg(test)]
@@ -901,6 +977,9 @@ mod tests {
             span: reference.evidence,
             reason: resolution.reason,
             candidates: resolution.candidates.min(u32::MAX as usize) as u32,
+            name_hash: xxhash_rust::xxh3::xxh3_64(intern::text_of(reference.name).as_bytes())
+              as u32,
+            alternatives: resolution.alternatives,
           });
         }
         None => {

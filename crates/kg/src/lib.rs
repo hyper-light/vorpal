@@ -17,7 +17,7 @@ mod model;
 mod writer;
 
 pub use kg::{Kg, NodeView, SymbolSelector, resolve_index_dir};
-pub use evidence::{EvidenceRow, EvidenceStore, save as save_evidence};
+pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
 pub use model::SymbolKind;
 pub use writer::{KgWriter, NodeDef, layout_entity_paths};
 

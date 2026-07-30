@@ -1173,6 +1173,24 @@ pub fn explain_edge_on(
       row.span_start,
       row.span_end
     );
+    // "Why this target and not the alternatives?" — the retained tie-set losers, by identity.
+    if !row.alternatives.is_empty() {
+      let listed: Vec<String> = row
+        .alternatives
+        .iter()
+        .map(|&alt| match kg.node(NodeId::new(alt as u64)) {
+          Some(view) => format!("id {alt} ({} {})", view.name, view.path),
+          None => format!("id {alt}"),
+        })
+        .collect();
+      let more = (row.candidates as usize).saturating_sub(1 + row.alternatives.len());
+      let suffix = if more > 0 {
+        format!(" (+{more} more not retained)")
+      } else {
+        String::new()
+      };
+      let _ = writeln!(out, "    beat: {}{}", listed.join(", "), suffix);
+    }
     // Snippet, digest-verified against the pinned generation (IMPROVEMENTS 07-29 §4): shown
     // only when the file's current bytes still match the digest this generation indexed, so
     // the rendered token can never be silently inconsistent with the edge. Without a pack
@@ -1201,6 +1219,63 @@ pub fn explain_edge_on(
         let _ = writeln!(out, "    (file changed since indexing — snippet omitted)");
       }
     }
+  }
+  Ok(out)
+}
+
+/// Answer "why is there NO edge from this node to anything named `name`?" — the no-edge
+/// occurrences (external/masked) the resolver retained for that referenced name, plus any real
+/// edges that DO exist to nodes of that name (so a partial answer is never mistaken for none).
+pub fn explain_absence_on(kg: &Kg, from_id: u64, name: &str) -> Result<String, Box<dyn Error>> {
+  let from = NodeId::new(from_id);
+  let Some(from_view) = kg.node(from) else {
+    return Err(format!("no such node id {from_id}").into());
+  };
+  let name_hash = xxhash_rust::xxh3::xxh3_64(name.as_bytes()) as u32;
+  let absences = kg.evidence_absences(from, name_hash);
+  let mut out = String::new();
+  // Real edges to same-named nodes first: absence of SOME occurrences ≠ absence of all.
+  let mut edges = 0usize;
+  for target in kg.nodes_named(name) {
+    for row in kg.edge_evidence(from, target) {
+      edges += 1;
+      let _ = writeln!(
+        out,
+        "  edge exists: {} → {}  ({}; {})",
+        from_view.name,
+        name,
+        vorpal_kg::EdgeType(row.etype).name(),
+        confidence_label(row.confidence)
+      );
+    }
+  }
+  if absences.is_empty() && edges == 0 {
+    return Ok(format!(
+      "(no retained occurrences from {} referencing '{name}' — the reference may not exist,        or the generation predates unresolved-evidence rows)
+",
+      from_view.name
+    ));
+  }
+  for row in absences {
+    let verdict = match row.outcome {
+      vorpal_kg::EvidenceOutcome::External => {
+        "external: no definition with this name exists in the indexed tree".to_string()
+      }
+      _ => format!(
+        "masked: {} definition{} exist{} but none is safely attributable from this site",
+        row.candidates,
+        if row.candidates == 1 { "" } else { "s" },
+        if row.candidates == 1 { "s" } else { "" }
+      ),
+    };
+    let _ = writeln!(
+      out,
+      "  no {} edge  [{verdict}]  {}:{}..{}",
+      vorpal_kg::EdgeType(row.etype).name(),
+      from_view.path,
+      row.span_start,
+      row.span_end
+    );
   }
   Ok(out)
 }

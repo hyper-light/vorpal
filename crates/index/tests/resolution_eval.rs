@@ -60,10 +60,12 @@ fn run(fixture: &Fixture) {
   build_index(&src, &out).unwrap();
   let kg = Kg::load(&out).unwrap();
 
-  // The emitted population, normalized to labelled tuples.
-  let emitted: Vec<(String, String, String, String, String)> = kg
-    .all_evidence()
-    .into_iter()
+  // The emitted EDGE population, normalized to labelled tuples (no-edge outcome rows are
+  // measured separately below, against the absent list).
+  let all_rows = kg.all_evidence();
+  let emitted: Vec<(String, String, String, String, String)> = all_rows
+    .iter()
+    .filter(|row| row.outcome == vorpal_kg::EvidenceOutcome::Edge)
     .map(|row| {
       let name_of = |id: u32| {
         kg.node(vorpal_kg::NodeId::new(id as u64))
@@ -119,7 +121,8 @@ fn run(fixture: &Fixture) {
     fixture.lang
   );
 
-  // Expected-absent pairs: no evidence row may connect them.
+  // Expected-absent pairs: no edge may connect them — and (v2) the absence itself must be
+  // retained as a no-edge evidence row with the referenced name's hash.
   for &(from, name) in fixture.absent {
     let offender = emitted
       .iter()
@@ -127,6 +130,19 @@ fn run(fixture: &Fixture) {
     assert!(
       offender.is_none(),
       "[{}] '{from}' must not resolve '{name}', but: {offender:?}",
+      fixture.lang
+    );
+    let name_hash = xxhash_rust::xxh3::xxh3_64(name.as_bytes()) as u32;
+    let recorded = all_rows.iter().any(|row| {
+      row.outcome != vorpal_kg::EvidenceOutcome::Edge
+        && row.name_hash == name_hash
+        && kg
+          .node(vorpal_kg::NodeId::new(row.from as u64))
+          .is_some_and(|v| short(v.name) == from)
+    });
+    assert!(
+      recorded,
+      "[{}] the absence of '{from}' → '{name}' must itself be retained as evidence",
       fixture.lang
     );
   }
