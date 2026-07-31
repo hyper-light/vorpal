@@ -215,11 +215,22 @@ pub fn link_writer(
   resolver: &Resolver,
 ) -> (Kg, ResolveStats) {
   phase_trace("link: table build start");
-  let table = build_symbol_table(&writer);
+  let mut table = build_symbol_table(&writer);
   // The table build's transients (per-shard pair vectors, the finalize sort buffer) just
   // died — return their pages before resolution allocates the edge lists.
   release_freed_pages();
   phase_trace("link: resolve start");
+  // Import-binding pre-pass (§3.3 scope step): resolve the qualifier-carrying imports first,
+  // so bare uses in an importing file inherit its import-proven targets.
+  let qualified: Vec<Reference> = references
+    .iter()
+    .filter(|r| {
+      r.kind == vorpal_resolve::RefKind::Import && r.form == vorpal_resolve::RefForm::Static
+    })
+    .copied()
+    .collect();
+  vorpal_resolve::seed_import_bindings(&mut table, &qualified, resolver);
+  drop(qualified);
   let (edges, stats) = resolve_all(&table, &references, resolver);
   phase_trace("link: resolve done");
   drop(table);
@@ -254,9 +265,12 @@ pub fn link_writer_spilled(
   resolver: &Resolver,
 ) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
   phase_trace("link: table build start");
-  let table = build_symbol_table(&writer);
+  let mut table = build_symbol_table(&writer);
   release_freed_pages();
   phase_trace("link: resolve start");
+  // Import-binding pre-pass (§3.3 scope step): the spill retained the qualifier-carrying
+  // imports in RAM, so bare uses in an importing file inherit its import-proven targets.
+  vorpal_resolve::seed_import_bindings(&mut table, spill.qualified_imports(), resolver);
   // Edges stream straight into the writer's edge log, in resolution order — the collected
   // edge vector was ~90 MB alive under the seal at kernel scale. Evidence rows are collected
   // alongside (24 bytes per emitted edge; they must all exist before the canonical sort that

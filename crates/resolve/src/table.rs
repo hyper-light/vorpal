@@ -41,6 +41,12 @@ pub struct SymbolTable {
   /// Post-finalize: name → `(start, len)` into `grouped`.
   ranges: HashMap<NameId, (u32, u32)>,
   files: HashMap<NameId, NodeId>,
+  /// Import-proven per-file bindings: `(importing file's path, imported name)` → the node the
+  /// file's import statement resolved to at constrained-or-better, single-target confidence
+  /// (seeded by [`crate::seed_import_bindings`]). Consulted for bare-name references after
+  /// local definitions (which shadow imports) and before global visibility. Probed, never
+  /// iterated, so map order is never observed.
+  import_bindings: HashMap<(NameId, NameId), NodeId>,
 }
 
 impl SymbolTable {
@@ -87,6 +93,17 @@ impl SymbolTable {
   /// path nothing interned cannot be in the table either.
   pub fn file(&self, path: &str) -> Option<NodeId> {
     self.files.get(&intern::peek(path)?).copied()
+  }
+
+  /// Install the import-binding map (see the field's doc). Called once by the link phase's
+  /// pre-pass, between `finalize` and the main resolution pass.
+  pub fn set_import_bindings(&mut self, bindings: HashMap<(NameId, NameId), NodeId>) {
+    self.import_bindings = bindings;
+  }
+
+  /// The node `path`'s import of `name` provably resolved to, if any.
+  pub fn import_binding(&self, path: NameId, name: NameId) -> Option<NodeId> {
+    self.import_bindings.get(&(path, name)).copied()
   }
 
   /// Merge another table's entries after this one's — the ordered-absorption step of a §7.5

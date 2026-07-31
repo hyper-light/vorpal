@@ -95,6 +95,7 @@ pub struct RefSpillWriter {
   out: BufWriter<File>,
   path: PathBuf,
   count: u64,
+  qualified_imports: Vec<Reference>,
 }
 
 impl RefSpillWriter {
@@ -103,10 +104,19 @@ impl RefSpillWriter {
       out: BufWriter::new(File::create(path)?),
       path: path.to_path_buf(),
       count: 0,
+      qualified_imports: Vec::new(),
     })
   }
 
   pub fn push(&mut self, reference: &Reference) -> io::Result<()> {
+    // Qualifier-carrying imports are additionally retained in RAM: the link phase resolves
+    // them *first* to seed per-file import bindings (§3.3 scope step), and re-decoding the
+    // whole spill for a pre-pass would cost a second full stream. They are rare — ~0.1% of
+    // references at kernel scale — so the retained vector is a few hundred KB, not the
+    // ~220 MB the spill exists to avoid.
+    if reference.kind == RefKind::Import && reference.form == RefForm::Static {
+      self.qualified_imports.push(*reference);
+    }
     let mut buf = [0u8; RECORD];
     encode(reference, &mut buf);
     self.out.write_all(&buf)?;
@@ -119,6 +129,7 @@ impl RefSpillWriter {
     Ok(RefSpill {
       path: self.path,
       count: self.count,
+      qualified_imports: self.qualified_imports,
     })
   }
 }
@@ -127,11 +138,19 @@ impl RefSpillWriter {
 pub struct RefSpill {
   path: PathBuf,
   count: u64,
+  qualified_imports: Vec<Reference>,
 }
 
 impl RefSpill {
   pub fn count(&self) -> u64 {
     self.count
+  }
+
+  /// The qualifier-carrying import references, in write order — the input of the link
+  /// phase's import-binding pre-pass. Also present in the spilled stream itself (this is a
+  /// retained copy, not a diversion), so chunked resolution still sees every reference.
+  pub fn qualified_imports(&self) -> &[Reference] {
+    &self.qualified_imports
   }
 
   /// Sequential chunk reader over the spilled records, in write order.

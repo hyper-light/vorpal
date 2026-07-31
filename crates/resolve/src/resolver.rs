@@ -90,6 +90,10 @@ pub enum ResolveReason {
   VisibleExport = 6,
   /// Several visible cross-file candidates; deterministic tie pick (approximate).
   VisibleTie = 7,
+  /// A bare name bound through the referencing file's own import: the file's qualified import
+  /// of this name resolved to a single corroborated target, and no local definition shadows
+  /// it. The strongest cross-file evidence a bare use can carry.
+  ImportBound = 8,
 }
 
 impl ResolveReason {
@@ -102,6 +106,7 @@ impl ResolveReason {
       5 => Self::LocalTie,
       6 => Self::VisibleExport,
       7 => Self::VisibleTie,
+      8 => Self::ImportBound,
       _ => Self::None,
     }
   }
@@ -117,6 +122,7 @@ impl ResolveReason {
       Self::LocalTie => "same-file-tie",
       Self::VisibleExport => "visible-export",
       Self::VisibleTie => "visible-tie",
+      Self::ImportBound => "import-bound",
     }
   }
 }
@@ -302,6 +308,26 @@ impl Resolver {
           reason: ResolveReason::None,
           alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
         };
+      }
+    }
+
+    // A bare name in a file whose own import provably bound it (the qualified import resolved
+    // to a single corroborated target — ties never seed bindings, so ambiguity cannot launder
+    // through here) resolves to that import's target, unless a local definition shadows the
+    // import. Confidence stays cross-file: the use inherits the import's certainty, never
+    // exceeds it.
+    if reference.form == RefForm::Bare {
+      if let Some(target) = table.import_binding(reference.from_path, reference.name) {
+        if !candidates.iter().any(|s| s.path == reference.from_path) {
+          return Resolution {
+            target: Some(target),
+            edge,
+            confidence: Confidence::CROSS_FILE,
+            candidates: candidates.len(),
+            reason: ResolveReason::ImportBound,
+            alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
+          };
+        }
       }
     }
 
@@ -567,6 +593,46 @@ fn pick(
       alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
     }
   }
+}
+
+/// Resolve the qualifier-carrying import references and install, per importing file, the
+/// bindings they prove: `(file path, imported name) → target node`. Only single-target,
+/// constrained-or-better, symbol-form resolutions seed a binding — a tied import proves
+/// nothing (so ambiguity can never launder into a binding), and a path-form match targets a
+/// *file* node, which a bare name must not inherit. When one file imports the same name twice
+/// the later import wins, matching rebinding semantics in the languages that allow it. Runs
+/// serially: qualified imports are ~0.1% of references, and the main pass re-resolves them
+/// identically for edge emission (bindings never alter `RefForm::Static` resolution).
+///
+/// Call between [`SymbolTable::finalize`] and the main resolution pass; returns the number of
+/// bindings installed.
+pub fn seed_import_bindings(
+  table: &mut SymbolTable,
+  qualified_imports: &[Reference],
+  resolver: &Resolver,
+) -> usize {
+  let mut bindings: std::collections::HashMap<(NameId, NameId), NodeId> =
+    std::collections::HashMap::new();
+  let mut scratch = ResolveScratch::default();
+  for reference in qualified_imports {
+    let resolution = resolver.resolve_with(table, reference, &mut scratch);
+    let Some(target) = resolution.target else {
+      continue;
+    };
+    if resolution.confidence < Confidence::CROSS_FILE {
+      continue;
+    }
+    if !matches!(
+      resolution.reason,
+      ResolveReason::Qualified | ResolveReason::Local | ResolveReason::VisibleExport
+    ) {
+      continue;
+    }
+    bindings.insert((reference.from_path, reference.name), target);
+  }
+  let count = bindings.len();
+  table.set_import_bindings(bindings);
+  count
 }
 
 /// Below this many references the fan-out overhead outweighs the win and the batch resolves
@@ -841,6 +907,59 @@ mod tests {
         .with_form(RefForm::Method),
     );
     assert_eq!(r.target, None, "receiver text is not namespace evidence");
+  }
+
+  #[test]
+  fn import_bindings_bind_bare_uses_but_ties_never_seed() {
+    // `helper` is exported by BOTH util.rs and other.rs; the importing file's
+    // `use crate::util::helper` disambiguates.
+    let mut table = SymbolTable::new();
+    table.insert("helper", symbol(1, "src/util.rs", true, None));
+    table.insert("helper", symbol(2, "src/other.rs", true, None));
+    table.finalize();
+
+    let import = |from_path: &str, qualifier: &str| {
+      Reference::new(NodeId::new(9), from_path, "helper", RefKind::Import)
+        .with_qualifier(Some(qualifier.into()))
+        .with_form(RefForm::Static)
+    };
+    let seeded = seed_import_bindings(
+      &mut table,
+      &[import("src/a.rs", "util")],
+      &Resolver::new(),
+    );
+    assert_eq!(seeded, 1);
+
+    // The bare call in the importing file inherits the import-proven target...
+    let r = Resolver::new().resolve(&table, &call("helper", "src/a.rs"));
+    assert_eq!(r.target, Some(NodeId::new(1)));
+    assert_eq!(r.confidence, Confidence::CROSS_FILE);
+    assert_eq!(r.reason, ResolveReason::ImportBound);
+    // ...while the same call in a file with no import stays a labelled blind tie.
+    let r = Resolver::new().resolve(&table, &call("helper", "src/b.rs"));
+    assert_eq!(r.reason, ResolveReason::VisibleTie);
+    assert_eq!(r.confidence, Confidence::AMBIGUOUS);
+
+    // A local definition shadows the file's own import.
+    let mut shadowed = SymbolTable::new();
+    shadowed.insert("helper", symbol(1, "src/util.rs", true, None));
+    shadowed.insert("helper", symbol(3, "src/a.rs", false, None));
+    shadowed.finalize();
+    seed_import_bindings(&mut shadowed, &[import("src/a.rs", "util")], &Resolver::new());
+    let r = Resolver::new().resolve(&shadowed, &call("helper", "src/a.rs"));
+    assert_eq!(r.target, Some(NodeId::new(3)));
+    assert_eq!(r.reason, ResolveReason::Local);
+
+    // Two module files share the qualifier's stem: the import itself is a qualifier TIE, and
+    // a tied import must seed nothing — ambiguity never launders into a binding.
+    let mut tied = SymbolTable::new();
+    tied.insert("helper", symbol(1, "src/util.rs", true, None));
+    tied.insert("helper", symbol(2, "vendor/util.rs", true, None));
+    tied.finalize();
+    let seeded = seed_import_bindings(&mut tied, &[import("src/a.rs", "util")], &Resolver::new());
+    assert_eq!(seeded, 0, "a tied import proves nothing");
+    let r = Resolver::new().resolve(&tied, &call("helper", "src/a.rs"));
+    assert_eq!(r.reason, ResolveReason::VisibleTie, "no binding, so the tie stays labelled");
   }
 
   #[test]
