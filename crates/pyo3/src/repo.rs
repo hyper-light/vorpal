@@ -70,6 +70,8 @@ pub fn index_graph(
   let target = vorpal_index::GraphTarget {
     name: name.to_string(),
     id,
+    // Durable ids arrive through the name as `eid:<hex>` (parsed by the selector).
+    external_id: None,
     path_suffix: path,
     kind,
     merge_all: all,

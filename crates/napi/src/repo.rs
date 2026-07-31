@@ -81,6 +81,8 @@ pub fn index_graph(
   let target = vorpal_index::GraphTarget {
     name,
     id: options.id.and_then(|v| u64::try_from(v).ok()),
+    // Durable ids arrive through the name as `eid:<hex>` (parsed by the selector).
+    external_id: None,
     path_suffix: options.path,
     kind: options.kind,
     merge_all: options.all.unwrap_or(false),
