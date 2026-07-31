@@ -71,6 +71,15 @@ pub fn global_grammar_stamp() -> u64 {
   vorpal_language::global_grammar_stamp()
 }
 
+/// Whether `lang` has reference-extraction semantics (calls/imports/types) — pure-structural
+/// languages (CSS, HTML, JSON, Markdown, YAML) do not. Public so the language matrix can be
+/// generated from code truth instead of a hand-maintained list.
+pub fn has_reference_extraction(lang: vorpal_language::SupportLang) -> bool {
+  references::ref_spec(lang).is_some()
+}
+
+pub use vorpal_language::SupportLang;
+
 /// The canonical language name for a user-supplied alias (`"ts"` → `"TypeScript"`), or `None`
 /// for an unknown language — the shared vocabulary of search-filter `lang` arguments.
 pub fn canonical_language(name: &str) -> Option<String> {
