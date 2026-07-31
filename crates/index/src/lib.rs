@@ -1227,6 +1227,36 @@ pub fn explain_edge_on(
   Ok(out)
 }
 
+/// A source read checked against the generation that indexed it (IMPROVEMENTS #7): persisted
+/// byte offsets are only meaningful against the bytes they were computed from.
+pub enum IndexedRead {
+  /// The file's current bytes match the indexed digest — offsets are exact.
+  Verified(Vec<u8>),
+  /// No digest is available to check (generation predates pack digests) — the caller may
+  /// slice, labeled as current-file contents.
+  Unverified(Vec<u8>),
+  /// The file changed since indexing: slicing persisted offsets would return bytes
+  /// inconsistent with the node. Callers must refuse, not guess.
+  Changed,
+}
+
+/// Read `path` and verify it against the digest `artifacts_dir`'s product pack recorded at
+/// indexing time (the same check `why` snippets use).
+pub fn read_indexed_source(
+  artifacts_dir: Option<&Path>,
+  path: &str,
+) -> Result<IndexedRead, String> {
+  let bytes = fs::read(path).map_err(|err| format!("read {path}: {err}"))?;
+  let indexed_digest = artifacts_dir
+    .and_then(PackReader::open)
+    .and_then(|pack| pack.get(path).and_then(vorpal_ingest::peek_product_digest));
+  Ok(match indexed_digest {
+    Some(digest) if xxhash_rust::xxh3::xxh3_64(&bytes) == digest => IndexedRead::Verified(bytes),
+    Some(_) => IndexedRead::Changed,
+    None => IndexedRead::Unverified(bytes),
+  })
+}
+
 /// Answer "why is there NO edge from this node to anything named `name`?" — the no-edge
 /// occurrences (external/masked) the resolver retained for that referenced name, plus any real
 /// edges that DO exist to nodes of that name (so a partial answer is never mistaken for none).

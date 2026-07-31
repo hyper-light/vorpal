@@ -229,6 +229,49 @@ impl Server {
           })?;
         crate::tools::structural_search(&root, &pattern, &lang, path, limit.clamp(1, 1000))
       }
+      "rule_search" => {
+        let rule = str_arg("rule")?;
+        let path = args.get("path").and_then(Value::as_str);
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+        let root = self
+          .watch
+          .as_ref()
+          .map(|w| w.src().to_path_buf())
+          .ok_or_else(|| {
+            "rule_search needs a watched source tree (daemon started on a default \
+             <src>/.vorpal/index location)"
+              .to_string()
+          })?;
+        crate::tools::rule_search(&root, &rule, path, limit.clamp(1, 1000))
+      }
+      "ast_dump" => {
+        let lang;
+        let source;
+        match (args.get("source").and_then(Value::as_str), args.get("path").and_then(Value::as_str)) {
+          (Some(inline), _) => {
+            source = inline.to_string();
+            lang = str_arg("lang")?;
+          }
+          (None, Some(path)) => {
+            source =
+              std::fs::read_to_string(path).map_err(|err| format!("read {path}: {err}"))?;
+            lang = match args.get("lang").and_then(Value::as_str) {
+              Some(lang) => lang.to_string(),
+              None => <vorpal_language::SupportLang as vorpal_core::Language>::from_path(
+                std::path::Path::new(path),
+              )
+              .map(|l: vorpal_language::SupportLang| l.to_string())
+              .ok_or_else(|| format!("cannot infer language from {path}; pass lang"))?,
+            };
+          }
+          (None, None) => return Err("pass source+lang, or path".to_string()),
+        }
+        let max_nodes = args
+          .get("max_nodes")
+          .and_then(Value::as_u64)
+          .unwrap_or(500) as usize;
+        crate::tools::ast_dump(&source, &lang, max_nodes.clamp(10, 5000))
+      }
       "fetch_span" => {
         let id = args
           .get("id")
@@ -238,8 +281,11 @@ impl Server {
           .get("max_bytes")
           .and_then(Value::as_u64)
           .unwrap_or(16_384) as usize;
-        let kg = self.kg()?;
-        crate::tools::fetch_span(kg, id, max_bytes.clamp(64, 262_144))
+        // Slice against the pinned generation's digests: stale offsets refuse, never guess.
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let kg = self.kg.as_ref().expect("pinned above");
+        crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144))
       }
       "why" => {
         let from_id = args
@@ -417,9 +463,37 @@ fn tools_list() -> Value {
       &["pattern", "lang"],
     ),
     tool(
+      "rule_search",
+      "Run full YAML rule(s) over the watched source tree — the complete rule model \
+       (composite/relational rules, constraints, utils, transform), not just a bare pattern. \
+       Rules with `fix` render each match's dry-run replacement; nothing on disk changes. \
+       Separate multiple rule documents with `---`.",
+      json!({
+        "rule": {"type": "string", "description": "YAML rule document(s): id, language, rule, and optionally constraints/utils/transform/fix"},
+        "path": {"type": "string", "description": "Only search files whose path ends with this suffix"},
+        "limit": {"type": "integer", "description": "Max matches (default 100, cap 1000)"}
+      }),
+      &["rule"],
+    ),
+    tool(
+      "ast_dump",
+      "Parse source and print the named-node tree (kind, byte span, leaf text) — the ground \
+       truth for choosing pattern/kind targets when authoring rules. Pass inline source+lang, \
+       or a file path (language inferred from the extension).",
+      json!({
+        "source": {"type": "string", "description": "Inline source text (requires lang)"},
+        "lang": {"type": "string", "description": "Language of the source (rust, c, python, …)"},
+        "path": {"type": "string", "description": "File to parse instead of inline source"},
+        "max_nodes": {"type": "integer", "description": "Cap printed nodes (default 500, max 5000)"}
+      }),
+      &[],
+    ),
+    tool(
       "fetch_span",
       "The defining source of a graph node, verbatim: pass a node id (from any graph tool's \
-       output or an ambiguity listing) and get back path:line plus the definition's bytes.",
+       output or an ambiguity listing) and get back path:line plus the definition's bytes, \
+       digest-verified against the pinned generation (stale files refuse rather than return \
+       inconsistent bytes).",
       json!({
         "id": {"type": "integer", "description": "Node id"},
         "max_bytes": {"type": "integer", "description": "Clamp returned source (default 16384)"}

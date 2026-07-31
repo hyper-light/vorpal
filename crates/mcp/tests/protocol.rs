@@ -94,6 +94,8 @@ fn initialize_handshake_and_tool_listing() {
       "type_users",
       "reachable",
       "structural_search",
+      "rule_search",
+      "ast_dump",
       "fetch_span",
       "why",
       "search"
@@ -153,6 +155,100 @@ fn warm_index_tools_answer_graph_queries() {
   );
   assert!(!is_err, "{text}");
   assert!(text.contains("unchanged — reused"), "{text}");
+
+  let _ = fs::remove_dir_all(src.parent().unwrap());
+}
+
+#[test]
+fn rule_search_and_ast_dump_serve_the_full_rule_model() {
+  // The structural tools need a watched tree: the daemon-default `<src>/.vorpal/index`.
+  let base = std::env::temp_dir().join(format!("vorpal-mcp-struct-{}", std::process::id()));
+  let src = base.join("src");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("b.rs"), "pub fn target() -> i32 {\n    0\n}\n").unwrap();
+  fs::write(
+    src.join("a.rs"),
+    "use b::target;\n\npub fn caller() -> i32 {\n    target()\n}\n",
+  )
+  .unwrap();
+  let idx = src.join(".vorpal").join("index");
+  let mut server = Server::new(idx);
+
+  let (text, is_err) = call_tool(
+    &mut server,
+    1,
+    "index",
+    json!({"src": src.to_string_lossy()}),
+  );
+  assert!(!is_err, "{text}");
+
+  // Full rule model: composite rule + constraints + fix, rendered as a dry run.
+  let rule = "id: retarget\nlanguage: rust\nrule:\n  pattern: $F()\nconstraints:\n  F:\n    regex: ^target$\nfix: replaced()\n";
+  let (text, is_err) = call_tool(&mut server, 2, "rule_search", json!({"rule": rule}));
+  assert!(!is_err, "{text}");
+  assert!(text.contains("[retarget]") && text.contains("a.rs"), "{text}");
+  assert!(text.contains("fix (dry-run) → replaced()"), "{text}");
+  // Dry run means dry: the file still holds the original call.
+  let a_rs = fs::read_to_string(src.join("a.rs")).unwrap();
+  assert!(a_rs.contains("target()") && !a_rs.contains("replaced"), "{a_rs}");
+
+  // A malformed rule is a tool error, not a crash.
+  let (text, is_err) = call_tool(&mut server, 3, "rule_search", json!({"rule": "rule: [nonsense"}));
+  assert!(is_err, "{text}");
+
+  // AST dump: inline source, named nodes with kinds and spans.
+  let (text, is_err) = call_tool(
+    &mut server,
+    4,
+    "ast_dump",
+    json!({"source": "def f():\n    return g()\n", "lang": "python"}),
+  );
+  assert!(!is_err, "{text}");
+  assert!(
+    text.contains("function_definition") && text.contains("call"),
+    "{text}"
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn fetch_span_is_digest_verified_and_refuses_stale_files() {
+  // Non-watched layout: an edit after indexing must NOT be silently rebuilt away — that is
+  // exactly the staleness this contract detects.
+  let (src, idx) = temp_tree("fetchspan");
+  let mut server = Server::new(idx);
+  let (text, is_err) = call_tool(
+    &mut server,
+    1,
+    "index",
+    json!({"src": src.to_string_lossy()}),
+  );
+  assert!(!is_err, "{text}");
+
+  let (text, is_err) = call_tool(&mut server, 2, "node", json!({"name": "target"}));
+  assert!(!is_err, "{text}");
+  let id: u64 = text
+    .split("id ")
+    .nth(1)
+    .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+    .and_then(|digits| digits.parse().ok())
+    .unwrap_or_else(|| panic!("no node id in: {text}"));
+
+  let (text, is_err) = call_tool(&mut server, 3, "fetch_span", json!({"id": id}));
+  assert!(!is_err, "{text}");
+  assert!(text.contains("(source verified)"), "{text}");
+  assert!(text.contains("pub fn target"), "{text}");
+
+  // Change the file: persisted offsets are now stale, so the tool must refuse the slice.
+  let b_rs = src.join("b.rs");
+  let mut content = fs::read_to_string(&b_rs).unwrap();
+  content.insert_str(0, "// shifted\n");
+  fs::write(&b_rs, content).unwrap();
+  let (text, is_err) = call_tool(&mut server, 4, "fetch_span", json!({"id": id}));
+  assert!(is_err, "stale file must refuse, got: {text}");
+  assert!(text.contains("changed since"), "{text}");
 
   let _ = fs::remove_dir_all(src.parent().unwrap());
 }
