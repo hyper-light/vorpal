@@ -115,6 +115,11 @@ impl Server {
 
   /// `tools/call`: run a tool, wrapping success and failure as MCP tool results (`isError`
   /// carries tool-level failures in-band, per spec; JSON-RPC errors are protocol-level only).
+  ///
+  /// Every result carries `structuredContent` (IMPROVEMENTS #7): successes state the pinned
+  /// **generation** content id the answer came from (`null` before any graph is loaded, e.g.
+  /// pure-parse tools like `ast_dump`), so ids and spans are attributable to exactly one
+  /// index state; failures state a **stable machine-readable code** alongside the message.
   fn tools_call(&mut self, params: &Value) -> Value {
     let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params
@@ -122,23 +127,46 @@ impl Server {
       .cloned()
       .unwrap_or_else(|| json!({}));
     match self.run_tool(tool, &args) {
-      Ok(text) => json!({"content": [{"type": "text", "text": text}], "isError": false}),
-      Err(text) => json!({"content": [{"type": "text", "text": text}], "isError": true}),
+      Ok(text) => json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": {"generation": self.generation_id()},
+        "isError": false
+      }),
+      Err(err) => json!({
+        "content": [{"type": "text", "text": err.message}],
+        "structuredContent": {"code": err.code},
+        "isError": true
+      }),
     }
   }
 
-  fn run_tool(&mut self, tool: &str, args: &Value) -> Result<String, String> {
+  /// The content id of the generation the pinned graph was loaded from.
+  fn generation_id(&self) -> Value {
+    match self
+      .kg_dir
+      .as_ref()
+      .and_then(|dir| dir.file_name())
+      .and_then(|name| name.to_str())
+    {
+      Some(name) => json!(name),
+      None => Value::Null,
+    }
+  }
+
+  fn run_tool(&mut self, tool: &str, args: &Value) -> Result<String, ToolError> {
     let str_arg = |key: &str| {
       args
         .get(key)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| format!("missing required argument '{key}'"))
+        .ok_or_else(|| ToolError::coded("bad-argument", format!("missing required argument '{key}'")))
     };
     // Query tools serve from a graph the watch keeps fresh; the explicit `index` tool builds
     // from its own `src` argument and needs no pre-validation.
     if tool != "index" {
-      self.ensure_fresh()?;
+      self
+        .ensure_fresh()
+        .map_err(|message| ToolError::coded("index-unavailable", message))?;
     }
     match tool {
       "index" => {
@@ -199,6 +227,7 @@ impl Server {
         // graph, and the "run the 'index' tool first" error when nothing is indexed yet.
         let kg = self.kg()?;
         vorpal_index::graph_query_on(kg, verb, &target).map_err(|err| err.to_string())
+          .map_err(ToolError::from)
       }
       "search" => {
         let query = str_arg("query")?;
@@ -228,6 +257,7 @@ impl Server {
               .to_string()
           })?;
         crate::tools::structural_search(&root, &pattern, &lang, path, limit.clamp(1, 1000))
+          .map_err(ToolError::from)
       }
       "rule_search" => {
         let rule = str_arg("rule")?;
@@ -243,6 +273,7 @@ impl Server {
               .to_string()
           })?;
         crate::tools::rule_search(&root, &rule, path, limit.clamp(1, 1000))
+          .map_err(ToolError::from)
       }
       "ast_dump" => {
         let lang;
@@ -264,13 +295,14 @@ impl Server {
               .ok_or_else(|| format!("cannot infer language from {path}; pass lang"))?,
             };
           }
-          (None, None) => return Err("pass source+lang, or path".to_string()),
+          (None, None) => return Err(ToolError::coded("bad-argument", "pass source+lang, or path")),
         }
         let max_nodes = args
           .get("max_nodes")
           .and_then(Value::as_u64)
           .unwrap_or(500) as usize;
         crate::tools::ast_dump(&source, &lang, max_nodes.clamp(10, 5000))
+          .map_err(ToolError::from)
       }
       "fetch_span" => {
         let id = args
@@ -285,7 +317,14 @@ impl Server {
         self.kg()?;
         let dir = self.kg_dir.clone();
         let kg = self.kg.as_ref().expect("pinned above");
-        crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144))
+        crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144)).map_err(
+          |err| match err {
+            crate::tools::FetchSpanError::Stale(message) => {
+              ToolError::coded("stale-source", message)
+            }
+            crate::tools::FetchSpanError::Other(message) => ToolError::from(message),
+          },
+        )
       }
       "why" => {
         let from_id = args
@@ -301,10 +340,12 @@ impl Server {
         let kg = self.kg.as_ref().expect("pinned above");
         match (to_id, name) {
           (Some(to_id), _) => vorpal_index::explain_edge_on(kg, dir.as_deref(), from_id, to_id)
-            .map_err(|err| err.to_string()),
+            .map_err(|err| err.to_string())
+            .map_err(ToolError::from),
           (None, Some(name)) => vorpal_index::explain_absence_on(kg, from_id, &name)
-            .map_err(|err| err.to_string()),
-          (None, None) => Err("pass to_id (edge evidence) or name (absence evidence)".into()),
+            .map_err(|err| err.to_string())
+            .map_err(ToolError::from),
+          (None, None) => Err(ToolError::coded("bad-argument", "pass to_id (edge evidence) or name (absence evidence)")),
         }
       }
       "reachable" => {
@@ -314,7 +355,7 @@ impl Server {
           "in" => vorpal_kg::Direction::In,
           "out" => vorpal_kg::Direction::Out,
           other => {
-            return Err(format!("direction must be \"in\" or \"out\", got '{other}'"));
+            return Err(ToolError::coded("bad-argument", format!("direction must be \"in\" or \"out\", got '{other}'")));
           }
         };
         // Selector-consistent (07-29 §6): same refinement contract as the direct graph tools —
@@ -348,7 +389,7 @@ impl Server {
               out
             }
           }
-          Some(_) => return Err("relations must be an array of relation names".to_string()),
+          Some(_) => return Err(ToolError::coded("bad-argument", "relations must be an array of relation names")),
           None => vec![vorpal_kg::EdgeType::CALLS],
         };
         let max_depth = match args.get("max_depth").and_then(Value::as_u64) {
@@ -362,8 +403,9 @@ impl Server {
         let kg = self.kg()?;
         vorpal_index::reachable_query_on(kg, &target, dir, &relations, max_depth, min_confidence)
           .map_err(|err| err.to_string())
+          .map_err(ToolError::from)
       }
-      other => Err(format!("unknown tool '{other}'")),
+      other => Err(ToolError::coded("bad-argument", format!("unknown tool '{other}'"))),
     }
   }
 
@@ -524,6 +566,36 @@ fn tools_list() -> Value {
       &["query"],
     ),
   ]})
+}
+
+/// A tool failure with a stable machine-readable code (IMPROVEMENTS #7). Codes are part of
+/// the MCP contract: `bad-argument` (caller passed something unusable), `index-unavailable`
+/// (no graph to answer from — build/revalidate failed), `no-watch` (a source-tree tool on a
+/// custom index location), `stale-source` (file changed since the pinned generation indexed
+/// it), and `tool-error` (everything else, message-only).
+struct ToolError {
+  code: &'static str,
+  message: String,
+}
+
+impl ToolError {
+  fn coded(code: &'static str, message: impl Into<String>) -> Self {
+    Self {
+      code,
+      message: message.into(),
+    }
+  }
+}
+
+/// Plain-string errors keep their message and take the generic code, so tool arms only name
+/// a code where the class is structurally distinguishable.
+impl From<String> for ToolError {
+  fn from(message: String) -> Self {
+    Self {
+      code: "tool-error",
+      message,
+    }
+  }
 }
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {

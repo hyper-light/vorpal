@@ -254,6 +254,75 @@ fn fetch_span_is_digest_verified_and_refuses_stale_files() {
 }
 
 #[test]
+fn results_carry_generation_identity_and_stable_error_codes() {
+  let (src, idx) = temp_tree("envelope");
+  let mut server = Server::new(idx);
+
+  // Success envelope: the pinned generation content id rides every result.
+  let response = request(
+    &mut server,
+    1,
+    "tools/call",
+    json!({"name": "index", "arguments": {"src": src.to_string_lossy()}}),
+  );
+  let generation = response["result"]["structuredContent"]["generation"]
+    .as_str()
+    .expect("generation id on success")
+    .to_string();
+  assert!(!generation.is_empty());
+  let response = request(
+    &mut server,
+    2,
+    "tools/call",
+    json!({"name": "node", "arguments": {"name": "target"}}),
+  );
+  assert_eq!(
+    response["result"]["structuredContent"]["generation"].as_str(),
+    Some(generation.as_str()),
+    "query answers name the same generation the index call pinned"
+  );
+
+  // Error envelope: stable machine-readable codes, not just prose.
+  let response = request(
+    &mut server,
+    3,
+    "tools/call",
+    json!({"name": "node", "arguments": {}}),
+  );
+  assert_eq!(response["result"]["isError"], true);
+  assert_eq!(
+    response["result"]["structuredContent"]["code"].as_str(),
+    Some("bad-argument")
+  );
+
+  // The stale-source refusal carries its own code.
+  let (text, _) = call_tool(&mut server, 4, "node", json!({"name": "target"}));
+  let id: u64 = text
+    .split("id ")
+    .nth(1)
+    .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+    .and_then(|digits| digits.parse().ok())
+    .unwrap_or_else(|| panic!("no node id in: {text}"));
+  let b_rs = src.join("b.rs");
+  let mut content = fs::read_to_string(&b_rs).unwrap();
+  content.insert_str(0, "// shifted\n");
+  fs::write(&b_rs, content).unwrap();
+  let response = request(
+    &mut server,
+    5,
+    "tools/call",
+    json!({"name": "fetch_span", "arguments": {"id": id}}),
+  );
+  assert_eq!(response["result"]["isError"], true);
+  assert_eq!(
+    response["result"]["structuredContent"]["code"].as_str(),
+    Some("stale-source")
+  );
+
+  let _ = fs::remove_dir_all(src.parent().unwrap());
+}
+
+#[test]
 fn protocol_and_tool_errors_are_explicit() {
   let (_src, idx) = temp_tree("errors");
   let mut server = Server::new(idx);

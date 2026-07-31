@@ -201,30 +201,41 @@ pub fn ast_dump(source: &str, lang: &str, max_nodes: usize) -> Result<String, St
 /// are stale and slicing them would return bytes inconsistent with the node — the tool
 /// refuses instead of guessing. Generations without pack digests slice the current file,
 /// labeled as unverified.
+/// How a [`fetch_span`] request failed — staleness is structurally distinguished so the MCP
+/// envelope can carry its stable error code without string matching.
+pub enum FetchSpanError {
+  /// The file changed since the pinned generation indexed it (`stale-source`).
+  Stale(String),
+  /// Anything else (missing node, no span, unreadable file).
+  Other(String),
+}
+
 pub fn fetch_span(
   kg: &vorpal_kg::Kg,
   artifacts_dir: Option<&Path>,
   id: u64,
   max_bytes: usize,
-) -> Result<String, String> {
+) -> Result<String, FetchSpanError> {
   let view = kg
     .node(vorpal_kg::NodeId::new(id))
-    .ok_or_else(|| format!("no node with id {id}"))?;
+    .ok_or_else(|| FetchSpanError::Other(format!("no node with id {id}")))?;
   let (start, end) = view.span;
   if end <= start {
-    return Err(format!(
+    return Err(FetchSpanError::Other(format!(
       "node {id} ({}) carries no source span (File node, or an index built before spans were persisted — re-run the 'index' tool)",
       view.name
-    ));
+    )));
   }
-  let (bytes, verdict) = match vorpal_index::read_indexed_source(artifacts_dir, view.path)? {
+  let read =
+    vorpal_index::read_indexed_source(artifacts_dir, view.path).map_err(FetchSpanError::Other)?;
+  let (bytes, verdict) = match read {
     vorpal_index::IndexedRead::Verified(bytes) => (bytes, "source verified"),
     vorpal_index::IndexedRead::Unverified(bytes) => (bytes, "current file contents — unverified"),
     vorpal_index::IndexedRead::Changed => {
-      return Err(format!(
+      return Err(FetchSpanError::Stale(format!(
         "{} changed since this generation indexed it — span offsets are stale; re-run the 'index' tool",
         view.path
-      ));
+      )));
     }
   };
   let end = (end as usize).min(bytes.len());
