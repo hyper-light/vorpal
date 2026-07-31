@@ -1378,3 +1378,71 @@ fn parse_errors_are_counted_across_languages() {
   );
   let _ = fs::remove_dir_all(&base);
 }
+
+/// IMPROVEMENTS #9: the persisted lexical tier answers the name channel without scanning —
+/// and answers it IDENTICALLY. Cold (no postings) and warm (posting intersection) searches
+/// must render byte-for-byte the same, the tier must be stamped fresh after a warm, and the
+/// artifact must be deterministic.
+#[test]
+fn posting_tier_matches_the_scan_byte_for_byte() {
+  // Detached autowarm children would race this test's own warm (and a re-commit can rewrite
+  // the generation dir under us); the veto keeps the sequence deterministic.
+  unsafe { std::env::set_var("VORPAL_NO_AUTOWARM", "1") };
+  let base = std::env::temp_dir().join(format!("vorpal-postings-eq-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(
+    src.join("a.rs"),
+    "pub fn parse_config() -> u32 { 1 }\n\
+     pub fn config_parser() -> u32 { 2 }\n\
+     pub fn parse_thing() -> u32 { parse_config() + config_parser() }\n",
+  )
+  .unwrap();
+  fs::write(src.join("b.rs"), "pub fn unrelated_helper() -> u32 { 3 }\n").unwrap();
+  vorpal_index::build_index(&src, &out).unwrap();
+  let gen_dir = live(&out);
+
+  // Cold: no posting tier yet — the exhaustive scan answers.
+  assert!(
+    vorpal_index::postings::Postings::load(&gen_dir).is_none(),
+    "no postings before a warm"
+  );
+  let cold_multi = vorpal_index::search_index_explained(&out, "parse config", 10).unwrap();
+  let cold_single = vorpal_index::search_index_explained(&out, "parse", 10).unwrap();
+  let cold_exact = vorpal_index::search_index_explained(&out, "config_parser", 10).unwrap();
+
+  // Warm builds ANN + postings under the same stamp discipline.
+  vorpal_index::warm_ann(&out).unwrap();
+  let postings = vorpal_index::postings::Postings::load(&gen_dir).expect("warm built postings");
+  let first_bytes = fs::read(gen_dir.join("postings.bin")).unwrap();
+
+  let warm_multi = vorpal_index::search_index_explained(&out, "parse config", 10).unwrap();
+  let warm_single = vorpal_index::search_index_explained(&out, "parse", 10).unwrap();
+  let warm_exact = vorpal_index::search_index_explained(&out, "config_parser", 10).unwrap();
+  assert_eq!(cold_multi, warm_multi, "multi-token query must not change");
+  assert_eq!(cold_single, warm_single, "single-token query must not change");
+  assert_eq!(cold_exact, warm_exact, "exact-name query must not change");
+  assert!(
+    warm_multi.contains("parse_config") && warm_multi.contains("config_parser"),
+    "{warm_multi}"
+  );
+
+  // The intersection itself: "parse"+"config" admits only parse_config (config_parser
+  // tokenizes to config+parser — "parser" ≠ "parse"), while "config" alone covers both.
+  let both = postings
+    .candidates(&["config".to_string(), "parse".to_string()])
+    .unwrap();
+  assert_eq!(both.len(), 1, "only parse_config carries both tokens: {both:?}");
+  let config_only = postings.candidates(&["config".to_string()]).unwrap();
+  assert_eq!(config_only.len(), 2, "parse_config + config_parser: {config_only:?}");
+
+  // Determinism: rebuilding the tier reproduces identical bytes.
+  fs::remove_file(gen_dir.join("postings.bin")).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+  let second_bytes = fs::read(gen_dir.join("postings.bin")).unwrap();
+  assert_eq!(first_bytes, second_bytes, "postings.bin must be bit-reproducible");
+
+  let _ = fs::remove_dir_all(&base);
+}

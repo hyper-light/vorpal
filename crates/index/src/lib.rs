@@ -13,6 +13,7 @@
 pub mod annfiles;
 pub mod autowarm;
 pub mod graph_predicates;
+pub mod postings;
 pub mod records;
 
 use std::collections::{HashMap, HashSet};
@@ -712,6 +713,11 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   let kg = Kg::load(index_dir)?;
   let current = stamp_of(&kg);
   if ann_is_fresh(index_dir, current, LexicalEmbedder::default().dim()) {
+    // The vector tier is current, but the lexical tier heals independently (it can be
+    // missing on indexes warmed by older builds, or after a partial cleanup).
+    if !postings::postings_are_fresh(index_dir, current) {
+      postings::build_postings(&kg, index_dir, current)?;
+    }
     return Ok(());
   }
   build_ann(&kg, index_dir, current).map_err(|err| err as Box<dyn Error>)?;
@@ -722,6 +728,12 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   let stamp_tmp = index_dir.join("ann.stamp.tmp");
   fs::write(&stamp_tmp, current.to_le_bytes())?;
   fs::rename(&stamp_tmp, &stamp_path)?;
+  // The lexical tier warms alongside (IMPROVEMENTS #9): same stamp discipline, same
+  // fallback correctness — a search whose postings are stale takes the exhaustive
+  // name scan and stays exact.
+  if !postings::postings_are_fresh(index_dir, current) {
+    postings::build_postings(&kg, index_dir, current)?;
+  }
   Ok(())
 }
 
@@ -1082,27 +1094,55 @@ fn search_core(
   };
 
   let query_tokens = tokenize(query);
-  // Parallel scan over the node rows; per-row work is pure, and the indexed flatten keeps
-  // ascending-id order, so the collected list is identical to the serial loop's.
-  let mut named: Vec<(u64, (u8, usize))> = {
-    use rayon::prelude::*;
-    (0..kg.node_count() as u64)
-      .into_par_iter()
-      .filter_map(|i| {
-        let view = kg.node(NodeId::new(i))?;
-        let name_tokens = tokenize(view.name);
-        let tier = if view.name == query {
-          0
-        } else if !query_tokens.is_empty() && name_tokens == query_tokens {
-          1
-        } else if !query_tokens.is_empty() && query_tokens.iter().all(|t| name_tokens.contains(t)) {
-          2
-        } else {
-          return None;
-        };
-        Some((i, (tier, view.name.len())))
-      })
-      .collect()
+  // Classify one candidate into the name channel's tiers (exact string, token-equal,
+  // token-subset) — shared verbatim by the posting-index path and the exhaustive scan, so
+  // the two paths cannot diverge in what they admit.
+  let classify = |i: u64| -> Option<(u64, (u8, usize))> {
+    let view = kg.node(NodeId::new(i))?;
+    let name_tokens = tokenize(view.name);
+    let tier = if view.name == query {
+      0
+    } else if !query_tokens.is_empty() && name_tokens == query_tokens {
+      1
+    } else if !query_tokens.is_empty() && query_tokens.iter().all(|t| name_tokens.contains(t)) {
+      2
+    } else {
+      return None;
+    };
+    Some((i, (tier, view.name.len())))
+  };
+  // Deduplicated query tokens for the posting intersection (lists store distinct tokens).
+  let lookup_tokens = {
+    let mut t = query_tokens.clone();
+    t.sort_unstable();
+    t.dedup();
+    t
+  };
+  // The persisted lexical tier (IMPROVEMENTS #9): when the posting index matches this
+  // generation, the name channel classifies only the intersection candidates instead of
+  // tokenizing every node. Every scan hit's name tokens are a superset of the query
+  // tokens, so the intersection provably contains all of them — identical results, and
+  // the fallback below stays the correctness anchor whenever the tier is missing/stale
+  // (a background warm heals it).
+  let posting_candidates: Option<Vec<u64>> = if query_tokens.is_empty() {
+    None
+  } else {
+    postings::Postings::load(index_dir)
+      .filter(|p| p.stamp() == current_stamp)
+      .and_then(|p| p.candidates(&lookup_tokens))
+      .map(|ids| ids.into_iter().map(|id| id as u64).collect())
+  };
+  let mut named: Vec<(u64, (u8, usize))> = match posting_candidates {
+    Some(candidates) => candidates.into_iter().filter_map(classify).collect(),
+    None => {
+      // Parallel scan over the node rows; per-row work is pure, and the indexed flatten
+      // keeps ascending-id order, so the collected list is identical to the serial loop's.
+      use rayon::prelude::*;
+      (0..kg.node_count() as u64)
+        .into_par_iter()
+        .filter_map(classify)
+        .collect()
+    }
   };
   named.sort_by_key(|&(id, key)| (key, id));
   named.truncate(pool);
