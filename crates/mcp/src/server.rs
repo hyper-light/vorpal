@@ -127,11 +127,16 @@ impl Server {
       .cloned()
       .unwrap_or_else(|| json!({}));
     match self.run_tool(tool, &args) {
-      Ok(text) => json!({
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": {"generation": self.generation_id()},
-        "isError": false
-      }),
+      Ok((text, mut data)) => {
+        // Typed tools return their records/pagination here; text-only tools return `{}`.
+        // Generation identity rides every success either way.
+        data["generation"] = self.generation_id();
+        json!({
+          "content": [{"type": "text", "text": text}],
+          "structuredContent": data,
+          "isError": false
+        })
+      }
       Err(err) => json!({
         "content": [{"type": "text", "text": err.message}],
         "structuredContent": {"code": err.code},
@@ -153,7 +158,9 @@ impl Server {
     }
   }
 
-  fn run_tool(&mut self, tool: &str, args: &Value) -> Result<String, ToolError> {
+  /// Run one tool: rendered text for humans plus, for the typed tools, a structured object
+  /// (records + pagination) that `tools_call` merges into `structuredContent`.
+  fn run_tool(&mut self, tool: &str, args: &Value) -> Result<(String, Value), ToolError> {
     let str_arg = |key: &str| {
       args
         .get(key)
@@ -185,7 +192,7 @@ impl Server {
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         self.kg = Some(Kg::load(&dir).map_err(|err| err.to_string())?);
         self.kg_dir = Some(dir);
-        Ok(if report.reused {
+        let text = if report.reused {
           format!("unchanged — reused existing index ({} nodes)", report.nodes)
         } else {
           format!(
@@ -198,7 +205,8 @@ impl Server {
             report.external,
             report.masked
           )
-        })
+        };
+        Ok((text, json!({})))
       }
       "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
         let name = str_arg("name")?;
@@ -226,21 +234,45 @@ impl Server {
         // `self.kg()` keeps the daemon contract: freshness revalidation, the warm cached
         // graph, and the "run the 'index' tool first" error when nothing is indexed yet.
         let kg = self.kg()?;
-        vorpal_index::graph_query_on(kg, verb, &target).map_err(|err| err.to_string())
-          .map_err(ToolError::from)
+        let data = if tool == "node" {
+          let records =
+            vorpal_index::records::listing_records(kg, &target).map_err(ToolError::from)?;
+          paged(records, args, "hits")?
+        } else {
+          let selected =
+            vorpal_index::records::related_records(kg, verb, &target).map_err(ToolError::from)?;
+          selected_data(selected, args)?
+        };
+        let text = vorpal_index::graph_query_on(kg, verb, &target)
+          .map_err(|err| err.to_string())
+          .map_err(ToolError::from)?;
+        Ok((text, data))
       }
       "search" => {
         let query = str_arg("query")?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
-        // Agents get ranking provenance by default: which channels (name/vector/graph)
-        // placed each hit, at which rank — §11's "expose which rankers contributed."
-        let rendered = vorpal_index::search_index_explained(&self.index_dir, &query, k)
+        // One ranking serves both surfaces: records for machines, and the explained text
+        // rendered from the same records (byte-compatible with `search_index_explained`) —
+        // agents get ranking provenance by default (§11's "expose which rankers
+        // contributed").
+        let records = vorpal_index::search_records(&self.index_dir, &query, k)
           .map_err(|err| err.to_string())?;
-        Ok(if rendered.is_empty() {
-          format!("(no results for '{query}')")
-        } else {
-          rendered
-        })
+        let mut text = String::new();
+        for hit in &records {
+          let mut provenance = format!("id {}", hit.node.id);
+          for channel in &hit.channels {
+            provenance.push_str(&format!("; {}#{}", channel.channel, channel.rank));
+          }
+          text.push_str(&format!(
+            "{:.4}  {} [{}] {}  ({provenance})\n",
+            hit.score, hit.node.name, hit.node.kind, hit.node.path
+          ));
+        }
+        if text.is_empty() {
+          text = format!("(no results for '{query}')");
+        }
+        let data = paged(records, args, "hits")?;
+        Ok((text, data))
       }
       "structural_search" => {
         let pattern = str_arg("pattern")?;
@@ -258,6 +290,7 @@ impl Server {
           })?;
         crate::tools::structural_search(&root, &pattern, &lang, path, limit.clamp(1, 1000))
           .map_err(ToolError::from)
+          .map(|text| (text, json!({})))
       }
       "rule_search" => {
         let rule = str_arg("rule")?;
@@ -274,6 +307,7 @@ impl Server {
           })?;
         crate::tools::rule_search(&root, &rule, path, limit.clamp(1, 1000))
           .map_err(ToolError::from)
+          .map(|text| (text, json!({})))
       }
       "ast_dump" => {
         let lang;
@@ -303,6 +337,7 @@ impl Server {
           .unwrap_or(500) as usize;
         crate::tools::ast_dump(&source, &lang, max_nodes.clamp(10, 5000))
           .map_err(ToolError::from)
+          .map(|text| (text, json!({})))
       }
       "fetch_span" => {
         let id = args
@@ -317,14 +352,14 @@ impl Server {
         self.kg()?;
         let dir = self.kg_dir.clone();
         let kg = self.kg.as_ref().expect("pinned above");
-        crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144)).map_err(
-          |err| match err {
+        crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144))
+          .map(|text| (text, json!({})))
+          .map_err(|err| match err {
             crate::tools::FetchSpanError::Stale(message) => {
               ToolError::coded("stale-source", message)
             }
             crate::tools::FetchSpanError::Other(message) => ToolError::from(message),
-          },
-        )
+          })
       }
       "why" => {
         let from_id = args
@@ -338,15 +373,21 @@ impl Server {
         self.kg()?;
         let dir = self.kg_dir.clone();
         let kg = self.kg.as_ref().expect("pinned above");
-        match (to_id, name) {
+        let text = match (to_id, name.as_deref()) {
           (Some(to_id), _) => vorpal_index::explain_edge_on(kg, dir.as_deref(), from_id, to_id)
-            .map_err(|err| err.to_string())
-            .map_err(ToolError::from),
-          (None, Some(name)) => vorpal_index::explain_absence_on(kg, from_id, &name)
-            .map_err(|err| err.to_string())
-            .map_err(ToolError::from),
-          (None, None) => Err(ToolError::coded("bad-argument", "pass to_id (edge evidence) or name (absence evidence)")),
-        }
+            .map_err(|err| err.to_string())?,
+          (None, Some(name)) => vorpal_index::explain_absence_on(kg, from_id, name)
+            .map_err(|err| err.to_string())?,
+          (None, None) => {
+            return Err(ToolError::coded(
+              "bad-argument",
+              "pass to_id (edge evidence) or name (absence evidence)",
+            ));
+          }
+        };
+        let records = vorpal_index::records::evidence_records(kg, from_id, to_id, name.as_deref());
+        let data = paged(records, args, "hits")?;
+        Ok((text, data))
       }
       "reachable" => {
         let name = str_arg("name")?;
@@ -401,9 +442,20 @@ impl Server {
         )
         .map_err(|err| err.to_string())?;
         let kg = self.kg()?;
-        vorpal_index::reachable_query_on(kg, &target, dir, &relations, max_depth, min_confidence)
+        let selected = vorpal_index::records::reach_records(
+          kg,
+          &target,
+          dir,
+          &relations,
+          max_depth,
+          min_confidence,
+        )
+        .map_err(ToolError::from)?;
+        let data = selected_data(selected, args)?;
+        let text = vorpal_index::reachable_query_on(kg, &target, dir, &relations, max_depth, min_confidence)
           .map_err(|err| err.to_string())
-          .map_err(ToolError::from)
+          .map_err(ToolError::from)?;
+        Ok((text, data))
       }
       other => Err(ToolError::coded("bad-argument", format!("unknown tool '{other}'"))),
     }
@@ -450,7 +502,9 @@ fn tools_list() -> Value {
     "kind": {"type": "string", "description": "Refine: symbol kind (function, method, struct, field, …)"},
     "id": {"type": "integer", "description": "Query exactly this node id (from `node` output or an ambiguity listing)"},
     "eid": {"type": "string", "description": "Durable external id (32 hex chars from `node` output) — survives rebuilds; also accepted as a `name` of the form eid:<hex>"},
-    "all": {"type": "boolean", "description": "Merge results across ALL same-named definitions instead of listing candidates"}
+    "all": {"type": "boolean", "description": "Merge results across ALL same-named definitions instead of listing candidates"},
+    "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+    "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
   });
   json!({"tools": [
     tool(
@@ -488,7 +542,9 @@ fn tools_list() -> Value {
         "kind": {"type": "string", "description": "Refine: seed's symbol kind"},
         "id": {"type": "integer", "description": "Seed exactly this node id"},
         "eid": {"type": "string", "description": "Seed by durable external id (32 hex chars)"},
-        "all": {"type": "boolean", "description": "Merge across ALL same-named seeds instead of listing candidates"}
+        "all": {"type": "boolean", "description": "Merge across ALL same-named seeds instead of listing candidates"},
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),
       &["name", "direction"],
     ),
@@ -550,7 +606,9 @@ fn tools_list() -> Value {
       json!({
         "from_id": {"type": "integer", "description": "Source node id (from any graph tool's id output)"},
         "to_id": {"type": "integer", "description": "Target node id (edge form: why does this edge exist?)"},
-        "name": {"type": "string", "description": "Referenced name (absence form: why is there NO edge to anything with this name?)"}
+        "name": {"type": "string", "description": "Referenced name (absence form: why is there NO edge to anything with this name?)"},
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),
       &["from_id"],
     ),
@@ -561,11 +619,71 @@ fn tools_list() -> Value {
        scores.",
       json!({
         "query": {"type": "string", "description": "Free-text query"},
-        "k": {"type": "integer", "description": "Max results (default 10)"}
+        "k": {"type": "integer", "description": "Max results (default 10)"},
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),
       &["query"],
     ),
   ]})
+}
+
+/// The cursor/pagination contract shared by every record-returning tool (IMPROVEMENTS #7):
+/// results are deterministic vectors, `cursor` is an opaque `o:<offset>` into that order,
+/// `limit` caps the page (default 100, max 1000), and the returned object always **declares**
+/// truncation — `total`, `truncated`, and `nextCursor` when more remain. Recomputing the
+/// vector per page keeps the server stateless; determinism makes the pages coherent.
+fn paged<T: serde::Serialize>(
+  records: Vec<T>,
+  args: &Value,
+  outcome: &str,
+) -> Result<Value, ToolError> {
+  let offset = match args.get("cursor").and_then(Value::as_str) {
+    None => 0usize,
+    Some(cursor) => cursor
+      .strip_prefix("o:")
+      .and_then(|n| n.parse().ok())
+      .ok_or_else(|| {
+        ToolError::coded("bad-argument", format!("malformed cursor '{cursor}' (want o:<offset>)"))
+      })?,
+  };
+  let limit = args
+    .get("limit")
+    .and_then(Value::as_u64)
+    .unwrap_or(100)
+    .clamp(1, 1000) as usize;
+  let total = records.len();
+  let start = offset.min(total);
+  let end = start.saturating_add(limit).min(total);
+  let page: Vec<Value> = records[start..end]
+    .iter()
+    .map(|record| serde_json::to_value(record).unwrap_or(Value::Null))
+    .collect();
+  let mut data = json!({
+    "outcome": outcome,
+    "records": page,
+    "total": total,
+    "truncated": end < total,
+  });
+  if end < total {
+    data["nextCursor"] = json!(format!("o:{end}"));
+  }
+  Ok(data)
+}
+
+/// Map a selector outcome to the structured object: `no-match` and `ambiguous` are answers
+/// (the ambiguous candidates page like any records), never errors.
+fn selected_data<T: serde::Serialize>(
+  selected: vorpal_index::records::Selected<T>,
+  args: &Value,
+) -> Result<Value, ToolError> {
+  match selected {
+    vorpal_index::records::Selected::NoMatch => Ok(json!({
+      "outcome": "no-match", "records": [], "total": 0, "truncated": false
+    })),
+    vorpal_index::records::Selected::Ambiguous(candidates) => paged(candidates, args, "ambiguous"),
+    vorpal_index::records::Selected::Hits(hits) => paged(hits, args, "hits"),
+  }
 }
 
 /// A tool failure with a stable machine-readable code (IMPROVEMENTS #7). Codes are part of

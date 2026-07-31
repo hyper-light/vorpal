@@ -13,6 +13,7 @@
 pub mod annfiles;
 pub mod autowarm;
 pub mod graph_predicates;
+pub mod records;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -923,12 +924,81 @@ pub fn search_index_explained(
   search_index_impl(index_dir, query, k, true)
 }
 
+/// The typed twin of [`search_index_explained`]: the same pinned-generation hybrid ranking,
+/// returned as records instead of rendered lines (IMPROVEMENTS #7).
+pub fn search_records(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
+  let (kg, ranked) = search_core(index_dir, query, k)?;
+  const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
+  Ok(
+    ranked
+      .into_iter()
+      .filter_map(|(row, score, ranks)| {
+        Some(records::SearchHitRecord {
+          node: records::node_record(&kg, NodeId::new(row))?,
+          score,
+          channels: CHANNELS
+            .iter()
+            .zip(&ranks)
+            .filter_map(|(&channel, rank)| {
+              rank.map(|rank| records::ChannelRank {
+                channel,
+                rank: rank + 1,
+              })
+            })
+            .collect(),
+        })
+      })
+      .collect(),
+  )
+}
+
 fn search_index_impl(
   index_dir: &Path,
   query: &str,
   k: usize,
   explain: bool,
 ) -> Result<String, Box<dyn Error>> {
+  let (kg, ranked) = search_core(index_dir, query, k)?;
+  let mut out = String::new();
+  for (row, score, ranks) in ranked {
+    if let Some(view) = kg.node(NodeId::new(row)) {
+      if explain {
+        let channels = ["name", "vector", "graph"];
+        let mut provenance = format!("id {row}");
+        for (channel, rank) in channels.iter().zip(&ranks) {
+          if let Some(rank) = rank {
+            let _ = write!(provenance, "; {channel}#{}", rank + 1);
+          }
+        }
+        let _ = writeln!(
+          out,
+          "{score:.4}  {} [{:?}] {}  ({provenance})",
+          view.name, view.kind, view.path
+        );
+      } else {
+        let _ = writeln!(
+          out,
+          "{score:.4}  {} [{:?}] {}",
+          view.name, view.kind, view.path
+        );
+      }
+    }
+  }
+  Ok(out)
+}
+
+/// The pinned-generation hybrid ranking shared by the rendered and typed search surfaces:
+/// name/semantic/in-degree channels fused by RRF, each hit carrying its per-channel ranks.
+#[allow(clippy::type_complexity)]
+fn search_core(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+) -> Result<(Kg, Vec<(u64, f32, Vec<Option<usize>>)>), Box<dyn Error>> {
   // Pin one generation for the whole query: the graph AND the ANN tier both come from the
   // directory CURRENT names right now, so a rebuild landing mid-search cannot hand this query
   // a mixed pair (the ANN stamp would catch it, but resolving once makes it impossible).
@@ -1050,33 +1120,7 @@ fn search_index_impl(
     )
   });
 
-  let ranked = rrf_fuse_explained(&[named, semantic, by_degree], k);
-  let mut out = String::new();
-  for (row, score, ranks) in ranked {
-    if let Some(view) = kg.node(NodeId::new(row)) {
-      if explain {
-        let channels = ["name", "vector", "graph"];
-        let mut provenance = format!("id {row}");
-        for (channel, rank) in channels.iter().zip(&ranks) {
-          if let Some(rank) = rank {
-            let _ = write!(provenance, "; {channel}#{}", rank + 1);
-          }
-        }
-        let _ = writeln!(
-          out,
-          "{score:.4}  {} [{:?}] {}  ({provenance})",
-          view.name, view.kind, view.path
-        );
-      } else {
-        let _ = writeln!(
-          out,
-          "{score:.4}  {} [{:?}] {}",
-          view.name, view.kind, view.path
-        );
-      }
-    }
-  }
-  Ok(out)
+  Ok((kg, rrf_fuse_explained(&[named, semantic, by_degree], k)))
 }
 
 /// Run one graph query verb against a persisted index and render the results — the shared
@@ -1334,14 +1378,10 @@ pub fn min_confidence_for_grade(grade: Option<&str>) -> Result<u8, Box<dyn Error
 /// `min_confidence`+ up to `max_depth`, and render each reached node **with its path** back to
 /// the seed — per-edge relation names included, so a traversal answer is auditable, not a bare
 /// node set.
-pub fn reachable_query_on(
-  kg: &Kg,
-  target: &GraphTarget,
-  dir: vorpal_kg::Direction,
-  relations: &[vorpal_kg::EdgeType],
-  max_depth: Option<u32>,
-  min_confidence: u8,
-) -> Result<String, Box<dyn Error>> {
+/// Resolve a [`GraphTarget`] to its matching node ids — the one selector implementation every
+/// surface shares (rendered queries, typed [`records`], and the `eid:<hex>`-as-name wire
+/// form).
+pub fn resolve_target(kg: &Kg, target: &GraphTarget) -> Result<Vec<NodeId>, Box<dyn Error>> {
   let kind = match target.kind.as_deref() {
     Some(text) => Some(
       vorpal_kg::SymbolKind::parse(text).ok_or_else(|| format!("unknown symbol kind '{text}'"))?,
@@ -1362,7 +1402,18 @@ pub fn reachable_query_on(
     kind,
     external_id: target.external_id.or(eid_from_name),
   };
-  let matches = kg.select(&selector);
+  Ok(kg.select(&selector))
+}
+
+pub fn reachable_query_on(
+  kg: &Kg,
+  target: &GraphTarget,
+  dir: vorpal_kg::Direction,
+  relations: &[vorpal_kg::EdgeType],
+  max_depth: Option<u32>,
+  min_confidence: u8,
+) -> Result<String, Box<dyn Error>> {
+  let matches = resolve_target(kg, target)?;
   if matches.is_empty() {
     return Ok(format!(
       "(no results for '{}' — no symbol matches that selector)
@@ -1442,29 +1493,7 @@ pub fn graph_query_selected(
 /// [`graph_query_selected`] over an already-loaded graph — the daemon path, which serves
 /// from its warm cached [`Kg`] instead of re-opening artifacts per tool call.
 pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<String, Box<dyn Error>> {
-  let kind = match target.kind.as_deref() {
-    Some(text) => Some(
-      vorpal_kg::SymbolKind::parse(text).ok_or_else(|| format!("unknown symbol kind '{text}'"))?,
-    ),
-    None => None,
-  };
-  // `eid:<32-hex>` as a name is the durable-bookmark wire form: usable anywhere a name is
-  // accepted (CLI verbs, MCP tools) without new arguments.
-  let (name, eid_from_name) = match target.name.strip_prefix("eid:") {
-    Some(hex) => (
-      "",
-      Some(u128::from_str_radix(hex, 16).map_err(|_| format!("malformed external id '{hex}'"))?),
-    ),
-    None => (target.name.as_str(), None),
-  };
-  let selector = vorpal_kg::SymbolSelector {
-    id: target.id,
-    name: (!name.is_empty()).then_some(name),
-    path_suffix: target.path_suffix.as_deref(),
-    kind,
-    external_id: target.external_id.or(eid_from_name),
-  };
-  let matches = kg.select(&selector);
+  let matches = resolve_target(kg, target)?;
   if matches.is_empty() {
     return Ok(format!(
       "(no results for '{}' — no symbol matches that selector)\n",

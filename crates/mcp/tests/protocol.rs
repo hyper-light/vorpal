@@ -323,6 +323,123 @@ fn results_carry_generation_identity_and_stable_error_codes() {
 }
 
 #[test]
+fn typed_records_and_cursor_pagination() {
+  let (src, idx) = temp_tree("records");
+  let mut server = Server::new(idx);
+  let (text, is_err) = call_tool(
+    &mut server,
+    1,
+    "index",
+    json!({"src": src.to_string_lossy()}),
+  );
+  assert!(!is_err, "{text}");
+
+  // `node` returns typed records: full identity (dense id, durable eid, kind, path, span).
+  let response = request(
+    &mut server,
+    2,
+    "tools/call",
+    json!({"name": "node", "arguments": {"name": "target"}}),
+  );
+  let data = &response["result"]["structuredContent"];
+  assert_eq!(data["outcome"], "hits");
+  assert_eq!(data["total"], 1);
+  assert_eq!(data["truncated"], false);
+  let record = &data["records"][0];
+  assert_eq!(record["name"], "target");
+  assert_eq!(record["kind"], "Function");
+  assert!(record["path"].as_str().unwrap().ends_with("b.rs"));
+  assert!(record["id"].as_u64().is_some());
+  assert!(
+    record["external_id"].as_str().unwrap().starts_with("eid:"),
+    "{record}"
+  );
+  assert!(record["span"][1].as_u64().unwrap() > 0);
+
+  // `callers` records carry the edge grade; `reachable` steps carry relation + via.
+  let response = request(
+    &mut server,
+    3,
+    "tools/call",
+    json!({"name": "callers", "arguments": {"name": "target"}}),
+  );
+  let data = &response["result"]["structuredContent"];
+  assert_eq!(data["outcome"], "hits");
+  assert_eq!(data["records"][0]["name"], "caller");
+  assert!(data["records"][0]["grade"].as_str().is_some());
+
+  let response = request(
+    &mut server,
+    4,
+    "tools/call",
+    json!({"name": "reachable", "arguments": {"name": "target", "direction": "in"}}),
+  );
+  let data = &response["result"]["structuredContent"];
+  assert_eq!(data["outcome"], "hits");
+  let step = &data["records"][0];
+  assert_eq!(step["name"], "caller");
+  assert_eq!(step["relation"], "calls");
+  assert_eq!(step["depth"], 1);
+  assert!(step["via"].as_u64().is_some());
+
+  // `why` typed evidence: relation, grade, reason, span — from the edge the graph holds.
+  let from_id = step["id"].as_u64().unwrap();
+  let target_id = record["id"].as_u64().unwrap();
+  let response = request(
+    &mut server,
+    5,
+    "tools/call",
+    json!({"name": "why", "arguments": {"from_id": from_id, "to_id": target_id}}),
+  );
+  let data = &response["result"]["structuredContent"];
+  assert_eq!(data["outcome"], "hits");
+  let row = &data["records"][0];
+  assert_eq!(row["relation"], "calls");
+  assert_eq!(row["to"].as_u64(), Some(target_id));
+  assert!(row["reason"].as_str().is_some());
+  assert!(row["span"][1].as_u64().unwrap() > 0);
+
+  // Pagination: limit=1 over the search records pages deterministically with a nextCursor.
+  let response = request(
+    &mut server,
+    6,
+    "tools/call",
+    json!({"name": "search", "arguments": {"query": "target caller", "k": 5, "limit": 1}}),
+  );
+  let data = &response["result"]["structuredContent"];
+  let total = data["total"].as_u64().unwrap();
+  assert!(total >= 2, "{data}");
+  assert_eq!(data["records"].as_array().unwrap().len(), 1);
+  assert_eq!(data["truncated"], true);
+  let cursor = data["nextCursor"].as_str().unwrap().to_string();
+  let first_name = data["records"][0]["name"].as_str().unwrap().to_string();
+  let response = request(
+    &mut server,
+    7,
+    "tools/call",
+    json!({"name": "search", "arguments": {"query": "target caller", "k": 5, "limit": 1, "cursor": cursor}}),
+  );
+  let data = &response["result"]["structuredContent"];
+  let second_name = data["records"][0]["name"].as_str().unwrap();
+  assert_ne!(first_name, second_name, "pages advance through the ranking");
+
+  // A malformed cursor is a coded bad-argument, never a silent first page.
+  let response = request(
+    &mut server,
+    8,
+    "tools/call",
+    json!({"name": "node", "arguments": {"name": "target", "cursor": "bogus"}}),
+  );
+  assert_eq!(response["result"]["isError"], true);
+  assert_eq!(
+    response["result"]["structuredContent"]["code"].as_str(),
+    Some("bad-argument")
+  );
+
+  let _ = fs::remove_dir_all(src.parent().unwrap());
+}
+
+#[test]
 fn protocol_and_tool_errors_are_explicit() {
   let (_src, idx) = temp_tree("errors");
   let mut server = Server::new(idx);
