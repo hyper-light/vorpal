@@ -33,7 +33,9 @@ mod jemalloc_conf {
 use vorpal_index::search_index;
 
 const USAGE: &str = "usage:
-  vorpal-index index        <src-dir> <index-dir> [--verify]  build + persist a knowledge graph
+  vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F]
+                                                    build + persist a knowledge graph
+  vorpal-index health       <index-dir>             per-file parse damage: byte ratios, error spans, affected entities
   vorpal-index callers      <index-dir> <name>      direct callers of a symbol
   vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
   vorpal-index importers    <index-dir> <name>      files importing a symbol
@@ -78,13 +80,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
   let args: Vec<String> = std::env::args().skip(1).collect();
   let argv: Vec<&str> = args.iter().map(String::as_str).collect();
   match argv.as_slice() {
-    ["index", src, out] | ["index", src, out, "--verify"] => {
-      let mode = if argv.last() == Some(&"--verify") {
-        vorpal_index::CacheMode::Verified
-      } else {
-        vorpal_index::CacheMode::default()
-      };
-      let report = vorpal_index::build_index_with(Path::new(src), Path::new(out), mode)?;
+    ["index", src, out, rest @ ..] => {
+      let mut mode = vorpal_index::CacheMode::default();
+      let mut policy = vorpal_index::ParseHealthPolicy::default();
+      let mut flags = rest.iter();
+      while let Some(flag) = flags.next() {
+        match *flag {
+          "--verify" => mode = vorpal_index::CacheMode::Verified,
+          "--parse-health" => {
+            policy.mode = match flags.next().copied() {
+              Some("warn") => vorpal_index::ParseHealthMode::Warn,
+              Some("exclude") => vorpal_index::ParseHealthMode::Exclude,
+              Some("fail") => vorpal_index::ParseHealthMode::Fail,
+              other => {
+                return Err(
+                  format!("--parse-health wants warn|exclude|fail, got {other:?}").into(),
+                );
+              }
+            };
+          }
+          "--max-error-ratio" => {
+            policy.max_error_ratio = flags
+              .next()
+              .and_then(|v| v.parse().ok())
+              .ok_or("--max-error-ratio wants a number in [0,1]")?;
+          }
+          other => return Err(format!("unknown flag '{other}'\n{USAGE}").into()),
+        }
+      }
+      let report =
+        vorpal_index::build_index_full(Path::new(src), Path::new(out), mode, policy)?;
       if report.reused {
         println!("unchanged — reused existing index ({} nodes)", report.nodes);
       } else {
@@ -100,11 +125,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         if report.error_files > 0 {
           println!(
-            "note: {} files had parse errors ({} ERROR nodes total; some definitions may be missing)",
-            report.error_files, report.error_nodes
+            "note: {} files had parse errors ({} ERROR nodes across {} bytes; some definitions may be missing — see the 'health' verb)",
+            report.error_files, report.error_nodes, report.error_bytes
+          );
+        }
+        if report.excluded_files > 0 {
+          println!(
+            "note: {} unhealthy files excluded from the graph (parse-health policy)",
+            report.excluded_files
           );
         }
       }
+      Ok(())
+    }
+    ["health", index] => {
+      print!("{}", vorpal_index::parse_health_report(Path::new(index))?);
       Ok(())
     }
     [

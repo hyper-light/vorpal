@@ -54,6 +54,11 @@ pub struct IndexReport {
   /// Total tree-sitter ERROR nodes across all files — the magnitude behind `error_files`, so a
   /// corpus with one badly-broken file reads differently from one with many lightly-broken files.
   pub error_nodes: u64,
+  /// Total bytes covered by (merged) ERROR ranges across all files — with per-file sizes, the
+  /// covered-byte ratio parse-health policies threshold on (IMPROVEMENTS #11).
+  pub error_bytes: u64,
+  /// Files the parse-health `exclude` policy dropped from the graph this build.
+  pub excluded_files: u64,
   pub nodes: usize,
   /// Confidently resolved references (single visible definition).
   pub resolved: u64,
@@ -128,6 +133,46 @@ impl CacheMode {
   }
 }
 
+/// What a build does about files whose parse produced ERROR nodes (IMPROVEMENTS #11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParseHealthMode {
+  /// Ingest everything, report the damage (the default — graceful degradation, visible).
+  #[default]
+  Warn,
+  /// Files past the threshold contribute NOTHING to the graph (their products still bank,
+  /// so a later Warn build reuses them). Missing relations from excluded files are then
+  /// meaningful absence, not silent decay.
+  Exclude,
+  /// Fail the build, listing the offenders — for pipelines that treat parse damage as a
+  /// stop-the-line defect.
+  Fail,
+}
+
+/// The threshold a [`ParseHealthMode`] acts on: a file is unhealthy when its merged
+/// ERROR-covered bytes exceed `max_error_ratio` of its size (0.0 = any error byte).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParseHealthPolicy {
+  pub mode: ParseHealthMode,
+  pub max_error_ratio: f64,
+}
+
+impl Default for ParseHealthPolicy {
+  fn default() -> Self {
+    Self {
+      mode: ParseHealthMode::Warn,
+      max_error_ratio: 0.0,
+    }
+  }
+}
+
+impl ParseHealthPolicy {
+  /// Whether a file with `error_bytes` of `size` crosses this policy's threshold.
+  pub fn is_unhealthy(&self, error_bytes: u64, size: u64) -> bool {
+    error_bytes > 0
+      && (size == 0 || error_bytes as f64 / size as f64 > self.max_error_ratio)
+  }
+}
+
 /// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`,
 /// with cache validity decided by [`CacheMode::from_env`] (fast-stat unless
 /// `VORPAL_VERIFY_CACHE=1`).
@@ -141,6 +186,19 @@ pub fn build_index_with(
   src: &Path,
   out: &Path,
   cache_mode: CacheMode,
+) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_full(src, out, cache_mode, ParseHealthPolicy::default())
+}
+
+/// [`build_index_with`] plus an explicit [`ParseHealthPolicy`] (IMPROVEMENTS #11): warn is
+/// today's behavior; exclude drops unhealthy files from the graph; fail aborts before the
+/// generation commits, listing offenders. Non-warn policies bypass the unchanged-tree fast
+/// path (its prior generation was built under some other policy and proves nothing).
+pub fn build_index_full(
+  src: &Path,
+  out: &Path,
+  cache_mode: CacheMode,
+  policy: ParseHealthPolicy,
 ) -> Result<IndexReport, Box<dyn Error>> {
   let extractor = OutlineExtractor::new()?;
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
@@ -208,6 +266,7 @@ pub fn build_index_with(
     if manifest.unchanged_since(&prior_manifest)
       && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
       && !verify_all
+      && policy.mode == ParseHealthMode::Warn
       && prior.join("strings.heap").exists()
       && prior.join("graph.bin").exists()
       && racy_files_verify()
@@ -227,6 +286,8 @@ pub fn build_index_with(
           cache_mode: cache_mode.label(),
           error_files: 0,
           error_nodes: 0,
+          error_bytes: 0,
+          excluded_files: 0,
           indexed: 0,
           skipped: manifest.len() as u64,
           nodes,
@@ -293,6 +354,14 @@ pub fn build_index_with(
   // kernel scale).
   let error_files = std::sync::atomic::AtomicU64::new(0);
   let error_nodes = std::sync::atomic::AtomicU64::new(0);
+  let error_bytes = std::sync::atomic::AtomicU64::new(0);
+  let excluded_files = std::sync::atomic::AtomicU64::new(0);
+  // Fail-policy offenders: collected during the stream, judged before the commit.
+  let unhealthy_files = std::sync::Mutex::new(Vec::<(String, f64)>::new());
+  let note_unhealthy = |path: &str, bytes: u64, size: u64| {
+    let ratio = if size == 0 { 1.0 } else { bytes as f64 / size as f64 };
+    unhealthy_files.lock().unwrap().push((path.to_string(), ratio));
+  };
   let spill_path = staging.join(".refs.spill");
   let heap_stream = staging.join("strings.heap.tmp");
   let stream_result = stream_apply_spilled(
@@ -319,13 +388,23 @@ pub fn build_index_with(
               if product.error_nodes > 0 {
                 error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 error_nodes.fetch_add(product.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
+                error_bytes.fetch_add(product.error_bytes, std::sync::atomic::Ordering::Relaxed);
               }
+              let unhealthy = policy.is_unhealthy(product.error_bytes, entry.size);
+              if unhealthy && policy.mode == ParseHealthMode::Fail {
+                note_unhealthy(&entry.path, product.error_bytes, entry.size);
+              }
+              // Bank the product either way; exclusion is a graph decision, not a cache one.
               pack_sink
                 .send(PackMsg {
                   path: entry.path.clone(),
                   body: bytes,
                 })
                 .map_err(send_fatal)?;
+              if unhealthy && policy.mode == ParseHealthMode::Exclude {
+                excluded_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(StreamWork::Skipped);
+              }
               return Ok(StreamWork::Replayed(entry.path.clone(), product));
             }
           }
@@ -348,9 +427,21 @@ pub fn build_index_with(
             && validate_product(bytes)
           {
             let ec = vorpal_ingest::peek_product_error_nodes(bytes).unwrap_or(0);
+            let eb = vorpal_ingest::peek_product_error_bytes(bytes).unwrap_or(0);
             if ec > 0 {
               error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
               error_nodes.fetch_add(ec as u64, std::sync::atomic::Ordering::Relaxed);
+              error_bytes.fetch_add(eb, std::sync::atomic::Ordering::Relaxed);
+            }
+            let unhealthy = policy.is_unhealthy(eb, entry.size);
+            if unhealthy && policy.mode == ParseHealthMode::Fail {
+              note_unhealthy(&entry.path, eb, entry.size);
+            }
+            if unhealthy && policy.mode == ParseHealthMode::Exclude {
+              // The reused pack body stays banked (live_paths keeps it); only the graph
+              // contribution is dropped.
+              excluded_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              return Ok(StreamWork::Skipped);
             }
             return Ok(StreamWork::ReplayedPacked(entry.path.clone()));
           }
@@ -366,7 +457,13 @@ pub fn build_index_with(
       if product.error_nodes > 0 {
         error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         error_nodes.fetch_add(product.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
+        error_bytes.fetch_add(product.error_bytes, std::sync::atomic::Ordering::Relaxed);
       }
+      let unhealthy = policy.is_unhealthy(product.error_bytes, entry.size);
+      if unhealthy && policy.mode == ParseHealthMode::Fail {
+        note_unhealthy(&entry.path, product.error_bytes, entry.size);
+      }
+      let excluded = unhealthy && policy.mode == ParseHealthMode::Exclude;
       product.source_size = entry.size;
       product.source_mtime_ns = entry.mtime_ns;
       scratch.encode.clear();
@@ -379,6 +476,10 @@ pub fn build_index_with(
           body: std::mem::take(&mut scratch.encode),
         })
         .map_err(send_fatal)?;
+      if excluded {
+        excluded_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(StreamWork::Skipped);
+      }
       Ok(StreamWork::Parsed(entry.path.clone(), product))
     },
   );
@@ -386,6 +487,28 @@ pub fn build_index_with(
   let pack_result = pack_thread.join().expect("pack writer panicked");
   let (writer, spilled_refs, stream) = stream_result?;
   pack_result?;
+  // Fail policy judges here — before sealing, before the generation commits: nothing is
+  // published, and the message lists the worst offenders with their damage ratios.
+  let offenders = unhealthy_files.into_inner().unwrap();
+  if !offenders.is_empty() {
+    let mut sorted = offenders;
+    sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let shown: Vec<String> = sorted
+      .iter()
+      .take(5)
+      .map(|(path, ratio)| format!("{path} ({:.1}% error bytes)", ratio * 100.0))
+      .collect();
+    return Err(
+      format!(
+        "parse-health policy 'fail' (max error ratio {:.3}): {} file(s) unhealthy — {}{}",
+        policy.max_error_ratio,
+        sorted.len(),
+        shown.join(", "),
+        if sorted.len() > shown.len() { ", …" } else { "" }
+      )
+      .into(),
+    );
+  }
   // Hard-limit gate before sealing (IMPROVEMENTS §12): node ids, graph endpoints, and string-heap
   // offsets are all 32-bit on disk. Rather than let a corpus past those ceilings silently wrap a
   // cast and persist a corrupt index, fail loudly and actionably. The heap grows monotonically,
@@ -442,6 +565,8 @@ pub fn build_index_with(
     skipped: replayed,
     error_files: error_files.into_inner(),
     error_nodes: error_nodes.into_inner(),
+    error_bytes: error_bytes.into_inner(),
+    excluded_files: excluded_files.into_inner(),
     nodes: kg.node_count(),
     resolved: resolve.resolved,
     ambiguous: resolve.ambiguous,
@@ -1524,6 +1649,92 @@ pub fn read_indexed_source(
     Some(_) => IndexedRead::Changed,
     None => IndexedRead::Unverified(bytes),
   })
+}
+
+/// The parse-health query (IMPROVEMENTS #11): per-file damage with everything a consumer
+/// needs before treating missing relations as meaningful absence — covered-byte ratios,
+/// representative merged error spans, parser/language context (language name + the
+/// extraction-identity digest the product was built under), and the graph entities whose
+/// definition spans intersect damaged regions.
+pub fn parse_health_report(index_dir: &Path) -> Result<String, Box<dyn Error>> {
+  let dir = vorpal_kg::resolve_index_dir(index_dir);
+  let kg = Kg::load(&dir)?;
+  let pack = PackReader::open(&dir).ok_or("no product pack in this generation")?;
+
+  // One pass over the nodes: file paths, and per-path entity lists for overlap checks.
+  let mut files: Vec<(u64, String)> = Vec::new();
+  let mut by_path: HashMap<String, Vec<u64>> = HashMap::new();
+  for id in 0..kg.node_count() as u64 {
+    let Some(view) = kg.node(NodeId::new(id)) else {
+      continue;
+    };
+    if view.kind == vorpal_kg::SymbolKind::File {
+      files.push((id, view.path.to_string()));
+    } else {
+      by_path.entry(view.path.to_string()).or_default().push(id);
+    }
+  }
+  files.sort_by(|a, b| a.1.cmp(&b.1));
+
+  let mut out = String::new();
+  let mut unhealthy = 0usize;
+  let mut total_error_bytes = 0u64;
+  for (_, path) in &files {
+    let Some(bytes) = pack.get(path) else {
+      continue;
+    };
+    let Ok(product) = vorpal_ingest::decode_product_view(bytes) else {
+      continue;
+    };
+    if product.error_nodes == 0 {
+      continue;
+    }
+    unhealthy += 1;
+    total_error_bytes += product.error_bytes;
+    let ratio = if product.source_size == 0 {
+      100.0
+    } else {
+      product.error_bytes as f64 / product.source_size as f64 * 100.0
+    };
+    let language = vorpal_ingest::language_name_of(path).unwrap_or_else(|| "?".to_string());
+    let _ = writeln!(
+      out,
+      "{path} [{language}; extraction-id {:016x}]: {} ERROR nodes, {} of {} bytes ({ratio:.1}%)",
+      product.grammar_digest, product.error_nodes, product.error_bytes, product.source_size
+    );
+    for &(start, end) in &product.error_spans {
+      let _ = writeln!(out, "  error span {start}..{end}");
+    }
+    // Entities whose definition span intersects any damaged region: relations from these
+    // may be incomplete — the difference between "no edge" and "unknowable here".
+    let mut affected: Vec<String> = Vec::new();
+    for &id in by_path.get(path).into_iter().flatten() {
+      let Some(view) = kg.node(NodeId::new(id)) else {
+        continue;
+      };
+      let (s, e) = view.span;
+      if (s, e) == (0, 0) {
+        continue;
+      }
+      if product
+        .error_spans
+        .iter()
+        .any(|&(es, ee)| s < ee && es < e)
+      {
+        affected.push(format!("{} [{:?}] (id {id})", view.name, view.kind));
+      }
+    }
+    if !affected.is_empty() {
+      let _ = writeln!(out, "  entities in damaged regions: {}", affected.join(", "));
+    }
+  }
+  if unhealthy == 0 {
+    return Ok("parse health: clean — every indexed file parsed without ERROR nodes\n".into());
+  }
+  Ok(format!(
+    "parse health: {unhealthy} of {} files carry ERROR nodes ({total_error_bytes} damaged bytes total)\n{out}",
+    files.len()
+  ))
 }
 
 /// Answer "why is there NO edge from this node to anything named `name`?" — the no-edge

@@ -86,6 +86,7 @@ fn initialize_handshake_and_tool_listing() {
     names,
     [
       "index",
+      "health",
       "node",
       "callers",
       "references",

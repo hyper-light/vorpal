@@ -118,9 +118,30 @@ impl OutlineExtractor {
     // node is the only definition span).
     let grep = lang.grep(source);
     // Graceful-degradation telemetry (all languages): count the tree-sitter ERROR nodes this
-    // parse produced (0 = clean), so definitions it dropped are surfaced with a "how bad"
-    // magnitude, never hidden.
-    let error_nodes = grep.root().dfs().filter(|node| node.is_error()).count() as u32;
+    // parse produced (0 = clean) AND measure the damage — merged error ranges give an honest
+    // affected-byte count (nested ERRORs never double-count) plus up to eight representative
+    // spans, so health policies can threshold on a ratio and humans can look at the wreckage
+    // without re-parsing (IMPROVEMENTS #11).
+    let mut error_ranges: Vec<(u32, u32)> = grep
+      .root()
+      .dfs()
+      .filter(|node| node.is_error())
+      .map(|node| {
+        let range = node.range();
+        (range.start as u32, range.end as u32)
+      })
+      .collect();
+    let error_nodes = error_ranges.len() as u32;
+    error_ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in error_ranges {
+      match merged.last_mut() {
+        Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+        _ => merged.push((start, end)),
+      }
+    }
+    let error_bytes: u64 = merged.iter().map(|&(s, e)| u64::from(e - s)).sum();
+    let error_spans: Vec<(u32, u32)> = merged.into_iter().take(8).collect();
     let items: Vec<OutlineItem<'_>> = combined
       .map(|c| c.extract(grep.root()).collect())
       .unwrap_or_default();
@@ -161,6 +182,8 @@ impl OutlineExtractor {
         self.rules_digest,
       ),
       error_nodes,
+      error_bytes,
+      error_spans,
       items: items.into_iter().map(product::own_item).collect(),
       refs,
     })

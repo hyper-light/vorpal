@@ -185,8 +185,28 @@ impl Server {
         } else {
           vorpal_index::CacheMode::default()
         };
-        let report = vorpal_index::build_index_with(Path::new(&src), &self.index_dir, mode)
-          .map_err(|err| err.to_string())?;
+        // Parse-health policy (IMPROVEMENTS #11): warn (default) | exclude | fail, with an
+        // error-byte-ratio threshold.
+        let policy = vorpal_index::ParseHealthPolicy {
+          mode: match args.get("parse_health").and_then(Value::as_str) {
+            None | Some("warn") => vorpal_index::ParseHealthMode::Warn,
+            Some("exclude") => vorpal_index::ParseHealthMode::Exclude,
+            Some("fail") => vorpal_index::ParseHealthMode::Fail,
+            Some(other) => {
+              return Err(ToolError::coded(
+                "bad-argument",
+                format!("parse_health wants warn|exclude|fail, got '{other}'"),
+              ));
+            }
+          },
+          max_error_ratio: args
+            .get("max_error_ratio")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        };
+        let report =
+          vorpal_index::build_index_full(Path::new(&src), &self.index_dir, mode, policy)
+            .map_err(|err| err.to_string())?;
         // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
         // new generation directory alongside it.
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
@@ -300,6 +320,14 @@ impl Server {
         crate::tools::structural_search(&root, &pattern, &lang, path, limit.clamp(1, 1000))
           .map_err(ToolError::from)
           .map(|text| (text, json!({})))
+      }
+      "health" => {
+        // Serve from the pinned generation so spans/entities match the ids other tools hand out.
+        self.kg()?;
+        let dir = self.kg_dir.clone().unwrap_or_else(|| self.index_dir.clone());
+        vorpal_index::parse_health_report(&dir)
+          .map(|text| (text, json!({})))
+          .map_err(|err| ToolError::from(err.to_string()))
       }
       "rule_search" => {
         let rule = str_arg("rule")?;
@@ -522,9 +550,20 @@ fn tools_list() -> Value {
        the tree is unchanged), then hold it warm for queries.",
       json!({
         "src": {"type": "string", "description": "Source directory to index"},
-        "verify": {"type": "boolean", "description": "Content-authoritative cache validation: verify every replay against current file bytes (default fast-stat trusts size+mtime outside the racy window)"}
+        "verify": {"type": "boolean", "description": "Content-authoritative cache validation: verify every replay against current file bytes (default fast-stat trusts size+mtime outside the racy window)"},
+        "parse_health": {"type": "string", "enum": ["warn", "exclude", "fail"], "description": "Policy for files whose parse produced ERROR nodes: warn reports (default), exclude drops them from the graph, fail aborts before committing"},
+        "max_error_ratio": {"type": "number", "description": "Unhealthy threshold: error bytes / file size above this ratio (default 0.0 = any error byte)"}
       }),
       &["src"],
+    ),
+    tool(
+      "health",
+      "Per-file parse damage in the pinned generation: ERROR-node counts, covered-byte \
+       ratios, representative error spans, language + extraction-identity context, and the \
+       graph entities whose definitions overlap damaged regions — the difference between \
+       'no edge' and 'unknowable here'.",
+      json!({}),
+      &[],
     ),
     tool("node", "Nodes matching an exact symbol name.", name_only.clone(), &["name"]),
     tool("callers", "Direct callers of a symbol (incoming `calls` edges).", name_only.clone(), &["name"]),

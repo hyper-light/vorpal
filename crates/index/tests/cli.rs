@@ -1607,3 +1607,81 @@ fn model_provenance_is_persisted_and_gates_the_tier() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+/// IMPROVEMENTS #11: parse health is measurable (byte ratios), inspectable (error spans +
+/// affected entities + parser context), and enforceable (warn / exclude / fail policies).
+#[test]
+fn parse_health_policies_and_report() {
+  let base = std::env::temp_dir().join(format!("vorpal-health-{}", std::process::id()));
+  let src = base.join("src");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("good.rs"), "pub fn good_fn() -> u32 { 1 }\n").unwrap();
+  // The error sits INSIDE `damaged`'s body, so the entity's span overlaps the damage.
+  fs::write(
+    src.join("broken.rs"),
+    "pub fn damaged() -> u32 { let x = ; 1 }\npub fn fine_sibling() -> u32 { 2 }\n",
+  )
+  .unwrap();
+
+  // Warn (default): builds, measures, reports.
+  let out_warn = base.join("warn");
+  let report = vorpal_index::build_index(&src, &out_warn).unwrap();
+  assert_eq!(report.error_files, 1);
+  assert!(report.error_nodes >= 1);
+  assert!(report.error_bytes > 0, "byte magnitude, not just a node count");
+  assert_eq!(report.excluded_files, 0);
+
+  // The health query: spans, parser/language context, and entities in damaged regions.
+  let health = vorpal_index::parse_health_report(&out_warn).unwrap();
+  assert!(health.contains("broken.rs"), "{health}");
+  assert!(health.contains("[Rust; extraction-id"), "{health}");
+  assert!(health.contains("error span"), "{health}");
+  assert!(
+    health.contains("entities in damaged regions") && health.contains("damaged"),
+    "{health}"
+  );
+  assert!(!health.contains("good.rs"), "clean files stay out of the report: {health}");
+
+  // Fail: aborts before commit, naming the offender; a lenient threshold passes.
+  let out_fail = base.join("fail");
+  let strict = vorpal_index::ParseHealthPolicy {
+    mode: vorpal_index::ParseHealthMode::Fail,
+    max_error_ratio: 0.0,
+  };
+  let err = vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), strict)
+    .expect_err("strict fail policy must abort");
+  assert!(err.to_string().contains("broken.rs"), "{err}");
+  assert!(
+    !out_fail.join("CURRENT").exists(),
+    "a failed build must not commit a generation"
+  );
+  let lenient = vorpal_index::ParseHealthPolicy {
+    mode: vorpal_index::ParseHealthMode::Fail,
+    max_error_ratio: 0.99,
+  };
+  vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), lenient)
+    .expect("under-threshold damage passes a lenient fail policy");
+
+  // Exclude: the unhealthy file contributes nothing; clean files are untouched.
+  let out_excl = base.join("excl");
+  let exclude = vorpal_index::ParseHealthPolicy {
+    mode: vorpal_index::ParseHealthMode::Exclude,
+    max_error_ratio: 0.0,
+  };
+  let report =
+    vorpal_index::build_index_full(&src, &out_excl, vorpal_index::CacheMode::default(), exclude)
+      .unwrap();
+  assert_eq!(report.excluded_files, 1);
+  let kg = vorpal_index::Kg::load(&live(&out_excl)).unwrap();
+  let names: Vec<String> = (0..kg.node_count() as u64)
+    .filter_map(|i| kg.node(vorpal_kg::NodeId::new(i)).map(|v| v.name.to_string()))
+    .collect();
+  assert!(names.iter().any(|n| n == "good_fn"), "{names:?}");
+  assert!(
+    !names.iter().any(|n| n == "damaged" || n == "fine_sibling"),
+    "excluded files contribute nothing: {names:?}"
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}

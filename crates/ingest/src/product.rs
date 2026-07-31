@@ -26,8 +26,9 @@ use vorpal_resolve::{RefForm, RefKind};
 /// as cache misses and re-parse — staleness is structural, never silent (§3.4). v8 adds the
 /// grammar-generation digest to the header; v9 widens the parse-error flag to an error-node
 /// count; v10 captures source-module qualifiers on import references (Python `from X import y`,
-/// Rust `use a::b::c`).
-pub const PRODUCT_FORMAT_VERSION: u32 = 10;
+/// Rust `use a::b::c`); v11 adds affected-byte counts and representative merged error spans
+/// (parse health beyond a scalar, IMPROVEMENTS #11).
+pub const PRODUCT_FORMAT_VERSION: u32 = 11;
 
 /// One file's extraction output, serializable for the on-disk product cache.
 #[derive(Debug, Clone)]
@@ -57,6 +58,12 @@ pub struct FileProduct {
   /// the graph. Language-agnostic graceful-degradation telemetry — surfaced in
   /// `IndexReport::{error_files, error_nodes}`, never acted on (parsing is tree-sitter's job).
   pub error_nodes: u32,
+  /// Total bytes covered by ERROR nodes, after merging nested/overlapping error ranges —
+  /// with `source_size`, the covered-byte ratio a health policy thresholds on.
+  pub error_bytes: u64,
+  /// Up to eight representative merged error spans, document order — enough to LOOK at the
+  /// damage without re-parsing.
+  pub error_spans: Vec<(u32, u32)>,
   pub items: Vec<OutlineItem<'static>>,
   pub refs: Vec<ProductRef>,
 }
@@ -330,6 +337,12 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
   buf.extend_from_slice(&product.source_xxh3.to_le_bytes());
   buf.extend_from_slice(&product.grammar_digest.to_le_bytes());
   push_u32(buf, product.error_nodes);
+  buf.extend_from_slice(&product.error_bytes.to_le_bytes());
+  push_u32(buf, product.error_spans.len() as u32);
+  for &(start, end) in &product.error_spans {
+    push_u32(buf, start);
+    push_u32(buf, end);
+  }
   push_u32(buf, product.items.len() as u32);
   for item in &product.items {
     if push_entry(buf, &item.entry).is_err() {
@@ -475,6 +488,8 @@ pub struct ProductView<'a> {
   pub source_xxh3: u64,
   pub grammar_digest: u64,
   pub error_nodes: u32,
+  pub error_bytes: u64,
+  pub error_spans: Vec<(u32, u32)>,
   pub items: Vec<OutlineItem<'a>>,
   pub refs: Vec<RefView<'a>>,
 }
@@ -547,6 +562,18 @@ pub fn peek_product_error_nodes(bytes: &[u8]) -> Option<u32> {
 /// [`decode_product_view`] performs — every bounds check, tag check, and UTF-8 check —
 /// with zero allocations. The pack-replay producer runs this so a corrupt entry still
 /// falls back to a re-parse, while the (validated) real decode happens once, at apply.
+/// The affected-byte count from a v11 header (offset 44..52) — replay paths sum it into
+/// `IndexReport::error_bytes` beside the node count.
+pub fn peek_product_error_bytes(bytes: &[u8]) -> Option<u64> {
+  if bytes.len() < 52 || &bytes[0..4] != PRODUCT_MAGIC {
+    return None;
+  }
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
+    return None;
+  }
+  Some(u64::from_le_bytes(bytes[44..52].try_into().ok()?))
+}
+
 pub fn validate_product(bytes: &[u8]) -> bool {
   fn walk_entry(r: &mut Reader<'_>) -> io::Result<()> {
     tag_role(r.u8()?)?;
@@ -572,6 +599,11 @@ pub fn validate_product(bytes: &[u8]) -> bool {
     r.u64()?; // source_xxh3
     r.u64()?; // grammar_digest
     r.u32()?; // error_nodes
+    r.u64()?; // error_bytes
+    for _ in 0..r.count()? {
+      r.u32()?; // error span start
+      r.u32()?; // error span end
+    }
     for _ in 0..r.count()? {
       walk_entry(&mut r)?;
       r.u8()?;
@@ -612,6 +644,12 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
   let source_xxh3 = r.u64()?;
   let grammar_digest = r.u64()?;
   let error_nodes = r.u32()?;
+  let error_bytes = r.u64()?;
+  let span_count = r.count()?;
+  let mut error_spans = Vec::with_capacity(span_count.min(16));
+  for _ in 0..span_count {
+    error_spans.push((r.u32()?, r.u32()?));
+  }
   let item_count = r.count()?;
   let mut items = Vec::with_capacity(item_count);
   for _ in 0..item_count {
@@ -661,6 +699,8 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     source_xxh3,
     grammar_digest,
     error_nodes,
+    error_bytes,
+    error_spans,
     items,
     refs,
   })
@@ -680,6 +720,12 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
   let source_xxh3 = r.u64()?;
   let grammar_digest = r.u64()?;
   let error_nodes = r.u32()?;
+  let error_bytes = r.u64()?;
+  let span_count = r.count()?;
+  let mut error_spans = Vec::with_capacity(span_count.min(16));
+  for _ in 0..span_count {
+    error_spans.push((r.u32()?, r.u32()?));
+  }
   let item_count = r.count()?;
   let mut items = Vec::with_capacity(item_count);
   for _ in 0..item_count {
@@ -729,6 +775,8 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     source_xxh3,
     grammar_digest,
     error_nodes,
+    error_bytes,
+    error_spans,
     items,
     refs,
   })
@@ -830,11 +878,11 @@ mod tests {
     let mut wrong_version = bytes.clone();
     wrong_version[4] ^= 0xFF;
     assert!(decode_product(&wrong_version).is_err());
-    // A corrupt huge count fails fast instead of allocating unboundedly.
+    // A corrupt huge count fails fast instead of allocating unboundedly. The error-span
+    // count sits after magic(4) + version(4) + stat stamp(16) + digest(8) +
+    // grammar_digest(8) + error_nodes(4) + error_bytes(8) — v11 header layout.
     let mut huge_count = bytes.clone();
-    // item_count sits after magic(4) + version(4) + stat stamp(16) + digest(8) +
-    // grammar_digest(8) + error_nodes(4).
-    huge_count[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+    huge_count[52..56].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(decode_product(&huge_count).is_err());
   }
 }
