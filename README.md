@@ -72,8 +72,12 @@ $ ./target/release/vorpal --help    # `vp` is a shorter alias binary
 ```
 
 npm (`@vorpal/cli`), Python (`vorpal-py`), and WebAssembly (`@vorpal/wasm`) packages are built
-from this repository (see [Language bindings](#language-bindings)); registry publication is in
-progress.
+from this repository (see [Language bindings](#language-bindings)). Versioned release workflows
+exist (`.github/workflows/{release,publish-node,publish-python}.yml`); the first registry
+publication awaits a maintainer release cut. Until then, `cargo build --release` above is the
+supported installation path. Index-format compatibility and migration policy:
+[docs/INDEX_FORMAT.md](docs/INDEX_FORMAT.md). Reproducible performance numbers (commands,
+datasets, hardware, cold/warm states, raw results): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Structural search & rewrite
 

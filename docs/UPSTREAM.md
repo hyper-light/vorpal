@@ -89,6 +89,15 @@ product header v8): editing a vendored grammar changes its digest, which invalid
 language's cached products on the next index. Use `vorpal grammars` to confirm this table and the
 binary agree.
 
+## Licenses (inherited engine + vendored parsers)
+
+The inherited structural engine is MIT; the repository root `LICENSE` preserves ast-grep's
+attribution (© Herrington Darkholme) unchanged. Every vendored grammar's license is recorded
+in `grammars/PROVENANCE.json` and **enforced by test**: the declared license field must be
+present and the license text itself must be vendored in the tree (all 27 currently MIT;
+nine missing license texts were fetched from their pinned upstream commits when enforcement
+first ran — see the provenance commit history).
+
 ## Provenance, corpora, and the reproducible update procedure (IMPROVEMENTS #10)
 
 Machine-readable provenance lives in **`grammars/PROVENANCE.json`** (repository, version,
