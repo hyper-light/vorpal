@@ -9,6 +9,32 @@ pub trait Embedder {
   fn embed(&self, text: &str) -> Vec<f32>;
 }
 
+/// Embedding-semantics version of the lexical hasher: bumped whenever tokenization, hashing,
+/// weighting, or normalization changes, so vectors persisted under older semantics never
+/// silently compare against fresh query vectors.
+pub const LEXICAL_EMBED_VERSION: u32 = 1;
+
+/// The complete provenance of an embedding model — the public configuration contract
+/// (IMPROVEMENTS #9): everything a consumer needs to decide whether two vector sets are
+/// comparable. Persisted beside the vector tier and validated before the tier is trusted;
+/// any mismatch routes queries to the exact fallback until a re-warm rebuilds under the
+/// active model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProvenance {
+  /// Stable model identifier.
+  pub model_id: String,
+  /// Vector dimensionality.
+  pub dim: usize,
+  /// Normalization applied to every vector.
+  pub normalization: String,
+  /// Embedding-semantics version (see [`LEXICAL_EMBED_VERSION`]).
+  pub version: u32,
+  /// Whether the model carries learned weights. `false` = deterministic, offline,
+  /// bit-reproducible — the honest label the default carries; a learned adapter must say
+  /// `true` and never masquerade as the deterministic default.
+  pub learned: bool,
+}
+
 /// The built-in default: deterministic lexical feature hashing. Tokens (split on non-alphanumeric
 /// boundaries *and* camelCase humps, lowercased) are hashed into `dim` signed buckets and the
 /// result unit-normalized — classic hashing-trick bag-of-tokens. It measures *lexical* similarity
@@ -21,6 +47,17 @@ pub struct LexicalEmbedder {
 impl LexicalEmbedder {
   pub fn new(dim: usize) -> Self {
     Self { dim: dim.max(8) }
+  }
+
+  /// This model's complete provenance (deterministic lexical hashing, L2-normalized).
+  pub fn provenance(&self) -> ModelProvenance {
+    ModelProvenance {
+      model_id: "lexical-hash".to_string(),
+      dim: self.dim,
+      normalization: "l2".to_string(),
+      version: LEXICAL_EMBED_VERSION,
+      learned: false,
+    }
   }
 }
 

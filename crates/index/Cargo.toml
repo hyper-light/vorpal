@@ -14,6 +14,7 @@ version.workspace = true
 rayon.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde.workspace = true
+serde_json = "1"
 vorpal-ann.workspace = true
 vorpal-ingest.workspace = true
 vorpal-kg = { workspace = true, features = ["alloc-stats"] }

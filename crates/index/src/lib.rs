@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, tokenize};
+use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, ModelProvenance, tokenize};
 use vorpal_ingest::{
   ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
   StreamWork, cache_file_name, decode_product, encode_product_into, link_writer_spilled,
@@ -657,6 +657,52 @@ pub fn peek_ann_header(index_dir: &Path) -> Option<(usize, u64)> {
   AnnIndex::peek_header(&vorpal_kg::resolve_index_dir(index_dir).join("ann.bin"))
 }
 
+/// The one production embedder construction point (IMPROVEMENTS #9): build, warm, overlay,
+/// and query must all agree on the model, so selection is explicit and singular. The
+/// deterministic lexical hasher is the offline default; a learned adapter would be selected
+/// here and carry `learned: true` in its persisted provenance — labeled honestly, never
+/// silently swapped (the provenance gate below invalidates the tier on ANY model change).
+fn active_embedder() -> LexicalEmbedder {
+  LexicalEmbedder::default()
+}
+
+/// The active embedding model's provenance — the public configuration contract: model id,
+/// dimensionality, normalization, semantics version, and whether weights are learned.
+pub fn model_provenance() -> ModelProvenance {
+  active_embedder().provenance()
+}
+
+/// The provenance persisted beside `index_dir`'s vector tier, if any — what the tier's
+/// vectors were actually built with (may differ from [`model_provenance`] until a re-warm).
+pub fn persisted_model_provenance(index_dir: &Path) -> Option<ModelProvenance> {
+  let text = fs::read_to_string(vorpal_kg::resolve_index_dir(index_dir).join("ann.model.json")).ok()?;
+  let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+  Some(ModelProvenance {
+    model_id: value.get("model_id")?.as_str()?.to_string(),
+    dim: value.get("dim")?.as_u64()? as usize,
+    normalization: value.get("normalization")?.as_str()?.to_string(),
+    version: value.get("version")?.as_u64()? as u32,
+    learned: value.get("learned")?.as_bool()?,
+  })
+}
+
+/// Persist the active model's provenance beside the tier — written before the stamp commit,
+/// so a committed stamp always implies readable provenance. Canonical field order keeps the
+/// file byte-reproducible.
+fn write_model_provenance(index_dir: &Path, provenance: &ModelProvenance) -> io::Result<()> {
+  let json = format!(
+    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{}}}\n",
+    serde_json::Value::String(provenance.model_id.clone()),
+    provenance.dim,
+    serde_json::Value::String(provenance.normalization.clone()),
+    provenance.version,
+    provenance.learned
+  );
+  let tmp = index_dir.join("ann.model.json.tmp");
+  fs::write(&tmp, json)?;
+  fs::rename(tmp, index_dir.join("ann.model.json"))
+}
+
 /// Whether the persisted vector tier matches `current_stamp` (and this build's format and
 /// embedder shape). Read-only — never blocks on, or triggers, a build.
 fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
@@ -668,6 +714,11 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
     // new bin before the new stamp lands, and the stamp file alone cannot see that.
     && AnnIndex::peek_header(&index_dir.join("ann.bin"))
       .is_some_and(|(bin_dim, bin_stamp)| bin_dim == dim && bin_stamp == current_stamp)
+    // Model-provenance gate (IMPROVEMENTS #9): the tier's vectors must have been built by
+    // exactly the active model — id, dim, normalization, semantics version, learned flag.
+    // Missing/foreign provenance (tiers warmed by older builds) reads as stale, which routes
+    // queries to the exact fallback and lets the next warm rebuild under the active model.
+    && persisted_model_provenance(index_dir).as_ref() == Some(&active_embedder().provenance())
 }
 
 /// Build the ANN tier iff its stamp no longer matches the persisted graph (or it does not
@@ -712,7 +763,7 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   // actually embedded, even if `nodes.vseg` is replaced underneath us mid-decision.
   let kg = Kg::load(index_dir)?;
   let current = stamp_of(&kg);
-  if ann_is_fresh(index_dir, current, LexicalEmbedder::default().dim()) {
+  if ann_is_fresh(index_dir, current, active_embedder().dim()) {
     // The vector tier is current, but the lexical tier heals independently (it can be
     // missing on indexes warmed by older builds, or after a partial cleanup).
     if !postings::postings_are_fresh(index_dir, current) {
@@ -721,9 +772,11 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
     return Ok(());
   }
   build_ann(&kg, index_dir, current).map_err(|err| err as Box<dyn Error>)?;
-  // Commit order: ann.bin → ann.files (both inside build_ann) → ann.stamp. The stamp is the
-  // commit point; a crash anywhere earlier leaves a mismatch that routes searches to the
-  // exhaustive fallback until the next warm heals it.
+  // Commit order: ann.bin → ann.files (both inside build_ann) → ann.model.json → ann.stamp.
+  // The stamp is the commit point (so a committed tier always has readable provenance); a
+  // crash anywhere earlier leaves a mismatch that routes searches to the exhaustive
+  // fallback until the next warm heals it.
+  write_model_provenance(index_dir, &active_embedder().provenance())?;
   let stamp_path = index_dir.join("ann.stamp");
   let stamp_tmp = index_dir.join("ann.stamp.tmp");
   fs::write(&stamp_tmp, current.to_le_bytes())?;
@@ -739,7 +792,7 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
 
 fn build_ann(kg: &Kg, out: &Path, base_stamp: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
   vorpal_kg::phase_stamp("ann: build start");
-  let embedder = LexicalEmbedder::default();
+  let embedder = active_embedder();
   let dim = embedder.dim();
   let ids = semantic_row_ids(kg);
   let row_ids = ids.clone();
@@ -1127,7 +1180,7 @@ fn search_core(
   let kg = Kg::load(index_dir)?;
   let compiled_filter = CompiledSearchFilter::compile(filter)?;
   let current_stamp = stamp_of(&kg);
-  let embedder = LexicalEmbedder::default();
+  let embedder = active_embedder();
   let pool = (k * 4).max(50);
   let query_vec = embedder.embed(query);
 

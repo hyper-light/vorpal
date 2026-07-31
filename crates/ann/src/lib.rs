@@ -21,7 +21,7 @@ mod quant;
 mod scan;
 mod vamana;
 
-pub use embed::{Embedder, LexicalEmbedder, tokenize};
+pub use embed::{Embedder, LEXICAL_EMBED_VERSION, LexicalEmbedder, ModelProvenance, tokenize};
 pub use index::{AnnConfig, AnnIndex};
 pub use quant::SignQuantizer;
 pub use scan::exhaustive_semantic;

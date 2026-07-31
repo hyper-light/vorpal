@@ -1560,3 +1560,50 @@ fn search_filters_apply_before_ranking() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+/// IMPROVEMENTS #9: the embedding model is a public configuration contract. Provenance
+/// (model id, dim, normalization, semantics version, learned flag) persists beside the
+/// vector tier; ANY mismatch with the active model reads as stale — queries take the exact
+/// fallback (identical results), and the next warm rebuilds under the active model.
+#[test]
+fn model_provenance_is_persisted_and_gates_the_tier() {
+  unsafe { std::env::set_var("VORPAL_NO_AUTOWARM", "1") };
+  let base = std::env::temp_dir().join(format!("vorpal-provenance-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn gadget_maker() -> u32 { 1 }\n").unwrap();
+  vorpal_index::build_index(&src, &out).unwrap();
+  vorpal_index::warm_ann(&out).unwrap();
+  let gen_dir = live(&out);
+
+  // The active contract is explicit and honest about what the default is.
+  let active = vorpal_index::model_provenance();
+  assert_eq!(active.model_id, "lexical-hash");
+  assert_eq!(active.normalization, "l2");
+  assert!(!active.learned, "the deterministic default must not claim learned weights");
+
+  // Persisted == active after a warm, and the file is the canonical single line.
+  let persisted = vorpal_index::persisted_model_provenance(&out).expect("provenance persisted");
+  assert_eq!(persisted, active);
+  let raw = fs::read_to_string(gen_dir.join("ann.model.json")).unwrap();
+  assert!(raw.contains("\"model_id\":\"lexical-hash\""), "{raw}");
+
+  let before = vorpal_index::search_index_explained(&out, "gadget maker", 5).unwrap();
+
+  // A model change (simulated: bump the persisted semantics version) invalidates the tier;
+  // search still answers — the exact fallback — with identical results.
+  let tampered = raw.replace("\"version\":1", "\"version\":999");
+  assert_ne!(raw, tampered, "test must actually change the version");
+  fs::write(gen_dir.join("ann.model.json"), &tampered).unwrap();
+  let stale = vorpal_index::search_index_explained(&out, "gadget maker", 5).unwrap();
+  assert_eq!(before, stale, "fallback must answer identically while the tier is distrusted");
+
+  // A re-warm rebuilds under the active model and restores the contract.
+  vorpal_index::warm_ann(&out).unwrap();
+  let healed = vorpal_index::persisted_model_provenance(&out).expect("healed provenance");
+  assert_eq!(healed, active);
+
+  let _ = fs::remove_dir_all(&base);
+}
