@@ -1,6 +1,7 @@
 mod completions;
 mod config;
 mod grammars;
+mod graph_filter;
 mod kg;
 mod lang;
 mod lsp;

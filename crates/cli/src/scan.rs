@@ -83,6 +83,13 @@ pub struct ScanArg {
   /// Useful for big codebase to fail scan/search fast.
   #[clap(long, conflicts_with = "interactive", value_name = "NUM")]
   pub(crate) max_results: Option<u16>,
+
+  /// Evaluate rule `graph:` predicates against the vorpal index at DIR.
+  ///
+  /// Overrides any index path the rules themselves declare. Only consulted by rules with a
+  /// `graph:` section; other rules never touch the index.
+  #[clap(long, value_name = "DIR")]
+  pub(crate) index: Option<PathBuf>,
 }
 
 /// The non-interactive printer a scan resolves to (see [`ScanArg::printer_kind`]). Interactive
@@ -150,6 +157,9 @@ impl ScanArg {
       context,
       remote: Default::default(),
       max_results,
+      // Graph predicates on remote agents evaluate against the agent-local default index
+      // location; wire jobs do not ship an override today.
+      index: None,
     }
   }
 }
@@ -219,6 +229,8 @@ pub(crate) struct ScanWithConfig {
   // TODO: remove this
   error_count: AtomicUsize,
   max_item_counter: Option<MaxItemCounter>,
+  /// Compiled `graph:` sections + the opened index they evaluate against (IMPROVEMENTS #5).
+  graph_filters: crate::graph_filter::ScanGraphFilters,
 }
 impl ScanWithConfig {
   pub(crate) fn try_new(arg: ScanArg, project: Result<ProjectConfig>) -> Result<Self> {
@@ -249,6 +261,11 @@ impl ScanWithConfig {
       .or_else(|_| std::env::current_dir())?;
     let max_item_counter = arg.max_results.map(MaxItemCounter::new);
     let prefilters = LangPrefilters::build(&configs);
+    let graph_filters = crate::graph_filter::ScanGraphFilters::compile(
+      &configs,
+      arg.index.as_deref(),
+      &absolute_proj_dir,
+    )?;
     Ok(Self {
       arg,
       configs,
@@ -259,6 +276,7 @@ impl ScanWithConfig {
       proj_dir: absolute_proj_dir,
       error_count: AtomicUsize::new(0),
       max_item_counter,
+      graph_filters,
     })
   }
 }
@@ -392,12 +410,21 @@ impl ScanWithConfig {
       // exclude_fix rule because we already have diff inspection before
       let scanned = combined.scan(&grep, /* separate_fix*/ interactive);
       if interactive {
-        let diffs = scanned.diffs;
+        // Graph predicates gate diffs too: an unproven site must not even be offered as an
+        // interactive edit — it belongs on the audit list.
+        let mut diffs = Vec::with_capacity(scanned.diffs.len());
+        for (rule, m) in scanned.diffs {
+          let mut survived = self.graph_filters.filter(&rule.id, path, vec![m])?;
+          if let Some(m) = survived.pop() {
+            diffs.push((rule, m));
+          }
+        }
         let count = diffs.len() as u32;
         let processed = match_rule_diff_on_file(path, diffs, processor)?;
         ret.push((processed, count));
       }
       for (rule, matches) in scanned.matches {
+        let matches = self.graph_filters.filter(&rule.id, path, matches)?;
         // Atomically reserve slots for matches, truncating if needed
         let matches: Vec<_> = if let Some(counter) = &self.max_item_counter {
           let wanted = matches.len();
@@ -459,7 +486,7 @@ impl ScanWithConfig {
     unused_suppression_rule: RuleConfig<SgLang>,
     no_suppress_all_rule: RuleConfig<SgLang>,
     proj_dir: PathBuf,
-  ) -> Self {
+  ) -> Result<Self> {
     let max_item_counter = arg.max_results.map(MaxItemCounter::new);
     let prefilters = LangPrefilters::build(&configs);
     let trace = arg.output.inspect.scan_trace(crate::utils::RuleTrace {
@@ -467,7 +494,11 @@ impl ScanWithConfig {
       effective_rule_count: configs.total_rule_count(),
       skipped_rule_count: 0,
     });
-    Self {
+    // Graph predicates evaluate against the agent-local index; a rule that requires facts
+    // fails the job here exactly as it would fail a local scan.
+    let graph_filters =
+      crate::graph_filter::ScanGraphFilters::compile(&configs, arg.index.as_deref(), &proj_dir)?;
+    Ok(Self {
       arg,
       configs,
       prefilters,
@@ -477,7 +508,8 @@ impl ScanWithConfig {
       proj_dir,
       error_count: AtomicUsize::new(0),
       max_item_counter,
-    }
+      graph_filters,
+    })
   }
 
   pub(crate) fn scan_arg(&self) -> &ScanArg {
@@ -674,6 +706,7 @@ rule:
     ScanArg {
       rule: None,
       inline_rules: None,
+      index: None,
       report_style: ReportStyle::Rich,
       include_metadata: false,
       input: InputArgs {

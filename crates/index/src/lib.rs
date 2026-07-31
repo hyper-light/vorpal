@@ -12,6 +12,7 @@
 
 pub mod annfiles;
 pub mod autowarm;
+pub mod graph_predicates;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;

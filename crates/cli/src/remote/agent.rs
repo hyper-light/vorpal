@@ -332,7 +332,7 @@ fn run_scan_job(
     unused_rule,
     no_suppress_rule,
     proj_dir,
-  ));
+  )?);
   let matched = stream_worker(worker.clone(), &job.printer, writer)?;
   let trace = worker.get_trace();
   Ok(FinalStats {

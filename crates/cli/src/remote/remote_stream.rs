@@ -655,13 +655,16 @@ mod tests {
       context: 0,
     };
     let arg = crate::scan::ScanArg::for_remote_agent(input, output, context, None);
-    std::sync::Arc::new(crate::scan::ScanWithConfig::from_remote_parts(
-      arg,
-      configs,
-      unused,
-      nosup,
-      root.canonicalize().unwrap(),
-    ))
+    std::sync::Arc::new(
+      crate::scan::ScanWithConfig::from_remote_parts(
+        arg,
+        configs,
+        unused,
+        nosup,
+        root.canonicalize().unwrap(),
+      )
+      .expect("remote test worker"),
+    )
   }
 
   /// Collect newline-delimited JSON fragments as a sorted multiset.
