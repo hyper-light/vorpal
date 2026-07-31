@@ -174,16 +174,30 @@ fn rust_resolution_meets_published_labels() {
       // first draft mislabelled and the harness caught.)
       ("r_amb1.rs", "pub fn r_shared() -> u32 { 10 }\n"),
       ("r_amb2.rs", "pub fn r_shared() -> u32 { 11 }\n"),
+      // `use` paths carry their module prefix as a qualifier. `r_shared` is defined in both
+      // amb files, so `use crate::r_amb1::r_shared` binding at qualifier-match (not a tie)
+      // proves the path disambiguated the conflict. `use vendored::r_caller` names a module
+      // outside the corpus: it must NOT fall back to the same-named local definition.
+      (
+        "r_imp.rs",
+        "use crate::r_def::r_target;\n\
+         use crate::r_amb1::r_shared;\n\
+         use vendored::r_caller;\n",
+      ),
     ],
     expected: &[
       ("r_caller", "r_target", "calls", "constrained", "visible-export"),
       ("r_local_a", "r_local_b", "calls", "exact", "same-file"),
       ("r_uses_thing", "RThing", "of_type", "constrained", "visible-export"),
       ("r_amb_caller", "r_shared", "calls", "heuristic", "visible-tie"),
+      ("r_imp.rs", "r_target", "imports", "constrained", "qualifier-match"),
+      ("r_imp.rs", "r_shared", "imports", "constrained", "qualifier-match"),
     ],
     absent: &[
       ("r_ext", "total_mystery_fn"), // defined nowhere — external, no edge
       ("r_masked", "r_private"),     // private to a sibling file — masked, no edge
+      // The external-module use stays masked despite a same-named local definition.
+      ("r_imp.rs", "r_caller"),
     ],
   });
 }
@@ -201,12 +215,32 @@ fn python_resolution_meets_published_labels() {
          def p_local_b():\n    return 2\n\
          def p_ext():\n    return never_defined_fn()\n",
       ),
+      // From-imports carry their module as a qualifier. `p_shared` is defined in BOTH amb
+      // files, so `from p_amb1 import p_shared` binding at qualifier-match (not visible-tie)
+      // proves the module disambiguated the conflict: the p_amb2 symbol cannot match the
+      // qualifier, so a mispick would surface as a different reason and fail these labels.
+      // `from vendored_dep import p_caller` names a module outside the corpus: it must NOT
+      // fall back to the coincidentally-named local `p_caller`.
+      (
+        "p_imp.py",
+        "from p_def import p_target\n\
+         from p_amb1 import p_shared\n\
+         from vendored_dep import p_caller\n",
+      ),
+      ("p_amb1.py", "def p_shared():\n    return 10\n"),
+      ("p_amb2.py", "def p_shared():\n    return 11\n"),
     ],
     expected: &[
       ("p_caller", "p_target", "calls", "constrained", "visible-export"),
       ("p_local_a", "p_local_b", "calls", "exact", "same-file"),
+      ("p_imp.py", "p_target", "imports", "constrained", "qualifier-match"),
+      ("p_imp.py", "p_shared", "imports", "constrained", "qualifier-match"),
     ],
-    absent: &[("p_ext", "never_defined_fn")],
+    absent: &[
+      ("p_ext", "never_defined_fn"),
+      // The external-module import stays masked despite a same-named local definition.
+      ("p_imp.py", "p_caller"),
+    ],
   });
 }
 

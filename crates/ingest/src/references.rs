@@ -90,11 +90,31 @@ const CALL_DEFAULTS: CallSpec = CallSpec {
   scope_field: None,
 };
 
+/// Where an import construct grammar-provides the module its target comes from. Captured as a
+/// qualifier so resolution can corroborate the target against that module's file (or owner)
+/// instead of guessing among same-named definitions — and can refuse to bind at all when the
+/// named module is outside the corpus (`from vendored import parse` must not edge to a
+/// coincidentally-named local `parse`).
+#[derive(Clone, Copy)]
+enum QualSource {
+  /// No usable qualifier: the import target resolves as a bare name.
+  None,
+  /// A field on the import node names the source module (`from a.b import c` → `module_name`
+  /// field, qualifier `b` — the final segment, matching per-file module stems).
+  NodeField(&'static str),
+  /// The selected target is (or, via a fieldless wrapper like `use_as_clause`, wraps) a scoped
+  /// path whose `path` prefix qualifies its final segment (`use crate::r_def::r_target` →
+  /// qualifier `r_def`).
+  TargetPath,
+}
+
 struct ImportSpec {
   kind: &'static str,
   target: Sel,
   /// The target is a string/path literal (strip delimiters, keep the module string verbatim).
   string_target: bool,
+  /// Where the import's source-module qualifier lives, when the grammar provides one.
+  qualifier: QualSource,
 }
 
 /// Classification of a call by its extracted callee text.
@@ -170,6 +190,7 @@ const RUST: RefSpec = RefSpec {
     kind: "use_declaration",
     target: Sel::Field("argument"),
     string_target: false,
+    qualifier: QualSource::TargetPath,
   }],
   types: TYPE_ID,
   implements: &[ImplSpec {
@@ -196,11 +217,13 @@ const PYTHON: RefSpec = RefSpec {
       kind: "import_from_statement",
       target: Sel::Field("name"),
       string_target: false,
+      qualifier: QualSource::NodeField("module_name"),
     },
     ImportSpec {
       kind: "import_statement",
       target: Sel::ChildOfKind(&["dotted_name", "aliased_import"]),
       string_target: false,
+      qualifier: QualSource::None,
     },
   ],
   implements: &[ImplSpec {
@@ -222,6 +245,7 @@ const GO: RefSpec = RefSpec {
     kind: "import_spec",
     target: Sel::Field("path"),
     string_target: true,
+    qualifier: QualSource::None,
   }],
   types: TYPE_ID,
   type_params: &["type_parameter_list"],
@@ -240,6 +264,7 @@ const JS_LIKE: RefSpec = RefSpec {
     kind: "import_statement",
     target: Sel::Field("source"),
     string_target: true,
+    qualifier: QualSource::None,
   }],
   text_rules: &[("require", TextAction::ImportFirstArg)],
   types: TYPE_ID,
@@ -265,6 +290,7 @@ const C_LIKE: RefSpec = RefSpec {
     kind: "preproc_include",
     target: Sel::Field("path"),
     string_target: true,
+    qualifier: QualSource::None,
   }],
   types: TYPE_ID,
   type_params: &["template_parameter_list"],
@@ -285,6 +311,7 @@ const JAVA: RefSpec = RefSpec {
     kind: "import_declaration",
     target: Sel::ChildOfKind(&["scoped_identifier", "identifier"]),
     string_target: false,
+    qualifier: QualSource::None,
   }],
   types: TYPE_ID,
   implements: &[
@@ -319,6 +346,7 @@ const CSHARP: RefSpec = RefSpec {
     kind: "using_directive",
     target: Sel::Field("name"),
     string_target: false,
+    qualifier: QualSource::None,
   }],
   implements: &[ImplSpec {
     kind: "base_list",
@@ -340,6 +368,7 @@ const KOTLIN: RefSpec = RefSpec {
     kind: "import_header",
     target: Sel::ChildOfKind(&["identifier"]),
     string_target: false,
+    qualifier: QualSource::None,
   }],
   types: TYPE_ID,
   type_params: &["type_parameters"],
@@ -358,6 +387,7 @@ const SWIFT: RefSpec = RefSpec {
     kind: "import_declaration",
     target: Sel::ChildOfKind(&["identifier"]),
     string_target: false,
+    qualifier: QualSource::None,
   }],
   types: TYPE_ID,
   type_params: &["type_parameters"],
@@ -414,6 +444,7 @@ const PHP: RefSpec = RefSpec {
     kind: "namespace_use_declaration",
     target: Sel::ChildOfKind(&["namespace_name", "name"]),
     string_target: false,
+    qualifier: QualSource::None,
   }],
   self_receivers: &["$this", "self", "static"],
   ..SPEC_DEFAULTS
@@ -436,6 +467,7 @@ const DART: RefSpec = RefSpec {
     kind: "import_specification",
     target: Sel::Field("uri"),
     string_target: true,
+    qualifier: QualSource::None,
   }],
   self_receivers: &["this"],
   ..SPEC_DEFAULTS
@@ -451,6 +483,7 @@ const SCALA: RefSpec = RefSpec {
     kind: "import_declaration",
     target: Sel::FieldLast("path"),
     string_target: false,
+    qualifier: QualSource::None,
   }],
   self_receivers: &["this"],
   ..SPEC_DEFAULTS
@@ -517,6 +550,7 @@ const HASKELL: RefSpec = RefSpec {
     kind: "import",
     target: Sel::Field("module"),
     string_target: false,
+    qualifier: QualSource::None,
   }],
   ..SPEC_DEFAULTS
 };
@@ -534,11 +568,13 @@ const SOLIDITY: RefSpec = RefSpec {
       kind: "import_directive",
       target: Sel::Field("import_name"),
       string_target: false,
+      qualifier: QualSource::None,
     },
     ImportSpec {
       kind: "import_directive",
       target: Sel::Field("source"),
       string_target: true,
+      qualifier: QualSource::None,
     },
   ],
   ..SPEC_DEFAULTS
@@ -1225,13 +1261,53 @@ fn emit_imports<'t>(
       callee_name(&target)
     };
     if let Some(name) = name {
-      pending.push(Pending::Ready(RawRef::plain(
+      let (form, qualifier) = match import_qualifier(node, &target, ispec.qualifier) {
+        Some(q) => (RefForm::Static, Some(q)),
+        None => (RefForm::Bare, None),
+      };
+      pending.push(Pending::Ready(RawRef {
         from,
         name,
-        RefKind::Import,
-        range.start as u32,
-        range.end as u32,
-      )));
+        kind: RefKind::Import,
+        start: range.start as u32,
+        end: range.end as u32,
+        qualifier,
+        form,
+      }));
+    }
+  }
+}
+
+/// The source-module qualifier an import construct provides for `target`, reduced to its final
+/// path segment (resolution compares qualifiers against owner names and per-file module stems,
+/// which are single segments). `None` means the grammar carries no usable qualifier here — the
+/// reference then stays a bare name, exactly as before qualifier capture. Relative heads
+/// (`from . import x`, `use super::x`) qualify nothing checkable and return `None`.
+fn import_qualifier<'t>(
+  node: &SgNode<'t>,
+  target: &SgNode<'t>,
+  source: QualSource,
+) -> Option<Cow<'t, str>> {
+  match source {
+    QualSource::None => None,
+    QualSource::NodeField(field) => {
+      let module = node.field(field)?;
+      let seg = trim_cow(module.text(), |s| {
+        s.trim().rsplit('.').next().unwrap_or("").trim()
+      });
+      (!seg.is_empty() && !seg.contains(char::is_whitespace)).then_some(seg)
+    }
+    QualSource::TargetPath => {
+      // A scoped path carries its own `name`; a fieldless wrapper (`use_as_clause`) holds the
+      // real path in its `path` field instead — unwrap once, then take that path's prefix.
+      let path_node = if target.field("name").is_some() {
+        target.clone()
+      } else {
+        target.field("path")?
+      };
+      let module = path_node.field("path").or_else(|| path_node.field("scope"))?;
+      let name = callee_name(&module)?;
+      (!matches!(name.as_ref(), "crate" | "super" | "self")).then_some(name)
     }
   }
 }
@@ -1702,13 +1778,19 @@ mod tests {
               callee_name(&target)
             };
             if let Some(name) = name {
-              out.push(RawRef::plain(
+              let (form, qualifier) = match import_qualifier(&node, &target, ispec.qualifier) {
+                Some(q) => (RefForm::Static, Some(q)),
+                None => (RefForm::Bare, None),
+              };
+              out.push(RawRef {
                 from,
                 name,
-                RefKind::Import,
-                range.start as u32,
-                range.end as u32,
-              ));
+                kind: RefKind::Import,
+                start: range.start as u32,
+                end: range.end as u32,
+                qualifier,
+                form,
+              });
             }
           }
         }

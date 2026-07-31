@@ -24,8 +24,10 @@ use vorpal_resolve::{RefForm, RefKind};
 /// The extraction-product format generation. Bumped whenever extraction output changes shape or
 /// semantics (fields, suppression rules, qualifier capture, encoding), so stale caches replay
 /// as cache misses and re-parse — staleness is structural, never silent (§3.4). v8 adds the
-/// grammar-generation digest to the header; v9 widens the parse-error flag to an error-node count.
-pub const PRODUCT_FORMAT_VERSION: u32 = 9;
+/// grammar-generation digest to the header; v9 widens the parse-error flag to an error-node
+/// count; v10 captures source-module qualifiers on import references (Python `from X import y`,
+/// Rust `use a::b::c`).
+pub const PRODUCT_FORMAT_VERSION: u32 = 10;
 
 /// One file's extraction output, serializable for the on-disk product cache.
 #[derive(Debug, Clone)]
