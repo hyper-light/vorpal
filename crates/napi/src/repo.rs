@@ -375,14 +375,48 @@ impl Index {
   }
 
   /// Typed hybrid search over the pinned generation: hits with score and per-channel
-  /// ranking provenance.
+  /// ranking provenance. Structured filters (IMPROVEMENTS #9) apply to every channel
+  /// before ranking, so `k` results means `k` matching results.
   #[napi]
-  pub fn search(&self, query: String, k: Option<u32>) -> Result<serde_json::Value> {
+  pub fn search(
+    &self,
+    query: String,
+    k: Option<u32>,
+    options: Option<SearchOptions>,
+  ) -> Result<serde_json::Value> {
+    let options = options.unwrap_or_default();
+    let filter = vorpal_index::SearchFilter {
+      path_prefix: options.prefix,
+      path_suffix: options.path,
+      kind: options.kind,
+      lang: options.lang,
+      exported_only: options.exported.unwrap_or(false),
+    };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
-    let records =
-      vorpal_index::search_records(&self.generation_dir, &query, k.unwrap_or(10) as usize)
-        .map_err(to_napi_err)?;
+    let records = vorpal_index::search_records_filtered(
+      &self.generation_dir,
+      &query,
+      k.unwrap_or(10) as usize,
+      &filter,
+    )
+    .map_err(to_napi_err)?;
     serde_json::to_value(records).map_err(|e| Error::from_reason(e.to_string()))
   }
+}
+
+/// Structured search filters for `Index.search` (IMPROVEMENTS #9).
+#[napi(object)]
+#[derive(Default)]
+pub struct SearchOptions {
+  /// Definition file path must end with this suffix.
+  pub path: Option<String>,
+  /// Definition file path must start with this prefix (package/subtree scoping).
+  pub prefix: Option<String>,
+  /// Symbol kind (function, method, struct, …).
+  pub kind: Option<String>,
+  /// Language name or alias (rust, py, ts, …).
+  pub lang: Option<String>,
+  /// Only exported definitions.
+  pub exported: Option<bool>,
 }

@@ -70,3 +70,18 @@ pub fn extraction_identity(grammar_digest: u64, rules_digest: u64) -> u64 {
 pub fn global_grammar_stamp() -> u64 {
   vorpal_language::global_grammar_stamp()
 }
+
+/// The canonical language name for a user-supplied alias (`"ts"` → `"TypeScript"`), or `None`
+/// for an unknown language — the shared vocabulary of search-filter `lang` arguments.
+pub fn canonical_language(name: &str) -> Option<String> {
+  name
+    .parse::<vorpal_language::SupportLang>()
+    .ok()
+    .map(|lang| lang.to_string())
+}
+
+/// The canonical language name `path` maps to by extension, or `None` for unsupported paths.
+pub fn language_name_of(path: &str) -> Option<String> {
+  use vorpal_language::Language;
+  vorpal_language::SupportLang::from_path(path).map(|lang| lang.to_string())
+}

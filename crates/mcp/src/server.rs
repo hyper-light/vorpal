@@ -251,11 +251,20 @@ impl Server {
       "search" => {
         let query = str_arg("query")?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+        // Structured pre-ranking filters (IMPROVEMENTS #9): k results means k MATCHING
+        // results — filters apply to every channel before fusion, never as a post-cut.
+        let filter = vorpal_index::SearchFilter {
+          path_prefix: args.get("prefix").and_then(Value::as_str).map(str::to_string),
+          path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
+          kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
+          lang: args.get("lang").and_then(Value::as_str).map(str::to_string),
+          exported_only: args.get("exported").and_then(Value::as_bool).unwrap_or(false),
+        };
         // One ranking serves both surfaces: records for machines, and the explained text
         // rendered from the same records (byte-compatible with `search_index_explained`) —
         // agents get ranking provenance by default (§11's "expose which rankers
         // contributed").
-        let records = vorpal_index::search_records(&self.index_dir, &query, k)
+        let records = vorpal_index::search_records_filtered(&self.index_dir, &query, k, &filter)
           .map_err(|err| err.to_string())?;
         let mut text = String::new();
         for hit in &records {
@@ -620,6 +629,11 @@ fn tools_list() -> Value {
       json!({
         "query": {"type": "string", "description": "Free-text query"},
         "k": {"type": "integer", "description": "Max results (default 10)"},
+        "path": {"type": "string", "description": "Filter: definition file path must end with this suffix"},
+        "prefix": {"type": "string", "description": "Filter: definition file path must start with this prefix (package/subtree scoping)"},
+        "kind": {"type": "string", "description": "Filter: symbol kind (function, method, struct, …)"},
+        "lang": {"type": "string", "description": "Filter: language name or alias (rust, py, ts, …)"},
+        "exported": {"type": "boolean", "description": "Filter: only exported definitions"},
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),

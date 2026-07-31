@@ -936,6 +936,104 @@ pub fn search_index_explained(
   search_index_impl(index_dir, query, k, true)
 }
 
+/// Structured pre-ranking filters (IMPROVEMENTS #9): applied to every channel's candidate
+/// population **before** ranking and fusion, so `k` results means `k` *matching* results —
+/// a filtered query is never starved because unfiltered hits crowded the pool.
+///
+/// Dimensions: definition-path prefix (package/subtree scoping) and suffix, symbol kind,
+/// language (canonical name or alias, resolved by defining-file extension), and visibility
+/// (`exported_only`). Resolution *grade* is deliberately absent here: search hits are
+/// definitions, not edges — grade floors live on the traversal/edge surfaces
+/// (`min_grade` on `reachable`, graph predicates in rules).
+#[derive(Default, Clone, Debug)]
+pub struct SearchFilter {
+  /// Definition file path must start with this prefix.
+  pub path_prefix: Option<String>,
+  /// Definition file path must end with this suffix.
+  pub path_suffix: Option<String>,
+  /// Symbol kind (function, method, struct, field, …).
+  pub kind: Option<String>,
+  /// Language name or alias (rust, py, ts, …), matched by defining-file extension.
+  pub lang: Option<String>,
+  /// Only exported definitions.
+  pub exported_only: bool,
+}
+
+impl SearchFilter {
+  pub fn is_empty(&self) -> bool {
+    self.path_prefix.is_none()
+      && self.path_suffix.is_none()
+      && self.kind.is_none()
+      && self.lang.is_none()
+      && !self.exported_only
+  }
+}
+
+/// The filter compiled for the hot path: kind/lang parsed once, applied per node view.
+struct CompiledSearchFilter<'f> {
+  path_prefix: Option<&'f str>,
+  path_suffix: Option<&'f str>,
+  kind: Option<vorpal_kg::SymbolKind>,
+  lang: Option<String>,
+  exported_only: bool,
+}
+
+impl<'f> CompiledSearchFilter<'f> {
+  fn compile(filter: &'f SearchFilter) -> Result<Self, Box<dyn Error>> {
+    let kind = match filter.kind.as_deref() {
+      Some(text) => Some(
+        vorpal_kg::SymbolKind::parse(text)
+          .ok_or_else(|| format!("unknown symbol kind '{text}'"))?,
+      ),
+      None => None,
+    };
+    let lang = match filter.lang.as_deref() {
+      Some(text) => Some(
+        vorpal_ingest::canonical_language(text)
+          .ok_or_else(|| format!("unknown language '{text}'"))?,
+      ),
+      None => None,
+    };
+    Ok(Self {
+      path_prefix: filter.path_prefix.as_deref(),
+      path_suffix: filter.path_suffix.as_deref(),
+      kind,
+      lang,
+      exported_only: filter.exported_only,
+    })
+  }
+
+  fn admits(&self, kg: &Kg, id: u64) -> bool {
+    let Some(view) = kg.node(NodeId::new(id)) else {
+      return false;
+    };
+    if let Some(prefix) = self.path_prefix {
+      if !view.path.starts_with(prefix) {
+        return false;
+      }
+    }
+    if let Some(suffix) = self.path_suffix {
+      if !view.path.ends_with(suffix) {
+        return false;
+      }
+    }
+    if let Some(kind) = self.kind {
+      if view.kind != kind {
+        return false;
+      }
+    }
+    if self.exported_only && !view.exported {
+      return false;
+    }
+    if let Some(lang) = &self.lang {
+      if vorpal_ingest::language_name_of(view.path).as_deref() != Some(lang.as_str()) {
+        return false;
+      }
+    }
+    true
+  }
+}
+
 /// The typed twin of [`search_index_explained`]: the same pinned-generation hybrid ranking,
 /// returned as records instead of rendered lines (IMPROVEMENTS #7).
 pub fn search_records(
@@ -943,7 +1041,17 @@ pub fn search_records(
   query: &str,
   k: usize,
 ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
-  let (kg, ranked) = search_core(index_dir, query, k)?;
+  search_records_filtered(index_dir, query, k, &SearchFilter::default())
+}
+
+/// [`search_records`] with structured pre-ranking filters.
+pub fn search_records_filtered(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+  filter: &SearchFilter,
+) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
+  let (kg, ranked) = search_core(index_dir, query, k, filter)?;
   const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
   Ok(
     ranked
@@ -974,7 +1082,7 @@ fn search_index_impl(
   k: usize,
   explain: bool,
 ) -> Result<String, Box<dyn Error>> {
-  let (kg, ranked) = search_core(index_dir, query, k)?;
+  let (kg, ranked) = search_core(index_dir, query, k, &SearchFilter::default())?;
   let mut out = String::new();
   for (row, score, ranks) in ranked {
     if let Some(view) = kg.node(NodeId::new(row)) {
@@ -1010,12 +1118,14 @@ fn search_core(
   index_dir: &Path,
   query: &str,
   k: usize,
+  filter: &SearchFilter,
 ) -> Result<(Kg, Vec<(u64, f32, Vec<Option<usize>>)>), Box<dyn Error>> {
   // Pin one generation for the whole query: the graph AND the ANN tier both come from the
   // directory CURRENT names right now, so a rebuild landing mid-search cannot hand this query
   // a mixed pair (the ANN stamp would catch it, but resolving once makes it impossible).
   let index_dir = &vorpal_kg::resolve_index_dir(index_dir);
   let kg = Kg::load(index_dir)?;
+  let compiled_filter = CompiledSearchFilter::compile(filter)?;
   let current_stamp = stamp_of(&kg);
   let embedder = LexicalEmbedder::default();
   let pool = (k * 4).max(50);
@@ -1029,7 +1139,11 @@ fn search_core(
   // 3. **Fallback**: anything else — no base, torn artifacts, overlay too large — takes the
   //    fused exhaustive scan (~0.2s at kernel scale, exact recall) and kicks a detached
   //    background warm. Correctness never depends on which tier answered.
-  let take = pool * 2;
+  //
+  // Filters shrink the pool AFTER the approximate tiers (the ANN cannot pre-filter), so a
+  // filtered query overfetches to keep its post-filter pool honest; the exhaustive fallback
+  // filters BEFORE scoring and needs no slack.
+  let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
   let candidates: Vec<u64> = if ann_is_fresh(index_dir, current_stamp, embedder.dim()) {
     AnnIndex::load(&index_dir.join("ann.bin"))?
       .search(&query_vec, take)
@@ -1060,7 +1174,12 @@ fn search_core(
     // Kick a detached warm so the *next* search takes the fast tier — gated (registered
     // binaries only, opt-out, once per process) and best-effort; see `autowarm`.
     autowarm::maybe_spawn(index_dir);
-    let ids = semantic_row_ids(&kg);
+    let mut ids = semantic_row_ids(&kg);
+    // The exhaustive path filters BEFORE scoring: exact recall over exactly the admitted
+    // population, no overfetch slack needed.
+    if !filter.is_empty() {
+      ids.retain(|&id| compiled_filter.admits(&kg, id));
+    }
     let scored = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &ids,
@@ -1069,6 +1188,16 @@ fn search_core(
       take,
     );
     scored.into_iter().map(|(id, _)| id).collect()
+  };
+  // Approximate tiers cannot pre-filter; drop non-matching candidates before the rerank so
+  // the fused pool holds only admitted definitions.
+  let candidates: Vec<u64> = if filter.is_empty() {
+    candidates
+  } else {
+    candidates
+      .into_iter()
+      .filter(|&id| compiled_filter.admits(&kg, id))
+      .collect()
   };
 
   // Re-score every candidate at full precision by re-embedding its parts against the
@@ -1098,6 +1227,9 @@ fn search_core(
   // token-subset) — shared verbatim by the posting-index path and the exhaustive scan, so
   // the two paths cannot diverge in what they admit.
   let classify = |i: u64| -> Option<(u64, (u8, usize))> {
+    if !filter.is_empty() && !compiled_filter.admits(&kg, i) {
+      return None;
+    }
     let view = kg.node(NodeId::new(i))?;
     let name_tokens = tokenize(view.name);
     let tier = if view.name == query {

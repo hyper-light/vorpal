@@ -354,13 +354,33 @@ impl Index {
   }
 
   /// Typed hybrid search over the pinned generation: hits with score and per-channel
-  /// ranking provenance.
-  #[pyo3(signature = (query, k=10))]
-  pub fn search(&self, py: Python<'_>, query: &str, k: usize) -> PyResult<Py<PyAny>> {
+  /// ranking provenance. Structured filters (IMPROVEMENTS #9) apply to every channel
+  /// before ranking, so `k` results means `k` matching results.
+  #[pyo3(signature = (query, k=10, path=None, prefix=None, kind=None, lang=None, exported=false))]
+  #[allow(clippy::too_many_arguments)]
+  pub fn search(
+    &self,
+    py: Python<'_>,
+    query: &str,
+    k: usize,
+    path: Option<String>,
+    prefix: Option<String>,
+    kind: Option<String>,
+    lang: Option<String>,
+    exported: bool,
+  ) -> PyResult<Py<PyAny>> {
+    let filter = vorpal_index::SearchFilter {
+      path_prefix: prefix,
+      path_suffix: path,
+      kind,
+      lang,
+      exported_only: exported,
+    };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
     let records =
-      vorpal_index::search_records(&self.generation_dir, query, k).map_err(to_py_err)?;
+      vorpal_index::search_records_filtered(&self.generation_dir, query, k, &filter)
+        .map_err(to_py_err)?;
     record_to_py(py, &records)
   }
 }

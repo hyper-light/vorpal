@@ -1446,3 +1446,117 @@ fn posting_tier_matches_the_scan_byte_for_byte() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+/// IMPROVEMENTS #9: structured filters apply to every channel BEFORE ranking — k results
+/// means k matching results, and every dimension (lang, kind, path prefix/suffix,
+/// visibility) restricts the population rather than post-cutting the page.
+#[test]
+fn search_filters_apply_before_ranking() {
+  unsafe { std::env::set_var("VORPAL_NO_AUTOWARM", "1") };
+  let base = std::env::temp_dir().join(format!("vorpal-filters-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(src.join("core")).unwrap();
+  fs::create_dir_all(src.join("util")).unwrap();
+  fs::write(
+    src.join("core/alpha.rs"),
+    "pub fn shared_widget() -> u32 { 1 }\nfn private_widget() -> u32 { 2 }\n",
+  )
+  .unwrap();
+  fs::write(src.join("util/beta.py"), "def shared_widget():\n    return 3\n").unwrap();
+  vorpal_index::build_index(&src, &out).unwrap();
+
+  let names = |filter: &vorpal_index::SearchFilter| -> Vec<(String, String)> {
+    vorpal_index::search_records_filtered(&out, "shared widget", 10, filter)
+      .unwrap()
+      .into_iter()
+      .map(|hit| (hit.node.name, hit.node.path))
+      .collect()
+  };
+
+  // Unfiltered: both languages' definitions rank.
+  let all = names(&vorpal_index::SearchFilter::default());
+  assert!(all.iter().any(|(_, p)| p.ends_with("alpha.rs")), "{all:?}");
+  assert!(all.iter().any(|(_, p)| p.ends_with("beta.py")), "{all:?}");
+
+  // Language filter (alias accepted): only the Python definition remains.
+  let py = names(&vorpal_index::SearchFilter {
+    lang: Some("py".to_string()),
+    ..Default::default()
+  });
+  assert!(!py.is_empty() && py.iter().all(|(_, p)| p.ends_with(".py")), "{py:?}");
+
+  // Path prefix (package scoping) restricts to the subtree.
+  let core_prefix = src.join("core").to_string_lossy().to_string();
+  let core = names(&vorpal_index::SearchFilter {
+    path_prefix: Some(core_prefix),
+    ..Default::default()
+  });
+  assert!(
+    !core.is_empty() && core.iter().all(|(_, p)| p.contains("/core/")),
+    "{core:?}"
+  );
+
+  // Kind filter: no structs here, so the population is provably empty.
+  let structs = names(&vorpal_index::SearchFilter {
+    kind: Some("struct".to_string()),
+    ..Default::default()
+  });
+  assert!(structs.is_empty(), "{structs:?}");
+
+  // Visibility: the private definition vanishes under exported_only.
+  let private_all = vorpal_index::search_records_filtered(
+    &out,
+    "private widget",
+    10,
+    &vorpal_index::SearchFilter::default(),
+  )
+  .unwrap();
+  assert!(
+    private_all.iter().any(|hit| hit.node.name == "private_widget"),
+    "unfiltered search must find the private fn"
+  );
+  let exported_only = vorpal_index::search_records_filtered(
+    &out,
+    "private widget",
+    10,
+    &vorpal_index::SearchFilter {
+      exported_only: true,
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  assert!(
+    exported_only.iter().all(|hit| hit.node.name != "private_widget"),
+    "{exported_only:?}"
+  );
+
+  // Unknown vocabulary fails loudly, never silently matches nothing.
+  assert!(
+    vorpal_index::search_records_filtered(
+      &out,
+      "widget",
+      10,
+      &vorpal_index::SearchFilter {
+        lang: Some("cobol-9000".to_string()),
+        ..Default::default()
+      }
+    )
+    .is_err()
+  );
+  assert!(
+    vorpal_index::search_records_filtered(
+      &out,
+      "widget",
+      10,
+      &vorpal_index::SearchFilter {
+        kind: Some("gizmo".to_string()),
+        ..Default::default()
+      }
+    )
+    .is_err()
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}
