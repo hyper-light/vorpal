@@ -95,6 +95,17 @@
         "$ref": "#/$defs/LabelConfig"
       }
     },
+    "graph": {
+      "description": "Graph predicates: repository facts (from a vorpal index) every match must additionally\nsatisfy — see [`crate::SerializableGraphFilter`]. A vorpal extension; absent in\nupstream ast-grep rules, which therefore parse unchanged.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SerializableGraphFilter"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "files": {
       "description": "Glob patterns to specify that the rule only applies to matching files",
       "type": [
@@ -1246,6 +1257,180 @@
           "const": "secondary"
         }
       ]
+    },
+    "SerializableGraphFilter": {
+      "description": "The `graph:` section of a rule: repository-fact predicates a match must satisfy.",
+      "type": "object",
+      "properties": {
+        "index": {
+          "description": "Index directory the predicates evaluate against. Relative paths resolve against the\nscanned project root. A CLI `--index` argument overrides this. When absent entirely,\nscan falls back to `.vorpal/index` under the project root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "description": "Generation content id (the `gen/<id>` name) this rule's facts must come from. When the\nlive index's CURRENT generation differs, semantics count as **unavailable** and\n`require` decides what happens — a rule pinned to reviewed facts never silently\nevaluates against newer ones.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "require": {
+          "description": "What to do when graph semantics are unavailable (no index, generation mismatch, or a\nfile outside the index).",
+          "$ref": "#/$defs/GraphRequire",
+          "default": "error"
+        },
+        "minimumGrade": {
+          "description": "Minimum resolution grade an edge must carry to satisfy any predicate here.\nBelow-floor edges are non-matches (reported as candidates, never rewritten).",
+          "$ref": "#/$defs/MinimumGrade",
+          "default": "constrained"
+        },
+        "predicates": {
+          "description": "The predicates; **all** must hold for the match to survive.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SerializableGraphPredicate"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "predicates"
+      ]
+    },
+    "GraphRequire": {
+      "description": "Behavior when the facts a predicate needs cannot be obtained at all.",
+      "oneOf": [
+        {
+          "description": "Fail the scan loudly. The default: a rule that asked for proofs must not degrade into\na structural-only rule because an index was missing.",
+          "type": "string",
+          "const": "error"
+        },
+        {
+          "description": "Drop the match (treat unavailable as unprovable, err toward not matching).",
+          "type": "string",
+          "const": "skip"
+        },
+        {
+          "description": "Keep the match (treat the predicate as vacuously true) — for rules where graph facts\nonly *sharpen* an already-safe structural match.",
+          "type": "string",
+          "const": "ignore"
+        }
+      ]
+    },
+    "MinimumGrade": {
+      "description": "The grade floor: which resolution grades satisfy a predicate.",
+      "oneOf": [
+        {
+          "description": "Only same-file lexical bindings.",
+          "type": "string",
+          "const": "exact"
+        },
+        {
+          "description": "Exact or single-candidate cross-file resolutions (the default): proven targets,\nnever tie guesses.",
+          "type": "string",
+          "const": "constrained"
+        },
+        {
+          "description": "Any emitted edge, including labelled tie picks.",
+          "type": "string",
+          "const": "heuristic"
+        }
+      ]
+    },
+    "SerializableGraphPredicate": {
+      "description": "One predicate anchored on a rule capture (meta-variable name **without** the `$` sigil,\nexactly like `constraints` keys). Exactly one predicate field must be set.",
+      "type": "object",
+      "properties": {
+        "capture": {
+          "description": "The meta-variable whose matched span anchors the predicate.",
+          "type": "string"
+        },
+        "resolvesTo": {
+          "description": "The reference at the capture's span must resolve (at or above the grade floor) to a\ndefinition matching this selector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphTargetSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sameBindingAs": {
+          "description": "This capture and the named other capture must resolve to the **same** definition.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "calls": {
+          "description": "The definition enclosing the capture must have a `calls` edge to a definition matching\nthis selector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphTargetSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "imports": {
+          "description": "The capture's file must have an `imports` edge to a target matching this selector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphTargetSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "implements": {
+          "description": "The definition enclosing the capture must have an `implements` edge to a definition\nmatching this selector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphTargetSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capture"
+      ]
+    },
+    "GraphTargetSelector": {
+      "description": "Selects the definition a predicate must reach. Every given field must hold (conjunction);\nat least one must be given. `externalId` is the durable content-derived identity\n(`eid:<32 hex>` accepted with or without the prefix) and is the recommended pin for\nmigration rules — it survives rebuilds and file moves.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Definition name (exact).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Defining file path suffix (`src/util.rs` matches `.../src/util.rs`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "externalId": {
+          "description": "Durable external id, `eid:<32 hex>` or bare hex.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "RuleFileGlob": {
       "anyOf": [

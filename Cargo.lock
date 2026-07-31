@@ -3738,6 +3738,8 @@ version = "0.1.0"
 dependencies = [
  "fd-lock",
  "rayon",
+ "serde",
+ "serde_json",
  "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tree-sitter",
@@ -3785,6 +3787,7 @@ version = "0.1.0"
 dependencies = [
  "ignore",
  "serde",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -3852,8 +3855,10 @@ version = "0.1.0"
 dependencies = [
  "ignore",
  "notify",
+ "serde",
  "serde_json",
  "tikv-jemallocator",
+ "vorpal-config",
  "vorpal-core",
  "vorpal-index",
  "vorpal-kg",
@@ -3878,6 +3883,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "serde",
  "serde_json",
  "tree-sitter",
  "vorpal-config",
