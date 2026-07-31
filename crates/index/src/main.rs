@@ -30,7 +30,7 @@ mod jemalloc_conf {
   );
 }
 
-use vorpal_index::{build_index, search_index};
+use vorpal_index::search_index;
 
 const USAGE: &str = "usage:
   vorpal-index index        <src-dir> <index-dir> [--verify]  build + persist a knowledge graph
