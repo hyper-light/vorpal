@@ -89,6 +89,31 @@ product header v8): editing a vendored grammar changes its digest, which invalid
 language's cached products on the next index. Use `vorpal grammars` to confirm this table and the
 binary agree.
 
+## Provenance, corpora, and the reproducible update procedure (IMPROVEMENTS #10)
+
+Machine-readable provenance lives in **`grammars/PROVENANCE.json`** (repository, version,
+pinned commit, license, generator ABI, local patches, full-tree digest), enforced on every
+`cargo test` by `crates/language/tests/grammar_provenance.rs` — any vendored byte change fails
+until provenance is regenerated and the diff is owned in review. Each grammar's **upstream test
+corpus** is vendored at the pinned commit and executed against the compiled parsers by
+`crates/language/tests/grammar_corpus.rs` (4k+ tests; `:skip`/`:platform`/`:error`/`:language`
+attributes honored; exclusions and allowlist entries carry written reasons). A **weekly audit**
+(`.github/workflows/grammar-audit.yml` → `scripts/grammar_audit.py`) re-verifies pinned commits
+exist upstream and our parser sources byte-match them, and reports newer upstream tags into a
+tracking issue.
+
+Updating a grammar is deliberate and reproducible:
+
+1. `curl -L https://codeload.github.com/<org>/<repo>/tar.gz/<new-commit-or-tag>` and replace
+   `grammars/<name>/` wholesale (keep local patches by re-applying them on top; record each in
+   the provenance `patches` field).
+2. Re-import its `test/corpus` from the same tarball.
+3. `cargo test -p vorpal-language --test grammar_provenance -- --ignored regenerate` (preserves
+   commit + patches fields; update `commit` to the new pin) and update this ledger's table row.
+4. Let the gates arbitrate the PR: provenance enforcement, the full corpus run, and the
+   workspace suite. A parser-semantics change invalidates exactly that language's cached
+   products via the grammar digest — no manual cache handling.
+
 ## Re-syncing a vendored grammar
 
 1. Fetch the target upstream tag/commit; copy the published-crate layout into `grammars/<name>/`

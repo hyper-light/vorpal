@@ -1,0 +1,43 @@
+# Grammar supply-chain audit (IMPROVEMENTS #10): scheduled drift detection against upstream.
+#
+# Two layers keep vendored grammars honest:
+#   1. Every push: the regular CI Test step runs grammar_provenance (digest/ABI/license
+#      enforcement over grammars/PROVENANCE.json) and grammar_corpus (4k+ upstream corpus
+#      tests against the compiled parsers). Those gates need no network.
+#   2. Weekly (this workflow): re-verify the pinned commits still exist upstream and that
+#      our vendored parser sources still byte-match them, and report newer upstream tags —
+#      the signal to run the reproducible update procedure in docs/UPSTREAM.md.
+#
+# Drift opens/updates a single tracking issue; it never edits the tree. Updates stay
+# deliberate: fetch the new tag tarball, replace the tree, re-run the regenerate test, and
+# let the corpus + provenance gates arbitrate the PR.
+name: grammar-audit
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit vendored grammars against upstream
+        run: python3 scripts/grammar_audit.py --report audit.md
+      - name: Open or update the drift issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="grammar supply-chain drift detected"
+          body="$(cat audit.md)"
+          number=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number' || true)
+          if [ -n "$number" ] && [ "$number" != "null" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
