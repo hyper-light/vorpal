@@ -1,6 +1,7 @@
 mod check_var;
 mod combined;
 mod fixer;
+mod graph_filter;
 mod label;
 mod maybe;
 mod rewriter;
@@ -17,6 +18,10 @@ use vorpal_core::language::Language;
 
 pub use combined::{CombinedScan, NO_SUPPRESS_ALL_ID, UNUSED_SUPPRESSION_ID};
 pub use fixer::Fixer;
+pub use graph_filter::{
+  GraphFilterError, GraphRequire, GraphTargetSelector, MinimumGrade, SerializableGraphFilter,
+  SerializableGraphPredicate,
+};
 pub use label::{Label, LabelStyle};
 pub use rule::DeserializeEnv;
 pub use rule::referent_rule::GlobalRules;

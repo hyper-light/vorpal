@@ -371,6 +371,7 @@ impl<'r, L: Language> CombinedScan<'r, L> {
       message: String::new(),
       note: None,
       files: None,
+      graph: None,
       ignores: None,
       rewriters: None,
       fix: None,

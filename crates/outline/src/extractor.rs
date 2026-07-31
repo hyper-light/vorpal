@@ -83,6 +83,7 @@ impl<L: Language> SerializableOutlineCommon<L> {
       severity: Severity::default(),
       labels: None,
       files: None,
+      graph: None,
       ignores: None,
       url: None,
       metadata: None,

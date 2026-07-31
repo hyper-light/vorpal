@@ -55,6 +55,8 @@ pub enum RuleConfigError {
   LabelVariable(String),
   #[error("Rule must specify a set of AST kinds to match. Try adding `kind` rule.")]
   MissingPotentialKinds,
+  #[error("`graph` section is not configured correctly.")]
+  Graph(#[from] crate::graph_filter::GraphFilterError),
 }
 
 #[derive(Serialize, Deserialize, Clone, JsonSchema)]
@@ -86,6 +88,10 @@ pub struct SerializableRuleConfig<L: Language> {
   /// Custom label dictionary to configure reporting. Key is the meta-variable name and
   /// value is the label message and label style.
   pub labels: Option<HashMap<String, LabelConfig>>,
+  /// Graph predicates: repository facts (from a vorpal index) every match must additionally
+  /// satisfy — see [`crate::SerializableGraphFilter`]. A vorpal extension; absent in
+  /// upstream ast-grep rules, which therefore parse unchanged.
+  pub graph: Option<crate::graph_filter::SerializableGraphFilter>,
   /// Glob patterns to specify that the rule only applies to matching files
   pub files: Option<Vec<RuleFileGlob>>,
   /// Glob patterns that exclude rules from applying to files
@@ -204,6 +210,11 @@ impl<L: Language> RuleConfig<L> {
     if matcher.potential_kinds().is_none() {
       return Err(RuleConfigError::MissingPotentialKinds);
     }
+    if let Some(graph) = &inner.graph {
+      // Malformed graph predicates fail at load, so a rule that asked for repository facts
+      // can never silently degrade into a structural-only rule.
+      graph.validate()?;
+    }
     let fixer = if let Some(fix) = &inner.fix {
       let env = matcher.get_env(inner.language.clone());
       Fixer::parse(fix, &env, &inner.transform)?
@@ -295,6 +306,7 @@ mod test {
       severity: Severity::Hint,
       labels: None,
       files: None,
+      graph: None,
       ignores: None,
       url: None,
       metadata: None,
