@@ -25,6 +25,7 @@ napi-derive = "3.4.0"
 
 ignore.workspace = true
 tree-sitter.workspace = true
+serde.workspace = true
 serde_json = "1.0.116"
 
 [features]

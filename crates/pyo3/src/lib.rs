@@ -29,7 +29,10 @@ fn vorpal_py(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
   m.add_function(wrap_pyfunction!(register_dynamic_language, m)?)?;
   // Repository intelligence (index/graph/search) — see `repo` module.
   m.add_class::<repo::NodeInfo>()?;
+  m.add_class::<repo::BuildReport>()?;
+  m.add_class::<repo::Index>()?;
   m.add_function(wrap_pyfunction!(repo::index_build, m)?)?;
+  m.add_function(wrap_pyfunction!(repo::index_build_report, m)?)?;
   m.add_function(wrap_pyfunction!(repo::index_search, m)?)?;
   m.add_function(wrap_pyfunction!(repo::index_graph, m)?)?;
   m.add_function(wrap_pyfunction!(repo::index_node, m)?)?;
