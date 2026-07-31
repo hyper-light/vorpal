@@ -1,0 +1,302 @@
+================================================================================
+Decimal integer literals
+================================================================================
+
+void main() {
+  0;
+  42;
+  1000;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (decimal_integer_literal))
+        (expression_statement
+          (decimal_integer_literal))
+        (expression_statement
+          (decimal_integer_literal))))))
+
+================================================================================
+Hexadecimal integer literals
+================================================================================
+
+void main() {
+  0x0;
+  0xFF;
+  0XDEAD;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (hex_integer_literal))
+        (expression_statement
+          (hex_integer_literal))
+        (expression_statement
+          (hex_integer_literal))))))
+
+================================================================================
+Floating point literals
+================================================================================
+
+void main() {
+  3.14;
+  .5;
+  1e10;
+  1.5e-3;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (decimal_floating_point_literal))
+        (expression_statement
+          (decimal_floating_point_literal))
+        (expression_statement
+          (decimal_floating_point_literal))
+        (expression_statement
+          (decimal_floating_point_literal))))))
+
+================================================================================
+Boolean literals
+================================================================================
+
+void main() {
+  true;
+  false;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (true))
+        (expression_statement
+          (false))))))
+
+================================================================================
+Null literal
+================================================================================
+
+void main() {
+  null;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (null_literal))))))
+
+================================================================================
+String literals
+================================================================================
+
+void main() {
+  'hello';
+  "world";
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (string_literal
+            (string_literal_single_quotes
+              (template_chars_single_single))))
+        (expression_statement
+          (string_literal
+            (string_literal_double_quotes
+              (template_chars_double_single))))))))
+
+================================================================================
+Symbol literals
+================================================================================
+
+void main() {
+  #foo;
+  #foo.bar;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (symbol_literal
+            (identifier)))
+        (expression_statement
+          (symbol_literal
+            (identifier)
+            (identifier)))))))
+
+================================================================================
+List literal
+================================================================================
+
+void main() {
+  [1, 2, 3];
+  <int>[1];
+  const [1];
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (list_literal
+            (decimal_integer_literal)
+            (decimal_integer_literal)
+            (decimal_integer_literal)))
+        (expression_statement
+          (list_literal
+            (type_arguments
+              (type
+                (type_identifier)))
+            (decimal_integer_literal)))
+        (expression_statement
+          (list_literal
+            (decimal_integer_literal)))))))
+
+================================================================================
+Set or map literal
+================================================================================
+
+void main() {
+  {1, 2};
+  {'a': 1};
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (set_or_map_literal
+            (decimal_integer_literal)
+            (decimal_integer_literal)))
+        (expression_statement
+          (set_or_map_literal
+            (pair
+              key: (string_literal
+                (string_literal_single_quotes
+                  (template_chars_single_single)))
+              value: (decimal_integer_literal))))))))
+
+================================================================================
+Null-aware elements
+================================================================================
+
+void main() {
+  [?a];
+  {?key: value};
+  {key: ?value};
+  {?key: ?value};
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (list_literal
+            (null_aware_element
+              (identifier))))
+        (expression_statement
+          (set_or_map_literal
+            (null_aware_pair
+              key: (identifier)
+              value: (identifier))))
+        (expression_statement
+          (set_or_map_literal
+            (pair
+              key: (identifier)
+              value: (null_aware_element
+                (identifier)))))
+        (expression_statement
+          (set_or_map_literal
+            (null_aware_pair
+              key: (identifier)
+              value: (null_aware_element
+                (identifier)))))))))

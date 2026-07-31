@@ -1,0 +1,427 @@
+================================================================================
+If statement
+================================================================================
+
+void main() {
+  if (x) a();
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (if_statement
+          (identifier)
+          consequence: (expression_statement
+            (call_expression
+              function: (identifier)
+              arguments: (arguments))))))))
+
+================================================================================
+If-else statement
+================================================================================
+
+void main() {
+  if (x) {
+    a();
+  } else {
+    b();
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (if_statement
+          (identifier)
+          consequence: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments))))
+          alternative: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments)))))))))
+
+================================================================================
+For loop
+================================================================================
+
+void main() {
+  for (var i = 0; i < 10; i++) {
+    print(i);
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (for_statement
+          init: (local_variable_declaration
+            (initialized_variable_definition
+              name: (identifier)
+              value: (decimal_integer_literal)))
+          condition: (relational_expression
+            (identifier)
+            (relational_operator)
+            (decimal_integer_literal))
+          update: (postfix_expression
+            argument: (assignable_expression
+              (identifier)))
+          body: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments
+                  (identifier))))))))))
+
+================================================================================
+For-in loop
+================================================================================
+
+void main() {
+  for (var x in list) {
+    print(x);
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (for_statement
+          name: (identifier)
+          value: (identifier)
+          body: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments
+                  (identifier))))))))))
+
+================================================================================
+While loop
+================================================================================
+
+void main() {
+  while (true) {
+    break;
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (while_statement
+          condition: (parenthesized_expression
+            (true))
+          body: (block
+            (break_statement)))))))
+
+================================================================================
+Do-while loop
+================================================================================
+
+void main() {
+  do {
+    x++;
+  } while (x < 10);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (do_statement
+          body: (block
+            (expression_statement
+              (postfix_expression
+                argument: (assignable_expression
+                  (identifier)))))
+          condition: (parenthesized_expression
+            (relational_expression
+              (identifier)
+              (relational_operator)
+              (decimal_integer_literal))))))))
+
+================================================================================
+Try-catch-finally
+================================================================================
+
+void main() {
+  try {
+    foo();
+  } on FormatException catch (e) {
+    print(e);
+  } catch (e, s) {
+    print(s);
+  } finally {
+    cleanup();
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (try_statement
+          body: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments))))
+          (type
+            (type_identifier))
+          (catch_clause
+            exception: (identifier))
+          (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments
+                  (identifier)))))
+          (catch_clause
+            exception: (identifier)
+            stack_trace: (identifier))
+          (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments
+                  (identifier)))))
+          (finally_clause
+            (block
+              (expression_statement
+                (call_expression
+                  function: (identifier)
+                  arguments: (arguments))))))))))
+
+================================================================================
+Rethrow statement
+================================================================================
+
+void main() {
+  try {
+    foo();
+  } catch (e) {
+    rethrow;
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (try_statement
+          body: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments))))
+          (catch_clause
+            exception: (identifier))
+          (block
+            (rethrow_statement)))))))
+
+================================================================================
+For-in loop with metadata
+================================================================================
+
+void main() {
+  for (@deprecated var x in list) {
+    print(x);
+  }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (for_statement
+          (annotation
+            name: (identifier))
+          name: (identifier)
+          value: (identifier)
+          body: (block
+            (expression_statement
+              (call_expression
+                function: (identifier)
+                arguments: (arguments
+                  (identifier))))))))))
+
+================================================================================
+Pattern for-in with metadata
+================================================================================
+
+void f(x) {
+  for (@annotation var (a, b) in x) {}
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list
+        (formal_parameter
+          (identifier))))
+    body: (function_body
+      (block
+        (for_statement
+          (annotation
+            name: (identifier))
+          (record_pattern
+            (constant_pattern
+              (identifier))
+            (constant_pattern
+              (identifier)))
+          value: (identifier)
+          body: (block))))))
+
+================================================================================
+Return statement
+================================================================================
+
+int foo() {
+  return 42;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (type_identifier))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (return_statement
+          (decimal_integer_literal))))))
+
+================================================================================
+Assert statement
+================================================================================
+
+void main() {
+  assert(x > 0, 'must be positive');
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (assert_statement
+          (assertion
+            (relational_expression
+              (identifier)
+              (relational_operator)
+              (decimal_integer_literal))
+            (string_literal
+              (string_literal_single_quotes
+                (template_chars_single_single)))))))))
+
+================================================================================
+Empty statement
+================================================================================
+
+void main() {
+  foo();
+  ;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (call_expression
+            function: (identifier)
+            arguments: (arguments)))
+        (empty_statement)))))

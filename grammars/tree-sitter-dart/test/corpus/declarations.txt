@@ -1,0 +1,912 @@
+================================================================================
+Simple class
+================================================================================
+
+class Foo {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Class with extends and implements
+================================================================================
+
+class Dog extends Animal implements Barker {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    superclass: (superclass
+      type: (type
+        (type_identifier)))
+    interfaces: (interfaces
+      (type
+        (type_identifier)))
+    body: (class_body)))
+
+================================================================================
+Class with mixins
+================================================================================
+
+class Cat extends Animal with Walker, Purrer {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    superclass: (superclass
+      type: (type
+        (type_identifier))
+      (mixins
+        (type
+          (type_identifier))
+        (type
+          (type_identifier))))
+    body: (class_body)))
+
+================================================================================
+Sealed class
+================================================================================
+
+sealed class Shape {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Abstract base class
+================================================================================
+
+abstract base class Vehicle {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Interface class
+================================================================================
+
+interface class Drawable {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Mixin declaration
+================================================================================
+
+mixin Flyable on Animal {
+  void fly() {}
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (mixin_declaration
+    name: (identifier)
+    (type
+      (type_identifier))
+    body: (class_body
+      (class_member
+        (method_declaration
+          signature: (method_signature
+            (function_signature
+              return_type: (type
+                (void_type))
+              name: (identifier)
+              parameters: (formal_parameter_list)))
+          body: (function_body
+            (block)))))))
+
+================================================================================
+Extension declaration
+================================================================================
+
+extension StringExt on String {
+  bool get isBlank => isEmpty;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extension_declaration
+    name: (identifier)
+    class: (type
+      (type_identifier))
+    body: (extension_body
+      (class_member
+        (method_declaration
+          signature: (method_signature
+            (getter_signature
+              return_type: (type
+                (type_identifier))
+              name: (identifier)))
+          body: (function_body
+            (identifier)))))))
+
+================================================================================
+Extension type
+================================================================================
+
+extension type Meters(double value) implements double {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extension_type_declaration
+    name: (extension_type_name
+      (identifier))
+    representation: (extension_type_representation
+      type: (type
+        (type_identifier))
+      name: (identifier))
+    (type
+      (type_identifier))
+    body: (class_body)))
+
+================================================================================
+Enum declaration
+================================================================================
+
+enum Color { red, green, blue }
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (enum_declaration
+    name: (identifier)
+    body: (enum_body
+      (enum_constant
+        name: (identifier))
+      (enum_constant
+        name: (identifier))
+      (enum_constant
+        name: (identifier)))))
+
+================================================================================
+Enhanced enum
+================================================================================
+
+enum Planet {
+  mercury(3.7),
+  earth(9.8);
+
+  final double gravity;
+  const Planet(this.gravity);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (enum_declaration
+    name: (identifier)
+    body: (enum_body
+      (enum_constant
+        name: (identifier)
+        (arguments
+          (decimal_floating_point_literal)))
+      (enum_constant
+        name: (identifier)
+        (arguments
+          (decimal_floating_point_literal)))
+      (class_member
+        (declaration
+          (type
+            (type_identifier))
+          (initialized_identifier_list
+            (initialized_identifier
+              name: (identifier)))))
+      (class_member
+        (declaration
+          (constant_constructor_signature
+            name: (identifier)
+            parameters: (formal_parameter_list
+              (formal_parameter
+                (constructor_param
+                  (identifier))))))))))
+
+================================================================================
+Typedef
+================================================================================
+
+typedef IntList = List<int>;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_alias
+    (type_identifier)
+    (type
+      (type_identifier)
+      (type_arguments
+        (type
+          (type_identifier))))))
+
+================================================================================
+Top-level variable declarations
+================================================================================
+
+final x = 42;
+var y = 'hello';
+const pi = 3.14;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (top_level_variable_declaration
+    (static_final_declaration_list
+      (static_final_declaration
+        name: (identifier)
+        value: (decimal_integer_literal))))
+  (top_level_variable_declaration
+    (initialized_identifier_list
+      (initialized_identifier
+        name: (identifier)
+        value: (string_literal
+          (string_literal_single_quotes
+            (template_chars_single_single))))))
+  (top_level_variable_declaration
+    (static_final_declaration_list
+      (static_final_declaration
+        name: (identifier)
+        value: (decimal_floating_point_literal)))))
+
+================================================================================
+Import declarations
+================================================================================
+
+import 'dart:core';
+import 'package:foo/foo.dart' as foo;
+import 'bar.dart' show Baz, Qux;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (import_or_export
+    (library_import
+      (import_specification
+        uri: (configurable_uri
+          (uri
+            (string_literal
+              (string_literal_single_quotes
+                (template_chars_single_single))))))))
+  (import_or_export
+    (library_import
+      (import_specification
+        uri: (configurable_uri
+          (uri
+            (string_literal
+              (string_literal_single_quotes
+                (template_chars_single_single)))))
+        alias: (identifier))))
+  (import_or_export
+    (library_import
+      (import_specification
+        uri: (configurable_uri
+          (uri
+            (string_literal
+              (string_literal_single_quotes
+                (template_chars_single_single)))))
+        (combinator
+          (identifier)
+          (identifier))))))
+
+================================================================================
+Export declaration
+================================================================================
+
+export 'src/foo.dart';
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (import_or_export
+    (library_export
+      uri: (configurable_uri
+        (uri
+          (string_literal
+            (string_literal_single_quotes
+              (template_chars_single_single))))))))
+
+================================================================================
+Part directive
+================================================================================
+
+part 'src/detail.dart';
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (part_directive
+    uri: (uri
+      (string_literal
+        (string_literal_single_quotes
+          (template_chars_single_single))))))
+
+================================================================================
+Library name
+================================================================================
+
+library my.app;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (library_name
+    (dotted_identifier_list
+      (identifier)
+      (identifier))))
+
+================================================================================
+Built-in identifiers as field names
+================================================================================
+
+class Foo {
+  int type = 0;
+  String get = '';
+  bool set = true;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body
+      (class_member
+        (declaration
+          (type
+            (type_identifier))
+          (initialized_identifier_list
+            (initialized_identifier
+              name: (identifier)
+              value: (decimal_integer_literal)))))
+      (class_member
+        (declaration
+          (type
+            (type_identifier))
+          (initialized_identifier_list
+            (initialized_identifier
+              name: (identifier)
+              value: (string_literal
+                (string_literal_single_quotes))))))
+      (class_member
+        (declaration
+          (type
+            (type_identifier))
+          (initialized_identifier_list
+            (initialized_identifier
+              name: (identifier)
+              value: (true))))))))
+
+================================================================================
+Chained assignment in constructor initializer
+================================================================================
+
+class Foo {
+  Foo() : a = b.c = d();
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body
+      (class_member
+        (declaration
+          (constructor_signature
+            name: (identifier)
+            parameters: (formal_parameter_list))
+          (initializers
+            (initializer_list_entry
+              (field_initializer
+                name: (identifier)
+                value: (assignment_expression
+                  left: (assignable_expression
+                    object: (identifier)
+                    property: (identifier))
+                  right: (call_expression
+                    function: (identifier)
+                    arguments: (arguments)))))))))))
+
+================================================================================
+Record return type with annotation
+================================================================================
+
+class Foo {
+  @override
+  (int, int?)? get range { return null; }
+
+  @override
+  (String, int) get pair => ('text', 42);
+
+  @JsonKey(name: 'foo')
+  (String, int) get annotatedPair => ('text', 42);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body
+      (class_member
+        (method_declaration
+          (annotation
+            name: (identifier))
+          signature: (method_signature
+            (getter_signature
+              return_type: (type
+                (record_type
+                  (record_type_field
+                    type: (type
+                      (type_identifier)))
+                  (record_type_field
+                    type: (type
+                      (type_identifier)))))
+              name: (identifier)))
+          body: (function_body
+            (block
+              (return_statement
+                (null_literal))))))
+      (class_member
+        (method_declaration
+          (annotation
+            name: (identifier))
+          signature: (method_signature
+            (getter_signature
+              return_type: (type
+                (record_type
+                  (record_type_field
+                    type: (type
+                      (type_identifier)))
+                  (record_type_field
+                    type: (type
+                      (type_identifier)))))
+              name: (identifier)))
+          body: (function_body
+            (record_literal
+              (record_field
+                (string_literal
+                  (string_literal_single_quotes
+                    (template_chars_single_single))))
+              (record_field
+                (decimal_integer_literal))))))
+      (class_member
+        (method_declaration
+          (annotation
+            name: (identifier)
+            (annotation_arguments
+              (annotation_open_paren)
+              (named_argument
+                (label
+                  (identifier))
+                (string_literal
+                  (string_literal_single_quotes
+                    (template_chars_single_single))))))
+          signature: (method_signature
+            (getter_signature
+              return_type: (type
+                (record_type
+                  (record_type_field
+                    type: (type
+                      (type_identifier)))
+                  (record_type_field
+                    type: (type
+                      (type_identifier)))))
+              name: (identifier)))
+          body: (function_body
+            (record_literal
+              (record_field
+                (string_literal
+                  (string_literal_single_quotes
+                    (template_chars_single_single))))
+              (record_field
+                (decimal_integer_literal)))))))))
+
+================================================================================
+Extension type with primary constructor
+================================================================================
+
+extension type JSArray<T extends JSAny?>._(JSArrayRepType _jsArray) implements JSObject {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extension_type_declaration
+    name: (extension_type_name
+      (identifier)
+      (type_parameters
+        (type_parameter
+          name: (type_identifier)
+          bound: (type
+            (type_identifier))
+          bound: (type)))
+      (identifier))
+    representation: (extension_type_representation
+      type: (type
+        (type_identifier))
+      name: (identifier))
+    (type
+      (type_identifier))
+    body: (class_body)))
+
+================================================================================
+Annotations with generic type arguments and .new
+================================================================================
+
+@GenericClass<int, String>.new()
+class Foo {}
+
+@GenericClass<int>.named()
+class Bar {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    (annotation
+      name: (identifier)
+      (type_arguments
+        (type
+          (type_identifier))
+        (type
+          (type_identifier)))
+      (annotation_arguments
+        (annotation_open_paren)))
+    name: (identifier)
+    body: (class_body))
+  (class_declaration
+    (annotation
+      name: (identifier)
+      (type_arguments
+        (type
+          (type_identifier)))
+      (identifier)
+      (annotation_arguments
+        (annotation_open_paren)))
+    name: (identifier)
+    body: (class_body)))
+
+================================================================================
+Extension type with annotated representation
+================================================================================
+
+extension type ExtensionType(@annotation int id) implements int {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (extension_type_declaration
+    name: (extension_type_name
+      (identifier))
+    representation: (extension_type_representation
+      (annotation
+        name: (identifier))
+      type: (type
+        (type_identifier))
+      name: (identifier))
+    (type
+      (type_identifier))
+    body: (class_body)))
+
+================================================================================
+Type variance modifiers
+================================================================================
+
+class Covariant<out T> {}
+class Contravariant<in T> {}
+class Invariant<inout K, inout V> {}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    type_parameters: (type_parameters
+      (type_parameter
+        variance: (variance_modifier)
+        name: (type_identifier)))
+    body: (class_body))
+  (class_declaration
+    name: (identifier)
+    type_parameters: (type_parameters
+      (type_parameter
+        variance: (variance_modifier)
+        name: (type_identifier)))
+    body: (class_body))
+  (class_declaration
+    name: (identifier)
+    type_parameters: (type_parameters
+      (type_parameter
+        variance: (variance_modifier)
+        name: (type_identifier))
+      (type_parameter
+        variance: (variance_modifier)
+        name: (type_identifier)))
+    body: (class_body)))
+
+================================================================================
+Augmentation library and augment declarations
+================================================================================
+
+library augment 'main.dart';
+
+augment class A with M {
+  augment String get name => '$augmented!';
+}
+
+augment mixin M {
+  augment String get mixinX => '${augmented}b';
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (library_name
+    uri: (uri
+      (string_literal
+        (string_literal_single_quotes
+          (template_chars_single_single)))))
+  (class_declaration
+    name: (identifier)
+    superclass: (superclass
+      (mixins
+        (type
+          (type_identifier))))
+    body: (class_body
+      (class_member
+        (method_declaration
+          signature: (method_signature
+            (getter_signature
+              return_type: (type
+                (type_identifier))
+              name: (identifier)))
+          body: (function_body
+            (string_literal
+              (string_literal_single_quotes
+                (template_substitution
+                  (identifier_dollar_escaped))
+                (template_chars_single_single))))))))
+  (mixin_declaration
+    name: (identifier)
+    body: (class_body
+      (class_member
+        (method_declaration
+          signature: (method_signature
+            (getter_signature
+              return_type: (type
+                (type_identifier))
+              name: (identifier)))
+          body: (function_body
+            (string_literal
+              (string_literal_single_quotes
+                (template_substitution
+                  (identifier))
+                (template_chars_single_single)))))))))
+
+================================================================================
+Native method body
+================================================================================
+
+class Foo {
+  int get length native;
+  String bar() native;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body
+      (class_member
+        (method_declaration
+          signature: (method_signature
+            (getter_signature
+              return_type: (type
+                (type_identifier))
+              name: (identifier)))
+          body: (function_body
+            (native))))
+      (class_member
+        (method_declaration
+          signature: (method_signature
+            (function_signature
+              return_type: (type
+                (type_identifier))
+              name: (identifier)
+              parameters: (formal_parameter_list)))
+          body: (function_body
+            (native)))))))
+
+================================================================================
+External final declaration
+================================================================================
+
+external final int x;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (external_variable_declaration
+    (external)
+    (type
+      (type_identifier))
+    (identifier_list
+      (identifier))))
+
+================================================================================
+Non-null assertion
+================================================================================
+
+void f() {
+  var x = y!;
+  w!.foo();
+  x.._parent!.foo();
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (local_variable_declaration
+          (initialized_variable_definition
+            name: (identifier)
+            value: (null_assertion_expression
+              value: (identifier))))
+        (expression_statement
+          (call_expression
+            function: (member_expression
+              object: (null_assertion_expression
+                value: (identifier))
+              property: (identifier))
+            arguments: (arguments)))
+        (expression_statement
+          (identifier)
+          (cascade_section
+            (cascade_call_expression
+              function: (cascade_member_expression
+                object: (cascade_null_assertion_expression
+                  value: (cascade_selector
+                    (identifier)))
+                property: (identifier))
+              arguments: (arguments))))))))
+
+================================================================================
+External static field declarations
+================================================================================
+
+class JsInterop {
+  external static dynamic TYPES;
+  external static final int DEBUG;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body
+      (class_member
+        (declaration
+          (external)
+          (type
+            (type_identifier))
+          (identifier_list
+            (identifier))))
+      (class_member
+        (declaration
+          (external)
+          (type
+            (type_identifier))
+          (identifier_list
+            (identifier)))))))
+
+================================================================================
+External covariant field declarations
+================================================================================
+
+class C {
+  external covariant num field;
+  external covariant var field2;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body
+      (class_member
+        (declaration
+          (external)
+          (type
+            (type_identifier))
+          (identifier_list
+            (identifier))))
+      (class_member
+        (declaration
+          (external)
+          (identifier_list
+            (identifier)))))))
+
+================================================================================
+Mixin class declaration
+================================================================================
+
+mixin class M {}
+
+base mixin class BM {}
+
+abstract mixin class AM {}
+
+abstract base mixin class ABM {}
+
+mixin class MC = Object with M1;
+
+abstract base mixin class AMC = Object with M1 implements I;
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    body: (class_body))
+  (class_declaration
+    name: (identifier)
+    body: (class_body))
+  (class_declaration
+    name: (identifier)
+    body: (class_body))
+  (class_declaration
+    name: (identifier)
+    body: (class_body))
+  (class_declaration
+    (mixin_application_class
+      (identifier)
+      (mixin_application
+        (type
+          (type_identifier))
+        (mixins
+          (type
+            (type_identifier))))))
+  (class_declaration
+    (mixin_application_class
+      (identifier)
+      (mixin_application
+        (type
+          (type_identifier))
+        (mixins
+          (type
+            (type_identifier)))
+        (interfaces
+          (type
+            (type_identifier)))))))

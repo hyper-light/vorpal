@@ -5,7 +5,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-bash",
-    "source_digest": "xxh3:d9111db2f351f448",
+    "source_digest": "xxh3:934287845e83e5bd",
     "version": "0.25.1"
   },
   "tree-sitter-c": {
@@ -14,7 +14,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-c",
-    "source_digest": "xxh3:234eb202c9f341f2",
+    "source_digest": "xxh3:b145da76ea0dc33d",
     "version": "0.24.2"
   },
   "tree-sitter-c-sharp": {
@@ -23,7 +23,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-c-sharp",
-    "source_digest": "xxh3:e39cbd0b93dfc668",
+    "source_digest": "xxh3:0d2996892944f918",
     "version": "0.23.5"
   },
   "tree-sitter-cpp": {
@@ -32,7 +32,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-cpp",
-    "source_digest": "xxh3:c2485919fc12008f",
+    "source_digest": "xxh3:8d9414e4e62f04c2",
     "version": "0.23.4"
   },
   "tree-sitter-css": {
@@ -41,7 +41,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-css",
-    "source_digest": "xxh3:a2edc90778ffc744",
+    "source_digest": "xxh3:d19c55f1b18c3735",
     "version": "0.25.0"
   },
   "tree-sitter-dart": {
@@ -50,7 +50,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/nielsenko/tree-sitter-dart",
-    "source_digest": "xxh3:3356c1896b400a3f",
+    "source_digest": "xxh3:d973125e99de64e1",
     "version": "0.2.0"
   },
   "tree-sitter-elixir": {
@@ -59,7 +59,7 @@
     "license": "Apache-2.0",
     "patches": [],
     "repository": "https://github.com/elixir-lang/tree-sitter-elixir",
-    "source_digest": "xxh3:72496a22ce4ed702",
+    "source_digest": "xxh3:83c60de83361f045",
     "version": "0.3.5"
   },
   "tree-sitter-go": {
@@ -68,7 +68,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-go",
-    "source_digest": "xxh3:8576edd22a9098a3",
+    "source_digest": "xxh3:edbbdf522d8d581f",
     "version": "0.25.0"
   },
   "tree-sitter-haskell": {
@@ -77,7 +77,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-haskell",
-    "source_digest": "xxh3:8be7bfb1bfd076f5",
+    "source_digest": "xxh3:5eecc64d09045f21",
     "version": "0.23.1"
   },
   "tree-sitter-hcl": {
@@ -86,7 +86,7 @@
     "license": "Apache-2.0",
     "patches": [],
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-hcl",
-    "source_digest": "xxh3:126431b6fda1d0b6",
+    "source_digest": "xxh3:9e2bc1c446298f49",
     "version": "1.1.0"
   },
   "tree-sitter-html": {
@@ -95,7 +95,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-html",
-    "source_digest": "xxh3:7da44dc0d533d98c",
+    "source_digest": "xxh3:71bdd83b11305f54",
     "version": "0.23.2"
   },
   "tree-sitter-java": {
@@ -104,7 +104,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-java",
-    "source_digest": "xxh3:18fd941b8eef27e1",
+    "source_digest": "xxh3:fb0b2e78381d8006",
     "version": "0.23.5"
   },
   "tree-sitter-javascript": {
@@ -113,7 +113,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-javascript",
-    "source_digest": "xxh3:b135ab0cb556d91f",
+    "source_digest": "xxh3:2b56d4a0dc57d855",
     "version": "0.25.0"
   },
   "tree-sitter-json": {
@@ -122,7 +122,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-json",
-    "source_digest": "xxh3:2aeb8fe5137aab46",
+    "source_digest": "xxh3:e5c9db3b80303203",
     "version": "0.24.8"
   },
   "tree-sitter-kotlin-sg": {
@@ -131,7 +131,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/ast-grep/tree-sitter-kotlin",
-    "source_digest": "xxh3:f4a235b49180bcd1",
+    "source_digest": "xxh3:4673014291403eaa",
     "version": "0.4.1"
   },
   "tree-sitter-lua": {
@@ -140,7 +140,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-lua",
-    "source_digest": "xxh3:36713c8d15765e04",
+    "source_digest": "xxh3:7fdb4c93c134db07",
     "version": "0.5.0"
   },
   "tree-sitter-md": {
@@ -149,7 +149,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-markdown",
-    "source_digest": "xxh3:6a1d481c44933d55",
+    "source_digest": "xxh3:3e3be8946649fe0b",
     "version": "0.5.3"
   },
   "tree-sitter-nix": {
@@ -158,7 +158,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/nix-community/tree-sitter-nix",
-    "source_digest": "xxh3:a95c223e4ee5709b",
+    "source_digest": "xxh3:a741893b888914cb",
     "version": "0.3.0"
   },
   "tree-sitter-php": {
@@ -167,7 +167,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-php",
-    "source_digest": "xxh3:5db581fbbbfde54b",
+    "source_digest": "xxh3:ce94537895a242cd",
     "version": "0.24.2"
   },
   "tree-sitter-python": {
@@ -187,16 +187,16 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-ruby",
-    "source_digest": "xxh3:b7743ba393dec326",
+    "source_digest": "xxh3:1d7f726eff8eb31e",
     "version": "0.23.1"
   },
   "tree-sitter-rust": {
     "abi": 15,
-    "commit": "e2bee853694a",
+    "commit": "77a3747266f4",
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-rust",
-    "source_digest": "xxh3:aef4b2f6815c6d01",
+    "source_digest": "xxh3:ce50c5429ea39957",
     "version": "0.24.2"
   },
   "tree-sitter-scala": {
@@ -205,7 +205,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-scala",
-    "source_digest": "xxh3:9966930790d6e49d",
+    "source_digest": "xxh3:bc91d9e2cd8762dd",
     "version": "0.26.0"
   },
   "tree-sitter-solidity": {
@@ -214,16 +214,18 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/JoranHonig/tree-sitter-solidity",
-    "source_digest": "xxh3:56f1d3c485482e48",
+    "source_digest": "xxh3:645559ae7f44e21e",
     "version": "1.2.13"
   },
   "tree-sitter-swift": {
     "abi": 15,
     "commit": "b8b22bffbb34",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "src/parser.c is the crates.io-packaged generated parser: upstream git does not commit generated sources (verified: all other vendored sources byte-match the pinned commit)"
+    ],
     "repository": "https://github.com/alex-pinkus/tree-sitter-swift",
-    "source_digest": "xxh3:58e1af174be81ddf",
+    "source_digest": "xxh3:aaf2f6a2cc17eb8a",
     "version": "0.7.3"
   },
   "tree-sitter-typescript": {
@@ -232,7 +234,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter/tree-sitter-typescript",
-    "source_digest": "xxh3:d179e423a98e5e7f",
+    "source_digest": "xxh3:019c30f748c9184b",
     "version": "0.23.2"
   },
   "tree-sitter-yaml": {
@@ -241,7 +243,7 @@
     "license": "MIT",
     "patches": [],
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-yaml",
-    "source_digest": "xxh3:c7f19ba8203e2467",
+    "source_digest": "xxh3:0df638e19971a497",
     "version": "0.7.2"
   }
 }

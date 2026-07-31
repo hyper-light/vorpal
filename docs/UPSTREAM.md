@@ -126,7 +126,7 @@ All under `grammars/<crate>/`, patched into the workspace. `Local patches` is "�
 | tree-sitter-php | 0.24.2 | `5b5627faaa29` | — (php + php_only parsers) |
 | tree-sitter-python | 0.25.0 | `293fdc02038e` | **PEP 810 lazy imports** — `lazy` soft keyword before `import`/`from` via an external-scanner context token (`src/scanner.c`), `optional($.lazy)` on both import rules, `+test/corpus/lazy_imports.txt`. See [[vendored-grammars-pep810]]. |
 | tree-sitter-ruby | 0.23.1 | `71bd32fb7607` | — |
-| tree-sitter-rust | 0.24.2 | `e2bee853694a` | — |
+| tree-sitter-rust | 0.24.2 | `77a3747266f4` | — |
 | tree-sitter-scala | 0.26.0 | `38950b525c9d` | — |
 | tree-sitter-solidity | 1.2.13 | `4e938a46c703` | — |
 | tree-sitter-swift | 0.7.3 | `b8b22bffbb34` | — |

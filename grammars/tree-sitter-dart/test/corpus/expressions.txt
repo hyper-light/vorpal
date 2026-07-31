@@ -1,0 +1,684 @@
+================================================================================
+Binary expressions
+================================================================================
+
+void main() {
+  a + b;
+  a - b;
+  a * b;
+  a / b;
+  a % b;
+  a ~/ b;
+  a << b;
+  a >> b;
+  a >>> b;
+  a & b;
+  a ^ b;
+  a | b;
+  a && b;
+  a || b;
+  a ?? b;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (additive_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (additive_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (multiplicative_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (multiplicative_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (multiplicative_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (multiplicative_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (shift_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (shift_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (shift_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (bitwise_and_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (bitwise_xor_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (bitwise_or_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (logical_and_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (logical_or_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (if_null_expression
+            (identifier)
+            (identifier)))))))
+
+================================================================================
+Relational and equality expressions
+================================================================================
+
+void main() {
+  a > b;
+  a < b;
+  a >= b;
+  a <= b;
+  a == b;
+  a != b;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (relational_expression
+            (identifier)
+            (relational_operator)
+            (identifier)))
+        (expression_statement
+          (relational_expression
+            (identifier)
+            (relational_operator)
+            (identifier)))
+        (expression_statement
+          (relational_expression
+            (identifier)
+            (relational_operator)
+            (identifier)))
+        (expression_statement
+          (relational_expression
+            (identifier)
+            (relational_operator)
+            (identifier)))
+        (expression_statement
+          (equality_expression
+            (identifier)
+            (identifier)))
+        (expression_statement
+          (equality_expression
+            (identifier)
+            (identifier)))))))
+
+================================================================================
+Ternary expression
+================================================================================
+
+void main() {
+  a ? b : c;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (conditional_expression
+            (identifier)
+            consequence: (identifier)
+            alternative: (identifier)))))))
+
+================================================================================
+Assignment expression
+================================================================================
+
+void main() {
+  x = 1;
+  x += 1;
+  x ??= 2;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              (identifier))
+            right: (decimal_integer_literal)))
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              (identifier))
+            right: (decimal_integer_literal)))
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              (identifier))
+            right: (decimal_integer_literal)))))))
+
+================================================================================
+Type test and cast expressions
+================================================================================
+
+void main() {
+  x is int;
+  x is! String;
+  x as double;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (type_test_expression
+            (identifier)
+            (type_test
+              (is_operator)
+              (type
+                (type_identifier)))))
+        (expression_statement
+          (type_test_expression
+            (identifier)
+            (type_test
+              (is_operator)
+              (type
+                (type_identifier)))))
+        (expression_statement
+          (type_cast_expression
+            (identifier)
+            (type_cast
+              (type
+                (type_identifier)))))))))
+
+================================================================================
+Unary expressions
+================================================================================
+
+void main() {
+  -x;
+  !x;
+  ~x;
+  ++x;
+  --x;
+  x++;
+  x--;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (unary_expression
+            (prefix_operator)
+            (identifier)))
+        (expression_statement
+          (unary_expression
+            (negate_operator)
+            (identifier)))
+        (expression_statement
+          (unary_expression
+            (prefix_operator)
+            (identifier)))
+        (expression_statement
+          (unary_expression
+            (assignable_expression
+              (identifier))))
+        (expression_statement
+          (unary_expression
+            (assignable_expression
+              (identifier))))
+        (expression_statement
+          (postfix_expression
+            argument: (assignable_expression
+              (identifier))))
+        (expression_statement
+          (postfix_expression
+            argument: (assignable_expression
+              (identifier))))))))
+
+================================================================================
+Await expression
+================================================================================
+
+void main() async {
+  await foo();
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (unary_expression
+            (await_expression
+              (call_expression
+                function: (identifier)
+                arguments: (arguments)))))))))
+
+================================================================================
+Throw expression
+================================================================================
+
+void main() {
+  throw Exception();
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (throw_expression
+            value: (call_expression
+              function: (identifier)
+              arguments: (arguments))))))))
+
+================================================================================
+Cascade expression
+================================================================================
+
+void main() {
+  list..add(1)..add(2);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (identifier)
+          (cascade_section
+            (cascade_call_expression
+              property: (identifier)
+              arguments: (arguments
+                (decimal_integer_literal))))
+          (cascade_section
+            (cascade_call_expression
+              property: (identifier)
+              arguments: (arguments
+                (decimal_integer_literal)))))))))
+
+================================================================================
+Built-in identifiers as assignable expressions
+================================================================================
+
+void f() {
+  type = 1;
+  get = 2;
+  show = 3;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              (identifier))
+            right: (decimal_integer_literal)))
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              (identifier))
+            right: (decimal_integer_literal)))
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              (identifier))
+            right: (decimal_integer_literal)))))))
+
+================================================================================
+Built-in identifiers as named arguments
+================================================================================
+
+void f() {
+  foo(type: 42);
+  bar(show: true);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (call_expression
+            function: (identifier)
+            arguments: (arguments
+              (named_argument
+                (label
+                  (identifier))
+                (decimal_integer_literal)))))
+        (expression_statement
+          (call_expression
+            function: (identifier)
+            arguments: (arguments
+              (named_argument
+                (label
+                  (identifier))
+                (true)))))))))
+
+================================================================================
+Built-in identifiers as member access
+================================================================================
+
+void f() {
+  obj.type = 1;
+  this.get = 2;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              object: (identifier)
+              property: (identifier))
+            right: (decimal_integer_literal)))
+        (expression_statement
+          (assignment_expression
+            left: (assignable_expression
+              property: (identifier))
+            right: (decimal_integer_literal)))))))
+
+================================================================================
+Function as identifier (static method access)
+================================================================================
+
+void f() {
+  Function.apply(callback, [value]);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (expression_statement
+          (call_expression
+            function: (member_expression
+              object: (identifier)
+              property: (identifier))
+            arguments: (arguments
+              (identifier)
+              (list_literal
+                (identifier)))))))))
+
+================================================================================
+Dot shorthand in assignment and arguments
+================================================================================
+
+Color f(Color c) {
+  Color x = .red;
+  paint(.blue);
+  return .green;
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (type_identifier))
+      name: (identifier)
+      parameters: (formal_parameter_list
+        (formal_parameter
+          (type
+            (type_identifier))
+          name: (identifier))))
+    body: (function_body
+      (block
+        (local_variable_declaration
+          (initialized_variable_definition
+            (type
+              (type_identifier))
+            name: (identifier)
+            value: (static_member_shorthand
+              (identifier))))
+        (expression_statement
+          (call_expression
+            function: (identifier)
+            arguments: (arguments
+              (static_member_shorthand
+                (identifier)))))
+        (return_statement
+          (static_member_shorthand
+            (identifier)))))))
+
+================================================================================
+Dot shorthand in list literal
+================================================================================
+
+void f() {
+  var x = [.red, .green, .blue];
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (local_variable_declaration
+          (initialized_variable_definition
+            name: (identifier)
+            value: (list_literal
+              (static_member_shorthand
+                (identifier))
+              (static_member_shorthand
+                (identifier))
+              (static_member_shorthand
+                (identifier)))))))))
+
+================================================================================
+Dot shorthand in map literal value
+================================================================================
+
+void f() {
+  var x = {'key': .red};
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (local_variable_declaration
+          (initialized_variable_definition
+            name: (identifier)
+            value: (set_or_map_literal
+              (pair
+                key: (string_literal
+                  (string_literal_single_quotes
+                    (template_chars_single_single)))
+                value: (static_member_shorthand
+                  (identifier))))))))))
+
+================================================================================
+Dot shorthand const constructor
+================================================================================
+
+void f() {
+  var x = const .new(1);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (function_declaration
+    signature: (function_signature
+      return_type: (type
+        (void_type))
+      name: (identifier)
+      parameters: (formal_parameter_list))
+    body: (function_body
+      (block
+        (local_variable_declaration
+          (initialized_variable_definition
+            name: (identifier)
+            value: (static_member_shorthand
+              (arguments
+                (decimal_integer_literal)))))))))
+
+================================================================================
+Super with argument part
+================================================================================
+
+class A extends B {
+  int call(int x) => super(x);
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (class_declaration
+    name: (identifier)
+    superclass: (superclass
+      type: (type
+        (type_identifier)))
+    body: (class_body
+      (class_member
+        (method_declaration
+          signature: (method_signature
+            (function_signature
+              return_type: (type
+                (type_identifier))
+              name: (identifier)
+              parameters: (formal_parameter_list
+                (formal_parameter
+                  (type
+                    (type_identifier))
+                  name: (identifier)))))
+          body: (function_body
+            (call_expression
+              arguments: (arguments
+                (identifier)))))))))
