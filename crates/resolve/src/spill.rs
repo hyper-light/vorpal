@@ -52,6 +52,7 @@ fn form_tag(form: RefForm) -> u8 {
     RefForm::Bare => 0,
     RefForm::Static => 1,
     RefForm::Method => 2,
+    RefForm::MethodHinted => 3,
   }
 }
 
@@ -59,6 +60,7 @@ fn form_of(tag: u8) -> RefForm {
   match tag {
     1 => RefForm::Static,
     2 => RefForm::Method,
+    3 => RefForm::MethodHinted,
     _ => RefForm::Bare,
   }
 }

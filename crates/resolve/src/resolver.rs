@@ -317,7 +317,11 @@ impl Resolver {
           &mut scratch.visible,
         );
       }
-      if reference.form != RefForm::Bare {
+      if reference.form == RefForm::MethodHinted {
+        // The receiver text corroborated no owner — it was an opaque value name after all.
+        // Fall through to plain Method semantics below: the hint may upgrade a resolution,
+        // never veto one.
+      } else if reference.form != RefForm::Bare {
         // The grammar names an owner/namespace and nothing in the tree matches it: the target
         // is outside the corpus (e.g. `Vec::new`). Falling back to bare-name candidates would
         // fake an edge to a coincidentally-named definition.
@@ -333,8 +337,8 @@ impl Resolver {
     }
 
     // Bare names may take a labeled approximate pick on a tie; member accesses on untyped
-    // values carry no evidence beyond the name, so only a unique match binds.
-    let guess_on_tie = reference.form != RefForm::Method;
+    // values (hinted or not) carry no proof beyond the name, so only a unique match binds.
+    let guess_on_tie = !matches!(reference.form, RefForm::Method | RefForm::MethodHinted);
     finish(
       candidates,
       reference,
@@ -985,6 +989,59 @@ mod tests {
     assert_eq!(seeded, 0, "a tied import proves nothing");
     let r = Resolver::new().resolve(&tied, &call("helper", "src/a.rs"));
     assert_eq!(r.reason, ResolveReason::VisibleTie, "no binding, so the tie stays labelled");
+  }
+
+  #[test]
+  fn receiver_hints_upgrade_but_never_veto() {
+    let mut table = SymbolTable::new();
+    table.insert("draw", symbol(1, "a.rs", true, Some("Chart")));
+    table.insert("draw", symbol(2, "b.rs", true, Some("Grid")));
+    table.insert("render", symbol(3, "a.rs", true, Some("Chart")));
+    table.finalize();
+
+    // The hint names an owner: corroborated exactly like a static qualifier, even among
+    // several same-named members.
+    let r = Resolver::new().resolve(
+      &table,
+      &call("draw", "c.rs")
+        .with_qualifier(Some("Grid".into()))
+        .with_form(RefForm::MethodHinted),
+    );
+    assert_eq!(r.target, Some(NodeId::new(2)));
+    assert_eq!(r.reason, ResolveReason::Qualified);
+
+    // The hint names nothing (an opaque variable): fall back to Method semantics — a unique
+    // member binds…
+    let r = Resolver::new().resolve(
+      &table,
+      &call("render", "c.rs")
+        .with_qualifier(Some("mystery".into()))
+        .with_form(RefForm::MethodHinted),
+    );
+    assert_eq!(r.target, Some(NodeId::new(3)), "hint must not veto the unique member");
+    assert_eq!(r.reason, ResolveReason::VisibleExport);
+
+    // …and a non-unique one stays unbound (no blind guessing), exactly like plain Method.
+    let r = Resolver::new().resolve(
+      &table,
+      &call("draw", "c.rs")
+        .with_qualifier(Some("mystery".into()))
+        .with_form(RefForm::MethodHinted),
+    );
+    assert_eq!(r.target, None);
+
+    // A hint must never module-stem match: a variable sharing a file's name is coincidence.
+    let mut files = SymbolTable::new();
+    files.insert("helper", symbol(7, "src/util.rs", true, None));
+    files.insert("helper", symbol(8, "src/other.rs", true, None));
+    files.finalize();
+    let r = Resolver::new().resolve(
+      &files,
+      &call("helper", "c.rs")
+        .with_qualifier(Some("util".into()))
+        .with_form(RefForm::MethodHinted),
+    );
+    assert_eq!(r.target, None, "hinted receivers get owner matching only");
   }
 
   #[test]

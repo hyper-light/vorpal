@@ -46,6 +46,12 @@ pub enum RefForm {
   /// A member access on a value (`x.helper()`): without receiver typing, the name must be
   /// unique among visible definitions to bind.
   Method,
+  /// A member access whose receiver is a plain name we cannot verify (`Foo.bar()`,
+  /// `obj.helper()`): the receiver text rides along as a HINT. If it names an owner in the
+  /// tree, the resolution is corroborated exactly like a static qualifier; if it names
+  /// nothing, the reference falls back to [`RefForm::Method`] semantics — the hint can
+  /// upgrade, never mask.
+  MethodHinted,
 }
 
 /// One reference occurrence: node `from` (in file `from_path`) mentions `name` at `evidence`.

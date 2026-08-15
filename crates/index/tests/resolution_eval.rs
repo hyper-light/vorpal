@@ -257,6 +257,20 @@ fn python_resolution_meets_published_labels() {
       ),
       ("p_amb1.py", "def p_shared():\n    return 10\n"),
       ("p_amb2.py", "def p_shared():\n    return 11\n"),
+      // Receiver hints: `PBox.p_make()` names class PBox, which owns p_make — corroborated
+      // like a static qualifier. `mystery.p_make()` names nothing (an opaque variable), so
+      // the hint falls back to plain Method semantics: p_make is unique among visible
+      // definitions, and the unique member binds at cross-file grade as before the hint
+      // machinery existed.
+      (
+        "p_box.py",
+        "class PBox:\n    def p_make(self):\n        return 1\n",
+      ),
+      (
+        "p_recv.py",
+        "def p_recv_hinted(b):\n    return PBox.p_make()\n\
+         def p_recv_opaque(mystery):\n    return mystery.p_make()\n",
+      ),
       // A local definition shadows the file's own import of the same name: the import edge
       // still targets p_def's `p_shade` (the qualifier says so), but the bare call binds
       // same-file, never import-bound.
@@ -277,6 +291,8 @@ fn python_resolution_meets_published_labels() {
       ("p_alias_user", "p_via_alias", "calls", "constrained", "import-bound"),
       ("p_shadow.py", "p_shade", "imports", "constrained", "qualifier-match"),
       ("p_shadow_user", "p_shade", "calls", "exact", "same-file"),
+      ("p_recv_hinted", "p_make", "calls", "constrained", "qualifier-match"),
+      ("p_recv_opaque", "p_make", "calls", "constrained", "visible-export"),
     ],
     absent: &[
       ("p_ext", "never_defined_fn"),
@@ -356,11 +372,10 @@ fn java_resolution_meets_published_labels() {
       ),
     ],
     expected: &[
-      // Today the extraction does not capture the `JDef.` qualifier for Java static calls, so
-      // the resolver takes the bare visible-export path (unique target — same edge, same
-      // grade). When Java qualifier capture lands, this label flips to qualifier-match and
-      // this harness gates the change.
-      ("jCaller", "jTarget", "calls", "constrained", "visible-export"),
+      // The receiver-hint upgrade, exactly as this fixture predicted: `JDef.jTarget()`
+      // carries its receiver as an owner hint, class JDef owns jTarget, and the resolution
+      // is corroborated — qualifier-match, no longer a bare visible-export coincidence.
+      ("jCaller", "jTarget", "calls", "constrained", "qualifier-match"),
       ("jLocalA", "jLocalB", "calls", "exact", "same-file"),
     ],
     absent: &[("jExt", "neverDefinedFn")],

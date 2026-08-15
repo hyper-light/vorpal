@@ -29,8 +29,9 @@ use vorpal_resolve::{RefForm, RefKind};
 /// Rust `use a::b::c`); v11 adds affected-byte counts and representative merged error spans
 /// (parse health beyond a scalar, IMPROVEMENTS #11); v12 carries the aliased-import local
 /// rebinding (`from x import y as z` → alias `z`), so import bindings can key on the name
-/// bare uses actually say.
-pub const PRODUCT_FORMAT_VERSION: u32 = 12;
+/// bare uses actually say; v13 adds the MethodHinted form — member-access receivers ride as
+/// owner hints (`Foo.bar()` corroborates class Foo) instead of being discarded.
+pub const PRODUCT_FORMAT_VERSION: u32 = 13;
 
 /// One file's extraction output, serializable for the on-disk product cache.
 #[derive(Debug, Clone)]
@@ -115,6 +116,7 @@ pub(crate) fn refform_tag(form: RefForm) -> u8 {
     RefForm::Bare => 0,
     RefForm::Static => 1,
     RefForm::Method => 2,
+    RefForm::MethodHinted => 3,
   }
 }
 
@@ -122,6 +124,7 @@ pub(crate) fn tag_refform(tag: u8) -> RefForm {
   match tag {
     1 => RefForm::Static,
     2 => RefForm::Method,
+    3 => RefForm::MethodHinted,
     _ => RefForm::Bare,
   }
 }

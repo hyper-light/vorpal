@@ -1031,7 +1031,7 @@ fn classify_call<'t>(
   }
   if let Some(receiver_field) = cspec.receiver_field {
     if let Some(receiver) = call.field(receiver_field) {
-      return (RefForm::Method, self_receiver_owner(&receiver, spec, owner));
+      return classify_receiver(&receiver, spec, owner);
     }
     return (RefForm::Bare, None);
   }
@@ -1043,11 +1043,42 @@ fn classify_call<'t>(
     return (RefForm::Static, scope.as_ref().and_then(qualifier_of));
   }
   if spec.method_callee_kinds.contains(&callee_kind) {
-    let receiver = RECEIVER_FIELDS.iter().find_map(|f| callee.field(f));
-    let qualifier = receiver.and_then(|r| self_receiver_owner(&r, spec, owner));
-    return (RefForm::Method, qualifier);
+    return match RECEIVER_FIELDS.iter().find_map(|f| callee.field(f)) {
+      Some(receiver) => classify_receiver(&receiver, spec, owner),
+      None => (RefForm::Method, None),
+    };
   }
   (RefForm::Bare, None)
+}
+
+/// Classify a member-access receiver (Java `obj.m()` / Python `Foo.bar()` / Rust
+/// `x.helper()` / …):
+/// - a **self keyword** proves the enclosing owner — [`RefForm::Method`] with the owner as a
+///   qualifier the resolver may trust outright;
+/// - a **plain single-token name** rides along as a HINT — [`RefForm::MethodHinted`]: if it
+///   names an owner in the tree (`Foo.bar()` where class `Foo` has `bar`), resolution is
+///   corroborated exactly like a static qualifier; if it names nothing (`obj` is just a
+///   variable), the resolver falls back to plain Method semantics. Structural either way —
+///   no capitalization heuristics;
+/// - anything else (call results, chained accesses) is opaque: plain Method, no hint.
+fn classify_receiver<'t>(
+  receiver: &SgNode<'t>,
+  spec: &RefSpec,
+  owner: impl FnOnce() -> Option<Cow<'t, str>>,
+) -> (RefForm, Option<Cow<'t, str>>) {
+  let text = trim_cow(receiver.text(), str::trim);
+  if spec.self_receivers.contains(&text.as_ref()) || text.as_ref() == "Self" {
+    return (RefForm::Method, owner());
+  }
+  let plain_name = !text.is_empty()
+    && text
+      .chars()
+      .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+  if plain_name {
+    (RefForm::MethodHinted, Some(text))
+  } else {
+    (RefForm::Method, None)
+  }
 }
 
 /// The enclosing item's name iff the receiver is a self keyword; other receivers are opaque.
@@ -1645,10 +1676,12 @@ mod tests {
     assert_eq!(plain.form, RefForm::Bare, "{plain:?}");
     assert_eq!(plain.qualifier, None);
     let method = find("method");
-    assert_eq!(method.form, RefForm::Method, "{method:?}");
+    assert_eq!(method.form, RefForm::MethodHinted, "{method:?}");
     assert_eq!(
-      method.qualifier, None,
-      "a value receiver is not namespace evidence"
+      method.qualifier.as_deref(),
+      Some("value"),
+      "a plain-name receiver rides as a HINT — the resolver corroborates it against owners \
+       or drops it, never treats it as proof"
     );
   }
 
