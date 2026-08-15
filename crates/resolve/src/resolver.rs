@@ -263,6 +263,27 @@ impl Resolver {
       }
     }
     let candidates = table.candidates(reference.name);
+    // A bare name in a file whose own import provably bound it (the qualified import
+    // resolved to a single corroborated target — ties never seed bindings, so ambiguity
+    // cannot launder through here) resolves to that import's target, unless a local
+    // definition shadows the import. This check precedes the empty-candidates return
+    // because an ALIASED import's local name has no candidates of its own (`from x import
+    // y as z`: nothing anywhere defines `z`), yet `z()` is exactly the call the binding
+    // proves. Confidence stays cross-file: the use inherits the import's certainty.
+    if reference.form == RefForm::Bare {
+      if let Some(target) = table.import_binding(reference.from_path, reference.name) {
+        if !candidates.iter().any(|s| s.path == reference.from_path) {
+          return Resolution {
+            target: Some(target),
+            edge,
+            confidence: Confidence::CROSS_FILE,
+            candidates: candidates.len(),
+            reason: ResolveReason::ImportBound,
+            alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
+          };
+        }
+      }
+    }
     if candidates.is_empty() {
       return Resolution {
         target: None,
@@ -308,26 +329,6 @@ impl Resolver {
           reason: ResolveReason::None,
           alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
         };
-      }
-    }
-
-    // A bare name in a file whose own import provably bound it (the qualified import resolved
-    // to a single corroborated target — ties never seed bindings, so ambiguity cannot launder
-    // through here) resolves to that import's target, unless a local definition shadows the
-    // import. Confidence stays cross-file: the use inherits the import's certainty, never
-    // exceeds it.
-    if reference.form == RefForm::Bare {
-      if let Some(target) = table.import_binding(reference.from_path, reference.name) {
-        if !candidates.iter().any(|s| s.path == reference.from_path) {
-          return Resolution {
-            target: Some(target),
-            edge,
-            confidence: Confidence::CROSS_FILE,
-            candidates: candidates.len(),
-            reason: ResolveReason::ImportBound,
-            alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
-          };
-        }
       }
     }
 
@@ -628,7 +629,10 @@ pub fn seed_import_bindings(
     ) {
       continue;
     }
-    bindings.insert((reference.from_path, reference.name), target);
+    // An aliased import rebinds under its LOCAL name — that is what bare uses in the file
+    // say, so the binding keys on the alias when one exists.
+    let bound_name = reference.alias.unwrap_or(reference.name);
+    bindings.insert((reference.from_path, bound_name), target);
   }
   let count = bindings.len();
   table.set_import_bindings(bindings);
@@ -949,6 +953,27 @@ mod tests {
     let r = Resolver::new().resolve(&shadowed, &call("helper", "src/a.rs"));
     assert_eq!(r.target, Some(NodeId::new(3)));
     assert_eq!(r.reason, ResolveReason::Local);
+
+    // An aliased import rebinds under its LOCAL name: the binding keys on the alias, and a
+    // bare use of that alias — a name with ZERO candidates of its own — still resolves
+    // import-bound (the consult precedes the empty-candidates return).
+    let mut aliased = SymbolTable::new();
+    aliased.insert("helper", symbol(1, "src/util.rs", true, None));
+    aliased.finalize();
+    let aliased_import = Reference::new(NodeId::new(9), "src/a.rs", "helper", RefKind::Import)
+      .with_qualifier(Some("util".into()))
+      .with_form(RefForm::Static)
+      .with_alias_ref(Some("h"));
+    let seeded = seed_import_bindings(&mut aliased, &[aliased_import], &Resolver::new());
+    assert_eq!(seeded, 1);
+    let r = Resolver::new().resolve(&aliased, &call("h", "src/a.rs"));
+    assert_eq!(r.target, Some(NodeId::new(1)), "alias call binds the original");
+    assert_eq!(r.reason, ResolveReason::ImportBound);
+    assert_eq!(r.candidates, 0, "the alias itself is defined nowhere");
+    // The ORIGINAL name did not get a binding in the aliased form — `helper()` in that file
+    // resolves through normal visibility, not the alias binding.
+    let r = Resolver::new().resolve(&aliased, &call("helper", "src/a.rs"));
+    assert_eq!(r.reason, ResolveReason::VisibleExport);
 
     // Two module files share the qualifier's stem: the import itself is a qualifier TIE, and
     // a tied import must seed nothing — ambiguity never launders into a binding.

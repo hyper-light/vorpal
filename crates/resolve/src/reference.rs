@@ -72,6 +72,11 @@ pub struct Reference {
   pub qualifier: Option<NameId>,
   /// The syntactic shape (see [`RefForm`]).
   pub form: RefForm,
+  /// The local rebinding an aliased import introduces (`from x import y as z` → `z`;
+  /// `use a::b as c` → `c`), interned. The reference's `name` stays the ORIGINAL (the edge
+  /// targets the real definition); the alias is what the importing file's bare uses say, so
+  /// the import-binding pre-pass keys on it.
+  pub alias: Option<NameId>,
 }
 
 impl Reference {
@@ -84,6 +89,7 @@ impl Reference {
       evidence: (0, 0),
       qualifier: None,
       form: RefForm::Bare,
+      alias: None,
     }
   }
 
@@ -98,6 +104,7 @@ impl Reference {
       evidence: (0, 0),
       qualifier: None,
       form: RefForm::Bare,
+      alias: None,
     }
   }
 
@@ -119,6 +126,12 @@ impl Reference {
 
   pub fn with_form(mut self, form: RefForm) -> Self {
     self.form = form;
+    self
+  }
+
+  /// [`Reference::with_qualifier_ref`]'s sibling for the aliased-import rebinding.
+  pub fn with_alias_ref(mut self, alias: Option<&str>) -> Self {
+    self.alias = alias.map(intern::intern);
     self
   }
 }

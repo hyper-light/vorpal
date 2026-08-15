@@ -41,6 +41,8 @@ pub(crate) struct RawRef<'t> {
   pub(crate) end: u32,
   pub(crate) qualifier: Option<Cow<'t, str>>,
   pub(crate) form: RefForm,
+  /// Aliased-import local rebinding (`as z`), when the grammar provides one.
+  pub(crate) alias: Option<Cow<'t, str>>,
 }
 
 impl<'t> RawRef<'t> {
@@ -53,6 +55,7 @@ impl<'t> RawRef<'t> {
       end,
       qualifier: None,
       form: RefForm::Bare,
+      alias: None,
     }
   }
 }
@@ -955,6 +958,7 @@ pub(crate) fn extract_references<'t>(
                 end: range.end as u32,
                 qualifier,
                 form,
+                alias: None,
               }));
             }
           }
@@ -1273,9 +1277,19 @@ fn emit_imports<'t>(
         end: range.end as u32,
         qualifier,
         form,
+        alias: import_alias(&target),
       }));
     }
   }
+}
+
+/// The local rebinding an aliased import introduces for `target`: `aliased_import`
+/// (`from x import y as z`) and `use_as_clause` (`use a::b as c`) both carry it in their
+/// `alias` field. `None` everywhere else — the imported name IS the local name.
+fn import_alias<'t>(target: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  let alias = target.field("alias")?;
+  let trimmed = trim_cow(alias.text(), str::trim);
+  (!trimmed.is_empty() && !trimmed.contains(char::is_whitespace)).then_some(trimmed)
 }
 
 /// The source-module qualifier an import construct provides for `target`, reduced to its final
@@ -1790,6 +1804,7 @@ mod tests {
                 end: range.end as u32,
                 qualifier,
                 form,
+                alias: import_alias(&target),
               });
             }
           }
@@ -1945,6 +1960,7 @@ mod tests {
               end: range.end as u32,
               qualifier,
               form,
+              alias: None,
             });
           }
         }

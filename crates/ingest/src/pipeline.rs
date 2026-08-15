@@ -423,6 +423,7 @@ pub(crate) fn apply_product(
       end: r.end,
       qualifier: r.qualifier.as_deref(),
       form: r.form,
+      alias: r.alias.as_deref(),
     }),
     writer,
     references,
@@ -473,6 +474,7 @@ fn apply_parts<'a>(
         Reference::with_interned_path(from, path_id, r.name, crate::product::tag_refkind(r.kind))
           .with_evidence(r.start, r.end)
           .with_qualifier_ref(r.qualifier)
+          .with_alias_ref(r.alias)
           .with_form(crate::product::tag_refform(r.form)),
       );
     }

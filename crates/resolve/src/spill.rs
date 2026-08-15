@@ -7,7 +7,7 @@
 //! temp file written behind a `BufWriter` and a streaming read whose in-flight memory is a
 //! few chunks.
 //!
-//! Records are fixed-width 30-byte little-endian, portable by construction, but the file is
+//! Records are fixed-width 34-byte little-endian, portable by construction, but the file is
 //! **process-private**: it stores interned `NameId` bits, which are meaningless outside the
 //! process that wrote them (and are never stable across runs). Create, read, delete — never
 //! persist.
@@ -22,7 +22,7 @@ use crate::intern::NameId;
 use crate::reference::{RefForm, RefKind, Reference};
 
 /// Bytes per spilled reference record.
-const RECORD: usize = 30;
+const RECORD: usize = 34;
 
 /// References per read chunk (~1 MB in flight per chunk).
 pub const SPILL_CHUNK: usize = 32_768;
@@ -74,6 +74,8 @@ fn encode(reference: &Reference, buf: &mut [u8; RECORD]) {
   buf[24..28].copy_from_slice(&reference.evidence.1.to_le_bytes());
   buf[28] = kind_tag(reference.kind);
   buf[29] = form_tag(reference.form);
+  let alias = reference.alias.map(NameId::to_bits).unwrap_or(0);
+  buf[30..34].copy_from_slice(&alias.to_le_bytes());
 }
 
 fn decode(buf: &[u8; RECORD]) -> Reference {
@@ -87,6 +89,7 @@ fn decode(buf: &[u8; RECORD]) -> Reference {
     evidence: (u32_at(20), u32_at(24)),
     kind: kind_of(buf[28]),
     form: form_of(buf[29]),
+    alias: NameId::from_bits(u32_at(30)),
   }
 }
 

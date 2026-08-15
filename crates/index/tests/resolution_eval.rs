@@ -156,7 +156,8 @@ fn rust_resolution_meets_published_labels() {
     files: &[
       (
         "r_def.rs",
-        "pub fn r_target() -> u32 { 1 }\npub struct RThing;\nfn r_private() -> u32 { 2 }\n",
+        "pub fn r_target() -> u32 { 1 }\npub struct RThing;\nfn r_private() -> u32 { 2 }\n\
+         pub fn r_plain() -> u32 { 8 }\n",
       ),
       (
         "r_use.rs",
@@ -187,8 +188,10 @@ fn rust_resolution_meets_published_labels() {
         "r_imp.rs",
         "use crate::r_def::r_target;\n\
          use crate::r_amb2::r_shared;\n\
+         use crate::r_def::r_plain as rp;\n\
          use vendored::r_caller;\n\
-         pub fn r_imp_user() -> u32 { r_shared() }\n",
+         pub fn r_imp_user() -> u32 { r_shared() }\n\
+         pub fn r_alias_user() -> u32 { rp() }\n",
       ),
     ],
     expected: &[
@@ -199,6 +202,10 @@ fn rust_resolution_meets_published_labels() {
       ("r_imp.rs", "r_target", "imports", "constrained", "qualifier-match"),
       ("r_imp.rs", "r_shared", "imports", "constrained", "qualifier-match"),
       ("r_imp_user", "r_shared", "calls", "constrained", "import-bound"),
+      // Aliased use: the import edge targets the original; the call to the alias `rp` —
+      // defined nowhere — binds through the file's import.
+      ("r_imp.rs", "r_plain", "imports", "constrained", "qualifier-match"),
+      ("r_alias_user", "r_plain", "calls", "constrained", "import-bound"),
     ],
     absent: &[
       ("r_ext", "total_mystery_fn"), // defined nowhere — external, no edge
@@ -216,7 +223,8 @@ fn python_resolution_meets_published_labels() {
     files: &[
       (
         "p_def.py",
-        "def p_target():\n    return 1\ndef p_shade():\n    return 3\n",
+        "def p_target():\n    return 1\ndef p_shade():\n    return 3\n\
+         def p_via_alias():\n    return 6\n",
       ),
       (
         "p_use.py",
@@ -235,12 +243,17 @@ fn python_resolution_meets_published_labels() {
       // provably lands on a different target than the old guess.
       // `from vendored_dep import p_caller` names a module outside the corpus: it must NOT
       // fall back to the coincidentally-named local `p_caller`.
+      // The aliased import rebinds under its LOCAL name: the import edge still targets the
+      // original definition, and the bare call to the ALIAS — a name defined nowhere —
+      // resolves import-bound through the file's own import.
       (
         "p_imp.py",
         "from p_def import p_target\n\
          from p_amb2 import p_shared\n\
+         from p_def import p_via_alias as local_alias\n\
          from vendored_dep import p_caller\n\
-         def p_imp_user():\n    return p_shared()\n",
+         def p_imp_user():\n    return p_shared()\n\
+         def p_alias_user():\n    return local_alias()\n",
       ),
       ("p_amb1.py", "def p_shared():\n    return 10\n"),
       ("p_amb2.py", "def p_shared():\n    return 11\n"),
@@ -260,6 +273,8 @@ fn python_resolution_meets_published_labels() {
       ("p_imp.py", "p_target", "imports", "constrained", "qualifier-match"),
       ("p_imp.py", "p_shared", "imports", "constrained", "qualifier-match"),
       ("p_imp_user", "p_shared", "calls", "constrained", "import-bound"),
+      ("p_imp.py", "p_via_alias", "imports", "constrained", "qualifier-match"),
+      ("p_alias_user", "p_via_alias", "calls", "constrained", "import-bound"),
       ("p_shadow.py", "p_shade", "imports", "constrained", "qualifier-match"),
       ("p_shadow_user", "p_shade", "calls", "exact", "same-file"),
     ],

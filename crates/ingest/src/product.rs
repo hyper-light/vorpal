@@ -27,8 +27,10 @@ use vorpal_resolve::{RefForm, RefKind};
 /// grammar-generation digest to the header; v9 widens the parse-error flag to an error-node
 /// count; v10 captures source-module qualifiers on import references (Python `from X import y`,
 /// Rust `use a::b::c`); v11 adds affected-byte counts and representative merged error spans
-/// (parse health beyond a scalar, IMPROVEMENTS #11).
-pub const PRODUCT_FORMAT_VERSION: u32 = 11;
+/// (parse health beyond a scalar, IMPROVEMENTS #11); v12 carries the aliased-import local
+/// rebinding (`from x import y as z` → alias `z`), so import bindings can key on the name
+/// bare uses actually say.
+pub const PRODUCT_FORMAT_VERSION: u32 = 12;
 
 /// One file's extraction output, serializable for the on-disk product cache.
 #[derive(Debug, Clone)]
@@ -78,6 +80,8 @@ pub struct ProductRef {
   pub from_entity_index: u32,
   pub name: String,
   pub kind: u8,
+  /// Aliased-import local rebinding (`as z`), when the grammar provides one.
+  pub alias: Option<String>,
   pub start: u32,
   pub end: u32,
   /// Grammar-provided qualifier evidence (owner/namespace), when any.
@@ -374,6 +378,13 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
       }
       None => buf.push(0),
     }
+    match &r.alias {
+      Some(a) => {
+        buf.push(1);
+        push_str(buf, a);
+      }
+      None => buf.push(0),
+    }
   }
 }
 
@@ -504,6 +515,7 @@ pub struct RefView<'a> {
   pub end: u32,
   pub qualifier: Option<&'a str>,
   pub form: u8,
+  pub alias: Option<&'a str>,
 }
 
 /// The stat stamp of an encoded product, read from its fixed header — magic and format
@@ -622,6 +634,9 @@ pub fn validate_product(bytes: &[u8]) -> bool {
       if r.u8()? != 0 {
         r.str_borrowed()?;
       }
+      if r.u8()? != 0 {
+        r.str_borrowed()?;
+      }
     }
     Ok(())
   }
@@ -683,6 +698,11 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     } else {
       None
     };
+    let alias = if r.u8()? != 0 {
+      Some(r.str_borrowed()?)
+    } else {
+      None
+    };
     refs.push(RefView {
       from_entity_index,
       name,
@@ -691,6 +711,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       end,
       qualifier,
       form,
+      alias,
     });
   }
   Ok(ProductView {
@@ -755,6 +776,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     let end = r.u32()?;
     let form = r.u8()?;
     let qualifier = if r.u8()? != 0 { Some(r.str()?) } else { None };
+    let alias = if r.u8()? != 0 { Some(r.str()?) } else { None };
     refs.push(ProductRef {
       from_entity_index,
       name,
@@ -763,6 +785,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
       end,
       qualifier,
       form,
+      alias,
     });
   }
   if r.off != bytes.len() {

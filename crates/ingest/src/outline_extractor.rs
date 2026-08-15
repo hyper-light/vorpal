@@ -164,6 +164,7 @@ impl OutlineExtractor {
         end: r.end,
         qualifier: r.qualifier.map(Cow::into_owned),
         form: product::refform_tag(r.form),
+        alias: r.alias.map(Cow::into_owned),
       })
       .collect();
 
