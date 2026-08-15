@@ -136,7 +136,16 @@ rule:
           kind: compound_statement
           stopBy: end
 name: $NAME
-isExported: true
+# Internal linkage is honest visibility (§3.3), same as c-function: a `static` file-scope
+# variable is translation-unit-local. Exporting it did double damage — the resolver could
+# fake cross-file edges to it, AND it sat in the global symbol table as a candidate that
+# call/type resolution could tie against or mispick. Direct-child check only (locals are
+# already excluded by the compound_statement guard above).
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
 ---
 id: c-struct-field
 language: C

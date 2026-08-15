@@ -359,7 +359,8 @@ fn c_resolution_meets_published_labels() {
     files: &[
       (
         "c_def.c",
-        "int c_target(void) { return 1; }\nstatic int c_priv(void) { return 2; }\n",
+        "int c_target(void) { return 1; }\nstatic int c_priv(void) { return 2; }\n\
+         static int c_tu_local = 3;\nint c_shared_var = 4;\n",
       ),
       (
         "c_use.c",
@@ -367,7 +368,8 @@ fn c_resolution_meets_published_labels() {
          int c_local_a(void) { return c_local_b(); }\n\
          int c_local_b(void) { return 2; }\n\
          int c_ext(void) { return never_defined_fn(); }\n\
-         int c_masked(void) { return c_priv(); }\n",
+         int c_masked(void) { return c_priv(); }\n\
+         int c_var_masked(void) { return c_tu_local(); }\n",
       ),
     ],
     expected: &[
@@ -377,6 +379,11 @@ fn c_resolution_meets_published_labels() {
     absent: &[
       ("c_ext", "never_defined_fn"),
       ("c_masked", "c_priv"), // `static` is translation-unit-local — masked, no edge
+      // A `static` file-scope VARIABLE is TU-local too: before the linkage fix this call's
+      // only candidate was c_def.c's static variable and the resolver minted a nonsense
+      // call→variable edge across files; now it is masked. (c_shared_var above stays
+      // exported — non-static file-scope variables keep external linkage.)
+      ("c_var_masked", "c_tu_local"),
     ],
   });
 }
