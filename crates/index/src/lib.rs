@@ -623,26 +623,47 @@ fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<
       };
     }
   }
-  // Content id: stream every artifact (fixed order) through one xxh3-128.
+  // Content id over every artifact in fixed order. Chunked-parallel: each artifact is read
+  // and hashed in 8 MiB chunks fanned across the pool, and the id folds the per-chunk
+  // digests (with the artifact name and length) in deterministic order. The previous
+  // single-stream hash serialized ~2 GB of read+hash at kernel scale into one thread at the
+  // very end of the build. The id remains a pure function of the artifact bytes — the
+  // folding shape is an internal detail of this binary version (ids are content addresses,
+  // not a cross-version interchange format; see docs/INDEX_FORMAT.md).
+  vorpal_kg::phase_stamp("commit: content-id hash start");
+  const HASH_CHUNK: u64 = 8 << 20;
   let mut hasher = xxhash_rust::xxh3::Xxh3::new();
   for artifact in GENERATION_ARTIFACTS {
     let path = staging.join(artifact);
-    let Ok(mut file) = fs::File::open(&path) else {
+    let Ok(file) = fs::File::open(&path) else {
       continue; // an artifact a smaller index legitimately lacks still yields a stable id
     };
-    hasher.update(artifact.as_bytes());
     let len = file.metadata()?.len();
+    hasher.update(artifact.as_bytes());
     hasher.update(&len.to_le_bytes());
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-      let n = io::Read::read(&mut file, &mut buf)?;
-      if n == 0 {
-        break;
-      }
-      hasher.update(&buf[..n]);
+    let chunk_count = len.div_ceil(HASH_CHUNK);
+    let chunk_digests: io::Result<Vec<u128>> = {
+      use rayon::prelude::*;
+      use std::os::unix::fs::FileExt;
+      // pread per chunk: threads share the fd position-free, and in-flight memory stays at
+      // (pool width × 8 MiB) — the whole-artifact read would have re-materialized a
+      // ~gigabyte pack this build just spent effort never holding at once.
+      (0..chunk_count)
+        .into_par_iter()
+        .map(|index| {
+          let offset = index * HASH_CHUNK;
+          let mut buf = vec![0u8; HASH_CHUNK.min(len - offset) as usize];
+          file.read_exact_at(&mut buf, offset)?;
+          Ok(xxhash_rust::xxh3::xxh3_128(&buf))
+        })
+        .collect()
+    };
+    for digest in chunk_digests? {
+      hasher.update(&digest.to_le_bytes());
     }
   }
   let id = format!("{:032x}", hasher.digest128());
+  vorpal_kg::phase_stamp("commit: content-id hash done");
   let final_dir = root.join("gen").join(&id);
   // Dedup guard: an existing same-id generation is byte-identical *by construction*, but only
   // if it is still complete — a tampered or partially-deleted dir must not be trusted over the
