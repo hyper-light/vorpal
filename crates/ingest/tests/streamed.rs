@@ -8,9 +8,16 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use vorpal_ingest::{
+
   FileProduct, FileStat, OutlineExtractor, Resolver, StreamWork, apply_products_sharded,
   link_writer, link_writer_spilled, stream_apply, stream_apply_spilled,
 };
+
+/// One shared session for the whole test binary — bounded vocabulary, no lifetime plumbing.
+fn itn() -> &'static vorpal_ingest::Interner {
+  static INTERNER: std::sync::OnceLock<vorpal_ingest::Interner> = std::sync::OnceLock::new();
+  INTERNER.get_or_init(vorpal_ingest::Interner::default)
+}
 
 fn corpus() -> Vec<(String, String)> {
   let mut files = Vec::new();
@@ -55,7 +62,7 @@ fn assert_identical_to_batch(budget: u64, tag: &str) {
   let by_path: HashMap<String, FileProduct> = products.iter().cloned().collect();
   let entries = entries_for(&files);
 
-  let (writer, references, stats) = stream_apply(&entries, budget, |entry, _scratch| {
+  let (writer, references, stats) = stream_apply(itn(), &entries, budget, |entry, _scratch| {
     Ok(StreamWork::Parsed(
       entry.path.clone(),
       by_path[&entry.path].clone(),
@@ -69,10 +76,10 @@ fn assert_identical_to_batch(budget: u64, tag: &str) {
     "budget must bound in-flight bytes: peak {} > budget {budget} ({tag})",
     stats.peak_in_flight_bytes
   );
-  let (streamed_kg, streamed_stats) = link_writer(writer, references, &Resolver::new());
+  let (streamed_kg, streamed_stats) = link_writer(itn(), writer, references, &Resolver::new());
 
-  let (writer, references) = apply_products_sharded(products);
-  let (batch_kg, batch_stats) = link_writer(writer, references, &Resolver::new());
+  let (writer, references) = apply_products_sharded(itn(), products);
+  let (batch_kg, batch_stats) = link_writer(itn(), writer, references, &Resolver::new());
 
   assert_eq!(streamed_stats, batch_stats, "{tag}");
   let base = std::env::temp_dir().join(format!("vorpal-streamed-eq-{tag}-{}", std::process::id()));
@@ -110,7 +117,7 @@ fn skips_advance_order_without_perturbing_the_rest() {
   let entries = entries_for(&files);
 
   // Stream: every third file is skipped (unreadable/unsupported in real runs).
-  let (writer, references, stats) = stream_apply(&entries, 64 * 1024, |entry, _| {
+  let (writer, references, stats) = stream_apply(itn(), &entries, 64 * 1024, |entry, _| {
     let index: usize = entry.path[8..11].parse().unwrap();
     if index % 3 == 0 {
       return Ok(StreamWork::Skipped);
@@ -122,7 +129,7 @@ fn skips_advance_order_without_perturbing_the_rest() {
   })
   .expect("stream succeeds");
   assert_eq!(stats.replayed, 80);
-  let (streamed_kg, streamed_stats) = link_writer(writer, references, &Resolver::new());
+  let (streamed_kg, streamed_stats) = link_writer(itn(), writer, references, &Resolver::new());
 
   // Batch over exactly the non-skipped products.
   let kept: Vec<_> = products
@@ -131,8 +138,8 @@ fn skips_advance_order_without_perturbing_the_rest() {
     .filter(|(i, _)| i % 3 != 0)
     .map(|(_, product)| product)
     .collect();
-  let (writer, references) = apply_products_sharded(kept);
-  let (batch_kg, batch_stats) = link_writer(writer, references, &Resolver::new());
+  let (writer, references) = apply_products_sharded(itn(), kept);
+  let (batch_kg, batch_stats) = link_writer(itn(), writer, references, &Resolver::new());
 
   assert_eq!(streamed_stats, batch_stats);
   assert_eq!(streamed_kg.node_count(), batch_kg.node_count());
@@ -145,7 +152,7 @@ fn first_error_aborts_the_stream_without_hanging() {
   let entries = entries_for(&files);
   let attempts = AtomicU64::new(0);
 
-  let result = stream_apply(&entries, 8 * 1024, |entry, _| {
+  let result = stream_apply(itn(), &entries, 8 * 1024, |entry, _| {
     let n = attempts.fetch_add(1, Ordering::Relaxed);
     if n == 57 {
       return Err(io::Error::other("injected cache-write failure"));
@@ -180,6 +187,7 @@ fn spilled_references_are_byte_identical_to_the_ram_path() {
   // identically through write-through + map-back.
   let heap_stream = base.join("strings.heap.tmp");
   let (writer, spill, stats) = stream_apply_spilled(
+    itn(),
     &entries,
     64 * 1024 * 1024,
     &spill_path,
@@ -196,20 +204,20 @@ fn spilled_references_are_byte_identical_to_the_ram_path() {
   assert_eq!(stats.parsed, 120);
   assert!(spill.count() > 0, "corpus produces references");
   let (spilled_kg, spilled_stats, _evidence) =
-    link_writer_spilled(writer, spill, &Resolver::new()).expect("spilled link succeeds");
+    link_writer_spilled(itn(), writer, spill, &Resolver::new()).expect("spilled link succeeds");
   assert!(
     !spill_path.exists(),
     "spill is deleted once resolution has streamed it"
   );
 
-  let (writer, references, _) = stream_apply(&entries, 64 * 1024 * 1024, |entry, _scratch| {
+  let (writer, references, _) = stream_apply(itn(), &entries, 64 * 1024 * 1024, |entry, _scratch| {
     Ok(StreamWork::Parsed(
       entry.path.clone(),
       by_path[&entry.path].clone(),
     ))
   })
   .expect("stream succeeds");
-  let (ram_kg, ram_stats) = link_writer(writer, references, &Resolver::new());
+  let (ram_kg, ram_stats) = link_writer(itn(), writer, references, &Resolver::new());
 
   assert_eq!(spilled_stats, ram_stats);
   let (a, b) = (base.join("spilled"), base.join("ram"));

@@ -133,46 +133,6 @@ impl CacheMode {
   }
 }
 
-/// Builds currently in flight in this process — the runtime check behind
-/// [`reclaim_session_memory`].
-static ACTIVE_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// What was freed by one [`reclaim_session_memory`] call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReclaimStats {
-  pub strings: usize,
-  pub bytes: usize,
-}
-
-/// Free the process-wide interner between index sessions — the memory-lifecycle valve for
-/// **long-lived embedded hosts** (see docs/EMBEDDING.md). Within one session the interner is
-/// bounded by the corpus vocabulary; across many sessions it grows monotonically, and this
-/// is the boundary that returns it to zero. One-shot processes (the CLI) never need it.
-///
-/// Panics if any `build_index*` call is in flight — that much misuse is caught at runtime.
-///
-/// # Safety
-///
-/// Everything `vorpal_resolve::intern::reclaim_all` requires: no vorpal call may be
-/// executing concurrently anywhere in the process, and no value that predates the call —
-/// `Reference`s, `SymbolTable`s, spills, or any `&str` the resolution layer handed out —
-/// may be used afterwards. Loaded [`Kg`]s and query results are safe to keep: persisted
-/// artifacts and their views never contain interner ids.
-pub unsafe fn reclaim_session_memory() -> ReclaimStats {
-  assert_eq!(
-    ACTIVE_BUILDS.load(std::sync::atomic::Ordering::Acquire),
-    0,
-    "reclaim_session_memory called while a build is in flight"
-  );
-  let stats = ReclaimStats {
-    strings: vorpal_ingest::intern_retained_strings(),
-    bytes: vorpal_ingest::intern_retained_bytes(),
-  };
-  // SAFETY: forwarded contract — the caller upholds quiescence and drops prior values.
-  unsafe { vorpal_ingest::intern_reclaim_all() };
-  stats
-}
-
 /// What a build does about files whose parse produced ERROR nodes (IMPROVEMENTS #11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParseHealthMode {
@@ -240,16 +200,11 @@ pub fn build_index_full(
   cache_mode: CacheMode,
   policy: ParseHealthPolicy,
 ) -> Result<IndexReport, Box<dyn Error>> {
-  // Embedded-host accounting: `reclaim_session_memory` refuses while any build is in
-  // flight. RAII so every early return and error path decrements.
-  struct BuildGuard;
-  impl Drop for BuildGuard {
-    fn drop(&mut self) {
-      ACTIVE_BUILDS.fetch_sub(1, std::sync::atomic::Ordering::Release);
-    }
-  }
-  ACTIVE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Acquire);
-  let _build_guard = BuildGuard;
+  // The build session's string interner (scoped-interner contract, docs/EMBEDDING.md):
+  // created here, dropped when this function returns — reclaim is `Drop`, and the `NameId`
+  // lifetime brand makes anything holding a session id un-returnable at compile time.
+  // Embedded hosts get bounded memory with no reclaim call at all.
+  let interner = vorpal_ingest::Interner::default();
   let extractor = OutlineExtractor::new()?;
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
@@ -415,6 +370,7 @@ pub fn build_index_full(
   let spill_path = staging.join(".refs.spill");
   let heap_stream = staging.join("strings.heap.tmp");
   let stream_result = stream_apply_spilled(
+    &interner,
     manifest.entries(),
     stream_budget_bytes(),
     &spill_path,
@@ -595,7 +551,8 @@ pub fn build_index_full(
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve, evidence) = link_writer_spilled(writer, spilled_refs, &Resolver::new())?;
+  let (kg, resolve, evidence) =
+    link_writer_spilled(&interner, writer, spilled_refs, &Resolver::new())?;
   // Persist the per-edge evidence sidecar into the staged generation (§5): span, resolver
   // reason, confidence, and candidate count per edge occurrence — canonically sorted, so it
   // joins the generation's content identity deterministically.

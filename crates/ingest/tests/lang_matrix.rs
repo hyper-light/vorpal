@@ -5,8 +5,15 @@
 use vorpal_ingest::{Ingestor, Kg, NodeId, OutlineExtractor, Resolver};
 use vorpal_kg::EdgeType;
 
+/// One shared session for the whole test binary — bounded vocabulary, no lifetime plumbing.
+fn itn() -> &'static vorpal_ingest::Interner {
+  static INTERNER: std::sync::OnceLock<vorpal_ingest::Interner> = std::sync::OnceLock::new();
+  INTERNER.get_or_init(vorpal_ingest::Interner::default)
+}
+
+
 fn kg_for(files: &[(&str, &str)]) -> (Kg, vorpal_ingest::ResolveStats) {
-  let mut ing = Ingestor::new(OutlineExtractor::new().unwrap());
+  let mut ing = Ingestor::new(itn(), OutlineExtractor::new().unwrap());
   for (path, src) in files {
     ing.ingest_source(path, src);
   }

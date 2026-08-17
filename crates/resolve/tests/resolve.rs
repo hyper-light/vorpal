@@ -6,16 +6,24 @@ use vorpal_kg::KgWriter;
 use vorpal_outline::model::{
   EntryRole, OutlineEntry, OutlineItem, SourcePosition, SourceRange, SymbolType,
 };
+use vorpal_resolve::intern::Interner;
 use vorpal_resolve::{
   Confidence, EdgeType, NodeId, RefKind, Reference, Resolver, Symbol, SymbolKind, SymbolTable,
   resolve_all,
 };
 
-fn sym(id: u64, kind: SymbolKind, path: &str, exported: bool) -> Symbol {
+/// One shared session for the whole test binary: tests only ever intern a bounded
+/// vocabulary, and `'static` ids keep the assertions free of lifetime plumbing.
+fn itn() -> &'static Interner {
+  static INTERNER: std::sync::OnceLock<Interner> = std::sync::OnceLock::new();
+  INTERNER.get_or_init(Interner::new)
+}
+
+fn sym(id: u64, kind: SymbolKind, path: &str, exported: bool) -> Symbol<'static> {
   Symbol {
     id: NodeId::new(id),
     kind,
-    path: vorpal_resolve::intern::intern(path),
+    path: itn().intern(path),
     exported,
     owner: None,
   }
@@ -24,11 +32,11 @@ fn sym(id: u64, kind: SymbolKind, path: &str, exported: bool) -> Symbol {
 #[test]
 fn resolves_local_definition_with_highest_confidence() {
   let mut table = SymbolTable::new();
-  table.insert("foo", sym(1, SymbolKind::Function, "a.rs", false));
-  let reference = Reference::new(NodeId::new(0), "a.rs", "foo", RefKind::Call);
+  table.insert(itn(), "foo", sym(1, SymbolKind::Function, "a.rs", false));
+  let reference = Reference::new(itn(), NodeId::new(0), "a.rs", "foo", RefKind::Call);
 
   table.finalize();
-  let res = Resolver::new().resolve(&table, &reference);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(res.target, Some(NodeId::new(1)));
   assert_eq!(res.confidence, Confidence::LOCAL);
   assert_eq!(res.edge, EdgeType::CALLS);
@@ -37,11 +45,11 @@ fn resolves_local_definition_with_highest_confidence() {
 #[test]
 fn resolves_exported_cross_file_definition() {
   let mut table = SymbolTable::new();
-  table.insert("bar", sym(2, SymbolKind::Function, "b.rs", true));
-  let reference = Reference::new(NodeId::new(0), "a.rs", "bar", RefKind::Call);
+  table.insert(itn(), "bar", sym(2, SymbolKind::Function, "b.rs", true));
+  let reference = Reference::new(itn(), NodeId::new(0), "a.rs", "bar", RefKind::Call);
 
   table.finalize();
-  let res = Resolver::new().resolve(&table, &reference);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(res.target, Some(NodeId::new(2)));
   assert_eq!(res.confidence, Confidence::CROSS_FILE);
 }
@@ -49,11 +57,11 @@ fn resolves_exported_cross_file_definition() {
 #[test]
 fn private_cross_file_definition_is_not_visible() {
   let mut table = SymbolTable::new();
-  table.insert("secret", sym(3, SymbolKind::Function, "b.rs", false));
-  let reference = Reference::new(NodeId::new(0), "a.rs", "secret", RefKind::Call);
+  table.insert(itn(), "secret", sym(3, SymbolKind::Function, "b.rs", false));
+  let reference = Reference::new(itn(), NodeId::new(0), "a.rs", "secret", RefKind::Call);
 
   table.finalize();
-  let res = Resolver::new().resolve(&table, &reference);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(
     res.target, None,
     "private symbol in another file is invisible"
@@ -68,12 +76,12 @@ fn private_cross_file_definition_is_not_visible() {
 #[test]
 fn local_definition_wins_over_exported_elsewhere() {
   let mut table = SymbolTable::new();
-  table.insert("dup", sym(5, SymbolKind::Function, "b.rs", true));
-  table.insert("dup", sym(6, SymbolKind::Function, "a.rs", false));
-  let reference = Reference::new(NodeId::new(0), "a.rs", "dup", RefKind::Call);
+  table.insert(itn(), "dup", sym(5, SymbolKind::Function, "b.rs", true));
+  table.insert(itn(), "dup", sym(6, SymbolKind::Function, "a.rs", false));
+  let reference = Reference::new(itn(), NodeId::new(0), "a.rs", "dup", RefKind::Call);
 
   table.finalize();
-  let res = Resolver::new().resolve(&table, &reference);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(res.target, Some(NodeId::new(6)), "same-file binding wins");
   assert_eq!(res.confidence, Confidence::LOCAL);
 }
@@ -81,12 +89,12 @@ fn local_definition_wins_over_exported_elsewhere() {
 #[test]
 fn ambiguous_exported_is_labeled_and_deterministic() {
   let mut table = SymbolTable::new();
-  table.insert("amb", sym(9, SymbolKind::Function, "c.rs", true));
-  table.insert("amb", sym(4, SymbolKind::Function, "b.rs", true));
-  let reference = Reference::new(NodeId::new(0), "a.rs", "amb", RefKind::Call);
+  table.insert(itn(), "amb", sym(9, SymbolKind::Function, "c.rs", true));
+  table.insert(itn(), "amb", sym(4, SymbolKind::Function, "b.rs", true));
+  let reference = Reference::new(itn(), NodeId::new(0), "a.rs", "amb", RefKind::Call);
 
   table.finalize();
-  let res = Resolver::new().resolve(&table, &reference);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(
     res.target,
     Some(NodeId::new(4)),
@@ -99,37 +107,38 @@ fn ambiguous_exported_is_labeled_and_deterministic() {
 #[test]
 fn path_imports_resolve_to_file_nodes() {
   let mut table = SymbolTable::new();
-  table.insert_file("src/util.ts", NodeId::new(7));
+  table.insert_file(itn(), "src/util.ts", NodeId::new(7));
 
   // `./util` from a sibling file resolves via the importer's own extension.
-  let reference = Reference::new(NodeId::new(0), "src/a.ts", "./util", RefKind::Import);
+  let reference = Reference::new(itn(), NodeId::new(0), "src/a.ts", "./util", RefKind::Import);
   table.finalize();
-  let res = Resolver::new().resolve(&table, &reference);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(res.target, Some(NodeId::new(7)));
   assert_eq!(res.confidence, Confidence::CROSS_FILE);
 
   // `../` navigation and explicit-extension forms also match exactly.
   let reference = Reference::new(
+    itn(),
     NodeId::new(0),
     "src/deep/b.ts",
     "../util.ts",
     RefKind::Import,
   );
   assert_eq!(
-    Resolver::new().resolve(&table, &reference).target,
+    Resolver::new().resolve(itn(), &table, &reference).target,
     Some(NodeId::new(7))
   );
 
   // A path miss stays unresolved — exact matches only, never faked.
-  let reference = Reference::new(NodeId::new(0), "src/a.ts", "./missing", RefKind::Import);
-  assert_eq!(Resolver::new().resolve(&table, &reference).target, None);
+  let reference = Reference::new(itn(), NodeId::new(0), "src/a.ts", "./missing", RefKind::Import);
+  assert_eq!(Resolver::new().resolve(itn(), &table, &reference).target, None);
 }
 
 #[test]
 fn unknown_name_is_unresolved() {
   let table = SymbolTable::new();
-  let reference = Reference::new(NodeId::new(0), "a.rs", "nope", RefKind::Call);
-  let res = Resolver::new().resolve(&table, &reference);
+  let reference = Reference::new(itn(), NodeId::new(0), "a.rs", "nope", RefKind::Call);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(res.target, None);
   assert_eq!(res.candidates, 0);
 }
@@ -146,17 +155,17 @@ fn ref_kinds_map_to_edge_types() {
 #[test]
 fn resolve_all_reports_stats_and_labeled_edges() {
   let mut table = SymbolTable::new();
-  table.insert("known", sym(1, SymbolKind::Function, "b.rs", true));
-  table.insert("amb", sym(2, SymbolKind::Function, "b.rs", true));
-  table.insert("amb", sym(3, SymbolKind::Function, "c.rs", true));
+  table.insert(itn(), "known", sym(1, SymbolKind::Function, "b.rs", true));
+  table.insert(itn(), "amb", sym(2, SymbolKind::Function, "b.rs", true));
+  table.insert(itn(), "amb", sym(3, SymbolKind::Function, "c.rs", true));
   let refs = vec![
-    Reference::new(NodeId::new(0), "a.rs", "known", RefKind::Call),
-    Reference::new(NodeId::new(0), "a.rs", "amb", RefKind::Call),
-    Reference::new(NodeId::new(0), "a.rs", "missing", RefKind::Call),
+    Reference::new(itn(), NodeId::new(0), "a.rs", "known", RefKind::Call),
+    Reference::new(itn(), NodeId::new(0), "a.rs", "amb", RefKind::Call),
+    Reference::new(itn(), NodeId::new(0), "a.rs", "missing", RefKind::Call),
   ];
 
   table.finalize();
-  let (edges, stats) = resolve_all(&table, &refs, &Resolver::new());
+  let (edges, stats) = resolve_all(itn(), &table, &refs, &Resolver::new());
   assert_eq!(stats.resolved, 1);
   assert_eq!(stats.ambiguous, 1);
   assert_eq!(stats.unresolved(), 1);
@@ -212,7 +221,7 @@ fn resolves_a_call_across_files_in_a_real_kg() {
     &[item(SymbolType::Function, "caller", "fn caller()", true)],
   );
   let kg = writer.seal();
-  let table = SymbolTable::from_kg(&kg);
+  let table = SymbolTable::from_kg(itn(), &kg);
 
   let find = |name: &str| {
     (0..kg.node_count() as u64)
@@ -223,8 +232,8 @@ fn resolves_a_call_across_files_in_a_real_kg() {
   let caller = find("caller");
   let target = find("target");
 
-  let reference = Reference::new(caller, "a.rs", "target", RefKind::Call);
-  let res = Resolver::new().resolve(&table, &reference);
+  let reference = Reference::new(itn(), caller, "a.rs", "target", RefKind::Call);
+  let res = Resolver::new().resolve(itn(), &table, &reference);
   assert_eq!(
     res.target,
     Some(target),
@@ -235,7 +244,7 @@ fn resolves_a_call_across_files_in_a_real_kg() {
   // File nodes are not resolution targets.
   assert_eq!(
     table
-      .candidates(vorpal_resolve::intern::intern("a.rs"))
+      .candidates(itn().intern("a.rs"))
       .len(),
     0
   );

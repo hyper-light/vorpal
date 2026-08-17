@@ -21,7 +21,7 @@ mod resolver;
 pub mod spill;
 mod table;
 
-pub use intern::NameId;
+pub use intern::{Interner, NameId};
 pub use reference::{RefForm, RefKind, Reference};
 pub use resolver::{
   Confidence, MAX_RETAINED_ALTERNATIVES, Resolution, ResolutionGrade, ResolveReason, ResolveStats,

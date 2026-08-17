@@ -2,7 +2,7 @@
 
 use vorpal_kg::{EdgeType, NodeId};
 
-use crate::intern::{self, NameId};
+use crate::intern::{Interner, NameId};
 
 /// What a reference is, which fixes the edge kind it resolves to (§3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,35 +62,41 @@ pub enum RefForm {
 /// integers. Constructors still take `&str` and intern internally, so call sites read
 /// unchanged; use [`intern::text_of`] when the text is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Reference {
+pub struct Reference<'i> {
   /// The node the reference occurs in (a function, method, …).
   pub from: NodeId,
   /// The file the reference occurs in — the intra-file scope key (interned path).
-  pub from_path: NameId,
+  pub from_path: NameId<'i>,
   /// The referenced name (simple, e.g. `parse`), interned.
-  pub name: NameId,
+  pub name: NameId<'i>,
   pub kind: RefKind,
   /// Byte span of the reference in `from_path`, kept as evidence.
   pub evidence: (u32, u32),
   /// The qualifying namespace/receiver the grammar provides, when any: `Kg::load` → `Kg`;
   /// `self.helper()` / `Self::helper()` → the enclosing item's name. `None` for bare names and
   /// for receivers whose type the syntax does not reveal.
-  pub qualifier: Option<NameId>,
+  pub qualifier: Option<NameId<'i>>,
   /// The syntactic shape (see [`RefForm`]).
   pub form: RefForm,
   /// The local rebinding an aliased import introduces (`from x import y as z` → `z`;
   /// `use a::b as c` → `c`), interned. The reference's `name` stays the ORIGINAL (the edge
   /// targets the real definition); the alias is what the importing file's bare uses say, so
   /// the import-binding pre-pass keys on it.
-  pub alias: Option<NameId>,
+  pub alias: Option<NameId<'i>>,
 }
 
-impl Reference {
-  pub fn new(from: NodeId, from_path: &str, name: &str, kind: RefKind) -> Self {
+impl<'i> Reference<'i> {
+  pub fn new(
+    interner: &'i Interner,
+    from: NodeId,
+    from_path: &str,
+    name: &str,
+    kind: RefKind,
+  ) -> Self {
     Self {
       from,
-      from_path: intern::intern(from_path),
-      name: intern::intern(name),
+      from_path: interner.intern(from_path),
+      name: interner.intern(name),
       kind,
       evidence: (0, 0),
       qualifier: None,
@@ -101,11 +107,17 @@ impl Reference {
 
   /// [`Reference::new`] with an already-interned path — apply loops intern each file's path
   /// once instead of re-hashing it per reference.
-  pub fn with_interned_path(from: NodeId, from_path: NameId, name: &str, kind: RefKind) -> Self {
+  pub fn with_interned_path(
+    interner: &'i Interner,
+    from: NodeId,
+    from_path: NameId<'i>,
+    name: &str,
+    kind: RefKind,
+  ) -> Self {
     Self {
       from,
       from_path,
-      name: intern::intern(name),
+      name: interner.intern(name),
       kind,
       evidence: (0, 0),
       qualifier: None,
@@ -119,14 +131,14 @@ impl Reference {
     self
   }
 
-  pub fn with_qualifier(self, qualifier: Option<String>) -> Self {
-    self.with_qualifier_ref(qualifier.as_deref())
+  pub fn with_qualifier(self, interner: &'i Interner, qualifier: Option<String>) -> Self {
+    self.with_qualifier_ref(interner, qualifier.as_deref())
   }
 
   /// [`Reference::with_qualifier`] over a borrowed qualifier — the view-replay path, which
   /// interns straight from mapped bytes without an owned intermediate.
-  pub fn with_qualifier_ref(mut self, qualifier: Option<&str>) -> Self {
-    self.qualifier = qualifier.map(intern::intern);
+  pub fn with_qualifier_ref(mut self, interner: &'i Interner, qualifier: Option<&str>) -> Self {
+    self.qualifier = qualifier.map(|q| interner.intern(q));
     self
   }
 
@@ -136,8 +148,8 @@ impl Reference {
   }
 
   /// [`Reference::with_qualifier_ref`]'s sibling for the aliased-import rebinding.
-  pub fn with_alias_ref(mut self, alias: Option<&str>) -> Self {
-    self.alias = alias.map(intern::intern);
+  pub fn with_alias_ref(mut self, interner: &'i Interner, alias: Option<&str>) -> Self {
+    self.alias = alias.map(|a| interner.intern(a));
     self
   }
 }

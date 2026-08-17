@@ -6,6 +6,13 @@ use std::fs;
 
 use vorpal_ingest::{Ingestor, OutlineExtractor, Resolver, apply_products_sharded, link_writer};
 
+/// One shared session for the whole test binary — bounded vocabulary, no lifetime plumbing.
+fn itn() -> &'static vorpal_ingest::Interner {
+  static INTERNER: std::sync::OnceLock<vorpal_ingest::Interner> = std::sync::OnceLock::new();
+  INTERNER.get_or_init(vorpal_ingest::Interner::default)
+}
+
+
 /// A synthetic corpus big enough to guarantee multiple shards on any machine (shard size is
 /// capped at max(len/(2·threads), 16), so ≥100 files always splits at least twice), with
 /// cross-file calls, methods, generics, and imports to exercise the whole apply surface.
@@ -37,15 +44,15 @@ fn sharded_apply_is_byte_identical_to_serial_apply() {
   assert_eq!(products.len(), 100);
 
   // Serial: the classic single-writer Ingestor path.
-  let mut serial = Ingestor::new(OutlineExtractor::new().unwrap());
+  let mut serial = Ingestor::new(itn(), OutlineExtractor::new().unwrap());
   for (path, product) in products.clone() {
     serial.ingest_product(&path, product);
   }
   let (serial_kg, serial_stats) = serial.link_and_seal(&Resolver::new());
 
   // Sharded: parallel per-shard writers, ordered absorption, same global link.
-  let (writer, references) = apply_products_sharded(products);
-  let (sharded_kg, sharded_stats) = link_writer(writer, references, &Resolver::new());
+  let (writer, references) = apply_products_sharded(itn(), products);
+  let (sharded_kg, sharded_stats) = link_writer(itn(), writer, references, &Resolver::new());
 
   assert_eq!(
     serial_stats, sharded_stats,
@@ -71,7 +78,7 @@ fn sharded_apply_is_byte_identical_to_serial_apply() {
 fn sharded_apply_handles_tiny_and_empty_inputs() {
   let extractor = OutlineExtractor::new().expect("rules compile");
 
-  let (writer, references) = apply_products_sharded(Vec::new());
+  let (writer, references) = apply_products_sharded(itn(), Vec::new());
   assert_eq!(writer.node_count(), 0);
   assert!(references.is_empty());
 
@@ -79,7 +86,7 @@ fn sharded_apply_handles_tiny_and_empty_inputs() {
   let product = extractor
     .extract_product("one.rs", "pub fn lone() -> i32 {\n    1\n}\n")
     .unwrap();
-  let (writer, references) = apply_products_sharded(vec![("one.rs".into(), product)]);
+  let (writer, references) = apply_products_sharded(itn(), vec![("one.rs".into(), product)]);
   assert_eq!(writer.node_count(), 2, "file node + fn node");
   assert!(references.is_empty());
 }

@@ -2198,23 +2198,25 @@ mod tests {
     eprintln!("products cache        {:>8.1} KB", total as f64 / 1e3);
     let _ = std::fs::remove_dir_all(&dir);
 
+    let interner = vorpal_resolve::Interner::default();
     time("apply (serial)", &|| {
       let mut writer = vorpal_kg::KgWriter::new();
       let mut references = Vec::new();
       for (path, product) in &products {
-        crate::pipeline::apply_product(path, product.clone(), &mut writer, &mut references);
+        crate::pipeline::apply_product(&interner, path, product.clone(), &mut writer, &mut references);
       }
       writer.node_count() + references.len()
     });
     time("apply (sharded)", &|| {
       let cloned: Vec<_> = products.clone();
-      let (writer, references) = crate::apply_products_sharded(cloned);
+      let (writer, references) = crate::apply_products_sharded(&interner, cloned);
       writer.node_count() + references.len()
     });
     time("apply+link (sharded)", &|| {
       let cloned: Vec<_> = products.clone();
-      let (writer, references) = crate::apply_products_sharded(cloned);
-      let (kg, stats) = crate::link_writer(writer, references, &vorpal_resolve::Resolver::new());
+      let (writer, references) = crate::apply_products_sharded(&interner, cloned);
+      let (kg, stats) =
+        crate::link_writer(&interner, writer, references, &vorpal_resolve::Resolver::new());
       kg.node_count() + stats.resolved as usize
     });
   }

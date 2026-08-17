@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use vorpal_kg::NodeId;
 
-use crate::intern::NameId;
+use crate::intern::{Interner, NameId};
 use crate::reference::{RefForm, RefKind, Reference};
 
 /// Bytes per spilled reference record.
@@ -80,32 +80,38 @@ fn encode(reference: &Reference, buf: &mut [u8; RECORD]) {
   buf[30..34].copy_from_slice(&alias.to_le_bytes());
 }
 
-fn decode(buf: &[u8; RECORD]) -> Reference {
+fn decode<'i>(interner: &'i Interner, buf: &[u8; RECORD]) -> Reference<'i> {
   let u64_at = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
   let u32_at = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
   Reference {
     from: NodeId::new(u64_at(0)),
-    name: NameId::from_bits(u32_at(8)).expect("spill wrote a valid name id"),
-    from_path: NameId::from_bits(u32_at(12)).expect("spill wrote a valid path id"),
-    qualifier: NameId::from_bits(u32_at(16)),
+    name: interner
+      .id_from_bits(u32_at(8))
+      .expect("spill wrote a valid name id"),
+    from_path: interner
+      .id_from_bits(u32_at(12))
+      .expect("spill wrote a valid path id"),
+    qualifier: interner.id_from_bits(u32_at(16)),
     evidence: (u32_at(20), u32_at(24)),
     kind: kind_of(buf[28]),
     form: form_of(buf[29]),
-    alias: NameId::from_bits(u32_at(30)),
+    alias: interner.id_from_bits(u32_at(30)),
   }
 }
 
 /// Append-only spill writer, buffered. `finish` flushes and hands back the read handle.
-pub struct RefSpillWriter {
+pub struct RefSpillWriter<'i> {
+  interner: &'i Interner,
   out: BufWriter<File>,
   path: PathBuf,
   count: u64,
-  qualified_imports: Vec<Reference>,
+  qualified_imports: Vec<Reference<'i>>,
 }
 
-impl RefSpillWriter {
-  pub fn create(path: &Path) -> io::Result<Self> {
+impl<'i> RefSpillWriter<'i> {
+  pub fn create(interner: &'i Interner, path: &Path) -> io::Result<Self> {
     Ok(Self {
+      interner,
       out: BufWriter::new(File::create(path)?),
       path: path.to_path_buf(),
       count: 0,
@@ -113,7 +119,7 @@ impl RefSpillWriter {
     })
   }
 
-  pub fn push(&mut self, reference: &Reference) -> io::Result<()> {
+  pub fn push(&mut self, reference: &Reference<'i>) -> io::Result<()> {
     // Qualifier-carrying imports are additionally retained in RAM: the link phase resolves
     // them *first* to seed per-file import bindings (§3.3 scope step), and re-decoding the
     // whole spill for a pre-pass would cost a second full stream. They are rare — ~0.1% of
@@ -129,9 +135,10 @@ impl RefSpillWriter {
     Ok(())
   }
 
-  pub fn finish(mut self) -> io::Result<RefSpill> {
+  pub fn finish(mut self) -> io::Result<RefSpill<'i>> {
     self.out.flush()?;
     Ok(RefSpill {
+      interner: self.interner,
       path: self.path,
       count: self.count,
       qualified_imports: self.qualified_imports,
@@ -140,13 +147,14 @@ impl RefSpillWriter {
 }
 
 /// A finished spill: read it once with [`RefSpill::chunks`], then [`RefSpill::remove`] it.
-pub struct RefSpill {
+pub struct RefSpill<'i> {
+  interner: &'i Interner,
   path: PathBuf,
   count: u64,
-  qualified_imports: Vec<Reference>,
+  qualified_imports: Vec<Reference<'i>>,
 }
 
-impl RefSpill {
+impl<'i> RefSpill<'i> {
   pub fn count(&self) -> u64 {
     self.count
   }
@@ -154,13 +162,14 @@ impl RefSpill {
   /// The qualifier-carrying import references, in write order — the input of the link
   /// phase's import-binding pre-pass. Also present in the spilled stream itself (this is a
   /// retained copy, not a diversion), so chunked resolution still sees every reference.
-  pub fn qualified_imports(&self) -> &[Reference] {
+  pub fn qualified_imports(&self) -> &[Reference<'i>] {
     &self.qualified_imports
   }
 
   /// Sequential chunk reader over the spilled records, in write order.
-  pub fn chunks(&self) -> io::Result<RefSpillChunks> {
+  pub fn chunks(&self) -> io::Result<RefSpillChunks<'i>> {
     Ok(RefSpillChunks {
+      interner: self.interner,
       reader: BufReader::with_capacity(1 << 20, File::open(&self.path)?),
       remaining: self.count,
     })
@@ -173,13 +182,14 @@ impl RefSpill {
 }
 
 /// Iterator of `Vec<Reference>` chunks (each `SPILL_CHUNK` long except the last).
-pub struct RefSpillChunks {
+pub struct RefSpillChunks<'i> {
+  interner: &'i Interner,
   reader: BufReader<File>,
   remaining: u64,
 }
 
-impl Iterator for RefSpillChunks {
-  type Item = io::Result<Vec<Reference>>;
+impl<'i> Iterator for RefSpillChunks<'i> {
+  type Item = io::Result<Vec<Reference<'i>>>;
 
   fn next(&mut self) -> Option<Self::Item> {
     if self.remaining == 0 {
@@ -192,7 +202,7 @@ impl Iterator for RefSpillChunks {
       if let Err(err) = self.reader.read_exact(&mut buf) {
         return Some(Err(err));
       }
-      chunk.push(decode(&buf));
+      chunk.push(decode(self.interner, &buf));
     }
     self.remaining -= take as u64;
     Some(Ok(chunk))
@@ -203,11 +213,19 @@ impl Iterator for RefSpillChunks {
 mod tests {
   use super::*;
 
+  /// One shared session for the whole test binary: tests only ever intern a bounded
+  /// vocabulary, and `'static` ids keep the assertions free of lifetime plumbing.
+  fn itn() -> &'static Interner {
+    static INTERNER: std::sync::OnceLock<Interner> = std::sync::OnceLock::new();
+    INTERNER.get_or_init(Interner::new)
+  }
+
   #[test]
   fn roundtrips_references_exactly() {
-    let refs: Vec<Reference> = (0..200_000u64)
+    let refs: Vec<Reference<'static>> = (0..200_000u64)
       .map(|i| {
         let mut r = Reference::new(
+          itn(),
           NodeId::new(i),
           &format!("src/file_{}.rs", i % 97),
           &format!("name_{}", i % 1013),
@@ -221,7 +239,7 @@ mod tests {
         )
         .with_evidence(i as u32, i as u32 + 7);
         if i % 3 == 0 {
-          r = r.with_qualifier(Some(format!("Owner{}", i % 11)));
+          r = r.with_qualifier(itn(), Some(format!("Owner{}", i % 11)));
         }
         if i % 4 == 1 {
           r = r.with_form(RefForm::Static);
@@ -235,7 +253,7 @@ mod tests {
     let dir = std::env::temp_dir().join(format!("vorpal-spill-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("refs.spill");
-    let mut writer = RefSpillWriter::create(&path).unwrap();
+    let mut writer = RefSpillWriter::create(itn(), &path).unwrap();
     for r in &refs {
       writer.push(r).unwrap();
     }

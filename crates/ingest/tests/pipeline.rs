@@ -5,19 +5,27 @@ use std::borrow::Cow;
 
 use vorpal_ingest::{FileExtractor, FileOutcome, Ingestor, KgWriter};
 use vorpal_outline::model::{
+
   EntryRole, OutlineEntry, OutlineItem, SourcePosition, SourceRange, SymbolType,
 };
+
+/// One shared session for the whole test binary — bounded vocabulary, no lifetime plumbing.
+fn itn() -> &'static vorpal_ingest::Interner {
+  static INTERNER: std::sync::OnceLock<vorpal_ingest::Interner> = std::sync::OnceLock::new();
+  INTERNER.get_or_init(vorpal_ingest::Interner::default)
+}
 
 /// Emits one function item per file, named by the source length — deterministic and engine-free.
 struct StubExtractor;
 
 impl FileExtractor for StubExtractor {
-  fn extract_into(
+  fn extract_into<'i>(
     &self,
+    _interner: &'i vorpal_ingest::Interner,
     path: &str,
     source: &str,
     writer: &mut KgWriter,
-    _references: &mut Vec<vorpal_ingest::Reference>,
+    _references: &mut Vec<vorpal_ingest::Reference<'i>>,
   ) {
     let item = OutlineItem {
       entry: OutlineEntry {
@@ -42,7 +50,7 @@ impl FileExtractor for StubExtractor {
 
 #[test]
 fn streams_indexes_and_skips_by_content_hash() {
-  let mut ing = Ingestor::new(StubExtractor);
+  let mut ing = Ingestor::new(itn(), StubExtractor);
 
   assert_eq!(ing.ingest_source("a.x", "aaa"), FileOutcome::Indexed);
   assert_eq!(ing.ingest_source("b.x", "bbbb"), FileOutcome::Indexed);

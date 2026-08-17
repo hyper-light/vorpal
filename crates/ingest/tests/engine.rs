@@ -3,6 +3,13 @@
 use vorpal_ingest::{Ingestor, OutlineExtractor};
 use vorpal_kg::{NodeId, SymbolKind};
 
+/// One shared session for the whole test binary — bounded vocabulary, no lifetime plumbing.
+fn itn() -> &'static vorpal_ingest::Interner {
+  static INTERNER: std::sync::OnceLock<vorpal_ingest::Interner> = std::sync::OnceLock::new();
+  INTERNER.get_or_init(vorpal_ingest::Interner::default)
+}
+
+
 const RUST_SRC: &str = "\
 pub struct Point {
     pub x: i32,
@@ -57,7 +64,7 @@ pub fn consume(r: Reader<'_>) -> u8 {
 
 #[test]
 fn generic_impl_methods_share_the_types_identity() {
-  let mut ing = Ingestor::new(OutlineExtractor::new().unwrap());
+  let mut ing = Ingestor::new(itn(), OutlineExtractor::new().unwrap());
   ing.ingest_source("lib.rs", GENERIC_SRC);
   let (kg, stats) = ing.link_and_seal(&vorpal_ingest::Resolver::new());
   assert!(stats.resolved >= 1, "r.read() should resolve: {stats:?}");
@@ -90,7 +97,7 @@ fn generic_impl_methods_share_the_types_identity() {
 
 #[test]
 fn extracts_a_real_rust_file_into_the_kg() {
-  let mut ing = Ingestor::new(OutlineExtractor::new().unwrap());
+  let mut ing = Ingestor::new(itn(), OutlineExtractor::new().unwrap());
   ing.ingest_source("lib.rs", RUST_SRC);
   let kg = ing.seal();
 

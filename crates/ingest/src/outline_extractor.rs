@@ -219,16 +219,17 @@ impl FileExtractor for OutlineExtractor {
     OutlineExtractor::handles(self, path)
   }
 
-  fn extract_into(
+  fn extract_into<'i>(
     &self,
+    interner: &'i vorpal_resolve::Interner,
     path: &str,
     source: &str,
     writer: &mut KgWriter,
-    references: &mut Vec<Reference>,
+    references: &mut Vec<Reference<'i>>,
   ) {
     // One extraction path for live and incremental ingest: build the product, apply it.
     if let Some(prod) = self.extract_product(path, source) {
-      crate::pipeline::apply_product(path, prod, writer, references);
+      crate::pipeline::apply_product(interner, path, prod, writer, references);
     }
   }
 }

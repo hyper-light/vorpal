@@ -11,12 +11,13 @@ use vorpal_resolve::{Reference, ResolveStats, Resolver, Symbol, SymbolTable, res
 /// Turns one file's source into KG nodes/edges via the writer, appending any references it finds
 /// to `references` for later resolution. Implementors own their parse tree locally.
 pub trait FileExtractor {
-  fn extract_into(
+  fn extract_into<'i>(
     &self,
+    interner: &'i vorpal_resolve::Interner,
     path: &str,
     source: &str,
     writer: &mut KgWriter,
-    references: &mut Vec<Reference>,
+    references: &mut Vec<Reference<'i>>,
   );
 
   /// Whether this extractor handles `path` (default: all files). Directory ingestion skips files
@@ -43,17 +44,19 @@ pub enum FileOutcome {
 
 /// A single-writer ingest sink: reads files, applies content-hash skip, drives extraction into a
 /// [`KgWriter`], buffers references, and seals a queryable [`Kg`] (optionally after linking).
-pub struct Ingestor<E: FileExtractor> {
+pub struct Ingestor<'i, E: FileExtractor> {
+  interner: &'i vorpal_resolve::Interner,
   extractor: E,
   writer: KgWriter,
-  references: Vec<Reference>,
+  references: Vec<Reference<'i>>,
   seen: HashMap<String, [u8; 32]>,
   stats: IngestStats,
 }
 
-impl<E: FileExtractor> Ingestor<E> {
-  pub fn new(extractor: E) -> Self {
+impl<'i, E: FileExtractor> Ingestor<'i, E> {
+  pub fn new(interner: &'i vorpal_resolve::Interner, extractor: E) -> Self {
     Self {
+      interner,
       extractor,
       writer: KgWriter::new(),
       references: Vec::new(),
@@ -72,9 +75,13 @@ impl<E: FileExtractor> Ingestor<E> {
       return FileOutcome::Skipped;
     }
     self.seen.insert(path.to_owned(), hash);
-    self
-      .extractor
-      .extract_into(path, source, &mut self.writer, &mut self.references);
+    self.extractor.extract_into(
+      self.interner,
+      path,
+      source,
+      &mut self.writer,
+      &mut self.references,
+    );
     self.stats.indexed += 1;
     FileOutcome::Indexed
   }
@@ -90,7 +97,7 @@ impl<E: FileExtractor> Ingestor<E> {
   /// Takes the product by value: its reference strings are moved into the buffered
   /// [`Reference`]s, so the single-writer apply stage clones nothing.
   pub fn ingest_product(&mut self, path: &str, product: crate::FileProduct) {
-    apply_product(path, product, &mut self.writer, &mut self.references);
+    apply_product(self.interner, path, product, &mut self.writer, &mut self.references);
   }
 
   /// Recursively ingest a directory, respecting `.gitignore`, skipping files the extractor does
@@ -134,7 +141,7 @@ impl<E: FileExtractor> Ingestor<E> {
   /// buffered reference, inject the resolved edges, then seal. Returns the graph and resolution
   /// stats. Unresolvable references produce no edge — they are counted, never faked.
   pub fn link_and_seal(self, resolver: &Resolver) -> (Kg, ResolveStats) {
-    link_writer(self.writer, self.references, resolver)
+    link_writer(self.interner, self.writer, self.references, resolver)
   }
 }
 
@@ -146,13 +153,13 @@ impl<E: FileExtractor> Ingestor<E> {
 /// Where the (rebased) reference stream goes during a streamed apply: RAM for callers that
 /// want the vector, or the disk spill for bulk builds — at kernel scale the in-RAM vector
 /// was ~220 MB of peak footprint that resolution only ever reads once, sequentially.
-enum RefSink<'a> {
-  Ram(&'a mut Vec<Reference>),
-  Spill(&'a mut vorpal_resolve::RefSpillWriter),
+enum RefSink<'a, 'i> {
+  Ram(&'a mut Vec<Reference<'i>>),
+  Spill(&'a mut vorpal_resolve::RefSpillWriter<'i>),
 }
 
-impl RefSink<'_> {
-  fn consume(&mut self, shard_references: Vec<Reference>, id_base: u64) -> io::Result<()> {
+impl<'i> RefSink<'_, 'i> {
+  fn consume(&mut self, shard_references: Vec<Reference<'i>>, id_base: u64) -> io::Result<()> {
     let rebased = shard_references.into_iter().map(|mut reference| {
       reference.from = NodeId::new(reference.from.raw() + id_base);
       reference
@@ -175,11 +182,11 @@ impl RefSink<'_> {
 /// Merge one completed shard into the global writer, rebasing its buffered references by
 /// the id base the absorb assigns — the single absorption step both the rolling path and
 /// the leftover tail share, so their outputs are identical by construction.
-fn absorb_shard(
+fn absorb_shard<'i>(
   writer: &mut KgWriter,
-  sink: &mut RefSink<'_>,
+  sink: &mut RefSink<'_, 'i>,
   shard_writer: KgWriter,
-  shard_references: Vec<Reference>,
+  shard_references: Vec<Reference<'i>>,
 ) -> io::Result<()> {
   let id_base = writer.absorb(shard_writer);
   sink.consume(shard_references, id_base)
@@ -209,29 +216,30 @@ pub fn release_freed_pages() {
   }
 }
 
-pub fn link_writer(
+pub fn link_writer<'i>(
+  interner: &'i vorpal_resolve::Interner,
   mut writer: KgWriter,
-  references: Vec<Reference>,
+  references: Vec<Reference<'i>>,
   resolver: &Resolver,
 ) -> (Kg, ResolveStats) {
   phase_trace("link: table build start");
-  let mut table = build_symbol_table(&writer);
+  let mut table = build_symbol_table(interner, &writer);
   // The table build's transients (per-shard pair vectors, the finalize sort buffer) just
   // died — return their pages before resolution allocates the edge lists.
   release_freed_pages();
   phase_trace("link: resolve start");
   // Import-binding pre-pass (§3.3 scope step): resolve the qualifier-carrying imports first,
   // so bare uses in an importing file inherit its import-proven targets.
-  let qualified: Vec<Reference> = references
+  let qualified: Vec<Reference<'i>> = references
     .iter()
     .filter(|r| {
       r.kind == vorpal_resolve::RefKind::Import && r.form == vorpal_resolve::RefForm::Static
     })
     .copied()
     .collect();
-  vorpal_resolve::seed_import_bindings(&mut table, &qualified, resolver);
+  vorpal_resolve::seed_import_bindings(interner, &mut table, &qualified, resolver);
   drop(qualified);
-  let (edges, stats) = resolve_all(&table, &references, resolver);
+  let (edges, stats) = resolve_all(interner, &table, &references, resolver);
   phase_trace("link: resolve done");
   drop(table);
   drop(references);
@@ -259,18 +267,19 @@ pub fn link_writer(
 /// the per-edge evidence rows (span, resolver reason, confidence, candidate count) resolution
 /// produced — the caller persists them as the generation's `evidence.bin` sidecar (§5), so
 /// every persisted relation can answer "why does this exist?".
-pub fn link_writer_spilled(
+pub fn link_writer_spilled<'i>(
+  interner: &'i vorpal_resolve::Interner,
   mut writer: KgWriter,
-  spill: vorpal_resolve::RefSpill,
+  spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
 ) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
   phase_trace("link: table build start");
-  let mut table = build_symbol_table(&writer);
+  let mut table = build_symbol_table(interner, &writer);
   release_freed_pages();
   phase_trace("link: resolve start");
   // Import-binding pre-pass (§3.3 scope step): the spill retained the qualifier-carrying
   // imports in RAM, so bare uses in an importing file inherit its import-proven targets.
-  vorpal_resolve::seed_import_bindings(&mut table, spill.qualified_imports(), resolver);
+  vorpal_resolve::seed_import_bindings(interner, &mut table, spill.qualified_imports(), resolver);
   // Edges stream straight into the writer's edge log, in resolution order — the collected
   // edge vector was ~90 MB alive under the seal at kernel scale. Evidence rows are collected
   // alongside (24 bytes per emitted edge; they must all exist before the canonical sort that
@@ -280,6 +289,7 @@ pub fn link_writer_spilled(
     let writer = &mut writer;
     let evidence = std::cell::RefCell::new(&mut evidence);
     vorpal_resolve::resolve_all_spilled_into(
+      interner,
       &table,
       &spill,
       resolver,
@@ -354,9 +364,10 @@ const SHARD_CAP_FILES: usize = 64;
 /// reproduce the serial writer's id assignment exactly, so the sealed output is bit-identical
 /// to a single-writer apply (pinned by test); cross-shard resolution still happens in the
 /// global [`link_writer`] pass, which sees the merged table.
-pub fn apply_products_sharded(
+pub fn apply_products_sharded<'i>(
+  interner: &'i vorpal_resolve::Interner,
   products: Vec<(String, crate::FileProduct)>,
-) -> (KgWriter, Vec<Reference>) {
+) -> (KgWriter, Vec<Reference<'i>>) {
   use rayon::prelude::*;
 
   let threads = rayon::current_num_threads().max(1);
@@ -370,19 +381,19 @@ pub fn apply_products_sharded(
     let mut writer = KgWriter::new();
     let mut references = Vec::new();
     for (path, product) in products {
-      apply_product(&path, product, &mut writer, &mut references);
+      apply_product(interner, &path, product, &mut writer, &mut references);
     }
     return (writer, references);
   }
 
-  let shards: Vec<(KgWriter, Vec<Reference>)> = products
+  let shards: Vec<(KgWriter, Vec<Reference<'i>>)> = products
     .into_par_iter()
     .chunks(shard_size)
     .map(|shard| {
       let mut writer = KgWriter::new();
       let mut references = Vec::new();
       for (path, product) in shard {
-        apply_product(&path, product, &mut writer, &mut references);
+        apply_product(interner, &path, product, &mut writer, &mut references);
       }
       (writer, references)
     })
@@ -405,14 +416,16 @@ pub fn apply_products_sharded(
 /// Consumes the product so name/qualifier strings move instead of cloning — this stage is the
 /// serial single-writer section of the pipeline, so every allocation here is on the critical
 /// path at any corpus size.
-pub(crate) fn apply_product(
+pub(crate) fn apply_product<'i>(
+  interner: &'i vorpal_resolve::Interner,
   path: &str,
   product: crate::FileProduct,
   writer: &mut KgWriter,
-  references: &mut Vec<Reference>,
+  references: &mut Vec<Reference<'i>>,
 ) {
   let crate::FileProduct { items, refs, .. } = product;
   apply_parts(
+    interner,
     path,
     &items,
     refs.iter().map(|r| crate::product::RefView {
@@ -433,13 +446,15 @@ pub(crate) fn apply_product(
 /// Apply a pack-replayed product straight from its mapped bytes: decode to views, apply —
 /// no owned strings anywhere on the path (the replay profile showed decode's per-string
 /// allocations as a top cost).
-pub(crate) fn apply_product_view(
+pub(crate) fn apply_product_view<'i>(
+  interner: &'i vorpal_resolve::Interner,
   path: &str,
   view: &crate::ProductView<'_>,
   writer: &mut KgWriter,
-  references: &mut Vec<Reference>,
+  references: &mut Vec<Reference<'i>>,
 ) {
   apply_parts(
+    interner,
     path,
     &view.items,
     view.refs.iter().copied(),
@@ -449,12 +464,13 @@ pub(crate) fn apply_product_view(
 }
 
 /// The single application kernel both product forms share.
-fn apply_parts<'a>(
+fn apply_parts<'a, 'i>(
+  interner: &'i vorpal_resolve::Interner,
   path: &str,
   items: &[vorpal_outline::model::OutlineItem<'_>],
   refs: impl Iterator<Item = crate::product::RefView<'a>>,
   writer: &mut KgWriter,
-  references: &mut Vec<Reference>,
+  references: &mut Vec<Reference<'i>>,
 ) {
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
@@ -464,18 +480,24 @@ fn apply_parts<'a>(
   // recomputed layout (an out-of-range index — a corrupt product — simply drops the ref).
   let (entities, _spans) = crate::outline_extractor::local_layout(items);
   // Intern the file's path once; every reference carries the 4-byte id.
-  let path_id = vorpal_resolve::intern::intern(path);
+  let path_id = interner.intern(path);
   for r in refs {
     let Some(entity) = entities.get(r.from_entity_index as usize) else {
       continue;
     };
     if let Some(from) = writer.entity_id(path, entity) {
       references.push(
-        Reference::with_interned_path(from, path_id, r.name, crate::product::tag_refkind(r.kind))
-          .with_evidence(r.start, r.end)
-          .with_qualifier_ref(r.qualifier)
-          .with_alias_ref(r.alias)
-          .with_form(crate::product::tag_refform(r.form)),
+        Reference::with_interned_path(
+          interner,
+          from,
+          path_id,
+          r.name,
+          crate::product::tag_refkind(r.kind),
+        )
+        .with_evidence(r.start, r.end)
+        .with_qualifier_ref(interner, r.qualifier)
+        .with_alias_ref(interner, r.alias)
+        .with_form(crate::product::tag_refform(r.form)),
       );
     }
   }
@@ -487,11 +509,14 @@ const MIN_DEFS_PER_SHARD: usize = 4096;
 /// The owner id for members whose owner's name no reference ever interned: a reserved,
 /// unparseable string (control character) that can never equal a real qualifier, preserving
 /// "is a member" without admitting a match.
-fn unmatchable_owner() -> vorpal_resolve::NameId {
-  vorpal_resolve::intern::intern("\u{1}vorpal:unreferenced-owner")
+fn unmatchable_owner<'i>(interner: &'i vorpal_resolve::Interner) -> vorpal_resolve::NameId<'i> {
+  interner.intern("\u{1}vorpal:unreferenced-owner")
 }
 
-fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
+fn build_symbol_table<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  writer: &KgWriter,
+) -> SymbolTable<'i> {
   // Derive each member's owner row from the containment edges (`Kg` for `Kg.load`) — the
   // target side of qualified-reference matching. Containment from a File node is not
   // ownership: top-level items match by module file instead. One cheap serial pass.
@@ -522,7 +547,7 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
       let (id, name, path, kind, exported) = writer.definition(row).expect("row < node_count");
       if kind == SymbolKind::File {
         // File nodes are the targets of path-form imports (`import "./util"`).
-        table.insert_file(path, id);
+        table.insert_file(interner, path, id);
       } else if kind != SymbolKind::Import {
         // Import/alias nodes are wiring, not definitions: offering them as resolution targets
         // let a `use foo` in one file steal call edges meant for the real `foo`.
@@ -532,14 +557,17 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
         let owner = owner_of[row]
           .and_then(|src| writer.definition(src as usize))
           .map(|(_, owner_name, _, _, _)| {
-            vorpal_resolve::intern::peek(owner_name).unwrap_or_else(unmatchable_owner)
+            interner
+              .peek(owner_name)
+              .unwrap_or_else(|| unmatchable_owner(interner))
           });
         table.insert_if_referenced(
+          interner,
           name,
           Symbol {
             id,
             kind,
-            path: vorpal_resolve::intern::intern(path),
+            path: interner.intern(path),
             exported,
             owner,
           },
@@ -572,6 +600,12 @@ fn build_symbol_table(writer: &KgWriter) -> SymbolTable {
 #[cfg(test)]
 mod sharded_table_tests {
   use super::*;
+
+  /// One shared session for this test module.
+  fn itn() -> &'static vorpal_resolve::Interner {
+    static INTERNER: std::sync::OnceLock<vorpal_resolve::Interner> = std::sync::OnceLock::new();
+    INTERNER.get_or_init(vorpal_resolve::Interner::default)
+  }
   use vorpal_kg::NodeDef;
 
   /// The serial specification: single-pass insertion via `for_each_definition`, exactly the
@@ -598,17 +632,20 @@ mod sharded_table_tests {
     let mut table = SymbolTable::new();
     writer.for_each_definition(|id, name, path, kind, exported| {
       if kind == SymbolKind::File {
-        table.insert_file(path, id);
+        table.insert_file(itn(), path, id);
       } else if kind != SymbolKind::Import {
         let owner = owner_of[id.raw() as usize].map(|src| {
-          vorpal_resolve::intern::peek(&names[src as usize]).unwrap_or_else(unmatchable_owner)
+          itn()
+            .peek(&names[src as usize])
+            .unwrap_or_else(|| unmatchable_owner(itn()))
         });
         table.insert_if_referenced(
+          itn(),
           name,
           Symbol {
             id,
             kind,
-            path: vorpal_resolve::intern::intern(path),
+            path: itn().intern(path),
             exported,
             owner,
           },
@@ -625,8 +662,8 @@ mod sharded_table_tests {
     // reference construction would have during commit) so the oracle exercises real,
     // non-empty tables regardless of what other tests interned first.
     for j in 0..4usize {
-      vorpal_resolve::intern::intern(&format!("Item{j}"));
-      vorpal_resolve::intern::intern(&format!("member_{j}"));
+      itn().intern(&format!("Item{j}"));
+      itn().intern(&format!("member_{j}"));
     }
     // A writer big enough to force multiple shards (> MIN_DEFS_PER_SHARD definitions), with
     // files, items, members (owners), imports, duplicate names, and privates.
@@ -693,7 +730,7 @@ mod sharded_table_tests {
     );
 
     assert_eq!(
-      build_symbol_table(&writer),
+      build_symbol_table(itn(), &writer),
       serial_reference_table(&writer),
       "sharded table diverged from the serial specification"
     );
@@ -863,16 +900,18 @@ enum Slot {
 ///
 /// The first `Err` from `work` aborts the run and is returned; a partial graph is never
 /// produced.
-pub fn stream_apply<F>(
+pub fn stream_apply<'i, F>(
+  interner: &'i vorpal_resolve::Interner,
   entries: &[crate::FileStat],
   budget_bytes: u64,
   work: F,
-) -> io::Result<(KgWriter, Vec<Reference>, StreamStats)>
+) -> io::Result<(KgWriter, Vec<Reference<'i>>, StreamStats)>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
   let mut references = Vec::new();
   let (writer, stats) = stream_apply_impl(
+    interner,
     entries,
     budget_bytes,
     work,
@@ -887,19 +926,21 @@ where
 /// RAM — the bulk-build configuration. Resolve the result with
 /// [`vorpal_resolve::resolve_all_spilled`] (or [`link_writer_spilled`]), which streams the
 /// file back in bounded chunks and deletes it.
-pub fn stream_apply_spilled<F>(
+pub fn stream_apply_spilled<'i, F>(
+  interner: &'i vorpal_resolve::Interner,
   entries: &[crate::FileStat],
   budget_bytes: u64,
   spill_path: &std::path::Path,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
   work: F,
-) -> io::Result<(KgWriter, vorpal_resolve::RefSpill, StreamStats)>
+) -> io::Result<(KgWriter, vorpal_resolve::RefSpill<'i>, StreamStats)>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
-  let mut spill_writer = vorpal_resolve::RefSpillWriter::create(spill_path)?;
+  let mut spill_writer = vorpal_resolve::RefSpillWriter::create(interner, spill_path)?;
   let (writer, stats) = stream_apply_impl(
+    interner,
     entries,
     budget_bytes,
     work,
@@ -910,11 +951,12 @@ where
   Ok((writer, spill_writer.finish()?, stats))
 }
 
-fn stream_apply_impl<F>(
+fn stream_apply_impl<'i, F>(
+  interner: &'i vorpal_resolve::Interner,
   entries: &[crate::FileStat],
   budget_bytes: u64,
   work: F,
-  mut sink: RefSink<'_>,
+  mut sink: RefSink<'_, 'i>,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
 ) -> io::Result<(KgWriter, StreamStats)>
@@ -948,18 +990,18 @@ where
       match work(entry, &mut scratch)? {
         StreamWork::Parsed(path, product) => {
           parsed += 1;
-          apply_product(&path, product, &mut writer, &mut references);
+          apply_product(interner, &path, product, &mut writer, &mut references);
         }
         StreamWork::Replayed(path, product) => {
           replayed += 1;
-          apply_product(&path, product, &mut writer, &mut references);
+          apply_product(interner, &path, product, &mut writer, &mut references);
         }
         StreamWork::ReplayedPacked(path) => {
           if let Some(view) = pack
             .and_then(|p| p.get(&path))
             .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
           {
-            apply_product_view(&path, &view, &mut writer, &mut references);
+            apply_product_view(interner, &path, &view, &mut writer, &mut references);
             replayed += 1;
           }
         }
@@ -1059,7 +1101,7 @@ where
                   reserved,
                 } => {
                   let (writer, references) = writers.get_mut(&shard).expect("owned shard");
-                  apply_product(&path, product, writer, references);
+                  apply_product(interner, &path, product, writer, references);
                   budget.release(reserved);
                   if was_parsed {
                     parsed += 1;
@@ -1076,7 +1118,7 @@ where
                     .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
                   {
                     let (writer, references) = writers.get_mut(&shard).expect("owned shard");
-                    apply_product_view(&path, &view, writer, references);
+                    apply_product_view(interner, &path, &view, writer, references);
                     replayed += 1;
                   }
                   budget.release(reserved);

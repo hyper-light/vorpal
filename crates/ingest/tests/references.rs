@@ -3,6 +3,13 @@
 use vorpal_ingest::{Ingestor, NodeId, OutlineExtractor, Resolver};
 use vorpal_kg::EdgeType;
 
+/// One shared session for the whole test binary — bounded vocabulary, no lifetime plumbing.
+fn itn() -> &'static vorpal_ingest::Interner {
+  static INTERNER: std::sync::OnceLock<vorpal_ingest::Interner> = std::sync::OnceLock::new();
+  INTERNER.get_or_init(vorpal_ingest::Interner::default)
+}
+
+
 const SRC: &str = "\
 pub fn helper() -> i32 {
     1
@@ -22,7 +29,7 @@ fn find(kg: &vorpal_ingest::Kg, name: &str) -> NodeId {
 
 #[test]
 fn extracts_and_resolves_real_rust_calls() {
-  let mut ing = Ingestor::new(OutlineExtractor::new().unwrap());
+  let mut ing = Ingestor::new(itn(), OutlineExtractor::new().unwrap());
   ing.ingest_source("lib.rs", SRC);
 
   // `run` calls `helper` (twice) — real call sites, extracted from the AST.

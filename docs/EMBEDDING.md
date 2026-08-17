@@ -6,32 +6,29 @@ long-lived host**. This document is the contract for that mode, and the honest i
 instance-model decision: embedded library vs session-scoped worker process vs a dedicated
 KG-service pod.
 
-## The one real hazard: the session interner
+## The former hazard, retired: the interner is session-owned
 
-Resolution interns every distinct name/path/qualifier into a process-wide table
-(`vorpal_resolve::intern`) so millions of references collapse to `u32` ids. Within one build
-it is bounded by the corpus vocabulary (**~718k strings / ~17.6 MB for the Linux kernel**);
-across many sessions in one process it grows monotonically — indexing different repos for
-weeks accumulates every distinct name ever seen.
+Resolution interns every distinct name/path/qualifier so millions of references collapse to
+`u32` ids (**~718k strings / ~17.6 MB for one Linux-kernel build**). The interner is now the
+**scoped-interner design proper**: `vorpal_resolve::Interner` is an owned object each
+`build_index*` call creates and drops internally — **reclaim is `Drop`**, and there is no
+process-wide table, no reclaim API, and no quiescence contract at all.
 
-The valve (this is the "scoped-interner patch"):
+The contract is enforced by the type system, not documentation: `NameId<'i>` (and therefore
+`Reference<'i>`, `SymbolTable<'i>`, the spill) is branded with the session lifetime, so
+holding any of them past their session **fails to compile** (pinned by a `compile_fail`
+doctest on `Interner`). Loaded `Kg`s and every query result are session-free — persisted
+artifacts never contain interner ids — so hosts keep those as long as they like. Kernel-scale
+verification: consecutive sessions in one process produce **bit-identical generation ids**,
+and each session's vocabulary frees when its build returns.
 
-- Strings live in reclaimable **arenas** (not leaks). `vorpal_ingest::intern_retained_bytes()`
-  / `intern_retained_strings()` are the safe telemetry a host watches.
-- `unsafe fn vorpal_index::reclaim_session_memory() -> ReclaimStats` frees everything at a
-  session boundary. It panics if any `build_index*` call is in flight; the remaining safety
-  contract is the caller's: **quiesce all vorpal calls and drop every vorpal value that
-  predates the reclaim** (references, tables, spills — all internal to builds and dropped
-  before `build_index` returns; loaded `Kg`s and query results are safe to keep, since
-  persisted artifacts never contain interner ids). Kernel-scale cycle verified: build →
-  reclaim to zero → rebuild → **bit-identical generation id**.
-- One-shot processes never call it. The grammar-kind interner is exempt by boundedness (a
-  few thousand strings, the union of node-kind names across compiled grammars).
-
-If a host cannot uphold the quiescence contract, take the **session-scoped worker process**
-model instead: same binary, one process per session, exit is the reclaim. The KG-service pod
-is the same decision at fleet granularity. All three are legitimate; the interner is no
-longer the thing forcing the choice.
+Embedded hosts therefore need to do *nothing*: call `build_index` repeatedly; memory is
+bounded per build. Hosts driving the lower layers directly create their own
+`Interner::default()` per session and let scope end it; `Interner::retained_bytes()` /
+`retained_strings()` give per-session telemetry. The worker-process and KG-service-pod models
+remain available for *other* reasons (isolation, fleet topology), but no memory behavior
+forces them. The grammar-kind interner remains process-wide and is exempt by boundedness (a
+few thousand node-kind names).
 
 ## Hygiene facts (verified in code)
 

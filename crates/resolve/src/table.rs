@@ -11,21 +11,21 @@ use std::collections::HashMap;
 
 use vorpal_kg::{Kg, NodeId, SymbolKind};
 
-use crate::intern::{self, NameId};
+use crate::intern::{Interner, NameId};
 
 /// A definition candidate for resolution — plain old data over interned strings (~24 bytes;
 /// the owned-`String` form cost ~130 bytes per symbol × millions at kernel scale).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Symbol {
+pub struct Symbol<'i> {
   pub id: NodeId,
   pub kind: SymbolKind,
   /// The file the definition lives in (interned path) — used for intra-file scoping.
-  pub path: NameId,
+  pub path: NameId<'i>,
   /// Whether the definition is visible across files.
   pub exported: bool,
   /// The containing definition's name for members (`Kg` for `Kg.load`), `None` for top-level
   /// items — the target side of qualified-reference matching (§3.3).
-  pub owner: Option<NameId>,
+  pub owner: Option<NameId<'i>>,
 }
 
 /// Maps a name to every definition with that name (§3.3 candidate set), plus an exact-path map
@@ -33,30 +33,30 @@ pub struct Symbol {
 /// [`SymbolTable::absorb`] for sharded builds), then call [`SymbolTable::finalize`] once
 /// before resolving.
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct SymbolTable {
+pub struct SymbolTable<'i> {
   /// Insertion-ordered `(name, symbol)` pairs, drained by `finalize`.
-  pending: Vec<(NameId, Symbol)>,
+  pending: Vec<(NameId<'i>, Symbol<'i>)>,
   /// Post-finalize: symbols grouped contiguously by name, insertion order within a name.
-  grouped: Vec<Symbol>,
+  grouped: Vec<Symbol<'i>>,
   /// Post-finalize: name → `(start, len)` into `grouped`.
-  ranges: HashMap<NameId, (u32, u32)>,
-  files: HashMap<NameId, NodeId>,
+  ranges: HashMap<NameId<'i>, (u32, u32)>,
+  files: HashMap<NameId<'i>, NodeId>,
   /// Import-proven per-file bindings: `(importing file's path, imported name)` → the node the
   /// file's import statement resolved to at constrained-or-better, single-target confidence
   /// (seeded by [`crate::seed_import_bindings`]). Consulted for bare-name references after
   /// local definitions (which shadow imports) and before global visibility. Probed, never
   /// iterated, so map order is never observed.
-  import_bindings: HashMap<(NameId, NameId), NodeId>,
+  import_bindings: HashMap<(NameId<'i>, NameId<'i>), NodeId>,
 }
 
-impl SymbolTable {
+impl<'i> SymbolTable<'i> {
   pub fn new() -> Self {
     Self::default()
   }
 
-  pub fn insert(&mut self, name: &str, symbol: Symbol) {
+  pub fn insert(&mut self, interner: &'i Interner, name: &str, symbol: Symbol<'i>) {
     debug_assert!(self.grouped.is_empty(), "insert after finalize");
-    self.pending.push((intern::intern(name), symbol));
+    self.pending.push((interner.intern(name), symbol));
   }
 
   /// Pre-size the pair vector for a known upper bound of inserts — sharded builds know their
@@ -77,32 +77,32 @@ impl SymbolTable {
   /// generated stubs) never enter the table at all — and, decisively, their names never
   /// enter the interner: ~1.4 M leaked strings plus shard-map entries that existed only to
   /// key rows nothing would ever look up.
-  pub fn insert_if_referenced(&mut self, name: &str, symbol: Symbol) {
+  pub fn insert_if_referenced(&mut self, interner: &'i Interner, name: &str, symbol: Symbol<'i>) {
     debug_assert!(self.grouped.is_empty(), "insert after finalize");
-    if let Some(id) = intern::peek(name) {
+    if let Some(id) = interner.peek(name) {
       self.pending.push((id, symbol));
     }
   }
 
   /// Register a file node by its exact ingested path (the target of path-form imports).
-  pub fn insert_file(&mut self, path: &str, id: NodeId) {
-    self.files.insert(intern::intern(path), id);
+  pub fn insert_file(&mut self, interner: &'i Interner, path: &str, id: NodeId) {
+    self.files.insert(interner.intern(path), id);
   }
 
   /// The file node at exactly `path`, if indexed. Probes never grow the interner: a joined
   /// path nothing interned cannot be in the table either.
-  pub fn file(&self, path: &str) -> Option<NodeId> {
-    self.files.get(&intern::peek(path)?).copied()
+  pub fn file(&self, interner: &'i Interner, path: &str) -> Option<NodeId> {
+    self.files.get(&interner.peek(path)?).copied()
   }
 
   /// Install the import-binding map (see the field's doc). Called once by the link phase's
   /// pre-pass, between `finalize` and the main resolution pass.
-  pub fn set_import_bindings(&mut self, bindings: HashMap<(NameId, NameId), NodeId>) {
+  pub fn set_import_bindings(&mut self, bindings: HashMap<(NameId<'i>, NameId<'i>), NodeId>) {
     self.import_bindings = bindings;
   }
 
   /// The node `path`'s import of `name` provably resolved to, if any.
-  pub fn import_binding(&self, path: NameId, name: NameId) -> Option<NodeId> {
+  pub fn import_binding(&self, path: NameId<'i>, name: NameId<'i>) -> Option<NodeId> {
     self.import_bindings.get(&(path, name)).copied()
   }
 
@@ -110,7 +110,7 @@ impl SymbolTable {
   /// sharded table build, a plain append of the flat pair vector. Absorbing row-range shards
   /// in row order reproduces the serial insertion order exactly. (File paths and canonical
   /// identities are disjoint across shards by construction.)
-  pub fn absorb(&mut self, other: SymbolTable) {
+  pub fn absorb(&mut self, other: SymbolTable<'i>) {
     debug_assert!(
       self.grouped.is_empty() && other.grouped.is_empty(),
       "absorb after finalize"
@@ -132,9 +132,9 @@ impl SymbolTable {
 
   /// Shared grouping kernel: `pairs` yielded in insertion order, twice-iterable via clone.
   fn group(
-    pairs: impl Iterator<Item = (NameId, Symbol)> + Clone,
+    pairs: impl Iterator<Item = (NameId<'i>, Symbol<'i>)> + Clone,
     total: usize,
-    into: &mut SymbolTable,
+    into: &mut SymbolTable<'i>,
   ) {
     if total == 0 {
       return;
@@ -170,7 +170,7 @@ impl SymbolTable {
   /// concatenating their pair vectors — the count pass reads the shards in place and the
   /// scatter writes directly into the final layout. Equal to `absorb`-then-`finalize` by
   /// construction (same iteration order, same grouping kernel).
-  pub fn from_shards(shards: Vec<SymbolTable>) -> Self {
+  pub fn from_shards(shards: Vec<SymbolTable<'i>>) -> Self {
     let mut table = SymbolTable::new();
     let total = shards.iter().map(|s| s.pending.len()).sum();
     {
@@ -191,13 +191,13 @@ impl SymbolTable {
   /// of path-form imports); import/alias nodes are wiring, not definitions, and are never
   /// candidates; every other definition goes to the name candidate set, with its containment
   /// parent (when not the file) recorded as `owner`. The returned table is finalized.
-  pub fn from_kg(kg: &Kg) -> Self {
+  pub fn from_kg(interner: &'i Interner, kg: &Kg) -> Self {
     let mut table = Self::new();
     for i in 0..kg.node_count() as u64 {
       let id = NodeId::new(i);
       if let Some(node) = kg.node(id) {
         if node.kind == SymbolKind::File {
-          table.insert_file(node.path, id);
+          table.insert_file(interner, node.path, id);
           continue;
         }
         if node.kind == SymbolKind::Import {
@@ -205,14 +205,15 @@ impl SymbolTable {
         }
         let owner = kg.container_of(id).and_then(|cid| {
           let container = kg.node(cid)?;
-          (container.kind != SymbolKind::File).then(|| intern::intern(container.name))
+          (container.kind != SymbolKind::File).then(|| interner.intern(container.name))
         });
         table.insert(
+          interner,
           node.name,
           Symbol {
             id,
             kind: node.kind,
-            path: intern::intern(node.path),
+            path: interner.intern(node.path),
             exported: node.exported,
             owner,
           },
@@ -224,7 +225,7 @@ impl SymbolTable {
   }
 
   /// Every definition carrying `name` (the candidate set for resolution), in insertion order.
-  pub fn candidates(&self, name: NameId) -> &[Symbol] {
+  pub fn candidates(&self, name: NameId<'i>) -> &[Symbol<'i>] {
     debug_assert!(
       self.pending.is_empty(),
       "finalize the table before resolving"
