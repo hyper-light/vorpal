@@ -98,36 +98,98 @@ impl EvidenceRow {
 /// — callers hand over arrival order — and the alternatives pool is laid out in sorted-row
 /// order, so the bytes are a pure function of the occurrence set.
 pub fn save(dir: &Path, mut rows: Vec<EvidenceRow>) -> io::Result<()> {
-  rows.sort_unstable_by_key(EvidenceRow::key);
-  let pool_len: usize = rows.iter().map(|r| r.alternatives.len()).sum();
-  let tmp = dir.join("evidence.bin.tmp");
-  let mut out = BufWriter::with_capacity(1 << 20, fs::File::create(&tmp)?);
-  out.write_all(MAGIC)?;
-  out.write_all(&VERSION.to_le_bytes())?;
-  out.write_all(&(rows.len() as u64).to_le_bytes())?;
-  out.write_all(&(pool_len as u64).to_le_bytes())?;
-  let mut alt_off = 0u32;
-  for row in &rows {
-    out.write_all(&row.from.to_le_bytes())?;
-    out.write_all(&row.to.to_le_bytes())?;
-    out.write_all(&row.name_hash.to_le_bytes())?;
-    out.write_all(&row.etype.to_le_bytes())?;
-    out.write_all(&[row.reason, row.confidence, row.outcome.tag()])?;
-    out.write_all(&[row.alternatives.len().min(255) as u8])?;
-    out.write_all(&[0u8, 0u8])?; // pad
-    out.write_all(&row.candidates.to_le_bytes())?;
-    out.write_all(&row.span_start.to_le_bytes())?;
-    out.write_all(&row.span_end.to_le_bytes())?;
-    out.write_all(&alt_off.to_le_bytes())?;
-    alt_off += row.alternatives.len() as u32;
+  use rayon::prelude::*;
+  crate::phase_stamp("evidence: sort start");
+  // Sort under a TOTAL order (canonical key, then every remaining field): the sorted
+  // sequence is unique, so the output is a pure function of the row set — deterministic
+  // under any sort algorithm and any thread count, which is what licenses the parallel
+  // unstable sort. (The previous serial sort keyed only on `key()`; ties, if any ever
+  // exist, were ordered by pdqsort's whims — the total order is strictly more canonical.)
+  rows.par_sort_unstable_by(|a, b| {
+    a.key()
+      .cmp(&b.key())
+      .then_with(|| a.name_hash.cmp(&b.name_hash))
+      .then_with(|| a.reason.cmp(&b.reason))
+      .then_with(|| a.confidence.cmp(&b.confidence))
+      .then_with(|| a.outcome.tag().cmp(&b.outcome.tag()))
+      .then_with(|| a.candidates.cmp(&b.candidates))
+      .then_with(|| a.alternatives.cmp(&b.alternatives))
+  });
+  crate::phase_stamp("evidence: encode start");
+
+  // Fixed-width rows encode at exact offsets: chunk the row set, prefix-sum each chunk's
+  // alternative count (the only cross-row dependency), then encode rows and pool in
+  // parallel straight into their final positions. The serial form issued ~13 tiny
+  // `write_all`s per row — ~88M calls at kernel scale, single-threaded.
+  const CHUNK: usize = 64 * 1024;
+  let chunk_alt_counts: Vec<u32> = rows
+    .par_chunks(CHUNK)
+    .map(|chunk| chunk.iter().map(|r| r.alternatives.len() as u32).sum())
+    .collect();
+  let mut chunk_alt_offsets = Vec::with_capacity(chunk_alt_counts.len());
+  let mut running = 0u32;
+  for &count in &chunk_alt_counts {
+    chunk_alt_offsets.push(running);
+    running += count;
   }
-  for row in &rows {
-    for &alt in &row.alternatives {
-      out.write_all(&alt.to_le_bytes())?;
+  let pool_len = running as usize;
+
+  let mut rows_buf = vec![0u8; rows.len() * ROW];
+  let mut pool_buf = vec![0u8; pool_len * 4];
+  {
+    // Pool slices per chunk are disjoint by construction (prefix offsets); split_at_mut
+    // walks them off the front in order.
+    let mut pool_rest: &mut [u8] = &mut pool_buf;
+    let mut pool_slices = Vec::with_capacity(chunk_alt_counts.len());
+    for &count in &chunk_alt_counts {
+      let (head, tail) = pool_rest.split_at_mut(count as usize * 4);
+      pool_slices.push(head);
+      pool_rest = tail;
     }
+    rows
+      .par_chunks(CHUNK)
+      .zip(rows_buf.par_chunks_mut(CHUNK * ROW))
+      .zip(pool_slices)
+      .zip(chunk_alt_offsets)
+      .for_each(|(((chunk, out_rows), out_pool), mut alt_off)| {
+        let mut pool_at = 0usize;
+        for (row, out) in chunk.iter().zip(out_rows.chunks_exact_mut(ROW)) {
+          out[0..4].copy_from_slice(&row.from.to_le_bytes());
+          out[4..8].copy_from_slice(&row.to.to_le_bytes());
+          out[8..12].copy_from_slice(&row.name_hash.to_le_bytes());
+          out[12..14].copy_from_slice(&row.etype.to_le_bytes());
+          out[14] = row.reason;
+          out[15] = row.confidence;
+          out[16] = row.outcome.tag();
+          out[17] = row.alternatives.len().min(255) as u8;
+          out[18] = 0;
+          out[19] = 0;
+          out[20..24].copy_from_slice(&row.candidates.to_le_bytes());
+          out[24..28].copy_from_slice(&row.span_start.to_le_bytes());
+          out[28..32].copy_from_slice(&row.span_end.to_le_bytes());
+          out[32..36].copy_from_slice(&alt_off.to_le_bytes());
+          for &alt in &row.alternatives {
+            out_pool[pool_at..pool_at + 4].copy_from_slice(&alt.to_le_bytes());
+            pool_at += 4;
+          }
+          alt_off += row.alternatives.len() as u32;
+        }
+      });
   }
-  out.flush()?;
+  crate::phase_stamp("evidence: write start");
+
+  let tmp = dir.join("evidence.bin.tmp");
+  let mut out = fs::File::create(&tmp)?;
+  let mut header = [0u8; 24];
+  header[0..4].copy_from_slice(MAGIC);
+  header[4..8].copy_from_slice(&VERSION.to_le_bytes());
+  header[8..16].copy_from_slice(&(rows.len() as u64).to_le_bytes());
+  header[16..24].copy_from_slice(&(pool_len as u64).to_le_bytes());
+  out.write_all(&header)?;
+  out.write_all(&rows_buf)?;
+  out.write_all(&pool_buf)?;
   drop(out);
+  crate::phase_stamp("evidence: save done");
   fs::rename(&tmp, dir.join("evidence.bin"))
 }
 

@@ -31,10 +31,18 @@ vorpal-index index ~/Projects/cpython /tmp/bench-py
 
 | Measurement | wall | user CPU | notes |
 |---|---|---|---|
-| linux cold | 8.97 s | 110.7 s | 72,541 files → 2,748,638 nodes; 2.17 M refs resolved |
+| linux cold | 7.95 s (min-of-3) | 113.1 s | 72,541 files → 2,748,638 nodes; 2.17 M refs resolved |
 | linux warm-unchanged | 0.11 s | — | manifest fast path, no file reads |
 | linux one-file update | 2.30 s | — | product replay + deterministic re-link |
-| cpython cold | 0.93 s | — | 3,592 files → 143,450 nodes |
+| cpython cold | 0.83 s | — | 3,592 files → 143,450 nodes |
+
+2026-08-17 saturation pass (was 8.79 s / 70% core utilization → 7.95 s / ~79%): parallel
+total-order evidence sort+encode (0.47 s → 0.07 s, overlapped with the graph save), the four
+generation artifacts written concurrently, per-worker stream budget 8 → 24 MiB (large
+generated headers stalled admission), parallel names-index sort. The remaining gap to 100%
+is ~12% distributed inside the extraction pipeline (parse-length imbalance and committer
+micro-waits) plus ~0.6 s of inherently ordered link tail; the phase timeline is inspectable
+with `VORPAL_PHASE_TRACE=1`.
 
 Index size (linux): generation 2.03 GiB (includes the 805 MB vector tier and 39.7 MB
 posting tier after a warm); index root 4.1 GiB total with the root-level product bank.

@@ -95,7 +95,10 @@ fn stream_budget_bytes() -> u64 {
   let threads = std::thread::available_parallelism()
     .map(|n| n.get() as u64)
     .unwrap_or(1);
-  (threads * 8 * 1024 * 1024).clamp(32 * 1024 * 1024, 512 * 1024 * 1024)
+  // 24 MiB per worker: at 8 MiB the kernel's 10–20 MiB generated headers stalled admission
+  // (measured ~0.5 s of wall at 18 cores); peak RSS is unaffected because the build's
+  // high-water lives at seal (~1.08 GB), well above the stream phase either way.
+  (threads * 24 * 1024 * 1024).clamp(64 * 1024 * 1024, 768 * 1024 * 1024)
 }
 
 /// How cache validity is decided (IMPROVEMENTS 07-29 §3) — an explicit, testable product
@@ -205,16 +208,21 @@ pub fn build_index_full(
   // lifetime brand makes anything holding a session id un-returnable at compile time.
   // Embedded hosts get bounded memory with no reclaim call at all.
   let interner = vorpal_ingest::Interner::default();
+  vorpal_kg::phase_stamp("build: enter");
   let extractor = OutlineExtractor::new()?;
+  vorpal_kg::phase_stamp("build: rules compiled");
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
   // it, so editing a grammar OR an outline rule invalidates reuse just as a file edit would.
   let rules_digest = extractor.rules_digest();
+  vorpal_kg::phase_stamp("scan: manifest start");
   let mut manifest = Manifest::scan(src, |p| extractor.handles(p))?;
+  vorpal_kg::phase_stamp("scan: manifest done");
   manifest.set_grammar_stamp(vorpal_ingest::extraction_identity(
     vorpal_ingest::global_grammar_stamp(),
     rules_digest,
   ));
+  vorpal_kg::phase_stamp("build: grammar stamp done");
   // Generation layout (IMPROVEMENTS §4): `out` is the index *root*. The live artifacts sit in
   // an immutable, content-addressed generation dir named by `out/CURRENT`; this run reads the
   // prior generation, stages a new one, and commits it with one atomic pointer swap — a
@@ -369,6 +377,7 @@ pub fn build_index_full(
   };
   let spill_path = staging.join(".refs.spill");
   let heap_stream = staging.join("strings.heap.tmp");
+  vorpal_kg::phase_stamp("stream: start");
   let stream_result = stream_apply_spilled(
     &interner,
     manifest.entries(),
@@ -553,15 +562,21 @@ pub fn build_index_full(
   // graph over the sharded table/resolve passes.
   let (kg, resolve, evidence) =
     link_writer_spilled(&interner, writer, spilled_refs, &Resolver::new())?;
-  // Persist the per-edge evidence sidecar into the staged generation (§5): span, resolver
-  // reason, confidence, and candidate count per edge occurrence — canonically sorted, so it
-  // joins the generation's content identity deterministically.
-  vorpal_kg::save_evidence(&staging, evidence)?;
-  // Embeddings stay off the commit hot path (§3.4): the graph persists now; the ANN tier is
-  // built lazily by the first search and validated by stamp, so incremental re-indexes never
-  // pay a full vector-graph rebuild (at kernel scale that rebuild dominated the whole run).
-  // The manifest is the commit point and always lands last.
-  kg.save(&staging)?;
+  // Persist the evidence sidecar (§5) and the graph segments CONCURRENTLY: they are
+  // independent artifacts in the same staged generation, and running them serially left
+  // 17 cores idle for the longer of the two. Evidence is canonically sorted (total order)
+  // inside its saver, so it still joins the content identity deterministically. The
+  // manifest stays strictly last — it is the commit point.
+  let (evidence_result, kg_result) = std::thread::scope(|scope| {
+    let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+    let kg_result = kg.save(&staging);
+    (
+      evidence_task.join().expect("evidence saver panicked"),
+      kg_result,
+    )
+  });
+  evidence_result?;
+  kg_result?;
   manifest.save(&staging.join("manifest.bin"))?;
   // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
   commit_generation(out, &prior, staging)?;

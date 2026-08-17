@@ -608,30 +608,44 @@ impl Kg {
   /// Sealed segments are immutable, so this is a plain write (§9.7).
   pub fn save(&self, dir: &Path) -> io::Result<()> {
     use std::io::Write;
-    crate::phase_stamp("kg save: segments");
+    crate::phase_stamp("kg save: start");
     fs::create_dir_all(dir)?;
     // Every artifact lands via tmp + rename: a rebuild must never truncate a file a live
     // reader — this process's daemon, or another process — still has mapped (truncating a
     // mapped file makes later reads fault). Rename swaps the directory entry; the old inode
     // survives until its last map goes away.
-    write_via_tmp(dir, "nodes.vseg", |out| out.write_all(self.nodes.bytes()))?;
-    let heap_final = dir.join("strings.heap");
-    match &self.heap_file {
-      // Streamed commit: the bytes are already in the tmp file — publish it.
-      Some(existing) if *existing == dir.join("strings.heap.tmp") => {
-        replace_file(existing, &heap_final)?;
-      }
-      // Loaded from this very directory: identical bytes are already in place.
-      Some(existing) if *existing == heap_final => {}
-      _ => write_via_tmp(dir, "strings.heap", |out| out.write_all(&self.heap[..]))?,
-    }
-
-    self.write_names_index(dir)?;
-
-    crate::phase_stamp("kg save: graph");
-    // Both CSR directions persist as one aligned section file the load path maps zero-copy —
-    // the edge-list form forced every open to re-run compaction (~64 ms at kernel scale).
-    write_via_tmp(dir, "graph.bin", |out| self.graph.write_to(out))?;
+    //
+    // The four artifacts are independent files; writing them serially left the save's wall
+    // time as their SUM (the largest single chunk of the post-stream tail). A scope writes
+    // them concurrently — wall becomes the max — and each write is still tmp+rename atomic.
+    let (nodes_result, names_result, graph_result) = std::thread::scope(|scope| {
+      let nodes_task = scope.spawn(|| {
+        write_via_tmp(dir, "nodes.vseg", |out| out.write_all(self.nodes.bytes()))?;
+        let heap_final = dir.join("strings.heap");
+        match &self.heap_file {
+          // Streamed commit: the bytes are already in the tmp file — publish it.
+          Some(existing) if *existing == dir.join("strings.heap.tmp") => {
+            replace_file(existing, &heap_final)
+          }
+          // Loaded from this very directory: identical bytes are already in place.
+          Some(existing) if *existing == heap_final => Ok(()),
+          _ => write_via_tmp(dir, "strings.heap", |out| out.write_all(&self.heap[..])),
+        }
+      });
+      let names_task = scope.spawn(|| self.write_names_index(dir));
+      // Both CSR directions persist as one aligned section file the load path maps
+      // zero-copy — the edge-list form forced every open to re-run compaction (~64 ms at
+      // kernel scale).
+      let graph_result = write_via_tmp(dir, "graph.bin", |out| self.graph.write_to(out));
+      (
+        nodes_task.join().expect("nodes/heap saver panicked"),
+        names_task.join().expect("names saver panicked"),
+        graph_result,
+      )
+    });
+    nodes_result?;
+    names_result?;
+    graph_result?;
     crate::phase_stamp("kg save: done");
     Ok(())
   }
@@ -644,6 +658,7 @@ impl Kg {
   pub fn write_names_index(&self, dir: &Path) -> io::Result<()> {
     use std::io::Write;
     write_via_tmp(dir, "names.idx", |out| {
+      use rayon::prelude::*;
       let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
         .filter_map(|i| {
           self
@@ -651,7 +666,7 @@ impl Kg {
             .map(|view| (xxhash_rust::xxh3::xxh3_64(view.name.as_bytes()), i))
         })
         .collect();
-      pairs.sort_unstable();
+      pairs.par_sort_unstable();
       out.write_all(&NAMES_MAGIC.to_le_bytes())?;
       out.write_all(&(pairs.len() as u32).to_le_bytes())?;
       for &(hash, _) in &pairs {
