@@ -98,6 +98,19 @@ present and the license text itself must be vendored in the tree (all 27 current
 nine missing license texts were fetched from their pinned upstream commits when enforcement
 first ran — see the provenance commit history).
 
+## Known upstream behaviors
+
+**Error recovery is optimization-sensitive** (tree-sitter C runtime): the same vendored
+sources compiled under different optimization profiles (workspace `lto = true` vs a plain
+release profile) can recover *different trees* inside ERROR regions. Measured on the Linux
+kernel (2026-08-17): 2,748,638 vs 2,748,539 nodes, every divergent file an assembly-macro
+C header the grammar cannot parse; with `--parse-health exclude` both compilations produce
+byte-identical `nodes.vseg`/`graph.bin`/`strings.heap`/`evidence.bin`. Healthy-file parses
+are bit-stable across profiles, and allocator choice (jemalloc vs system) provably does not
+matter (same generation id). Vorpal's determinism contract — same binary, bit-identical
+output — is unaffected; this only concerns byte-agreement across *differently compiled*
+binaries, and docs/EMBEDDING.md carries the guidance.
+
 ## Provenance, corpora, and the reproducible update procedure (IMPROVEMENTS #10)
 
 Machine-readable provenance lives in **`grammars/PROVENANCE.json`** (repository, version,

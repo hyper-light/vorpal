@@ -133,6 +133,46 @@ impl CacheMode {
   }
 }
 
+/// Builds currently in flight in this process — the runtime check behind
+/// [`reclaim_session_memory`].
+static ACTIVE_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What was freed by one [`reclaim_session_memory`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimStats {
+  pub strings: usize,
+  pub bytes: usize,
+}
+
+/// Free the process-wide interner between index sessions — the memory-lifecycle valve for
+/// **long-lived embedded hosts** (see docs/EMBEDDING.md). Within one session the interner is
+/// bounded by the corpus vocabulary; across many sessions it grows monotonically, and this
+/// is the boundary that returns it to zero. One-shot processes (the CLI) never need it.
+///
+/// Panics if any `build_index*` call is in flight — that much misuse is caught at runtime.
+///
+/// # Safety
+///
+/// Everything `vorpal_resolve::intern::reclaim_all` requires: no vorpal call may be
+/// executing concurrently anywhere in the process, and no value that predates the call —
+/// `Reference`s, `SymbolTable`s, spills, or any `&str` the resolution layer handed out —
+/// may be used afterwards. Loaded [`Kg`]s and query results are safe to keep: persisted
+/// artifacts and their views never contain interner ids.
+pub unsafe fn reclaim_session_memory() -> ReclaimStats {
+  assert_eq!(
+    ACTIVE_BUILDS.load(std::sync::atomic::Ordering::Acquire),
+    0,
+    "reclaim_session_memory called while a build is in flight"
+  );
+  let stats = ReclaimStats {
+    strings: vorpal_ingest::intern_retained_strings(),
+    bytes: vorpal_ingest::intern_retained_bytes(),
+  };
+  // SAFETY: forwarded contract — the caller upholds quiescence and drops prior values.
+  unsafe { vorpal_ingest::intern_reclaim_all() };
+  stats
+}
+
 /// What a build does about files whose parse produced ERROR nodes (IMPROVEMENTS #11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParseHealthMode {
@@ -200,6 +240,16 @@ pub fn build_index_full(
   cache_mode: CacheMode,
   policy: ParseHealthPolicy,
 ) -> Result<IndexReport, Box<dyn Error>> {
+  // Embedded-host accounting: `reclaim_session_memory` refuses while any build is in
+  // flight. RAII so every early return and error path decrements.
+  struct BuildGuard;
+  impl Drop for BuildGuard {
+    fn drop(&mut self) {
+      ACTIVE_BUILDS.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+  }
+  ACTIVE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+  let _build_guard = BuildGuard;
   let extractor = OutlineExtractor::new()?;
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
@@ -898,11 +948,21 @@ pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
-  // One build at a time per process: an eager background warm and a foreground search must
-  // not both build (duplicate work, racing writes). Late entrants re-check freshness under
-  // the lock and find the first builder's work done.
-  static ANN_BUILD: Mutex<()> = Mutex::new(());
-  let _guard = ANN_BUILD
+  // One build at a time **per index directory**: an eager background warm and a foreground
+  // search on the same index must not both build (duplicate work, racing writes), but a
+  // host serving several indexes warms them concurrently — the old process-wide mutex
+  // serialized unrelated indexes for no reason. Late entrants re-check freshness under the
+  // dir lock and find the first builder's work done. The key map is bounded by the distinct
+  // index dirs this process ever warms.
+  static ANN_BUILDS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+  let dir_lock = {
+    let mut map = ANN_BUILDS
+      .get_or_init(|| Mutex::new(HashMap::new()))
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(index_dir.to_path_buf()).or_default().clone()
+  };
+  let _guard = dir_lock
     .lock()
     .unwrap_or_else(|poisoned| poisoned.into_inner());
   // Load first, stamp the loaded bytes: the stamp this build writes must describe the KG it

@@ -11,9 +11,17 @@
 //! **sharded 64 ways** by string hash: parallel link passes make ~10M interner calls across
 //! all worker threads, and a single lock measurably serialized them (pthread rwlock syscalls
 //! under contention). Each id carries its shard in its high bits, so resolving text touches
-//! only that shard's lock. Memory is bounded by the union of vocabularies ever interned in
-//! the process — the same boundedness argument as the grammar-kind interner. Interned ids are
-//! process-internal and never reach any output, so run-to-run determinism is unaffected.
+//! only that shard's lock. Interned ids are process-internal and never reach any output, so
+//! run-to-run determinism is unaffected.
+//!
+//! **Lifecycle (embedded hosts)**: within one build session memory is bounded by the union
+//! of vocabularies interned; across sessions in a long-lived host it grows monotonically —
+//! indexing many distinct repos over weeks accumulates every distinct name ever seen.
+//! Strings therefore live in per-shard **arenas, not leaks**: [`reclaim_all`] frees every
+//! arena between sessions under an explicit safety contract (no prior [`NameId`] and no
+//! `&str` from [`text_of`] may be used afterwards), and [`retained_bytes`] /
+//! [`retained_strings`] let a host observe growth and decide when. One-shot processes (the
+//! CLI) never need to call it — process exit is the reclaim.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -58,6 +66,10 @@ const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
 struct Shard {
   by_text: HashMap<&'static str, u32>,
   by_index: Vec<&'static str>,
+  /// Owns every string the two maps borrow. `Box<str>` contents are heap-stable, so the
+  /// vector may grow freely while `&'static str` borrows into the boxes circulate; entries
+  /// drop only in [`reclaim_all`], whose contract guarantees no such borrow is still alive.
+  arena: Vec<Box<str>>,
 }
 
 fn shards() -> &'static [RwLock<Shard>; SHARDS] {
@@ -71,7 +83,7 @@ fn shard_of(text: &str) -> usize {
   (hasher.finish() as usize) & (SHARDS - 1)
 }
 
-/// Intern `text`, returning its stable id (allocating and leaking the string on first sight).
+/// Intern `text`, returning its stable id (allocating into the shard arena on first sight).
 pub fn intern(text: &str) -> NameId {
   let shard_index = shard_of(text);
   let lock = &shards()[shard_index];
@@ -82,12 +94,68 @@ pub fn intern(text: &str) -> NameId {
   if let Some(&index) = shard.by_text.get(text) {
     return NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index);
   }
-  let leaked: &'static str = Box::leak(text.to_string().into_boxed_str());
+  let boxed: Box<str> = text.to_string().into_boxed_str();
+  // The box's heap contents are address-stable; extending the borrow to `'static` is sound
+  // while the arena entry lives, which the `reclaim_all` contract guarantees for every
+  // handed-out borrow.
+  let interned: &'static str = unsafe { &*(boxed.as_ref() as *const str) };
+  shard.arena.push(boxed);
   let index = shard.by_index.len() as u32;
   assert!(index < INDEX_MASK, "interner shard overflow");
-  shard.by_index.push(leaked);
-  shard.by_text.insert(leaked, index);
+  shard.by_index.push(interned);
+  shard.by_text.insert(interned, index);
   NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index)
+}
+
+/// Total bytes of interned string content currently retained — the number an embedded host
+/// watches to decide when a [`reclaim_all`] boundary is worth taking.
+pub fn retained_bytes() -> usize {
+  shards()
+    .iter()
+    .map(|lock| {
+      lock
+        .read()
+        .unwrap()
+        .arena
+        .iter()
+        .map(|boxed| boxed.len())
+        .sum::<usize>()
+    })
+    .sum()
+}
+
+/// Distinct strings currently retained.
+pub fn retained_strings() -> usize {
+  shards()
+    .iter()
+    .map(|lock| lock.read().unwrap().arena.len())
+    .sum()
+}
+
+/// Free every interned string and reset the id space — the session boundary for long-lived
+/// embedded hosts. One-shot processes never need this.
+///
+/// # Safety
+///
+/// After this call, **nothing minted before it may be used**:
+/// - no prior [`NameId`] may be passed to [`text_of`] (ids restart from zero; a stale id
+///   would name an unrelated new string, or panic on an empty shard), and
+/// - no `&str` previously returned by [`text_of`] (or held via any type that captured one)
+///   may still be alive — their arenas are dropped here.
+///
+/// In vorpal's own architecture both hold structurally between builds: `Reference`,
+/// `SymbolTable`, and the spill are dropped before `build_index` returns, and persisted
+/// artifacts never contain interner ids. Callers embedding the library must uphold the same
+/// discipline: quiesce every vorpal call, drop every vorpal value that predates the reclaim,
+/// then call this. `vorpal_index::reclaim_session_memory` layers a build-in-flight check on
+/// top and is the entry point hosts should prefer.
+pub unsafe fn reclaim_all() {
+  for lock in shards() {
+    let mut shard = lock.write().unwrap();
+    shard.by_text.clear();
+    shard.by_index.clear();
+    shard.arena.clear();
+  }
 }
 
 /// The id of `text` iff it was ever interned — for speculative probes (path-form import

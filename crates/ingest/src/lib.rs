@@ -39,6 +39,10 @@ pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
 pub use vorpal_resolve::{
   Confidence, RefKind, Reference, ResolutionGrade, ResolveReason, ResolveStats, Resolver,
 };
+pub use vorpal_resolve::intern::{
+  reclaim_all as intern_reclaim_all, retained_bytes as intern_retained_bytes,
+  retained_strings as intern_retained_strings,
+};
 
 /// The grammar-generation digest for the language of `path`, or `None` if the path maps to no
 /// supported language. The product-cache replay gate compares this against the digest a cached
