@@ -39,10 +39,17 @@ vorpal-index index ~/Projects/cpython /tmp/bench-py
 2026-08-17 saturation pass (was 8.79 s / 70% core utilization → 7.95 s / ~79%): parallel
 total-order evidence sort+encode (0.47 s → 0.07 s, overlapped with the graph save), the four
 generation artifacts written concurrently, per-worker stream budget 8 → 24 MiB (large
-generated headers stalled admission), parallel names-index sort. The remaining gap to 100%
-is ~12% distributed inside the extraction pipeline (parse-length imbalance and committer
-micro-waits) plus ~0.6 s of inherently ordered link tail; the phase timeline is inspectable
-with `VORPAL_PHASE_TRACE=1`.
+generated headers stalled admission), parallel names-index sort. A follow-up pass moved
+rolling absorption to a dedicated thread (admission is now a pure budget-gated feed) and
+deepened the work queue 36 → 1,152 entries (16 B each — depth was conflated with the byte
+budget): matched traces show the stream span at 7.10 s vs 7.31 s, output bit-identical.
+File-level longest-first admission was evaluated and rejected with a proof sketch: it either
+deadlocks the byte budget or unbounds the absorber's shard-writer holdback; the safe
+formulation is per-shard order preservation, which global order already provides. The
+remaining gap to 100% is distributed parse-length imbalance inside extraction plus ~0.6 s of
+inherently ordered link tail; the phase timeline is inspectable with
+`VORPAL_PHASE_TRACE=1`. (Wall-clock deltas below ~0.5 s are unresolvable on this hardware:
+user CPU for identical builds varied 110–127 s with thermal state across the session.)
 
 Index size (linux): generation 2.03 GiB (includes the 805 MB vector tier and 39.7 MB
 posting tier after a warm); index root 4.1 GiB total with the root-level product bank.

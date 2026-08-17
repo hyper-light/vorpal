@@ -1033,7 +1033,12 @@ where
 
   // Admission → workers: a bounded MPMC of (sequence, entry); fixed capacity IS the
   // backpressure.
-  let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, &crate::FileStat)>(threads * 2);
+  // Queue DEPTH is decoupled from the byte budget: entries are 16-byte (sequence, &stat)
+  // pairs whose source bytes are already reserved, so a deep queue costs kilobytes while
+  // absorbing admission jitter — at threads*2 the queue drained in single-digit
+  // milliseconds whenever admission paused, starving every parser.
+  let (work_tx, work_rx) =
+    crossbeam_channel::bounded::<(usize, &crate::FileStat)>((threads * 64).clamp(64, 4096));
   // Workers → committers: one bounded channel per committer thread; shard k routes to
   // committer k % committers.
   let (slot_txs, slot_rxs): (Vec<_>, Vec<_>) = (0..committers)
@@ -1047,12 +1052,7 @@ where
     // never touches anonymous memory); the link pass reads it back through a zero-copy map.
     writer.stream_heap_to(path)?;
   }
-  let mut holdback: std::collections::BTreeMap<usize, (KgWriter, Vec<Reference>)> =
-    std::collections::BTreeMap::new();
-  let mut next_absorb = 0usize;
-  // First sink (spill IO) error: aborts absorption, surfaced after the scope joins.
-  let mut sink_error: Option<io::Error> = None;
-  // Committers → caller: completed shards, for rolling prefix absorption. Unbounded so a
+  // Committers → absorber: completed shards, for rolling prefix absorption. Unbounded so a
   // committer never blocks handing off a finished shard.
   let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>)>();
 
@@ -1196,27 +1196,35 @@ where
     drop(work_rx);
     drop(slot_txs);
 
-    // Rolling prefix absorption, on the calling thread: shard k merges as soon as shards
-    // 0..k have merged and k is complete — same order and rebases as absorb-at-the-end,
-    // bit-identical output (pinned by test), but shard writers die while commit is still
-    // running.
-    let mut roll_in = |shard, shard_writer, shard_references| {
-      holdback.insert(shard, (shard_writer, shard_references));
-      while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
-        if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
-          && sink_error.is_none()
-        {
-          sink_error = Some(err);
+    // Absorber: rolling prefix absorption on its OWN thread. Absorb is memcpy plus spill
+    // IO; interleaved with admission it paused the feed for milliseconds at a time, and the
+    // work queue drained under every pause — measured as the distributed stream-phase idle.
+    // Shard k still merges exactly after shards 0..k with the same rebases, so output stays
+    // bit-identical (pinned by test).
+    let absorber = scope.spawn(move || {
+      let mut writer = writer;
+      let mut sink = sink;
+      let mut holdback: std::collections::BTreeMap<usize, (KgWriter, Vec<Reference<'i>>)> =
+        std::collections::BTreeMap::new();
+      let mut next_absorb = 0usize;
+      // First sink (spill IO) error: aborts absorption, surfaced after the scope joins.
+      let mut sink_error: Option<io::Error> = None;
+      while let Ok((shard, shard_writer, shard_references)) = done_rx.recv() {
+        holdback.insert(shard, (shard_writer, shard_references));
+        while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
+          if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
+            && sink_error.is_none()
+          {
+            sink_error = Some(err);
+          }
+          next_absorb += 1;
         }
-        next_absorb += 1;
       }
-    };
+      (writer, sink, holdback, next_absorb, sink_error)
+    });
 
-    // Admission, on the calling thread: manifest order, budget-gated.
+    // Admission, on the calling thread: manifest order, budget-gated — and nothing else.
     for (sequence, entry) in entries.iter().enumerate() {
-      while let Ok((shard, shard_writer, shard_references)) = done_rx.try_recv() {
-        roll_in(shard, shard_writer, shard_references);
-      }
       if abort.load(std::sync::atomic::Ordering::Acquire) {
         break;
       }
@@ -1226,29 +1234,30 @@ where
       }
     }
     drop(work_tx);
-    // Drop the caller's sender so the drain below ends when the committers exit.
+    // Drop the caller's sender so the absorber's drain ends when the committers exit.
     drop(done_tx);
     phase_trace("stream: admission done, draining completions");
-    while let Ok((shard, shard_writer, shard_references)) = done_rx.recv() {
-      roll_in(shard, shard_writer, shard_references);
-    }
 
     for handle in worker_handles {
       let _ = handle.join();
     }
     // Workers dropped their slot senders on exit; committers drain and finish.
-    committer_handles
+    let committer_outputs: Vec<_> = committer_handles
       .into_iter()
       .map(|handle| handle.join().expect("committer panicked"))
-      .collect::<Vec<_>>()
+      .collect();
+    let absorbed = absorber.join().expect("absorber panicked");
+    (committer_outputs, absorbed)
   });
+  let (committer_outputs, (mut writer, mut sink, mut holdback, mut next_absorb, mut sink_error)) =
+    outputs;
 
   if let Some(err) = first_error.into_inner().unwrap() {
     return Err(err);
   }
 
   let (mut parsed, mut replayed) = (0u64, 0u64);
-  for (leftover, shard_parsed, shard_replayed) in outputs {
+  for (leftover, shard_parsed, shard_replayed) in committer_outputs {
     parsed += shard_parsed;
     replayed += shard_replayed;
     // Leftovers exist only when admission aborted mid-run; fold them in anyway so the
