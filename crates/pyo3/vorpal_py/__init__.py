@@ -1,7 +1,22 @@
 from __future__ import annotations
 
 from typing import List, TypedDict,  Literal, Dict, Union, Mapping, Optional
-from .vorpal_py import SgNode, SgRoot, Pos, Range, Edit, register_dynamic_language
+from .vorpal_py import (
+    BuildReport,
+    Edit,
+    Index,
+    NodeInfo,
+    Pos,
+    Range,
+    SgNode,
+    SgRoot,
+    index_build,
+    index_build_report,
+    index_graph,
+    index_node,
+    index_search,
+    register_dynamic_language,
+)
 
 Strictness = Union[Literal["cst"], Literal["smart"], Literal["ast"], Literal["relaxed"], Literal["signature"]]
 
@@ -82,4 +97,12 @@ __all__ = [
     "Range",
     "Edit",
     "register_dynamic_language",
+    "Index",
+    "NodeInfo",
+    "BuildReport",
+    "index_build",
+    "index_build_report",
+    "index_graph",
+    "index_node",
+    "index_search",
 ]

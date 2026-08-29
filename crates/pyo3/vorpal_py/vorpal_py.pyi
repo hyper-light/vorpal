@@ -1,4 +1,4 @@
-from typing import List, Optional, overload, Unpack, Dict
+from typing import Any, List, Optional, Tuple, overload, Unpack, Dict
 
 from . import Rule, Config, CustomLang
 
@@ -69,3 +69,94 @@ class SgNode:
     def commit_edits(self, edits: List[Edit]) -> str: ...
 
 def register_dynamic_language(langs: Dict[str, CustomLang]): ...
+
+# ── Repository intelligence (index / graph / search) ─────────────────────────
+# Typed complements to the structural API above: build a knowledge-graph index,
+# query relations with resolution grades, and run hybrid search. Record-returning
+# methods yield plain dicts/lists (the pythonized vorpal-index typed records).
+
+class NodeInfo:
+    id: int
+    name: str
+    kind: str
+    path: str
+    signature: str
+    exported: bool
+    span: Tuple[int, int]
+
+class BuildReport:
+    indexed: int
+    skipped: int
+    nodes: int
+    resolved: int
+    ambiguous: int
+    external: int
+    masked: int
+    reused: bool
+
+class Index:
+    @staticmethod
+    def open(index_dir: str) -> Index: ...
+    @property
+    def generation(self) -> str: ...
+    def node(self, id: int) -> Optional[Dict[str, Any]]: ...
+    def nodes(
+        self,
+        name: str,
+        path: Optional[str] = None,
+        kind: Optional[str] = None,
+        id: Optional[int] = None,
+        all: bool = False,
+    ) -> List[Dict[str, Any]]: ...
+    def related(
+        self,
+        verb: str,
+        name: str,
+        path: Optional[str] = None,
+        kind: Optional[str] = None,
+        id: Optional[int] = None,
+        all: bool = False,
+    ) -> List[Dict[str, Any]]: ...
+    def reachable(
+        self,
+        name: str,
+        direction: str,
+        relations: Optional[List[str]] = None,
+        max_depth: Optional[int] = None,
+        min_grade: Optional[str] = None,
+        path: Optional[str] = None,
+        kind: Optional[str] = None,
+        id: Optional[int] = None,
+        all: bool = False,
+    ) -> List[Dict[str, Any]]: ...
+    def why(
+        self,
+        from_id: int,
+        to_id: Optional[int] = None,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]: ...
+    def search(
+        self,
+        query: str,
+        k: int = 10,
+        path: Optional[str] = None,
+        prefix: Optional[str] = None,
+        kind: Optional[str] = None,
+        lang: Optional[str] = None,
+        exported: bool = False,
+    ) -> List[Dict[str, Any]]: ...
+
+def index_build(src: str, out: Optional[str] = None) -> str: ...
+def index_build_report(src: str, out: Optional[str] = None) -> BuildReport: ...
+def index_search(index_dir: str, query: str, k: int = 10, explain: bool = False) -> str: ...
+def index_graph(
+    index_dir: str,
+    verb: str,
+    name: str,
+    path: Optional[str] = None,
+    kind: Optional[str] = None,
+    id: Optional[int] = None,
+    all: bool = False,
+    ids: bool = False,
+) -> str: ...
+def index_node(index_dir: str, id: int) -> NodeInfo: ...
