@@ -244,6 +244,81 @@ impl Kg {
     self.nodes.row_count() as usize
   }
 
+  /// Total directed edges (each stored edge counted once).
+  pub fn edge_count(&self) -> u64 {
+    self.graph.edge_count() as u64
+  }
+
+  /// Incoming-edge count for one node — two mapped offset reads, no allocation (unlike
+  /// [`Kg::in_neighbors`], which materializes the row).
+  pub fn in_degree(&self, id: NodeId) -> usize {
+    self.graph.in_degree(id.raw() as u32)
+  }
+
+  /// Outgoing-edge count for one node — two mapped offset reads, no allocation.
+  pub fn out_degree(&self, id: NodeId) -> usize {
+    self.graph.out_degree(id.raw() as u32)
+  }
+
+  /// Node counts bucketed by symbol kind: one pass over the mapped kind column (u8/node).
+  /// Ascending tag order, zero buckets omitted — deterministic by construction.
+  pub fn node_count_by_kind(&self) -> Vec<(SymbolKind, u64)> {
+    let mut buckets = [0u64; 256];
+    if let Some(column) = self.nodes.column_at(self.cols.kind) {
+      if let Some(tags) = column.as_slice::<u8>() {
+        for &tag in tags {
+          buckets[tag as usize] += 1;
+        }
+      } else {
+        for row in 0..self.nodes.row_count() {
+          if let Some(tag) = column.get_u8(row) {
+            buckets[tag as usize] += 1;
+          }
+        }
+      }
+    }
+    buckets
+      .iter()
+      .enumerate()
+      .filter(|&(_, &count)| count > 0)
+      .map(|(tag, &count)| (SymbolKind::from_tag(tag as u8), count))
+      .collect()
+  }
+
+  /// Directed edge counts bucketed by base relation: one parallel pass over the out-CSR
+  /// type column (u16/edge, confidence byte stripped; per-chunk buckets merged — counts
+  /// commute, so the result is order-independent). Ascending tag order, zero buckets omitted.
+  pub fn edge_count_by_type(&self) -> Vec<(EdgeType, u64)> {
+    use rayon::prelude::*;
+    let etypes = self.graph.out_etypes_all();
+    let buckets = etypes
+      .par_chunks(1 << 20)
+      .fold(
+        || [0u64; 256],
+        |mut buckets, chunk| {
+          for &packed in chunk {
+            buckets[EdgeType(packed).base().0 as usize & 0xff] += 1;
+          }
+          buckets
+        },
+      )
+      .reduce(
+        || [0u64; 256],
+        |mut a, b| {
+          for (a, b) in a.iter_mut().zip(b) {
+            *a += b;
+          }
+          a
+        },
+      );
+    buckets
+      .iter()
+      .enumerate()
+      .filter(|&(_, &count)| count > 0)
+      .map(|(tag, &count)| (EdgeType(tag as u16), count))
+      .collect()
+  }
+
   /// Every retained evidence occurrence for edges `from → to` (all edge types): the source
   /// span of each referencing token, the resolver branch that bound it, its confidence, and
   /// the candidate count — "why does this relation exist?" (§5). Empty when the generation

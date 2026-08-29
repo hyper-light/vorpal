@@ -87,6 +87,7 @@ fn initialize_handshake_and_tool_listing() {
     [
       "index",
       "health",
+      "schema",
       "node",
       "callers",
       "references",
@@ -107,6 +108,39 @@ fn initialize_handshake_and_tool_listing() {
     assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
     assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
   }
+}
+
+#[test]
+fn schema_reports_vocabulary_with_counts() {
+  let (src, idx) = temp_tree("schema");
+  let mut server = Server::new(idx);
+  let (_, is_err) = call_tool(&mut server, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err);
+
+  let response = request(&mut server, 2, "tools/call", json!({"name": "schema", "arguments": {}}));
+  let result = &response["result"];
+  assert_eq!(result["isError"], false);
+  let data = &result["structuredContent"];
+  assert!(data["nodes"].as_u64().unwrap() >= 4, "two files + two fns: {data}");
+  assert_eq!(data["files"], 2);
+  let kinds: Vec<&str> = data["kinds"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|row| row["name"].as_str().unwrap())
+    .collect();
+  assert!(kinds.contains(&"Function") && kinds.contains(&"File"), "{kinds:?}");
+  let relations: Vec<&str> = data["relations"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|row| row["name"].as_str().unwrap())
+    .collect();
+  assert!(relations.contains(&"calls") && relations.contains(&"defines"), "{relations:?}");
+  assert_eq!(data["grades"][0], "exact");
+  let text = result["content"][0]["text"].as_str().unwrap();
+  assert!(text.starts_with("generation "), "{text}");
+  assert!(text.contains("kinds: "), "{text}");
 }
 
 #[test]

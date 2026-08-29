@@ -316,6 +316,17 @@ impl Server {
           .map(|text| (text, json!({})))
           .map_err(|err| ToolError::from(err.to_string()))
       }
+      "schema" => {
+        // Vocabulary introspection: what kinds/relations/grades exist here, with counts —
+        // the call an agent makes before forming its first real query.
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let kg = self.kg.as_ref().expect("pinned above");
+        let report = vorpal_index::records::schema_report(kg, dir.as_deref());
+        let text = vorpal_index::records::render_schema(&report);
+        let data = serde_json::to_value(&report).unwrap_or(Value::Null);
+        Ok((text, data))
+      }
       "rule_search" => {
         let rule = str_arg("rule")?;
         let path = args.get("path").and_then(Value::as_str);
@@ -577,6 +588,14 @@ fn tools_list() -> Value {
        ratios, representative error spans, language + extraction-identity context, and the \
        graph entities whose definitions overlap damaged regions — the difference between \
        'no edge' and 'unknowable here'.",
+      json!({}),
+      &[],
+    ),
+    tool(
+      "schema",
+      "What this graph contains, by vocabulary: node kinds, edge relations, and resolution \
+       grades — each with counts — plus generation id and warm-tier state. Call this before \
+       forming queries; it is the authority on which kind/relation/grade names exist.",
       json!({}),
       &[],
     ),

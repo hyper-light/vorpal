@@ -220,6 +220,98 @@ pub fn render_snippets(records: &[SnippetRecord]) -> String {
   out
 }
 
+/// What this generation's graph contains, by vocabulary: the introspection surface that
+/// teaches a caller (agent or human) what is queryable before it guesses — kinds, relations,
+/// grades, and tier state, with counts.
+#[derive(Serialize, Debug)]
+pub struct SchemaReport {
+  /// Generation content id (the `gen/<id>` dir name), when resolved from a generation dir.
+  pub generation: Option<String>,
+  pub nodes: u64,
+  pub edges: u64,
+  pub files: u64,
+  /// Node counts per symbol kind — count-descending, then name, so hubs read first.
+  pub kinds: Vec<CountRow>,
+  /// Directed edge counts per relation — count-descending, then name.
+  pub relations: Vec<CountRow>,
+  /// The resolution-grade vocabulary, best first (traversal floors accept these).
+  pub grades: Vec<String>,
+  /// Warm search tiers present in this generation (absent tiers change latency, never answers).
+  pub ann_tier: bool,
+  pub postings_tier: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub struct CountRow {
+  pub name: String,
+  pub count: u64,
+}
+
+fn count_rows<T>(counts: Vec<(T, u64)>, name_of: impl Fn(&T) -> String) -> Vec<CountRow> {
+  let mut rows: Vec<CountRow> = counts
+    .into_iter()
+    .map(|(item, count)| CountRow {
+      name: name_of(&item),
+      count,
+    })
+    .collect();
+  rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+  rows
+}
+
+/// Compute the schema report: one pass over the kind column, one over the edge-type column.
+pub fn schema_report(kg: &Kg, generation_dir: Option<&std::path::Path>) -> SchemaReport {
+  let kinds = kg.node_count_by_kind();
+  let files = kinds
+    .iter()
+    .find(|(kind, _)| *kind == vorpal_kg::SymbolKind::File)
+    .map_or(0, |&(_, count)| count);
+  SchemaReport {
+    generation: generation_dir
+      .and_then(|dir| dir.file_name())
+      .map(|name| name.to_string_lossy().into_owned()),
+    nodes: kg.node_count() as u64,
+    edges: kg.edge_count(),
+    files,
+    kinds: count_rows(kinds, |kind| format!("{kind:?}")),
+    relations: count_rows(kg.edge_count_by_type(), |edge| edge.name().to_string()),
+    grades: ["exact", "constrained", "heuristic", "structural"]
+      .map(String::from)
+      .to_vec(),
+    ann_tier: generation_dir.is_some_and(|dir| dir.join("ann.bin").is_file()),
+    postings_tier: generation_dir.is_some_and(|dir| dir.join("postings.bin").is_file()),
+  }
+}
+
+/// The rendered schema — compact, count-annotated, one vocabulary per line.
+pub fn render_schema(report: &SchemaReport) -> String {
+  use std::fmt::Write;
+  let mut out = String::new();
+  let generation = report.generation.as_deref().unwrap_or("(in-memory)");
+  let _ = writeln!(
+    out,
+    "generation {generation}: {} nodes · {} edges · {} files",
+    report.nodes, report.edges, report.files
+  );
+  let list = |rows: &[CountRow]| {
+    rows
+      .iter()
+      .map(|row| format!("{} {}", row.name, row.count))
+      .collect::<Vec<_>>()
+      .join(" · ")
+  };
+  let _ = writeln!(out, "kinds: {}", list(&report.kinds));
+  let _ = writeln!(out, "relations: {}", list(&report.relations));
+  let _ = writeln!(out, "grades: {}", report.grades.join(" > "));
+  let _ = writeln!(
+    out,
+    "tiers: ann {} · postings {}",
+    if report.ann_tier { "warm" } else { "cold" },
+    if report.postings_tier { "warm" } else { "cold" }
+  );
+  out
+}
+
 /// The outcome of a selector-driven record query.
 #[derive(Debug)]
 pub enum Selected<T> {

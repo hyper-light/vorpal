@@ -77,6 +77,8 @@ enum GraphVerb {
   Reachable,
   /// The defining source of a symbol, sliced from its indexed span (digest-verified).
   Snippet,
+  /// What this index contains: kinds, relations, grades, and tier state, with counts.
+  Schema,
 }
 
 impl GraphVerb {
@@ -90,6 +92,7 @@ impl GraphVerb {
       GraphVerb::Node => "node",
       GraphVerb::Reachable => "reachable",
       GraphVerb::Snippet => "snippet",
+      GraphVerb::Schema => "schema",
     }
   }
 }
@@ -99,8 +102,8 @@ pub struct GraphArg {
   /// Which relation to query.
   #[clap(value_enum)]
   verb: GraphVerb,
-  /// Exact symbol name.
-  name: String,
+  /// Exact symbol name (not used by `schema`).
+  name: Option<String>,
   /// Refine to definitions whose file path ends with this suffix.
   #[clap(long, value_name = "SUFFIX")]
   path: Option<String>,
@@ -240,6 +243,23 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
 pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
   arg.page.reject_for_text(arg.format)?;
   let dir = index_dir(arg.index);
+
+  if matches!(arg.verb, GraphVerb::Schema) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let report = vorpal_index::records::schema_report(&kg, Some(&gen_dir));
+    match arg.format {
+      OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
+      OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  let name = arg
+    .name
+    .ok_or_else(|| anyhow!("`graph {}` needs a symbol name", arg.verb.as_str()))?;
   let eid = match arg.eid.as_deref() {
     Some(hex) => Some(
       u128::from_str_radix(hex, 16)
@@ -248,7 +268,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     None => None,
   };
   let target = vorpal_index::GraphTarget {
-    name: arg.name,
+    name,
     id: arg.id,
     external_id: eid,
     path_suffix: arg.path,

@@ -36,6 +36,7 @@ const USAGE: &str = "usage:
   vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F]
                                                     build + persist a knowledge graph
   vorpal-index health       <index-dir>             per-file parse damage: byte ratios, error spans, affected entities
+  vorpal-index schema       <index-dir>             kinds, relations, grades, tier state — with counts
   vorpal-index callers      <index-dir> <name>      direct callers of a symbol
   vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
   vorpal-index importers    <index-dir> <name>      files importing a symbol
@@ -141,6 +142,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     ["health", index] => {
       print!("{}", vorpal_index::parse_health_report(Path::new(index))?);
+      Ok(())
+    }
+    ["schema", index] => {
+      let dir = vorpal_kg::resolve_index_dir(Path::new(index));
+      let kg = vorpal_kg::Kg::load(&dir)?;
+      let report = vorpal_index::records::schema_report(&kg, Some(&dir));
+      print!("{}", vorpal_index::records::render_schema(&report));
       Ok(())
     }
     [

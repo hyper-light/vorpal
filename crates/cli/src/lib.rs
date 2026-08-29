@@ -198,6 +198,8 @@ mod test_cli {
       "graph callers seal --format json --limit 5 --cursor o:100",
       "graph node Kg --format json",
       "graph snippet resolve_target --context 3",
+      "graph schema",
+      "graph schema --format json --index /tmp/idx",
       "graph snippet Kg --all --format json --max-bytes 4096",
       "search import-path-resolution -k 5",
       "search embed --format json --kind function --lang rust --exported --prefix crates/",

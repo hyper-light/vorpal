@@ -58,6 +58,12 @@ impl Graph {
     self.out.edge_types(u)
   }
 
+  /// Every out-edge's type tag, in CSR order — the bulk column for whole-graph statistics
+  /// (each directed edge appears exactly once here).
+  pub fn out_etypes_all(&self) -> &[u16] {
+    self.out.raw_etypes()
+  }
+
   pub fn out_degree(&self, u: u32) -> usize {
     self.out.degree(u)
   }
