@@ -117,9 +117,13 @@ it from `.cursor/mcp.json`).
 > Use an **absolute** index path — MCP clients launch the server without a working directory. If
 > `vorpal` isn't on the client's `PATH`, use the binary's absolute path as `command`.
 
-Tools exposed: `index`, `health`, `node`, `callers`, `references`, `importers`, `implementors`,
-`type_users`, `reachable`, `search`, `structural_search`, `rule_search`, `ast_dump`, `fetch_span`,
-`why`. Full descriptions and setup notes: **[docs/mcp.md](docs/mcp.md)**.
+Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
+`compare_generations`, `impact`, `dead_code`, `node`, `callers`, `references`, `importers`,
+`implementors`, `type_users`, `reachable`, `structural_search`, `rule_search`, `ast_dump`,
+`fetch_span`, `snippet`, `why`, `search`. Record-bearing tools page with cursors and accept
+`format: "toon" | "lean" | "ids"` for token-lean output; `--profile scout|analysis|full`
+serves a smaller surface to read-only agents. Full descriptions and setup notes:
+**[docs/mcp.md](docs/mcp.md)**.
 
 ## Language packages
 
@@ -139,7 +143,7 @@ npm install @hyper-light/vorpal-wasm     # browser / portable
 |---|---|
 | `vorpal index [src] [--out DIR] [--verify]` | Build/refresh the knowledge-graph index |
 | `vorpal search <query> [-k N] [--index DIR]` | Hybrid (name + semantic + graph) search |
-| `vorpal graph <verb> <name> [--index DIR]` | `callers` `refs` `importers` `implementors` `typeusers` `node` `reachable` |
+| `vorpal graph <verb> [name] [--index DIR]` | `callers` `refs` `importers` `implementors` `typeusers` `node` `reachable` `snippet` `schema` `dead` `coverage` `impact` `diff` `architecture` |
 | `vorpal run -p <pattern> [-l lang] [-r fix]` | One-off structural search/rewrite (default command) |
 | `vorpal scan [-r rule.yml] [--format github]` | Run configured YAML rules across a project |
 | `vorpal outline [paths] [--view signatures]` | File structure: symbols, members, imports/exports |
