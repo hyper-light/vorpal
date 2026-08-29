@@ -1295,14 +1295,16 @@ pub fn search_records_filtered(
   k: usize,
   filter: &SearchFilter,
 ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
-  let (kg, ranked) = search_core(index_dir, query, k, filter)?;
+  let searcher = cached_searcher(index_dir)?;
+  let ranked = searcher.run(query, k, filter)?;
+  let kg = &searcher.kg;
   const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
   Ok(
     ranked
       .into_iter()
       .filter_map(|(row, score, ranks)| {
         Some(records::SearchHitRecord {
-          node: records::node_record(&kg, NodeId::new(row))?,
+          node: records::node_record(kg, NodeId::new(row))?,
           score,
           channels: CHANNELS
             .iter()
@@ -1326,54 +1328,65 @@ fn search_index_impl(
   k: usize,
   explain: bool,
 ) -> Result<String, Box<dyn Error>> {
-  let (kg, ranked) = search_core(index_dir, query, k, &SearchFilter::default())?;
-  let mut out = String::new();
-  for (row, score, ranks) in ranked {
-    if let Some(view) = kg.node(NodeId::new(row)) {
-      if explain {
-        let channels = ["name", "vector", "graph"];
-        let mut provenance = format!("id {row}");
-        for (channel, rank) in channels.iter().zip(&ranks) {
-          if let Some(rank) = rank {
-            let _ = write!(provenance, "; {channel}#{}", rank + 1);
-          }
-        }
-        let _ = writeln!(
-          out,
-          "{score:.4}  {} [{:?}] {}  ({provenance})",
-          view.name, view.kind, view.path
-        );
-      } else {
-        let _ = writeln!(
-          out,
-          "{score:.4}  {} [{:?}] {}",
-          view.name, view.kind, view.path
-        );
-      }
-    }
-  }
-  Ok(out)
+  cached_searcher(index_dir)?.search_rendered(query, k, explain)
 }
 
-/// The pinned-generation hybrid ranking shared by the rendered and typed search surfaces:
-/// name/semantic/in-degree channels fused by RRF, each hit carrying its per-channel ranks.
-#[allow(clippy::type_complexity)]
-fn search_core(
-  index_dir: &Path,
-  query: &str,
-  k: usize,
-  filter: &SearchFilter,
-) -> Result<(Kg, Vec<(u64, f32, Vec<Option<usize>>)>), Box<dyn Error>> {
-  // Pin one generation for the whole query: the graph AND the ANN tier both come from the
-  // directory CURRENT names right now, so a rebuild landing mid-search cannot hand this query
-  // a mixed pair (the ANN stamp would catch it, but resolving once makes it impossible).
-  let index_dir = &vorpal_kg::resolve_index_dir(index_dir);
-  let kg = Kg::load(index_dir)?;
-  let compiled_filter = CompiledSearchFilter::compile(filter)?;
-  let current_stamp = stamp_of(&kg);
-  let embedder = active_embedder();
-  let pool = (k * 4).max(50);
-  let query_vec = embedder.embed(query);
+/// A persistent, reusable search handle for one **immutable** generation: it mmaps the graph,
+/// the ANN tier, and the posting tier **once** and answers many queries against them. Because
+/// generations are content-addressed (`gen/<id>/`), an open handle can never go stale — a
+/// rebuild mints a new generation dir, which [`cached_searcher`] opens as a fresh entry.
+/// Reusing the mappings removes the per-query mmap/munmap storm that serialized concurrent
+/// searches on the kernel address-space lock (~10× system-time blow-up at 32 concurrent
+/// queries before this).
+pub struct Searcher {
+  generation_dir: PathBuf,
+  kg: Kg,
+  /// The persisted ANN tier — present only when fresh for this generation (the common warm
+  /// case). Absent → `run` takes the overlay/exhaustive tiers (cold, degraded, load per call).
+  ann: Option<AnnIndex>,
+  /// The persisted lexical posting tier — present only when its stamp matches this generation.
+  postings: Option<postings::Postings>,
+}
+
+impl Searcher {
+  /// Open (mmap) every tier for `index_dir`'s current generation, once.
+  pub fn open(index_dir: &Path) -> Result<Searcher, Box<dyn Error>> {
+    // Pin the generation for the handle's lifetime: an immutable, content-addressed snapshot,
+    // so nothing this handle serves can ever be a mixed or stale pair.
+    let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
+    let kg = Kg::load(&generation_dir)?;
+    let stamp = stamp_of(&kg);
+    let dim = active_embedder().dim();
+    let ann = if ann_is_fresh(&generation_dir, stamp, dim) {
+      AnnIndex::load(&generation_dir.join("ann.bin")).ok()
+    } else {
+      None
+    };
+    let postings = postings::Postings::load(&generation_dir).filter(|p| p.stamp() == stamp);
+    Ok(Searcher {
+      generation_dir,
+      kg,
+      ann,
+      postings,
+    })
+  }
+
+  /// The pinned-generation hybrid ranking shared by the rendered and typed search surfaces:
+  /// name/semantic/in-degree channels fused by RRF, each hit carrying its per-channel ranks.
+  /// Reads only the handle's already-open mappings — no `Kg::load`/`AnnIndex::load` per call.
+  #[allow(clippy::type_complexity)]
+  pub fn run(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<Vec<(u64, f32, Vec<Option<usize>>)>, Box<dyn Error>> {
+    let kg = &self.kg;
+    let index_dir = self.generation_dir.as_path();
+    let compiled_filter = CompiledSearchFilter::compile(filter)?;
+    let embedder = active_embedder();
+    let pool = (k * 4).max(50);
+    let query_vec = embedder.embed(query);
 
   // Semantic candidate pool, by tier — a search NEVER waits on an ANN build:
   // 1. **Base-fresh**: the persisted tier matches this KG generation → beam search.
@@ -1388,13 +1401,13 @@ fn search_core(
   // filtered query overfetches to keep its post-filter pool honest; the exhaustive fallback
   // filters BEFORE scoring and needs no slack.
   let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
-  let candidates: Vec<u64> = if ann_is_fresh(index_dir, current_stamp, embedder.dim()) {
-    AnnIndex::load(&index_dir.join("ann.bin"))?
+  let candidates: Vec<u64> = if let Some(ann) = &self.ann {
+    ann
       .search(&query_vec, take)
       .into_iter()
       .map(|(id, _)| id)
       .collect()
-  } else if let Some(overlay) = annfiles::OverlayView::assemble(index_dir, &kg, embedder.dim()) {
+  } else if let Some(overlay) = annfiles::OverlayView::assemble(index_dir, kg, embedder.dim()) {
     autowarm::maybe_spawn(index_dir);
     // Overfetch by the dead-row count (bounded) so tombstoning cannot starve the pool.
     let bump = (overlay.tombstoned_nodes as usize).min(take);
@@ -1406,7 +1419,7 @@ fn search_core(
     let overlay_hits = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &overlay.overlay_ids,
-      |i, row| embed_node_into(&kg, &embedder, overlay.overlay_ids[i], row),
+      |i, row| embed_node_into(kg, &embedder, overlay.overlay_ids[i], row),
       &query_vec,
       take,
     );
@@ -1418,16 +1431,16 @@ fn search_core(
     // Kick a detached warm so the *next* search takes the fast tier — gated (registered
     // binaries only, opt-out, once per process) and best-effort; see `autowarm`.
     autowarm::maybe_spawn(index_dir);
-    let mut ids = semantic_row_ids(&kg);
+    let mut ids = semantic_row_ids(kg);
     // The exhaustive path filters BEFORE scoring: exact recall over exactly the admitted
     // population, no overfetch slack needed.
     if !filter.is_empty() {
-      ids.retain(|&id| compiled_filter.admits(&kg, id));
+      ids.retain(|&id| compiled_filter.admits(kg, id));
     }
     let scored = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &ids,
-      |i, row| embed_node_into(&kg, &embedder, ids[i], row),
+      |i, row| embed_node_into(kg, &embedder, ids[i], row),
       &query_vec,
       take,
     );
@@ -1440,7 +1453,7 @@ fn search_core(
   } else {
     candidates
       .into_iter()
-      .filter(|&id| compiled_filter.admits(&kg, id))
+      .filter(|&id| compiled_filter.admits(kg, id))
       .collect()
   };
 
@@ -1452,7 +1465,7 @@ fn search_core(
       .into_iter()
       .map(|id| {
         let mut row = vec![0.0f32; embedder.dim()];
-        embed_node_into(&kg, &embedder, id, &mut row);
+        embed_node_into(kg, &embedder, id, &mut row);
         let exact = row
           .iter()
           .zip(&query_vec)
@@ -1471,7 +1484,7 @@ fn search_core(
   // token-subset) — shared verbatim by the posting-index path and the exhaustive scan, so
   // the two paths cannot diverge in what they admit.
   let classify = |i: u64| -> Option<(u64, (u8, usize))> {
-    if !filter.is_empty() && !compiled_filter.admits(&kg, i) {
+    if !filter.is_empty() && !compiled_filter.admits(kg, i) {
       return None;
     }
     let view = kg.node(NodeId::new(i))?;
@@ -1503,8 +1516,9 @@ fn search_core(
   let posting_candidates: Option<Vec<u64>> = if query_tokens.is_empty() {
     None
   } else {
-    postings::Postings::load(index_dir)
-      .filter(|p| p.stamp() == current_stamp)
+    self
+      .postings
+      .as_ref()
       .and_then(|p| p.candidates(&lookup_tokens))
       .map(|ids| ids.into_iter().map(|id| id as u64).collect())
   };
@@ -1536,7 +1550,91 @@ fn search_core(
     )
   });
 
-  Ok((kg, rrf_fuse_explained(&[named, semantic, by_degree], k)))
+    Ok(rrf_fuse_explained(&[named, semantic, by_degree], k))
+  }
+
+  /// Run a search and render it to the CLI's exact text format — shared by `search_index`
+  /// and the batched async path so there is one rendering contract everywhere.
+  pub fn search_rendered(
+    &self,
+    query: &str,
+    k: usize,
+    explain: bool,
+  ) -> Result<String, Box<dyn Error>> {
+    let ranked = self.run(query, k, &SearchFilter::default())?;
+    let kg = &self.kg;
+    let mut out = String::new();
+    for (row, score, ranks) in ranked {
+      if let Some(view) = kg.node(NodeId::new(row)) {
+        if explain {
+          let channels = ["name", "vector", "graph"];
+          let mut provenance = format!("id {row}");
+          for (channel, rank) in channels.iter().zip(&ranks) {
+            if let Some(rank) = rank {
+              let _ = write!(provenance, "; {channel}#{}", rank + 1);
+            }
+          }
+          let _ = writeln!(
+            out,
+            "{score:.4}  {} [{:?}] {}  ({provenance})",
+            view.name, view.kind, view.path
+          );
+        } else {
+          let _ = writeln!(
+            out,
+            "{score:.4}  {} [{:?}] {}",
+            view.name, view.kind, view.path
+          );
+        }
+      }
+    }
+    Ok(out)
+  }
+}
+
+/// A reusable handle to an index's current generation: opens (mmaps) every tier once and
+/// answers many queries lock-free. Ideal for bulk/concurrent work — hold one and fan queries
+/// across threads, instead of paying a cache lookup (and, historically, a full re-`mmap`) per
+/// call. Backed by the same immutable-generation cache the one-shot search functions use.
+pub fn open_searcher(index_dir: &Path) -> Result<Arc<Searcher>, Box<dyn Error>> {
+  cached_searcher(index_dir)
+}
+
+/// Process-wide LRU cache of open [`Searcher`]s, keyed by the immutable generation dir.
+/// Repeated searches (a daemon, MCP, the async pool) reuse one set of mappings instead of
+/// re-`mmap`ing every tier per call. Safe by construction: generation dirs are
+/// content-addressed and immutable, so a cached entry is never stale — a rebuild resolves to a
+/// new dir and opens a fresh entry. Bounded, so retired generations' mappings are released.
+/// Newest-first LRU of open searchers, keyed by immutable generation dir.
+type SearcherCache = Mutex<Vec<(PathBuf, Arc<Searcher>)>>;
+
+fn cached_searcher(index_dir: &Path) -> Result<Arc<Searcher>, Box<dyn Error>> {
+  const CAP: usize = 8;
+  static CACHE: OnceLock<SearcherCache> = OnceLock::new();
+  let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
+  let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+  {
+    let mut guard = cache.lock().unwrap();
+    if let Some(pos) = guard.iter().position(|(dir, _)| *dir == generation_dir) {
+      let entry = guard.remove(pos);
+      let searcher = entry.1.clone();
+      guard.push(entry); // most-recently-used to the back
+      return Ok(searcher);
+    }
+  }
+  // Open (mmap all tiers) outside the lock — a load must not serialize searches on other
+  // generations.
+  let searcher = Arc::new(Searcher::open(&generation_dir)?);
+  let mut guard = cache.lock().unwrap();
+  // A concurrent caller may have opened the same generation meanwhile; keep a single entry.
+  if let Some(pos) = guard.iter().position(|(dir, _)| *dir == generation_dir) {
+    return Ok(guard[pos].1.clone());
+  }
+  guard.push((generation_dir, searcher.clone()));
+  if guard.len() > CAP {
+    guard.remove(0);
+  }
+  Ok(searcher)
 }
 
 /// Run one graph query verb against a persisted index and render the results — the shared

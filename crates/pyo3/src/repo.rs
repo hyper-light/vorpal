@@ -17,39 +17,59 @@ fn to_py_err(err: Box<dyn std::error::Error>) -> PyErr {
 /// the same one-line report the CLI prints.
 #[pyfunction]
 #[pyo3(signature = (src, out=None))]
-pub fn index_build(src: &str, out: Option<&str>) -> PyResult<String> {
-  let src = std::path::Path::new(src);
-  let out = out
-    .map(std::path::PathBuf::from)
-    .unwrap_or_else(|| src.join(".vorpal/index"));
-  let report = vorpal_index::build_index(src, &out).map_err(to_py_err)?;
-  Ok(if report.reused {
-    format!("unchanged — reused existing index ({} nodes)", report.nodes)
-  } else {
-    format!(
-      "parsed {} files ({} replayed from cache) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",
-      report.indexed,
-      report.skipped,
-      report.nodes,
-      report.resolved,
-      report.ambiguous,
-      report.external,
-      report.masked
-    )
-  })
+pub fn index_build(py: Python<'_>, src: &str, out: Option<&str>) -> PyResult<String> {
+  let src = src.to_string();
+  let out = out.map(str::to_string);
+  // Release the GIL for the whole (blocking, CPU/IO-heavy) build so the async facade in
+  // vorpal_py (`await vorpal.build(...)`) actually yields the event loop instead of pinning
+  // it. PyErr is not `Ungil`, so the closure returns Result<_, String> and the error is
+  // rebuilt into a PyErr after the GIL is reacquired.
+  let result: Result<String, String> = py.detach(move || {
+    let src = std::path::Path::new(&src);
+    let out = out
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|| src.join(".vorpal/index"));
+    let report = vorpal_index::build_index(src, &out).map_err(|e| e.to_string())?;
+    Ok(if report.reused {
+      format!("unchanged — reused existing index ({} nodes)", report.nodes)
+    } else {
+      format!(
+        "parsed {} files ({} replayed from cache) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",
+        report.indexed,
+        report.skipped,
+        report.nodes,
+        report.resolved,
+        report.ambiguous,
+        report.external,
+        report.masked
+      )
+    })
+  });
+  result.map_err(PyRuntimeError::new_err)
 }
 
 /// Hybrid search over a persisted index. `explain=True` appends `(id N; channel#rank …)`
 /// ranking provenance per line.
 #[pyfunction]
 #[pyo3(signature = (index_dir, query, k=10, explain=false))]
-pub fn index_search(index_dir: &str, query: &str, k: usize, explain: bool) -> PyResult<String> {
-  let dir = std::path::Path::new(index_dir);
-  if explain {
-    vorpal_index::search_index_explained(dir, query, k).map_err(to_py_err)
-  } else {
-    vorpal_index::search_index(dir, query, k).map_err(to_py_err)
-  }
+pub fn index_search(
+  py: Python<'_>,
+  index_dir: &str,
+  query: &str,
+  k: usize,
+  explain: bool,
+) -> PyResult<String> {
+  let index_dir = index_dir.to_string();
+  let query = query.to_string();
+  let result: Result<String, String> = py.detach(move || {
+    let dir = std::path::Path::new(&index_dir);
+    if explain {
+      vorpal_index::search_index_explained(dir, &query, k).map_err(|e| e.to_string())
+    } else {
+      vorpal_index::search_index(dir, &query, k).map_err(|e| e.to_string())
+    }
+  });
+  result.map_err(PyRuntimeError::new_err)
 }
 
 /// Graph query with the shared symbol-selector contract: ambiguous names return candidate
@@ -58,6 +78,7 @@ pub fn index_search(index_dir: &str, query: &str, k: usize, explain: bool) -> Py
 #[pyo3(signature = (index_dir, verb, name, path=None, kind=None, id=None, all=false, ids=false))]
 #[allow(clippy::too_many_arguments)]
 pub fn index_graph(
+  py: Python<'_>,
   index_dir: &str,
   verb: &str,
   name: &str,
@@ -67,18 +88,24 @@ pub fn index_graph(
   all: bool,
   ids: bool,
 ) -> PyResult<String> {
-  let target = vorpal_index::GraphTarget {
-    name: name.to_string(),
-    id,
-    // Durable ids arrive through the name as `eid:<hex>` (parsed by the selector).
-    external_id: None,
-    path_suffix: path,
-    kind,
-    merge_all: all,
-    show_ids: ids,
-  };
-  vorpal_index::graph_query_selected(std::path::Path::new(index_dir), verb, &target)
-    .map_err(to_py_err)
+  let index_dir = index_dir.to_string();
+  let verb = verb.to_string();
+  let name = name.to_string();
+  let result: Result<String, String> = py.detach(move || {
+    let target = vorpal_index::GraphTarget {
+      name,
+      id,
+      // Durable ids arrive through the name as `eid:<hex>` (parsed by the selector).
+      external_id: None,
+      path_suffix: path,
+      kind,
+      merge_all: all,
+      show_ids: ids,
+    };
+    vorpal_index::graph_query_selected(std::path::Path::new(&index_dir), &verb, &target)
+      .map_err(|e| e.to_string())
+  });
+  result.map_err(PyRuntimeError::new_err)
 }
 
 /// One node's structured fields — the typed complement to the rendered surfaces.
@@ -96,21 +123,25 @@ pub struct NodeInfo {
 
 /// Fetch one node by id.
 #[pyfunction]
-pub fn index_node(index_dir: &str, id: u64) -> PyResult<NodeInfo> {
-  let kg =
-    vorpal_kg::Kg::load(std::path::Path::new(index_dir)).map_err(|e| to_py_err(Box::new(e)))?;
-  let view = kg
-    .node(vorpal_kg::NodeId::new(id))
-    .ok_or_else(|| PyRuntimeError::new_err(format!("no node with id {id}")))?;
-  Ok(NodeInfo {
-    id,
-    name: view.name.to_string(),
-    kind: format!("{:?}", view.kind),
-    path: view.path.to_string(),
-    signature: view.signature.to_string(),
-    exported: view.exported,
-    span: view.span,
-  })
+pub fn index_node(py: Python<'_>, index_dir: &str, id: u64) -> PyResult<NodeInfo> {
+  let index_dir = index_dir.to_string();
+  // The mmap open + lookup runs GIL-free; only the owned fields cross back.
+  let result: Result<NodeInfo, String> = py.detach(move || {
+    let kg = vorpal_kg::Kg::load(std::path::Path::new(&index_dir)).map_err(|e| e.to_string())?;
+    let view = kg
+      .node(vorpal_kg::NodeId::new(id))
+      .ok_or_else(|| format!("no node with id {id}"))?;
+    Ok(NodeInfo {
+      id,
+      name: view.name.to_string(),
+      kind: format!("{:?}", view.kind),
+      path: view.path.to_string(),
+      signature: view.signature.to_string(),
+      exported: view.exported,
+      span: view.span,
+    })
+  });
+  result.map_err(PyRuntimeError::new_err)
 }
 
 /// Typed build report — the structured twin of [`index_build`]'s one-liner.
@@ -388,20 +419,25 @@ impl Index {
 /// [`index_build`], returning the typed [`BuildReport`] instead of the rendered line.
 #[pyfunction]
 #[pyo3(signature = (src, out=None))]
-pub fn index_build_report(src: &str, out: Option<&str>) -> PyResult<BuildReport> {
-  let src = std::path::Path::new(src);
-  let out = out
-    .map(std::path::PathBuf::from)
-    .unwrap_or_else(|| src.join(".vorpal/index"));
-  let report = vorpal_index::build_index(src, &out).map_err(to_py_err)?;
-  Ok(BuildReport {
-    indexed: report.indexed as u64,
-    skipped: report.skipped as u64,
-    nodes: report.nodes as u64,
-    resolved: report.resolved as u64,
-    ambiguous: report.ambiguous as u64,
-    external: report.external as u64,
-    masked: report.masked as u64,
-    reused: report.reused,
-  })
+pub fn index_build_report(py: Python<'_>, src: &str, out: Option<&str>) -> PyResult<BuildReport> {
+  let src = src.to_string();
+  let out = out.map(str::to_string);
+  let result: Result<BuildReport, String> = py.detach(move || {
+    let src = std::path::Path::new(&src);
+    let out = out
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|| src.join(".vorpal/index"));
+    let report = vorpal_index::build_index(src, &out).map_err(|e| e.to_string())?;
+    Ok(BuildReport {
+      indexed: report.indexed as u64,
+      skipped: report.skipped as u64,
+      nodes: report.nodes as u64,
+      resolved: report.resolved as u64,
+      ambiguous: report.ambiguous as u64,
+      external: report.external as u64,
+      masked: report.masked as u64,
+      reused: report.reused,
+    })
+  });
+  result.map_err(PyRuntimeError::new_err)
 }

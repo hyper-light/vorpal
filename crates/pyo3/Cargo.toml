@@ -27,8 +27,16 @@ anyhow.workspace = true
 pyo3 = { version = "0.29.0", optional = true, features = ["anyhow", "py-clone"] }
 pythonize = { version = "0.29.0", optional = true }
 serde.workspace = true
+crossbeam-channel = { workspace = true }
 
 # uncomment default features when developing pyo3
 [features]
 # default = ["python"]
 python = ["pythonize", "pyo3", "pyo3/extension-module", "pyo3/abi3-py39"]
+
+# The extension's Rust allocations use jemalloc off Windows: macOS/glibc default malloc
+# lock-contends hard under the async pool's concurrent searches (measured ~3.5x CPU
+# amplification at N=32). jemalloc's per-thread arenas remove that. Python's own
+# allocations are unaffected (they use pymalloc). MSVC keeps the system allocator.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7.0"

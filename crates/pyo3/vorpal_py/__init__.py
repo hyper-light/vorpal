@@ -16,6 +16,17 @@ from .vorpal_py import (
     index_node,
     index_search,
     register_dynamic_language,
+    # Awaitable repository API — native coroutines backed by a Rust-owned worker pool
+    # (crates/pyo3/src/async_bridge.rs). `await vorpal.search(...)`, `await vorpal.build(...)`.
+    # Each releases the GIL for the whole native call and resolves its asyncio.Future from
+    # the pool, so concurrent awaits run in genuine parallel across cores. Pool size:
+    # VORPAL_ASYNC_WORKERS (default 8× cores); workers spawn lazily under real concurrency.
+    build,
+    build_report,
+    search,
+    search_many,
+    node,
+    graph,
 )
 
 Strictness = Union[Literal["cst"], Literal["smart"], Literal["ast"], Literal["relaxed"], Literal["signature"]]
@@ -85,6 +96,8 @@ class CustomLang(TypedDict, total=False):
   meta_var_char: Optional[str]
   expando_char: Optional[str]
 
+
+
 __all__ = [
     "Rule",
     "Config",
@@ -105,4 +118,11 @@ __all__ = [
     "index_graph",
     "index_node",
     "index_search",
+    # async facade
+    "build",
+    "build_report",
+    "search",
+    "search_many",
+    "node",
+    "graph",
 ]

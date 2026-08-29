@@ -1,5 +1,15 @@
 #![cfg(not(test))]
 #![cfg(feature = "python")]
+
+// Concurrency-friendly allocator for the extension's Rust allocations: the async worker
+// pool runs many searches at once, and the platform default malloc serializes on its
+// internal locks under that load. jemalloc's per-thread arenas keep concurrent allocation
+// contention-free. (Python objects still use pymalloc; this only governs Rust's heap.)
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+mod async_bridge;
 mod py_lang;
 mod py_node;
 mod range;
@@ -36,6 +46,13 @@ fn vorpal_py(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
   m.add_function(wrap_pyfunction!(repo::index_search, m)?)?;
   m.add_function(wrap_pyfunction!(repo::index_graph, m)?)?;
   m.add_function(wrap_pyfunction!(repo::index_node, m)?)?;
+  // Awaitable twins driven by the Rust-owned worker pool (see `async_bridge`).
+  m.add_function(wrap_pyfunction!(async_bridge::build, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::build_report, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::search, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::search_many, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::node, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::graph, m)?)?;
   Ok(())
 }
 
