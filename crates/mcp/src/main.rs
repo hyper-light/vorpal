@@ -22,17 +22,29 @@ mod jemalloc_conf {
   );
 }
 
-const USAGE: &str = "usage: vorpal-mcp <index-dir>
+const USAGE: &str = "usage: vorpal-mcp <index-dir> [--profile full|analysis|scout]
 Serves vorpal knowledge-graph queries as MCP tools over stdio.
 <index-dir> holds the persisted index (created by the 'index' tool if absent).";
 
 fn main() -> ExitCode {
-  let mut args = std::env::args().skip(1);
-  let (Some(dir), None) = (args.next(), args.next()) else {
-    eprintln!("{USAGE}");
-    return ExitCode::FAILURE;
+  let args: Vec<String> = std::env::args().skip(1).collect();
+  let (dir, profile) = match args.as_slice() {
+    [dir] => (dir.clone(), vorpal_mcp::Profile::Full),
+    [dir, flag, profile] if flag == "--profile" => {
+      match vorpal_mcp::Profile::parse(profile) {
+        Some(profile) => (dir.clone(), profile),
+        None => {
+          eprintln!("{USAGE}");
+          return ExitCode::FAILURE;
+        }
+      }
+    }
+    _ => {
+      eprintln!("{USAGE}");
+      return ExitCode::FAILURE;
+    }
   };
-  match vorpal_mcp::serve_stdio(PathBuf::from(dir)) {
+  match vorpal_mcp::serve_stdio_profiled(PathBuf::from(dir), profile) {
     Ok(()) => ExitCode::SUCCESS,
     Err(err) => {
       eprintln!("vorpal-mcp: {err}");

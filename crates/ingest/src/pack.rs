@@ -119,6 +119,19 @@ impl PackReader {
   fn entry(&self, path: &str) -> Option<Entry> {
     self.index.get(path).copied()
   }
+
+  /// Every packed `(path, product bytes)` pair, in unspecified order — whole-bank sweeps
+  /// (coverage overviews) sort their own results. Bytes are the raw cached product; decode
+  /// and stamp validation stay the caller's job.
+  pub fn entries(&self) -> impl Iterator<Item = (&str, &[u8])> {
+    self.index.iter().filter_map(|(path, &(off, len))| {
+      let bytes = self
+        .store
+        .as_bytes()
+        .get(off as usize..off as usize + len as usize)?;
+      Some((path.as_ref(), bytes))
+    })
+  }
 }
 
 fn read_sidecar(path: &Path, pack_len: usize) -> Option<(HashMap<Box<str>, Entry>, usize)> {

@@ -22,8 +22,55 @@ const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
 /// the steady-state freshness check is one atomic load — no walk, no stats — while answers
 /// stay as fresh as an explicit re-index. Custom index locations (no derivable source root)
 /// keep the explicit-`index`-tool behavior unchanged.
+/// Which tool subset this daemon serves. Slimmer surfaces mean fewer tokens of tool schema
+/// per agent turn and a smaller blast radius for read-only deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+  #[default]
+  Full,
+  /// Read-only navigation + traversal, evidence, and health surfaces.
+  Analysis,
+  /// Read-only navigation only: find, search, read.
+  Scout,
+}
+
+impl Profile {
+  pub fn parse(text: &str) -> Option<Self> {
+    match text {
+      "full" => Some(Profile::Full),
+      "analysis" => Some(Profile::Analysis),
+      "scout" => Some(Profile::Scout),
+      _ => None,
+    }
+  }
+
+  fn label(self) -> &'static str {
+    match self {
+      Profile::Full => "full",
+      Profile::Analysis => "analysis",
+      Profile::Scout => "scout",
+    }
+  }
+
+  /// The single authority on membership: tools_list filters by it and run_tool gates on it,
+  /// so the advertised surface and the callable surface can never drift apart.
+  fn allows(self, tool: &str) -> bool {
+    const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
+    const ANALYSIS_EXTRA: &[&str] = &[
+      "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
+      "health", "dead_code", "coverage",
+    ];
+    match self {
+      Profile::Full => true,
+      Profile::Analysis => SCOUT.contains(&tool) || ANALYSIS_EXTRA.contains(&tool),
+      Profile::Scout => SCOUT.contains(&tool),
+    }
+  }
+}
+
 pub struct Server {
   index_dir: PathBuf,
+  profile: Profile,
   kg: Option<Kg>,
   /// The resolved generation directory the cached graph was loaded from — the artifacts a
   /// `why` snippet is digest-verified against, so a concurrent `CURRENT` swap can never split
@@ -34,6 +81,10 @@ pub struct Server {
 
 impl Server {
   pub fn new(index_dir: PathBuf) -> Self {
+    Self::with_profile(index_dir, Profile::Full)
+  }
+
+  pub fn with_profile(index_dir: PathBuf, profile: Profile) -> Self {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
     // start building it now instead of on the first semantic search.
@@ -45,6 +96,7 @@ impl Server {
     }
     Self {
       index_dir,
+      profile,
       kg: None,
       kg_dir: None,
       watch,
@@ -106,7 +158,7 @@ impl Server {
     let result = match method {
       "initialize" => initialize(&params),
       "ping" => json!({}),
-      "tools/list" => tools_list(),
+      "tools/list" => tools_list(self.profile),
       "tools/call" => self.tools_call(&params),
       _ => return Some(error_response(id, -32601, "method not found")),
     };
@@ -168,6 +220,12 @@ impl Server {
         .map(str::to_owned)
         .ok_or_else(|| ToolError::coded("bad-argument", format!("missing required argument '{key}'")))
     };
+    if !self.profile.allows(tool) {
+      return Err(ToolError::coded(
+        "bad-argument",
+        format!("tool '{tool}' is not in this daemon's '{}' profile", self.profile.label()),
+      ));
+    }
     // Query tools serve from a graph the watch keeps fresh; the explicit `index` tool builds
     // from its own `src` argument and needs no pre-validation.
     if tool != "index" {
@@ -227,6 +285,19 @@ impl Server {
           )
         };
         Ok((text, json!({})))
+      }
+      "coverage" => {
+        // The cheap parse-coverage overview (header peeks over the product bank); span and
+        // entity detail lives in `health`.
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let report = vorpal_index::records::coverage_records(dir.as_deref());
+        let text = vorpal_index::records::render_coverage(&report);
+        let mut data = paged(report.records, args, "hits")?;
+        data["totalFiles"] = report.total_files.into();
+        data["damagedFiles"] = report.damaged_files.into();
+        data["totalErrorBytes"] = report.total_error_bytes.into();
+        Ok((text, data))
       }
       "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
         // Pattern listing (node only): regex over names, matches ARE the answer.
@@ -596,7 +667,7 @@ fn initialize(params: &Value) -> Value {
   })
 }
 
-fn tools_list() -> Value {
+fn tools_list(profile: Profile) -> Value {
   let name_only = json!({
     "name": {"type": "string", "description": "Exact symbol name"},
     "path": {"type": "string", "description": "Refine: definition file path must end with this suffix"},
@@ -607,7 +678,7 @@ fn tools_list() -> Value {
     "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
     "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
   });
-  json!({"tools": [
+  let tools: Vec<Value> = vec![
     tool(
       "index",
       "Build or refresh the knowledge-graph index from a source directory (near-instant when \
@@ -635,6 +706,18 @@ fn tools_list() -> Value {
        grades — each with counts — plus generation id and warm-tier state. Call this before \
        forming queries; it is the authority on which kind/relation/grade names exist.",
       json!({}),
+      &[],
+    ),
+    tool(
+      "coverage",
+      "Per-file parse-coverage overview from the product bank: error nodes/bytes and damage \
+       ratio per file, worst first (clean files counted, not listed). The cheap first stop \
+       before trusting absence anywhere; `health` has span/entity detail. No bank → says \
+       coverage is UNAVAILABLE, never that parses were clean.",
+      json!({
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+      }),
       &[],
     ),
     tool(
@@ -802,7 +885,13 @@ fn tools_list() -> Value {
       }),
       &["query"],
     ),
-  ]})
+  ];
+  // Advertise exactly what run_tool will accept: one membership authority.
+  let tools: Vec<Value> = tools
+    .into_iter()
+    .filter(|t| profile.allows(t["name"].as_str().unwrap_or("")))
+    .collect();
+  json!({"tools": tools})
 }
 
 /// The cursor/pagination contract shared by every record-returning tool (IMPROVEMENTS #7):

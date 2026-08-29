@@ -81,6 +81,8 @@ enum GraphVerb {
   Schema,
   /// Definitions with no semantic in-edges anywhere (suppression-honest dead-code leads).
   Dead,
+  /// Per-file parse-coverage overview (error bytes/ratio, worst first).
+  Coverage,
 }
 
 impl GraphVerb {
@@ -96,6 +98,7 @@ impl GraphVerb {
       GraphVerb::Snippet => "snippet",
       GraphVerb::Schema => "schema",
       GraphVerb::Dead => "dead",
+      GraphVerb::Coverage => "coverage",
     }
   }
 }
@@ -211,6 +214,10 @@ pub struct McpArg {
   /// Index directory the daemon serves (default: `./.vorpal/index`).
   #[clap(long)]
   index: Option<PathBuf>,
+  /// Tool profile: `scout` (read-only navigation), `analysis` (+ traversal/evidence/health),
+  /// `full` (everything).
+  #[clap(long, default_value = "full")]
+  profile: String,
 }
 
 fn index_dir(explicit: Option<PathBuf>) -> PathBuf {
@@ -272,6 +279,31 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Coverage) {
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    if !gen_dir.join("manifest.bin").exists() {
+      anyhow::bail!(missing_index_hint(&dir));
+    }
+    let report = vorpal_index::records::coverage_records(Some(&gen_dir));
+    match arg.format {
+      OutputFormat::Text => print!("{}", vorpal_index::records::render_coverage(&report)),
+      OutputFormat::Json => {
+        let mut value = vorpal_index::records::paged_value(
+          &report.records,
+          arg.page.cursor.as_deref(),
+          arg.page.limit,
+          "hits",
+        )
+        .map_err(anyhow::Error::msg)?;
+        value["totalFiles"] = report.total_files.into();
+        value["damagedFiles"] = report.damaged_files.into();
+        value["totalErrorBytes"] = report.total_error_bytes.into();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+      }
     }
     return Ok(ExitCode::SUCCESS);
   }
@@ -498,7 +530,9 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
 }
 
 pub fn run_mcp(arg: McpArg) -> Result<ExitCode> {
-  vorpal_mcp::serve_stdio(index_dir(arg.index))?;
+  let profile = vorpal_mcp::Profile::parse(&arg.profile)
+    .ok_or_else(|| anyhow!("--profile must be full, analysis, or scout"))?;
+  vorpal_mcp::serve_stdio_profiled(index_dir(arg.index), profile)?;
   Ok(ExitCode::SUCCESS)
 }
 

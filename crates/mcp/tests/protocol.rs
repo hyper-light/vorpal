@@ -88,6 +88,7 @@ fn initialize_handshake_and_tool_listing() {
       "index",
       "health",
       "schema",
+      "coverage",
       "dead_code",
       "node",
       "callers",
@@ -109,6 +110,39 @@ fn initialize_handshake_and_tool_listing() {
     assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
     assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
   }
+}
+
+#[test]
+fn profiles_gate_both_the_listing_and_the_calls() {
+  use vorpal_mcp::Profile;
+  let (src, idx) = temp_tree("profile");
+  // Build once with a full server so the scout server has a graph to read.
+  let mut full = Server::new(idx.clone());
+  let (_, is_err) = call_tool(&mut full, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err);
+
+  let mut scout = Server::with_profile(idx, Profile::Scout);
+  let response = request(&mut scout, 2, "tools/list", Value::Null);
+  let names: Vec<&str> = response["result"]["tools"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|t| t["name"].as_str().unwrap())
+    .collect();
+  assert_eq!(names, ["schema", "node", "fetch_span", "snippet", "search"]);
+
+  // Advertised tools answer; unlisted tools refuse with the stable code — the listing and
+  // the gate can never drift apart.
+  let (_, is_err) = call_tool(&mut scout, 3, "node", json!({"name": "target"}));
+  assert!(!is_err);
+  let response = request(
+    &mut scout,
+    4,
+    "tools/call",
+    json!({"name": "index", "arguments": {"src": src.to_str().unwrap()}}),
+  );
+  assert_eq!(response["result"]["isError"], true);
+  assert_eq!(response["result"]["structuredContent"]["code"], "bad-argument");
 }
 
 #[test]

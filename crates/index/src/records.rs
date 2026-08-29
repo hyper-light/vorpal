@@ -450,6 +450,99 @@ pub fn render_dead(report: &DeadReport) -> String {
   out
 }
 
+/// One file's parse-coverage row: how much of it the parser actually understood. The cheap
+/// whole-bank overview (header peeks only — no product decode); per-span/per-entity detail
+/// stays with the `health` surface.
+#[derive(Serialize, Debug)]
+pub struct CoverageRecord {
+  pub path: String,
+  pub error_nodes: u64,
+  pub error_bytes: u64,
+  pub size: u64,
+  /// error_bytes / size (0.0 when size unknown).
+  pub ratio: f64,
+}
+
+/// Coverage overview + honesty head.
+#[derive(Serialize, Debug)]
+pub struct CoverageReport {
+  /// Damaged files only, worst ratio first (ties: path) — clean files are counted, not listed.
+  pub records: Vec<CoverageRecord>,
+  pub total_files: u64,
+  pub damaged_files: u64,
+  pub total_error_bytes: u64,
+}
+
+/// Sweep the generation's product bank: one header peek per file. Absence of a bank yields
+/// an empty report with totals 0 — callers state that, never "everything parsed".
+pub fn coverage_records(artifacts_dir: Option<&std::path::Path>) -> CoverageReport {
+  let mut records = Vec::new();
+  let mut total_files = 0u64;
+  let mut total_error_bytes = 0u64;
+  if let Some(pack) = artifacts_dir.and_then(crate::cached_pack) {
+    for (path, bytes) in pack.entries() {
+      total_files += 1;
+      let error_nodes = vorpal_ingest::peek_product_error_nodes(bytes).unwrap_or(0);
+      let error_bytes = vorpal_ingest::peek_product_error_bytes(bytes).unwrap_or(0);
+      if error_nodes == 0 && error_bytes == 0 {
+        continue;
+      }
+      total_error_bytes += error_bytes;
+      let size = vorpal_ingest::peek_product_stamps(bytes).map_or(0, |(size, _)| size);
+      records.push(CoverageRecord {
+        path: path.to_string(),
+        error_nodes: error_nodes as u64,
+        error_bytes,
+        size,
+        ratio: if size > 0 { error_bytes as f64 / size as f64 } else { 0.0 },
+      });
+    }
+  }
+  records.sort_by(|a, b| {
+    b.ratio
+      .partial_cmp(&a.ratio)
+      .unwrap_or(std::cmp::Ordering::Equal)
+      .then_with(|| a.path.cmp(&b.path))
+  });
+  let damaged_files = records.len() as u64;
+  CoverageReport {
+    records,
+    total_files,
+    damaged_files,
+    total_error_bytes,
+  }
+}
+
+/// Rendered coverage overview, capped like the other whole-tree listings.
+pub fn render_coverage(report: &CoverageReport) -> String {
+  use std::fmt::Write;
+  const TEXT_CAP: usize = 100;
+  let mut out = String::new();
+  if report.total_files == 0 {
+    return "no product bank in this generation — coverage unavailable (not proof of clean parses)\n".to_string();
+  }
+  let _ = writeln!(
+    out,
+    "{} of {} files carry parse damage ({} error bytes total); worst first:",
+    report.damaged_files, report.total_files, report.total_error_bytes
+  );
+  for record in report.records.iter().take(TEXT_CAP) {
+    let _ = writeln!(
+      out,
+      "{:>6.2}%  {} ({} error nodes, {} of {} bytes)",
+      record.ratio * 100.0,
+      record.path,
+      record.error_nodes,
+      record.error_bytes,
+      record.size
+    );
+  }
+  if report.records.len() > TEXT_CAP {
+    let _ = writeln!(out, "… {} more — page the records surface, or `health` for span detail", report.records.len() - TEXT_CAP);
+  }
+  out
+}
+
 /// What this generation's graph contains, by vocabulary: the introspection surface that
 /// teaches a caller (agent or human) what is queryable before it guesses — kinds, relations,
 /// grades, and tier state, with counts.

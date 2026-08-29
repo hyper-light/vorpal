@@ -38,6 +38,7 @@ const USAGE: &str = "usage:
   vorpal-index health       <index-dir>             per-file parse damage: byte ratios, error spans, affected entities
   vorpal-index schema       <index-dir>             kinds, relations, grades, tier state — with counts
   vorpal-index dead         <index-dir> [kind]      definitions with no semantic in-edges (suppression-honest)
+  vorpal-index coverage     <index-dir>             per-file parse-coverage overview (worst first)
   vorpal-index callers      <index-dir> <name>      direct callers of a symbol
   vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
   vorpal-index importers    <index-dir> <name>      files importing a symbol
@@ -194,6 +195,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
       };
       print!("{rendered}");
+      Ok(())
+    }
+    ["coverage", index] => {
+      let dir = vorpal_kg::resolve_index_dir(Path::new(index));
+      let report = vorpal_index::records::coverage_records(Some(&dir));
+      print!("{}", vorpal_index::records::render_coverage(&report));
       Ok(())
     }
     ["dead", index, rest @ ..] => {

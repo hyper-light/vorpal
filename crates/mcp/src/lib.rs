@@ -14,7 +14,7 @@ mod server;
 mod tools;
 mod watch;
 
-pub use server::Server;
+pub use server::{Profile, Server};
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -22,7 +22,13 @@ use std::path::PathBuf;
 /// Serve MCP over stdio (one JSON-RPC message per line) until stdin closes — the daemon loop
 /// shared by the standalone `vorpal-mcp` binary and the `vorpal mcp` subcommand.
 pub fn serve_stdio(index_dir: PathBuf) -> io::Result<()> {
-  let mut server = Server::new(index_dir);
+  serve_stdio_profiled(index_dir, Profile::Full)
+}
+
+/// [`serve_stdio`] with a tool profile: `scout` (read-only navigation), `analysis`
+/// (+ traversal/evidence/health), `full` (everything, including index builds and rule tools).
+pub fn serve_stdio_profiled(index_dir: PathBuf, profile: Profile) -> io::Result<()> {
+  let mut server = Server::with_profile(index_dir, profile);
   let stdin = io::stdin();
   let mut stdout = io::stdout().lock();
   for line in stdin.lock().lines() {

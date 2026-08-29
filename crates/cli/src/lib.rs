@@ -208,6 +208,9 @@ mod test_cli {
       "search embed --format json --kind function --lang rust --exported --prefix crates/",
       "search seal --path lib.rs --format json --limit 3",
       "mcp --index /tmp/idx",
+      "mcp --profile scout",
+      "graph coverage",
+      "graph coverage --format json --limit 10",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));
     }
