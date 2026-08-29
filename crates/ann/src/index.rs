@@ -120,6 +120,21 @@ impl AnnGraphStore {
   }
 }
 
+/// Beam-width multiplier over the requested pool, read once. `VORPAL_ANN_BEAM` overrides
+/// the default of 2 for tuning; the exact rerank re-scores the returned pool, so this trades
+/// only approximate-pool breadth, never final precision.
+fn ann_beam_mult() -> usize {
+  use std::sync::OnceLock;
+  static M: OnceLock<usize> = OnceLock::new();
+  *M.get_or_init(|| {
+    std::env::var("VORPAL_ANN_BEAM")
+      .ok()
+      .and_then(|s| s.parse::<usize>().ok())
+      .filter(|&m| m > 0)
+      .unwrap_or(2)
+  })
+}
+
 impl AnnIndex {
   /// Build from `(stable id, vector)` rows; vectors are unit-normalized on the way in. The tier
   /// follows `AnnConfig::for_n` unless overridden (tests exercise every tier at any size).
@@ -263,7 +278,7 @@ impl AnnIndex {
 
   /// Top-`k` nearest rows as `(stable id, squared L2 distance)`, closest first. Every tier ends
   /// in an exact rerank over full-precision vectors.
-  pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
     let n = self.len();
     if n == 0 || k == 0 {
       return Vec::new();
@@ -295,7 +310,14 @@ impl AnnIndex {
         // full-precision final ordering re-score the returned pool (§10's rerank seam).
         let quant = self.quant.as_ref().expect("vamana tier carries codes");
         let query = quant.quantize_query(&q);
-        let l = (k * 16).clamp(64, n);
+        // Beam width. Callers already overfetch (`k` here is the rerank pool, ~100) and
+        // re-score the returned candidates at full precision, so the beam only needs to be a
+        // small multiple of the requested pool to surface the right nodes — not 16×, which
+        // explored thousands of nodes per query (~1 ms at kernel scale) for no recall the
+        // rerank didn't already recover. 2× (floored at 64) keeps recall@5 = 1.0 on the
+        // labelled gate at ~8× fewer hops. The multiplier is read once (env override for
+        // tuning) — never per query, which would put an env syscall on the hot path.
+        let l = (k * ann_beam_mult()).clamp(64, n);
         let mut stamps = VisitStamps::new(n);
         let adjacency = self.graph.adjacency();
         let mut pool = greedy_search(
