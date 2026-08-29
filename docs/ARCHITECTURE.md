@@ -4,7 +4,7 @@
 > `IMPROVEMENT_PLAN.md` (the ast-grep engine speed/semantics tiers).
 > **Baseline:** ast-grep v0.44.0 has been copied into this repo and rebranded to build,
 > run, and test as `vorpal` (crates `vorpal-*`, binary `vorpal`/`vp`, library type
-> `Vorpal`, method `.grep()`, bindings `@vorpal/node` · `@vorpal/wasm` · `vorpal_py`).
+> `Vorpal`, method `.grep()`, bindings `@hyper-light/vorpal-node` · `@hyper-light/vorpal-wasm` · `vorpal_py`).
 > 708 engine/CLI tests green. This document plans what we build *on top of* that engine.
 
 ---

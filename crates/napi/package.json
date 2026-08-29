@@ -1,5 +1,5 @@
 {
-  "name": "@vorpal/node",
+  "name": "@hyper-light/vorpal-node",
   "version": "0.1.0",
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "homepage": "https://vorpal.github.io",

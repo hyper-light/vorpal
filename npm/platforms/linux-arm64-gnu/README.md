@@ -1,3 +1,3 @@
-# `@vorpal/cli-linux-arm64-gnu`
+# `@hyper-light/vorpal-cli-linux-arm64-gnu`
 
-This is the **aarch64-unknown-linux-gnu** binary for `@vorpal/cli`
+This is the **aarch64-unknown-linux-gnu** binary for `@hyper-light/vorpal-cli`

@@ -71,7 +71,7 @@ $ cargo build --release -p vorpal
 $ ./target/release/vorpal --help    # `vp` is a shorter alias binary
 ```
 
-npm (`@vorpal/cli`), Python (`vorpal-py`), and WebAssembly (`@vorpal/wasm`) packages are built
+npm (`@hyper-light/vorpal-cli`), Python (`vorpal-py`), and WebAssembly (`@hyper-light/vorpal-wasm`) packages are built
 from this repository (see [Language bindings](#language-bindings)). Versioned release workflows
 exist (`.github/workflows/{release,publish-node,publish-python}.yml`); the first registry
 publication awaits a maintainer release cut. Until then, `cargo build --release` above is the
@@ -460,7 +460,7 @@ materializing them.
 
 ## TypeScript API
 
-`@vorpal/node` exposes the pattern engine to Node.js as native bindings (napi-rs), with full
+`@hyper-light/vorpal-node` exposes the pattern engine to Node.js as native bindings (napi-rs), with full
 TypeScript definitions — including per-language typed node kinds, so `node.kind()` and
 `node.field(...)` narrow like you'd hope. Built from `crates/napi`. Every snippet below was
 executed against the built module before landing in this README.
@@ -468,7 +468,7 @@ executed against the built module before landing in this README.
 ### Parse, query, capture
 
 ```ts
-import { parse, Lang } from '@vorpal/node'
+import { parse, Lang } from '@hyper-light/vorpal-node'
 
 // Patterns are real code; metavariables capture real AST nodes.
 const root = parse(Lang.TypeScript, 'console.log(user.name); console.log(count)')
@@ -501,7 +501,7 @@ root.root().commitEdits(edits)
 Migrate a test suite's assertions in a few lines:
 
 ```ts
-import { parse, Lang } from '@vorpal/node'
+import { parse, Lang } from '@hyper-light/vorpal-node'
 
 function modernizeAsserts(source: string): string {
   const root = parse(Lang.TypeScript, source)
@@ -562,7 +562,7 @@ node.is('call_expression')     // type-guard narrowing for typed kinds
 Parsing, file discovery, and matching run in Rust worker threads:
 
 ```ts
-import { parseAsync, parseFiles, findInFiles } from '@vorpal/node'
+import { parseAsync, parseFiles, findInFiles } from '@hyper-light/vorpal-node'
 
 await parseAsync(Lang.TypeScript, source)   // threaded parse of one source
 
@@ -646,8 +646,8 @@ are plain classes with the same shapes as their TypeScript counterparts.
 
 | Package | Tech | Surface |
 |---|---|---|
-| `@vorpal/wasm` | wasm-pack | Browser/WASM pattern engine |
-| `@vorpal/cli` | npm wrapper | Ships the `vorpal` / `vp` binaries per platform |
+| `@hyper-light/vorpal-wasm` | wasm-pack | Browser/WASM pattern engine |
+| `@hyper-light/vorpal-cli` | npm wrapper | Ships the `vorpal` / `vp` binaries per platform |
 
 ## Developer guide
 

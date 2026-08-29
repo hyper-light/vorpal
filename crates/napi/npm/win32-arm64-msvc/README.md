@@ -1,3 +1,3 @@
-# `@vorpal/node-win32-arm64-msvc`
+# `@hyper-light/vorpal-node-win32-arm64-msvc`
 
-This is the **aarch64-pc-windows-msvc** binary for `@vorpal/node`
+This is the **aarch64-pc-windows-msvc** binary for `@hyper-light/vorpal-node`

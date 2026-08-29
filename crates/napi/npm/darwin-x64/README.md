@@ -1,3 +1,3 @@
-# `@vorpal/node-darwin-x64`
+# `@hyper-light/vorpal-node-darwin-x64`
 
-This is the **x86_64-apple-darwin** binary for `@vorpal/node`
+This is the **x86_64-apple-darwin** binary for `@hyper-light/vorpal-node`

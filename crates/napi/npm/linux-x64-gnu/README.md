@@ -1,3 +1,3 @@
-# `@vorpal/node-linux-x64-gnu`
+# `@hyper-light/vorpal-node-linux-x64-gnu`
 
-This is the **x86_64-unknown-linux-gnu** binary for `@vorpal/node`
+This is the **x86_64-unknown-linux-gnu** binary for `@hyper-light/vorpal-node`

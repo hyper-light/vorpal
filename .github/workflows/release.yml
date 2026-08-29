@@ -1,6 +1,6 @@
 # CLI release: build the `vorpal` + `vp` binaries for every supported platform, attach them to
-# a GitHub Release as `app-<target>.zip` (the name cargo-binstall and the @vorpal/cli npm
-# wrapper expect), and publish the @vorpal/cli wrapper + its per-platform binary packages.
+# a GitHub Release as `app-<target>.zip` (the name cargo-binstall and the @hyper-light/vorpal-cli npm
+# wrapper expect), and publish the @hyper-light/vorpal-cli wrapper + its per-platform binary packages.
 #
 # Triggers: pushing a tag `v<version>` does the full release; workflow_dispatch runs the build
 # matrix only (a dry run — nothing is released or published without a tag).
@@ -195,7 +195,7 @@ jobs:
           generate_release_notes: true
 
   publish-cli-npm:
-    name: Publish @vorpal/cli to npm
+    name: Publish @hyper-light/vorpal-cli to npm
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build, test]
     runs-on: ubuntu-latest
@@ -241,5 +241,5 @@ jobs:
           for dir in npm/platforms/*/; do
             (cd "$dir" && npm publish --access public)
           done
-      - name: Publish @vorpal/cli wrapper
+      - name: Publish @hyper-light/vorpal-cli wrapper
         run: cd npm && npm publish --access public

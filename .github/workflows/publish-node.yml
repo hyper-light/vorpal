@@ -1,5 +1,5 @@
-# Node bindings: build the @vorpal/node native module for every platform, publish the
-# per-platform packages and the main package to npm, plus @vorpal/wasm.
+# Node bindings: build the @hyper-light/vorpal-node native module for every platform, publish the
+# per-platform packages and the main package to npm, plus @hyper-light/vorpal-wasm.
 #
 # Triggers: tag `v<version>` publishes; workflow_dispatch is a build-only dry run.
 # Publishing uses npm TRUSTED PUBLISHING (OIDC) — no NPM_TOKEN. Each package needs a
@@ -96,7 +96,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish @vorpal/node
+    name: Publish @hyper-light/vorpal-node
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build, build-musl]
     runs-on: ubuntu-latest
@@ -124,7 +124,7 @@ jobs:
         run: npm publish --access public
 
   wasm:
-    name: Publish @vorpal/wasm
+    name: Publish @hyper-light/vorpal-wasm
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -148,6 +148,10 @@ jobs:
       - name: Install wasm-pack
         run: npm install -g wasm-pack
       - name: Build
-        run: wasm-pack build crates/wasm --release --scope vorpal
+        run: wasm-pack build crates/wasm --release --scope hyper-light
+      - name: Name the package @hyper-light/vorpal-wasm
+        run: |
+          cd crates/wasm/pkg
+          node -e "const f='package.json',p=require('./'+f);p.name='@hyper-light/vorpal-wasm';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
       - name: Publish
         run: cd crates/wasm/pkg && npm publish --access public

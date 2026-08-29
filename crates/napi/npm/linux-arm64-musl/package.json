@@ -1,5 +1,5 @@
 {
-  "name": "@vorpal/node-linux-arm64-musl",
+  "name": "@hyper-light/vorpal-node-linux-arm64-musl",
   "version": "0.1.0",
   "os": [
     "linux"

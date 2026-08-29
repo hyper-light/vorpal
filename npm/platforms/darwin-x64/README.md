@@ -1,3 +1,3 @@
-# `@vorpal/cli-darwin-x64`
+# `@hyper-light/vorpal-cli-darwin-x64`
 
-This is the **x86_64-apple-darwin** binary for `@vorpal/cli`
+This is the **x86_64-apple-darwin** binary for `@hyper-light/vorpal-cli`

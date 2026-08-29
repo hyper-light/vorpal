@@ -1,13 +1,13 @@
-# @vorpal/wasm
+# @hyper-light/vorpal-wasm
 
 WebAssembly build of [vorpal](https://vorpal.github.io/) for use in browsers and Node.js.
 
-This package provides the same API as [`@vorpal/node`](https://www.npmjs.com/package/@vorpal/node) but runs in any JavaScript environment that supports WebAssembly, including browsers, Deno, and edge runtimes.
+This package provides the same API as [`@hyper-light/vorpal-node`](https://www.npmjs.com/package/@hyper-light/vorpal-node) but runs in any JavaScript environment that supports WebAssembly, including browsers, Deno, and edge runtimes.
 
 ## Installation
 
 ```bash
-yarn add @vorpal/wasm web-tree-sitter
+yarn add @hyper-light/vorpal-wasm web-tree-sitter
 ```
 
 `web-tree-sitter` is a required peer dependency.
@@ -22,10 +22,10 @@ When using Vite, you need to make `tree-sitter.wasm` available in your public di
 
 ## Usage
 
-Unlike `@vorpal/node`, this package has no predefined language support. All languages must be registered at runtime by loading their tree-sitter WASM parser.
+Unlike `@hyper-light/vorpal-node`, this package has no predefined language support. All languages must be registered at runtime by loading their tree-sitter WASM parser.
 
 ```js
-import { initializeTreeSitter, registerDynamicLanguage, parse, kind } from '@vorpal/wasm'
+import { initializeTreeSitter, registerDynamicLanguage, parse, kind } from '@hyper-light/vorpal-wasm'
 
 // 1. Initialize the tree-sitter WASM runtime (once)
 await initializeTreeSitter()

@@ -1,4 +1,4 @@
-# @vorpal/cli
+# @hyper-light/vorpal-cli
 
 <p align=center>
   <img src="https://vorpal.github.io/logo.svg" alt="vorpal"/>

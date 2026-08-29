@@ -1,5 +1,5 @@
 {
-  "name": "@vorpal/cli-linux-arm64-gnu",
+  "name": "@hyper-light/vorpal-cli-linux-arm64-gnu",
   "version": "0.1.0",
   "os": [
     "linux"

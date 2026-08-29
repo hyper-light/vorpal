@@ -1,4 +1,4 @@
-# @vorpal/node
+# @hyper-light/vorpal-node
 
 <p align=center>
   <img src="https://vorpal.github.io/logo.svg" alt="vorpal"/>

@@ -1,3 +1,3 @@
-# `@vorpal/node-linux-arm64-musl`
+# `@hyper-light/vorpal-node-linux-arm64-musl`
 
-This is the **aarch64-unknown-linux-musl** binary for `@vorpal/node`
+This is the **aarch64-unknown-linux-musl** binary for `@hyper-light/vorpal-node`
