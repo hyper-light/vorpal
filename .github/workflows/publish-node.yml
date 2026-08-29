@@ -12,11 +12,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The musl rows build inside the napi-rs alpine containers (native musl toolchain, so the
-  # repo .cargo/config.toml's dynamic-musl settings link against a real musl libgcc_s).
-  # The repo config names a triple-prefixed aarch64 linker; alpine's is plain gcc.
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: gcc
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: gcc
+  # musl targets build NATIVELY per arch (x86_64 on x64, aarch64 on arm64) — no container,
+  # no cross toolchain. musl-tools' musl-gcc is the native musl linker (overriding the repo
+  # config's cross-prefixed name); the build step links libgcc statically so the .node
+  # carries no libgcc_s.so.1 runtime dependency.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
   NAPI_CLI_VERSION: 3.7.2
 
 jobs:
@@ -32,8 +35,8 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true, container: 'ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine' }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, container: 'ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine' }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true, container: 'node:24' }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, container: 'node:24' }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
           - { target: aarch64-pc-windows-msvc, os: windows-latest }
           - { target: i686-pc-windows-msvc, os: windows-latest }
@@ -47,13 +50,20 @@ jobs:
         with:
           key: napi-${{ matrix.target }}
       - uses: actions/setup-node@v4
-        if: ${{ !matrix.container }}  # the napi-rs container ships its own node
+        if: ${{ !matrix.container }}
         with:
-          node-version: 22
+          node-version: 24
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: apt-get update && apt-get install -y musl-tools  # container runs as root; no sudo
       - name: Install napi CLI
         run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
       - name: Build
         working-directory: crates/napi
+        env:
+          # Dynamic musl libc (loads against the host musl at runtime), libgcc linked
+          # statically so the .node has no libgcc_s.so.1 dependency.
+          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=-crt-static -C link-arg=-static-libgcc' || '' }}
         run: napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
@@ -70,7 +80,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
       - name: Install napi CLI
         run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
@@ -101,7 +111,7 @@ jobs:
           key: wasm
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
       - name: Install wasm-pack
         run: npm install -g wasm-pack
