@@ -61,9 +61,9 @@ jobs:
       - name: Build
         working-directory: crates/napi
         env:
-          # Dynamic musl libc (loads against the host musl at runtime), libgcc linked
-          # statically so the .node has no libgcc_s.so.1 dependency.
-          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=-crt-static -C link-arg=-static-libgcc' || '' }}
+          # Fully static musl (+crt-static): rustc links libgcc.a and emits no -lgcc_s, so
+          # the .node has zero libgcc_s.so.1 dependency — the self-contained musl convention.
+          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=+crt-static' || '' }}
         run: napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
@@ -76,12 +76,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC: npm trusted publishing — no token, no 2FA
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest
       - name: Install napi CLI
         run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
       - uses: actions/download-artifact@v4
@@ -92,14 +97,15 @@ jobs:
         run: napi artifacts
       - name: Publish (platform packages via prepublish, then main)
         working-directory: crates/napi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
 
   wasm:
     name: Publish @vorpal/wasm
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC: npm trusted publishing — no token, no 2FA
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -113,11 +119,11 @@ jobs:
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest
       - name: Install wasm-pack
         run: npm install -g wasm-pack
       - name: Build
         run: wasm-pack build crates/wasm --release --scope vorpal
       - name: Publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd crates/wasm/pkg && npm publish --access public

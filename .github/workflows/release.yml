@@ -199,12 +199,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build, test]
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC: npm trusted publishing — no token, no 2FA
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -231,14 +236,10 @@ jobs:
             esac
           done
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           for dir in npm/platforms/*/; do
             (cd "$dir" && npm publish --access public)
           done
       - name: Publish @vorpal/cli wrapper
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd npm && npm publish --access public
