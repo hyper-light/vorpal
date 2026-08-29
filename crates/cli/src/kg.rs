@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 
-mod emit;
 
 /// Default index location relative to the indexed tree / working directory. Hidden, so the
 /// ignore-respecting walker never indexes the index itself.
@@ -21,6 +20,10 @@ enum OutputFormat {
   #[default]
   Text,
   Json,
+  /// Token-oriented columnar text: columns declared once, directories grouped.
+  Toon,
+  /// One durable id per line (eid, falling back to the dense id).
+  Ids,
 }
 
 /// Cursor/limit flags shared by the paged query verbs. Pagination is a machine-surface
@@ -38,10 +41,29 @@ struct PageArg {
 impl PageArg {
   fn reject_for_text(&self, format: OutputFormat) -> Result<()> {
     if format == OutputFormat::Text && (self.limit.is_some() || self.cursor.is_some()) {
-      anyhow::bail!("--limit/--cursor page the records surface: add --format json");
+      anyhow::bail!("--limit/--cursor page the records surfaces: add --format json|toon|ids");
     }
     Ok(())
   }
+}
+
+/// Render one page's already-serialized envelope in the chosen machine format.
+fn emit_machine(format: OutputFormat, value: &serde_json::Value) -> Result<String> {
+  let rows = value
+    .get("records")
+    .and_then(serde_json::Value::as_array)
+    .map(Vec::as_slice)
+    .unwrap_or(&[]);
+  Ok(match format {
+    OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(value)?),
+    OutputFormat::Toon => vorpal_index::records::toon_from_values(rows),
+    OutputFormat::Ids => vorpal_index::records::ids_from_values(rows),
+    OutputFormat::Text => unreachable_text()?,
+  })
+}
+
+fn unreachable_text() -> Result<String> {
+  anyhow::bail!("text format renders through the library surfaces, not the records envelope")
 }
 
 #[derive(Args)]
@@ -304,6 +326,9 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+      OutputFormat::Toon | OutputFormat::Ids => {
+        anyhow::bail!("schema is a single report — use --format text or json")
+      }
     }
     return Ok(ExitCode::SUCCESS);
   }
@@ -316,6 +341,9 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_architecture(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+      OutputFormat::Toon | OutputFormat::Ids => {
+        anyhow::bail!("architecture is a single report — use --format text or json")
+      }
     }
     return Ok(ExitCode::SUCCESS);
   }
@@ -333,7 +361,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     let diff = vorpal_index::gendiff::diff(&from_kg, &to_kg, &label(&from_dir), &label(&to_dir));
     let page = match arg.format {
       OutputFormat::Text => vorpal_index::records::PageRequest { cursor: None, limit: Some(200) },
-      OutputFormat::Json => vorpal_index::records::PageRequest {
+      _ => vorpal_index::records::PageRequest {
         cursor: arg.page.cursor.as_deref(),
         limit: arg.page.limit,
       },
@@ -342,7 +370,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       .map_err(anyhow::Error::msg)?;
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_diff(&report)),
-      OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+      machine => print!("{}", emit_machine(machine, &serde_json::to_value(&report)?)?),
     }
     return Ok(ExitCode::SUCCESS);
   }
@@ -366,7 +394,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       vorpal_index::min_confidence_for_grade(arg.min_grade.as_deref()).map_err(boxed)?;
     let page = match arg.format {
       OutputFormat::Text => vorpal_index::records::PageRequest { cursor: None, limit: Some(200) },
-      OutputFormat::Json => vorpal_index::records::PageRequest {
+      _ => vorpal_index::records::PageRequest {
         cursor: arg.page.cursor.as_deref(),
         limit: arg.page.limit,
       },
@@ -383,7 +411,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     .map_err(anyhow::Error::msg)?;
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_impact(&report)),
-      OutputFormat::Json => {
+      machine => {
         let mut value = serde_json::json!({
           "outcome": "hits",
           "records": serde_json::to_value(&report.records)?,
@@ -396,7 +424,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         if report.end < report.total {
           value["nextCursor"] = serde_json::json!(format!("o:{}", report.end));
         }
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        print!("{}", emit_machine(machine, &value)?);
       }
     }
     return Ok(ExitCode::SUCCESS);
@@ -410,7 +438,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     let report = vorpal_index::records::coverage_records(Some(&gen_dir));
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_coverage(&report)),
-      OutputFormat::Json => {
+      machine => {
         let mut value = vorpal_index::records::paged_value(
           &report.records,
           arg.page.cursor.as_deref(),
@@ -421,7 +449,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         value["totalFiles"] = report.total_files.into();
         value["damagedFiles"] = report.damaged_files.into();
         value["totalErrorBytes"] = report.total_error_bytes.into();
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        print!("{}", emit_machine(machine, &value)?);
       }
     }
     return Ok(ExitCode::SUCCESS);
@@ -451,7 +479,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         .map_err(anyhow::Error::msg)?;
         print!("{}", vorpal_index::records::render_dead(&report));
       }
-      OutputFormat::Json => {
+      machine => {
         let report = vorpal_index::records::dead_records_page(
           &kg,
           Some(&gen_dir),
@@ -474,7 +502,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         if report.end < report.total {
           value["nextCursor"] = serde_json::json!(format!("o:{}", report.end));
         }
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        print!("{}", emit_machine(machine, &value)?);
       }
     }
     return Ok(ExitCode::SUCCESS);
@@ -492,12 +520,17 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         "{}",
         vorpal_index::pattern_query_on(&kg, &pattern, 200).map_err(boxed)?
       ),
-      OutputFormat::Json => {
+      machine => {
         let records =
           vorpal_index::records::pattern_records(&kg, &pattern).map_err(anyhow::Error::msg)?;
-        let mut json = emit::records_json(&records, arg.page.cursor.as_deref(), arg.page.limit)?;
-        json.push('\n');
-        print!("{json}");
+        let value = vorpal_index::records::paged_value(
+          &records,
+          arg.page.cursor.as_deref(),
+          arg.page.limit,
+          "hits",
+        )
+        .map_err(anyhow::Error::msg)?;
+        print!("{}", emit_machine(machine, &value)?);
       }
     }
     return Ok(ExitCode::SUCCESS);
@@ -561,7 +594,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         max_bytes,
       )
       .map_err(snippet_error)?,
-      OutputFormat::Json => {
+      machine => {
         let selected = vorpal_index::records::snippet_records(
           &kg,
           Some(&gen_dir),
@@ -570,9 +603,13 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
           max_bytes,
         )
         .map_err(snippet_error)?;
-        let mut json = emit::selected_json(selected, arg.page.cursor.as_deref(), arg.page.limit)?;
-        json.push('\n');
-        json
+        let value = vorpal_index::records::selected_value(
+          selected,
+          arg.page.cursor.as_deref(),
+          arg.page.limit,
+        )
+        .map_err(anyhow::Error::msg)?;
+        emit_machine(machine, &value)?
       }
     };
     print!("{output}");
@@ -590,43 +627,48 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     (OutputFormat::Text, None) => vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
       .map_err(boxed)
       .with_context(|| missing_index_hint(&dir))?,
-    (OutputFormat::Json, _) => {
+    (machine, _) => {
       let kg = vorpal_index::Kg::load(&dir)
         .map_err(|err| anyhow::anyhow!(err.to_string()))
         .with_context(|| missing_index_hint(&dir))?;
       let cursor = arg.page.cursor.as_deref();
-      let mut json = match (&traversal, arg.verb) {
-        (Some((direction, relations, max_depth, min_confidence)), _) => emit::selected_page_json(
-          vorpal_index::records::reach_records_page(
-            &kg,
-            &target,
-            *direction,
-            relations,
-            *max_depth,
-            *min_confidence,
-            vorpal_index::records::PageRequest {
-              cursor,
-              limit: arg.page.limit,
-            },
+      let value = match (&traversal, arg.verb) {
+        (Some((direction, relations, max_depth, min_confidence)), _) => {
+          vorpal_index::records::selected_page_value(
+            vorpal_index::records::reach_records_page(
+              &kg,
+              &target,
+              *direction,
+              relations,
+              *max_depth,
+              *min_confidence,
+              vorpal_index::records::PageRequest {
+                cursor,
+                limit: arg.page.limit,
+              },
+            )
+            .map_err(anyhow::Error::msg)?,
+            cursor,
+            arg.page.limit,
           )
-          .map_err(anyhow::Error::msg)?,
-          cursor,
-          arg.page.limit,
-        )?,
-        (None, GraphVerb::Node) => emit::records_json(
+          .map_err(anyhow::Error::msg)?
+        }
+        (None, GraphVerb::Node) => vorpal_index::records::paged_value(
           &vorpal_index::records::listing_records(&kg, &target).map_err(anyhow::Error::msg)?,
           cursor,
           arg.page.limit,
-        )?,
-        (None, verb) => emit::selected_json(
+          "hits",
+        )
+        .map_err(anyhow::Error::msg)?,
+        (None, verb) => vorpal_index::records::selected_value(
           vorpal_index::records::related_records(&kg, verb.as_str(), &target)
             .map_err(anyhow::Error::msg)?,
           cursor,
           arg.page.limit,
-        )?,
+        )
+        .map_err(anyhow::Error::msg)?,
       };
-      json.push('\n');
-      json
+      emit_machine(machine, &value)?
     }
   };
   print!("{output}");
@@ -659,13 +701,18 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
         print!("{rendered}");
       }
     }
-    OutputFormat::Json => {
+    machine => {
       let records = vorpal_index::search_records_filtered(&dir, &arg.query, arg.k, &filter)
         .map_err(boxed)
         .with_context(|| missing_index_hint(&dir))?;
-      let mut json = emit::records_json(&records, arg.page.cursor.as_deref(), arg.page.limit)?;
-      json.push('\n');
-      print!("{json}");
+      let value = vorpal_index::records::paged_value(
+        &records,
+        arg.page.cursor.as_deref(),
+        arg.page.limit,
+        "hits",
+      )
+      .map_err(anyhow::Error::msg)?;
+      print!("{}", emit_machine(machine, &value)?);
     }
   }
   Ok(ExitCode::SUCCESS)

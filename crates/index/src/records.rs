@@ -948,6 +948,95 @@ pub fn reach_records_page(
   })
 }
 
+/// TOON ("token-oriented object notation") rendering: declare columns once, then one row
+/// per record — path prefixes grouped so directories print once and rows carry basenames.
+/// Built for agent token budgets: on homogeneous result sets the per-row cost collapses to
+/// the values themselves. Lossless for scalars; nested values inline as compact JSON; tabs
+/// and newlines escape. Records arrive as serialized `Value`s so one renderer serves every
+/// record type on every surface.
+pub fn toon_from_values(rows: &[serde_json::Value]) -> String {
+  use std::fmt::Write;
+  if rows.is_empty() {
+    return "(no records)\n".to_string();
+  }
+  // Column order: identity-first, then everything else in first-seen order (serde_json
+  // maps iterate sorted, which is deterministic — the priority list restores readability).
+  const PRIORITY: [&str; 6] = ["change", "name", "kind", "path", "depth", "grade"];
+  let mut columns: Vec<String> = Vec::new();
+  for lead in PRIORITY {
+    if rows.iter().any(|row| row.get(lead).is_some()) {
+      columns.push(lead.to_string());
+    }
+  }
+  for row in rows {
+    if let Some(map) = row.as_object() {
+      for key in map.keys() {
+        if !columns.iter().any(|c| c == key) {
+          columns.push(key.clone());
+        }
+      }
+    }
+  }
+  let cell = |row: &serde_json::Value, column: &str| -> String {
+    let value = match row.get(column) {
+      None | Some(serde_json::Value::Null) => return "-".to_string(),
+      Some(value) => value,
+    };
+    let text = match value {
+      serde_json::Value::String(text) => text.clone(),
+      other => other.to_string(),
+    };
+    let mut text = text.replace('\t', "\\t").replace('\n', "\\n");
+    if text.is_empty() {
+      text.push('-');
+    }
+    text
+  };
+  let mut out = String::new();
+  let _ = writeln!(out, "cols: {}", columns.join("\t"));
+  let mut current_dir: Option<String> = None;
+  for row in rows {
+    let full_path = row.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
+    let (dir, base) = full_path.rsplit_once('/').unwrap_or(("", full_path));
+    if !dir.is_empty() && current_dir.as_deref() != Some(dir) {
+      let _ = writeln!(out, "{dir}/");
+      current_dir = Some(dir.to_string());
+    }
+    let mut first = true;
+    for column in &columns {
+      if !first {
+        out.push('\t');
+      }
+      first = false;
+      if column == "path" && !dir.is_empty() {
+        out.push_str(base);
+      } else {
+        out.push_str(&cell(row, column));
+      }
+    }
+    out.push('\n');
+  }
+  out
+}
+
+/// The bare-identity rendering: one durable id per line (`eid:<hex>`, falling back to the
+/// dense id) — for piping into further queries.
+pub fn ids_from_values(rows: &[serde_json::Value]) -> String {
+  use std::fmt::Write;
+  let mut out = String::new();
+  for row in rows {
+    match row.get("external_id").and_then(serde_json::Value::as_str) {
+      Some(eid) => {
+        let _ = writeln!(out, "{eid}");
+      }
+      None => {
+        let _ = writeln!(out, "id:{}", row.get("id").and_then(serde_json::Value::as_u64).unwrap_or(0));
+      }
+    }
+  }
+  out
+}
+
 /// One module row of the architecture summary (module = defining file's directory).
 #[derive(Serialize, Debug)]
 pub struct ModuleRow {
@@ -1381,6 +1470,30 @@ pub fn reach_records(
 #[cfg(test)]
 mod paging_tests {
   use super::*;
+
+  #[test]
+  fn toon_declares_columns_groups_dirs_and_escapes() {
+    let rows = vec![
+      serde_json::json!({"name": "alpha", "kind": "Function", "path": "src/a/x.rs", "grade": "exact"}),
+      serde_json::json!({"name": "beta\ttabbed", "kind": "Struct", "path": "src/a/y.rs", "grade": "exact"}),
+      serde_json::json!({"name": "gamma", "kind": "Field", "path": "src/b/z.rs", "grade": null}),
+    ];
+    let toon = toon_from_values(&rows);
+    let lines: Vec<&str> = toon.lines().collect();
+    assert_eq!(lines[0], "cols: name\tkind\tpath\tgrade");
+    assert_eq!(lines[1], "src/a/");
+    assert_eq!(lines[2], "alpha\tFunction\tx.rs\texact");
+    assert!(lines[3].starts_with("beta\\ttabbed\t"), "tab escaped: {:?}", lines[3]);
+    assert_eq!(lines[4], "src/b/");
+    assert!(lines[5].ends_with("\t-"), "null renders as -: {:?}", lines[5]);
+    assert_eq!(toon_from_values(&[]), "(no records)\n");
+
+    let ids = ids_from_values(&[
+      serde_json::json!({"external_id": "eid:00ff", "id": 7}),
+      serde_json::json!({"id": 9}),
+    ]);
+    assert_eq!(ids, "eid:00ff\nid:9\n");
+  }
 
   #[test]
   fn page_bounds_contract() {

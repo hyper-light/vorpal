@@ -182,6 +182,25 @@ fn schema_reports_vocabulary_with_counts() {
 }
 
 #[test]
+fn toon_format_rewrites_record_tool_text() {
+  let (src, idx) = temp_tree("toon");
+  let mut server = Server::new(idx);
+  let (_, is_err) = call_tool(&mut server, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err);
+  let (text, is_err) = call_tool(
+    &mut server,
+    2,
+    "callers",
+    json!({"name": "target", "format": "toon"}),
+  );
+  assert!(!is_err);
+  assert!(text.starts_with("cols: "), "{text}");
+  assert!(text.contains("caller"), "{text}");
+  let (ids, _) = call_tool(&mut server, 3, "callers", json!({"name": "target", "format": "ids"}));
+  assert!(ids.starts_with("eid:") || ids.starts_with("id:"), "{ids}");
+}
+
+#[test]
 fn snippet_selects_by_name_with_context_and_refuses_stale() {
   let (src, idx) = temp_tree("snippet");
   let mut server = Server::new(idx);

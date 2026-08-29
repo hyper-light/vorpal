@@ -180,6 +180,17 @@ impl Server {
       .unwrap_or_else(|| json!({}));
     match self.run_tool(tool, &args) {
       Ok((text, mut data)) => {
+        // Token-oriented text: `format: "toon" | "ids"` rewrites the rendered half from
+        // this page's records — one renderer for every record-bearing tool; tools without
+        // records keep their prose.
+        let text = match (
+          args.get("format").and_then(Value::as_str),
+          data.get("records").and_then(Value::as_array),
+        ) {
+          (Some("toon"), Some(rows)) => vorpal_index::records::toon_from_values(rows),
+          (Some("ids"), Some(rows)) => vorpal_index::records::ids_from_values(rows),
+          _ => text,
+        };
         // Typed tools return their records/pagination here; text-only tools return `{}`.
         // Generation identity rides every success either way.
         data["generation"] = self.generation_id();

@@ -217,6 +217,8 @@ mod test_cli {
       "graph diff --from prev --to CURRENT --format json --limit 50",
       "graph architecture",
       "graph architecture --top 10 --format json",
+      "graph callers seal --format toon",
+      "graph node Kg --format ids --limit 500",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));
     }
