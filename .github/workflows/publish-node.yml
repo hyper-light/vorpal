@@ -2,7 +2,8 @@
 # per-platform packages and the main package to npm, plus @vorpal/wasm.
 #
 # Triggers: tag `v<version>` publishes; workflow_dispatch is a build-only dry run.
-# Required repository secrets: NPM_TOKEN.
+# Publishing uses npm TRUSTED PUBLISHING (OIDC) — no NPM_TOKEN. Each package needs a
+# trusted (or pending) publisher configured on npmjs.com pointing at this repo + workflow.
 name: Publish Node bindings
 
 on:
@@ -12,21 +13,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # musl targets build NATIVELY per arch (x86_64 on x64, aarch64 on arm64) — no container,
-  # no cross toolchain. musl-tools' musl-gcc is the native musl linker (overriding the repo
-  # config's cross-prefixed name); the build step links libgcc statically so the .node
-  # carries no libgcc_s.so.1 runtime dependency.
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-  CC_x86_64_unknown_linux_musl: musl-gcc
-  CC_aarch64_unknown_linux_musl: musl-gcc
   NAPI_CLI_VERSION: 3.7.2
 
 jobs:
+  # Non-musl targets build natively (glibc Linux, macOS, Windows); aarch64 on native arm64
+  # runners — no cross toolchains.
   build:
     name: napi ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
@@ -35,8 +29,6 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true, container: 'node:24' }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, container: 'node:24' }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
           - { target: aarch64-pc-windows-msvc, os: windows-latest }
           - { target: i686-pc-windows-msvc, os: windows-latest }
@@ -50,21 +42,53 @@ jobs:
         with:
           key: napi-${{ matrix.target }}
       - uses: actions/setup-node@v4
-        if: ${{ !matrix.container }}
         with:
           node-version: 24
-      - name: Install musl toolchain
-        if: matrix.musl
-        run: apt-get update && apt-get install -y musl-tools  # container runs as root; no sudo
       - name: Install napi CLI
         run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
       - name: Build
         working-directory: crates/napi
-        env:
-          # Fully static musl (+crt-static): rustc links libgcc.a and emits no -lgcc_s, so
-          # the .node has zero libgcc_s.so.1 dependency — the self-contained musl convention.
-          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=+crt-static' || '' }}
         run: napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/napi/vorpal-napi.*.node
+          if-no-files-found: error
+
+  # musl .node builds inside the official node:24-alpine image, NATIVE per arch (x86_64 on
+  # x64, aarch64 on arm64). Alpine is musl, so its native toolchain ships a musl libgcc and
+  # the dynamic cdylib links cleanly — Debian's musl-tools only carries glibc's libgcc (wrong
+  # ABI), which is why every VM-side attempt hit "cannot find libgcc_s.so.1", and +crt-static
+  # is rejected for a cdylib. The container is launched via `docker run`, NOT `container:`, so
+  # checkout/upload stay on the host and never trip GitHub's "JS actions in Alpine containers
+  # are x64-only" rule on the arm64 runner.
+  build-musl:
+    name: napi ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .node in node:24-alpine (native musl)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            node:24-alpine sh -c '
+              set -e
+              apk add --no-cache build-base curl
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.98.0 --profile default
+              . "$HOME/.cargo/env"
+              rustup target add ${{ matrix.target }}
+              npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+              cd crates/napi
+              napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
+            '
       - uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.target }}
@@ -74,7 +98,7 @@ jobs:
   publish:
     name: Publish @vorpal/node
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, build-musl]
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # OIDC: npm trusted publishing — no token, no 2FA
