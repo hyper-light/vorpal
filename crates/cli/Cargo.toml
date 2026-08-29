@@ -63,8 +63,6 @@ smallvec = "1.13.2"
 tokio = { version = "1.37.0", features = ["rt-multi-thread", "io-std", "io-util", "sync", "time", "macros"] }
 clap_complete = "4.5.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tikv-jemallocator = "0.7.0"
-tikv-jemalloc-sys = "0.7.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -84,3 +82,9 @@ pkg-url = "{ repo }/releases/download/{ version }/app-{ target }{ archive-suffix
 pkg-fmt = "zip"
 bin-dir = "{ bin }{ binary-ext }"
 disabled-strategies = ["quick-install"]
+
+# jemalloc is the binary's allocator on every platform except MSVC (tikv-jemalloc-sys does
+# not build there); main.rs cfg-gates the #[global_allocator] to match.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7.0"
+tikv-jemalloc-sys = "0.7.1"

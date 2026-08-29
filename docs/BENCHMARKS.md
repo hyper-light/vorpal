@@ -9,7 +9,9 @@ never blur a measurement.
 ## Hardware and toolchain
 
 - Apple M5 Max, 18 cores, 128 GiB RAM, macOS 26.4.1
-- rustc 1.94.1; `cargo build --release -p vorpal-index`
+- rustc 1.94.1; `cargo build --release -p vorpal-index` (toolchain since pinned to
+  1.98.0 via rust-toolchain.toml, 2026-08-29 — kernel generation id verified byte-identical
+  across the bump, so the numbers remain comparable)
 - Datasets: `linux` @ `1590cf032971` (72,541 indexable files), `cpython` @ `b86a41cbf63`
   (3,592 indexable files)
 

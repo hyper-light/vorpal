@@ -142,11 +142,8 @@ pub(crate) fn greedy_search(
   let mut beam: Vec<(f32, u32, bool)> = vec![(dist(medoid), medoid, false)];
   let mut visited: Vec<Scored> = Vec::new();
 
-  loop {
-    // Beam is sorted: the first unexpanded entry is the closest one.
-    let Some(index) = beam.iter().position(|&(_, _, expanded)| !expanded) else {
-      break;
-    };
+  // Beam is sorted: the first unexpanded entry is the closest one.
+  while let Some(index) = beam.iter().position(|&(_, _, expanded)| !expanded) {
     beam[index].2 = true;
     let (dist_next, next, _) = beam[index];
     visited.push((next, dist_next));

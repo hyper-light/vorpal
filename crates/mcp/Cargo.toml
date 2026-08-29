@@ -18,7 +18,10 @@ ignore.workspace = true
 notify = "8"
 serde.workspace = true
 serde_json = "1"
-tikv-jemallocator = "0.7.0"
 vorpal-config.workspace = true
 vorpal-core.workspace = true
 vorpal-language.workspace = true
+
+# MSVC has no jemalloc; the binary's #[global_allocator] is cfg-gated to match.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7.0"

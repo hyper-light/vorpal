@@ -135,7 +135,7 @@ impl CanonicalIndex {
       return;
     }
     let mut entries: Vec<([u8; 32], Entry)> = self.hot.drain().collect();
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_unstable_by_key(|a| a.0);
     let mut keys = Vec::with_capacity(entries.len());
     let mut ids = Vec::with_capacity(entries.len());
     let mut content_hashes = Vec::with_capacity(entries.len());

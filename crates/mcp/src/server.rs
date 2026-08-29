@@ -347,17 +347,12 @@ impl Server {
           .map(|text| (text, json!({})))
       }
       "ast_dump" => {
-        let lang;
-        let source;
-        match (args.get("source").and_then(Value::as_str), args.get("path").and_then(Value::as_str)) {
-          (Some(inline), _) => {
-            source = inline.to_string();
-            lang = str_arg("lang")?;
-          }
+        let (source, lang) = match (args.get("source").and_then(Value::as_str), args.get("path").and_then(Value::as_str)) {
+          (Some(inline), _) => (inline.to_string(), str_arg("lang")?),
           (None, Some(path)) => {
-            source =
+            let source =
               std::fs::read_to_string(path).map_err(|err| format!("read {path}: {err}"))?;
-            lang = match args.get("lang").and_then(Value::as_str) {
+            let lang = match args.get("lang").and_then(Value::as_str) {
               Some(lang) => lang.to_string(),
               None => <vorpal_language::SupportLang as vorpal_core::Language>::from_path(
                 std::path::Path::new(path),
@@ -365,9 +360,10 @@ impl Server {
               .map(|l: vorpal_language::SupportLang| l.to_string())
               .ok_or_else(|| format!("cannot infer language from {path}; pass lang"))?,
             };
+            (source, lang)
           }
           (None, None) => return Err(ToolError::coded("bad-argument", "pass source+lang, or path")),
-        }
+        };
         let max_nodes = args
           .get("max_nodes")
           .and_then(Value::as_u64)

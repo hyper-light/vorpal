@@ -1,3 +1,7 @@
 [toolchain]
-channel = "stable"
+# Exact version, deliberately (not "stable"): the channel name resolves differently on
+# every machine — CI's runner and a dev laptop can be four stables apart, which made the
+# clippy -D warnings gate unreproducible. Bump this file (and the matching pre-install
+# pins in .github/workflows/) in one commit, after a local `cargo clippy` pass.
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]

@@ -27,7 +27,7 @@ vorpal-canonical = { path = "crates/canonical", version = "0.1.0" }
 vorpal-config = { path = "crates/config", version = "0.1.0" }
 vorpal-dynamic = { path = "crates/dynamic", version = "0.1.0" }
 vorpal-graph = { path = "crates/graph", version = "0.1.0" }
-vorpal-index = { path = "crates/index", version = "0.1.0" }
+vorpal-index = { path = "crates/index", version = "0.1.0", default-features = false }
 vorpal-ingest = { path = "crates/ingest", version = "0.1.0" }
 vorpal-kg = { path = "crates/kg", version = "0.1.0" }
 vorpal-language = { path = "crates/language", version = "0.1.0" }
