@@ -154,5 +154,5 @@ text.
 - **[Use it with Claude (MCP)](./mcp.md)** — wire vorpal's tools into an AI agent.
 - **[Python quickstart](./python.md)** — `pip install vorpal-py`.
 - **[TypeScript / JavaScript quickstart](./typescript.md)** — the pattern engine for Node & the browser.
-- **[Supported languages](./LANGUAGES.md)** — the full matrix of what each grammar extracts.
-- **[How it works](./ARCHITECTURE.md)** and **[benchmarks](./BENCHMARKS.md)** — for the curious.
+- **[Supported languages](./wip/LANGUAGES.md)** — the full matrix of what each grammar extracts.
+- **[How it works](./wip/ARCHITECTURE.md)** and **[benchmarks](./wip/BENCHMARKS.md)** — for the curious.

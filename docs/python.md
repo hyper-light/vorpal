@@ -138,4 +138,4 @@ Async functions: `build`, `build_report`, `search`, `search_many`, `node`, `grap
 
 Case-insensitive, with common aliases: `python`/`py`, `javascript`/`js`/`jsx`, `typescript`/`ts`,
 `tsx`, `rust`/`rs`, `go`/`golang`, `c`, `cpp`/`c++`, `java`, `ruby`/`rb`, `css`, `html`, `json`,
-`yaml`, and more — see the [language matrix](./LANGUAGES.md).
+`yaml`, and more — see the [language matrix](./wip/LANGUAGES.md).
