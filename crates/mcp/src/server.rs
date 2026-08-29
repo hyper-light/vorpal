@@ -279,6 +279,7 @@ impl Server {
           kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
           lang: args.get("lang").and_then(Value::as_str).map(str::to_string),
           exported_only: args.get("exported").and_then(Value::as_bool).unwrap_or(false),
+          exclude_tests: args.get("exclude_tests").and_then(Value::as_bool).unwrap_or(false),
         };
         // One ranking serves both surfaces: records for machines, and the explained text
         // rendered from the same records (byte-compatible with `search_index_explained`) —
@@ -411,6 +412,7 @@ impl Server {
           path_prefix: args.get("prefix").and_then(Value::as_str).map(str::to_string),
           path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
           exported_only: args.get("exported").and_then(Value::as_bool).unwrap_or(false),
+          exclude_tests: args.get("exclude_tests").and_then(Value::as_bool).unwrap_or(false),
         };
         self.kg()?;
         let dir = self.kg_dir.clone();
@@ -501,8 +503,12 @@ impl Server {
         let dir = match direction.as_str() {
           "in" => vorpal_kg::Direction::In,
           "out" => vorpal_kg::Direction::Out,
+          "both" => vorpal_kg::Direction::Both,
           other => {
-            return Err(ToolError::coded("bad-argument", format!("direction must be \"in\" or \"out\", got '{other}'")));
+            return Err(ToolError::coded(
+              "bad-argument",
+              format!("direction must be \"in\", \"out\", or \"both\", got '{other}'"),
+            ));
           }
         };
         // Selector-consistent (07-29 §6): same refinement contract as the direct graph tools —
@@ -644,6 +650,7 @@ fn tools_list() -> Value {
         "prefix": {"type": "string", "description": "Filter: definition file path starts with this prefix"},
         "path": {"type": "string", "description": "Filter: definition file path ends with this suffix"},
         "exported": {"type": "boolean", "description": "Only exported definitions"},
+        "exclude_tests": {"type": "boolean", "description": "Exclude test-classified paths (tests/, __tests__/, *_test.*, …)"},
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),
@@ -675,7 +682,7 @@ fn tools_list() -> Value {
        contract as the direct graph tools (ambiguous names list candidates).",
       json!({
         "name": {"type": "string", "description": "Exact symbol name"},
-        "direction": {"type": "string", "enum": ["in", "out"]},
+        "direction": {"type": "string", "enum": ["in", "out", "both"]},
         "relations": {"type": "array", "items": {"type": "string"},
           "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides (default [\"calls\"])"},
         "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"},
@@ -789,6 +796,7 @@ fn tools_list() -> Value {
         "kind": {"type": "string", "description": "Filter: symbol kind (function, method, struct, …)"},
         "lang": {"type": "string", "description": "Filter: language name or alias (rust, py, ts, …)"},
         "exported": {"type": "boolean", "description": "Filter: only exported definitions"},
+        "exclude_tests": {"type": "boolean", "description": "Filter: exclude test-classified paths"},
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),

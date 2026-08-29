@@ -124,8 +124,9 @@ pub struct GraphArg {
   #[clap(long)]
   all: bool,
   /// (reachable) Traversal direction: `in` = everything reaching the symbol (transitive
-  /// callers), `out` = everything it reaches. Default `in`.
-  #[clap(long, value_name = "in|out", default_value = "in")]
+  /// callers), `out` = everything it reaches, `both` = the undirected closure (hops may
+  /// alternate orientation). Default `in`.
+  #[clap(long, value_name = "in|out|both", default_value = "in")]
   direction: String,
   /// (reachable) Comma-separated edge types to follow (calls, references, imports,
   /// implements, of_type, defines, has_method, has_field, overrides). Default `calls`.
@@ -147,6 +148,9 @@ pub struct GraphArg {
   /// (dead) Only exported definitions.
   #[clap(long)]
   exported: bool,
+  /// (dead) Exclude test-classified paths.
+  #[clap(long)]
+  no_tests: bool,
   /// (snippet) Whole context lines to include around the definition span.
   #[clap(long, value_name = "N", default_value_t = 0)]
   context: usize,
@@ -189,6 +193,9 @@ pub struct SearchArg {
   /// Filter: only exported definitions.
   #[clap(long)]
   exported: bool,
+  /// Filter: exclude test-classified paths (tests/, __tests__/, *_test.*, test_*.py, …).
+  #[clap(long)]
+  no_tests: bool,
   /// Output format: byte-stable text (default) or the paged records envelope.
   #[clap(long, value_enum, default_value_t)]
   format: OutputFormat,
@@ -279,6 +286,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       path_prefix: arg.prefix,
       path_suffix: arg.path,
       exported_only: arg.exported,
+      exclude_tests: arg.no_tests,
     };
     let report = vorpal_index::records::dead_records(&kg, Some(&gen_dir), &filter)
       .map_err(anyhow::Error::msg)?;
@@ -350,7 +358,8 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     let direction = match arg.direction.as_str() {
       "in" => vorpal_index::Direction::In,
       "out" => vorpal_index::Direction::Out,
-      other => anyhow::bail!("--direction must be `in` or `out`, got '{other}'"),
+      "both" => vorpal_index::Direction::Both,
+      other => anyhow::bail!("--direction must be `in`, `out`, or `both`, got '{other}'"),
     };
     let mut relations = Vec::new();
     for rel in arg.relations.split(',').filter(|r| !r.trim().is_empty()) {
@@ -459,6 +468,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     kind: arg.kind,
     lang: arg.lang,
     exported_only: arg.exported,
+    exclude_tests: arg.no_tests,
   };
   match arg.format {
     OutputFormat::Text => {

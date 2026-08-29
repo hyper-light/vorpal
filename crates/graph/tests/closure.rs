@@ -157,3 +157,42 @@ fn typed_paths_record_parents_and_respect_confidence_floor() {
   let steps = reachable_typed_paths(&g, &[1], Direction::Out, &[EdgeType::HAS_METHOD], None, 1);
   assert!(steps.is_empty(), "structural edges sit below any grade floor");
 }
+
+#[test]
+fn both_direction_is_the_undirected_closure_with_per_step_orientation() {
+  // 0 → 1 → 2 and 3 → 1: from seed 1, Out reaches {2}, In reaches {0, 3},
+  // Both reaches all three — and alternation matters: from seed 2, Both reaches
+  // 1 (against), then 0 and 3 (against), which neither In nor Out alone can.
+  let g = graph(4, &[(0, 1), (1, 2), (3, 1)]);
+  let ids = |steps: &[vorpal_graph::ReachStep]| {
+    let mut v: Vec<u32> = steps.iter().map(|s| s.node).collect();
+    v.sort_unstable();
+    v
+  };
+  let both = reachable_typed_paths(&g, &[1], Direction::Both, &[EdgeType::CALLS], None, 0);
+  assert_eq!(ids(&both), vec![0, 2, 3]);
+  // Orientation is recorded per hop: 2 was reached along the stored edge (out leg),
+  // 0 and 3 against it (in leg).
+  for step in &both {
+    match step.node {
+      2 => assert!(!step.inbound, "1→2 is an out leg"),
+      0 | 3 => assert!(step.inbound, "0→1 / 3→1 are in legs"),
+      other => panic!("unexpected node {other}"),
+    }
+  }
+  let from_leaf = reachable_typed_paths(&g, &[2], Direction::Both, &[EdgeType::CALLS], None, 0);
+  assert_eq!(ids(&from_leaf), vec![0, 1, 3], "alternating hops reach the whole component");
+  // Pure directions are unchanged by the Both machinery.
+  assert_eq!(
+    ids(&reachable_typed_paths(&g, &[1], Direction::In, &[EdgeType::CALLS], None, 0)),
+    vec![0, 3]
+  );
+  assert_eq!(
+    ids(&reachable_typed_paths(&g, &[1], Direction::Out, &[EdgeType::CALLS], None, 0)),
+    vec![2]
+  );
+  // Untyped strategy closure agrees across push/pull under Both.
+  let push: Vec<u32> = reachable_strategy(&g, &[2], Direction::Both, Strategy::Push).iter().map(|i| i as u32).collect();
+  let pull: Vec<u32> = reachable_strategy(&g, &[2], Direction::Both, Strategy::Pull).iter().map(|i| i as u32).collect();
+  assert_eq!(push, pull, "push ≡ pull under Both");
+}

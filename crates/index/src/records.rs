@@ -27,6 +27,8 @@ pub struct NodeRecord {
   /// Definition byte range in `path`; `[0, 0]` when unknown (File nodes, pre-span segments).
   pub span: [u32; 2],
   pub signature: String,
+  /// Conservative path classification: source | test | vendored | generated.
+  pub class: String,
 }
 
 /// A node related to the query target through one edge, with the edge's resolution grade
@@ -48,6 +50,9 @@ pub struct ReachRecord {
   pub via: u64,
   pub relation: String,
   pub grade: String,
+  /// Orientation of the stored edge relative to the BFS tree: `"in"` = it points from this
+  /// node toward `via`. Constant for pure in/out traversals; per-hop under direction=both.
+  pub edge_direction: String,
 }
 
 /// One evidence-sidecar occurrence: an emitted edge (`to` set) or a retained no-edge outcome
@@ -281,6 +286,9 @@ pub struct DeadFilter {
   pub path_prefix: Option<String>,
   pub path_suffix: Option<String>,
   pub exported_only: bool,
+  /// Exclude test-classified paths — a test's local helpers are dead in production terms
+  /// anyway, and test entry points are runner-invoked (always in-degree 0).
+  pub exclude_tests: bool,
 }
 
 /// Parse-damage suppression threshold: candidates in files with more than this fraction of
@@ -339,6 +347,9 @@ pub fn dead_records(
         return false;
       }
       if filter.exported_only && !view.exported {
+        return false;
+      }
+      if filter.exclude_tests && crate::path_class(view.path) == crate::PathClass::Test {
         return false;
       }
       if let Some(prefix) = filter.path_prefix.as_deref() {
@@ -624,6 +635,7 @@ pub fn node_record(kg: &Kg, id: NodeId) -> Option<NodeRecord> {
     exported: view.exported,
     span: [view.span.0, view.span.1],
     signature: view.signature.to_string(),
+    class: crate::path_class(view.path).label().to_string(),
   })
 }
 
@@ -712,6 +724,7 @@ pub fn reach_records(
         via: step.via.0 as u64,
         relation: step.via.1.name().to_string(),
         grade: crate::confidence_label(step.via.1.confidence()).to_string(),
+        edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
       });
     }
   }

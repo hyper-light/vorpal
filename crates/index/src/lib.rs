@@ -1221,6 +1221,9 @@ pub struct SearchFilter {
   pub lang: Option<String>,
   /// Only exported definitions.
   pub exported_only: bool,
+  /// Exclude test-classified paths (`path_class` == Test): tests reference everything, so
+  /// production-signal queries filter them out rather than demote them.
+  pub exclude_tests: bool,
 }
 
 impl SearchFilter {
@@ -1230,7 +1233,60 @@ impl SearchFilter {
       && self.kind.is_none()
       && self.lang.is_none()
       && !self.exported_only
+      && !self.exclude_tests
   }
+}
+
+/// Conservative cross-language path classification. A **filter** facet, never a ranking
+/// signal — ranking stays bit-stable; `--no-tests` and friends narrow populations instead.
+/// Conservative means: only unambiguous conventions classify away from `Source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathClass {
+  Source,
+  Test,
+  Vendored,
+  Generated,
+}
+
+impl PathClass {
+  pub fn label(self) -> &'static str {
+    match self {
+      PathClass::Source => "source",
+      PathClass::Test => "test",
+      PathClass::Vendored => "vendored",
+      PathClass::Generated => "generated",
+    }
+  }
+}
+
+pub fn path_class(path: &str) -> PathClass {
+  let mut basename = path;
+  for component in path.split(['/', '\\']) {
+    if component.is_empty() {
+      continue;
+    }
+    basename = component;
+    match component {
+      "vendor" | "vendored" | "third_party" | "third-party" | "node_modules" => {
+        return PathClass::Vendored;
+      }
+      "tests" | "test" | "__tests__" | "spec" | "testdata" => return PathClass::Test,
+      "generated" | "__generated__" => return PathClass::Generated,
+      _ => {}
+    }
+  }
+  let stem = basename;
+  let is_test_basename = stem.starts_with("test_")
+    || stem.starts_with("conftest.")
+    || [".test.", ".spec.", "_test.", "_spec."].iter().any(|m| stem.contains(m));
+  if is_test_basename {
+    return PathClass::Test;
+  }
+  if stem.contains(".generated.") || stem.contains("_generated.") {
+    return PathClass::Generated;
+  }
+  PathClass::Source
 }
 
 /// The filter compiled for the hot path: kind/lang parsed once, applied per node view.
@@ -1240,6 +1296,7 @@ struct CompiledSearchFilter<'f> {
   kind: Option<vorpal_kg::SymbolKind>,
   lang: Option<String>,
   exported_only: bool,
+  exclude_tests: bool,
 }
 
 impl<'f> CompiledSearchFilter<'f> {
@@ -1264,6 +1321,7 @@ impl<'f> CompiledSearchFilter<'f> {
       kind,
       lang,
       exported_only: filter.exported_only,
+      exclude_tests: filter.exclude_tests,
     })
   }
 
@@ -1287,6 +1345,9 @@ impl<'f> CompiledSearchFilter<'f> {
       }
     }
     if self.exported_only && !view.exported {
+      return false;
+    }
+    if self.exclude_tests && path_class(view.path) == PathClass::Test {
       return false;
     }
     if let Some(lang) = &self.lang {
@@ -2155,9 +2216,9 @@ pub fn reachable_query_on(
   for &seed in &matches {
     // Parent-edge map for path reconstruction; steps arrive in BFS order (deterministic).
     let steps = kg.reachable_via_paths(seed, dir, relations, max_depth, min_confidence);
-    let mut parent: HashMap<u32, (u32, vorpal_kg::EdgeType)> = HashMap::new();
+    let mut parent: HashMap<u32, (u32, vorpal_kg::EdgeType, bool)> = HashMap::new();
     for step in &steps {
-      parent.insert(step.node, step.via);
+      parent.insert(step.node, (step.via.0, step.via.1, step.inbound));
     }
     let seed_raw = seed.raw() as u32;
     let name_of = |id: u32| {
@@ -2173,10 +2234,16 @@ pub fn reachable_query_on(
       let mut chain: Vec<String> = Vec::new();
       let mut at = step.node;
       while at != seed_raw {
-        let Some(&(up, edge)) = parent.get(&at) else {
+        let Some(&(up, edge, inbound)) = parent.get(&at) else {
           break;
         };
-        chain.push(format!("-{}→ {}", edge.name(), name_of(at)));
+        // Pure In/Out keeps the historical arrow; Both labels each hop's real orientation
+        // (`←rel-` = the stored edge points from this node toward its parent).
+        if matches!(dir, vorpal_kg::Direction::Both) && inbound {
+          chain.push(format!("←{}- {}", edge.name(), name_of(at)));
+        } else {
+          chain.push(format!("-{}→ {}", edge.name(), name_of(at)));
+        }
         at = up;
       }
       chain.reverse();

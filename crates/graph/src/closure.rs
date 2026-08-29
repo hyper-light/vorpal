@@ -13,11 +13,14 @@ use crate::edge::EdgeType;
 use crate::graph::Graph;
 
 /// Which edge direction to follow: `Out` = what a seed reaches (`refsTo`/`defines`-transitive),
-/// `In` = what reaches a seed (`callersOf`/container-transitive).
+/// `In` = what reaches a seed (`callersOf`/container-transitive), `Both` = the undirected
+/// closure (each hop may go with or against edge direction — NOT the union of In and Out,
+/// which cannot alternate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
   Out,
   In,
+  Both,
 }
 
 impl Direction {
@@ -25,6 +28,16 @@ impl Direction {
     match self {
       Direction::Out => Direction::In,
       Direction::In => Direction::Out,
+      Direction::Both => Direction::Both,
+    }
+  }
+
+  /// The adjacency legs one expansion visits: `(use_out, use_in)`.
+  fn legs(self) -> (bool, bool) {
+    match self {
+      Direction::Out => (true, false),
+      Direction::In => (false, true),
+      Direction::Both => (true, true),
     }
   }
 }
@@ -40,11 +53,14 @@ pub enum Strategy {
 /// Switch to bottom-up pull once the frontier exceeds `n / ALPHA` (Beamer's heuristic threshold).
 const ALPHA: usize = 8;
 
-fn neighbors_dir(graph: &Graph, node: u32, dir: Direction) -> &[u32] {
-  match dir {
-    Direction::Out => graph.out_targets(node),
-    Direction::In => graph.in_targets(node),
-  }
+/// The adjacency legs of `node` in `dir` — one slice for In/Out, both for Both. A fixed
+/// [out, in] order keeps every traversal deterministic.
+fn neighbor_legs(graph: &Graph, node: u32, dir: Direction) -> [Option<&[u32]>; 2] {
+  let (use_out, use_in) = dir.legs();
+  [
+    use_out.then(|| graph.out_targets(node)),
+    use_in.then(|| graph.in_targets(node)),
+  ]
 }
 
 /// The set of nodes reachable from `seeds` via ≥1 edge in `dir` (seeds excluded unless reached
@@ -75,20 +91,23 @@ pub fn reachable_typed(
     }
   }
   let allowed_bases: Vec<u16> = allowed.iter().map(|e| e.base().0).collect();
+  let (use_out, use_in) = dir.legs();
   let mut depth = 0u32;
   while !frontier.is_empty() && max_depth.is_none_or(|md| depth < md) {
     let mut next: Vec<u32> = Vec::new();
     for &u in &frontier {
-      let (targets, types) = match dir {
-        Direction::Out => (graph.out_targets(u), graph.out_edge_types(u)),
-        Direction::In => (graph.in_targets(u), graph.in_edge_types(u)),
-      };
-      for (&v, &et) in targets.iter().zip(types) {
-        if !allowed_bases.contains(&EdgeType(et).base().0) {
-          continue;
-        }
-        if (v as usize) < n && visited.insert(v as usize) {
-          next.push(v);
+      let legs = [
+        use_out.then(|| (graph.out_targets(u), graph.out_edge_types(u))),
+        use_in.then(|| (graph.in_targets(u), graph.in_edge_types(u))),
+      ];
+      for (targets, types) in legs.into_iter().flatten() {
+        for (&v, &et) in targets.iter().zip(types) {
+          if !allowed_bases.contains(&EdgeType(et).base().0) {
+            continue;
+          }
+          if (v as usize) < n && visited.insert(v as usize) {
+            next.push(v);
+          }
         }
       }
     }
@@ -111,6 +130,9 @@ pub struct ReachStep {
   pub depth: u32,
   /// `(parent, edge_type_with_confidence)` — `None` only for a seed (never emitted).
   pub via: (u32, EdgeType),
+  /// The stored edge points `node → parent` (an In leg). Constant for pure In/Out
+  /// traversals; meaningful per step under [`Direction::Both`], where legs alternate.
+  pub inbound: bool,
 }
 
 /// [`reachable_typed`] with **paths and a confidence floor**: BFS restricted to `allowed` base
@@ -137,27 +159,32 @@ pub fn reachable_typed_paths(
     }
   }
   let allowed_bases: Vec<u16> = allowed.iter().map(|e| e.base().0).collect();
+  let (use_out, use_in) = dir.legs();
   let mut steps: Vec<ReachStep> = Vec::new();
   let mut depth = 0u32;
   while !frontier.is_empty() && max_depth.is_none_or(|md| depth < md) {
     let mut next: Vec<u32> = Vec::new();
     for &u in &frontier {
-      let (targets, types) = match dir {
-        Direction::Out => (graph.out_targets(u), graph.out_edge_types(u)),
-        Direction::In => (graph.in_targets(u), graph.in_edge_types(u)),
-      };
-      for (&v, &et) in targets.iter().zip(types) {
-        let edge = EdgeType(et);
-        if !allowed_bases.contains(&edge.base().0) || edge.confidence() < min_confidence {
-          continue;
-        }
-        if (v as usize) < n && visited.insert(v as usize) {
-          steps.push(ReachStep {
-            node: v,
-            depth: depth + 1,
-            via: (u, edge),
-          });
-          next.push(v);
+      // Out leg first, then In — a fixed order, so Both stays deterministic.
+      let legs = [
+        use_out.then(|| (graph.out_targets(u), graph.out_edge_types(u), false)),
+        use_in.then(|| (graph.in_targets(u), graph.in_edge_types(u), true)),
+      ];
+      for (targets, types, inbound) in legs.into_iter().flatten() {
+        for (&v, &et) in targets.iter().zip(types) {
+          let edge = EdgeType(et);
+          if !allowed_bases.contains(&edge.base().0) || edge.confidence() < min_confidence {
+            continue;
+          }
+          if (v as usize) < n && visited.insert(v as usize) {
+            steps.push(ReachStep {
+              node: v,
+              depth: depth + 1,
+              via: (u, edge),
+              inbound,
+            });
+            next.push(v);
+          }
         }
       }
     }
@@ -194,15 +221,17 @@ pub fn reachable_strategy(
     let mut next = BitSet::with_capacity(n);
 
     if use_pull {
-      // Bottom-up: an unvisited `w` joins the frontier iff a reverse-`dir` neighbor is in it.
+      // Bottom-up: an unvisited `w` joins the frontier iff a reverse-`dir` neighbor is in
+      // it. `Both` is its own reverse (undirected), so the same legs serve.
       let reverse = dir.opposite();
       for w in 0..n {
         if visited.contains(w) {
           continue;
         }
-        if neighbors_dir(graph, w as u32, reverse)
-          .iter()
-          .any(|&x| frontier.contains(x as usize))
+        if neighbor_legs(graph, w as u32, reverse)
+          .into_iter()
+          .flatten()
+          .any(|leg| leg.iter().any(|&x| frontier.contains(x as usize)))
         {
           visited.insert(w);
           next.insert(w);
@@ -211,11 +240,13 @@ pub fn reachable_strategy(
     } else {
       // Top-down: expand each frontier node's `dir` neighbors.
       for u in frontier.iter() {
-        for &v in neighbors_dir(graph, u as u32, dir) {
-          let v = v as usize;
-          if !visited.contains(v) {
-            visited.insert(v);
-            next.insert(v);
+        for leg in neighbor_legs(graph, u as u32, dir).into_iter().flatten() {
+          for &v in leg {
+            let v = v as usize;
+            if !visited.contains(v) {
+              visited.insert(v);
+              next.insert(v);
+            }
           }
         }
       }
