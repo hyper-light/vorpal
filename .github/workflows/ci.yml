@@ -16,6 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # No `cargo fmt --check` gate, deliberately: the tree predates rustfmt conformance
