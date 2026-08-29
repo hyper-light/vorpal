@@ -91,6 +91,76 @@ pub enum Selected<T> {
   Hits(Vec<T>),
 }
 
+/// Resolved slice bounds for one page of a deterministic record vector — the cursor/limit
+/// contract every paged surface shares (MCP tools, `--format json` CLI verbs). `cursor` is
+/// an opaque `o:<offset>` into the record order; `limit` caps the page (default 100, max
+/// 1000). Errors are plain messages for the surface to wrap in its own error shape.
+pub struct PageBounds {
+  pub start: usize,
+  pub end: usize,
+  pub total: usize,
+}
+
+pub fn page_bounds(
+  total: usize,
+  cursor: Option<&str>,
+  limit: Option<u64>,
+) -> Result<PageBounds, String> {
+  let offset = match cursor {
+    None => 0usize,
+    Some(cursor) => cursor
+      .strip_prefix("o:")
+      .and_then(|n| n.parse().ok())
+      .ok_or_else(|| format!("malformed cursor '{cursor}' (want o:<offset>)"))?,
+  };
+  let limit = limit.unwrap_or(100).clamp(1, 1000) as usize;
+  let start = offset.min(total);
+  let end = start.saturating_add(limit).min(total);
+  Ok(PageBounds { start, end, total })
+}
+
+/// One page of records as the shared structured envelope: `{outcome, records, total,
+/// truncated, nextCursor?}`. Truncation is always declared; recomputing the vector per page
+/// keeps callers stateless, and record-order determinism is what makes the pages coherent.
+pub fn paged_value<T: Serialize>(
+  records: &[T],
+  cursor: Option<&str>,
+  limit: Option<u64>,
+  outcome: &str,
+) -> Result<serde_json::Value, String> {
+  let PageBounds { start, end, total } = page_bounds(records.len(), cursor, limit)?;
+  let page: Vec<serde_json::Value> = records[start..end]
+    .iter()
+    .map(|record| serde_json::to_value(record).unwrap_or(serde_json::Value::Null))
+    .collect();
+  let mut data = serde_json::json!({
+    "outcome": outcome,
+    "records": page,
+    "total": total,
+    "truncated": end < total,
+  });
+  if end < total {
+    data["nextCursor"] = serde_json::json!(format!("o:{end}"));
+  }
+  Ok(data)
+}
+
+/// [`paged_value`] over a selector outcome: `no-match` and `ambiguous` are answers (the
+/// ambiguous candidates page like any records), never errors.
+pub fn selected_value<T: Serialize>(
+  selected: Selected<T>,
+  cursor: Option<&str>,
+  limit: Option<u64>,
+) -> Result<serde_json::Value, String> {
+  match selected {
+    Selected::NoMatch => Ok(serde_json::json!({
+      "outcome": "no-match", "records": [], "total": 0, "truncated": false
+    })),
+    Selected::Ambiguous(candidates) => paged_value(&candidates, cursor, limit, "ambiguous"),
+    Selected::Hits(hits) => paged_value(&hits, cursor, limit, "hits"),
+  }
+}
+
 /// The typed view of one node, if it exists.
 pub fn node_record(kg: &Kg, id: NodeId) -> Option<NodeRecord> {
   let view = kg.node(id)?;
@@ -195,6 +265,42 @@ pub fn reach_records(
     }
   }
   Ok(Selected::Hits(records))
+}
+
+#[cfg(test)]
+mod paging_tests {
+  use super::*;
+
+  #[test]
+  fn page_bounds_contract() {
+    // Defaults: offset 0, limit 100.
+    let b = page_bounds(250, None, None).unwrap();
+    assert_eq!((b.start, b.end, b.total), (0, 100, 250));
+    // Cursor resumes; limit clamps to [1, 1000].
+    let b = page_bounds(250, Some("o:200"), Some(0)).unwrap();
+    assert_eq!((b.start, b.end), (200, 201));
+    let b = page_bounds(5000, Some("o:100"), Some(9999)).unwrap();
+    assert_eq!((b.start, b.end), (100, 1100));
+    // Past-the-end cursor yields an empty page, never an error.
+    let b = page_bounds(10, Some("o:50"), None).unwrap();
+    assert_eq!((b.start, b.end, b.total), (10, 10, 10));
+    // Malformed cursors are errors, never a silent first page.
+    assert!(page_bounds(10, Some("page-2"), None).is_err());
+    assert!(page_bounds(10, Some("o:-1"), None).is_err());
+  }
+
+  #[test]
+  fn paged_value_declares_truncation() {
+    let rows: Vec<u32> = (0..7).collect();
+    let v = paged_value(&rows, None, Some(3), "hits").unwrap();
+    assert_eq!(v["total"], 7);
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["nextCursor"], "o:3");
+    assert_eq!(v["records"].as_array().unwrap().len(), 3);
+    let last = paged_value(&rows, Some("o:6"), Some(3), "hits").unwrap();
+    assert_eq!(last["truncated"], false);
+    assert!(last.get("nextCursor").is_none());
+  }
 }
 
 /// The typed twin of `why`: the retained evidence occurrences from `from_id` — the edge form

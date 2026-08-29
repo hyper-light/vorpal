@@ -687,37 +687,13 @@ fn paged<T: serde::Serialize>(
   args: &Value,
   outcome: &str,
 ) -> Result<Value, ToolError> {
-  let offset = match args.get("cursor").and_then(Value::as_str) {
-    None => 0usize,
-    Some(cursor) => cursor
-      .strip_prefix("o:")
-      .and_then(|n| n.parse().ok())
-      .ok_or_else(|| {
-        ToolError::coded("bad-argument", format!("malformed cursor '{cursor}' (want o:<offset>)"))
-      })?,
-  };
-  let limit = args
-    .get("limit")
-    .and_then(Value::as_u64)
-    .unwrap_or(100)
-    .clamp(1, 1000) as usize;
-  let total = records.len();
-  let start = offset.min(total);
-  let end = start.saturating_add(limit).min(total);
-  let page: Vec<Value> = records[start..end]
-    .iter()
-    .map(|record| serde_json::to_value(record).unwrap_or(Value::Null))
-    .collect();
-  let mut data = json!({
-    "outcome": outcome,
-    "records": page,
-    "total": total,
-    "truncated": end < total,
-  });
-  if end < total {
-    data["nextCursor"] = json!(format!("o:{end}"));
-  }
-  Ok(data)
+  vorpal_index::records::paged_value(
+    &records,
+    args.get("cursor").and_then(Value::as_str),
+    args.get("limit").and_then(Value::as_u64),
+    outcome,
+  )
+  .map_err(|message| ToolError::coded("bad-argument", message))
 }
 
 /// Map a selector outcome to the structured object: `no-match` and `ambiguous` are answers
@@ -726,13 +702,12 @@ fn selected_data<T: serde::Serialize>(
   selected: vorpal_index::records::Selected<T>,
   args: &Value,
 ) -> Result<Value, ToolError> {
-  match selected {
-    vorpal_index::records::Selected::NoMatch => Ok(json!({
-      "outcome": "no-match", "records": [], "total": 0, "truncated": false
-    })),
-    vorpal_index::records::Selected::Ambiguous(candidates) => paged(candidates, args, "ambiguous"),
-    vorpal_index::records::Selected::Hits(hits) => paged(hits, args, "hits"),
-  }
+  vorpal_index::records::selected_value(
+    selected,
+    args.get("cursor").and_then(Value::as_str),
+    args.get("limit").and_then(Value::as_u64),
+  )
+  .map_err(|message| ToolError::coded("bad-argument", message))
 }
 
 /// A tool failure with a stable machine-readable code (IMPROVEMENTS #7). Codes are part of

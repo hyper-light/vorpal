@@ -1178,6 +1178,17 @@ pub fn search_index(index_dir: &Path, query: &str, k: usize) -> Result<String, B
   search_index_impl(index_dir, query, k, false)
 }
 
+/// [`search_index`] with structured pre-ranking filters (the CLI's `--path`/`--prefix`/
+/// `--kind`/`--lang`/`--exported` flags): same rendering contract, narrowed population.
+pub fn search_index_filtered(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+  filter: &SearchFilter,
+) -> Result<String, Box<dyn Error>> {
+  cached_searcher(index_dir)?.search_rendered_filtered(query, k, false, filter)
+}
+
 /// [`search_index`] with ranking provenance: each line gains `(id N; name#r vector#r graph#r)`
 /// — the node id (for `fetch_span`/selector refinement) and each contributing channel's
 /// 1-based rank. The plain renderer stays byte-stable for humans and captured docs.
@@ -1570,7 +1581,19 @@ impl Searcher {
     k: usize,
     explain: bool,
   ) -> Result<String, Box<dyn Error>> {
-    let ranked = self.run(query, k, &SearchFilter::default())?;
+    self.search_rendered_filtered(query, k, explain, &SearchFilter::default())
+  }
+
+  /// [`Searcher::search_rendered`] with structured pre-ranking filters — the rendering
+  /// contract is identical; only the candidate population narrows.
+  pub fn search_rendered_filtered(
+    &self,
+    query: &str,
+    k: usize,
+    explain: bool,
+    filter: &SearchFilter,
+  ) -> Result<String, Box<dyn Error>> {
+    let ranked = self.run(query, k, filter)?;
     let kg = &self.kg;
     let mut out = String::new();
     for (row, score, ranks) in ranked {

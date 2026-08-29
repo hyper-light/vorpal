@@ -195,7 +195,11 @@ mod test_cli {
       "index crates --out /tmp/idx",
       "graph callers seal",
       "graph implementors FileExtractor --index /tmp/idx",
+      "graph callers seal --format json --limit 5 --cursor o:100",
+      "graph node Kg --format json",
       "search import-path-resolution -k 5",
+      "search embed --format json --kind function --lang rust --exported --prefix crates/",
+      "search seal --path lib.rs --format json --limit 3",
       "mcp --index /tmp/idx",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));

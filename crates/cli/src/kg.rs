@@ -8,9 +8,41 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 
+mod emit;
+
 /// Default index location relative to the indexed tree / working directory. Hidden, so the
 /// ignore-respecting walker never indexes the index itself.
 const DEFAULT_INDEX_DIR: &str = ".vorpal/index";
+
+/// Output surface for the query verbs: `text` is the byte-stable human rendering; `json` is
+/// the records/pagination envelope shared with the MCP server.
+#[derive(Copy, Clone, PartialEq, Eq, Default, ValueEnum)]
+enum OutputFormat {
+  #[default]
+  Text,
+  Json,
+}
+
+/// Cursor/limit flags shared by the paged query verbs. Pagination is a machine-surface
+/// feature: both flags require `--format json` (text output stays complete and unchanged).
+#[derive(Args)]
+struct PageArg {
+  /// (json) Records per page (default 100, max 1000).
+  #[clap(long, value_name = "N")]
+  limit: Option<u64>,
+  /// (json) Opaque page cursor from a previous page's `nextCursor`.
+  #[clap(long, value_name = "CURSOR")]
+  cursor: Option<String>,
+}
+
+impl PageArg {
+  fn reject_for_text(&self, format: OutputFormat) -> Result<()> {
+    if format == OutputFormat::Text && (self.limit.is_some() || self.cursor.is_some()) {
+      anyhow::bail!("--limit/--cursor page the records surface: add --format json");
+    }
+    Ok(())
+  }
+}
 
 #[derive(Args)]
 pub struct IndexArg {
@@ -100,6 +132,11 @@ pub struct GraphArg {
   /// Append each result's node id (stable within this index generation).
   #[clap(long)]
   ids: bool,
+  /// Output format: byte-stable text (default) or the paged records envelope.
+  #[clap(long, value_enum, default_value_t)]
+  format: OutputFormat,
+  #[clap(flatten)]
+  page: PageArg,
   /// Index directory (default: `./.vorpal/index`).
   #[clap(long)]
   index: Option<PathBuf>,
@@ -113,6 +150,26 @@ pub struct SearchArg {
   /// Max results.
   #[clap(short, default_value_t = 10)]
   k: usize,
+  /// Filter: definition file path must start with this prefix (package/subtree scoping).
+  #[clap(long, value_name = "PREFIX")]
+  prefix: Option<String>,
+  /// Filter: definition file path must end with this suffix.
+  #[clap(long, value_name = "SUFFIX")]
+  path: Option<String>,
+  /// Filter: symbol kind (function, method, struct, field, …).
+  #[clap(long, value_name = "KIND")]
+  kind: Option<String>,
+  /// Filter: language name or alias (rust, py, ts, …).
+  #[clap(long, value_name = "LANG")]
+  lang: Option<String>,
+  /// Filter: only exported definitions.
+  #[clap(long)]
+  exported: bool,
+  /// Output format: byte-stable text (default) or the paged records envelope.
+  #[clap(long, value_enum, default_value_t)]
+  format: OutputFormat,
+  #[clap(flatten)]
+  page: PageArg,
   /// Index directory (default: `./.vorpal/index`).
   #[clap(long)]
   index: Option<PathBuf>,
@@ -172,6 +229,7 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
 }
 
 pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
+  arg.page.reject_for_text(arg.format)?;
   let dir = index_dir(arg.index);
   let eid = match arg.eid.as_deref() {
     Some(hex) => Some(
@@ -189,7 +247,9 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     merge_all: arg.all,
     show_ids: arg.ids,
   };
-  let rendered = if matches!(arg.verb, GraphVerb::Reachable) {
+  // Reachable parses its traversal flags in both formats; the other verbs only need them
+  // rendered or recorded.
+  let traversal = if matches!(arg.verb, GraphVerb::Reachable) {
     let direction = match arg.direction.as_str() {
       "in" => vorpal_index::Direction::In,
       "out" => vorpal_index::Direction::Out,
@@ -205,29 +265,94 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     let max_depth = (arg.depth > 0).then_some(arg.depth);
     let min_confidence =
       vorpal_index::min_confidence_for_grade(arg.min_grade.as_deref()).map_err(boxed)?;
-    let kg = vorpal_index::Kg::load(&dir)
-      .map_err(|err| anyhow::anyhow!(err.to_string()))
-      .with_context(|| missing_index_hint(&dir))?;
-    vorpal_index::reachable_query_on(&kg, &target, direction, &relations, max_depth, min_confidence)
-      .map_err(boxed)?
+    Some((direction, relations, max_depth, min_confidence))
   } else {
-    vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
-      .map_err(boxed)
-      .with_context(|| missing_index_hint(&dir))?
+    None
   };
-  print!("{rendered}");
+
+  let output = match (arg.format, &traversal) {
+    (OutputFormat::Text, Some((direction, relations, max_depth, min_confidence))) => {
+      let kg = vorpal_index::Kg::load(&dir)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+        .with_context(|| missing_index_hint(&dir))?;
+      vorpal_index::reachable_query_on(&kg, &target, *direction, relations, *max_depth, *min_confidence)
+        .map_err(boxed)?
+    }
+    (OutputFormat::Text, None) => vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
+      .map_err(boxed)
+      .with_context(|| missing_index_hint(&dir))?,
+    (OutputFormat::Json, _) => {
+      let kg = vorpal_index::Kg::load(&dir)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+        .with_context(|| missing_index_hint(&dir))?;
+      let cursor = arg.page.cursor.as_deref();
+      let mut json = match (&traversal, arg.verb) {
+        (Some((direction, relations, max_depth, min_confidence)), _) => emit::selected_json(
+          vorpal_index::records::reach_records(
+            &kg,
+            &target,
+            *direction,
+            relations,
+            *max_depth,
+            *min_confidence,
+          )
+          .map_err(anyhow::Error::msg)?,
+          cursor,
+          arg.page.limit,
+        )?,
+        (None, GraphVerb::Node) => emit::records_json(
+          &vorpal_index::records::listing_records(&kg, &target).map_err(anyhow::Error::msg)?,
+          cursor,
+          arg.page.limit,
+        )?,
+        (None, verb) => emit::selected_json(
+          vorpal_index::records::related_records(&kg, verb.as_str(), &target)
+            .map_err(anyhow::Error::msg)?,
+          cursor,
+          arg.page.limit,
+        )?,
+      };
+      json.push('\n');
+      json
+    }
+  };
+  print!("{output}");
   Ok(ExitCode::SUCCESS)
 }
 
 pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
+  arg.page.reject_for_text(arg.format)?;
   let dir = index_dir(arg.index);
-  let rendered = vorpal_index::search_index(&dir, &arg.query, arg.k)
-    .map_err(boxed)
-    .with_context(|| missing_index_hint(&dir))?;
-  if rendered.is_empty() {
-    println!("(no results for '{}')", arg.query);
-  } else {
-    print!("{rendered}");
+  let filter = vorpal_index::SearchFilter {
+    path_prefix: arg.prefix,
+    path_suffix: arg.path,
+    kind: arg.kind,
+    lang: arg.lang,
+    exported_only: arg.exported,
+  };
+  match arg.format {
+    OutputFormat::Text => {
+      let rendered = if filter.is_empty() {
+        vorpal_index::search_index(&dir, &arg.query, arg.k)
+      } else {
+        vorpal_index::search_index_filtered(&dir, &arg.query, arg.k, &filter)
+      }
+      .map_err(boxed)
+      .with_context(|| missing_index_hint(&dir))?;
+      if rendered.is_empty() {
+        println!("(no results for '{}')", arg.query);
+      } else {
+        print!("{rendered}");
+      }
+    }
+    OutputFormat::Json => {
+      let records = vorpal_index::search_records_filtered(&dir, &arg.query, arg.k, &filter)
+        .map_err(boxed)
+        .with_context(|| missing_index_hint(&dir))?;
+      let mut json = emit::records_json(&records, arg.page.cursor.as_deref(), arg.page.limit)?;
+      json.push('\n');
+      print!("{json}");
+    }
   }
   Ok(ExitCode::SUCCESS)
 }
