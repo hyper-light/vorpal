@@ -392,6 +392,25 @@ impl Server {
             crate::tools::FetchSpanError::Other(message) => ToolError::from(message),
           })
       }
+      "dead_code" => {
+        let filter = vorpal_index::records::DeadFilter {
+          kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
+          path_prefix: args.get("prefix").and_then(Value::as_str).map(str::to_string),
+          path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
+          exported_only: args.get("exported").and_then(Value::as_bool).unwrap_or(false),
+        };
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let kg = self.kg.as_ref().expect("pinned above");
+        let report = vorpal_index::records::dead_records(kg, dir.as_deref(), &filter)
+          .map_err(ToolError::from)?;
+        let text = vorpal_index::records::render_dead(&report);
+        let mut data = paged(report.records, args, "hits")?;
+        data["suppressedReferenced"] = report.suppressed_referenced.into();
+        data["suppressedDamaged"] = report.suppressed_damaged.into();
+        data["nameSuppression"] = report.name_suppression.into();
+        Ok((text, data))
+      }
       "snippet" => {
         // The selector-driven sibling of `fetch_span`: name/path/kind/id/eid resolution with
         // the shared ambiguity contract, whole-line context, and the same digest refusal.
@@ -597,6 +616,24 @@ fn tools_list() -> Value {
        grades — each with counts — plus generation id and warm-tier state. Call this before \
        forming queries; it is the authority on which kind/relation/grade names exist.",
       json!({}),
+      &[],
+    ),
+    tool(
+      "dead_code",
+      "Definitions with no semantic in-edges anywhere in the graph (calls/references/\
+       imports/implements/of_type/overrides — containment doesn't count), with honest \
+       suppression: candidates whose name appears in ANY evidence occurrence (fn-pointer \
+       tables, dynamic dispatch, namesake ties) and candidates in parse-damaged files are \
+       counted out, not listed. Leads, not verdicts: absence of an edge is not proof of \
+       death — check `coverage`/`health` before deleting anything.",
+      json!({
+        "kind": {"type": "string", "description": "One symbol kind (default set: function, method, class, struct, enum, interface, constructor)"},
+        "prefix": {"type": "string", "description": "Filter: definition file path starts with this prefix"},
+        "path": {"type": "string", "description": "Filter: definition file path ends with this suffix"},
+        "exported": {"type": "boolean", "description": "Only exported definitions"},
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+      }),
       &[],
     ),
     tool("node", "Nodes matching an exact symbol name.", name_only.clone(), &["name"]),

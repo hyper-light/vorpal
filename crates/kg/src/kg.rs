@@ -255,6 +255,26 @@ impl Kg {
     self.graph.in_degree(id.raw() as u32)
   }
 
+  /// The incoming edges' packed type tags for one node, zero-copy (confidence in the high
+  /// byte — compare through [`EdgeType::base`]). The allocation-free spine of whole-graph
+  /// liveness scans.
+  pub fn in_edge_types_of(&self, id: NodeId) -> &[u16] {
+    self.graph.in_edge_types(id.raw() as u32)
+  }
+
+  /// Visit the referenced-name hash of every retained evidence occurrence (all outcomes).
+  /// Returns `false` when the generation carries no sidecar — callers must then treat
+  /// name-based suppression as unavailable, not as "nothing was referenced".
+  pub fn for_each_evidence_name_hash(&self, f: impl FnMut(u32)) -> bool {
+    match &self.evidence {
+      Some(store) => {
+        store.for_each_name_hash(f);
+        true
+      }
+      None => false,
+    }
+  }
+
   /// Outgoing-edge count for one node — two mapped offset reads, no allocation.
   pub fn out_degree(&self, id: NodeId) -> usize {
     self.graph.out_degree(id.raw() as u32)

@@ -235,6 +235,18 @@ impl EvidenceStore {
     })
   }
 
+  /// Visit every retained occurrence's referenced-name hash (all outcomes — edges, external,
+  /// masked), decoding nothing else: one strided u32 read per row. This is the population
+  /// for "was this name referenced anywhere?" suppression (dead-code precision), where
+  /// materializing full rows would cost hundreds of MB at kernel scale.
+  pub fn for_each_name_hash(&self, mut f: impl FnMut(u32)) {
+    let bytes = self.store.as_bytes();
+    for i in 0..self.count {
+      let at = HEADER + i * ROW + 8;
+      f(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()));
+    }
+  }
+
   fn row(&self, i: usize) -> EvidenceRow {
     let at = HEADER + i * ROW;
     let b = &self.store.as_bytes()[at..at + ROW];

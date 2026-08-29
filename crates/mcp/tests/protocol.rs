@@ -88,6 +88,7 @@ fn initialize_handshake_and_tool_listing() {
       "index",
       "health",
       "schema",
+      "dead_code",
       "node",
       "callers",
       "references",

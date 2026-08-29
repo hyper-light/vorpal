@@ -37,6 +37,7 @@ const USAGE: &str = "usage:
                                                     build + persist a knowledge graph
   vorpal-index health       <index-dir>             per-file parse damage: byte ratios, error spans, affected entities
   vorpal-index schema       <index-dir>             kinds, relations, grades, tier state — with counts
+  vorpal-index dead         <index-dir> [kind]      definitions with no semantic in-edges (suppression-honest)
   vorpal-index callers      <index-dir> <name>      direct callers of a symbol
   vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
   vorpal-index importers    <index-dir> <name>      files importing a symbol
@@ -186,6 +187,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
       };
       print!("{rendered}");
+      Ok(())
+    }
+    ["dead", index, rest @ ..] => {
+      let kind = match rest {
+        [] => None,
+        [kind] => Some((*kind).to_string()),
+        _ => {
+          eprintln!("{USAGE}");
+          return Err("invalid arguments".into());
+        }
+      };
+      let dir = vorpal_kg::resolve_index_dir(Path::new(index));
+      let kg = vorpal_kg::Kg::load(&dir)?;
+      let filter = vorpal_index::records::DeadFilter {
+        kind,
+        ..Default::default()
+      };
+      let report = vorpal_index::records::dead_records(&kg, Some(&dir), &filter)?;
+      print!("{}", vorpal_index::records::render_dead(&report));
       Ok(())
     }
     ["snippet", index, name, rest @ ..] => {

@@ -1685,3 +1685,64 @@ fn parse_health_policies_and_report() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn dead_scan_finds_uncalled_definitions_and_suppresses_referenced_names() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-dead-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  // `target` is called; `orphan` is not; `taken` is only named in a reference resolution
+  // can't pin (namesake ambiguity across files) — it must be suppressed, not declared dead.
+  fs::write(src.join("b.rs"), "pub fn target() -> i32 {\n    0\n}\npub fn orphan() -> i32 {\n    1\n}\npub fn taken() -> i32 {\n    2\n}\n").unwrap();
+  fs::write(src.join("c.rs"), "pub fn taken() -> i32 {\n    3\n}\n").unwrap();
+  fs::write(
+    src.join("a.rs"),
+    "pub fn caller() -> i32 {\n    target() + taken()\n}\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  let kg = Kg::load(&out).unwrap();
+  let report = vorpal_index::records::dead_records(
+    &kg,
+    Some(&live(&out)),
+    &vorpal_index::records::DeadFilter::default(),
+  )
+  .unwrap();
+  let names: Vec<&str> = report.records.iter().map(|r| r.node.name.as_str()).collect();
+  assert!(names.contains(&"orphan"), "uncalled fn is a candidate: {names:?}");
+  assert!(!names.contains(&"target"), "called fn is not dead: {names:?}");
+  assert!(report.name_suppression, "evidence sidecar present");
+  // `caller` itself is uncalled → also a legitimate candidate.
+  assert!(names.contains(&"caller"), "{names:?}");
+  // Whatever resolution did with the ambiguous `taken` pair, no `taken` definition may be
+  // reported dead: either it received the edge, or its name is in evidence (suppressed).
+  assert!(!names.contains(&"taken"), "referenced name never reported dead: {names:?}");
+
+  // Kind filter narrows; unknown kind errors loudly.
+  let only_fn = vorpal_index::records::dead_records(
+    &kg,
+    Some(&live(&out)),
+    &vorpal_index::records::DeadFilter {
+      kind: Some("function".into()),
+      ..Default::default()
+    },
+  )
+  .unwrap();
+  assert!(only_fn.records.iter().all(|r| r.node.kind == "Function"));
+  assert!(
+    vorpal_index::records::dead_records(
+      &kg,
+      None,
+      &vorpal_index::records::DeadFilter {
+        kind: Some("gizmo".into()),
+        ..Default::default()
+      }
+    )
+    .is_err()
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}

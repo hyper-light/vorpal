@@ -200,6 +200,8 @@ mod test_cli {
       "graph snippet resolve_target --context 3",
       "graph schema",
       "graph schema --format json --index /tmp/idx",
+      "graph dead",
+      "graph dead --kind function --prefix crates/ --exported --format json --limit 20",
       "graph snippet Kg --all --format json --max-bytes 4096",
       "search import-path-resolution -k 5",
       "search embed --format json --kind function --lang rust --exported --prefix crates/",

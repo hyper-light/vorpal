@@ -220,6 +220,202 @@ pub fn render_snippets(records: &[SnippetRecord]) -> String {
   out
 }
 
+/// One dead-code candidate: a definition with **no semantic in-edges anywhere in the graph**
+/// (no calls/references/imports/implements/of_type/overrides — containment edges don't count
+/// as liveness), surviving the referenced-name and parse-damage suppressions.
+#[derive(Serialize, Debug)]
+pub struct DeadRecord {
+  #[serde(flatten)]
+  pub node: NodeRecord,
+  /// Total in-edges including structural containment (context: 1 = just its `defines`).
+  pub in_degree: u64,
+}
+
+/// The dead-code scan's answer: candidates plus the honesty envelope — how many were
+/// suppressed and why, and whether name suppression was even available.
+#[derive(Serialize, Debug)]
+pub struct DeadReport {
+  pub records: Vec<DeadRecord>,
+  /// Candidates whose NAME appears in evidence (some occurrence referenced it — resolved,
+  /// external, masked, or a namesake tie): extraction saw a use that resolution could not
+  /// pin to this node, so calling it dead would be a guess. Function-pointer tables and
+  /// dynamic dispatch land here.
+  pub suppressed_referenced: u64,
+  /// Candidates in files whose parse damage exceeds the ratio threshold: their edges may be
+  /// missing because the parse is, not because the code is dead.
+  pub suppressed_damaged: u64,
+  /// Whether the evidence sidecar existed; without it, `suppressed_referenced` is 0 because
+  /// suppression was UNAVAILABLE, not because nothing was referenced.
+  pub name_suppression: bool,
+}
+
+/// Filters for the dead-code scan.
+#[derive(Default, Clone, Debug)]
+pub struct DeadFilter {
+  /// One symbol kind; absent = the default definition set (Function, Method, Class, Struct,
+  /// Enum, Interface, Constructor).
+  pub kind: Option<String>,
+  pub path_prefix: Option<String>,
+  pub path_suffix: Option<String>,
+  pub exported_only: bool,
+}
+
+/// Parse-damage suppression threshold: candidates in files with more than this fraction of
+/// bytes inside ERROR nodes are reported as suppressed, not dead.
+const DEAD_DAMAGE_RATIO: f64 = 0.10;
+
+/// Whole-graph dead-definition scan. Deterministic: candidates in ascending node id.
+pub fn dead_records(
+  kg: &Kg,
+  artifacts_dir: Option<&std::path::Path>,
+  filter: &DeadFilter,
+) -> Result<DeadReport, String> {
+  use rayon::prelude::*;
+
+  let mut allowed = [false; 256];
+  match filter.kind.as_deref() {
+    Some(text) => {
+      let kind =
+        vorpal_kg::SymbolKind::parse(text).ok_or_else(|| format!("unknown symbol kind '{text}'"))?;
+      allowed[kind.tag() as usize] = true;
+    }
+    None => {
+      use vorpal_kg::SymbolKind as K;
+      for kind in [K::Function, K::Method, K::Class, K::Struct, K::Enum, K::Interface, K::Constructor]
+      {
+        allowed[kind.tag() as usize] = true;
+      }
+    }
+  }
+
+  // Semantic (liveness) relations, as base tags; defines/has_method/has_field are containment.
+  let semantic = {
+    let mut mask = [false; 256];
+    for edge in [
+      vorpal_kg::EdgeType::CALLS,
+      vorpal_kg::EdgeType::REFERENCES,
+      vorpal_kg::EdgeType::IMPORTS,
+      vorpal_kg::EdgeType::IMPLEMENTS,
+      vorpal_kg::EdgeType::OF_TYPE,
+      vorpal_kg::EdgeType::OVERRIDES,
+    ] {
+      mask[edge.0 as usize & 0xff] = true;
+    }
+    mask
+  };
+
+  // Pass 1 (parallel, allocation-free per node): kind gate, then the in-edge type scan.
+  // Node views (heap string reads) are only built for survivors, in pass 2.
+  let node_count = kg.node_count() as u64;
+  let candidates: Vec<u64> = (0..node_count)
+    .into_par_iter()
+    .filter(|&row| {
+      let id = NodeId::new(row);
+      let Some(view) = kg.node(id) else { return false };
+      if !allowed[view.kind.tag() as usize] {
+        return false;
+      }
+      if filter.exported_only && !view.exported {
+        return false;
+      }
+      if let Some(prefix) = filter.path_prefix.as_deref() {
+        if !view.path.starts_with(prefix) {
+          return false;
+        }
+      }
+      if let Some(suffix) = filter.path_suffix.as_deref() {
+        if !view.path.ends_with(suffix) {
+          return false;
+        }
+      }
+      !kg
+        .in_edge_types_of(id)
+        .iter()
+        .any(|&packed| semantic[vorpal_kg::EdgeType(packed).base().0 as usize & 0xff])
+    })
+    .collect();
+
+  // Pass 2: referenced-name suppression — any evidence occurrence carrying this name's hash
+  // (any outcome) means extraction saw a use; absence of an edge is then attribution
+  // failure, not death. Conservative by design.
+  let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
+  let name_suppression = kg.for_each_evidence_name_hash(|hash| {
+    referenced.insert(hash);
+  });
+  let mut suppressed_referenced = 0u64;
+  let mut suppressed_damaged = 0u64;
+  let pack = artifacts_dir.and_then(crate::cached_pack);
+  // Per-file damage ratio, computed once per distinct candidate path (candidates are id-
+  // ordered = path-grouped).
+  let mut damage_cache: Option<(String, bool)> = None;
+  let mut records = Vec::new();
+  for row in candidates {
+    let id = NodeId::new(row);
+    let Some(node) = node_record(kg, id) else { continue };
+    if name_suppression {
+      let hash = xxhash_rust::xxh3::xxh3_64(node.name.as_bytes()) as u32;
+      if referenced.contains(&hash) {
+        suppressed_referenced += 1;
+        continue;
+      }
+    }
+    if let Some(pack) = pack.as_deref() {
+      if damage_cache.as_ref().is_none_or(|(path, _)| path != &node.path) {
+        let damaged = pack.get(&node.path).is_some_and(|bytes| {
+          let error_bytes = vorpal_ingest::peek_product_error_bytes(bytes).unwrap_or(0);
+          let size = vorpal_ingest::peek_product_stamps(bytes).map_or(0, |(size, _)| size);
+          size > 0 && (error_bytes as f64 / size as f64) > DEAD_DAMAGE_RATIO
+        });
+        damage_cache = Some((node.path.clone(), damaged));
+      }
+      if damage_cache.as_ref().is_some_and(|&(_, damaged)| damaged) {
+        suppressed_damaged += 1;
+        continue;
+      }
+    }
+    let in_degree = kg.in_degree(id) as u64;
+    records.push(DeadRecord { node, in_degree });
+  }
+  Ok(DeadReport {
+    records,
+    suppressed_referenced,
+    suppressed_damaged,
+    name_suppression,
+  })
+}
+
+/// Rendered dead-code report: the honesty head, then one line per candidate — capped, so a
+/// whole-tree scan stays readable (and token-sane in a tool result); the full set pages
+/// through the records surface.
+pub fn render_dead(report: &DeadReport) -> String {
+  use std::fmt::Write;
+  const TEXT_CAP: usize = 200;
+  let mut out = String::new();
+  let _ = writeln!(
+    out,
+    "{} dead candidates ({} suppressed: name referenced somewhere; {} suppressed: file parse-damaged{})",
+    report.records.len(),
+    report.suppressed_referenced,
+    report.suppressed_damaged,
+    if report.name_suppression { "" } else { "; no evidence sidecar — name suppression unavailable" },
+  );
+  for record in report.records.iter().take(TEXT_CAP) {
+    let _ = writeln!(
+      out,
+      "{} [{}] {}  (in-degree {})",
+      record.node.name, record.node.kind, record.node.path, record.in_degree
+    );
+  }
+  if report.records.len() > TEXT_CAP {
+    let _ = writeln!(
+      out,
+      "… {} more — refine (--kind/--prefix/--path/--exported) or page the records surface",
+      report.records.len() - TEXT_CAP
+    );
+  }
+  out
+}
+
 /// What this generation's graph contains, by vocabulary: the introspection surface that
 /// teaches a caller (agent or human) what is queryable before it guesses — kinds, relations,
 /// grades, and tier state, with counts.

@@ -79,6 +79,8 @@ enum GraphVerb {
   Snippet,
   /// What this index contains: kinds, relations, grades, and tier state, with counts.
   Schema,
+  /// Definitions with no semantic in-edges anywhere (suppression-honest dead-code leads).
+  Dead,
 }
 
 impl GraphVerb {
@@ -93,6 +95,7 @@ impl GraphVerb {
       GraphVerb::Reachable => "reachable",
       GraphVerb::Snippet => "snippet",
       GraphVerb::Schema => "schema",
+      GraphVerb::Dead => "dead",
     }
   }
 }
@@ -135,6 +138,12 @@ pub struct GraphArg {
   /// (exact | constrained | heuristic). Absent = structural edges included.
   #[clap(long, value_name = "GRADE")]
   min_grade: Option<String>,
+  /// (dead) Refine to definitions whose file path starts with this prefix.
+  #[clap(long, value_name = "PREFIX")]
+  prefix: Option<String>,
+  /// (dead) Only exported definitions.
+  #[clap(long)]
+  exported: bool,
   /// (snippet) Whole context lines to include around the definition span.
   #[clap(long, value_name = "N", default_value_t = 0)]
   context: usize,
@@ -253,6 +262,39 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Dead) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let filter = vorpal_index::records::DeadFilter {
+      kind: arg.kind,
+      path_prefix: arg.prefix,
+      path_suffix: arg.path,
+      exported_only: arg.exported,
+    };
+    let report = vorpal_index::records::dead_records(&kg, Some(&gen_dir), &filter)
+      .map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => print!("{}", vorpal_index::records::render_dead(&report)),
+      OutputFormat::Json => {
+        // Page the candidate records; carry the suppression head alongside.
+        let mut value = vorpal_index::records::paged_value(
+          &report.records,
+          arg.page.cursor.as_deref(),
+          arg.page.limit,
+          "hits",
+        )
+        .map_err(anyhow::Error::msg)?;
+        value["suppressedReferenced"] = report.suppressed_referenced.into();
+        value["suppressedDamaged"] = report.suppressed_damaged.into();
+        value["nameSuppression"] = report.name_suppression.into();
+        println!("{}", serde_json::to_string_pretty(&value)?);
+      }
     }
     return Ok(ExitCode::SUCCESS);
   }
