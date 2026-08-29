@@ -188,6 +188,7 @@ impl Server {
           data.get("records").and_then(Value::as_array),
         ) {
           (Some("toon"), Some(rows)) => vorpal_index::records::toon_from_values(rows),
+          (Some("lean"), Some(rows)) => vorpal_index::records::lean_from_values(rows),
           (Some("ids"), Some(rows)) => vorpal_index::records::ids_from_values(rows),
           _ => text,
         };

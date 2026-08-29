@@ -218,6 +218,7 @@ mod test_cli {
       "graph architecture",
       "graph architecture --top 10 --format json",
       "graph callers seal --format toon",
+      "graph callers seal --format lean",
       "graph node Kg --format ids --limit 500",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));

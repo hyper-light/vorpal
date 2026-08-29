@@ -29,6 +29,12 @@ pub struct NodeRecord {
   pub signature: String,
   /// Conservative path classification: source | test | vendored | generated.
   pub class: String,
+  /// Total in/out edges (containment included) — populated on identity listings (`node`),
+  /// where degree is the question; absent elsewhere to keep pages lean.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub in_degree: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub out_degree: Option<u64>,
 }
 
 /// A node related to the query target through one edge, with the edge's resolution grade
@@ -791,6 +797,8 @@ pub fn node_record(kg: &Kg, id: NodeId) -> Option<NodeRecord> {
     span: [view.span.0, view.span.1],
     signature: view.signature.to_string(),
     class: crate::path_class(view.path).label().to_string(),
+    in_degree: None,
+    out_degree: None,
   })
 }
 
@@ -798,7 +806,17 @@ pub fn node_record(kg: &Kg, id: NodeId) -> Option<NodeRecord> {
 /// never treats multiple matches as ambiguity: the matches ARE the answer.
 pub fn listing_records(kg: &Kg, target: &GraphTarget) -> Result<Vec<NodeRecord>, String> {
   let matches = resolve_target(kg, target).map_err(|err| err.to_string())?;
-  Ok(matches.iter().filter_map(|&id| node_record(kg, id)).collect())
+  Ok(
+    matches
+      .iter()
+      .filter_map(|&id| {
+        let mut record = node_record(kg, id)?;
+        record.in_degree = Some(kg.in_degree(id) as u64);
+        record.out_degree = Some(kg.out_degree(id) as u64);
+        Some(record)
+      })
+      .collect(),
+  )
 }
 
 /// The typed twin of the edge verbs (`callers`/`references`/`importers`/`implementors`/
@@ -978,17 +996,22 @@ pub fn toon_from_values(rows: &[serde_json::Value]) -> String {
     }
   }
   let cell = |row: &serde_json::Value, column: &str| -> String {
+    // LEAN-style cell economies (adopted after measuring): T/F/_ beat true/false/null in
+    // every tokenizer, and they cost nothing to keep lossless (booleans and nulls are
+    // typed in the records, never strings).
     let value = match row.get(column) {
-      None | Some(serde_json::Value::Null) => return "-".to_string(),
+      None | Some(serde_json::Value::Null) => return "_".to_string(),
       Some(value) => value,
     };
     let text = match value {
+      serde_json::Value::Bool(true) => return "T".to_string(),
+      serde_json::Value::Bool(false) => return "F".to_string(),
       serde_json::Value::String(text) => text.clone(),
       other => other.to_string(),
     };
     let mut text = text.replace('\t', "\\t").replace('\n', "\\n");
     if text.is_empty() {
-      text.push('-');
+      text.push('_');
     }
     text
   };
@@ -1013,6 +1036,79 @@ pub fn toon_from_values(rows: &[serde_json::Value]) -> String {
       } else {
         out.push_str(&cell(row, column));
       }
+    }
+    out.push('\n');
+  }
+  out
+}
+
+/// LEAN (LLM-Efficient Adaptive Notation) rendering of one record page — the tabular-array
+/// profile of the published spec: `records[N]:` header declaring count + tab-separated
+/// columns once, two-space-indented tab-delimited rows, `T`/`F`/`_` for booleans and null,
+/// bare strings quoted only when they would parse as something else or carry specials
+/// (RFC-4180 quote doubling; `\n`/`\\` escapes). Benchmarked leaner than TOON-style output
+/// at equal retrieval accuracy; both formats are offered — measure on your own pages.
+pub fn lean_from_values(rows: &[serde_json::Value]) -> String {
+  use std::fmt::Write;
+  if rows.is_empty() {
+    return "records[0]:\n".to_string();
+  }
+  const PRIORITY: [&str; 6] = ["change", "name", "kind", "path", "depth", "grade"];
+  let mut columns: Vec<String> = Vec::new();
+  for lead in PRIORITY {
+    if rows.iter().any(|row| row.get(lead).is_some()) {
+      columns.push(lead.to_string());
+    }
+  }
+  for row in rows {
+    if let Some(map) = row.as_object() {
+      for key in map.keys() {
+        if !columns.iter().any(|c| c == key) {
+          columns.push(key.clone());
+        }
+      }
+    }
+  }
+  fn lean_cell(value: Option<&serde_json::Value>) -> String {
+    let value = match value {
+      None | Some(serde_json::Value::Null) => return "_".to_string(),
+      Some(value) => value,
+    };
+    match value {
+      serde_json::Value::Bool(true) => "T".to_string(),
+      serde_json::Value::Bool(false) => "F".to_string(),
+      serde_json::Value::Number(number) => number.to_string(),
+      serde_json::Value::String(text) => lean_string(text),
+      other => lean_string(&other.to_string()),
+    }
+  }
+  fn lean_string(text: &str) -> String {
+    let looks_reserved = matches!(text, "T" | "F" | "_");
+    let looks_numeric = !text.is_empty() && text.parse::<f64>().is_ok();
+    let has_specials = text.contains(['\t', '\n', '\\', '"']);
+    let edge_space = text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace);
+    if text.is_empty() || looks_reserved || looks_numeric || has_specials || edge_space {
+      let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\"\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+      format!("\"{escaped}\"")
+    } else {
+      text.to_string()
+    }
+  }
+  let mut out = String::new();
+  let _ = writeln!(out, "records[{}]:{}", rows.len(), columns.join("\t"));
+  for row in rows {
+    out.push_str("  ");
+    let mut first = true;
+    for column in &columns {
+      if !first {
+        out.push('\t');
+      }
+      first = false;
+      out.push_str(&lean_cell(row.get(column.as_str())));
     }
     out.push('\n');
   }
@@ -1472,6 +1568,21 @@ mod paging_tests {
   use super::*;
 
   #[test]
+  fn lean_tabular_profile_matches_the_spec() {
+    let rows = vec![
+      serde_json::json!({"name": "alpha", "kind": "Function", "path": "src/x.rs", "exported": true, "grade": null}),
+      serde_json::json!({"name": "42", "kind": "T", "path": "src/y.rs", "exported": false, "grade": "exact"}),
+    ];
+    let lean = lean_from_values(&rows);
+    let lines: Vec<&str> = lean.lines().collect();
+    assert_eq!(lines[0], "records[2]:name\tkind\tpath\tgrade\texported");
+    assert_eq!(lines[1], "  alpha\tFunction\tsrc/x.rs\t_\tT");
+    // Numeric-looking and keyword-colliding strings quote; booleans abbreviate.
+    assert_eq!(lines[2], "  \"42\"\t\"T\"\tsrc/y.rs\texact\tF");
+    assert_eq!(lean_from_values(&[]), "records[0]:\n");
+  }
+
+  #[test]
   fn toon_declares_columns_groups_dirs_and_escapes() {
     let rows = vec![
       serde_json::json!({"name": "alpha", "kind": "Function", "path": "src/a/x.rs", "grade": "exact"}),
@@ -1485,7 +1596,7 @@ mod paging_tests {
     assert_eq!(lines[2], "alpha\tFunction\tx.rs\texact");
     assert!(lines[3].starts_with("beta\\ttabbed\t"), "tab escaped: {:?}", lines[3]);
     assert_eq!(lines[4], "src/b/");
-    assert!(lines[5].ends_with("\t-"), "null renders as -: {:?}", lines[5]);
+    assert!(lines[5].ends_with("\t_"), "null renders as _: {:?}", lines[5]);
     assert_eq!(toon_from_values(&[]), "(no records)\n");
 
     let ids = ids_from_values(&[

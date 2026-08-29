@@ -22,6 +22,8 @@ enum OutputFormat {
   Json,
   /// Token-oriented columnar text: columns declared once, directories grouped.
   Toon,
+  /// LEAN (LLM-Efficient Adaptive Notation) tabular profile: leanest measured page format.
+  Lean,
   /// One durable id per line (eid, falling back to the dense id).
   Ids,
 }
@@ -57,6 +59,7 @@ fn emit_machine(format: OutputFormat, value: &serde_json::Value) -> Result<Strin
   Ok(match format {
     OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(value)?),
     OutputFormat::Toon => vorpal_index::records::toon_from_values(rows),
+    OutputFormat::Lean => vorpal_index::records::lean_from_values(rows),
     OutputFormat::Ids => vorpal_index::records::ids_from_values(rows),
     OutputFormat::Text => unreachable_text()?,
   })
@@ -326,7 +329,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-      OutputFormat::Toon | OutputFormat::Ids => {
+      OutputFormat::Toon | OutputFormat::Lean | OutputFormat::Ids => {
         anyhow::bail!("schema is a single report — use --format text or json")
       }
     }
@@ -341,7 +344,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_architecture(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-      OutputFormat::Toon | OutputFormat::Ids => {
+      OutputFormat::Toon | OutputFormat::Lean | OutputFormat::Ids => {
         anyhow::bail!("architecture is a single report — use --format text or json")
       }
     }
