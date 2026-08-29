@@ -18,9 +18,11 @@ mod pack;
 mod pipeline;
 mod product;
 mod references;
+mod selfcheck;
 
 pub use manifest::{FileStat, Manifest};
 pub use outline_extractor::OutlineExtractor;
+pub use selfcheck::{verify_default_extraction, verify_extraction};
 pub use pack::{PackMsg, PackReader, PackWriter};
 pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,

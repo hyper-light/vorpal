@@ -313,6 +313,12 @@ pub fn build_index_full(
     }
   }
 
+  // Past the fast path, this run will stage a new generation and write bank products —
+  // prove the binary can extract before letting it (crates/ingest selfcheck: a stale or
+  // internally inconsistent build otherwise seals a silently gutted graph with exit 0).
+  // Once per process; the unchanged-tree fast path above returns before this line.
+  vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
+
   // Incremental path, streamed (§7.5): replay cached products for stat-unchanged files,
   // re-parse the rest — admission is byte-budget-gated, extraction fans out over scoped
   // workers with per-worker scratch, and products flow straight into the sharded single-writer
@@ -1058,6 +1064,9 @@ pub fn warm_product_cache(file: &Path) -> io::Result<bool> {
     return Ok(false);
   };
   let extractor = OutlineExtractor::new().map_err(io::Error::other)?;
+  // Bank products written by a broken binary replay into healthy runs (same digests, same
+  // source) — the self-check keeps a bad build from feeding the bank at all.
+  vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
   let Some(mut product) = extractor.extract_product(&keyed, &source) else {
     return Ok(false);
   };
