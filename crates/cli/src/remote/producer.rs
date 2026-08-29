@@ -983,3 +983,59 @@ impl StreamInput {
     Self { input }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The `--loader` path (docs/REMOTE.md §2, §6): `agent_launch_for` must push the loader, build a
+  /// `loader --pubkey <hex> -- vorpal-agent __agent` launch, and produce a signed preamble that the
+  /// **loader's own verifier** accepts against the embedded public key — recovering the agent bytes
+  /// exactly. This nails the coordinator↔loader contract end to end (the loader's exec side is
+  /// covered by `vorpal-loader`'s own tests).
+  #[tokio::test]
+  async fn loader_launch_plan_signs_an_agent_the_loader_accepts() {
+    use vorpal_transport::{LandingSpot, SubprocessTransport};
+
+    let dir = tempfile::tempdir().unwrap();
+    let landing = LandingSpot::Tmp(dir.path().to_str().unwrap().to_string());
+
+    // Stand-in loader + agent binaries — opaque bytes; the plan only reads, pushes, and signs them.
+    let loader_path = dir.path().join("vorpal-loader");
+    std::fs::write(&loader_path, b"#!/bin/sh\nexit 0\n").unwrap();
+    let agent_path = dir.path().join("vorpal-agent-bin");
+    let agent_bytes = b"\x7fELF-pretend-agent-binary-bytes-\x00\x01\x02".to_vec();
+    std::fs::write(&agent_path, &agent_bytes).unwrap();
+
+    // A subprocess transport performs the "push" into the landing dir locally.
+    let transport = SubprocessTransport::new("sh", vec![]);
+    let ssh = SshDialOpts {
+      push_agent: Some(agent_path.clone()),
+      loader: Some(loader_path.clone()),
+      ..Default::default()
+    };
+    let target = Target::Ssh(crate::remote::SshUri { user: None, host: "node".into(), port: 22 });
+
+    let plan = agent_launch_for(&target, &transport, 0, &None, &ssh, Some(&landing))
+      .await
+      .expect("loader launch plan");
+
+    assert!(plan.provisioned.is_some(), "the pushed loader is provisioned for cleanup");
+    let preamble = plan.preamble.expect("a signed agent preamble is produced");
+
+    // The launch runs `<pushed-loader> --pubkey <hex> -- vorpal-agent __agent`.
+    let line = plan.launch.to_shell_line();
+    assert!(line.contains("--pubkey"), "launch passes --pubkey: {line}");
+    assert!(line.contains("vorpal-agent"), "launch names the agent argv0: {line}");
+    assert!(line.trim_end_matches('\'').ends_with("__agent"), "agent enters __agent mode: {line}");
+
+    // Extract the embedded public key and confirm the loader would verify + recover the agent bytes.
+    let tokens: Vec<String> =
+      line.replace('\'', "").split_whitespace().map(str::to_owned).collect();
+    let i = tokens.iter().position(|t| t == "--pubkey").expect("--pubkey present");
+    let key = vorpal_loader::verifying_key_from_hex(&tokens[i + 1]).expect("valid pubkey hex");
+    let recovered = vorpal_loader::verify_and_extract(&mut &preamble[..], &key, 64 << 20)
+      .expect("the loader verifies the coordinator's signed stream");
+    assert_eq!(recovered, agent_bytes, "the loader recovers exactly the agent bytes");
+  }
+}
