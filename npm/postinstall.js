@@ -9,7 +9,7 @@ function detectPackageName() {
   switch (platform) {
     case "darwin":
       if (arch === "arm64") return "@hyper-light/vorpal-cli-darwin-arm64";
-      if (arch === "x64") return "@hyper-light/vorpal-cli-darwin-x64";
+      // Intel macOS (x64) is not published; build from source (cargo build --release -p vorpal).
       break;
     case "linux": {
       const { MUSL, familySync } = require("detect-libc");
