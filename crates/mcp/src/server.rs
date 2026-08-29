@@ -229,23 +229,10 @@ impl Server {
         Ok((text, json!({})))
       }
       "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
-        let name = str_arg("name")?;
         // Symbol identity contract (IMPROVEMENTS §1): ambiguous names return the candidate
         // list (with node ids) instead of silently merging namesake neighborhoods; refine
         // with `path`/`kind`/`id`, or pass `all: true` to merge explicitly.
-        let target = vorpal_index::GraphTarget {
-          name,
-          id: args.get("id").and_then(Value::as_u64),
-          // The durable-bookmark facet; `name: "eid:<hex>"` works too (shared wire form).
-          external_id: args
-            .get("eid")
-            .and_then(Value::as_str)
-            .and_then(|hex| u128::from_str_radix(hex, 16).ok()),
-          path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
-          kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
-          merge_all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
-          show_ids: true,
-        };
+        let target = graph_target(args, str_arg("name")?);
         let verb = match tool {
           "type_users" => "typeusers",
           "references" => "refs",
@@ -394,6 +381,49 @@ impl Server {
             crate::tools::FetchSpanError::Other(message) => ToolError::from(message),
           })
       }
+      "snippet" => {
+        // The selector-driven sibling of `fetch_span`: name/path/kind/id/eid resolution with
+        // the shared ambiguity contract, whole-line context, and the same digest refusal.
+        let target = graph_target(args, str_arg("name")?);
+        let context_lines =
+          args.get("context_lines").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let max_bytes = args
+          .get("max_bytes")
+          .and_then(Value::as_u64)
+          .unwrap_or(16_384)
+          .clamp(64, 262_144) as usize;
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let kg = self.kg.as_ref().expect("pinned above");
+        let selected = vorpal_index::records::snippet_records(
+          kg,
+          dir.as_deref(),
+          &target,
+          context_lines,
+          max_bytes,
+        )
+        .map_err(|err| match err {
+          vorpal_index::records::SnippetError::Stale(message) => {
+            ToolError::coded("stale-source", message)
+          }
+          vorpal_index::records::SnippetError::Other(message) => ToolError::from(message),
+        })?;
+        let text = match &selected {
+          vorpal_index::records::Selected::NoMatch => {
+            format!("(no results for '{}' — no symbol matches that selector)\n", target.name)
+          }
+          vorpal_index::records::Selected::Ambiguous(candidates) => format!(
+            "ambiguous: '{}' matches {} definitions — refine with path/kind/id, or all: true\n",
+            target.name,
+            candidates.len()
+          ),
+          vorpal_index::records::Selected::Hits(hits) => {
+            vorpal_index::records::render_snippets(hits)
+          }
+        };
+        let data = selected_data(selected, args)?;
+        Ok((text, data))
+      }
       "why" => {
         let from_id = args
           .get("from_id")
@@ -434,18 +464,7 @@ impl Server {
         };
         // Selector-consistent (07-29 §6): same refinement contract as the direct graph tools —
         // ambiguous names return candidates; id/eid/path/kind refine; `all` merges explicitly.
-        let target = vorpal_index::GraphTarget {
-          name,
-          id: args.get("id").and_then(Value::as_u64),
-          external_id: args
-            .get("eid")
-            .and_then(Value::as_str)
-            .and_then(|hex| u128::from_str_radix(hex, 16).ok()),
-          path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
-          kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
-          merge_all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
-          show_ids: true,
-        };
+        let target = graph_target(args, name);
         let relations: Vec<vorpal_kg::EdgeType> = match args.get("relations") {
           Some(Value::Array(items)) => {
             let mut out = Vec::new();
@@ -643,6 +662,27 @@ fn tools_list() -> Value {
       &["id"],
     ),
     tool(
+      "snippet",
+      "The defining source of a symbol by NAME (or id/eid): the selector-driven sibling of \
+       fetch_span — same digest verification, plus whole-line context expansion. Ambiguous \
+       names return the candidate list to refine (path/kind/id), never a guessed snippet. \
+       Absence of a match is not proof the symbol doesn't exist: check `coverage` for parse \
+       damage in its file.",
+      json!({
+        "name": {"type": "string", "description": "Exact symbol name (or eid:<hex>)"},
+        "path": {"type": "string", "description": "Refine: definition file path ends with this suffix"},
+        "kind": {"type": "string", "description": "Refine: symbol kind (function, method, struct, …)"},
+        "id": {"type": "integer", "description": "Refine: exactly this node id"},
+        "eid": {"type": "string", "description": "Refine: durable external id (32 hex chars)"},
+        "all": {"type": "boolean", "description": "Return a snippet for every same-named match instead of an ambiguity listing"},
+        "context_lines": {"type": "integer", "description": "Whole context lines around the span (default 0)"},
+        "max_bytes": {"type": "integer", "description": "Byte cap per snippet body (default 16384, clamp 64..262144)"},
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+      }),
+      &["name"],
+    ),
+    tool(
       "why",
       "Evidence for the edge(s) from one node to another: each retained occurrence's edge \
        type, resolution grade, resolver reason, candidate count, and source span — why does \
@@ -737,6 +777,24 @@ impl From<String> for ToolError {
       code: "tool-error",
       message,
     }
+  }
+}
+
+/// The shared selector construction every symbol-addressed tool uses: `name` (or
+/// `eid:<hex>` in name position), plus optional `id`/`eid`/`path`/`kind`/`all` facets.
+fn graph_target(args: &Value, name: String) -> vorpal_index::GraphTarget {
+  vorpal_index::GraphTarget {
+    name,
+    id: args.get("id").and_then(Value::as_u64),
+    // The durable-bookmark facet; `name: "eid:<hex>"` works too (shared wire form).
+    external_id: args
+      .get("eid")
+      .and_then(Value::as_str)
+      .and_then(|hex| u128::from_str_radix(hex, 16).ok()),
+    path_suffix: args.get("path").and_then(Value::as_str).map(str::to_string),
+    kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
+    merge_all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
+    show_ids: true,
   }
 }
 

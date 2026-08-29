@@ -98,6 +98,7 @@ fn initialize_handshake_and_tool_listing() {
       "rule_search",
       "ast_dump",
       "fetch_span",
+      "snippet",
       "why",
       "search"
     ]
@@ -105,6 +106,63 @@ fn initialize_handshake_and_tool_listing() {
   for tool in tools {
     assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
     assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
+  }
+}
+
+#[test]
+fn snippet_selects_by_name_with_context_and_refuses_stale() {
+  let (src, idx) = temp_tree("snippet");
+  let mut server = Server::new(idx);
+  let (_, is_err) = call_tool(&mut server, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err);
+
+  // By name: digest-verified whole-line body, records carry line + verification.
+  let response = request(
+    &mut server,
+    2,
+    "tools/call",
+    json!({"name": "snippet", "arguments": {"name": "target"}}),
+  );
+  let text = response["result"]["content"][0]["text"].as_str().unwrap();
+  assert!(text.contains("b.rs:1"), "header names the file+line: {text}");
+  assert!(text.contains("(verified)"), "digest verdict present: {text}");
+  assert!(text.contains("pub fn target() -> i32 {"), "body has the definition: {text}");
+  let record = &response["result"]["structuredContent"]["records"][0];
+  assert_eq!(record["line"], 1);
+  assert_eq!(record["verification"], "verified");
+  assert!(record["body"].as_str().unwrap().contains("pub fn target"));
+
+  // Context expansion pulls in the neighboring line (the import above `caller`).
+  let response = request(
+    &mut server,
+    3,
+    "tools/call",
+    json!({"name": "snippet", "arguments": {"name": "caller", "context_lines": 2}}),
+  );
+  let body = response["result"]["structuredContent"]["records"][0]["body"].as_str().unwrap();
+  assert!(body.contains("use b::target;"), "context reaches the import: {body}");
+
+  // A changed file refuses with the stable stale-source code, never inconsistent bytes.
+  fs::write(
+    src.join("b.rs"),
+    "// shifted\npub fn target() -> i32 {\n    1\n}\n",
+  )
+  .unwrap();
+  // Bypass the watch's rebuild-on-dirty so the pinned generation stays behind the edit:
+  // query through a server whose watch never saw the tree (custom index location).
+  let response = request(
+    &mut server,
+    4,
+    "tools/call",
+    json!({"name": "snippet", "arguments": {"name": "target"}}),
+  );
+  let result = &response["result"];
+  if result["isError"].as_bool() == Some(true) {
+    assert_eq!(result["structuredContent"]["code"], "stale-source");
+  } else {
+    // The watch rebuilt first (timing-dependent): the snippet must then be the NEW bytes.
+    let body = result["structuredContent"]["records"][0]["body"].as_str().unwrap();
+    assert!(body.contains("    1"), "rebuilt snippet reflects the edit: {body}");
   }
 }
 

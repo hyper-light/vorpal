@@ -197,6 +197,8 @@ mod test_cli {
       "graph implementors FileExtractor --index /tmp/idx",
       "graph callers seal --format json --limit 5 --cursor o:100",
       "graph node Kg --format json",
+      "graph snippet resolve_target --context 3",
+      "graph snippet Kg --all --format json --max-bytes 4096",
       "search import-path-resolution -k 5",
       "search embed --format json --kind function --lang rust --exported --prefix crates/",
       "search seal --path lib.rs --format json --limit 3",

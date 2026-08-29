@@ -1817,6 +1817,41 @@ pub fn explain_edge_on(
   Ok(out)
 }
 
+pub use vorpal_kg::resolve_index_dir;
+
+/// Process-wide cache of open [`PackReader`]s, keyed by the **immutable** generation dir —
+/// the read-few query surfaces (`snippet`, `fetch_span`, `why`) verify one or two files per
+/// call, and opening the pack (a full sidecar parse: one entry per indexed file) costs more
+/// than the query itself at kernel scale (~5 ms / 72K entries). Content-addressed generation
+/// dirs make the cache safe by construction, exactly like [`cached_searcher`]. Never used by
+/// the build path, which owns its reader for the whole run.
+pub(crate) fn cached_pack(generation_dir: &Path) -> Option<Arc<PackReader>> {
+  const CAP: usize = 8;
+  type PackCache = Mutex<Vec<(PathBuf, Arc<PackReader>)>>;
+  static CACHE: OnceLock<PackCache> = OnceLock::new();
+  let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+  {
+    let mut guard = cache.lock().unwrap();
+    if let Some(pos) = guard.iter().position(|(dir, _)| dir == generation_dir) {
+      let entry = guard.remove(pos);
+      let pack = entry.1.clone();
+      guard.push(entry); // most-recently-used to the back
+      return Some(pack);
+    }
+  }
+  // Open (mmap + sidecar parse) outside the lock.
+  let pack = Arc::new(PackReader::open(generation_dir)?);
+  let mut guard = cache.lock().unwrap();
+  if let Some(pos) = guard.iter().position(|(dir, _)| dir == generation_dir) {
+    return Some(guard[pos].1.clone());
+  }
+  guard.push((generation_dir.to_path_buf(), pack.clone()));
+  if guard.len() > CAP {
+    guard.remove(0);
+  }
+  Some(pack)
+}
+
 /// A source read checked against the generation that indexed it (IMPROVEMENTS #7): persisted
 /// byte offsets are only meaningful against the bytes they were computed from.
 pub enum IndexedRead {
@@ -1836,10 +1871,17 @@ pub fn read_indexed_source(
   artifacts_dir: Option<&Path>,
   path: &str,
 ) -> Result<IndexedRead, String> {
+  read_indexed_source_with(artifacts_dir.and_then(cached_pack).as_deref(), path)
+}
+
+/// [`read_indexed_source`] against an already-open pack: bulk callers (multi-node snippet
+/// selections) open the pack once instead of re-mapping it per file.
+pub fn read_indexed_source_with(
+  pack: Option<&PackReader>,
+  path: &str,
+) -> Result<IndexedRead, String> {
   let bytes = fs::read(path).map_err(|err| format!("read {path}: {err}"))?;
-  let indexed_digest = artifacts_dir
-    .and_then(PackReader::open)
-    .and_then(|pack| pack.get(path).and_then(vorpal_ingest::peek_product_digest));
+  let indexed_digest = pack.and_then(|pack| pack.get(path).and_then(vorpal_ingest::peek_product_digest));
   Ok(match indexed_digest {
     Some(digest) if xxhash_rust::xxh3::xxh3_64(&bytes) == digest => IndexedRead::Verified(bytes),
     Some(_) => IndexedRead::Changed,
@@ -2035,6 +2077,35 @@ pub fn resolve_target(kg: &Kg, target: &GraphTarget) -> Result<Vec<NodeId>, Box<
     external_id: target.external_id.or(eid_from_name),
   };
   Ok(kg.select(&selector))
+}
+
+/// Rendered selector-driven snippets (the text twin of [`records::snippet_records`]):
+/// `path:line  name [Kind] (verification)` headers over digest-verified span bodies, with
+/// the same no-match/ambiguity wording as every other selector verb.
+pub fn snippet_query_on(
+  kg: &Kg,
+  artifacts_dir: Option<&Path>,
+  target: &GraphTarget,
+  context_lines: usize,
+  max_bytes: usize,
+) -> Result<String, records::SnippetError> {
+  match records::snippet_records(kg, artifacts_dir, target, context_lines, max_bytes)? {
+    records::Selected::NoMatch => Ok(format!(
+      "(no results for '{}' — no symbol matches that selector)\n",
+      target.name
+    )),
+    records::Selected::Ambiguous(candidates) => {
+      let mut out = format!(
+        "ambiguous: '{}' matches {} definitions — refine with --path/--kind/--id, or --all to merge:\n",
+        target.name,
+        candidates.len()
+      );
+      let ids: Vec<NodeId> = candidates.iter().map(|c| NodeId::new(c.id)).collect();
+      out.push_str(&render_candidates(kg, &ids));
+      Ok(out)
+    }
+    records::Selected::Hits(hits) => Ok(records::render_snippets(&hits)),
+  }
 }
 
 pub fn reachable_query_on(

@@ -80,6 +80,146 @@ pub struct ChannelRank {
   pub rank: usize,
 }
 
+/// One definition's source text, sliced from its persisted byte span and digest-verified
+/// against the generation that recorded it — the selector-driven twin of `fetch_span`.
+#[derive(Serialize, Debug)]
+pub struct SnippetRecord {
+  #[serde(flatten)]
+  pub node: NodeRecord,
+  /// 1-based line of the (context-expanded) snippet start in `path`.
+  pub line: usize,
+  /// `verified` (bytes match the indexed digest) or `unverified` (generation carries no
+  /// digest for this file). A changed file is an error, never a mislabeled snippet.
+  pub verification: String,
+  pub body: String,
+  /// Full span length in bytes when `body` was clamped by `max_bytes`.
+  pub truncated_from: Option<u64>,
+}
+
+/// How a snippet query failed: staleness is structurally distinguished so surfaces can keep
+/// their stable error codes (`stale-source` on MCP) without string matching.
+#[derive(Debug)]
+pub enum SnippetError {
+  /// The file changed since the pinned generation indexed it.
+  Stale(String),
+  /// Anything else (selector error, spanless node, unreadable file).
+  Other(String),
+}
+
+/// Selector-driven snippet extraction: resolve `target`, slice each match's span from its
+/// file (expanded by `context_lines` whole lines on each side, clamped to `max_bytes`),
+/// verifying bytes against `artifacts_dir`'s product pack. Ambiguity semantics match every
+/// other selector verb; with `merge_all`, each match yields its own snippet.
+pub fn snippet_records(
+  kg: &Kg,
+  artifacts_dir: Option<&std::path::Path>,
+  target: &GraphTarget,
+  context_lines: usize,
+  max_bytes: usize,
+) -> Result<Selected<SnippetRecord>, SnippetError> {
+  let matches = resolve_target(kg, target).map_err(|err| SnippetError::Other(err.to_string()))?;
+  if matches.is_empty() {
+    return Ok(Selected::NoMatch);
+  }
+  if matches.len() > 1 && !target.merge_all {
+    return Ok(Selected::Ambiguous(
+      matches.iter().filter_map(|&id| node_record(kg, id)).collect(),
+    ));
+  }
+  // One pack handle for the whole selection (process-cached per generation), and one read
+  // per distinct file: `--all` over N same-file overloads costs one read, not N. Matches
+  // arrive in ascending id order (= file-grouped), so a single-entry cache is a full dedup.
+  let pack = artifacts_dir.and_then(crate::cached_pack);
+  let mut cached: Option<(String, Vec<u8>, &'static str)> = None;
+  let mut records = Vec::new();
+  for &id in &matches {
+    let Some(node) = node_record(kg, id) else {
+      continue;
+    };
+    let [start, end] = node.span;
+    if end <= start {
+      return Err(SnippetError::Other(format!(
+        "node {} ({}) carries no source span (File node, or an index built before spans \
+         were persisted — rebuild the index)",
+        node.id, node.name
+      )));
+    }
+    if cached.as_ref().is_none_or(|(path, ..)| path != &node.path) {
+      let read = crate::read_indexed_source_with(pack.as_deref(), &node.path)
+        .map_err(SnippetError::Other)?;
+      let (bytes, verification) = match read {
+        crate::IndexedRead::Verified(bytes) => (bytes, "verified"),
+        crate::IndexedRead::Unverified(bytes) => (bytes, "unverified"),
+        crate::IndexedRead::Changed => {
+          return Err(SnippetError::Stale(format!(
+            "{} changed since this generation indexed it — span offsets are stale; rebuild \
+             the index",
+            node.path
+          )));
+        }
+      };
+      cached = Some((node.path.clone(), bytes, verification));
+    }
+    let (_, bytes, verification) = cached.as_ref().expect("just populated");
+    let end = (end as usize).min(bytes.len());
+    let start = (start as usize).min(end);
+    // Whole-lines contract: the span's own first/last lines complete, then `context_lines`
+    // more on each side. `line_start` maps any offset to the start of its line.
+    let line_start =
+      |at: usize| bytes[..at].iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
+    let mut from = line_start(start);
+    for _ in 0..context_lines {
+      if from == 0 {
+        break;
+      }
+      from = line_start(from - 1); // step onto the previous line's newline, then to its start
+    }
+    let mut to = end;
+    for _ in 0..=context_lines {
+      match bytes[to..].iter().position(|&b| b == b'\n') {
+        Some(nl) => to += nl + 1,
+        None => {
+          to = bytes.len();
+          break;
+        }
+      }
+    }
+    let full = to - from;
+    let clamped_to = to.min(from + max_bytes);
+    let line = bytes[..from].iter().filter(|&&b| b == b'\n').count() + 1;
+    records.push(SnippetRecord {
+      node,
+      line,
+      verification: verification.to_string(),
+      body: String::from_utf8_lossy(&bytes[from..clamped_to]).into_owned(),
+      truncated_from: (clamped_to < to).then_some(full as u64),
+    });
+  }
+  Ok(Selected::Hits(records))
+}
+
+/// The rendered form of one snippet page: `path:line  name [Kind] (verification)` header
+/// then the body — the same shape `fetch_span` prints, per selected node.
+pub fn render_snippets(records: &[SnippetRecord]) -> String {
+  use std::fmt::Write;
+  let mut out = String::new();
+  for record in records {
+    let _ = write!(
+      out,
+      "{}:{}  {} [{}] ({})\n{}",
+      record.node.path, record.line, record.node.name, record.node.kind, record.verification,
+      record.body
+    );
+    if !record.body.ends_with('\n') {
+      out.push('\n');
+    }
+    if let Some(full) = record.truncated_from {
+      let _ = writeln!(out, "(truncated: {} of {full} bytes)", record.body.len());
+    }
+  }
+  out
+}
+
 /// The outcome of a selector-driven record query.
 #[derive(Debug)]
 pub enum Selected<T> {

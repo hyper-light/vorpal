@@ -75,6 +75,8 @@ enum GraphVerb {
   Node,
   /// Relation-specific transitive traversal, each reached node with its path to the seed.
   Reachable,
+  /// The defining source of a symbol, sliced from its indexed span (digest-verified).
+  Snippet,
 }
 
 impl GraphVerb {
@@ -87,6 +89,7 @@ impl GraphVerb {
       GraphVerb::Typeusers => "typeusers",
       GraphVerb::Node => "node",
       GraphVerb::Reachable => "reachable",
+      GraphVerb::Snippet => "snippet",
     }
   }
 }
@@ -129,6 +132,12 @@ pub struct GraphArg {
   /// (exact | constrained | heuristic). Absent = structural edges included.
   #[clap(long, value_name = "GRADE")]
   min_grade: Option<String>,
+  /// (snippet) Whole context lines to include around the definition span.
+  #[clap(long, value_name = "N", default_value_t = 0)]
+  context: usize,
+  /// (snippet) Byte cap per snippet body (clamped to 64..262144).
+  #[clap(long, value_name = "BYTES", default_value_t = 16384)]
+  max_bytes: usize,
   /// Append each result's node id (stable within this index generation).
   #[clap(long)]
   ids: bool,
@@ -270,6 +279,39 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     None
   };
 
+  if matches!(arg.verb, GraphVerb::Snippet) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let max_bytes = arg.max_bytes.clamp(64, 262_144);
+    let output = match arg.format {
+      OutputFormat::Text => vorpal_index::snippet_query_on(
+        &kg,
+        Some(&gen_dir),
+        &target,
+        arg.context,
+        max_bytes,
+      )
+      .map_err(snippet_error)?,
+      OutputFormat::Json => {
+        let selected = vorpal_index::records::snippet_records(
+          &kg,
+          Some(&gen_dir),
+          &target,
+          arg.context,
+          max_bytes,
+        )
+        .map_err(snippet_error)?;
+        let mut json = emit::selected_json(selected, arg.page.cursor.as_deref(), arg.page.limit)?;
+        json.push('\n');
+        json
+      }
+    };
+    print!("{output}");
+    return Ok(ExitCode::SUCCESS);
+  }
+
   let output = match (arg.format, &traversal) {
     (OutputFormat::Text, Some((direction, relations, max_depth, min_confidence))) => {
       let kg = vorpal_index::Kg::load(&dir)
@@ -367,4 +409,11 @@ fn missing_index_hint(dir: &Path) -> String {
     "querying index at {} (build one first: `vorpal index <src>`)",
     dir.display()
   )
+}
+
+fn snippet_error(err: vorpal_index::records::SnippetError) -> anyhow::Error {
+  match err {
+    vorpal_index::records::SnippetError::Stale(message)
+    | vorpal_index::records::SnippetError::Other(message) => anyhow!(message),
+  }
 }

@@ -43,6 +43,7 @@ const USAGE: &str = "usage:
   vorpal-index typeusers    <index-dir> <name>      definitions using a type
   vorpal-index node         <index-dir> <name>      nodes matching a name
   vorpal-index why          <index-dir> <from-id> <to-id|name>  edge evidence, or why no edge to <name>
+  vorpal-index snippet      <index-dir> <name> [context-lines] [--all]  defining source, digest-verified
   vorpal-index search       <index-dir> <query> [k] hybrid search (name + semantic + graph, RRF)";
 
 /// Route tree-sitter's C-side allocations through jemalloc too. Without this the parser's
@@ -176,6 +177,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
           vorpal_index::explain_absence_on(&kg, from_id.parse()?, to_or_name)?
         }
       };
+      print!("{rendered}");
+      Ok(())
+    }
+    ["snippet", index, name, rest @ ..] => {
+      let mut context_lines = 0usize;
+      let mut merge_all = false;
+      for arg in rest {
+        match *arg {
+          "--all" => merge_all = true,
+          other => context_lines = other.parse().map_err(|_| format!("bad context '{other}'"))?,
+        }
+      }
+      let dir = vorpal_kg::resolve_index_dir(Path::new(index));
+      let kg = vorpal_kg::Kg::load(&dir)?;
+      let target = vorpal_index::GraphTarget {
+        name: (*name).to_string(),
+        merge_all,
+        ..vorpal_index::GraphTarget::default()
+      };
+      let rendered =
+        vorpal_index::snippet_query_on(&kg, Some(&dir), &target, context_lines, 262_144)
+          .map_err(|err| match err {
+            vorpal_index::records::SnippetError::Stale(m)
+            | vorpal_index::records::SnippetError::Other(m) => m,
+          })?;
       print!("{rendered}");
       Ok(())
     }
