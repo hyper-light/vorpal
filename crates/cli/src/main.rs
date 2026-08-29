@@ -37,6 +37,14 @@ fn unify_parser_allocator() {
 }
 
 fn main() -> Result<ExitCode> {
+  // Restore default SIGPIPE so `vorpal … | head` ends quietly like every Unix tool, instead
+  // of Rust's ignore-then-panic ("failed printing to stdout: Broken pipe"). The stdio
+  // daemons (lsp/mcp) inherit this: a vanished client ends the process, which is the
+  // correct daemon behavior too.
+  #[cfg(unix)]
+  unsafe {
+    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+  }
   #[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
   unify_parser_allocator();
   execute_main()
