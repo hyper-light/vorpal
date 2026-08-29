@@ -2079,6 +2079,22 @@ pub fn resolve_target(kg: &Kg, target: &GraphTarget) -> Result<Vec<NodeId>, Box<
   Ok(kg.select(&selector))
 }
 
+/// Rendered pattern listing (the text twin of [`records::pattern_records`]): candidate
+/// lines with ids/eids, capped for readability — the full set pages through records.
+pub fn pattern_query_on(kg: &Kg, pattern: &str, cap: usize) -> Result<String, Box<dyn Error>> {
+  let records = records::pattern_records(kg, pattern)?;
+  if records.is_empty() {
+    return Ok(format!("(no names match /{pattern}/)\n"));
+  }
+  let ids: Vec<NodeId> = records.iter().take(cap).map(|r| NodeId::new(r.id)).collect();
+  let mut out = render_candidates(kg, &ids);
+  if records.len() > cap {
+    use std::fmt::Write;
+    let _ = writeln!(out, "… {} more — tighten the pattern or page the records surface", records.len() - cap);
+  }
+  Ok(out)
+}
+
 /// Rendered selector-driven snippets (the text twin of [`records::snippet_records`]):
 /// `path:line  name [Kind] (verification)` headers over digest-verified span bodies, with
 /// the same no-match/ambiguity wording as every other selector verb.

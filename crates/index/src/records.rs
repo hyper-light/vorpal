@@ -220,6 +220,29 @@ pub fn render_snippets(records: &[SnippetRecord]) -> String {
   out
 }
 
+/// Pattern listing: every node whose NAME matches the regex, ascending id (deterministic).
+/// A listing like the `node` verb — matches are the answer, never auto-selected for edge
+/// queries. The regex engine's own literal prefilter does the heavy lifting; `names.idx`
+/// cannot help here (it is hash-sorted, not lexicographic).
+pub fn pattern_records(kg: &Kg, pattern: &str) -> Result<Vec<NodeRecord>, String> {
+  use rayon::prelude::*;
+  let regex = regex::Regex::new(pattern).map_err(|err| format!("bad pattern: {err}"))?;
+  let node_count = kg.node_count() as u64;
+  Ok(
+    (0..node_count)
+      .into_par_iter()
+      .filter_map(|row| {
+        let id = NodeId::new(row);
+        if regex.is_match(kg.node_name(id)?) {
+          node_record(kg, id)
+        } else {
+          None
+        }
+      })
+      .collect(),
+  )
+}
+
 /// One dead-code candidate: a definition with **no semantic in-edges anywhere in the graph**
 /// (no calls/references/imports/implements/of_type/overrides — containment edges don't count
 /// as liveness), surviving the referenced-name and parse-damage suppressions.

@@ -43,7 +43,7 @@ const USAGE: &str = "usage:
   vorpal-index importers    <index-dir> <name>      files importing a symbol
   vorpal-index implementors <index-dir> <name>      types implementing/extending a symbol
   vorpal-index typeusers    <index-dir> <name>      definitions using a type
-  vorpal-index node         <index-dir> <name>      nodes matching a name
+  vorpal-index node         <index-dir> <name>      nodes matching a name (append --pattern for regex)
   vorpal-index why          <index-dir> <from-id> <to-id|name>  edge evidence, or why no edge to <name>
   vorpal-index snippet      <index-dir> <name> [context-lines] [--all]  defining source, digest-verified
   vorpal-index search       <index-dir> <query> [k] hybrid search (name + semantic + graph, RRF)";
@@ -158,8 +158,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       name,
       rest @ ..,
     ] => {
-      // Optional trailing selector flag: `--all` merges across same-named definitions
-      // (the historical union); the richer selector surface lives on the `vorpal` CLI.
+      // Optional trailing selector flags: `--all` merges across same-named definitions
+      // (the historical union); `node <regex> --pattern` lists regex name matches. The
+      // richer selector surface lives on the `vorpal` CLI.
+      if *verb == "node" && rest == ["--pattern"] {
+        let dir = vorpal_kg::resolve_index_dir(Path::new(index));
+        let kg = vorpal_kg::Kg::load(&dir)?;
+        print!("{}", vorpal_index::pattern_query_on(&kg, name, 200)?);
+        return Ok(());
+      }
       let target = vorpal_index::GraphTarget {
         name: (*name).to_string(),
         merge_all: rest == ["--all"],

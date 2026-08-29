@@ -201,6 +201,7 @@ mod test_cli {
       "graph schema",
       "graph schema --format json --index /tmp/idx",
       "graph dead",
+      "graph node --pattern ^tcp_v4_.* --format json",
       "graph dead --kind function --prefix crates/ --exported --format json --limit 20",
       "graph snippet Kg --all --format json --max-bytes 4096",
       "search import-path-resolution -k 5",

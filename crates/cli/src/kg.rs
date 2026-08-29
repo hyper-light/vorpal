@@ -138,6 +138,9 @@ pub struct GraphArg {
   /// (exact | constrained | heuristic). Absent = structural edges included.
   #[clap(long, value_name = "GRADE")]
   min_grade: Option<String>,
+  /// (node) List nodes whose name matches this regex instead of an exact name.
+  #[clap(long, value_name = "REGEX")]
+  pattern: Option<String>,
   /// (dead) Refine to definitions whose file path starts with this prefix.
   #[clap(long, value_name = "PREFIX")]
   prefix: Option<String>,
@@ -294,6 +297,29 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         value["suppressedDamaged"] = report.suppressed_damaged.into();
         value["nameSuppression"] = report.name_suppression.into();
         println!("{}", serde_json::to_string_pretty(&value)?);
+      }
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if let Some(pattern) = arg.pattern {
+    if !matches!(arg.verb, GraphVerb::Node) {
+      anyhow::bail!("--pattern is a listing: use `graph node --pattern <regex>`");
+    }
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    match arg.format {
+      OutputFormat::Text => print!(
+        "{}",
+        vorpal_index::pattern_query_on(&kg, &pattern, 200).map_err(boxed)?
+      ),
+      OutputFormat::Json => {
+        let records =
+          vorpal_index::records::pattern_records(&kg, &pattern).map_err(anyhow::Error::msg)?;
+        let mut json = emit::records_json(&records, arg.page.cursor.as_deref(), arg.page.limit)?;
+        json.push('\n');
+        print!("{json}");
       }
     }
     return Ok(ExitCode::SUCCESS);

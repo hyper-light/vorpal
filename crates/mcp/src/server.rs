@@ -229,6 +229,19 @@ impl Server {
         Ok((text, json!({})))
       }
       "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
+        // Pattern listing (node only): regex over names, matches ARE the answer.
+        if tool == "node" {
+          if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
+            self.kg()?;
+            let kg = self.kg.as_ref().expect("pinned above");
+            let text =
+              vorpal_index::pattern_query_on(kg, pattern, 200).map_err(|err| err.to_string())?;
+            let records =
+              vorpal_index::records::pattern_records(kg, pattern).map_err(ToolError::from)?;
+            let data = paged(records, args, "hits")?;
+            return Ok((text, data));
+          }
+        }
         // Symbol identity contract (IMPROVEMENTS §1): ambiguous names return the candidate
         // list (with node ids) instead of silently merging namesake neighborhoods; refine
         // with `path`/`kind`/`id`, or pass `all: true` to merge explicitly.
@@ -636,7 +649,18 @@ fn tools_list() -> Value {
       }),
       &[],
     ),
-    tool("node", "Nodes matching an exact symbol name.", name_only.clone(), &["name"]),
+    tool(
+      "node",
+      "Nodes matching an exact symbol name — or, with `pattern`, every node whose name \
+       matches a regex (a listing; refine from its ids).",
+      {
+        let mut props = name_only.clone();
+        props["pattern"] =
+          json!({"type": "string", "description": "Regex over names (replaces `name`)"});
+        props
+      },
+      &[],
+    ),
     tool("callers", "Direct callers of a symbol (incoming `calls` edges).", name_only.clone(), &["name"]),
     tool("references", "Direct referrers of a symbol (incoming `references` edges).", name_only.clone(), &["name"]),
     tool("importers", "Files importing a symbol (incoming `imports` edges).", name_only.clone(), &["name"]),

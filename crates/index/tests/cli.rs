@@ -1721,6 +1721,12 @@ fn dead_scan_finds_uncalled_definitions_and_suppresses_referenced_names() {
   // reported dead: either it received the edge, or its name is in evidence (suppressed).
   assert!(!names.contains(&"taken"), "referenced name never reported dead: {names:?}");
 
+  // Pattern listing over the same graph: regex matches are the answer; bad regexes error.
+  let hits = vorpal_index::records::pattern_records(&kg, "^orph").unwrap();
+  assert_eq!(hits.len(), 1);
+  assert_eq!(hits[0].name, "orphan");
+  assert!(vorpal_index::records::pattern_records(&kg, "st[").is_err());
+
   // Kind filter narrows; unknown kind errors loudly.
   let only_fn = vorpal_index::records::dead_records(
     &kg,

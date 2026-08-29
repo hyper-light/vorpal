@@ -393,6 +393,14 @@ impl Kg {
   }
 
   /// Resolve a node's attributes (§3.3). Reads HOT columns (`base + row·stride`) + the heap.
+  /// Just the node's name, zero-copy — the whole-graph name-scan primitive (pattern
+  /// matching, dedup passes) where materializing the full [`NodeView`] would read three
+  /// heap strings per row to use one.
+  pub fn node_name(&self, id: NodeId) -> Option<&str> {
+    let (_segment, row) = self.directory.locate(id)?;
+    self.heap_str(self.cols.name_off, self.cols.name_len, row)
+  }
+
   pub fn node(&self, id: NodeId) -> Option<NodeView<'_>> {
     let (_segment, row) = self.directory.locate(id)?;
     let kind = SymbolKind::from_tag(self.nodes.column_at(self.cols.kind)?.get_u8(row)?);

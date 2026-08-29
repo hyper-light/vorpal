@@ -3736,6 +3736,7 @@ version = "0.2.0"
 dependencies = [
  "fd-lock",
  "rayon",
+ "regex",
  "serde",
  "serde_json",
  "tikv-jemalloc-sys",
