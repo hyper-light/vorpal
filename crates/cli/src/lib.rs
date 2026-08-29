@@ -215,6 +215,8 @@ mod test_cli {
       "graph impact --relations calls,references --min-grade constrained --format json",
       "graph diff",
       "graph diff --from prev --to CURRENT --format json --limit 50",
+      "graph architecture",
+      "graph architecture --top 10 --format json",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));
     }

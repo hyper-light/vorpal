@@ -948,6 +948,207 @@ pub fn reach_records_page(
   })
 }
 
+/// One module row of the architecture summary (module = defining file's directory).
+#[derive(Serialize, Debug)]
+pub struct ModuleRow {
+  pub module: String,
+  pub files: u64,
+  pub definitions: u64,
+  /// Imports arriving from OTHER modules (how much the codebase leans on this module).
+  pub imported_by_others: u64,
+  /// Imports this module makes into other modules.
+  pub imports_others: u64,
+}
+
+/// A hub: a definition ranked by semantic in-degree (calls/references/of_type/implements/
+/// imports/overrides — containment excluded).
+#[derive(Serialize, Debug)]
+pub struct HubRecord {
+  #[serde(flatten)]
+  pub node: NodeRecord,
+  pub semantic_in_degree: u64,
+}
+
+/// The orientation summary an agent asks for first: where the mass is, what everything
+/// leans on, and where execution enters.
+#[derive(Serialize, Debug)]
+pub struct ArchitectureReport {
+  /// Modules by definition count (desc, then name) — capped by `top`.
+  pub modules: Vec<ModuleRow>,
+  /// Definitions by semantic in-degree (desc, then id) — capped by `top`.
+  pub hubs: Vec<HubRecord>,
+  /// Exported definitions nothing semantic reaches: entry-point candidates — capped by `top`.
+  pub entries: Vec<NodeRecord>,
+  pub total_modules: u64,
+}
+
+/// Compute the summary: one parallel pass over every node's in-edge types (semantic
+/// in-degree → hubs + entries), one pass over IMPORTS out-edges (module matrix), one
+/// node_path sweep for per-module tallies. Deterministic ordering throughout.
+pub fn architecture_report(kg: &Kg, top: usize) -> ArchitectureReport {
+  use rayon::prelude::*;
+  let semantic = {
+    let mut mask = [false; 256];
+    for edge in [
+      vorpal_kg::EdgeType::CALLS,
+      vorpal_kg::EdgeType::REFERENCES,
+      vorpal_kg::EdgeType::IMPORTS,
+      vorpal_kg::EdgeType::IMPLEMENTS,
+      vorpal_kg::EdgeType::OF_TYPE,
+      vorpal_kg::EdgeType::OVERRIDES,
+    ] {
+      mask[edge.0 as usize & 0xff] = true;
+    }
+    mask
+  };
+  let n = kg.node_count() as u64;
+  let kind_tags = kg.kind_tags();
+
+  // Per-node semantic in-degree (u32; saturating — a >4B-edge node is already a hub).
+  let in_semantic: Vec<u32> = (0..n)
+    .into_par_iter()
+    .map(|row| {
+      kg.in_edge_types_of(NodeId::new(row))
+        .iter()
+        .filter(|&&packed| semantic[vorpal_kg::EdgeType(packed).base().0 as usize & 0xff])
+        .count() as u32
+    })
+    .collect();
+
+  // Modules from the FILE RUNS, not the node table: one iteration per file (72K at kernel
+  // scale) instead of per node (2.7M) — the run carries the path and its definition count
+  // (`len - 1`), and the File node is `run.start` for the import margins.
+  let runs = crate::annfiles::file_runs_of(kg);
+  let mut modules: std::collections::BTreeMap<&str, ModuleRow> = std::collections::BTreeMap::new();
+  fn dir_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+  }
+  let blank = |module: &str| ModuleRow {
+    module: module.to_string(),
+    files: 0,
+    definitions: 0,
+    imported_by_others: 0,
+    imports_others: 0,
+  };
+  for run in &runs {
+    let module = dir_of(&run.path);
+    let mut cross: Vec<&str> = Vec::new();
+    for (target, edge) in kg.out_neighbors(NodeId::new(run.start)) {
+      if edge.base() != vorpal_kg::EdgeType::IMPORTS {
+        continue;
+      }
+      let Some(target_path) = kg.node_path(target) else { continue };
+      let target_module = dir_of(target_path);
+      if target_module != module {
+        cross.push(target_module);
+      }
+    }
+    let entry = modules.entry(module).or_insert_with(|| blank(module));
+    entry.files += 1;
+    entry.definitions += u64::from(run.len.saturating_sub(1));
+    entry.imports_others += cross.len() as u64;
+    for target_module in cross {
+      modules
+        .entry(target_module)
+        .or_insert_with(|| blank(target_module))
+        .imported_by_others += 1;
+    }
+  }
+  let total_modules = modules.len() as u64;
+  let mut modules: Vec<ModuleRow> = modules.into_values().collect();
+  modules.sort_by(|a, b| {
+    b.definitions
+      .cmp(&a.definitions)
+      .then_with(|| a.module.cmp(&b.module))
+  });
+  modules.truncate(top);
+
+  // Hubs: top-N semantic in-degree. One partial pass keeps this O(n log top).
+  let mut hub_ids: Vec<(u32, u64)> = in_semantic
+    .iter()
+    .enumerate()
+    .filter(|&(_, &d)| d > 0)
+    .map(|(row, &d)| (d, row as u64))
+    .collect();
+  // Partial select: only the top slice ever sorts (1.5M nonzero rows at kernel scale).
+  let cmp = |a: &(u32, u64), b: &(u32, u64)| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1));
+  if hub_ids.len() > top {
+    hub_ids.select_nth_unstable_by(top - 1, cmp);
+    hub_ids.truncate(top);
+  }
+  hub_ids.sort_unstable_by(cmp);
+  let hubs = hub_ids
+    .into_iter()
+    .filter_map(|(d, row)| {
+      Some(HubRecord {
+        node: node_record(kg, NodeId::new(row))?,
+        semantic_in_degree: d as u64,
+      })
+    })
+    .collect();
+
+  // Entries: exported, semantically unreached, callable kinds — id order, capped.
+  let callable = [
+    vorpal_kg::SymbolKind::Function.tag(),
+    vorpal_kg::SymbolKind::Method.tag(),
+  ];
+  let mut entries = Vec::new();
+  for row in 0..n {
+    if entries.len() >= top {
+      break;
+    }
+    if in_semantic[row as usize] != 0 {
+      continue;
+    }
+    let id = NodeId::new(row);
+    let tag = match kind_tags {
+      Some(tags) => tags.get(row as usize).copied(),
+      None => kg.node_kind(id).map(|kind| kind.tag()),
+    };
+    if !tag.is_some_and(|tag| callable.contains(&tag)) {
+      continue;
+    }
+    let Some(record) = node_record(kg, id) else { continue };
+    if record.exported && record.class == "source" {
+      entries.push(record);
+    }
+  }
+
+  ArchitectureReport {
+    modules,
+    hubs,
+    entries,
+    total_modules,
+  }
+}
+
+/// Rendered architecture summary.
+pub fn render_architecture(report: &ArchitectureReport) -> String {
+  use std::fmt::Write;
+  let mut out = String::new();
+  let _ = writeln!(out, "modules ({} total; top by definitions):", report.total_modules);
+  for row in &report.modules {
+    let _ = writeln!(
+      out,
+      "  {}  {} defs · {} files · imported-by-others {} · imports-others {}",
+      row.module, row.definitions, row.files, row.imported_by_others, row.imports_others
+    );
+  }
+  let _ = writeln!(out, "hubs (top by semantic in-degree):");
+  for hub in &report.hubs {
+    let _ = writeln!(
+      out,
+      "  {:>7}  {} [{}] {}",
+      hub.semantic_in_degree, hub.node.name, hub.node.kind, hub.node.path
+    );
+  }
+  let _ = writeln!(out, "entry-point candidates (exported, semantically unreached):");
+  for entry in &report.entries {
+    let _ = writeln!(out, "  {} [{}] {}", entry.name, entry.kind, entry.path);
+  }
+  out
+}
+
 /// One node-level generation difference.
 #[derive(Serialize, Debug)]
 pub struct DiffRecord {

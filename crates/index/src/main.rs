@@ -40,6 +40,7 @@ const USAGE: &str = "usage:
   vorpal-index dead         <index-dir> [kind]      definitions with no semantic in-edges (suppression-honest)
   vorpal-index coverage     <index-dir>             per-file parse-coverage overview (worst first)
   vorpal-index diff         <index-root> [from] [to]  generation diff (defaults: prev → CURRENT)
+  vorpal-index architecture <index-dir> [top]        module mass, hubs, entry-point candidates
   vorpal-index callers      <index-dir> <name>      direct callers of a symbol
   vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
   vorpal-index importers    <index-dir> <name>      files importing a symbol
@@ -202,6 +203,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       let dir = vorpal_kg::resolve_index_dir(Path::new(index));
       let report = vorpal_index::records::coverage_records(Some(&dir));
       print!("{}", vorpal_index::records::render_coverage(&report));
+      Ok(())
+    }
+    ["architecture", index, rest @ ..] => {
+      let top = match rest {
+        [] => 20usize,
+        [n] => n.parse().map_err(|_| format!("bad top '{n}'"))?,
+        _ => {
+          eprintln!("{USAGE}");
+          return Err("invalid arguments".into());
+        }
+      };
+      let dir = vorpal_kg::resolve_index_dir(Path::new(index));
+      let kg = vorpal_kg::Kg::load(&dir)?;
+      let report = vorpal_index::records::architecture_report(&kg, top.clamp(1, 500));
+      print!("{}", vorpal_index::records::render_architecture(&report));
       Ok(())
     }
     ["diff", root, rest @ ..] => {

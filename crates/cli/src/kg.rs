@@ -87,6 +87,8 @@ enum GraphVerb {
   Impact,
   /// What changed between two generations (files, nodes by durable eid, edge counts).
   Diff,
+  /// Orientation summary: module mass, hubs by in-degree, entry-point candidates.
+  Architecture,
 }
 
 impl GraphVerb {
@@ -105,6 +107,7 @@ impl GraphVerb {
       GraphVerb::Coverage => "coverage",
       GraphVerb::Impact => "impact",
       GraphVerb::Diff => "diff",
+      GraphVerb::Architecture => "architecture",
     }
   }
 }
@@ -151,6 +154,9 @@ pub struct GraphArg {
   /// (node) List nodes whose name matches this regex instead of an exact name.
   #[clap(long, value_name = "REGEX")]
   pattern: Option<String>,
+  /// (architecture) Rows per section.
+  #[clap(long, value_name = "N", default_value_t = 20)]
+  top: usize,
   /// (diff) Older generation: content id, path, or `prev` (default).
   #[clap(long, value_name = "GEN", default_value = "prev")]
   from: String,
@@ -297,6 +303,18 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     let report = vorpal_index::records::schema_report(&kg, Some(&gen_dir));
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
+      OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Architecture) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let report = vorpal_index::records::architecture_report(&kg, arg.top.clamp(1, 500));
+    match arg.format {
+      OutputFormat::Text => print!("{}", vorpal_index::records::render_architecture(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
     }
     return Ok(ExitCode::SUCCESS);

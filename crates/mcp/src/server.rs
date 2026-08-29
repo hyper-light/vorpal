@@ -58,7 +58,7 @@ impl Profile {
     const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
       "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
-      "health", "dead_code", "coverage", "impact", "compare_generations",
+      "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
     ];
     match self {
       Profile::Full => true,
@@ -285,6 +285,17 @@ impl Server {
           )
         };
         Ok((text, json!({})))
+      }
+      "architecture" => {
+        let top = args.get("top").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
+        self.kg()?;
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
+        let report = vorpal_index::records::architecture_report(kg, top);
+        let text = vorpal_index::records::render_architecture(&report);
+        let data = serde_json::to_value(&report).unwrap_or(Value::Null);
+        Ok((text, data))
       }
       "compare_generations" => {
         let root = self.index_dir.clone();
@@ -874,6 +885,16 @@ fn tools_list(profile: Profile) -> Value {
       json!({
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+      }),
+      &[],
+    ),
+    tool(
+      "architecture",
+      "Orientation summary: modules by definition mass with cross-module import margins, \
+       hub definitions by semantic in-degree, and entry-point candidates (exported, \
+       semantically unreached). The first call to make in an unfamiliar codebase.",
+      json!({
+        "top": {"type": "integer", "description": "Rows per section (default 20, max 500)"}
       }),
       &[],
     ),
