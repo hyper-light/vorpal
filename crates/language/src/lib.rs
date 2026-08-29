@@ -565,36 +565,95 @@ pub fn grammar_info(lang: SupportLang) -> GrammarInfo {
   }
 }
 
-fn compute_grammar_digest(lang: SupportLang) -> u64 {
-  let ts = lang.get_ts_language();
-  let mut h = xxhash_rust::xxh3::Xxh3::new();
-  if let Some(name) = ts.name() {
-    h.update(name.as_bytes());
-  }
-  h.update(&(ts.abi_version() as u64).to_le_bytes());
-  if let Some(md) = ts.metadata() {
-    h.update(&[md.major_version, md.minor_version, md.patch_version]);
-  }
+/// One element of a grammar's observable surface, in enumeration order. This enumeration is
+/// THE definition of "what a grammar is" for identity purposes: the product-cache digest
+/// ([`grammar_digest_of`]) and the remote extraction-parity fingerprint both consume it —
+/// each with its own byte framing, which is why events are structured rather than bytes —
+/// so the two identities can never drift on *which* surface they observe (ADOPTION F-M0).
+pub enum GrammarSurfaceEvent<'t> {
+  Name(Option<&'t str>),
+  Abi(u64),
+  Metadata(Option<(u8, u8, u8)>),
+  Counts {
+    node_kinds: usize,
+    parse_states: usize,
+    fields: usize,
+  },
+  /// Emitted once per node-kind id, ascending; `name` is `None` for unnamed gaps.
+  NodeKind { name: Option<&'t str>, named: bool },
+  /// Emitted once per field id (1-based), ascending.
+  Field(Option<&'t str>),
+}
+
+/// Walk `ts`'s observable surface in the fixed order every identity consumer relies on:
+/// name, ABI, metadata, counts, node kinds ascending, fields ascending.
+pub fn grammar_surface(ts: &TSLanguage, mut f: impl FnMut(GrammarSurfaceEvent<'_>)) {
+  use GrammarSurfaceEvent as E;
+  f(E::Name(ts.name()));
+  f(E::Abi(ts.abi_version() as u64));
+  f(E::Metadata(ts.metadata().map(|md| {
+    (md.major_version, md.minor_version, md.patch_version)
+  })));
   let node_kinds = ts.node_kind_count();
   let fields = ts.field_count();
-  h.update(&(node_kinds as u64).to_le_bytes());
-  h.update(&(ts.parse_state_count() as u64).to_le_bytes());
-  h.update(&(fields as u64).to_le_bytes());
-  // Node-kind and field names, in id order — captures additions, removals, and renames.
+  f(E::Counts {
+    node_kinds,
+    parse_states: ts.parse_state_count(),
+    fields,
+  });
   for id in 0..node_kinds as u16 {
-    if let Some(name) = ts.node_kind_for_id(id) {
-      h.update(name.as_bytes());
-      h.update(&[u8::from(ts.node_kind_is_named(id))]);
-    }
-    h.update(&[0xff]); // delimiter so distinct name boundaries can't collide
+    f(E::NodeKind {
+      name: ts.node_kind_for_id(id),
+      named: ts.node_kind_is_named(id),
+    });
   }
   for id in 1..=fields as u16 {
-    if let Some(name) = ts.field_name_for_id(id) {
-      h.update(name.as_bytes());
-    }
-    h.update(&[0xff]);
+    f(E::Field(ts.field_name_for_id(id)));
   }
+}
+
+/// The structural digest of ANY tree-sitter language (not just a compiled-in variant):
+/// xxh3 over the [`grammar_surface`] events with the historical framing, so values are
+/// byte-identical to every digest ever written into a product header (pinned by test).
+pub fn grammar_digest_of(ts: &TSLanguage) -> u64 {
+  use GrammarSurfaceEvent as E;
+  let mut h = xxhash_rust::xxh3::Xxh3::new();
+  grammar_surface(ts, |event| match event {
+    E::Name(Some(name)) => h.update(name.as_bytes()),
+    E::Name(None) => {}
+    E::Abi(abi) => h.update(&abi.to_le_bytes()),
+    E::Metadata(Some((major, minor, patch))) => h.update(&[major, minor, patch]),
+    E::Metadata(None) => {}
+    E::Counts {
+      node_kinds,
+      parse_states,
+      fields,
+    } => {
+      h.update(&(node_kinds as u64).to_le_bytes());
+      h.update(&(parse_states as u64).to_le_bytes());
+      h.update(&(fields as u64).to_le_bytes());
+    }
+    // Node-kind and field names, in id order — captures additions, removals, and renames;
+    // 0xff delimits so distinct name boundaries can't collide.
+    E::NodeKind { name, named } => {
+      if let Some(name) = name {
+        h.update(name.as_bytes());
+        h.update(&[u8::from(named)]);
+      }
+      h.update(&[0xff]);
+    }
+    E::Field(name) => {
+      if let Some(name) = name {
+        h.update(name.as_bytes());
+      }
+      h.update(&[0xff]);
+    }
+  });
   h.digest()
+}
+
+fn compute_grammar_digest(lang: SupportLang) -> u64 {
+  grammar_digest_of(&lang.get_ts_language())
 }
 
 fn extensions(lang: SupportLang) -> &'static [&'static str] {
