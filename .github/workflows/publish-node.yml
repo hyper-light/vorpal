@@ -59,6 +59,8 @@ jobs:
         run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
       - name: Build
         working-directory: crates/napi
+        env:
+          RUSTFLAGS: ${{ matrix.musl && '-C link-arg=-static-libgcc' || '' }}
         run: napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:

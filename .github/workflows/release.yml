@@ -82,6 +82,9 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
+        env:
+          # musl-gcc links against shared libgcc_s.so.1 by default, which runners lack.
+          RUSTFLAGS: ${{ matrix.musl && '-C link-arg=-static-libgcc' || '' }}
         run: cargo build --release -p vorpal --target ${{ matrix.target }}
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -140,8 +143,11 @@ jobs:
       - name: Build the stage-0 loader (musl; public key embedded when available)
         env:
           VORPAL_LOADER_PUBKEY_HEX: ${{ steps.pubkey.outputs.hex }}
+          RUSTFLAGS: -C link-arg=-static-libgcc
         run: cargo build --release -p vorpal-loader --bin vorpal-loader --target ${{ matrix.target }}
       - name: Build the agent (the musl vorpal binary, launched as `__agent`)
+        env:
+          RUSTFLAGS: -C link-arg=-static-libgcc
         run: cargo build --release -p vorpal --bin vorpal --target ${{ matrix.target }}
       - name: Sign the agent (if keyed) and record its blake3 pin
         run: |

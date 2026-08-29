@@ -23,9 +23,9 @@ jobs:
       matrix:
         include:
           - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: auto }
-          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, manylinux: auto }  # native build: an explicit target makes maturin demand a cross linker the image lacks
           - { name: musllinux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
-          - { name: musllinux-aarch64, os: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
+          - { name: musllinux-aarch64, os: ubuntu-24.04-arm, manylinux: musllinux_1_2 }
           - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin }
           - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
           - { name: windows-x64, os: windows-latest, target: x64 }
@@ -37,7 +37,7 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
-          target: ${{ matrix.target }}
+          target: ${{ matrix.target || '' }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist -m crates/pyo3/Cargo.toml
       - uses: actions/upload-artifact@v4
