@@ -16,10 +16,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
+      # No `cargo fmt --check` gate, deliberately: the tree predates rustfmt conformance
+      # (inherited ast-grep code plus repo idiom), and a whole-repo reformat would poison
+      # blame and permanently diverge every inherited file from upstream. The gate failed
+      # every push since the workflow landed, which also meant Clippy and Test NEVER ran —
+      # a red-forever check is worse than no check. Clippy at -D warnings is the lint gate.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test

@@ -610,7 +610,7 @@ mod sharded_table_tests {
 
   /// The serial specification: single-pass insertion via `for_each_definition`, exactly the
   /// pre-sharding algorithm. The sharded build must produce an equal table.
-  fn serial_reference_table(writer: &KgWriter) -> SymbolTable {
+  fn serial_reference_table(writer: &KgWriter) -> SymbolTable<'static> {
     let mut names: Vec<String> = Vec::with_capacity(writer.node_count());
     let mut kinds: Vec<SymbolKind> = Vec::with_capacity(writer.node_count());
     writer.for_each_definition(|_, name, _, kind, _| {

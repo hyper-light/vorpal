@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use vorpal_core::tree_sitter::LanguageExt as _;
-use vorpal_core::{Language as _, Matcher as _, Pattern};
+use vorpal_core::{Language as _, Pattern};
 use vorpal_language::SupportLang;
 
 /// Run `pattern` (parsed under `lang`) over every matching-language file beneath `root`,

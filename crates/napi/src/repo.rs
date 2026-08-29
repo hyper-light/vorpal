@@ -128,6 +128,9 @@ pub fn index_node(index_dir: String, id: i64) -> Result<NodeInfo> {
 }
 
 /// Typed build report — the structured twin of `indexBuild`'s one-liner.
+// The napi export glue is what consumes these; it is inert under cfg(test), so the test
+// compilation alone sees them as dead.
+#[cfg_attr(test, allow(dead_code))]
 #[napi(object)]
 pub struct BuildReport {
   pub indexed: i64,
@@ -141,6 +144,7 @@ pub struct BuildReport {
 }
 
 /// `indexBuild`, returning the typed report instead of the rendered line.
+#[cfg_attr(test, allow(dead_code))]
 #[napi]
 pub fn index_build_report(src: String, out: Option<String>) -> Result<BuildReport> {
   let src = std::path::Path::new(&src);

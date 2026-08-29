@@ -1081,19 +1081,6 @@ fn classify_receiver<'t>(
   }
 }
 
-/// The enclosing item's name iff the receiver is a self keyword; other receivers are opaque.
-fn self_receiver_owner<'t>(
-  receiver: &SgNode<'_>,
-  spec: &RefSpec,
-  owner: impl FnOnce() -> Option<Cow<'t, str>>,
-) -> Option<Cow<'t, str>> {
-  let text = receiver.text();
-  spec
-    .self_receivers
-    .contains(&text.trim())
-    .then(owner)
-    .flatten()
-}
 
 /// The top-level item owning an already-resolved enclosing definition (`Kg.load` → `Kg`).
 fn owner_of_entity(entities: &[String], from: NodeId) -> Option<String> {

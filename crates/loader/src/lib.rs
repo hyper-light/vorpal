@@ -277,7 +277,7 @@ mod tests {
   fn rejects_bad_magic_and_oversized_len() {
     let vk = key().verifying_key();
     // Bad magic.
-    let mut junk = vec![0u8; LOADER_HEADER_LEN];
+    let mut junk = [0u8; LOADER_HEADER_LEN];
     junk[0] = b'X';
     assert!(matches!(verify_and_extract(&mut &junk[..], &vk, 1 << 20), Err(LoaderError::BadMagic)));
     // Oversized payload_len is rejected before allocating.

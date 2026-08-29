@@ -18,10 +18,7 @@ pub struct GrammarsArg {
 pub fn run_grammars(arg: GrammarsArg) -> Result<ExitCode> {
   let filter = arg.lang.as_deref().map(str::to_ascii_lowercase);
   let mut shown = 0usize;
-  println!(
-    "{:<12} {:>4} {:>9} {:>7} {:>8}  {}",
-    "LANGUAGE", "ABI", "SEMVER", "NODES", "STATES", "DIGEST"
-  );
+  println!("LANGUAGE      ABI    SEMVER   NODES   STATES  DIGEST");
   for lang in SupportLang::all_langs() {
     let name = format!("{lang}");
     if let Some(f) = &filter {

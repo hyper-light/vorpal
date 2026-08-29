@@ -302,7 +302,7 @@ fn upstream_corpora_pass_against_the_compiled_parsers() {
         }
         let mut parser = tree_sitter::Parser::new();
         parser
-          .set_language(&lang.get_ts_language().into())
+          .set_language(&lang.get_ts_language())
           .unwrap_or_else(|err| panic!("{lang:?}: set_language: {err}"));
         let Some(tree) = parser.parse(&test.source, None) else {
           failures.push(format!("[{basename}] {}: parser returned no tree", test.name));

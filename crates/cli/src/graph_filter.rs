@@ -9,7 +9,7 @@
 //! drop the match, or wave it through.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Result, bail};
 use vorpal_config::{

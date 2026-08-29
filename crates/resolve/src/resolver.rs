@@ -370,6 +370,7 @@ struct ResolveScratch<'i> {
 }
 
 /// Shared tail of resolution: local-first, then cross-file visibility, then pick.
+#[allow(clippy::too_many_arguments)] // resolution kernel: scratch buffers ride as args by design
 fn finish<'i>(
   interner: &'i Interner,
   set: &[Symbol<'i>],

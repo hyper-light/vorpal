@@ -712,7 +712,7 @@ fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<
   // artifacts are only ever *replaced* (tmp + rename), never mutated in place: a re-warm in
   // this generation unlinks its name without touching the prior generation's inode. Never
   // overwrites — a generation that already warmed its own tier keeps it.
-  if prior != &final_dir {
+  if *prior != final_dir {
     for ann_file in ["ann.bin", "ann.files", "ann.stamp"] {
       let from = prior.join(ann_file);
       let to = final_dir.join(ann_file);
@@ -1648,7 +1648,7 @@ pub fn explain_edge_on(
     // digest to check (older generation), the snippet is labeled as current-file contents.
     if let Ok(bytes) = fs::read(&from_path) {
       let indexed_digest = artifacts_dir
-        .and_then(|dir| PackReader::open(dir))
+        .and_then(PackReader::open)
         .and_then(|pack| {
           pack
             .get(&from_path)

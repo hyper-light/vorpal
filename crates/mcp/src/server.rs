@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use vorpal_index::{build_index, format_nodes};
-use vorpal_kg::{Kg, NodeId};
+use vorpal_index::build_index;
+use vorpal_kg::Kg;
 
 use crate::watch::SourceWatch;
 
@@ -795,13 +795,6 @@ fn watch_root(index_dir: &Path) -> Option<PathBuf> {
   src.is_dir().then(|| src.to_path_buf())
 }
 
-fn render(kg: &Kg, name: &str, ids: &[NodeId]) -> String {
-  if ids.is_empty() {
-    format!("(no results for '{name}')")
-  } else {
-    format_nodes(kg, ids)
-  }
-}
 
 fn error_response(id: Value, code: i64, message: &str) -> String {
   json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
