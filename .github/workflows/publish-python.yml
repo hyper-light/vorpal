@@ -13,6 +13,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The repo .cargo/config.toml names cross linkers (aarch64-linux-gnu-gcc / -musl-gcc);
+  # the NATIVE aarch64 manylinux/musllinux images ship plain gcc. Env outranks config.
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: gcc
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: gcc
 
 jobs:
   wheels:

@@ -12,21 +12,18 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # aarch64-musl builds run natively on ubuntu-24.04-arm; musl-tools' musl-gcc is the
-  # correct compiler AND linker there (no triple-prefixed cross binary exists on runners).
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-  CC_aarch64_unknown_linux_musl: musl-gcc
-  # Same for x86_64: the default host-cc driver mislinks static musl binaries that carry
-  # tokio + jemalloc (undefined `pow` — libc.a ordered before the objects needing it);
-  # musl-gcc owns the correct library group ordering.
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-  CC_x86_64_unknown_linux_musl: musl-gcc
+  # The musl rows build inside the napi-rs alpine containers (native musl toolchain, so the
+  # repo .cargo/config.toml's dynamic-musl settings link against a real musl libgcc_s).
+  # The repo config names a triple-prefixed aarch64 linker; alpine's is plain gcc.
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: gcc
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: gcc
   NAPI_CLI_VERSION: 3.7.2
 
 jobs:
   build:
     name: napi ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
@@ -35,8 +32,8 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true, container: 'ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine' }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, container: 'ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine' }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
           - { target: aarch64-pc-windows-msvc, os: windows-latest }
           - { target: i686-pc-windows-msvc, os: windows-latest }
@@ -50,17 +47,13 @@ jobs:
         with:
           key: napi-${{ matrix.target }}
       - uses: actions/setup-node@v4
+        if: ${{ !matrix.container }}  # the napi-rs container ships its own node
         with:
           node-version: 22
-      - name: Install musl toolchain
-        if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Install napi CLI
         run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
       - name: Build
         working-directory: crates/napi
-        env:
-          RUSTFLAGS: ${{ matrix.musl && '-C link-arg=-static-libgcc' || '' }}
         run: napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
