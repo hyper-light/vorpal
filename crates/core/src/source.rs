@@ -123,6 +123,12 @@ pub trait SgNode<'r>: Clone {
   fn is_error(&self) -> bool {
     false
   }
+  /// Whether this node or any descendant is an ERROR/MISSING node. Tree-sitter records this as
+  /// an O(1) subtree flag, so a caller can skip a full error-scan walk when the answer is `false`.
+  /// The default (no error tracking) is conservative: non-tree-sitter backends report `false`.
+  fn has_error(&self) -> bool {
+    false
+  }
 
   fn field(&self, name: &str) -> Option<Self>;
   fn field_children(&self, field_id: Option<u16>) -> impl Iterator<Item = Self>;

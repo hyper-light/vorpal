@@ -64,6 +64,10 @@ rayon = "1.10.0"
 # one binary, one version, one deterministic parser set. See docs/UPSTREAM.md for the sync
 # ledger.
 [patch.crates-io]
+# Vendored tree-sitter *runtime* (not just grammars): the parser is ~two-thirds of cold-index
+# CPU, so the C runtime (lexer/parser/subtree/stack) is ours to profile and optimize in-tree.
+# See docs/UPSTREAM.md for the sync ledger.
+tree-sitter = { path = "vendor/tree-sitter" }
 tree-sitter-bash = { path = "grammars/tree-sitter-bash" }
 tree-sitter-c = { path = "grammars/tree-sitter-c" }
 tree-sitter-c-sharp = { path = "grammars/tree-sitter-c-sharp" }

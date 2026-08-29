@@ -89,6 +89,26 @@ product header v8): editing a vendored grammar changes its digest, which invalid
 language's cached products on the next index. Use `vorpal grammars` to confirm this table and the
 binary agree.
 
+## Tree-sitter runtime (vendored)
+
+The tree-sitter **runtime** — not just the grammars — is now vendored into `vendor/tree-sitter/`
+and injected via `[patch.crates-io]`, at the resolved version **0.26.10** (byte-identical to
+crates.io as copied). Cold indexing is ~two-thirds parser CPU, so the C runtime
+(`lexer.c`/`parser.c`/`subtree.c`/`stack.c`) is ours to profile and optimize in place. Every
+change below was verified **byte-identical**: the kernel and CPython index content-ids
+(`gen/<id>`) are unchanged, and the full suite + `retrieval_eval` stay green.
+
+| Patch | Where | Effect |
+|---|---|---|
+| **Lexer ASCII fast path** | `vendor/tree-sitter/src/lexer.c` (`ts_lexer__get_lookahead`) | A byte `< 0x80` under UTF-8 is a self-decoding codepoint; handle it inline instead of the encoding dispatch + indirect `decode(...)` call that otherwise ran per character. ~7% off kernel cold-index. |
+| **`set_contains` ASCII fast path** | 23 grammars' `src/tree_sitter/parser.h` | Character sets are sorted by range start; for a lookahead `< 0x80` a short linear scan over the leading ranges beats ~log2(len) probes across the full table (the C identifier set alone is 687 ranges). Recorded per-grammar in `grammars/PROVENANCE.json` `patches`. |
+
+Both are pure membership/decoding fast paths — same tokens, same trees. Build note: a grammar's
+`build.rs` tracks `src/parser.c`, **not** the headers, so after editing a bundled `parser.h`
+you must `touch` that grammar's `parser.c` (or `cargo clean -p <grammar>`) to force cc to
+recompile. Indexing worker count is tunable via `VORPAL_INDEX_THREADS` (default: CPU count);
+mild oversubscription hides per-file read stalls on a parse-bound corpus.
+
 ## Licenses (inherited engine + vendored parsers)
 
 The inherited structural engine is MIT; the repository root `LICENSE` preserves ast-grep's

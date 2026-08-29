@@ -132,6 +132,17 @@ struct TSLanguage {
 };
 
 static inline bool set_contains(TSCharacterRange *ranges, uint32_t len, int32_t lookahead) {
+  // vorpal: ASCII/low-codepoint fast path. Character sets are sorted by range start and source
+  // is overwhelmingly ASCII, so for a low lookahead a short linear scan over the leading ranges
+  // resolves membership in 1-4 comparisons and bails the moment a range starts past it — versus
+  // ~log2(len) probes across the full table. Same result as the binary search below.
+  if (lookahead < 0x80) {
+    for (uint32_t i = 0; i < len; i++) {
+      if (lookahead < ranges[i].start) return false;
+      if (lookahead <= ranges[i].end) return true;
+    }
+    return false;
+  }
   uint32_t index = 0;
   uint32_t size = len - index;
   while (size > 1) {

@@ -33,10 +33,23 @@ vorpal-index index ~/Projects/cpython /tmp/bench-py
 
 | Measurement | wall | user CPU | notes |
 |---|---|---|---|
-| linux cold | 7.95 s (min-of-3) | 113.1 s | 72,541 files → 2,748,638 nodes; 2.17 M refs resolved |
+| linux cold | 7.01 s (best-of-3) | 109.6 s | 72,541 files → 2,748,638 nodes; 2.17 M refs resolved |
 | linux warm-unchanged | 0.11 s | — | manifest fast path, no file reads |
 | linux one-file update | 2.30 s | — | product replay + deterministic re-link |
-| cpython cold | 0.83 s | — | 3,592 files → 143,450 nodes |
+| cpython cold | 0.71 s | — | 3,592 files → 143,450 nodes |
+
+2026-08-29 tree-sitter runtime pass (7.85 s → 7.01 s, output bit-identical — kernel generation
+id unchanged): the runtime is now vendored (`vendor/tree-sitter`, see docs/UPSTREAM.md), and
+cold indexing is ~two-thirds parser CPU, so the parse path itself was profiled and optimized.
+(1) A lexer ASCII fast path (`ts_lexer__get_lookahead`) decodes a `< 0x80` byte inline instead
+of the per-character encoding dispatch + indirect `decode()` call — the single biggest win
+(~7%). (2) An ASCII fast path in the grammars' `set_contains` linear-scans the sorted leading
+ranges for a low lookahead instead of a ~log2(687) binary search across the full Unicode
+identifier table. (3) The clean-parse error scan is skipped via tree-sitter's O(1) `has_error`
+flag rather than a whole-tree DFS on every file. `target-cpu=native` was measured and made no
+difference (the parse is latency/branch-bound, not SIMD-bound). Prior levers that did *not* pay:
+parser reuse across files (`Parser::new` + `set_language` is 0.16 µs — already trivial) and
+worker oversubscription (18 → 28 threads bought ~3%, left as the `VORPAL_INDEX_THREADS` knob).
 
 2026-08-17 saturation pass (was 8.79 s / 70% core utilization → 7.95 s / ~79%): parallel
 total-order evidence sort+encode (0.47 s → 0.07 s, overlapped with the graph save), the four

@@ -3,144 +3,176 @@
     "abi": 15,
     "commit": "a06c2e4415e9",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-bash",
-    "source_digest": "xxh3:934287845e83e5bd",
+    "source_digest": "xxh3:cde1e30da919c148",
     "version": "0.25.1"
   },
   "tree-sitter-c": {
     "abi": 15,
     "commit": "b780e47fc780",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-c",
-    "source_digest": "xxh3:b145da76ea0dc33d",
+    "source_digest": "xxh3:573dca5fa8c183ac",
     "version": "0.24.2"
   },
   "tree-sitter-c-sharp": {
     "abi": 15,
     "commit": "cac6d5fb595f",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-c-sharp",
-    "source_digest": "xxh3:0d2996892944f918",
+    "source_digest": "xxh3:8fbd5adaa16a66a7",
     "version": "0.23.5"
   },
   "tree-sitter-cpp": {
     "abi": 14,
     "commit": "f41e1a044c8a",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-cpp",
-    "source_digest": "xxh3:8d9414e4e62f04c2",
+    "source_digest": "xxh3:326cfec631aa2327",
     "version": "0.23.4"
   },
   "tree-sitter-css": {
     "abi": 15,
     "commit": "dda5cfc5722c",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-css",
-    "source_digest": "xxh3:d19c55f1b18c3735",
+    "source_digest": "xxh3:ed285f561d7195f3",
     "version": "0.25.0"
   },
   "tree-sitter-dart": {
     "abi": 15,
     "commit": "b57d734c84f5",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/nielsenko/tree-sitter-dart",
-    "source_digest": "xxh3:d973125e99de64e1",
+    "source_digest": "xxh3:8874798438ded27e",
     "version": "0.2.0"
   },
   "tree-sitter-elixir": {
     "abi": 14,
     "commit": "e2d9e6e0e76b",
     "license": "Apache-2.0",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/elixir-lang/tree-sitter-elixir",
-    "source_digest": "xxh3:83c60de83361f045",
+    "source_digest": "xxh3:95ee4b6f42e3c5db",
     "version": "0.3.5"
   },
   "tree-sitter-go": {
     "abi": 15,
     "commit": "1547678a9da5",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-go",
-    "source_digest": "xxh3:edbbdf522d8d581f",
+    "source_digest": "xxh3:f5ee27c0146dcccc",
     "version": "0.25.0"
   },
   "tree-sitter-haskell": {
     "abi": 14,
     "commit": "c30d812bc908",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-haskell",
-    "source_digest": "xxh3:5eecc64d09045f21",
+    "source_digest": "xxh3:e957a61fb261600d",
     "version": "0.23.1"
   },
   "tree-sitter-hcl": {
     "abi": 15,
     "commit": "009def4ae38e",
     "license": "Apache-2.0",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-hcl",
-    "source_digest": "xxh3:9e2bc1c446298f49",
+    "source_digest": "xxh3:5f9c91f65e565032",
     "version": "1.1.0"
   },
   "tree-sitter-html": {
     "abi": 14,
     "commit": "5a5ca8551a17",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-html",
-    "source_digest": "xxh3:71bdd83b11305f54",
+    "source_digest": "xxh3:a003508f85bc533e",
     "version": "0.23.2"
   },
   "tree-sitter-java": {
     "abi": 14,
     "commit": "94703d5a6bed",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-java",
-    "source_digest": "xxh3:fb0b2e78381d8006",
+    "source_digest": "xxh3:3dd6bdb8e0d63dfb",
     "version": "0.23.5"
   },
   "tree-sitter-javascript": {
     "abi": 15,
     "commit": "44c892e0be05",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-javascript",
-    "source_digest": "xxh3:2b56d4a0dc57d855",
+    "source_digest": "xxh3:920237063fe7966d",
     "version": "0.25.0"
   },
   "tree-sitter-json": {
     "abi": 14,
     "commit": "ee35a6ebefce",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-json",
-    "source_digest": "xxh3:e5c9db3b80303203",
+    "source_digest": "xxh3:7c0a9ca98fff1722",
     "version": "0.24.8"
   },
   "tree-sitter-kotlin-sg": {
     "abi": 14,
     "commit": "1a6f9b1ee112",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/ast-grep/tree-sitter-kotlin",
-    "source_digest": "xxh3:4673014291403eaa",
+    "source_digest": "xxh3:7741c9113c502303",
     "version": "0.4.1"
   },
   "tree-sitter-lua": {
     "abi": 15,
     "commit": "10fe0054734e",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-lua",
-    "source_digest": "xxh3:7fdb4c93c134db07",
+    "source_digest": "xxh3:1dd4d8d4f8cd09d0",
     "version": "0.5.0"
   },
   "tree-sitter-md": {
@@ -175,46 +207,55 @@
     "commit": "293fdc02038e",
     "license": "MIT",
     "patches": [
-      "PEP 810 lazy imports: `lazy` soft keyword via an external-scanner context token (src/scanner.c), optional($.lazy) on import_statement/import_from_statement, +test/corpus/lazy_imports.txt (see docs/UPSTREAM.md)"
+      "PEP 810 lazy imports: `lazy` soft keyword via an external-scanner context token (src/scanner.c), optional($.lazy) on import_statement/import_from_statement, +test/corpus/lazy_imports.txt (see docs/UPSTREAM.md)",
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
     ],
     "repository": "https://github.com/tree-sitter/tree-sitter-python",
-    "source_digest": "xxh3:cf6a33a8f956cf64",
+    "source_digest": "xxh3:528b84851d2e3f20",
     "version": "0.25.0"
   },
   "tree-sitter-ruby": {
     "abi": 14,
     "commit": "71bd32fb7607",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-ruby",
-    "source_digest": "xxh3:1d7f726eff8eb31e",
+    "source_digest": "xxh3:cd9bbeec2f131781",
     "version": "0.23.1"
   },
   "tree-sitter-rust": {
     "abi": 15,
     "commit": "77a3747266f4",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-rust",
-    "source_digest": "xxh3:ce50c5429ea39957",
+    "source_digest": "xxh3:b9a7ab416e7c7763",
     "version": "0.24.2"
   },
   "tree-sitter-scala": {
     "abi": 15,
     "commit": "38950b525c9d",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter/tree-sitter-scala",
-    "source_digest": "xxh3:bc91d9e2cd8762dd",
+    "source_digest": "xxh3:45822ef1a0f11bbf",
     "version": "0.26.0"
   },
   "tree-sitter-solidity": {
     "abi": 15,
     "commit": "4e938a46c703",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/JoranHonig/tree-sitter-solidity",
-    "source_digest": "xxh3:645559ae7f44e21e",
+    "source_digest": "xxh3:26f79f55aee5b8d4",
     "version": "1.2.13"
   },
   "tree-sitter-swift": {
@@ -222,10 +263,11 @@
     "commit": "b8b22bffbb34",
     "license": "MIT",
     "patches": [
-      "src/parser.c is the crates.io-packaged generated parser: upstream git does not commit generated sources (verified: all other vendored sources byte-match the pinned commit)"
+      "src/parser.c is the crates.io-packaged generated parser: upstream git does not commit generated sources (verified: all other vendored sources byte-match the pinned commit)",
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
     ],
     "repository": "https://github.com/alex-pinkus/tree-sitter-swift",
-    "source_digest": "xxh3:aaf2f6a2cc17eb8a",
+    "source_digest": "xxh3:7b1b1dadd0d67a36",
     "version": "0.7.3"
   },
   "tree-sitter-typescript": {
@@ -241,9 +283,11 @@
     "abi": 14,
     "commit": "7708026449be",
     "license": "MIT",
-    "patches": [],
+    "patches": [
+      "ASCII/low-codepoint fast path in set_contains (src/tree_sitter/parser.h): linear scan of leading ranges for lookahead < 0x80, byte-identical membership vs the binary search — cuts identifier-lexing cost (see docs/UPSTREAM.md)"
+    ],
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-yaml",
-    "source_digest": "xxh3:0df638e19971a497",
+    "source_digest": "xxh3:d1efdda20594bb74",
     "version": "0.7.2"
   }
 }

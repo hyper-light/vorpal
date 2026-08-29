@@ -140,6 +140,11 @@ impl<'r, D: Doc> Node<'r, D> {
   pub fn is_error(&self) -> bool {
     self.inner.is_error()
   }
+  /// Whether this node or any descendant is an ERROR/MISSING node — an O(1) subtree-flag read
+  /// on tree-sitter backends. Lets callers skip a full error-scan walk on clean parses.
+  pub fn has_error(&self) -> bool {
+    self.inner.has_error()
+  }
   pub fn kind(&self) -> Cow<'_, str> {
     self.inner.kind()
   }

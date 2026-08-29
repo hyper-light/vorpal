@@ -963,9 +963,15 @@ fn stream_apply_impl<'i, F>(
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
-  let threads = std::thread::available_parallelism()
-    .map(|n| n.get())
-    .unwrap_or(1);
+  let threads = std::env::var("VORPAL_INDEX_THREADS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .filter(|&n: &usize| n > 0)
+    .unwrap_or_else(|| {
+      std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+    });
   // Shards are deliberately small: sequential admission keeps the in-flight window narrow,
   // and with a handful of huge shards only one or two committers were ever active — the
   // replay profile showed every worker blocked on a full committer channel while one
