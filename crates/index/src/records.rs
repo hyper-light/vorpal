@@ -259,11 +259,16 @@ pub struct DeadRecord {
   pub in_degree: u64,
 }
 
-/// The dead-code scan's answer: candidates plus the honesty envelope — how many were
-/// suppressed and why, and whether name suppression was even available.
+/// The dead-code scan's answer: one page of candidates plus the honesty envelope — the
+/// full candidate total, how many were suppressed and why, and whether name suppression
+/// was even available.
 #[derive(Serialize, Debug)]
-pub struct DeadReport {
+pub struct DeadPage {
+  /// The requested page of candidates (ascending node id over the whole candidate set).
   pub records: Vec<DeadRecord>,
+  pub total: usize,
+  pub start: usize,
+  pub end: usize,
   /// Candidates whose NAME appears in evidence (some occurrence referenced it — resolved,
   /// external, masked, or a namesake tie): extraction saw a use that resolution could not
   /// pin to this node, so calling it dead would be a guess. Function-pointer tables and
@@ -295,12 +300,16 @@ pub struct DeadFilter {
 /// bytes inside ERROR nodes are reported as suppressed, not dead.
 const DEAD_DAMAGE_RATIO: f64 = 0.10;
 
-/// Whole-graph dead-definition scan. Deterministic: candidates in ascending node id.
-pub fn dead_records(
+/// Whole-graph dead-definition scan, page-materialized. Deterministic: candidates in
+/// ascending node id; `page` selects which slice becomes full records (at kernel scale
+/// ~430K raw candidates survive the edge scan — building NodeRecords for all of them was
+/// 120 ms of the original 250; a page costs microseconds).
+pub fn dead_records_page(
   kg: &Kg,
   artifacts_dir: Option<&std::path::Path>,
   filter: &DeadFilter,
-) -> Result<DeadReport, String> {
+  page: PageRequest<'_>,
+) -> Result<DeadPage, String> {
   use rayon::prelude::*;
 
   let mut allowed = [false; 256];
@@ -335,17 +344,39 @@ pub fn dead_records(
     mask
   };
 
-  // Pass 1 (parallel, allocation-free per node): kind gate, then the in-edge type scan.
-  // Node views (heap string reads) are only built for survivors, in pass 2.
+  // Pass 1 (parallel): cheapest gates first — the u8 kind tag, then the in-edge type slice
+  // (both allocation-free; most definitions have semantic in-edges and die here) — and only
+  // then the heap-string view for the path/export filters. At kernel scale this ordering is
+  // the difference between 2.7M three-string view materializations and ~400K.
+  let needs_view = filter.exported_only
+    || filter.exclude_tests
+    || filter.path_prefix.is_some()
+    || filter.path_suffix.is_some();
   let node_count = kg.node_count() as u64;
+  let kind_tags = kg.kind_tags();
   let candidates: Vec<u64> = (0..node_count)
     .into_par_iter()
     .filter(|&row| {
       let id = NodeId::new(row);
-      let Some(view) = kg.node(id) else { return false };
-      if !allowed[view.kind.tag() as usize] {
+      let tag = match kind_tags {
+        Some(tags) => tags.get(row as usize).copied(),
+        None => kg.node_kind(id).map(|kind| kind.tag()),
+      };
+      let Some(tag) = tag else { return false };
+      if !allowed[tag as usize] {
         return false;
       }
+      if kg
+        .in_edge_types_of(id)
+        .iter()
+        .any(|&packed| semantic[vorpal_kg::EdgeType(packed).base().0 as usize & 0xff])
+      {
+        return false;
+      }
+      if !needs_view {
+        return true;
+      }
+      let Some(view) = kg.node(id) else { return false };
       if filter.exported_only && !view.exported {
         return false;
       }
@@ -357,94 +388,106 @@ pub fn dead_records(
           return false;
         }
       }
-      if let Some(suffix) = filter.path_suffix.as_deref() {
-        if !view.path.ends_with(suffix) {
-          return false;
-        }
+      match filter.path_suffix.as_deref() {
+        Some(suffix) => view.path.ends_with(suffix),
+        None => true,
       }
-      !kg
-        .in_edge_types_of(id)
-        .iter()
-        .any(|&packed| semantic[vorpal_kg::EdgeType(packed).base().0 as usize & 0xff])
     })
     .collect();
 
   // Pass 2: referenced-name suppression — any evidence occurrence carrying this name's hash
   // (any outcome) means extraction saw a use; absence of an edge is then attribution
-  // failure, not death. Conservative by design.
-  let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
+  // failure, not death. Conservative by design. Membership structure: collect + parallel
+  // sort + dedup, then binary search — at kernel scale (~6.9M occurrences) this builds in
+  // tens of ms where a SipHash set build was the scan's dominant cost.
+  let mut referenced: Vec<u32> = Vec::new();
   let name_suppression = kg.for_each_evidence_name_hash(|hash| {
-    referenced.insert(hash);
+    referenced.push(hash);
   });
+  referenced.par_sort_unstable();
+  referenced.dedup();
   let mut suppressed_referenced = 0u64;
   let mut suppressed_damaged = 0u64;
   let pack = artifacts_dir.and_then(crate::cached_pack);
-  // Per-file damage ratio, computed once per distinct candidate path (candidates are id-
-  // ordered = path-grouped).
+  // Suppression works on the cheap accessors (name for the hash, path for the damage
+  // lookup) — full records are built only for the requested page below. Per-file damage is
+  // computed once per distinct candidate path (candidates are id-ordered = path-grouped).
   let mut damage_cache: Option<(String, bool)> = None;
-  let mut records = Vec::new();
+  let mut survivors: Vec<u64> = Vec::new();
   for row in candidates {
     let id = NodeId::new(row);
-    let Some(node) = node_record(kg, id) else { continue };
     if name_suppression {
-      let hash = xxhash_rust::xxh3::xxh3_64(node.name.as_bytes()) as u32;
-      if referenced.contains(&hash) {
+      let Some(name) = kg.node_name(id) else { continue };
+      let hash = xxhash_rust::xxh3::xxh3_64(name.as_bytes()) as u32;
+      if referenced.binary_search(&hash).is_ok() {
         suppressed_referenced += 1;
         continue;
       }
     }
     if let Some(pack) = pack.as_deref() {
-      if damage_cache.as_ref().is_none_or(|(path, _)| path != &node.path) {
-        let damaged = pack.get(&node.path).is_some_and(|bytes| {
+      let Some(path) = kg.node_path(id) else { continue };
+      if damage_cache.as_ref().is_none_or(|(cached, _)| cached != path) {
+        let damaged = pack.get(path).is_some_and(|bytes| {
           let error_bytes = vorpal_ingest::peek_product_error_bytes(bytes).unwrap_or(0);
           let size = vorpal_ingest::peek_product_stamps(bytes).map_or(0, |(size, _)| size);
           size > 0 && (error_bytes as f64 / size as f64) > DEAD_DAMAGE_RATIO
         });
-        damage_cache = Some((node.path.clone(), damaged));
+        damage_cache = Some((path.to_string(), damaged));
       }
       if damage_cache.as_ref().is_some_and(|&(_, damaged)| damaged) {
         suppressed_damaged += 1;
         continue;
       }
     }
-    let in_degree = kg.in_degree(id) as u64;
-    records.push(DeadRecord { node, in_degree });
+    survivors.push(row);
   }
-  Ok(DeadReport {
+  let PageBounds { start, end, total } = page_bounds(survivors.len(), page.cursor, page.limit)?;
+  let records = survivors[start..end]
+    .iter()
+    .filter_map(|&row| {
+      let id = NodeId::new(row);
+      Some(DeadRecord {
+        node: node_record(kg, id)?,
+        in_degree: kg.in_degree(id) as u64,
+      })
+    })
+    .collect();
+  Ok(DeadPage {
     records,
+    total,
+    start,
+    end,
     suppressed_referenced,
     suppressed_damaged,
     name_suppression,
   })
 }
 
-/// Rendered dead-code report: the honesty head, then one line per candidate — capped, so a
-/// whole-tree scan stays readable (and token-sane in a tool result); the full set pages
-/// through the records surface.
-pub fn render_dead(report: &DeadReport) -> String {
+/// Rendered dead-code page: the honesty head (whole-scan totals), then one line per record
+/// in this page. Text callers pass a 200-record page; the full set pages through records.
+pub fn render_dead(report: &DeadPage) -> String {
   use std::fmt::Write;
-  const TEXT_CAP: usize = 200;
   let mut out = String::new();
   let _ = writeln!(
     out,
     "{} dead candidates ({} suppressed: name referenced somewhere; {} suppressed: file parse-damaged{})",
-    report.records.len(),
+    report.total,
     report.suppressed_referenced,
     report.suppressed_damaged,
     if report.name_suppression { "" } else { "; no evidence sidecar — name suppression unavailable" },
   );
-  for record in report.records.iter().take(TEXT_CAP) {
+  for record in &report.records {
     let _ = writeln!(
       out,
       "{} [{}] {}  (in-degree {})",
       record.node.name, record.node.kind, record.node.path, record.in_degree
     );
   }
-  if report.records.len() > TEXT_CAP {
+  if report.end < report.total {
     let _ = writeln!(
       out,
       "… {} more — refine (--kind/--prefix/--path/--exported) or page the records surface",
-      report.records.len() - TEXT_CAP
+      report.total - report.end
     );
   }
   out
@@ -473,30 +516,36 @@ pub struct CoverageReport {
   pub total_error_bytes: u64,
 }
 
-/// Sweep the generation's product bank: one header peek per file. Absence of a bank yields
-/// an empty report with totals 0 — callers state that, never "everything parsed".
+/// Sweep the generation's product bank: one header peek per file, fanned across the pool
+/// (peeks fault mapped pages — exactly the work that parallelizes). Absence of a bank
+/// yields an empty report with totals 0 — callers state that, never "everything parsed".
 pub fn coverage_records(artifacts_dir: Option<&std::path::Path>) -> CoverageReport {
+  use rayon::prelude::*;
   let mut records = Vec::new();
   let mut total_files = 0u64;
   let mut total_error_bytes = 0u64;
   if let Some(pack) = artifacts_dir.and_then(crate::cached_pack) {
-    for (path, bytes) in pack.entries() {
-      total_files += 1;
-      let error_nodes = vorpal_ingest::peek_product_error_nodes(bytes).unwrap_or(0);
-      let error_bytes = vorpal_ingest::peek_product_error_bytes(bytes).unwrap_or(0);
-      if error_nodes == 0 && error_bytes == 0 {
-        continue;
-      }
-      total_error_bytes += error_bytes;
-      let size = vorpal_ingest::peek_product_stamps(bytes).map_or(0, |(size, _)| size);
-      records.push(CoverageRecord {
-        path: path.to_string(),
-        error_nodes: error_nodes as u64,
-        error_bytes,
-        size,
-        ratio: if size > 0 { error_bytes as f64 / size as f64 } else { 0.0 },
-      });
-    }
+    let entries: Vec<(&str, &[u8])> = pack.entries().collect();
+    total_files = entries.len() as u64;
+    records = entries
+      .par_iter()
+      .filter_map(|&(path, bytes)| {
+        let error_nodes = vorpal_ingest::peek_product_error_nodes(bytes).unwrap_or(0);
+        let error_bytes = vorpal_ingest::peek_product_error_bytes(bytes).unwrap_or(0);
+        if error_nodes == 0 && error_bytes == 0 {
+          return None;
+        }
+        let size = vorpal_ingest::peek_product_stamps(bytes).map_or(0, |(size, _)| size);
+        Some(CoverageRecord {
+          path: path.to_string(),
+          error_nodes: error_nodes as u64,
+          error_bytes,
+          size,
+          ratio: if size > 0 { error_bytes as f64 / size as f64 } else { 0.0 },
+        })
+      })
+      .collect();
+    total_error_bytes = records.iter().map(|r| r.error_bytes).sum();
   }
   records.sort_by(|a, b| {
     b.ratio
@@ -650,6 +699,13 @@ pub enum Selected<T> {
 /// contract every paged surface shares (MCP tools, `--format json` CLI verbs). `cursor` is
 /// an opaque `o:<offset>` into the record order; `limit` caps the page (default 100, max
 /// 1000). Errors are plain messages for the surface to wrap in its own error shape.
+/// A page request as surfaces receive it: the raw cursor + limit pair.
+#[derive(Clone, Copy, Default)]
+pub struct PageRequest<'a> {
+  pub cursor: Option<&'a str>,
+  pub limit: Option<u64>,
+}
+
 pub struct PageBounds {
   pub start: usize,
   pub end: usize,
@@ -786,6 +842,106 @@ pub fn related_records(
   ))
 }
 
+/// One page of a selector-driven query whose full record set would be expensive to
+/// materialize: the page's records plus the bounds that locate it in the deterministic
+/// whole. `NoMatch`/`Ambiguous` keep the usual meanings.
+#[derive(Debug)]
+pub enum SelectedPage<T> {
+  NoMatch,
+  Ambiguous(Vec<NodeRecord>),
+  Page {
+    records: Vec<T>,
+    total: usize,
+    start: usize,
+    end: usize,
+  },
+}
+
+/// The structured envelope for a pre-sliced page — identical shape to [`paged_value`],
+/// without re-serializing anything outside the page.
+pub fn selected_page_value<T: Serialize>(
+  selected: SelectedPage<T>,
+  cursor: Option<&str>,
+  limit: Option<u64>,
+) -> Result<serde_json::Value, String> {
+  match selected {
+    SelectedPage::NoMatch => Ok(serde_json::json!({
+      "outcome": "no-match", "records": [], "total": 0, "truncated": false
+    })),
+    SelectedPage::Ambiguous(candidates) => paged_value(&candidates, cursor, limit, "ambiguous"),
+    SelectedPage::Page {
+      records,
+      total,
+      end,
+      ..
+    } => {
+      let page: Vec<serde_json::Value> = records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap_or(serde_json::Value::Null))
+        .collect();
+      let mut data = serde_json::json!({
+        "outcome": "hits",
+        "records": page,
+        "total": total,
+        "truncated": end < total,
+      });
+      if end < total {
+        data["nextCursor"] = serde_json::json!(format!("o:{end}"));
+      }
+      Ok(data)
+    }
+  }
+}
+
+/// [`reach_records`] materializing NodeRecords **only for one page**: the BFS still runs
+/// whole (steps are 16-byte Copy values — the deterministic vector the cursor indexes),
+/// but the heap-string record construction is paid per page, not per closure. An
+/// undirected kernel walk reaches 200K+ nodes; building 200K records to emit 100 was the
+/// dominant cost of the paged surface.
+pub fn reach_records_page(
+  kg: &Kg,
+  target: &GraphTarget,
+  dir: vorpal_kg::Direction,
+  relations: &[vorpal_kg::EdgeType],
+  max_depth: Option<u32>,
+  min_confidence: u8,
+  page: PageRequest<'_>,
+) -> Result<SelectedPage<ReachRecord>, String> {
+  let matches = resolve_target(kg, target).map_err(|err| err.to_string())?;
+  if matches.is_empty() {
+    return Ok(SelectedPage::NoMatch);
+  }
+  if matches.len() > 1 && !target.merge_all {
+    return Ok(SelectedPage::Ambiguous(
+      matches.iter().filter_map(|&id| node_record(kg, id)).collect(),
+    ));
+  }
+  let mut steps = Vec::new();
+  for &seed in &matches {
+    steps.extend(kg.reachable_via_paths(seed, dir, relations, max_depth, min_confidence));
+  }
+  let PageBounds { start, end, total } = page_bounds(steps.len(), page.cursor, page.limit)?;
+  let records = steps[start..end]
+    .iter()
+    .filter_map(|step| {
+      Some(ReachRecord {
+        node: node_record(kg, NodeId::new(step.node as u64))?,
+        depth: step.depth,
+        via: step.via.0 as u64,
+        relation: step.via.1.name().to_string(),
+        grade: crate::confidence_label(step.via.1.confidence()).to_string(),
+        edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+      })
+    })
+    .collect();
+  Ok(SelectedPage::Page {
+    records,
+    total,
+    start,
+    end,
+  })
+}
+
 /// The typed twin of `reachable`: BFS steps in deterministic order, each step carrying its
 /// parent and the (grade-labeled) edge that reached it.
 pub fn reach_records(
@@ -910,4 +1066,89 @@ pub fn evidence_records(
       span: [row.span_start, row.span_end],
     })
     .collect()
+}
+
+#[cfg(test)]
+mod dead_bench {
+  use super::*;
+
+  /// Sub-step timing against a real index: `VORPAL_BENCH_INDEX=<dir> cargo test --release
+  /// -p vorpal-index --lib dead_bench -- --ignored --nocapture`.
+  #[test]
+  #[ignore = "diagnostic: localizes dead-scan cost on a real index"]
+  fn where_does_dead_spend() {
+    use rayon::prelude::*;
+    let Ok(dir) = std::env::var("VORPAL_BENCH_INDEX") else { return };
+    let kg = Kg::load(std::path::Path::new(&dir)).unwrap();
+    let t = std::time::Instant::now();
+    let filter = DeadFilter::default();
+    let report = dead_records_page(&kg, None, &filter, PageRequest::default()).unwrap();
+    println!("whole (no pack): {:?} ({} candidates)", t.elapsed(), report.total);
+
+    let mut allowed = [false; 256];
+    for kind in [
+      vorpal_kg::SymbolKind::Function,
+      vorpal_kg::SymbolKind::Method,
+      vorpal_kg::SymbolKind::Class,
+      vorpal_kg::SymbolKind::Struct,
+      vorpal_kg::SymbolKind::Enum,
+      vorpal_kg::SymbolKind::Interface,
+      vorpal_kg::SymbolKind::Constructor,
+    ] {
+      allowed[kind.tag() as usize] = true;
+    }
+    let semantic = {
+      let mut mask = [false; 256];
+      for edge in [
+        vorpal_kg::EdgeType::CALLS,
+        vorpal_kg::EdgeType::REFERENCES,
+        vorpal_kg::EdgeType::IMPORTS,
+        vorpal_kg::EdgeType::IMPLEMENTS,
+        vorpal_kg::EdgeType::OF_TYPE,
+        vorpal_kg::EdgeType::OVERRIDES,
+      ] {
+        mask[edge.0 as usize & 0xff] = true;
+      }
+      mask
+    };
+    let n = kg.node_count() as u64;
+    let tags = kg.kind_tags().unwrap();
+
+    let t = std::time::Instant::now();
+    let kind_only: u64 = (0..n).into_par_iter().filter(|&r| allowed[tags[r as usize] as usize]).count() as u64;
+    println!("kind gate only: {:?} ({kind_only} pass)", t.elapsed());
+
+    let t = std::time::Instant::now();
+    let survivors: Vec<u64> = (0..n)
+      .into_par_iter()
+      .filter(|&r| {
+        allowed[tags[r as usize] as usize]
+          && !kg
+            .in_edge_types_of(NodeId::new(r))
+            .iter()
+            .any(|&p| semantic[vorpal_kg::EdgeType(p).base().0 as usize & 0xff])
+      })
+      .collect();
+    println!("+ in-edge scan: {:?} ({} pass)", t.elapsed(), survivors.len());
+
+    let t = std::time::Instant::now();
+    let viewed = survivors.iter().filter(|&&r| kg.node(NodeId::new(r)).is_some()).count();
+    println!("+ survivor views (serial): {:?} ({viewed})", t.elapsed());
+
+    let t = std::time::Instant::now();
+    let mut hashes: Vec<u32> = Vec::new();
+    kg.for_each_evidence_name_hash(|h| hashes.push(h));
+    println!("name-hash collect: {:?} ({} rows)", t.elapsed(), hashes.len());
+    let t = std::time::Instant::now();
+    hashes.par_sort_unstable();
+    hashes.dedup();
+    println!("sort+dedup: {:?} ({} distinct)", t.elapsed(), hashes.len());
+
+    let t = std::time::Instant::now();
+    let built = survivors
+      .iter()
+      .filter_map(|&r| node_record(&kg, NodeId::new(r)))
+      .count();
+    println!("record build for survivors: {:?} ({built})", t.elapsed());
+  }
 }

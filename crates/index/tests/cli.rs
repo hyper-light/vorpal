@@ -1705,10 +1705,11 @@ fn dead_scan_finds_uncalled_definitions_and_suppresses_referenced_names() {
   build_index(&src, &out).unwrap();
 
   let kg = Kg::load(&out).unwrap();
-  let report = vorpal_index::records::dead_records(
+  let report = vorpal_index::records::dead_records_page(
     &kg,
     Some(&live(&out)),
     &vorpal_index::records::DeadFilter::default(),
+    vorpal_index::records::PageRequest::default(),
   )
   .unwrap();
   let names: Vec<&str> = report.records.iter().map(|r| r.node.name.as_str()).collect();
@@ -1728,24 +1729,26 @@ fn dead_scan_finds_uncalled_definitions_and_suppresses_referenced_names() {
   assert!(vorpal_index::records::pattern_records(&kg, "st[").is_err());
 
   // Kind filter narrows; unknown kind errors loudly.
-  let only_fn = vorpal_index::records::dead_records(
+  let only_fn = vorpal_index::records::dead_records_page(
     &kg,
     Some(&live(&out)),
     &vorpal_index::records::DeadFilter {
       kind: Some("function".into()),
       ..Default::default()
     },
+    vorpal_index::records::PageRequest::default(),
   )
   .unwrap();
   assert!(only_fn.records.iter().all(|r| r.node.kind == "Function"));
   assert!(
-    vorpal_index::records::dead_records(
+    vorpal_index::records::dead_records_page(
       &kg,
       None,
       &vorpal_index::records::DeadFilter {
         kind: Some("gizmo".into()),
         ..Default::default()
-      }
+      },
+      vorpal_index::records::PageRequest::default(),
     )
     .is_err()
   );

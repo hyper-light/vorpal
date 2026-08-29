@@ -45,10 +45,55 @@ const PACK_VERSION: u32 = 2;
 /// A live entry: body offset + length within the pack.
 type Entry = (u64, u32);
 
+/// Where an entry's path bytes live: the retained sidecar buffer, or the mapped pack itself
+/// (tail-scanned records). Referencing ranges instead of owning strings is what makes open()
+/// allocation-free per entry — at kernel scale the old `HashMap<Box<str>, _>` build was 72k
+/// heap allocations + SipHash, ~5 ms of pure tax on every one-shot query and every replay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathSrc {
+  Sidecar,
+  Pack,
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+  path_src: PathSrc,
+  path_off: u64,
+  path_len: u32,
+  body_off: u64,
+  body_len: u32,
+}
+
+/// Keys are already xxh3-mixed, so the map hasher is the identity — full hash quality with
+/// zero re-hash work. Deterministic and dependency-free.
+#[derive(Default)]
+struct PrehashedId(u64);
+
+impl std::hash::Hasher for PrehashedId {
+  fn finish(&self) -> u64 {
+    self.0
+  }
+  fn write(&mut self, _bytes: &[u8]) {
+    unreachable!("prehashed keys only")
+  }
+  fn write_u64(&mut self, key: u64) {
+    self.0 = key;
+  }
+}
+
+type PrehashedMap = HashMap<u64, Slot, std::hash::BuildHasherDefault<PrehashedId>>;
+
 /// Read side: the mapped pack plus its live-entry index.
 pub struct PackReader {
   store: Arc<MappedStore>,
-  index: HashMap<Box<str>, Entry>,
+  /// Retained sidecar bytes — the backing for `PathSrc::Sidecar` ranges.
+  sidecar: Vec<u8>,
+  /// `xxh3(path)` → slot. Every hit is byte-verified against the slot's path range, so a
+  /// 64-bit collision can never serve the wrong product.
+  index: PrehashedMap,
+  /// Same-hash-different-path residents (astronomically rare): checked after a failed
+  /// primary verification.
+  overflow: Vec<(u64, Slot)>,
 }
 
 impl PackReader {
@@ -75,14 +120,19 @@ impl PackReader {
       return None;
     }
 
-    let mut index = HashMap::new();
+    let mut reader = PackReader {
+      store: store.clone(),
+      sidecar: Vec::new(),
+      index: PrehashedMap::default(),
+      overflow: Vec::new(),
+    };
     let mut scan_from = 8usize;
-    if let Some((entries, covered)) = read_sidecar(&dir.join(PACK_INDEX), bytes.len()) {
-      index = entries;
+    if let Some(covered) = reader.load_sidecar(&dir.join(PACK_INDEX), bytes.len()) {
       scan_from = covered;
     }
     // Recovery / tail scan: pick up records the sidecar has not seen. A torn final record
     // fails a bounds check and ends the scan; whatever decoded cleanly is kept.
+    let bytes = store.as_bytes();
     let mut at = scan_from;
     while at + 8 <= bytes.len() {
       let path_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
@@ -100,68 +150,145 @@ impl PackReader {
       let Some(body_end) = body_at.checked_add(body_len).filter(|&e| e <= bytes.len()) else {
         break;
       };
-      index.insert(path.into(), (body_at as u64, body_len as u32));
+      let slot = Slot {
+        path_src: PathSrc::Pack,
+        path_off: (at + 4) as u64,
+        path_len: path_len as u32,
+        body_off: body_at as u64,
+        body_len: body_len as u32,
+      };
+      reader.insert(xxhash_rust::xxh3::xxh3_64(path.as_bytes()), slot);
       at = body_end;
     }
-    Some(PackReader { store, index })
+    Some(reader)
+  }
+
+  /// Parse the sidecar into slots referencing its retained bytes. Returns the covered
+  /// length on success; on any inconsistency the whole sidecar is discarded (recovery scan
+  /// takes over), never half-trusted.
+  fn load_sidecar(&mut self, path: &Path, pack_len: usize) -> Option<usize> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 24 || &bytes[0..4] != IDX_MAGIC {
+      return None;
+    }
+    if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PACK_VERSION {
+      return None;
+    }
+    let covered = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+    if covered > pack_len {
+      return None; // sidecar from a different pack generation
+    }
+    let count = u64::from_le_bytes(bytes[16..24].try_into().ok()?) as usize;
+    let mut index = PrehashedMap::with_capacity_and_hasher(count, Default::default());
+    let mut overflow = Vec::new();
+    let mut at = 24usize;
+    for _ in 0..count {
+      let path_len = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+      let path = std::str::from_utf8(bytes.get(at + 4..at + 4 + path_len)?).ok()?;
+      let off_at = at + 4 + path_len;
+      let off = u64::from_le_bytes(bytes.get(off_at..off_at + 8)?.try_into().ok()?);
+      let len = u32::from_le_bytes(bytes.get(off_at + 8..off_at + 12)?.try_into().ok()?);
+      if off as usize + len as usize > pack_len {
+        return None;
+      }
+      let slot = Slot {
+        path_src: PathSrc::Sidecar,
+        path_off: (at + 4) as u64,
+        path_len: path_len as u32,
+        body_off: off,
+        body_len: len,
+      };
+      let hash = xxhash_rust::xxh3::xxh3_64(path.as_bytes());
+      // Canonical sidecars carry unique paths; same-hash residents go to overflow.
+      match index.entry(hash) {
+        std::collections::hash_map::Entry::Vacant(slot_entry) => {
+          slot_entry.insert(slot);
+        }
+        std::collections::hash_map::Entry::Occupied(_) => overflow.push((hash, slot)),
+      }
+      at = off_at + 12;
+    }
+    self.sidecar = bytes;
+    self.index = index;
+    self.overflow = overflow;
+    Some(covered)
+  }
+
+  fn path_bytes(&self, slot: &Slot) -> &[u8] {
+    let (start, end) = (slot.path_off as usize, (slot.path_off + slot.path_len as u64) as usize);
+    match slot.path_src {
+      PathSrc::Sidecar => self.sidecar.get(start..end).unwrap_or(&[]),
+      PathSrc::Pack => self.store.as_bytes().get(start..end).unwrap_or(&[]),
+    }
+  }
+
+  /// Insert (tail scan): replace an existing same-path slot wherever it lives, else claim
+  /// the primary map slot or overflow. Runs only for records past the sidecar's covered
+  /// length (a handful after a kill; the whole pack only when the sidecar is gone), so the
+  /// owned needle allocation is off the common open path.
+  fn insert(&mut self, hash: u64, slot: Slot) {
+    let Some(&existing) = self.index.get(&hash) else {
+      self.index.insert(hash, slot);
+      return;
+    };
+    let needle = self.path_bytes(&slot).to_vec();
+    if self.path_bytes(&existing) == needle.as_slice() {
+      self.index.insert(hash, slot);
+      return;
+    }
+    if let Some(i) = (0..self.overflow.len())
+      .find(|&i| self.overflow[i].0 == hash && self.path_bytes(&self.overflow[i].1) == needle)
+    {
+      self.overflow[i].1 = slot;
+      return;
+    }
+    self.overflow.push((hash, slot));
+  }
+
+  fn lookup(&self, path: &str) -> Option<&Slot> {
+    let hash = xxhash_rust::xxh3::xxh3_64(path.as_bytes());
+    if let Some(slot) = self.index.get(&hash) {
+      if self.path_bytes(slot) == path.as_bytes() {
+        return Some(slot);
+      }
+    }
+    self
+      .overflow
+      .iter()
+      .find(|(h, slot)| *h == hash && self.path_bytes(slot) == path.as_bytes())
+      .map(|(_, slot)| slot)
+  }
+
+  fn body(&self, slot: &Slot) -> Option<&[u8]> {
+    self
+      .store
+      .as_bytes()
+      .get(slot.body_off as usize..(slot.body_off + slot.body_len as u64) as usize)
   }
 
   /// The cached product bytes for `path`, if packed. Decode + stamp validation stay the
   /// caller's job — exactly as with a loose file's bytes.
   pub fn get(&self, path: &str) -> Option<&[u8]> {
-    let &(off, len) = self.index.get(path)?;
-    self
-      .store
-      .as_bytes()
-      .get(off as usize..off as usize + len as usize)
+    self.body(self.lookup(path)?)
   }
 
   fn entry(&self, path: &str) -> Option<Entry> {
-    self.index.get(path).copied()
+    self.lookup(path).map(|slot| (slot.body_off, slot.body_len))
   }
 
   /// Every packed `(path, product bytes)` pair, in unspecified order — whole-bank sweeps
   /// (coverage overviews) sort their own results. Bytes are the raw cached product; decode
   /// and stamp validation stay the caller's job.
   pub fn entries(&self) -> impl Iterator<Item = (&str, &[u8])> {
-    self.index.iter().filter_map(|(path, &(off, len))| {
-      let bytes = self
-        .store
-        .as_bytes()
-        .get(off as usize..off as usize + len as usize)?;
-      Some((path.as_ref(), bytes))
-    })
+    self
+      .index
+      .values()
+      .chain(self.overflow.iter().map(|(_, slot)| slot))
+      .filter_map(|slot| {
+        let path = std::str::from_utf8(self.path_bytes(slot)).ok()?;
+        Some((path, self.body(slot)?))
+      })
   }
-}
-
-fn read_sidecar(path: &Path, pack_len: usize) -> Option<(HashMap<Box<str>, Entry>, usize)> {
-  let bytes = fs::read(path).ok()?;
-  if bytes.len() < 24 || &bytes[0..4] != IDX_MAGIC {
-    return None;
-  }
-  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PACK_VERSION {
-    return None;
-  }
-  let covered = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
-  if covered > pack_len {
-    return None; // sidecar from a different pack generation
-  }
-  let count = u64::from_le_bytes(bytes[16..24].try_into().ok()?) as usize;
-  let mut entries = HashMap::with_capacity(count);
-  let mut at = 24usize;
-  for _ in 0..count {
-    let path_len = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
-    let path = std::str::from_utf8(bytes.get(at + 4..at + 4 + path_len)?).ok()?;
-    let off_at = at + 4 + path_len;
-    let off = u64::from_le_bytes(bytes.get(off_at..off_at + 8)?.try_into().ok()?);
-    let len = u32::from_le_bytes(bytes.get(off_at + 8..off_at + 12)?.try_into().ok()?);
-    if off as usize + len as usize > pack_len {
-      return None;
-    }
-    entries.insert(path.into(), (off, len));
-    at = off_at + 12;
-  }
-  Some((entries, covered))
 }
 
 /// One message from the extraction pipeline to the pack thread: a freshly encoded product

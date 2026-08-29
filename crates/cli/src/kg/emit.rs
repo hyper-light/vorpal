@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use vorpal_index::records::{Selected, paged_value, selected_value};
+use vorpal_index::records::{Selected, SelectedPage, paged_value, selected_page_value, selected_value};
 
 /// One page of a selector outcome, pretty-printed.
 pub fn selected_json<T: Serialize>(
@@ -14,6 +14,16 @@ pub fn selected_json<T: Serialize>(
   limit: Option<u64>,
 ) -> Result<String> {
   let value = selected_value(selected, cursor, limit).map_err(anyhow::Error::msg)?;
+  Ok(serde_json::to_string_pretty(&value)?)
+}
+
+/// One pre-sliced page (expensive-to-materialize closures), pretty-printed.
+pub fn selected_page_json<T: Serialize>(
+  selected: SelectedPage<T>,
+  cursor: Option<&str>,
+  limit: Option<u64>,
+) -> Result<String> {
+  let value = selected_page_value(selected, cursor, limit).map_err(anyhow::Error::msg)?;
   Ok(serde_json::to_string_pretty(&value)?)
 }
 

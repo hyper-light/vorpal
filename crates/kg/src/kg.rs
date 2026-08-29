@@ -401,6 +401,29 @@ impl Kg {
     self.heap_str(self.cols.name_off, self.cols.name_len, row)
   }
 
+  /// Just the node's kind — one u8 column read. Whole-graph scans gate on this before
+  /// touching any heap string.
+  pub fn node_kind(&self, id: NodeId) -> Option<SymbolKind> {
+    let (_segment, row) = self.directory.locate(id)?;
+    Some(SymbolKind::from_tag(
+      self.nodes.column_at(self.cols.kind)?.get_u8(row)?,
+    ))
+  }
+
+  /// The raw kind-tag column as one contiguous stripe (row index == dense `NodeId`) — the
+  /// whole-graph scan fast path: no per-row directory lookup, no bounds ceremony. `None`
+  /// when the segment stores kinds some other way; callers fall back to [`Kg::node_kind`].
+  pub fn kind_tags(&self) -> Option<&[u8]> {
+    self.nodes.column_at(self.cols.kind)?.as_slice::<u8>()
+  }
+
+  /// Just the node's defining path, zero-copy — scan passes that need file identity without
+  /// the full three-string view.
+  pub fn node_path(&self, id: NodeId) -> Option<&str> {
+    let (_segment, row) = self.directory.locate(id)?;
+    self.heap_str(self.cols.path_off, self.cols.path_len, row)
+  }
+
   pub fn node(&self, id: NodeId) -> Option<NodeView<'_>> {
     let (_segment, row) = self.directory.locate(id)?;
     let kind = SymbolKind::from_tag(self.nodes.column_at(self.cols.kind)?.get_u8(row)?);

@@ -320,22 +320,41 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       exported_only: arg.exported,
       exclude_tests: arg.no_tests,
     };
-    let report = vorpal_index::records::dead_records(&kg, Some(&gen_dir), &filter)
-      .map_err(anyhow::Error::msg)?;
     match arg.format {
-      OutputFormat::Text => print!("{}", vorpal_index::records::render_dead(&report)),
-      OutputFormat::Json => {
-        // Page the candidate records; carry the suppression head alongside.
-        let mut value = vorpal_index::records::paged_value(
-          &report.records,
-          arg.page.cursor.as_deref(),
-          arg.page.limit,
-          "hits",
+      OutputFormat::Text => {
+        // Text = the first 200 candidates (whole-scan totals in the head).
+        let report = vorpal_index::records::dead_records_page(
+          &kg,
+          Some(&gen_dir),
+          &filter,
+          vorpal_index::records::PageRequest { cursor: None, limit: Some(200) },
         )
         .map_err(anyhow::Error::msg)?;
-        value["suppressedReferenced"] = report.suppressed_referenced.into();
-        value["suppressedDamaged"] = report.suppressed_damaged.into();
-        value["nameSuppression"] = report.name_suppression.into();
+        print!("{}", vorpal_index::records::render_dead(&report));
+      }
+      OutputFormat::Json => {
+        let report = vorpal_index::records::dead_records_page(
+          &kg,
+          Some(&gen_dir),
+          &filter,
+          vorpal_index::records::PageRequest {
+            cursor: arg.page.cursor.as_deref(),
+            limit: arg.page.limit,
+          },
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut value = serde_json::json!({
+          "outcome": "hits",
+          "records": serde_json::to_value(&report.records)?,
+          "total": report.total,
+          "truncated": report.end < report.total,
+          "suppressedReferenced": report.suppressed_referenced,
+          "suppressedDamaged": report.suppressed_damaged,
+          "nameSuppression": report.name_suppression,
+        });
+        if report.end < report.total {
+          value["nextCursor"] = serde_json::json!(format!("o:{}", report.end));
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
       }
     }
@@ -458,14 +477,18 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         .with_context(|| missing_index_hint(&dir))?;
       let cursor = arg.page.cursor.as_deref();
       let mut json = match (&traversal, arg.verb) {
-        (Some((direction, relations, max_depth, min_confidence)), _) => emit::selected_json(
-          vorpal_index::records::reach_records(
+        (Some((direction, relations, max_depth, min_confidence)), _) => emit::selected_page_json(
+          vorpal_index::records::reach_records_page(
             &kg,
             &target,
             *direction,
             relations,
             *max_depth,
             *min_confidence,
+            vorpal_index::records::PageRequest {
+              cursor,
+              limit: arg.page.limit,
+            },
           )
           .map_err(anyhow::Error::msg)?,
           cursor,

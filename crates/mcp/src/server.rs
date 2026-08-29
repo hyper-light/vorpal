@@ -488,13 +488,29 @@ impl Server {
         self.kg()?;
         let dir = self.kg_dir.clone();
         let kg = self.kg.as_ref().expect("pinned above");
-        let report = vorpal_index::records::dead_records(kg, dir.as_deref(), &filter)
-          .map_err(ToolError::from)?;
+        let report = vorpal_index::records::dead_records_page(
+          kg,
+          dir.as_deref(),
+          &filter,
+          vorpal_index::records::PageRequest {
+            cursor: args.get("cursor").and_then(Value::as_str),
+            limit: args.get("limit").and_then(Value::as_u64),
+          },
+        )
+        .map_err(ToolError::from)?;
         let text = vorpal_index::records::render_dead(&report);
-        let mut data = paged(report.records, args, "hits")?;
-        data["suppressedReferenced"] = report.suppressed_referenced.into();
-        data["suppressedDamaged"] = report.suppressed_damaged.into();
-        data["nameSuppression"] = report.name_suppression.into();
+        let mut data = json!({
+          "outcome": "hits",
+          "records": serde_json::to_value(&report.records).unwrap_or(Value::Null),
+          "total": report.total,
+          "truncated": report.end < report.total,
+          "suppressedReferenced": report.suppressed_referenced,
+          "suppressedDamaged": report.suppressed_damaged,
+          "nameSuppression": report.name_suppression,
+        });
+        if report.end < report.total {
+          data["nextCursor"] = json!(format!("o:{}", report.end));
+        }
         Ok((text, data))
       }
       "snippet" => {
@@ -614,19 +630,40 @@ impl Server {
         )
         .map_err(|err| err.to_string())?;
         let kg = self.kg()?;
-        let selected = vorpal_index::records::reach_records(
+        // Page-materialized: the BFS runs whole (that IS the deterministic vector), but
+        // record construction is paid per page — an undirected kernel walk reaches 200K+
+        // nodes and building all their records to serve one page dominated this tool.
+        let selected = vorpal_index::records::reach_records_page(
           kg,
           &target,
           dir,
           &relations,
           max_depth,
           min_confidence,
+          vorpal_index::records::PageRequest {
+            cursor: args.get("cursor").and_then(Value::as_str),
+            limit: args.get("limit").and_then(Value::as_u64),
+          },
         )
         .map_err(ToolError::from)?;
-        let data = selected_data(selected, args)?;
+        let data = vorpal_index::records::selected_page_value(
+          selected,
+          args.get("cursor").and_then(Value::as_str),
+          args.get("limit").and_then(Value::as_u64),
+        )
+        .map_err(|message| ToolError::coded("bad-argument", message))?;
+        // Text stays human-shaped but capped: a full undirected closure renders tens of MB.
         let text = vorpal_index::reachable_query_on(kg, &target, dir, &relations, max_depth, min_confidence)
           .map_err(|err| err.to_string())
           .map_err(ToolError::from)?;
+        const TEXT_CAP: usize = 200;
+        let text = match text.match_indices('\n').nth(TEXT_CAP - 1) {
+          Some((at, _)) if at + 1 < text.len() => {
+            let lines = text.lines().count();
+            format!("{}… {} more lines — page structuredContent\n", &text[..at + 1], lines - TEXT_CAP)
+          }
+          _ => text,
+        };
         Ok((text, data))
       }
       other => Err(ToolError::coded("bad-argument", format!("unknown tool '{other}'"))),

@@ -218,7 +218,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         kind,
         ..Default::default()
       };
-      let report = vorpal_index::records::dead_records(&kg, Some(&dir), &filter)?;
+      let report = vorpal_index::records::dead_records_page(
+        &kg,
+        Some(&dir),
+        &filter,
+        vorpal_index::records::PageRequest { cursor: None, limit: Some(200) },
+      )?;
       print!("{}", vorpal_index::records::render_dead(&report));
       Ok(())
     }
