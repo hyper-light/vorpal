@@ -162,6 +162,10 @@ parts/
 sdist/
 var/
 include/
+# ...but the vendored tree-sitter runtime ships its public headers in include/ (tree_sitter/api.h),
+# which the C build needs. Re-include that specific path despite the broad Python-venv rule above.
+!vendor/tree-sitter/include/
+!vendor/tree-sitter/include/**
 man/
 venv/
 *.egg-info/
