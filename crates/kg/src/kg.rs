@@ -565,9 +565,23 @@ impl Kg {
     max_depth: Option<u32>,
     min_confidence: u8,
   ) -> Vec<vorpal_graph::ReachStep> {
+    self.reachable_via_paths_multi(&[id], dir, edge_types, max_depth, min_confidence)
+  }
+
+  /// Multi-seed form: ONE BFS over the whole seed set, so each reached node's depth is its
+  /// minimum hop distance from ANY seed — the impact-analysis semantics (seeds excluded).
+  pub fn reachable_via_paths_multi(
+    &self,
+    seeds: &[NodeId],
+    dir: Direction,
+    edge_types: &[EdgeType],
+    max_depth: Option<u32>,
+    min_confidence: u8,
+  ) -> Vec<vorpal_graph::ReachStep> {
+    let raw: Vec<u32> = seeds.iter().map(|id| id.raw() as u32).collect();
     vorpal_graph::reachable_typed_paths(
       &self.graph,
-      &[id.raw() as u32],
+      &raw,
       dir,
       edge_types,
       max_depth,

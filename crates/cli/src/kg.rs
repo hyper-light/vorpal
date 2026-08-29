@@ -83,6 +83,8 @@ enum GraphVerb {
   Dead,
   /// Per-file parse-coverage overview (error bytes/ratio, worst first).
   Coverage,
+  /// Blast radius of changed files: git-diff-seeded transitive inbound closure.
+  Impact,
 }
 
 impl GraphVerb {
@@ -99,6 +101,7 @@ impl GraphVerb {
       GraphVerb::Schema => "schema",
       GraphVerb::Dead => "dead",
       GraphVerb::Coverage => "coverage",
+      GraphVerb::Impact => "impact",
     }
   }
 }
@@ -145,6 +148,13 @@ pub struct GraphArg {
   /// (node) List nodes whose name matches this regex instead of an exact name.
   #[clap(long, value_name = "REGEX")]
   pattern: Option<String>,
+  /// (impact) Diff base: everything the branch/worktree changes relative to this ref
+  /// (merge-base semantics). Absent = uncommitted changes only.
+  #[clap(long, value_name = "REF")]
+  since: Option<String>,
+  /// (impact) The indexed source root (a git repo).
+  #[clap(long, value_name = "DIR", default_value = ".")]
+  src: PathBuf,
   /// (dead) Refine to definitions whose file path starts with this prefix.
   #[clap(long, value_name = "PREFIX")]
   prefix: Option<String>,
@@ -279,6 +289,61 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Impact) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let changed = vorpal_index::impact::changed_paths(&arg.src, arg.since.as_deref())
+      .map_err(anyhow::Error::msg)?;
+    let (seeds, missing) = vorpal_index::impact::seeds_for_paths(&kg, &arg.src, &changed);
+    let mut relations = Vec::new();
+    for rel in arg.relations.split(',').filter(|r| !r.trim().is_empty()) {
+      relations.push(
+        vorpal_index::EdgeType::from_name(rel.trim())
+          .ok_or_else(|| anyhow::anyhow!("unknown relation '{rel}'"))?,
+      );
+    }
+    let max_depth = (arg.depth > 0).then_some(arg.depth);
+    let min_confidence =
+      vorpal_index::min_confidence_for_grade(arg.min_grade.as_deref()).map_err(boxed)?;
+    let page = match arg.format {
+      OutputFormat::Text => vorpal_index::records::PageRequest { cursor: None, limit: Some(200) },
+      OutputFormat::Json => vorpal_index::records::PageRequest {
+        cursor: arg.page.cursor.as_deref(),
+        limit: arg.page.limit,
+      },
+    };
+    let report = vorpal_index::records::impact_page(
+      &kg,
+      &seeds,
+      &relations,
+      max_depth,
+      min_confidence,
+      (changed.len(), missing),
+      page,
+    )
+    .map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => print!("{}", vorpal_index::records::render_impact(&report)),
+      OutputFormat::Json => {
+        let mut value = serde_json::json!({
+          "outcome": "hits",
+          "records": serde_json::to_value(&report.records)?,
+          "total": report.total,
+          "truncated": report.end < report.total,
+          "changedFiles": report.changed_files,
+          "missingFiles": report.missing_files,
+          "seeds": report.seeds,
+        });
+        if report.end < report.total {
+          value["nextCursor"] = serde_json::json!(format!("o:{}", report.end));
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+      }
     }
     return Ok(ExitCode::SUCCESS);
   }

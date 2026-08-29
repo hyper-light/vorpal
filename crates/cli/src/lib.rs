@@ -211,6 +211,8 @@ mod test_cli {
       "mcp --profile scout",
       "graph coverage",
       "graph coverage --format json --limit 10",
+      "graph impact --since origin/main --src . --depth 3",
+      "graph impact --relations calls,references --min-grade constrained --format json",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));
     }

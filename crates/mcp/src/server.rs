@@ -58,7 +58,7 @@ impl Profile {
     const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
       "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
-      "health", "dead_code", "coverage",
+      "health", "dead_code", "coverage", "impact",
     ];
     match self {
       Profile::Full => true,
@@ -285,6 +285,77 @@ impl Server {
           )
         };
         Ok((text, json!({})))
+      }
+      "impact" => {
+        // Blast radius vs a git ref (or the uncommitted worktree): needs the watched source
+        // root — the same precondition structural_search states.
+        let root = self
+          .watch
+          .as_ref()
+          .map(|w| w.src().to_path_buf())
+          .ok_or_else(|| {
+            "impact needs a watched source tree (daemon started on a default \
+             <src>/.vorpal/index location)"
+              .to_string()
+          })?;
+        let since = args.get("since").and_then(Value::as_str).map(str::to_string);
+        let relations: Vec<vorpal_kg::EdgeType> = match args.get("relations") {
+          Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for it in items {
+              let name = it.as_str().ok_or_else(|| "relations must be strings".to_string())?;
+              out.push(
+                vorpal_kg::EdgeType::from_name(name)
+                  .ok_or_else(|| format!("unknown relation '{name}'"))?,
+              );
+            }
+            if out.is_empty() { vec![vorpal_kg::EdgeType::CALLS] } else { out }
+          }
+          Some(_) => {
+            return Err(ToolError::coded("bad-argument", "relations must be an array of relation names"));
+          }
+          None => vec![vorpal_kg::EdgeType::CALLS],
+        };
+        let max_depth = match args.get("max_depth").and_then(Value::as_u64) {
+          Some(0) | None => None,
+          Some(d) => Some(d as u32),
+        };
+        let min_confidence = vorpal_index::min_confidence_for_grade(
+          args.get("min_grade").and_then(Value::as_str),
+        )
+        .map_err(|err| err.to_string())?;
+        let changed = vorpal_index::impact::changed_paths(&root, since.as_deref())
+          .map_err(ToolError::from)?;
+        self.kg()?;
+        let kg = self.kg.as_ref().expect("pinned above");
+        let (seeds, missing) = vorpal_index::impact::seeds_for_paths(kg, &root, &changed);
+        let report = vorpal_index::records::impact_page(
+          kg,
+          &seeds,
+          &relations,
+          max_depth,
+          min_confidence,
+          (changed.len(), missing),
+          vorpal_index::records::PageRequest {
+            cursor: args.get("cursor").and_then(Value::as_str),
+            limit: args.get("limit").and_then(Value::as_u64),
+          },
+        )
+        .map_err(ToolError::from)?;
+        let text = vorpal_index::records::render_impact(&report);
+        let mut data = json!({
+          "outcome": "hits",
+          "records": serde_json::to_value(&report.records).unwrap_or(Value::Null),
+          "total": report.total,
+          "truncated": report.end < report.total,
+          "changedFiles": report.changed_files,
+          "missingFiles": report.missing_files,
+          "seeds": report.seeds,
+        });
+        if report.end < report.total {
+          data["nextCursor"] = json!(format!("o:{}", report.end));
+        }
+        Ok((text, data))
       }
       "coverage" => {
         // The cheap parse-coverage overview (header peeks over the product bank); span and
@@ -752,6 +823,22 @@ fn tools_list(profile: Profile) -> Value {
        before trusting absence anywhere; `health` has span/entity detail. No bank → says \
        coverage is UNAVAILABLE, never that parses were clean.",
       json!({
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+      }),
+      &[],
+    ),
+    tool(
+      "impact",
+      "Blast radius of changed files: git-diff-seeded (merge-base vs `since`, or the \
+       uncommitted worktree) transitive INBOUND closure over the chosen relations — every \
+       impacted node with its minimum hop distance. Changed files missing from the index \
+       are counted in missingFiles, never silently dropped.",
+      json!({
+        "since": {"type": "string", "description": "Git ref to diff against (merge-base semantics). Absent = uncommitted changes only"},
+        "relations": {"type": "array", "items": {"type": "string"}, "description": "Edge types to follow (default [calls])"},
+        "max_depth": {"type": "integer", "description": "Hop bound (0/absent = unbounded)"},
+        "min_grade": {"type": "string", "description": "Only traverse edges at this grade or better (exact|constrained|heuristic)"},
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),

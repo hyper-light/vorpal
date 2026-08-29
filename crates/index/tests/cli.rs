@@ -1755,3 +1755,64 @@ fn dead_scan_finds_uncalled_definitions_and_suppresses_referenced_names() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn impact_traces_the_blast_radius_of_changed_files() {
+  use std::process::Command;
+  let base = std::env::temp_dir().join(format!("vorpal-index-impact-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("b.rs"), "pub fn target() -> i32 {\n    0\n}\n").unwrap();
+  fs::write(src.join("a.rs"), "pub fn caller() -> i32 {\n    target()\n}\n").unwrap();
+  let git = |args: &[&str]| {
+    let ok = Command::new("git")
+      .arg("-C")
+      .arg(&src)
+      .args(args)
+      .env("GIT_AUTHOR_NAME", "t")
+      .env("GIT_AUTHOR_EMAIL", "t@t")
+      .env("GIT_COMMITTER_NAME", "t")
+      .env("GIT_COMMITTER_EMAIL", "t@t")
+      .output()
+      .unwrap();
+    assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+  };
+  git(&["init", "-q"]);
+  git(&["add", "."]);
+  git(&["commit", "-qm", "base"]);
+
+  build_index(&src, &out).unwrap();
+  let kg = Kg::load(&out).unwrap();
+
+  // Worktree mode: touch target's file; caller must appear in the inbound closure.
+  fs::write(src.join("b.rs"), "pub fn target() -> i32 {\n    1\n}\n").unwrap();
+  let changed = vorpal_index::impact::changed_paths(&src, None).unwrap();
+  assert_eq!(changed, vec!["b.rs".to_string()]);
+  let (seeds, missing) = vorpal_index::impact::seeds_for_paths(&kg, &src, &changed);
+  assert_eq!(missing, 0);
+  assert!(!seeds.is_empty());
+  let report = vorpal_index::records::impact_page(
+    &kg,
+    &seeds,
+    &[vorpal_kg::EdgeType::CALLS],
+    None,
+    0,
+    (changed.len(), missing),
+    vorpal_index::records::PageRequest::default(),
+  )
+  .unwrap();
+  let names: Vec<&str> = report.records.iter().map(|r| r.node.name.as_str()).collect();
+  assert!(names.contains(&"caller"), "caller is in the blast radius: {names:?}");
+
+  // Ref mode: committed change vs HEAD~1 sees the same file; a bogus ref surfaces git's error.
+  git(&["add", "."]);
+  git(&["commit", "-qm", "change"]);
+  let changed = vorpal_index::impact::changed_paths(&src, Some("HEAD~1")).unwrap();
+  assert_eq!(changed, vec!["b.rs".to_string()]);
+  let err = vorpal_index::impact::changed_paths(&src, Some("no-such-ref")).unwrap_err();
+  assert!(err.contains("no-such-ref") || err.contains("merge-base"), "{err}");
+
+  let _ = fs::remove_dir_all(&base);
+}

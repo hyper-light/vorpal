@@ -942,6 +942,100 @@ pub fn reach_records_page(
   })
 }
 
+/// One page of a change-impact query, with the whole-scan honesty head.
+#[derive(Serialize, Debug)]
+pub struct ImpactPage {
+  /// This page of impacted nodes (min-hop BFS order over the whole seed set).
+  pub records: Vec<ReachRecord>,
+  pub total: usize,
+  pub start: usize,
+  pub end: usize,
+  /// Changed paths git reported.
+  pub changed_files: usize,
+  /// Changed paths with no File node in this generation (deleted, unindexed, or renamed):
+  /// their impact is NOT included — stated, never silently dropped.
+  pub missing_files: usize,
+  /// BFS seeds (changed File nodes + their definitions).
+  pub seeds: usize,
+}
+
+/// The impact closure for pre-resolved seeds, page-materialized like every whole-graph
+/// surface. Depth is min-hop from any seed by construction (one multi-seed BFS).
+#[allow(clippy::too_many_arguments)]
+pub fn impact_page(
+  kg: &Kg,
+  seeds: &[NodeId],
+  relations: &[vorpal_kg::EdgeType],
+  max_depth: Option<u32>,
+  min_confidence: u8,
+  counts: (usize, usize),
+  page: PageRequest<'_>,
+) -> Result<ImpactPage, String> {
+  let steps = kg.reachable_via_paths_multi(
+    seeds,
+    vorpal_kg::Direction::In,
+    relations,
+    max_depth,
+    min_confidence,
+  );
+  let PageBounds { start, end, total } = page_bounds(steps.len(), page.cursor, page.limit)?;
+  let records = steps[start..end]
+    .iter()
+    .filter_map(|step| {
+      Some(ReachRecord {
+        node: node_record(kg, NodeId::new(step.node as u64))?,
+        depth: step.depth,
+        via: step.via.0 as u64,
+        relation: step.via.1.name().to_string(),
+        grade: crate::confidence_label(step.via.1.confidence()).to_string(),
+        edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+      })
+    })
+    .collect();
+  Ok(ImpactPage {
+    records,
+    total,
+    start,
+    end,
+    changed_files: counts.0,
+    missing_files: counts.1,
+    seeds: seeds.len(),
+  })
+}
+
+/// Rendered impact page: the blast-radius head, then one line per impacted node.
+pub fn render_impact(report: &ImpactPage) -> String {
+  use std::fmt::Write;
+  let mut out = String::new();
+  let _ = writeln!(
+    out,
+    "{} changed files ({} not in this index) → {} seed definitions → {} impacted nodes:",
+    report.changed_files, report.missing_files, report.seeds, report.total
+  );
+  for record in &report.records {
+    let _ = writeln!(
+      out,
+      "depth {}  {} [{}] {}  ({}, {})",
+      record.depth, record.node.name, record.node.kind, record.node.path, record.relation,
+      record.grade
+    );
+  }
+  if report.end < report.total {
+    let _ = writeln!(
+      out,
+      "… {} more — page the records surface, or bound --depth / raise --min-grade",
+      report.total - report.end
+    );
+  }
+  if report.total == 0 && report.changed_files > 0 {
+    let _ = writeln!(
+      out,
+      "(no inbound edges reach the changed definitions under those relations/grade)"
+    );
+  }
+  out
+}
+
 /// The typed twin of `reachable`: BFS steps in deterministic order, each step carrying its
 /// parent and the (grade-labeled) edge that reached it.
 pub fn reach_records(

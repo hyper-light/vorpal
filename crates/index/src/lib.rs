@@ -11,6 +11,7 @@
 //! as deterministic as the serial loop was.
 
 pub mod annfiles;
+pub mod impact;
 pub mod autowarm;
 pub mod graph_predicates;
 pub mod postings;
