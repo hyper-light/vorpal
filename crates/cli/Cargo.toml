@@ -85,6 +85,6 @@ disabled-strategies = ["quick-install"]
 
 # jemalloc is the binary's allocator on every platform except MSVC (tikv-jemalloc-sys does
 # not build there); main.rs cfg-gates the #[global_allocator] to match.
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+[target.'cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))'.dependencies]
 tikv-jemallocator = "0.7.0"
 tikv-jemalloc-sys = "0.7.1"

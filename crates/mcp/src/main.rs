@@ -5,11 +5,11 @@ use std::process::ExitCode;
 
 /// Same allocator policy as `vorpal-index`: jemalloc with immediate page return, so a
 /// long-lived daemon's RSS tracks its live set instead of its high-water mark.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
 mod jemalloc_conf {
   #[repr(transparent)]
   pub struct SyncPtr(#[allow(dead_code)] *const u8);

@@ -7,7 +7,7 @@ use std::process::ExitCode;
 /// allocator's peak footprint was freed-but-retained magazine pages (2.05 GB observed vs a
 /// ~0.95 GB live set). jemalloc's decay returns those pages while running, and its
 /// thread-local caches are also simply faster under the pipeline's multithreaded churn.
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[cfg(all(feature = "jemalloc", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -17,7 +17,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// arena count stops 4×ncpu arenas from each holding a retention tail (~140 MB spread at
 /// kernel scale). Measured on the Linux tree: default malloc 2.05 GB peak → this config
 /// 1.13 GB, equal wall time.
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[cfg(all(feature = "jemalloc", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
 mod jemalloc_conf {
   #[repr(transparent)]
   pub struct SyncPtr(#[allow(dead_code)] *const u8);
@@ -49,7 +49,7 @@ const USAGE: &str = "usage:
 /// tree memory lives in the macOS default zone — outside jemalloc's decay policy — and
 /// freed-but-retained tree pages (~150–250 MB at kernel scale) ride under the link phase's
 /// peak. One allocator, one policy.
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[cfg(all(feature = "jemalloc", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
 fn unify_parser_allocator() {
   unsafe {
     tree_sitter::set_allocator(
@@ -62,7 +62,7 @@ fn unify_parser_allocator() {
 }
 
 fn main() -> ExitCode {
-  #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+  #[cfg(all(feature = "jemalloc", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
   unify_parser_allocator();
   // Detached-warm re-entry + spawn permission — before any argument handling.
   vorpal_index::autowarm::run_if_sentinel();

@@ -12,6 +12,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # aarch64-musl builds run natively on ubuntu-24.04-arm; musl-tools' musl-gcc is the
+  # correct compiler AND linker there (no triple-prefixed cross binary exists on runners).
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
   NAPI_CLI_VERSION: 3.7.2
 
 jobs:

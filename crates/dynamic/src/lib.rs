@@ -281,13 +281,41 @@ mod test {
 
   // currently we only have json parser for these platforms
   // apple silicon macos and linux x86_64
-  fn get_tree_sitter_path() -> &'static str {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-      "../../fixtures/json-mac.so"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-      "../../fixtures/json-linux.so"
-    } else {
-      ""
+  /// Compile the VENDORED json grammar into a shared library, once per test process —
+  /// the fixture is generated from source instead of shipped as a per-platform binary
+  /// blob (the old `fixtures/*.so` files were untracked, so CI never had them). Returns
+  /// `None` where no C compiler toolchain applies (non-unix), and the tests skip.
+  fn json_fixture() -> Option<std::path::PathBuf> {
+    #[cfg(not(unix))]
+    {
+      None
+    }
+    #[cfg(unix)]
+    {
+      use std::sync::OnceLock;
+      static BUILT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+      BUILT
+        .get_or_init(|| {
+          let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../grammars/tree-sitter-json/src");
+          let out = std::env::temp_dir().join(format!(
+            "vorpal-json-fixture-{}.so",
+            std::process::id()
+          ));
+          let status = std::process::Command::new("cc")
+            .arg("-shared")
+            .arg("-fPIC")
+            .arg("-O1")
+            .arg("-I")
+            .arg(&src)
+            .arg(src.join("parser.c"))
+            .arg("-o")
+            .arg(&out)
+            .status()
+            .ok()?;
+          status.success().then_some(out)
+        })
+        .clone()
     }
   }
 
@@ -314,12 +342,11 @@ mod test {
 
   #[test]
   fn test_load_parser() {
-    let path = get_tree_sitter_path();
-    // skip unsupported platform
-    if path.is_empty() {
+    // skip platforms without a usable C toolchain
+    let Some(path) = json_fixture() else {
       return;
-    }
-    let (_lib, lang) = unsafe { load_ts_language(path.into(), "tree_sitter_json".into()).unwrap() };
+    };
+    let (_lib, lang) = unsafe { load_ts_language(path, "tree_sitter_json".into()).unwrap() };
     let lang = TSLangWrapper(lang);
     let sg = lang.grep("{\"a\": 123}");
     assert_eq!(
@@ -330,16 +357,15 @@ mod test {
 
   #[test]
   fn test_register_lang() {
-    let path = get_tree_sitter_path();
-    // skip unsupported platform
-    if path.is_empty() {
+    // skip platforms without a usable C toolchain
+    let Some(path) = json_fixture() else {
       return;
-    }
+    };
     let registration = Registration {
       lang_name: "json".to_string(),
       expando_char: Some('_'),
       extensions: vec!["json".into()],
-      lib_path: PathBuf::from(path),
+      lib_path: path,
       meta_var_char: None,
       symbol: "tree_sitter_json".into(),
     };

@@ -58,10 +58,18 @@ impl HardwareProbe {
   }
 }
 
+#[cfg(unix)]
 fn base_page_bytes() -> usize {
   // SAFETY: `sysconf` is a pure query with no preconditions.
   let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
   if v > 0 { v as usize } else { 4096 }
+}
+
+#[cfg(not(unix))]
+fn base_page_bytes() -> usize {
+  // Windows: 4 KiB pages on every supported architecture. This feeds TLB-reach
+  // heuristics only — the honest constant beats importing a syscall binding for it.
+  4096
 }
 
 #[cfg(target_os = "linux")]

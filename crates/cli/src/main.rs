@@ -7,11 +7,11 @@ use vorpal::execute_main;
 /// page return — a bulk index/scan's peak footprint tracks its live set instead of stacking
 /// each phase's retained garbage (2.05 GB → 1.13 GB at kernel scale), and the thread-local
 /// caches are faster under the pipeline's multithreaded churn.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
 mod jemalloc_conf {
   #[repr(transparent)]
   pub struct SyncPtr(#[allow(dead_code)] *const u8);
@@ -24,7 +24,7 @@ mod jemalloc_conf {
 /// Route tree-sitter's C-side allocations (parse trees) through jemalloc too — one
 /// allocator, one decay policy; without this the trees age out in the default zone beyond
 /// jemalloc's reach (~150–250 MB of retained pages at kernel scale).
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
 fn unify_parser_allocator() {
   unsafe {
     tree_sitter::set_allocator(
@@ -37,7 +37,7 @@ fn unify_parser_allocator() {
 }
 
 fn main() -> Result<ExitCode> {
-  #[cfg(not(target_env = "msvc"))]
+  #[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
   unify_parser_allocator();
   execute_main()
 }
