@@ -73,8 +73,12 @@ impl std::hash::Hasher for PrehashedId {
   fn finish(&self) -> u64 {
     self.0
   }
-  fn write(&mut self, _bytes: &[u8]) {
-    unreachable!("prehashed keys only")
+  fn write(&mut self, bytes: &[u8]) {
+    // Keys arrive prehashed via write_u64; if the map ever hashes raw bytes anyway, fold
+    // them correctly instead of failing — same distribution, never a panic.
+    for &byte in bytes {
+      self.0 = self.0.rotate_left(8) ^ u64::from(byte).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
   }
   fn write_u64(&mut self, key: u64) {
     self.0 = key;
@@ -133,19 +137,26 @@ impl PackReader {
     // Recovery / tail scan: pick up records the sidecar has not seen. A torn final record
     // fails a bounds check and ends the scan; whatever decoded cleanly is kept.
     let bytes = store.as_bytes();
+    let read_u32 = |at: usize| -> Option<u32> {
+      Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
     let mut at = scan_from;
     while at + 8 <= bytes.len() {
-      let path_len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+      let Some(path_len) = read_u32(at).map(|v| v as usize) else {
+        break;
+      };
       let Some(path_end) = (at + 4)
         .checked_add(path_len)
         .filter(|&e| e + 4 <= bytes.len())
       else {
         break;
       };
-      let Ok(path) = std::str::from_utf8(&bytes[at + 4..path_end]) else {
+      let Some(Ok(path)) = bytes.get(at + 4..path_end).map(std::str::from_utf8) else {
         break;
       };
-      let body_len = u32::from_le_bytes(bytes[path_end..path_end + 4].try_into().unwrap()) as usize;
+      let Some(body_len) = read_u32(path_end).map(|v| v as usize) else {
+        break;
+      };
       let body_at = path_end + 4;
       let Some(body_end) = body_at.checked_add(body_len).filter(|&e| e <= bytes.len()) else {
         break;
@@ -301,6 +312,14 @@ pub struct PackMsg {
   pub body: Vec<u8>,
 }
 
+/// The post-`sink` half of a [`PackWriter`]: everything `finish` needs once the append
+/// channel is dropped.
+struct FinishState {
+  dir: PathBuf,
+  rx: crossbeam_channel::Receiver<PackMsg>,
+  reader: Option<Arc<PackReader>>,
+}
+
 /// Where one canonical entry's body currently lives: freshly appended to this run's pack
 /// (an offset into the local file), or carried from the prior generation's pack (fetched by
 /// path through its mapped [`PackReader`]).
@@ -316,7 +335,7 @@ enum BodySource {
 pub struct PackWriter {
   dir: PathBuf,
   rx: crossbeam_channel::Receiver<PackMsg>,
-  tx: Option<crossbeam_channel::Sender<PackMsg>>,
+  tx: crossbeam_channel::Sender<PackMsg>,
   reader: Option<Arc<PackReader>>,
 }
 
@@ -326,13 +345,16 @@ impl PackWriter {
     Self {
       dir: dir.to_path_buf(),
       rx,
-      tx: Some(tx),
+      tx,
       reader,
     }
   }
 
+  /// A clone of the append channel. `finish(self)` consumes the writer, so sink-after-finish
+  /// is unrepresentable — the type system carries the contract the old `Option` + expect
+  /// merely asserted.
   pub fn sink(&self) -> crossbeam_channel::Sender<PackMsg> {
-    self.tx.as_ref().expect("sink before finish").clone()
+    self.tx.clone()
   }
 
   /// Drain every append (streamed to disk as it arrives — bounded memory), carry entries for
@@ -343,8 +365,9 @@ impl PackWriter {
   /// stays complete for any reader still holding it. Call only after every
   /// [`PackWriter::sink`] clone is dropped.
   pub fn finish(self, live: impl IntoIterator<Item = String>) -> io::Result<()> {
-    let mut this = self;
-    drop(this.tx.take());
+    let PackWriter { dir, rx, tx, reader } = self;
+    let this = FinishState { dir, rx, reader };
+    drop(tx);
     // Fresh spool for this run's appended records (magic + version header first). A side
     // file, not `products.pack` itself: the reader may be mapping a same-named prior pack in
     // this very directory (legacy flat layout, tests), and truncating it in place would

@@ -417,11 +417,34 @@ impl Kg {
     self.nodes.column_at(self.cols.kind)?.as_slice::<u8>()
   }
 
+  /// The raw content-hash column as one stripe (row index == dense `NodeId`) — per-file
+  /// digesting and cross-generation alignment without per-row lookups.
+  pub fn content_hashes(&self) -> Option<&[u64]> {
+    self.nodes.column_at(self.cols.content_hash)?.as_slice::<u64>()
+  }
+
   /// Just the node's defining path, zero-copy — scan passes that need file identity without
   /// the full three-string view.
   pub fn node_path(&self, id: NodeId) -> Option<&str> {
     let (_segment, row) = self.directory.locate(id)?;
     self.heap_str(self.cols.path_off, self.cols.path_len, row)
+  }
+
+  /// The node's durable identity pair `(external_id, content_hash)` — no heap-string reads.
+  /// Cross-generation alignment (diffs) walks entire runs with this; `None` eid on pre-eid
+  /// segments.
+  pub fn node_identity(&self, id: NodeId) -> Option<(Option<u128>, u64)> {
+    let (_segment, row) = self.directory.locate(id)?;
+    let content_hash = self.nodes.column_at(self.cols.content_hash)?.get_u64(row)?;
+    let external_id = match (self.cols.eid_lo, self.cols.eid_hi) {
+      (Some(lo_col), Some(hi_col)) => {
+        let lo = self.nodes.column_at(lo_col)?.get_u64(row)? as u128;
+        let hi = self.nodes.column_at(hi_col)?.get_u64(row)? as u128;
+        Some((hi << 64) | lo)
+      }
+      _ => None,
+    };
+    Some((external_id, content_hash))
   }
 
   pub fn node(&self, id: NodeId) -> Option<NodeView<'_>> {

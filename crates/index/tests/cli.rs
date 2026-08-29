@@ -1816,3 +1816,66 @@ fn impact_traces_the_blast_radius_of_changed_files() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn generation_diff_classifies_files_and_aligns_nodes_by_eid() {
+  let base = std::env::temp_dir().join(format!("vorpal-index-gendiff-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.rs"), "pub fn stable() -> i32 {\n    0\n}\n").unwrap();
+  fs::write(
+    src.join("b.rs"),
+    "pub struct Holder {\n    pub slot: i32,\n}\npub fn morphs() -> i32 {\n    0\n}\npub fn doomed() -> i32 {\n    1\n}\n",
+  )
+  .unwrap();
+  build_index(&src, &out).unwrap();
+
+  // Second generation: b.rs changes the field's type (same identity → modified), changes
+  // morphs' SIGNATURE (overloadable identity → removed + added, per the eid contract),
+  // deletes doomed, adds fresh; c.rs appears.
+  fs::write(
+    src.join("b.rs"),
+    "pub struct Holder {\n    pub slot: i64,\n}\npub fn morphs() -> i64 {\n    9\n}\npub fn fresh() -> i32 {\n    2\n}\n",
+  )
+  .unwrap();
+  fs::write(src.join("c.rs"), "pub fn newcomer() -> i32 {\n    3\n}\n").unwrap();
+  build_index(&src, &out).unwrap();
+
+  let from_dir = vorpal_index::gendiff::resolve_generation(&out, "prev").unwrap();
+  let to_dir = vorpal_index::gendiff::resolve_generation(&out, "CURRENT").unwrap();
+  assert_ne!(from_dir, to_dir);
+  let from_kg = Kg::load(&from_dir).unwrap();
+  let to_kg = Kg::load(&to_dir).unwrap();
+  let diff = vorpal_index::gendiff::diff(&from_kg, &to_kg, "prev", "cur");
+  assert_eq!(diff.files_unchanged, 1, "a.rs untouched");
+  assert_eq!(diff.files_changed, 1, "b.rs changed");
+  assert_eq!(diff.files_added, 1, "c.rs added");
+  assert_eq!(diff.files_removed, 0);
+
+  let report = vorpal_index::records::diff_page(
+    &from_kg,
+    &to_kg,
+    diff,
+    vorpal_index::records::PageRequest::default(),
+  )
+  .unwrap();
+  let mut changes: Vec<(String, String)> = report
+    .records
+    .iter()
+    .map(|r| (r.change.clone(), r.node.name.clone()))
+    .collect();
+  changes.sort();
+  assert!(changes.contains(&("added".into(), "fresh".into())), "{changes:?}");
+  assert!(changes.contains(&("added".into(), "newcomer".into())), "{changes:?}");
+  assert!(changes.contains(&("removed".into(), "doomed".into())), "{changes:?}");
+  // Same identity (field), new signature → modified.
+  assert!(changes.contains(&("modified".into(), "slot".into())), "{changes:?}");
+  // Overloadable identity's signature change is an identity transition: removed + added.
+  assert!(changes.contains(&("removed".into(), "morphs".into())), "{changes:?}");
+  assert!(changes.contains(&("added".into(), "morphs".into())), "{changes:?}");
+  assert!(!changes.iter().any(|(_, name)| name == "stable"), "{changes:?}");
+
+  let _ = fs::remove_dir_all(&base);
+}

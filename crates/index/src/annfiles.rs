@@ -48,17 +48,20 @@ pub fn file_runs_of(kg: &Kg) -> Vec<FileRun> {
   }
   // Parallel boundary scan (a row starts a run iff its path differs from its predecessor's),
   // then parallel per-run hashing. Both passes are pure per-row reads; the ordered collects
-  // make the output identical to the serial walk.
+  // make the output identical to the serial walk. Path comparison reads one heap string per
+  // row (not the three-string view), and the digest input comes off the kind/content-hash
+  // column stripes directly — the full-view form of this scan cost ~3×n materializations.
   let starts: Vec<u64> = (0..n)
     .into_par_iter()
     .filter(|&i| {
       i == 0
-        || match (kg.node(NodeId::new(i - 1)), kg.node(NodeId::new(i))) {
-          (Some(prev), Some(here)) => prev.path != here.path,
+        || match (kg.node_path(NodeId::new(i - 1)), kg.node_path(NodeId::new(i))) {
+          (Some(prev), Some(here)) => prev != here,
           _ => true,
         }
     })
     .collect();
+  let (kind_tags, content_hashes) = (kg.kind_tags(), kg.content_hashes());
   starts
     .par_iter()
     .enumerate()
@@ -66,15 +69,25 @@ pub fn file_runs_of(kg: &Kg) -> Vec<FileRun> {
       let end = starts.get(run_index + 1).copied().unwrap_or(n);
       let mut hasher = xxhash_rust::xxh3::Xxh3::new();
       for at in start..end {
-        if let Some(view) = kg.node(NodeId::new(at)) {
-          hasher.update(&[kind_tag(view.kind)]);
-          hasher.update(&view.content_hash.to_le_bytes());
+        let striped = match (kind_tags, content_hashes) {
+          (Some(kinds), Some(hashes)) => {
+            hasher.update(&[kinds[at as usize]]);
+            hasher.update(&hashes[at as usize].to_le_bytes());
+            true
+          }
+          _ => false,
+        };
+        if !striped {
+          if let Some(view) = kg.node(NodeId::new(at)) {
+            hasher.update(&[kind_tag(view.kind)]);
+            hasher.update(&view.content_hash.to_le_bytes());
+          }
         }
       }
       FileRun {
         path: kg
-          .node(NodeId::new(start))
-          .map(|view| view.path.to_string())
+          .node_path(NodeId::new(start))
+          .map(str::to_string)
           .unwrap_or_default(),
         start,
         len: (end - start) as u32,

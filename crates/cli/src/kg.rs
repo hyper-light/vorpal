@@ -85,6 +85,8 @@ enum GraphVerb {
   Coverage,
   /// Blast radius of changed files: git-diff-seeded transitive inbound closure.
   Impact,
+  /// What changed between two generations (files, nodes by durable eid, edge counts).
+  Diff,
 }
 
 impl GraphVerb {
@@ -102,6 +104,7 @@ impl GraphVerb {
       GraphVerb::Dead => "dead",
       GraphVerb::Coverage => "coverage",
       GraphVerb::Impact => "impact",
+      GraphVerb::Diff => "diff",
     }
   }
 }
@@ -148,6 +151,12 @@ pub struct GraphArg {
   /// (node) List nodes whose name matches this regex instead of an exact name.
   #[clap(long, value_name = "REGEX")]
   pattern: Option<String>,
+  /// (diff) Older generation: content id, path, or `prev` (default).
+  #[clap(long, value_name = "GEN", default_value = "prev")]
+  from: String,
+  /// (diff) Newer generation: content id, path, or `CURRENT` (default).
+  #[clap(long, value_name = "GEN", default_value = "CURRENT")]
+  to: String,
   /// (impact) Diff base: everything the branch/worktree changes relative to this ref
   /// (merge-base semantics). Absent = uncommitted changes only.
   #[clap(long, value_name = "REF")]
@@ -288,6 +297,33 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     let report = vorpal_index::records::schema_report(&kg, Some(&gen_dir));
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_schema(&report)),
+      OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Diff) {
+    let from_dir = vorpal_index::gendiff::resolve_generation(&dir, &arg.from)
+      .map_err(anyhow::Error::msg)?;
+    let to_dir = vorpal_index::gendiff::resolve_generation(&dir, &arg.to)
+      .map_err(anyhow::Error::msg)?;
+    let from_kg = vorpal_index::Kg::load(&from_dir).map_err(|err| anyhow!(err.to_string()))?;
+    let to_kg = vorpal_index::Kg::load(&to_dir).map_err(|err| anyhow!(err.to_string()))?;
+    let label = |dir: &std::path::Path| {
+      dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+    let diff = vorpal_index::gendiff::diff(&from_kg, &to_kg, &label(&from_dir), &label(&to_dir));
+    let page = match arg.format {
+      OutputFormat::Text => vorpal_index::records::PageRequest { cursor: None, limit: Some(200) },
+      OutputFormat::Json => vorpal_index::records::PageRequest {
+        cursor: arg.page.cursor.as_deref(),
+        limit: arg.page.limit,
+      },
+    };
+    let report = vorpal_index::records::diff_page(&from_kg, &to_kg, diff, page)
+      .map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => print!("{}", vorpal_index::records::render_diff(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
     }
     return Ok(ExitCode::SUCCESS);

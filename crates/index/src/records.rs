@@ -149,23 +149,29 @@ pub fn snippet_records(
         node.id, node.name
       )));
     }
-    if cached.as_ref().is_none_or(|(path, ..)| path != &node.path) {
-      let read = crate::read_indexed_source_with(pack.as_deref(), &node.path)
-        .map_err(SnippetError::Other)?;
-      let (bytes, verification) = match read {
-        crate::IndexedRead::Verified(bytes) => (bytes, "verified"),
-        crate::IndexedRead::Unverified(bytes) => (bytes, "unverified"),
-        crate::IndexedRead::Changed => {
-          return Err(SnippetError::Stale(format!(
-            "{} changed since this generation indexed it — span offsets are stale; rebuild \
-             the index",
-            node.path
-          )));
+    let (bytes, verification) = match &cached {
+      Some((path, bytes, verification)) if path == &node.path => (bytes, *verification),
+      _ => {
+        let read = crate::read_indexed_source_with(pack.as_deref(), &node.path)
+          .map_err(SnippetError::Other)?;
+        let (bytes, verification) = match read {
+          crate::IndexedRead::Verified(bytes) => (bytes, "verified"),
+          crate::IndexedRead::Unverified(bytes) => (bytes, "unverified"),
+          crate::IndexedRead::Changed => {
+            return Err(SnippetError::Stale(format!(
+              "{} changed since this generation indexed it — span offsets are stale; rebuild \
+               the index",
+              node.path
+            )));
+          }
+        };
+        cached = Some((node.path.clone(), bytes, verification));
+        match &cached {
+          Some((_, bytes, verification)) => (bytes, *verification),
+          None => return Err(SnippetError::Other("snippet cache write failed".to_string())),
         }
-      };
-      cached = Some((node.path.clone(), bytes, verification));
-    }
-    let (_, bytes, verification) = cached.as_ref().expect("just populated");
+      }
+    };
     let end = (end as usize).min(bytes.len());
     let start = (start as usize).min(end);
     // Whole-lines contract: the span's own first/last lines complete, then `context_lines`
@@ -940,6 +946,103 @@ pub fn reach_records_page(
     start,
     end,
   })
+}
+
+/// One node-level generation difference.
+#[derive(Serialize, Debug)]
+pub struct DiffRecord {
+  /// added | removed | modified (by durable eid; modified = same eid, new content hash).
+  pub change: String,
+  #[serde(flatten)]
+  pub node: NodeRecord,
+}
+
+/// One page of a generation diff, with whole-diff totals.
+#[derive(Serialize, Debug)]
+pub struct DiffPage {
+  pub records: Vec<DiffRecord>,
+  pub total: usize,
+  pub start: usize,
+  pub end: usize,
+  pub from_generation: String,
+  pub to_generation: String,
+  pub files_unchanged: usize,
+  pub files_added: usize,
+  pub files_removed: usize,
+  pub files_changed: usize,
+  /// (relation, from-count, to-count).
+  pub relations: Vec<(String, u64, u64)>,
+}
+
+/// Page-materialize a [`crate::gendiff::GenDiff`]: removed nodes render from `from`,
+/// added/modified from `to`.
+pub fn diff_page(
+  from: &Kg,
+  to: &Kg,
+  diff: crate::gendiff::GenDiff,
+  page: PageRequest<'_>,
+) -> Result<DiffPage, String> {
+  let PageBounds { start, end, total } = page_bounds(diff.changes.len(), page.cursor, page.limit)?;
+  let records = diff.changes[start..end]
+    .iter()
+    .filter_map(|change| {
+      let (label, kg, id) = match change {
+        crate::gendiff::NodeChange::Added(id) => ("added", to, *id),
+        crate::gendiff::NodeChange::Removed(id) => ("removed", from, *id),
+        crate::gendiff::NodeChange::Modified(id) => ("modified", to, *id),
+      };
+      Some(DiffRecord {
+        change: label.to_string(),
+        node: node_record(kg, id)?,
+      })
+    })
+    .collect();
+  Ok(DiffPage {
+    records,
+    total,
+    start,
+    end,
+    from_generation: diff.from_generation,
+    to_generation: diff.to_generation,
+    files_unchanged: diff.files_unchanged,
+    files_added: diff.files_added,
+    files_removed: diff.files_removed,
+    files_changed: diff.files_changed,
+    relations: diff.relation_deltas,
+  })
+}
+
+/// Rendered diff page: totals head, relation deltas, then one line per change.
+pub fn render_diff(report: &DiffPage) -> String {
+  use std::fmt::Write;
+  let mut out = String::new();
+  let _ = writeln!(
+    out,
+    "{} → {}: {} files changed, {} added, {} removed, {} unchanged; {} node changes",
+    report.from_generation,
+    report.to_generation,
+    report.files_changed,
+    report.files_added,
+    report.files_removed,
+    report.files_unchanged,
+    report.total
+  );
+  for (name, from, to) in &report.relations {
+    if from != to {
+      let _ = writeln!(out, "relation {name}: {from} → {to}");
+    }
+  }
+  for record in &report.records {
+    let _ = writeln!(
+      out,
+      "{:<9} {} [{}] {}",
+      record.change, record.node.name, record.node.kind, record.node.path
+    );
+  }
+  if report.end < report.total {
+    let _ = writeln!(out, "… {} more — page the records surface", report.total - report.end);
+  }
+  out
 }
 
 /// One page of a change-impact query, with the whole-scan honesty head.

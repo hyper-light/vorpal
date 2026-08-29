@@ -39,6 +39,7 @@ const USAGE: &str = "usage:
   vorpal-index schema       <index-dir>             kinds, relations, grades, tier state — with counts
   vorpal-index dead         <index-dir> [kind]      definitions with no semantic in-edges (suppression-honest)
   vorpal-index coverage     <index-dir>             per-file parse-coverage overview (worst first)
+  vorpal-index diff         <index-root> [from] [to]  generation diff (defaults: prev → CURRENT)
   vorpal-index callers      <index-dir> <name>      direct callers of a symbol
   vorpal-index refs         <index-dir> <name>      direct referrers of a symbol
   vorpal-index importers    <index-dir> <name>      files importing a symbol
@@ -201,6 +202,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       let dir = vorpal_kg::resolve_index_dir(Path::new(index));
       let report = vorpal_index::records::coverage_records(Some(&dir));
       print!("{}", vorpal_index::records::render_coverage(&report));
+      Ok(())
+    }
+    ["diff", root, rest @ ..] => {
+      let (from, to) = match rest {
+        [] => ("prev", "CURRENT"),
+        [from] => (*from, "CURRENT"),
+        [from, to] => (*from, *to),
+        _ => {
+          eprintln!("{USAGE}");
+          return Err("invalid arguments".into());
+        }
+      };
+      let root = Path::new(root);
+      let from_dir = vorpal_index::gendiff::resolve_generation(root, from)?;
+      let to_dir = vorpal_index::gendiff::resolve_generation(root, to)?;
+      let from_kg = vorpal_kg::Kg::load(&from_dir)?;
+      let to_kg = vorpal_kg::Kg::load(&to_dir)?;
+      let label = |dir: &Path| {
+        dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+      };
+      let diff = vorpal_index::gendiff::diff(&from_kg, &to_kg, &label(&from_dir), &label(&to_dir));
+      let report = vorpal_index::records::diff_page(
+        &from_kg,
+        &to_kg,
+        diff,
+        vorpal_index::records::PageRequest { cursor: None, limit: Some(200) },
+      )?;
+      print!("{}", vorpal_index::records::render_diff(&report));
       Ok(())
     }
     ["dead", index, rest @ ..] => {

@@ -58,7 +58,7 @@ impl Profile {
     const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
       "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
-      "health", "dead_code", "coverage", "impact",
+      "health", "dead_code", "coverage", "impact", "compare_generations",
     ];
     match self {
       Profile::Full => true,
@@ -286,6 +286,38 @@ impl Server {
         };
         Ok((text, json!({})))
       }
+      "compare_generations" => {
+        let root = self.index_dir.clone();
+        let from_spec = args.get("from").and_then(Value::as_str).unwrap_or("prev");
+        let to_spec = args.get("to").and_then(Value::as_str).unwrap_or("CURRENT");
+        let from_dir =
+          vorpal_index::gendiff::resolve_generation(&root, from_spec).map_err(ToolError::from)?;
+        let to_dir =
+          vorpal_index::gendiff::resolve_generation(&root, to_spec).map_err(ToolError::from)?;
+        let from_kg = vorpal_index::Kg::load(&from_dir).map_err(|err| err.to_string())?;
+        let to_kg = vorpal_index::Kg::load(&to_dir).map_err(|err| err.to_string())?;
+        let label = |dir: &Path| {
+          dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+        };
+        let diff =
+          vorpal_index::gendiff::diff(&from_kg, &to_kg, &label(&from_dir), &label(&to_dir));
+        let report = vorpal_index::records::diff_page(
+          &from_kg,
+          &to_kg,
+          diff,
+          vorpal_index::records::PageRequest {
+            cursor: args.get("cursor").and_then(Value::as_str),
+            limit: args.get("limit").and_then(Value::as_u64),
+          },
+        )
+        .map_err(|message| ToolError::coded("bad-argument", message))?;
+        let text = vorpal_index::records::render_diff(&report);
+        let data = serde_json::to_value(&report).unwrap_or(Value::Null);
+        Ok((text, data))
+      }
       "impact" => {
         // Blast radius vs a git ref (or the uncommitted worktree): needs the watched source
         // root — the same precondition structural_search states.
@@ -327,7 +359,9 @@ impl Server {
         let changed = vorpal_index::impact::changed_paths(&root, since.as_deref())
           .map_err(ToolError::from)?;
         self.kg()?;
-        let kg = self.kg.as_ref().expect("pinned above");
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
         let (seeds, missing) = vorpal_index::impact::seeds_for_paths(kg, &root, &changed);
         let report = vorpal_index::records::impact_page(
           kg,
@@ -375,7 +409,9 @@ impl Server {
         if tool == "node" {
           if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
             self.kg()?;
-            let kg = self.kg.as_ref().expect("pinned above");
+            let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
             let text =
               vorpal_index::pattern_query_on(kg, pattern, 200).map_err(|err| err.to_string())?;
             let records =
@@ -477,7 +513,9 @@ impl Server {
         // the call an agent makes before forming its first real query.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let kg = self.kg.as_ref().expect("pinned above");
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
         let report = vorpal_index::records::schema_report(kg, dir.as_deref());
         let text = vorpal_index::records::render_schema(&report);
         let data = serde_json::to_value(&report).unwrap_or(Value::Null);
@@ -538,7 +576,9 @@ impl Server {
         // Slice against the pinned generation's digests: stale offsets refuse, never guess.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let kg = self.kg.as_ref().expect("pinned above");
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
         crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144))
           .map(|text| (text, json!({})))
           .map_err(|err| match err {
@@ -558,7 +598,9 @@ impl Server {
         };
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let kg = self.kg.as_ref().expect("pinned above");
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
         let report = vorpal_index::records::dead_records_page(
           kg,
           dir.as_deref(),
@@ -597,7 +639,9 @@ impl Server {
           .clamp(64, 262_144) as usize;
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let kg = self.kg.as_ref().expect("pinned above");
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
         let selected = vorpal_index::records::snippet_records(
           kg,
           dir.as_deref(),
@@ -638,7 +682,9 @@ impl Server {
         // that produced these ids, and the snippet digest-checks against the same generation.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let kg = self.kg.as_ref().expect("pinned above");
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
         let text = match (to_id, name.as_deref()) {
           (Some(to_id), _) => vorpal_index::explain_edge_on(kg, dir.as_deref(), from_id, to_id)
             .map_err(|err| err.to_string())?,
@@ -754,7 +800,10 @@ impl Server {
       self.kg = Some(loaded);
       self.kg_dir = Some(dir);
     }
-    Ok(self.kg.as_ref().expect("just loaded"))
+    self
+      .kg
+      .as_ref()
+      .ok_or_else(|| "index load raced away — retry the query".to_string())
   }
 }
 
@@ -823,6 +872,21 @@ fn tools_list(profile: Profile) -> Value {
        before trusting absence anywhere; `health` has span/entity detail. No bank → says \
        coverage is UNAVAILABLE, never that parses were clean.",
       json!({
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+      }),
+      &[],
+    ),
+    tool(
+      "compare_generations",
+      "What changed between two retained generations of this index: files added/removed/\
+       changed (unchanged files skip by digest), node-level adds/removes/modifications \
+       aligned by durable eid, and per-relation edge-count deltas. A signature change on an \
+       overloadable definition is an identity transition (removed + added) by the eid \
+       contract; body-only edits alter no semantic content and diff as unchanged.",
+      json!({
+        "from": {"type": "string", "description": "Older generation: content id, path, or 'prev' (default)"},
+        "to": {"type": "string", "description": "Newer generation: content id, path, or 'CURRENT' (default)"},
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),

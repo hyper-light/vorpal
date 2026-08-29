@@ -213,6 +213,8 @@ mod test_cli {
       "graph coverage --format json --limit 10",
       "graph impact --since origin/main --src . --depth 3",
       "graph impact --relations calls,references --min-grade constrained --format json",
+      "graph diff",
+      "graph diff --from prev --to CURRENT --format json --limit 50",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));
     }
