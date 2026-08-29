@@ -59,6 +59,7 @@ impl Profile {
     const ANALYSIS_EXTRA: &[&str] = &[
       "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
+      "code_search",
     ];
     match self {
       Profile::Full => true,
@@ -298,13 +299,40 @@ impl Server {
         };
         Ok((text, json!({})))
       }
-      "architecture" => {
-        let top = args.get("top").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
+      "code_search" => {
+        let pattern = str_arg("pattern")?;
+        let k = args.get("k").and_then(Value::as_u64).unwrap_or(20) as usize;
+        let lang = args.get("lang").and_then(Value::as_str).map(str::to_string);
+        let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
         self.kg()?;
+        let dir = self.kg_dir.clone();
         let Some(kg) = self.kg.as_ref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
-        let report = vorpal_index::records::architecture_report(kg, top);
+        let report = vorpal_index::records::code_search(
+          kg,
+          dir.as_deref(),
+          &pattern,
+          lang.as_deref(),
+          prefix.as_deref(),
+          k,
+        )
+        .map_err(ToolError::from)?;
+        let text = vorpal_index::records::render_code_search(&report);
+        let mut data = paged(report.records, args, "hits")?;
+        data["staleFiles"] = report.stale_files.into();
+        data["scannedFiles"] = report.scanned_files.into();
+        data["totalMatches"] = report.total_matches.into();
+        Ok((text, data))
+      }
+      "architecture" => {
+        let top = args.get("top").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
+        let report = vorpal_index::records::architecture_report(kg, dir.as_deref(), top);
         let text = vorpal_index::records::render_architecture(&report);
         let data = serde_json::to_value(&report).unwrap_or(Value::Null);
         Ok((text, data))
@@ -899,6 +927,25 @@ fn tools_list(profile: Profile) -> Value {
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),
       &[],
+    ),
+    tool(
+      "code_search",
+      "Structural pattern search fused with the graph: run an ast-grep pattern over the \
+       generation's own files (digest-verified — changed files are counted stale and \
+       skipped), attribute matches to their enclosing definitions, rank by semantic \
+       in-degree. Whole-tree parse: seconds at monorepo scale — scope with lang/prefix. \
+       C/C++ gotcha (grammar ambiguity): bare `f($A)` parses as a declaration — write call \
+       patterns in statement form, `f($A);`.",
+      json!({
+        "pattern": {"type": "string", "description": "ast-grep pattern (e.g. 'kfree($X)')"},
+        "lang": {"type": "string", "description": "Restrict to one language (rust, c, py, …)"},
+        "prefix": {"type": "string", "description": "Restrict to paths starting with this prefix"},
+        "k": {"type": "integer", "description": "Top definitions to return (default 20, max 1000)"},
+        "format": {"type": "string", "enum": ["toon", "lean", "ids"], "description": "Token-oriented text rendering"},
+        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
+        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+      }),
+      &["pattern"],
     ),
     tool(
       "architecture",

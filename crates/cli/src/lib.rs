@@ -207,6 +207,7 @@ mod test_cli {
       "search import-path-resolution -k 5",
       "search embed --format json --kind function --lang rust --exported --prefix crates/",
       "search seal --path lib.rs --format json --limit 3",
+      "search kfree($X) --code --lang c -k 30",
       "mcp --index /tmp/idx",
       "mcp --profile scout",
       "graph coverage",

@@ -89,6 +89,7 @@ fn initialize_handshake_and_tool_listing() {
       "health",
       "schema",
       "coverage",
+      "code_search",
       "architecture",
       "compare_generations",
       "impact",

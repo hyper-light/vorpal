@@ -226,8 +226,14 @@ pub struct GraphArg {
 #[derive(Args)]
 pub struct SearchArg {
   /// Free-text query — hybrid retrieval fusing exact/token name matches, lexical-embedding
-  /// similarity, and graph in-degree (RRF).
+  /// similarity, and graph in-degree (RRF). With --code, an ast-grep PATTERN instead.
   query: String,
+  /// Structural mode: treat the query as an ast-grep pattern, run it over the generation's
+  /// own (digest-verified) files, and rank enclosing definitions by semantic in-degree.
+  /// C/C++ call patterns need statement form (`kfree($A);`) — bare calls parse as
+  /// declarations.
+  #[clap(long)]
+  code: bool,
   /// Max results.
   #[clap(short, default_value_t = 10)]
   k: usize,
@@ -340,7 +346,9 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     let kg = vorpal_index::Kg::load(&dir)
       .map_err(|err| anyhow::anyhow!(err.to_string()))
       .with_context(|| missing_index_hint(&dir))?;
-    let report = vorpal_index::records::architecture_report(&kg, arg.top.clamp(1, 500));
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let report =
+      vorpal_index::records::architecture_report(&kg, Some(&gen_dir), arg.top.clamp(1, 500));
     match arg.format {
       OutputFormat::Text => print!("{}", vorpal_index::records::render_architecture(&report)),
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
@@ -681,6 +689,39 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
 pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
   arg.page.reject_for_text(arg.format)?;
   let dir = index_dir(arg.index);
+  if arg.code {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let report = vorpal_index::records::code_search(
+      &kg,
+      Some(&gen_dir),
+      &arg.query,
+      arg.lang.as_deref(),
+      arg.prefix.as_deref(),
+      arg.k.max(1),
+    )
+    .map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => print!("{}", vorpal_index::records::render_code_search(&report)),
+      machine => {
+        let value = vorpal_index::records::paged_value(
+          &report.records,
+          arg.page.cursor.as_deref(),
+          arg.page.limit,
+          "hits",
+        )
+        .map_err(anyhow::Error::msg)?;
+        let mut value = value;
+        value["staleFiles"] = report.stale_files.into();
+        value["scannedFiles"] = report.scanned_files.into();
+        value["totalMatches"] = report.total_matches.into();
+        print!("{}", emit_machine(machine, &value)?);
+      }
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
   let filter = vorpal_index::SearchFilter {
     path_prefix: arg.prefix,
     path_suffix: arg.path,

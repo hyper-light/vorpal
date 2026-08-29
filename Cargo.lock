@@ -3743,8 +3743,10 @@ dependencies = [
  "tikv-jemallocator",
  "tree-sitter",
  "vorpal-ann",
+ "vorpal-core",
  "vorpal-ingest",
  "vorpal-kg",
+ "vorpal-language",
  "xxhash-rust",
 ]
 

@@ -1915,6 +1915,39 @@ pub(crate) fn cached_pack(generation_dir: &Path) -> Option<Arc<PackReader>> {
   Some(pack)
 }
 
+/// Process-wide cache of per-generation FILE RUNS (the path-sorted per-file id ranges every
+/// whole-graph surface starts from) — deriving them is a full boundary scan (~300 ms at
+/// kernel scale), pure per generation, so immutable content-addressed dirs make the cache
+/// safe exactly like [`cached_pack`]/[`cached_searcher`].
+pub(crate) fn cached_runs(kg: &vorpal_kg::Kg, generation_dir: Option<&Path>) -> Arc<Vec<annfiles::FileRun>> {
+  const CAP: usize = 8;
+  type RunsCache = Mutex<Vec<(PathBuf, Arc<Vec<annfiles::FileRun>>)>>;
+  static CACHE: OnceLock<RunsCache> = OnceLock::new();
+  let Some(dir) = generation_dir else {
+    return Arc::new(annfiles::file_runs_of(kg));
+  };
+  let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+  {
+    let mut guard = cache.lock().unwrap();
+    if let Some(pos) = guard.iter().position(|(cached, _)| cached == dir) {
+      let entry = guard.remove(pos);
+      let runs = entry.1.clone();
+      guard.push(entry);
+      return runs;
+    }
+  }
+  let runs = Arc::new(annfiles::file_runs_of(kg));
+  let mut guard = cache.lock().unwrap();
+  if let Some(pos) = guard.iter().position(|(cached, _)| cached == dir) {
+    return guard[pos].1.clone();
+  }
+  guard.push((dir.to_path_buf(), runs.clone()));
+  if guard.len() > CAP {
+    guard.remove(0);
+  }
+  runs
+}
+
 /// A source read checked against the generation that indexed it (IMPROVEMENTS #7): persisted
 /// byte offsets are only meaningful against the bytes they were computed from.
 pub enum IndexedRead {

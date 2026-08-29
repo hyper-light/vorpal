@@ -966,6 +966,248 @@ pub fn reach_records_page(
   })
 }
 
+/// One graph-ranked structural-search hit: the enclosing definition of ≥1 pattern match,
+/// with its match count and semantic in-degree (the ranking signal — heavily-used code
+/// outranks dead-weight lookalikes, the same prior hybrid search uses).
+#[derive(Serialize, Debug)]
+pub struct CodeMatchRecord {
+  #[serde(flatten)]
+  pub node: NodeRecord,
+  pub matches: u32,
+  pub semantic_in_degree: u64,
+  /// 1-based line of the first match in the file.
+  pub first_line: u32,
+}
+
+/// The whole answer, with the honesty margins.
+#[derive(Serialize, Debug)]
+pub struct CodeSearchReport {
+  pub records: Vec<CodeMatchRecord>,
+  /// Files whose current bytes no longer match the generation (skipped, not guessed).
+  pub stale_files: u64,
+  /// Files scanned (post lang/prefix filters).
+  pub scanned_files: u64,
+  pub total_matches: u64,
+}
+
+/// Structural pattern search fused with the graph (ADOPTION B3): run the ast-grep pattern
+/// over the generation's OWN file set (digest-verified against the product pack — changed
+/// files are counted stale and skipped, never half-trusted), attribute each match to its
+/// innermost enclosing definition via the index spans, and rank definitions by semantic
+/// in-degree. Their `search_code` shells out to grep; this is in-process, structural, and
+/// generation-coherent.
+pub fn code_search(
+  kg: &Kg,
+  artifacts_dir: Option<&std::path::Path>,
+  pattern: &str,
+  lang_filter: Option<&str>,
+  path_prefix: Option<&str>,
+  k: usize,
+) -> Result<CodeSearchReport, String> {
+  use rayon::prelude::*;
+  use vorpal_language::{Language, LanguageExt, SupportLang};
+
+  let runs = crate::cached_runs(kg, artifacts_dir);
+  let pack = artifacts_dir.and_then(crate::cached_pack);
+  // Copyable borrow for the per-chunk closures.
+  let pack_ref = pack.as_deref();
+  let semantic = {
+    let mut mask = [false; 256];
+    for edge in [
+      vorpal_kg::EdgeType::CALLS,
+      vorpal_kg::EdgeType::REFERENCES,
+      vorpal_kg::EdgeType::IMPORTS,
+      vorpal_kg::EdgeType::IMPLEMENTS,
+      vorpal_kg::EdgeType::OF_TYPE,
+      vorpal_kg::EdgeType::OVERRIDES,
+    ] {
+      mask[edge.0 as usize & 0xff] = true;
+    }
+    mask
+  };
+
+  struct FileHits {
+    stale: bool,
+    /// (definition id, match count, first match offset).
+    defs: Vec<(u64, u32, u32)>,
+  }
+
+  // Pattern compilation is ~a parse of the pattern itself: per-chunk, per-language reuse
+  // keeps it to a few hundred compiles across a monorepo instead of one per file (the
+  // difference between 69 s and parse-bound wall time on the kernel's 63K C files).
+  let per_file: Vec<Option<FileHits>> = runs
+    .par_chunks(256)
+    .flat_map_iter(|chunk| {
+      let mut compiled: Vec<(SupportLang, vorpal_core::matcher::Pattern)> = Vec::new();
+      chunk.iter().map(move |run| {
+      let lang = SupportLang::from_path(&run.path)?;
+      if let Some(filter) = lang_filter {
+        if !format!("{lang:?}").eq_ignore_ascii_case(filter) && lang.to_string() != filter {
+          return None;
+        }
+      }
+      if let Some(prefix) = path_prefix {
+        if !run.path.starts_with(prefix) {
+          return None;
+        }
+      }
+      let matcher = match compiled.iter().position(|(l, _)| *l == lang) {
+        Some(at) => &compiled[at].1,
+        None => {
+          let pattern = vorpal_core::matcher::Pattern::try_new(pattern, lang).ok()?;
+          compiled.push((lang, pattern));
+          &compiled[compiled.len() - 1].1
+        }
+      };
+      let bytes = match crate::read_indexed_source_with(pack_ref, &run.path) {
+        Ok(crate::IndexedRead::Verified(bytes)) => bytes,
+        Ok(crate::IndexedRead::Unverified(bytes)) => bytes,
+        Ok(crate::IndexedRead::Changed) => {
+          return Some(FileHits {
+            stale: true,
+            defs: Vec::new(),
+          });
+        }
+        Err(_) => return None, // unreadable (deleted since indexing): not scanned
+      };
+      let Ok(source) = String::from_utf8(bytes) else {
+        return None;
+      };
+      let grep = lang.grep(&source);
+      let mut match_starts: Vec<u32> = grep
+        .root()
+        .find_all(matcher)
+        .map(|hit| hit.range().start as u32)
+        .collect();
+      if match_starts.is_empty() {
+        // Scanned, clean, matchless — counted as scanned (silence must be attributable).
+        return Some(FileHits {
+          stale: false,
+          defs: Vec::new(),
+        });
+      }
+      match_starts.sort_unstable();
+      // Attribute to the innermost containing definition span within this file's run.
+      let spans: Vec<(u32, u32, u64)> = (run.start..run.start + run.len as u64)
+        .filter_map(|id| {
+          let view = kg.node(NodeId::new(id))?;
+          if view.kind == vorpal_kg::SymbolKind::File || view.span.1 <= view.span.0 {
+            return None;
+          }
+          Some((view.span.0, view.span.1, id))
+        })
+        .collect();
+      let mut defs: std::collections::BTreeMap<u64, (u32, u32)> = std::collections::BTreeMap::new();
+      for &start in &match_starts {
+        let owner = spans
+          .iter()
+          .filter(|&&(s, e, _)| s <= start && start < e)
+          .min_by_key(|&&(s, e, _)| e - s)
+          .map(|&(.., id)| id)
+          .unwrap_or(run.start); // no containing definition → the File node
+        let entry = defs.entry(owner).or_insert((0, start));
+        entry.0 += 1;
+        entry.1 = entry.1.min(start);
+      }
+      Some(FileHits {
+        stale: false,
+        defs: defs
+          .into_iter()
+          .map(|(id, (count, first))| {
+            let line = source.as_bytes()[..first as usize]
+              .iter()
+              .filter(|&&b| b == b'\n')
+              .count() as u32
+              + 1;
+            (id, count, line)
+          })
+          .collect(),
+      })
+      })
+    })
+    .collect();
+
+  let mut stale_files = 0u64;
+  let mut scanned_files = 0u64;
+  let mut total_matches = 0u64;
+  let mut hits: Vec<(u64, u32, u32)> = Vec::new();
+  for file in per_file.into_iter().flatten() {
+    if file.stale {
+      stale_files += 1;
+      continue;
+    }
+    scanned_files += 1;
+    for (id, count, first) in file.defs {
+      total_matches += u64::from(count);
+      hits.push((id, count, first));
+    }
+  }
+
+  // Rank: semantic in-degree desc, then match count desc, then id — computed only for
+  // definitions that actually matched.
+  let mut ranked: Vec<(u64, u32, u32, u64)> = hits
+    .into_iter()
+    .map(|(id, count, first)| {
+      let in_semantic = kg
+        .in_edge_types_of(NodeId::new(id))
+        .iter()
+        .filter(|&&packed| semantic[vorpal_kg::EdgeType(packed).base().0 as usize & 0xff])
+        .count() as u64;
+      (id, count, first, in_semantic)
+    })
+    .collect();
+  ranked.sort_unstable_by(|a, b| {
+    b.3
+      .cmp(&a.3)
+      .then_with(|| b.1.cmp(&a.1))
+      .then_with(|| a.0.cmp(&b.0))
+  });
+  ranked.truncate(k.clamp(1, 1000));
+
+  let records = ranked
+    .into_iter()
+    .filter_map(|(id, matches, first, in_semantic)| {
+      Some(CodeMatchRecord {
+        node: node_record(kg, NodeId::new(id))?,
+        matches,
+        semantic_in_degree: in_semantic,
+        first_line: first,
+      })
+    })
+    .collect();
+  Ok(CodeSearchReport {
+    records,
+    stale_files,
+    scanned_files,
+    total_matches,
+  })
+}
+
+/// Rendered code-search page.
+pub fn render_code_search(report: &CodeSearchReport) -> String {
+  use std::fmt::Write;
+  let mut out = String::new();
+  let _ = writeln!(
+    out,
+    "{} matches across {} scanned files ({} stale skipped); top definitions by in-degree:",
+    report.total_matches, report.scanned_files, report.stale_files
+  );
+  for record in &report.records {
+    let _ = writeln!(
+      out,
+      "{:>6}  {} [{}] {}  ({} match{}, first at line {})",
+      record.semantic_in_degree,
+      record.node.name,
+      record.node.kind,
+      record.node.path,
+      record.matches,
+      if record.matches == 1 { "" } else { "es" },
+      record.first_line
+    );
+  }
+  out
+}
+
 /// TOON ("token-oriented object notation") rendering: declare columns once, then one row
 /// per record — path prefixes grouped so directories print once and rows carry basenames.
 /// Built for agent token budgets: on homogeneous result sets the per-row cost collapses to
@@ -1170,7 +1412,11 @@ pub struct ArchitectureReport {
 /// Compute the summary: one parallel pass over every node's in-edge types (semantic
 /// in-degree → hubs + entries), one pass over IMPORTS out-edges (module matrix), one
 /// node_path sweep for per-module tallies. Deterministic ordering throughout.
-pub fn architecture_report(kg: &Kg, top: usize) -> ArchitectureReport {
+pub fn architecture_report(
+  kg: &Kg,
+  artifacts_dir: Option<&std::path::Path>,
+  top: usize,
+) -> ArchitectureReport {
   use rayon::prelude::*;
   let semantic = {
     let mut mask = [false; 256];
@@ -1203,7 +1449,7 @@ pub fn architecture_report(kg: &Kg, top: usize) -> ArchitectureReport {
   // Modules from the FILE RUNS, not the node table: one iteration per file (72K at kernel
   // scale) instead of per node (2.7M) — the run carries the path and its definition count
   // (`len - 1`), and the File node is `run.start` for the import margins.
-  let runs = crate::annfiles::file_runs_of(kg);
+  let runs = crate::cached_runs(kg, artifacts_dir);
   let mut modules: std::collections::BTreeMap<&str, ModuleRow> = std::collections::BTreeMap::new();
   fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
@@ -1215,7 +1461,7 @@ pub fn architecture_report(kg: &Kg, top: usize) -> ArchitectureReport {
     imported_by_others: 0,
     imports_others: 0,
   };
-  for run in &runs {
+  for run in runs.iter() {
     let module = dir_of(&run.path);
     let mut cross: Vec<&str> = Vec::new();
     for (target, edge) in kg.out_neighbors(NodeId::new(run.start)) {

@@ -216,7 +216,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       };
       let dir = vorpal_kg::resolve_index_dir(Path::new(index));
       let kg = vorpal_kg::Kg::load(&dir)?;
-      let report = vorpal_index::records::architecture_report(&kg, top.clamp(1, 500));
+      let report = vorpal_index::records::architecture_report(&kg, Some(&dir), top.clamp(1, 500));
       print!("{}", vorpal_index::records::render_architecture(&report));
       Ok(())
     }
