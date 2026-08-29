@@ -666,16 +666,29 @@ fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<
     let chunk_count = len.div_ceil(HASH_CHUNK);
     let chunk_digests: io::Result<Vec<u128>> = {
       use rayon::prelude::*;
-      use std::os::unix::fs::FileExt;
-      // pread per chunk: threads share the fd position-free, and in-flight memory stays at
-      // (pool width × 8 MiB) — the whole-artifact read would have re-materialized a
-      // ~gigabyte pack this build just spent effort never holding at once.
+      // Positional reads per chunk: threads never share a cursor, and in-flight memory
+      // stays at (pool width × 8 MiB) — the whole-artifact read would have re-materialized
+      // a ~gigabyte pack this build just spent effort never holding at once. Unix pread's
+      // Windows sibling moves the handle's file pointer, so non-unix opens a fresh handle
+      // per chunk instead (identical bytes, no shared-cursor races).
+      #[cfg(unix)]
+      let read_chunk = |buf: &mut [u8], offset: u64| -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+      };
+      #[cfg(not(unix))]
+      let read_chunk = |buf: &mut [u8], offset: u64| -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut chunk_file = fs::File::open(&path)?;
+        chunk_file.seek(SeekFrom::Start(offset))?;
+        chunk_file.read_exact(buf)
+      };
       (0..chunk_count)
         .into_par_iter()
         .map(|index| {
           let offset = index * HASH_CHUNK;
           let mut buf = vec![0u8; HASH_CHUNK.min(len - offset) as usize];
-          file.read_exact_at(&mut buf, offset)?;
+          read_chunk(&mut buf, offset)?;
           Ok(xxhash_rust::xxh3::xxh3_128(&buf))
         })
         .collect()

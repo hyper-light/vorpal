@@ -16,6 +16,11 @@ env:
   # correct compiler AND linker there (no triple-prefixed cross binary exists on runners).
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
   CC_aarch64_unknown_linux_musl: musl-gcc
+  # Same for x86_64: the default host-cc driver mislinks static musl binaries that carry
+  # tokio + jemalloc (undefined `pow` — libc.a ordered before the objects needing it);
+  # musl-gcc owns the correct library group ordering.
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CC_x86_64_unknown_linux_musl: musl-gcc
   NAPI_CLI_VERSION: 3.7.2
 
 jobs:
