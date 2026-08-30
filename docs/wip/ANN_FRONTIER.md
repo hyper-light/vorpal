@@ -190,6 +190,27 @@ is load-bearing, the third independent confirmation of that law.
   search 52ms finding a just-added symbol. Compaction: dead_fraction > 5% retires the
   tier, the classic warm rebuilds densely, adoption re-keys the fresh tier.
 
+- Tier-3 quality instrumentation + universal resync — **LANDED** (53a3ab5). The live
+  tier measures its own pool recall: `AnnOverlay::pool_recall_probe_with` runs the build
+  calibration's exact recipe against the merged view — **equivalence proved by A/B on
+  the same tier: overlay probe with the build's probe rows reads 0.9938 vs calibration
+  0.9937**. Probe sets are PINNED for the tier's life (alive rows kept, dead ones
+  replaced deterministically): 32 correlated probes carry ±points of SET-to-SET spread
+  (0.9625 vs 0.9937 measured on the same tier under different draws — misses cluster
+  per probe), so redrawn sets would swamp any bar; same-set probes compare like with
+  like. Policy: self-anchored baseline (first probe after adoption), cadence one probe
+  per 1% live-row churn (five points across the 5% compaction window), degradation bar
+  baseline − 0.01 (~3× the 1/320 probe quantization step); `needs_compaction()` =
+  tombstone debt > 5% OR measured degradation. Baseline probe: 2.34M rows in ~1.9s,
+  background. **Fifth lifecycle law (measured, heavy-burst validation):** a commit that
+  produces a new sealed graph WITHOUT an eid-churn ledger (replay-pipeline serves:
+  incomplete watcher capture, dropped overlay, big bursts) leaves the tier translating
+  eids to RETIRED node ids with no signal that would ever resync it — retire the tier at
+  those commit sites (whole-tree reuse keeps it), discard any in-flight task result, and
+  let the stale-tolerant adopt reconcile fresh from the committed generation (60-file
+  bursts: retire → re-adopt with 2,486/2,544 reconciliations, ~1-2s background, zero
+  full builds).
+
 Next up: FastScan-packed SymphonyQG layout as a dedicated branch-scale effort (design
 above). T3 follow-ups: quality-probe cadence on the live tier (probe machinery exists),
 persistence policy for long-lived overlays (warm-as-compactor already wired).
