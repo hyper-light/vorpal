@@ -10,6 +10,8 @@ use toml_edit::{DocumentMut, value as to_toml};
 enum Task {
   Schema,
   Release(String),
+  /// Checksums + optional detached signatures + a provenance record over a dist directory.
+  ReleaseArtifacts(String),
 }
 
 fn get_task() -> Result<Task> {
@@ -17,6 +19,11 @@ fn get_task() -> Result<Task> {
   let arg = args().nth(1).context(message)?;
   if arg == "schema" {
     Ok(Task::Schema)
+  } else if arg == "release-artifacts" {
+    let dir = args()
+      .nth(2)
+      .context("usage: cargo xtask release-artifacts <dist-dir>")?;
+    Ok(Task::ReleaseArtifacts(dir))
   } else {
     Ok(Task::Release(arg))
   }
@@ -26,7 +33,109 @@ fn main() -> Result<()> {
   match get_task()? {
     Task::Schema => schema::generate_schema(),
     Task::Release(version) => release_new_version(&version),
+    Task::ReleaseArtifacts(dir) => release_artifacts(Path::new(&dir)),
   }
+}
+
+/// Supply-chain surface for a dist directory (D6, the release-flow half that does not touch
+/// CI workflow files): writes `SHA256SUMS`, a `provenance.json` (git commit, rustc/cargo
+/// versions, per-file sha256 + blake3 + size), and — when `VORPAL_SIGN_KEY_HEX` is set (a CI
+/// secret, never a file) — an ed25519 `SHA256SUMS.sig` over the checksums file via the same
+/// vorpal-loader signing machinery the fleet's stage-0 loader verifies with. Verification
+/// instructions live in docs/RELEASING.md.
+fn release_artifacts(dist: &Path) -> Result<()> {
+  use std::io::Read;
+  if !dist.is_dir() {
+    bail!("{} is not a directory", dist.display());
+  }
+  let mut names: Vec<String> = read_dir(dist)?
+    .flatten()
+    .filter(|e| e.path().is_file())
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .filter(|n| n != "SHA256SUMS" && n != "SHA256SUMS.sig" && n != "provenance.json")
+    .collect();
+  names.sort();
+  if names.is_empty() {
+    bail!("{} holds no artifacts", dist.display());
+  }
+
+  let mut sums = String::new();
+  let mut files = Vec::new();
+  for name in &names {
+    let path = dist.join(name);
+    let mut file = fs::File::open(&path)?;
+    use sha2::Digest;
+    let mut sha = sha2::Sha256::new();
+    let mut blake = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut len: u64 = 0;
+    loop {
+      let n = file.read(&mut buf)?;
+      if n == 0 {
+        break;
+      }
+      sha.update(&buf[..n]);
+      blake.update(&buf[..n]);
+      len += n as u64;
+    }
+    let sha_hex = format!("{:x}", sha.finalize());
+    sums.push_str(&format!("{sha_hex}  {name}
+"));
+    files.push(serde_json::json!({
+      "name": name,
+      "size": len,
+      "sha256": sha_hex,
+      "blake3": blake.finalize().to_hex().to_string(),
+    }));
+  }
+  fs::write(dist.join("SHA256SUMS"), &sums)?;
+  println!("wrote SHA256SUMS ({} artifacts)", names.len());
+
+  let commit = Command::new("git")
+    .args(["rev-parse", "HEAD"])
+    .output()
+    .ok()
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
+  let rustc = Command::new("rustc")
+    .arg("--version")
+    .output()
+    .ok()
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
+  let provenance = serde_json::json!({
+    "format": "vorpal-provenance/1",
+    "git_commit": commit,
+    "rustc": rustc,
+    "built_at_unix": std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_secs())
+      .unwrap_or(0),
+    "artifacts": files,
+  });
+  fs::write(
+    dist.join("provenance.json"),
+    format!("{}
+", to_string_pretty(&provenance)?),
+  )?;
+  println!("wrote provenance.json (commit {commit})");
+
+  match std::env::var("VORPAL_SIGN_KEY_HEX") {
+    Ok(key_hex) if !key_hex.trim().is_empty() => {
+      let key = vorpal_loader::signing_key_from_hex(key_hex.trim())
+        .context("VORPAL_SIGN_KEY_HEX is not a valid ed25519 private key hex")?;
+      let signature = vorpal_loader::sign_bytes_hex(&key, sums.as_bytes());
+      let pubkey = vorpal_loader::verifying_key_to_hex(&key.verifying_key());
+      fs::write(
+        dist.join("SHA256SUMS.sig"),
+        format!("ed25519 {pubkey} {signature}
+"),
+      )?;
+      println!("wrote SHA256SUMS.sig (pubkey {pubkey})");
+    }
+    _ => println!("VORPAL_SIGN_KEY_HEX not set — checksums unsigned (fine for local builds)"),
+  }
+  Ok(())
 }
 
 fn release_new_version(version: &str) -> Result<()> {

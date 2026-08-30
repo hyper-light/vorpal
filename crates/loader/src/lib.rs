@@ -181,6 +181,36 @@ pub fn verifying_key_from_hex(hex: &str) -> Option<VerifyingKey> {
 }
 
 /// Lowercase-hex-encode a public key for passing to the loader.
+/// Detached ed25519 signature over arbitrary bytes, hex-encoded — the release checksums
+/// signer (D6). Verification pairs with [`verify_bytes_hex`].
+pub fn sign_bytes_hex(key: &SigningKey, bytes: &[u8]) -> String {
+  let signature = key.sign(bytes);
+  signature
+    .to_bytes()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect()
+}
+
+/// Verify a detached hex signature produced by [`sign_bytes_hex`].
+pub fn verify_bytes_hex(pubkey_hex: &str, bytes: &[u8], signature_hex: &str) -> bool {
+  use ed25519_dalek::Verifier;
+  let Some(key) = verifying_key_from_hex(pubkey_hex) else {
+    return false;
+  };
+  let Ok(raw) = (0..signature_hex.len())
+    .step_by(2)
+    .map(|i| u8::from_str_radix(signature_hex.get(i..i + 2).unwrap_or("zz"), 16))
+    .collect::<Result<Vec<u8>, _>>()
+  else {
+    return false;
+  };
+  let Ok(sig_bytes) = <[u8; 64]>::try_from(raw.as_slice()) else {
+    return false;
+  };
+  key.verify(bytes, &Signature::from_bytes(&sig_bytes)).is_ok()
+}
+
 pub fn verifying_key_to_hex(key: &VerifyingKey) -> String {
   encode_hex(key.as_bytes())
 }
@@ -312,5 +342,25 @@ mod tests {
     let hex = verifying_key_to_hex(&vk);
     assert_eq!(verifying_key_from_hex(&hex).unwrap().as_bytes(), vk.as_bytes());
     assert!(verifying_key_from_hex("not-hex").is_none());
+  }
+}
+
+#[cfg(test)]
+mod detached_sig_tests {
+  use super::*;
+
+  #[test]
+  fn detached_signatures_round_trip_and_reject_tampering() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let pubkey = verifying_key_to_hex(&key.verifying_key());
+    let body = b"2e59c0...  vorpal-x.tar.gz\n";
+    let sig = sign_bytes_hex(&key, body);
+    assert!(verify_bytes_hex(&pubkey, body, &sig));
+    assert!(!verify_bytes_hex(&pubkey, b"tampered", &sig));
+    let mut bad = sig.clone();
+    bad.replace_range(0..2, if &sig[0..2] == "00" { "11" } else { "00" });
+    assert!(!verify_bytes_hex(&pubkey, body, &bad));
+    assert!(!verify_bytes_hex("zz", body, &sig), "junk pubkey never verifies");
+    assert!(!verify_bytes_hex(&pubkey, body, "zz"), "junk signature never verifies");
   }
 }

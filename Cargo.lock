@@ -4703,12 +4703,15 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "schemars",
  "serde_json",
+ "sha2",
  "toml_edit",
  "vorpal-config",
  "vorpal-core",
  "vorpal-language",
+ "vorpal-loader",
 ]
 
 [[package]]
