@@ -134,6 +134,20 @@ impl VisitStamps {
 /// The beam is a sorted array with inline expanded flags — total order `(distance, id)`, so
 /// traversal is deterministic. A node ever admitted to the beam is stamped in `stamps`, which
 /// is exactly what stops an evicted-then-rediscovered node from re-entering and looping.
+/// Deterministic build instrumentation (VORPAL_PHASE_TRACE-gated): distance evaluations and
+/// beam expansions are pure functions of (input, binary) under the deterministic build, so
+/// two builds' counters are exactly comparable even when wall time drowns in machine noise.
+pub(crate) static BUILD_DIST_EVALS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BUILD_EXPANSIONS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn counters_enabled() -> bool {
+  static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *ON.get_or_init(|| std::env::var_os("VORPAL_PHASE_TRACE").is_some())
+}
+
 pub(crate) fn greedy_search(
   graph: &Adjacency<'_>,
   medoid: u32,
@@ -183,6 +197,11 @@ pub(crate) fn greedy_search(
         continue;
       }
       cand.push((dist(nb), nb));
+    }
+    if counters_enabled() {
+      use std::sync::atomic::Ordering;
+      BUILD_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+      BUILD_DIST_EVALS.fetch_add(cand.len() as u64, Ordering::Relaxed);
     }
     if cand.is_empty() {
       continue;
@@ -275,6 +294,11 @@ impl Vamana {
     let mut rng = Rng::new(params.seed);
     for i in (1..n).rev() {
       order.swap(i, rng.below(i + 1));
+    }
+    if counters_enabled() {
+      use std::sync::atomic::Ordering;
+      BUILD_DIST_EVALS.store(0, Ordering::Relaxed);
+      BUILD_EXPANSIONS.store(0, Ordering::Relaxed);
     }
     let threads = rayon::current_num_threads().max(1);
     // Reused stamp arrays, bounded by in-flight task count; dropped with the build. A fresh
@@ -402,6 +426,15 @@ impl Vamana {
         round *= 2;
       }
     }
+    if counters_enabled() {
+      use std::sync::atomic::Ordering;
+      crate::trace(&format!(
+        "vamana: {} dist evals, {} expansions ({} points)",
+        BUILD_DIST_EVALS.load(Ordering::Relaxed),
+        BUILD_EXPANSIONS.load(Ordering::Relaxed),
+        n
+      ));
+    }
     Self {
       flat,
       lens,
@@ -453,15 +486,20 @@ fn robust_prune(
       break;
     }
     removed[scan] = true;
+    let mut prune_evals = 0u64;
     for i in (scan + 1)..candidates.len() {
       if removed[i] {
         continue;
       }
       let (v, dist_p) = candidates[i];
+      prune_evals += 1;
       // `retain` KEPT iff (v != closest && α·dist_sq(closest,v) > dist_p); remove the complement.
       if !(v != closest && alpha * matrix.dist_sq(closest, v) > dist_p) {
         removed[i] = true;
       }
+    }
+    if counters_enabled() && prune_evals > 0 {
+      BUILD_DIST_EVALS.fetch_add(prune_evals, std::sync::atomic::Ordering::Relaxed);
     }
   }
   let _ = p;

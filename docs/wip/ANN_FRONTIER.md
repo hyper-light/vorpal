@@ -77,6 +77,13 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
     + reconciliation anchor (oplog replay = bit-exact state identity). ~15-25ms CPU per
     edit; staleness bounded by one edit-apply instead of 8.5s.
 
+### Measured on-corpus since synthesis
+- Round-size cap n/50 (Tier-1 item 4): **REJECTED by gate** — dist evals 2.71B → 3.97B
+  (+46%), vamana build ~9.7s → 13.5-18.3s, pool recall 0.9125 → 0.9094. ParlayANN's cap
+  guards against quality loss vs sequential; our uncapped build already matches sequential
+  quality on this corpus, so the cap only added work. Counters (deterministic dist-eval /
+  expansion totals) landed and are the standing A/B instrument.
+
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
 - kNN-first wholesale (NN-descent/RNN-descent/HCNNG): 10-16× more distance evals; honest
