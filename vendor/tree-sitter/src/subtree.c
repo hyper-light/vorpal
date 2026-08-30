@@ -22,6 +22,48 @@ typedef struct {
 #define TS_MAX_INLINE_TREE_LENGTH UINT8_MAX
 #define TS_MAX_TREE_POOL_SIZE 32
 
+// vorpal: thread-local persistent freelist for SubtreeHeapData.
+//
+// The stock pool recycles at most TS_MAX_TREE_POOL_SIZE (32) nodes within one parse, and
+// `ts_tree_delete` releases through a zero-capacity pool — so bulk indexing pays a full
+// malloc/free round trip per heap subtree (tens of millions per large-corpus build; the
+// allocator was ~a quarter of cold-build samples). Freed nodes instead thread a singly
+// linked list through their own storage (SubtreeHeapData is comfortably pointer-sized) and
+// are handed back before any malloc. One size class only, so no headers and no size lookup;
+// per-thread, so no synchronization; allocation identity cannot affect parse RESULTS, so
+// output bytes are unchanged by construction. Capacity is bounded (drains to ts_free past
+// the cap, sized to a few large trees); worker threads live for the process, so the resident
+// freelist is reclaimed at exit.
+typedef struct VorpalSubtreeFreeNode {
+  struct VorpalSubtreeFreeNode *next;
+} VorpalSubtreeFreeNode;
+
+#define VORPAL_SUBTREE_FREELIST_CAP (1u << 18)
+
+static _Thread_local VorpalSubtreeFreeNode *vorpal_subtree_freelist = NULL;
+static _Thread_local uint32_t vorpal_subtree_freelist_len = 0;
+
+static inline SubtreeHeapData *vorpal_subtree_alloc(void) {
+  VorpalSubtreeFreeNode *head = vorpal_subtree_freelist;
+  if (head) {
+    vorpal_subtree_freelist = head->next;
+    vorpal_subtree_freelist_len -= 1;
+    return (SubtreeHeapData *)head;
+  }
+  return ts_malloc(sizeof(SubtreeHeapData));
+}
+
+static inline void vorpal_subtree_dealloc(SubtreeHeapData *tree) {
+  if (vorpal_subtree_freelist_len < VORPAL_SUBTREE_FREELIST_CAP) {
+    VorpalSubtreeFreeNode *node = (VorpalSubtreeFreeNode *)tree;
+    node->next = vorpal_subtree_freelist;
+    vorpal_subtree_freelist = node;
+    vorpal_subtree_freelist_len += 1;
+  } else {
+    ts_free(tree);
+  }
+}
+
 // ExternalScannerState
 
 void ts_external_scanner_state_init(ExternalScannerState *self, const char *data, unsigned length) {
@@ -127,7 +169,7 @@ SubtreePool ts_subtree_pool_new(uint32_t capacity) {
 void ts_subtree_pool_delete(SubtreePool *self) {
   if (self->free_trees.contents) {
     for (unsigned i = 0; i < self->free_trees.size; i++) {
-      ts_free(array_get(&self->free_trees, i)->ptr);
+      vorpal_subtree_dealloc(array_get(&self->free_trees, i)->ptr);
     }
     array_delete(&self->free_trees);
   }
@@ -138,7 +180,7 @@ static SubtreeHeapData *ts_subtree_pool_allocate(SubtreePool *self) {
   if (self->free_trees.size > 0) {
     return array_pop(&self->free_trees).ptr;
   } else {
-    return ts_malloc(sizeof(SubtreeHeapData));
+    return vorpal_subtree_alloc();
   }
 }
 
@@ -146,7 +188,7 @@ static void ts_subtree_pool_free(SubtreePool *self, SubtreeHeapData *tree) {
   if (self->free_trees.capacity > 0 && self->free_trees.size + 1 <= TS_MAX_TREE_POOL_SIZE) {
     array_push(&self->free_trees, (MutableSubtree) {.ptr = tree});
   } else {
-    ts_free(tree);
+    vorpal_subtree_dealloc(tree);
   }
 }
 

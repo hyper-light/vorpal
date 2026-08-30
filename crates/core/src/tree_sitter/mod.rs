@@ -27,18 +27,38 @@ pub enum TSParseError {
   TreeUnavailable,
 }
 
+std::thread_local! {
+  /// One reusable parser per worker thread. A fresh `Parser::new()` per file made bulk
+  /// indexing recreate the GLR stack's node pool and the lexer's buffers tens of millions
+  /// of times per large corpus (the allocator was ~a quarter of cold-build samples); a
+  /// warm parser keeps those pools across files. Parser state never influences tree
+  /// CONTENT — same input, same grammar, same tree — so reuse cannot change output bytes.
+  /// Injection parsing (which sets included ranges) deliberately does NOT use this slot:
+  /// it builds fresh parsers, so the shared one never carries range state between files.
+  static REUSED_PARSER: std::cell::RefCell<Option<Parser>> = const { std::cell::RefCell::new(None) };
+}
+
 #[inline]
 fn parse_lang(
   parse_fn: impl Fn(&mut Parser) -> Option<Tree>,
   ts_lang: TSLanguage,
 ) -> Result<Tree, TSParseError> {
-  let mut parser = Parser::new();
-  parser.set_language(&ts_lang)?;
-  if let Some(tree) = parse_fn(&mut parser) {
-    Ok(tree)
-  } else {
-    Err(TSParseError::TreeUnavailable)
-  }
+  REUSED_PARSER.with(|slot| {
+    // A nested parse while the slot is borrowed (defensive — none exists today) falls back
+    // to a fresh parser rather than panicking.
+    let Ok(mut slot) = slot.try_borrow_mut() else {
+      let mut parser = Parser::new();
+      parser.set_language(&ts_lang)?;
+      return parse_fn(&mut parser).ok_or(TSParseError::TreeUnavailable);
+    };
+    let parser = slot.get_or_insert_with(Parser::new);
+    parser.set_language(&ts_lang)?;
+    if let Some(tree) = parse_fn(parser) {
+      Ok(tree)
+    } else {
+      Err(TSParseError::TreeUnavailable)
+    }
+  })
 }
 
 #[derive(Clone)]
