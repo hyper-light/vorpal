@@ -17,7 +17,7 @@ use vorpal_lang_registry::SgLang;
 
 use crate::references::{
   CallSpecData, HandlerAtData, ImplSpecData, ImportSpecData, QualSourceData, RefSpecData,
-  RouteSpecData, SelData, TextAction,
+  RequestSpecData, RouteSpecData, SelData, TextAction,
 };
 
 /// How to locate the referenced sub-node inside a matched node — the tagged mirror of
@@ -249,6 +249,54 @@ impl SerializableRouteSpec {
   }
 }
 
+/// An HTTP client call construct — mirror of `references::RequestSpec`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SerializableRequestSpec {
+  pub kind: String,
+  pub name: Vec<SerializableSel>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub verb_names: Vec<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub get_names: Vec<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub receivers: Vec<String>,
+  pub args: Vec<SerializableSel>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub method_from_arg: Option<u8>,
+  /// Strict-kind escape hatch: this entry may name a kind the grammar lacks (shared specs).
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub optional: bool,
+}
+
+impl SerializableRequestSpec {
+  fn to_request_data(&self) -> RequestSpecData {
+    RequestSpecData {
+      kind: self.kind.clone(),
+      name: self.name.iter().map(SelData::from).collect(),
+      verb_names: self.verb_names.clone(),
+      get_names: self.get_names.clone(),
+      receivers: self.receivers.clone(),
+      args: self.args.iter().map(SelData::from).collect(),
+      method_from_arg: self.method_from_arg,
+    }
+  }
+
+  #[cfg(test)] // the round-trip expressiveness test's lifting direction
+  fn from_request_data(data: &RequestSpecData) -> Self {
+    Self {
+      kind: data.kind.clone(),
+      name: data.name.iter().map(SerializableSel::from).collect(),
+      verb_names: data.verb_names.clone(),
+      get_names: data.get_names.clone(),
+      receivers: data.receivers.clone(),
+      args: data.args.iter().map(SerializableSel::from).collect(),
+      method_from_arg: data.method_from_arg,
+      optional: false,
+    }
+  }
+}
+
 fn is_default_sel(sel: &SerializableSel) -> bool {
   *sel == SerializableSel::FirstNamedChild
 }
@@ -285,6 +333,8 @@ pub struct SerializableRefSpec {
   pub self_receivers: Vec<String>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub routes: Vec<SerializableRouteSpec>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub requests: Vec<SerializableRequestSpec>,
 }
 
 impl SerializableRefSpec {
@@ -352,6 +402,12 @@ impl SerializableRefSpec {
         routes.push(entry.to_route_data());
       }
     }
+    let mut requests = Vec::with_capacity(self.requests.len());
+    for entry in &self.requests {
+      if check(&entry.kind, "requests", entry.optional)? {
+        requests.push(entry.to_request_data());
+      }
+    }
 
     Ok(RefSpecData {
       calls,
@@ -369,6 +425,7 @@ impl SerializableRefSpec {
       method_callee_kinds: self.method_callee_kinds.clone(),
       self_receivers: self.self_receivers.clone(),
       routes,
+      requests,
     })
   }
 
@@ -417,6 +474,11 @@ impl SerializableRefSpec {
       method_callee_kinds: self.method_callee_kinds.clone(),
       self_receivers: self.self_receivers.clone(),
       routes: self.routes.iter().map(SerializableRouteSpec::to_route_data).collect(),
+      requests: self
+        .requests
+        .iter()
+        .map(SerializableRequestSpec::to_request_data)
+        .collect(),
     }
   }
 
@@ -472,6 +534,11 @@ impl SerializableRefSpec {
       method_callee_kinds: data.method_callee_kinds.clone(),
       self_receivers: data.self_receivers.clone(),
       routes: data.routes.iter().map(SerializableRouteSpec::from_route_data).collect(),
+      requests: data
+        .requests
+        .iter()
+        .map(SerializableRequestSpec::from_request_data)
+        .collect(),
     }
   }
 }

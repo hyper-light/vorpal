@@ -152,6 +152,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
           Some(note) => println!("near-clones: {note}"),
           None => println!("near-clones: {} similar_to pairs from token sketches", report.similar_edges),
         }
+        if report.request_sites > 0 {
+          println!(
+            "requests: {} of {} client call sites linked to routes",
+            report.request_edges, report.request_sites
+          );
+        }
+        if let Some(note) = &report.request_note {
+          println!("requests: {note}");
+        }
         if report.excluded_files > 0 {
           println!(
             "note: {} unhealthy files excluded from the graph (parse-health policy)",

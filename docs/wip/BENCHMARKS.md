@@ -93,6 +93,19 @@ pass), one-file update parity (0.26 / 0.24 s). cpython and the kernel truthfully
 zero routes (no web code); the only ref-level delta is one extra *masked* reference — a
 handler probe that resolved to nothing, producing no edge.
 
+2026-08-30 request → route edges (`requests`, ADOPTION #25 slice 2, product format 17):
+HTTP client call sites with literal URLs (`fetch("/api/users")`, `requests.get(url)`,
+`axios.<verb>`, `http.Get`/`NewRequest`, reqwest) are recorded at extraction and matched
+against `Route` templates at link — unique matches only, template parameters absorb
+segments, cross-language (a TS `fetch("/health")` links into a Go `HandleFunc` route in
+the fixtures), directional edges at confidence 95 (literal-exact) / 85 (parameterized).
+Ambiguous and unmatched sites are counted on the report, never guessed. Measured against
+the route-slice binary, interleaved: kernel cold 8.02 → 7.82 s, cpython cold 2.17/0.98 →
+1.98/0.98 s, one-file update 0.27/0.28 s — parity throughout (+1.4% cpython user CPU);
+pack +4 bytes per product (the empty section count: kernel +304 KB = +0.05%). cpython in
+the wild: 1 client call site found, 0 linked, stated on the report ("this tree defines no
+routes — all external"). Cross-repo linking waits on the fleet index merge (R2).
+
 Index size (linux, one generation): 1.27 GiB before tiers — `products.pack` 595 MB,
 `evidence.bin` 268 MB, `nodes.vseg` 171 MB, `strings.heap` 150 MB, `graph.bin` 122 MB,
 `names.idx` 44 MB, `manifest.bin` 6.8 MB, `products.idx` 6.5 MB, `dataflow.bin` 0.75 MB

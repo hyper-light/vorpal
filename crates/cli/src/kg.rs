@@ -228,7 +228,7 @@ pub struct GraphArg {
   direction: String,
   /// (reachable) Comma-separated edge types to follow (calls, references, imports,
   /// implements, of_type, defines, has_method, has_field, overrides, data_flows,
-  /// changes_with, similar_to).
+  /// changes_with, similar_to, requests).
   /// Default `calls`.
   #[clap(long, value_name = "RELS", default_value = "calls")]
   relations: String,
@@ -591,6 +591,15 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
     match &report.similar_note {
       Some(note) => println!("near-clones: {note}"),
       None => println!("near-clones: {} similar_to pairs from token sketches", report.similar_edges),
+    }
+    if report.request_sites > 0 {
+      println!(
+        "requests: {} of {} client call sites linked to routes",
+        report.request_edges, report.request_sites
+      );
+    }
+    if let Some(note) = &report.request_note {
+      println!("requests: {note}");
     }
   }
   if !report.unverified_langs.is_empty() {

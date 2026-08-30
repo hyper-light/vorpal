@@ -34,7 +34,7 @@ use vorpal_resolve::{RefForm, RefKind};
 /// v14 (G-M1): refs carry receiver/receiver-type/args; products carry per-entity params.
 /// The version check itself is this bump's invalidation — v13 bytes never decode, so every
 /// file re-extracts exactly once.
-pub const PRODUCT_FORMAT_VERSION: u32 = 16;
+pub const PRODUCT_FORMAT_VERSION: u32 = 17;
 
 /// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
 pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
@@ -83,12 +83,16 @@ pub struct FileProduct {
   /// `(function name, declared return type)` — v15, the chained-call return ledger. Name-
 /// v16: near-clone signatures — per callable definition a 64-byte MinHash sketch + shingle
 /// count (trailing section, absent for definitions under the 32-token floor).
+/// v17: HTTP request records — per client call site the method + literal URL (trailing
+/// section), matched against `Route` templates at link.
   /// keyed on purpose: link joins it against receiver "types" that are really callee names
   /// (`let x = make(); x.render()`), poisoning same-named functions with disagreeing
   /// returns. Only capture languages with a return annotation produce rows.
   pub returns: Vec<(String, String)>,
   /// Near-clone sketches per signed callable definition (v16), entity-ordered.
   pub signatures: Vec<ProductSignature>,
+  /// HTTP client call sites with literal URLs (v17), in walk order.
+  pub requests: Vec<ProductRequest>,
 }
 
 /// A reference keyed by its enclosing definition's position in the file's local layout
@@ -134,6 +138,26 @@ pub struct SignatureView<'a> {
   pub entity_index: u32,
   pub shingles: u32,
   pub sketch: &'a [u8],
+}
+
+/// One HTTP client call site (v17): the enclosing entity, method, literal URL, span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductRequest {
+  pub from_entity_index: u32,
+  pub method: String,
+  pub path: String,
+  pub start: u32,
+  pub end: u32,
+}
+
+/// Borrowed twin of [`ProductRequest`].
+#[derive(Clone, Copy)]
+pub struct RequestView<'a> {
+  pub from_entity_index: u32,
+  pub method: &'a str,
+  pub path: &'a str,
+  pub start: u32,
+  pub end: u32,
 }
 
 /// One persisted call-site argument (see `references::RawArg`).
@@ -507,6 +531,14 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
     push_u32(buf, sig.shingles);
     buf.extend_from_slice(&sig.sketch);
   }
+  push_u32(buf, product.requests.len() as u32);
+  for req in &product.requests {
+    push_u32(buf, req.from_entity_index);
+    push_u32(buf, req.start);
+    push_u32(buf, req.end);
+    push_str(buf, &req.method);
+    push_str(buf, &req.path);
+  }
 }
 
 struct Reader<'a> {
@@ -634,6 +666,8 @@ pub struct ProductView<'a> {
   pub returns: Vec<(&'a str, &'a str)>,
   /// Borrowed twin of `FileProduct::signatures` (v16).
   pub signatures: Vec<SignatureView<'a>>,
+  /// Borrowed twin of `FileProduct::requests` (v17).
+  pub requests: Vec<RequestView<'a>>,
 }
 
 /// One reference occurrence as a borrowed view (see [`ProductRef`] for field semantics).
@@ -967,6 +1001,22 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       sketch,
     });
   }
+  let request_count = r.count()?;
+  let mut requests = Vec::with_capacity(request_count.min(1024));
+  for _ in 0..request_count {
+    let from_entity_index = r.u32()?;
+    let start = r.u32()?;
+    let end = r.u32()?;
+    let method = r.str_borrowed()?;
+    let path = r.str_borrowed()?;
+    requests.push(RequestView {
+      from_entity_index,
+      method,
+      path,
+      start,
+      end,
+    });
+  }
   if r.off != bytes.len() {
     return Err(corrupt("trailing bytes after product"));
   }
@@ -983,6 +1033,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     entity_params,
     returns,
     signatures,
+    requests,
   })
 }
 
@@ -1107,6 +1158,22 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
       sketch,
     });
   }
+  let request_count = r.count()?;
+  let mut requests = Vec::with_capacity(request_count.min(1024));
+  for _ in 0..request_count {
+    let from_entity_index = r.u32()?;
+    let start = r.u32()?;
+    let end = r.u32()?;
+    let method = r.str()?;
+    let path = r.str()?;
+    requests.push(ProductRequest {
+      from_entity_index,
+      method,
+      path,
+      start,
+      end,
+    });
+  }
   if r.off != bytes.len() {
     return Err(corrupt("trailing bytes after product"));
   }
@@ -1124,6 +1191,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     entity_params,
     returns,
     signatures,
+    requests,
   })
 }
 

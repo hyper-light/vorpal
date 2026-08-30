@@ -70,8 +70,12 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 > Go `net/http`/gin/echo/chi (Go 1.22 `"GET /x"` patterns included), axum,
 > actix-web/Rocket attributes, Spring, ASP.NET attributes, and Rails/Sinatra. A route
 > `calls` its handler, so `callers <handler>` names the endpoint, `reachable` from a route
-> walks its implementation, and `dead_code` never flags handlers. Literal path strings
-> only; a route built from variables is not extracted (nothing is guessed).
+> walks its implementation, and `dead_code` never flags handlers. HTTP client call sites
+> with literal URLs (`fetch("/api/users")`, `requests.get(url)`, `http.NewRequest`)
+> gain a directional `requests` edge to the route their path uniquely matches — template
+> parameters absorb segments, cross-language (a TS frontend into a Go backend is one
+> graph), ambiguity refuses and is counted. Literal strings only; a URL or route built
+> from variables is not extracted (nothing is guessed).
 | Tool | What it does |
 |---|---|
 | `node` | Nodes matching an exact symbol name. |

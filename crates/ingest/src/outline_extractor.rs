@@ -389,6 +389,7 @@ impl OutlineExtractor {
 
     let mut raw = Vec::new();
     let mut bindings = Vec::new();
+    let mut raw_requests = Vec::new();
     match spec {
       Some(spec) => extract_references_with_facts(
         grep.root(),
@@ -398,6 +399,7 @@ impl OutlineExtractor {
         &entities,
         &mut raw,
         &mut bindings,
+        &mut raw_requests,
         signer.as_mut(),
       ),
       None => {
@@ -427,6 +429,7 @@ impl OutlineExtractor {
           &entities,
           &mut raw,
           &mut bindings,
+          &mut raw_requests,
           signer.as_mut(),
         );
       } else if let Some(signer) = signer.as_mut() {
@@ -566,6 +569,16 @@ impl OutlineExtractor {
       entity_params,
       returns,
       signatures,
+      requests: raw_requests
+        .into_iter()
+        .map(|r| product::ProductRequest {
+          from_entity_index: r.from.raw() as u32,
+          method: r.method,
+          path: r.path.into_owned(),
+          start: r.start,
+          end: r.end,
+        })
+        .collect(),
     })
   }
 }

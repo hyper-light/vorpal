@@ -205,6 +205,26 @@ struct RouteSpec {
   handler: HandlerAt,
 }
 
+/// An HTTP client call site (`fetch("/api/users")`, `requests.get(url)`): matching nodes
+/// record a request (method + literal URL) for link-time matching against `Route` nodes.
+/// Literal URLs only — a URL built from variables records nothing.
+struct RequestSpec {
+  kind: &'static str,
+  /// Navigation to the callee node.
+  name: &'static [Sel],
+  /// Callee names that ARE the HTTP verb (`get`, `Post`).
+  verb_names: &'static [&'static str],
+  /// Callee names implying GET (`fetch` without an options argument is a GET).
+  get_names: &'static [&'static str],
+  /// Receiver spellings that mark an HTTP client (`axios`, `requests`, `http`); empty
+  /// means the callee name alone suffices (`fetch`).
+  receivers: &'static [&'static str],
+  args: &'static [Sel],
+  /// The argument (0-based, named children) carrying the method as a string literal
+  /// (`http.NewRequest("GET", url, …)`); the verb from the name is ignored then.
+  method_from_arg: Option<u8>,
+}
+
 /// An implements/extends construct: matching nodes emit `implements` references for their type
 /// targets (`impl Trait for T`, `class C implements I`, `class Sub extends Base`).
 struct ImplSpec {
@@ -239,6 +259,8 @@ pub(crate) struct RefSpec {
   self_receivers: &'static [&'static str],
   /// HTTP route registration constructs (see [`RouteSpec`]).
   routes: &'static [RouteSpec],
+  /// HTTP client call constructs (see [`RequestSpec`]).
+  requests: &'static [RequestSpec],
 }
 
 const NONE_TEXT: &[(&str, TextAction)] = &[];
@@ -260,6 +282,7 @@ const SPEC_DEFAULTS: RefSpec = RefSpec {
   method_callee_kinds: NO_KINDS,
   self_receivers: NO_KINDS,
   routes: &[],
+  requests: &[],
 };
 
 // ---- Owned spec data (F-M4) ---------------------------------------------------------------
@@ -410,6 +433,32 @@ impl From<&RouteSpec> for RouteSpecData {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RequestSpecData {
+  pub(crate) kind: String,
+  pub(crate) name: Vec<SelData>,
+  pub(crate) verb_names: Vec<String>,
+  pub(crate) get_names: Vec<String>,
+  pub(crate) receivers: Vec<String>,
+  pub(crate) args: Vec<SelData>,
+  pub(crate) method_from_arg: Option<u8>,
+}
+
+impl From<&RequestSpec> for RequestSpecData {
+  fn from(spec: &RequestSpec) -> Self {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).into()).collect() };
+    Self {
+      kind: spec.kind.into(),
+      name: spec.name.iter().map(SelData::from).collect(),
+      verb_names: owned(spec.verb_names),
+      get_names: owned(spec.get_names),
+      receivers: owned(spec.receivers),
+      args: spec.args.iter().map(SelData::from).collect(),
+      method_from_arg: spec.method_from_arg,
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RefSpecData {
   pub(crate) calls: Vec<CallSpecData>,
   pub(crate) imports: Vec<ImportSpecData>,
@@ -422,6 +471,7 @@ pub(crate) struct RefSpecData {
   pub(crate) method_callee_kinds: Vec<String>,
   pub(crate) self_receivers: Vec<String>,
   pub(crate) routes: Vec<RouteSpecData>,
+  pub(crate) requests: Vec<RequestSpecData>,
 }
 
 impl From<&RefSpec> for RefSpecData {
@@ -443,6 +493,7 @@ impl From<&RefSpec> for RefSpecData {
       method_callee_kinds: owned(spec.method_callee_kinds),
       self_receivers: owned(spec.self_receivers),
       routes: spec.routes.iter().map(RouteSpecData::from).collect(),
+      requests: spec.requests.iter().map(RequestSpecData::from).collect(),
     }
   }
 }
@@ -493,6 +544,16 @@ const RUST: RefSpec = RefSpec {
       handler: HandlerAt::NextSibling(&["function_item"]),
     },
   ],
+  requests: &[RequestSpec {
+    // reqwest: client.get("http://…"), reqwest::get(…).
+    kind: "call_expression",
+    name: &[Sel::Field("function")],
+    verb_names: &["get", "post", "put", "delete", "patch", "head"],
+    get_names: &[],
+    receivers: &["client", "reqwest", "http_client"],
+    args: &[Sel::Field("arguments")],
+    method_from_arg: None,
+  }],
   ..SPEC_DEFAULTS
 };
 
@@ -548,6 +609,16 @@ const PYTHON: RefSpec = RefSpec {
       handler: HandlerAt::LastArgument,
     },
   ],
+  requests: &[RequestSpec {
+    // requests.get("http://svc/x"), httpx.post(...), session/client verbs.
+    kind: "call",
+    name: &[Sel::Field("function")],
+    verb_names: &["get", "post", "put", "delete", "patch", "head", "options", "request"],
+    get_names: &[],
+    receivers: &["requests", "httpx", "client", "session", "http", "api"],
+    args: &[Sel::Field("arguments")],
+    method_from_arg: None,
+  }],
   ..SPEC_DEFAULTS
 };
 
@@ -579,6 +650,28 @@ const GO: RefSpec = RefSpec {
       args: &[Sel::Field("arguments")],
       path_any: false,
       handler: HandlerAt::LastArgument,
+    },
+  ],
+  requests: &[
+    // http.Get(url) / http.Head / http.PostForm — package-level client calls.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &["Get", "Post", "Head", "PostForm"],
+      get_names: &[],
+      receivers: &["http", "client", "resty"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    // http.NewRequest("GET", url, …) — the method is the first argument.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &["NewRequest", "NewRequestWithContext"],
+      get_names: &[],
+      receivers: &["http"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: Some(0),
     },
   ],
   ..SPEC_DEFAULTS
@@ -626,6 +719,28 @@ const JS_LIKE: RefSpec = RefSpec {
       args: &[Sel::ChildOfKind(&["call_expression"]), Sel::Field("arguments")],
       path_any: true,
       handler: HandlerAt::NextSibling(&["method_definition"]),
+    },
+  ],
+  requests: &[
+    // fetch("/api/users") — GET unless options say otherwise (v1 records GET).
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &["fetch"],
+      receivers: &[],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    // axios.get("/x") and friends — verb-named member calls on known client receivers.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &["get", "post", "put", "delete", "patch", "head", "options"],
+      get_names: &[],
+      receivers: &["axios", "http", "https", "client", "api", "ky", "got", "superagent", "agent"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
     },
   ],
   ..SPEC_DEFAULTS
@@ -1203,6 +1318,8 @@ pub(crate) struct ResolvedRefSpec {
   /// Resolved kind id per `spec.routes` entry (routes share kinds with calls, so they
   /// dispatch beside the chain, never through it).
   route_kind_ids: Vec<u16>,
+  /// Resolved kind id per `spec.requests` entry — same beside-the-chain dispatch.
+  request_kind_ids: Vec<u16>,
 }
 
 impl ResolvedRefSpec {
@@ -1222,6 +1339,11 @@ impl ResolvedRefSpec {
       .collect();
     let route_kind_ids: Vec<u16> = spec
       .routes
+      .iter()
+      .map(|r| id_of(&r.kind).unwrap_or(0))
+      .collect();
+    let request_kind_ids: Vec<u16> = spec
+      .requests
       .iter()
       .map(|r| id_of(&r.kind).unwrap_or(0))
       .collect();
@@ -1274,6 +1396,7 @@ impl ResolvedRefSpec {
       type_params,
       import_kind_ids,
       route_kind_ids,
+      request_kind_ids,
     }
   }
 
@@ -1511,6 +1634,16 @@ impl<'a> SpanCursor<'a> {
   }
 }
 
+/// One recorded HTTP client call site: the enclosing definition, the method, and the
+/// literal URL — matched against `Route` templates at link time.
+pub(crate) struct RawRequest<'t> {
+  pub(crate) from: NodeId,
+  pub(crate) method: String,
+  pub(crate) path: Cow<'t, str>,
+  pub(crate) start: u32,
+  pub(crate) end: u32,
+}
+
 /// A walk emission awaiting the post-pass: definite references pass through in visit order;
 /// type-use candidates wait for the complete binder set (a `type_parameters` declaration may
 /// be visited after uses of its binder, so the shadow filter can only run once the walk ends).
@@ -1545,6 +1678,7 @@ pub(crate) fn extract_references<'t>(
     entities,
     out,
     &mut Vec::new(),
+    &mut Vec::new(),
     None,
   );
 }
@@ -1561,6 +1695,7 @@ pub(crate) fn extract_references_with_facts<'t>(
   entities: &[String],
   out: &mut Vec<RawRef<'t>>,
   bindings: &mut Vec<crate::typefacts::RawBinding<'t>>,
+  requests_out: &mut Vec<RawRequest<'t>>,
   mut signer: Option<&mut crate::signature::Signer>,
 ) {
   let spec = &*resolved.spec;
@@ -1602,6 +1737,11 @@ pub(crate) fn extract_references_with_facts<'t>(
     for (idx, &id) in resolved.route_kind_ids.iter().enumerate() {
       if id != 0 && id == kind_id {
         emit_route_handler(&node, &spec.routes[idx], spec, &mut span_cursor, &mut pending);
+      }
+    }
+    for (idx, &id) in resolved.request_kind_ids.iter().enumerate() {
+      if id != 0 && id == kind_id {
+        emit_request(&node, &spec.requests[idx], &mut span_cursor, requests_out);
       }
     }
     match resolved.chain_at(kind_id) {
@@ -2207,6 +2347,97 @@ fn emit_route_handler<'t>(
     raw.form = RefForm::MethodHinted;
   }
   pending.push(Pending::Ready(raw));
+}
+
+/// The container (receiver/module) text of a callee node, when it is a single word:
+/// `axios.get` → `axios`, `reqwest::get` → `reqwest`, `http.Get` → `http`.
+fn container_text<'t>(callee: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  ["object", "operand", "value", "scope", "path"]
+    .iter()
+    .find_map(|field| callee.field(field))
+    .map(|container| trim_cow(container.text(), str::trim))
+    .filter(|text| !text.is_empty() && !text.contains(char::is_whitespace))
+}
+
+/// The first URL-shaped string literal under `args`: content starting `/`, `http://`, or
+/// `https://`. Quote-stripped; `None` when every argument is dynamic.
+fn request_url_literal<'t>(args: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  args
+    .dfs()
+    .skip(1)
+    .filter(|n| {
+      let kind = n.kind();
+      kind.as_ref() == "string" || kind.as_ref().ends_with("string_literal")
+    })
+    .map(|literal| {
+      trim_cow(literal.text(), |t| {
+        t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+      })
+    })
+    .find(|text| {
+      text.starts_with('/') || text.starts_with("http://") || text.starts_with("https://")
+    })
+}
+
+/// Record an HTTP client call site (see [`RequestSpec`]) for link-time route matching.
+fn emit_request<'t>(
+  node: &SgNode<'t>,
+  request: &RequestSpecData,
+  span_cursor: &mut SpanCursor<'_>,
+  out: &mut Vec<RawRequest<'t>>,
+) {
+  let Some(callee) = select_path(node, &request.name) else {
+    return;
+  };
+  let Some(name) = callee_name(&callee) else {
+    return;
+  };
+  let method = if request.verb_names.iter().any(|n| n == name.as_ref()) {
+    name.to_ascii_uppercase()
+  } else if request.get_names.iter().any(|n| n == name.as_ref()) {
+    "GET".to_string()
+  } else {
+    return;
+  };
+  if !request.receivers.is_empty() {
+    let Some(receiver) = container_text(&callee) else {
+      return;
+    };
+    if !request.receivers.iter().any(|r| r == receiver.as_ref()) {
+      return;
+    }
+  }
+  let Some(args) = select_path(node, &request.args) else {
+    return;
+  };
+  let method = match request.method_from_arg {
+    None => method,
+    Some(index) => {
+      // The method rides as a string argument (`http.NewRequest("GET", …)`).
+      let Some(arg) = args.children().filter(|c| c.is_named()).nth(index as usize) else {
+        return;
+      };
+      let text = trim_cow(arg.text(), |t| t.trim_matches(|c| c == '"' || c == '\'' || c == '`'));
+      if text.is_empty() || !text.bytes().all(|b| b.is_ascii_uppercase()) {
+        return;
+      }
+      text.to_string()
+    }
+  };
+  let Some(path) = request_url_literal(&args) else {
+    return;
+  };
+  let range = node.range();
+  let Some(from) = span_cursor.enclosing(range.start) else {
+    return;
+  };
+  out.push(RawRequest {
+    from,
+    method,
+    path,
+    start: range.start as u32,
+    end: range.end as u32,
+  });
 }
 
 /// All matching targets for an import node (repeated fields / multiple names per statement).

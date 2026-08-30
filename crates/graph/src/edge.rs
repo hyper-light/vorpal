@@ -43,6 +43,11 @@ impl EdgeType {
   /// by their MinHash sketches (symmetric; confidence = estimated similarity × 100). Derived
   /// at link from extraction-time signatures, never from name resolution.
   pub const SIMILAR_TO: EdgeType = EdgeType(12);
+  /// An HTTP client call site whose literal URL uniquely matches a `Route` node's template
+  /// (`fetch("/api/users")` → `GET /api/users`): caller → route, directional. Confidence 95
+  /// for a literal-exact path, 85 when template parameters absorbed segments. Derived at
+  /// link from extraction-time request records; ambiguity refuses, never guesses.
+  pub const REQUESTS: EdgeType = EdgeType(13);
 
   /// The user-facing relation name (the spelling accepted by [`EdgeType::from_name`] and shown
   /// in traversal results). Confidence is ignored — this reports the base type.
@@ -60,6 +65,7 @@ impl EdgeType {
       EdgeType::DATA_FLOWS => "data_flows",
       EdgeType::CHANGES_WITH => "changes_with",
       EdgeType::SIMILAR_TO => "similar_to",
+      EdgeType::REQUESTS => "requests",
       _ => "unknown",
     }
   }
@@ -80,6 +86,7 @@ impl EdgeType {
       "data_flows" => Some(EdgeType::DATA_FLOWS),
       "changes_with" => Some(EdgeType::CHANGES_WITH),
       "similar_to" => Some(EdgeType::SIMILAR_TO),
+      "requests" => Some(EdgeType::REQUESTS),
       _ => None,
     }
   }

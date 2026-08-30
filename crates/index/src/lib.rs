@@ -90,6 +90,13 @@ pub struct IndexReport {
   /// Why the similarity pass produced nothing, or what it truncated — stated, never a
   /// silent zero. `None` when pairs were sealed.
   pub similar_note: Option<String>,
+  /// HTTP client call sites with a literal URL seen this build.
+  pub request_sites: u64,
+  /// Directional `requests` edges sealed (unique client URL → route template matches).
+  pub request_edges: u64,
+  /// Stated when request sites existed but nothing linked — external services are normal,
+  /// silence is not.
+  pub request_note: Option<String>,
 }
 
 impl IndexReport {
@@ -351,6 +358,9 @@ pub fn build_index_env(
           cochange_note: None,
           similar_edges: 0,
           similar_note: None,
+          request_sites: 0,
+          request_edges: 0,
+          request_note: None,
         });
       }
     }
@@ -654,7 +664,8 @@ pub fn build_index_env(
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve, evidence, flows, similar) = vorpal_ingest::link_writer_spilled_with_flows(
+  let (kg, resolve, evidence, flows, similar, request_report) =
+    vorpal_ingest::link_writer_spilled_with_flows(
     &interner,
     writer,
     spilled_refs,
@@ -701,6 +712,9 @@ pub fn build_index_env(
     cochange_note,
     similar_edges: similar.edges,
     similar_note: similar.note,
+    request_sites: request_report.sites,
+    request_edges: request_report.edges,
+    request_note: request_report.note,
   })
 }
 
