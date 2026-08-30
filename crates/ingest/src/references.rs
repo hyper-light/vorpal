@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::LazyLock;
 
-use vorpal_core::tree_sitter::StrDoc;
+use vorpal_core::tree_sitter::{PreWithDepth, StrDoc};
 use vorpal_core::{Language, Node};
 use vorpal_kg::NodeId;
 use vorpal_language::SupportLang;
@@ -873,40 +873,48 @@ pub(crate) fn extract_references<'t>(
   // call, so the previous stack walk paid one C-side cursor malloc per visited node (~350k per
   // index of this repo); `dfs()` streams the whole file over ONE cursor. Anonymous token
   // leaves still stream past, but a skipped iterator step is free where a cursor was not.
-  for node in root.dfs() {
-    if !node.is_named() {
-      continue;
-    }
-    let kind_id = node.kind_id();
-    if resolved.declares_type_params(kind_id) {
-      collect_binders_in(&node, &mut binders);
-    }
-    match resolved.chain_at(kind_id) {
-      Chain::None => {}
-      Chain::Import => {
-        for (ispec, &id) in spec.imports.iter().zip(&resolved.import_kind_ids) {
-          if id == kind_id {
-            emit_imports(&node, ispec, def_spans, &mut pending);
+  // Explicit ancestor stack, driven by the walk's own depth (a truncate + push per node):
+  // every parent the handlers consult reads from this stack instead of `Node::parent`,
+  // which has no parent pointer and re-walks from the tree ROOT (one
+  // `child_with_descendant` scan per level) on every call — per-node parent queries were
+  // a leading slice of the whole build's cursor churn at kernel scale.
+  let mut ancestors: Vec<SgNode<'t>> = Vec::new();
+  for (node, depth) in PreWithDepth::new(&root) {
+    ancestors.truncate(depth);
+    'dispatch: {
+      if !node.is_named() {
+        break 'dispatch;
+      }
+      let kind_id = node.kind_id();
+      if resolved.declares_type_params(kind_id) {
+        collect_binders_in(&node, ancestors.last(), &mut binders);
+      }
+      match resolved.chain_at(kind_id) {
+        Chain::None => {}
+        Chain::Import => {
+          for (ispec, &id) in spec.imports.iter().zip(&resolved.import_kind_ids) {
+            if id == kind_id {
+              emit_imports(&node, ispec, def_spans, &mut pending);
+            }
           }
         }
-      }
-      Chain::Type => stage_type_use(&node, spec, &mut span_cursor, &mut pending),
-      Chain::Implements(idx) => emit_implements(
-        &node,
-        &spec.implements[idx as usize],
-        spec,
-        &mut span_cursor,
-        &mut seen_impls,
-        &mut pending,
-      ),
-      Chain::Call(idx) => {
-        let cspec = &spec.calls[idx as usize];
-        if suppressed.remove(&node.node_id()) || is_chain_link(&node, spec) {
-          continue;
-        }
-        let Some(mut callee) = select(&node, &cspec.callee) else {
-          continue;
-        };
+        Chain::Type => stage_type_use(&node, &ancestors, spec, &mut span_cursor, &mut pending),
+        Chain::Implements(idx) => emit_implements(
+          &node,
+          &spec.implements[idx as usize],
+          spec,
+          &mut span_cursor,
+          &mut seen_impls,
+          &mut pending,
+        ),
+        Chain::Call(idx) => {
+          let cspec = &spec.calls[idx as usize];
+          if suppressed.remove(&node.node_id()) || is_chain_link(&node, ancestors.last(), spec) {
+            break 'dispatch;
+          }
+          let Some(mut callee) = select(&node, &cspec.callee) else {
+            break 'dispatch;
+          };
         // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
         // chain yields one reference, attributed at the outermost node.
         while let Some(inner) = spec
@@ -917,9 +925,9 @@ pub(crate) fn extract_references<'t>(
         {
           callee = inner;
         }
-        let Some(name) = callee_name(&callee) else {
-          continue;
-        };
+          let Some(name) = callee_name(&callee) else {
+            break 'dispatch;
+          };
         let range = node.range();
         match spec
           .text_rules
@@ -967,7 +975,9 @@ pub(crate) fn extract_references<'t>(
           }
         }
       }
+      }
     }
+    ancestors.push(node);
   }
 
   // Post-pass in visit order: binder-shadowed type uses drop; survivors dedup per
@@ -1099,9 +1109,13 @@ const BINDER_LEAF_KINDS: &[&str] = &["type_identifier", "identifier", "simple_id
 /// parameter's *binder* name (the declared name only — never its bounds or defaults, which are
 /// real type uses) scoped to the declaring item's full span. Runs inside the fused walk when
 /// the dispatch table flags the node's kind.
-fn collect_binders_in<'t>(node: &SgNode<'t>, binders: &mut Vec<(Range<usize>, Cow<'t, str>)>) {
+fn collect_binders_in<'t>(
+  node: &SgNode<'t>,
+  parent: Option<&SgNode<'t>>,
+  binders: &mut Vec<(Range<usize>, Cow<'t, str>)>,
+) {
   // The suppression scope is the whole declaring item (fn/struct/impl…, including its body).
-  let scope = node.parent().map_or_else(|| node.range(), |p| p.range());
+  let scope = parent.map_or_else(|| node.range(), |p| p.range());
   for param in node.children().filter(|c| c.is_named()) {
     let binder = if BINDER_LEAF_KINDS.contains(&param.kind().as_ref()) {
       Some(param)
@@ -1128,11 +1142,12 @@ const IMPL_TARGET_KINDS: &[&str] = &["type_identifier", "identifier", "constant"
 /// dedup run in the post-pass, once the walk has seen every `type_parameters` declaration.
 fn stage_type_use<'t>(
   node: &SgNode<'t>,
+  ancestors: &[SgNode<'t>],
   spec: &RefSpec,
   span_cursor: &mut SpanCursor<'_>,
   pending: &mut Vec<Pending<'t>>,
 ) {
-  let Some(parent) = node.parent() else {
+  let Some(parent) = ancestors.last() else {
     return;
   };
   if parent
@@ -1141,13 +1156,12 @@ fn stage_type_use<'t>(
   {
     return;
   }
-  let mut ancestor = Some(parent);
-  for _ in 0..2 {
-    let Some(a) = ancestor else { break };
+  // Parent and grandparent, straight off the walk stack (was two root-walking
+  // `Node::parent` calls per type leaf).
+  for a in ancestors.iter().rev().take(2) {
     if spec.implements.iter().any(|s| s.kind == a.kind().as_ref()) {
       return;
     }
-    ancestor = a.parent();
   }
   let range = node.range();
   let (Some(name), Some(from)) = (callee_name(node), span_cursor.enclosing(range.start)) else {
@@ -1209,8 +1223,8 @@ fn emit_implements<'t>(
 }
 
 /// A call node that is its same-kind parent's selected callee is a chain link, not a call site.
-fn is_chain_link(node: &SgNode<'_>, spec: &RefSpec) -> bool {
-  let Some(parent) = node.parent() else {
+fn is_chain_link(node: &SgNode<'_>, parent: Option<&SgNode<'_>>, spec: &RefSpec) -> bool {
+  let Some(parent) = parent else {
     return false;
   };
   let parent_kind = parent.kind();
@@ -1221,7 +1235,7 @@ fn is_chain_link(node: &SgNode<'_>, spec: &RefSpec) -> bool {
     .calls
     .iter()
     .find(|c| c.kind == parent_kind.as_ref())
-    .and_then(|c| select(&parent, &c.callee))
+    .and_then(|c| select(parent, &c.callee))
     .is_some_and(|callee| callee.node_id() == node.node_id())
 }
 
@@ -1791,7 +1805,7 @@ mod tests {
     while let Some(node) = stack.pop() {
       push_children(&mut stack, &node);
       if spec.type_params.contains(&node.kind().as_ref()) {
-        collect_binders_in(&node, &mut binders);
+        collect_binders_in(&node, node.parent().as_ref(), &mut binders);
       }
     }
 
@@ -1925,7 +1939,8 @@ mod tests {
       let Some(cspec) = spec.calls.iter().find(|c| c.kind == kind) else {
         continue;
       };
-      if suppressed.remove(&node.node_id()) || is_chain_link(&node, spec) {
+      if suppressed.remove(&node.node_id()) || is_chain_link(&node, node.parent().as_ref(), spec)
+      {
         continue;
       }
       let Some(mut callee) = select(&node, &cspec.callee) else {

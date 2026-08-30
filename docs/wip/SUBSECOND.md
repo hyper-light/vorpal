@@ -327,6 +327,20 @@ extraction temporaries; (2) rule dispatch — per-language kind→rule bitmap pr
 matching is tried per node×rule; (3) single-pass traversal — eliminate re-seeks behind
 ts_node_child_with_descendant; (4) background tree drops (ts_subtree_release 4.2%).
 
+**Fresh attribution 2026-08-30 (leaf-weight `sample`, current binary — SUPERSEDES the
+26.7% allocator figure above):** tree-sitter runtime 83.9% of on-CPU (parse+lex+stack
+~30%, cursor walking 26.2%, subtree machinery ~10%), vorpal extraction code 5.3%,
+allocator only 4.2%, memmove 2.0%. jemalloc floor probes measured DEAD: decay 10s trades
++0.4 GB RSS for −2.3 s sys but wall holds ~6.6-6.8 s; narenas 8→16 within noise — the
+config has no juice, the cost is call count. **Landed from the cursor bucket:** the
+references fused walk now maintains an explicit ancestor stack driven by the traversal's
+own depth (`PreWithDepth` in core) — `Node::parent` has no parent pointer and re-walks
+from the tree root per call (`child_with_descendant` per level), and stage_type_use paid
+up to three of those per type leaf. Bit-identical output (same generation content-id),
+fused-vs-reference battery green, cursor bucket 26.2% → 22.2% (~2.5-4 core-s). The
+remaining bucket is legitimate semantic walking (field lookups, children scans) — no
+single lever; the parser proper (~30%) is the floor at this design point.
+
 **Cold-build allocation ground truth (jemalloc stats_print, one cold kernel build):**
 211.5M slab mallocs / 361M total requests in ~6.5s (~32M allocs/sec). Dominant bins:
 size-112 → 40.2M nmalloc; size-96 → 15.2M nmalloc but **187M requests** (tcache-served);

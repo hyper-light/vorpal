@@ -8,7 +8,7 @@ use crate::{Matcher, Vorpal};
 use std::borrow::Cow;
 use std::num::NonZero;
 use thiserror::Error;
-pub use traversal::{TsPre, Visitor};
+pub use traversal::{PreWithDepth, TsPre, Visitor};
 pub use tree_sitter::Language as TSLanguage;
 use tree_sitter::{InputEdit, LanguageError, Node, Parser, Point, Tree};
 pub use tree_sitter::{Point as TSPoint, Range as TSRange};
