@@ -10,6 +10,7 @@ pub(crate) enum Tok {
   /// `'…'` or `"…"` with `\\`, `\'`, `\"` escapes.
   Str(String),
   Int(u64),
+  Float(f64),
   LParen,
   RParen,
   LBracket,
@@ -30,6 +31,9 @@ pub(crate) enum Tok {
   Ne,
   /// `=~` (regex match).
   Match,
+  Plus,
+  Slash,
+  Percent,
 }
 
 pub(crate) struct Lexed {
@@ -84,6 +88,18 @@ pub(crate) fn lex(text: &str) -> Result<Lexed, QueryError> {
       }
       b'*' => {
         tokens.push((Tok::Star, i));
+        i += 1;
+      }
+      b'+' => {
+        tokens.push((Tok::Plus, i));
+        i += 1;
+      }
+      b'/' => {
+        tokens.push((Tok::Slash, i));
+        i += 1;
+      }
+      b'%' => {
+        tokens.push((Tok::Percent, i));
         i += 1;
       }
       b'>' => {
@@ -169,10 +185,22 @@ pub(crate) fn lex(text: &str) -> Result<Lexed, QueryError> {
         while i < bytes.len() && bytes[i].is_ascii_digit() {
           i += 1;
         }
-        let value: u64 = text[start..i]
-          .parse()
-          .map_err(|_| QueryError::parse(start, "integer out of range (u64)"))?;
-        tokens.push((Tok::Int(value), start));
+        // A fraction needs a digit right after the point, so `1..3` stays Int DotDot Int.
+        if bytes.get(i) == Some(&b'.') && bytes.get(i + 1).is_some_and(|b| b.is_ascii_digit()) {
+          i += 1;
+          while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+          }
+          let value: f64 = text[start..i]
+            .parse()
+            .map_err(|_| QueryError::parse(start, "malformed number"))?;
+          tokens.push((Tok::Float(value), start));
+        } else {
+          let value: u64 = text[start..i]
+            .parse()
+            .map_err(|_| QueryError::parse(start, "integer out of range (u64)"))?;
+          tokens.push((Tok::Int(value), start));
+        }
       }
       b'A'..=b'Z' | b'a'..=b'z' | b'_' => {
         let start = i;

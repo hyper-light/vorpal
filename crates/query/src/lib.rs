@@ -1,12 +1,14 @@
 //! vorpal-query: a Cypher-shaped, read-only query language over the vorpal knowledge graph
 //! (ADOPTION P4 item C / plan G-M4).
 //!
-//! v1 grammar: one `MATCH` with a single linear pattern (0–1 relationship segment, fixed or
+//! v2 grammar: one `MATCH` with a linear pattern (up to 8 relationship segments, fixed or
 //! var-length `*min..max`, direction `->` / `<-` / `--`, optional `{grade: …}` floor),
-//! `WHERE` with AND-combined property predicates (`=`, `<>`, `STARTS WITH`, `ENDS WITH`,
-//! `CONTAINS`), `RETURN` projections or `COUNT(*)` / `COUNT(DISTINCT var.prop)` with one
-//! implicit grouping key, `ORDER BY` / `SKIP` / `LIMIT`. Structurally read-only: the IR has
-//! no mutating construct.
+//! `WHERE` with AND/OR/NOT trees over comparisons (`=`, `<>`, `<`…`>=`, `STARTS/ENDS
+//! WITH`, `CONTAINS`, `=~`, `IN`, `IS NULL`, `n:Label`, `EXISTS { … }`), `WITH` / `UNWIND`
+//! pipeline stages, `RETURN [DISTINCT]` of arbitrary expressions (arithmetic, string and
+//! list functions, `CASE`, `count/sum/avg/min/max/collect` with implicit grouping),
+//! `ORDER BY` / `SKIP` / `LIMIT`, and `UNION [ALL]`. Structurally read-only: the IR has no
+//! mutating construct.
 //!
 //! ```text
 //! MATCH (f:Function)-[:data_flows*1..5 {grade: constrained}]->(g {name: "deserialize"})
@@ -18,11 +20,12 @@
 //! truncated answer.
 
 mod exec;
+mod expr;
 pub mod ir;
 mod lexer;
 mod parser;
 
-pub use exec::Cell;
+pub use expr::Cell;
 pub use ir::Query;
 
 /// Query text longer than this is refused before lexing.

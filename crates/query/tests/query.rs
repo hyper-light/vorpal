@@ -194,8 +194,11 @@ fn typed_errors_name_the_boundary() {
   );
   assert!(plan_err("MATCH (f) RETURN g.name").contains("not bound"));
   assert!(plan_err("MATCH (f) WHERE f.vibes = 3 RETURN f.name").contains("unknown property"));
+  // Ordering by an unreturned expression is legal for plain projections (Cypher), but an
+  // aggregated RETURN can only order by what it returns.
   assert!(
-    plan_err("MATCH (f) RETURN f.name ORDER BY f.path").contains("does not name a returned column")
+    plan_err("MATCH (f)-[:calls]->(g) RETURN g.name, count(*) ORDER BY f.path")
+      .contains("does not name a returned column")
   );
 
   match run(&kg, "MATCH (f)-[:calls*1..11]->(g) RETURN f.name") {
@@ -212,7 +215,9 @@ fn typed_errors_name_the_boundary() {
     Err(QueryError::Parse { message, .. }) => message,
     other => panic!("expected a parse error for {text}, got {other:?}"),
   };
-  assert!(parse_err("MATCH (f) WHERE f.name IN ['a'] RETURN f.name").contains("IN lists"));
+  assert!(parse_err("OPTIONAL MATCH (f) RETURN f.name").contains("OPTIONAL MATCH"));
+  assert!(parse_err("MATCH (f) MATCH (g) RETURN f.name").contains("second MATCH"));
+  assert!(parse_err("MATCH (f) WHERE f.name = 'a' XOR f.name = 'b' RETURN f.name").contains("XOR"));
   assert!(
     parse_err(&format!("MATCH (a){} RETURN a.name", "-[:calls]->(x)".repeat(9)))
       .contains("at most 8"),
@@ -251,7 +256,8 @@ fn parser_fuzz_never_panics() {
   };
   let vocab = [
     "MATCH", "WHERE", "RETURN", "ORDER", "BY", "SKIP", "LIMIT", "COUNT", "DISTINCT", "AND",
-    "OR", "NOT", "=~",
+    "OR", "NOT", "=~", "WITH", "UNWIND", "UNION", "CASE", "WHEN", "THEN", "ELSE", "END",
+    "EXISTS", "IS", "NULL", "+", "/", "%", "1.5", "sum", "collect", "AS", "DISTINCT",
     "AS", "STARTS", "ENDS", "WITH", "CONTAINS", "(", ")", "[", "]", "{", "}", ":", ",", ".",
     "..", "|", "*", "<", ">", "-", "->", "<-", "=", "<>", "!=", "'x'", "\"y\"", "42", "f",
     "calls", "name", "grade", "true", "false", "\\", "\u{1F980}", "\0",
@@ -497,4 +503,185 @@ fn regex_predicates_are_bounded() {
     Err(QueryError::Plan(message)) => assert!(message.contains("text comparison"), "{message}"),
     other => panic!("expected plan error, got {other:?}"),
   }
+}
+
+#[test]
+fn aggregates_case_and_functions() {
+  let kg = fixture();
+
+  // General aggregates with implicit grouping; collect keeps row order (slot-id order).
+  let r = run(
+    &kg,
+    "MATCH (f)-[:calls]->(g) RETURN g.name, count(*) AS n, collect(f.name) AS callers ORDER BY n DESC, g.name",
+  )
+  .unwrap();
+  assert_eq!(r.columns, ["g.name", "n", "callers"]);
+  assert_eq!(
+    r.rows[0],
+    vec![
+      Cell::Text("deserialize".into()),
+      Cell::Int(2),
+      Cell::List(vec![Cell::Text("validate".into()), Cell::Text("helper".into())])
+    ]
+  );
+  assert_eq!(r.rows.len(), 3);
+
+  // sum/avg/min/max over an ungrouped table.
+  let r = run(
+    &kg,
+    "MATCH (f:Function) RETURN sum(f.in_degree) AS total, avg(f.in_degree) AS mean, min(f.name) AS first, max(f.name) AS last",
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![vec![
+      Cell::Int(5),
+      Cell::Float(1.25),
+      Cell::Text("deserialize".into()),
+      Cell::Text("validate".into())
+    ]]
+  );
+
+  // CASE, string functions, arithmetic — all per row.
+  let r = run(
+    &kg,
+    r#"MATCH (f:Function) RETURN f.name, CASE WHEN f.in_degree >= 2 THEN "hub" ELSE "leaf" END AS role, toUpper(f.name) AS up, size(f.name) + 1 AS n ORDER BY f.name"#,
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows[0],
+    vec![
+      Cell::Text("deserialize".into()),
+      Cell::Text("hub".into()),
+      Cell::Text("DESERIALIZE".into()),
+      Cell::Int(12)
+    ]
+  );
+  assert_eq!(r.rows[1][1], Cell::Text("leaf".into())); // main
+
+  // Subject-form CASE and coalesce/split/left.
+  let r = run(
+    &kg,
+    r#"MATCH (f {name: "main"}) RETURN CASE f.kind WHEN "function" THEN 1 ELSE 0 END AS isfn, coalesce(f.scc_size, -1) AS scc, split(f.path, "/") AS parts, left(f.name, 2) AS pre"#,
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![vec![
+      Cell::Int(1),
+      Cell::Int(1),
+      Cell::List(vec![Cell::Text("src".into()), Cell::Text("main.rs".into())]),
+      Cell::Text("ma".into())
+    ]]
+  );
+
+  // DISTINCT projections.
+  let r = run(&kg, "MATCH (f)-[:calls]->(g) RETURN DISTINCT g.path ORDER BY g.path").unwrap();
+  assert_eq!(texts(&r.rows, 0), ["src/parse.rs", "src/serde.rs"]);
+
+  // Plan-time refusals name the rule.
+  let plan_err = |text: &str| match run(&kg, text) {
+    Err(QueryError::Plan(message)) => message,
+    other => panic!("expected a plan error for {text}, got {other:?}"),
+  };
+  assert!(plan_err("MATCH (f) WHERE count(*) > 1 RETURN f.name").contains("belong in RETURN or WITH"));
+  assert!(plan_err("MATCH (f) RETURN count(count(*))").contains("cannot nest"));
+  assert!(plan_err("MATCH (f) RETURN frobnicate(f.name)").contains("unknown function"));
+  assert!(plan_err("MATCH (f)-[:calls]->(g) RETURN type(g)").contains("relationship variable"));
+}
+
+#[test]
+fn with_unwind_union_and_exists() {
+  let kg = fixture();
+
+  // WITH aggregates then filters on the aggregate; the node survives the projection.
+  let r = run(
+    &kg,
+    "MATCH (f)-[:calls]->(g) WITH g, count(*) AS n WHERE n >= 2 RETURN g.name, n",
+  )
+  .unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Text("deserialize".into()), Cell::Int(2)]]);
+
+  // WITH ORDER BY … LIMIT, then an aggregate over the survivors.
+  let r = run(
+    &kg,
+    "MATCH (f:Function) WITH f ORDER BY f.name LIMIT 2 RETURN collect(f.name) AS names",
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![vec![Cell::List(vec![
+      Cell::Text("deserialize".into()),
+      Cell::Text("main".into())
+    ])]]
+  );
+
+  // UNWIND a literal list and a collected list.
+  let r = run(
+    &kg,
+    r#"MATCH (f {name: "main"}) UNWIND [1, 2, 3] AS x RETURN f.name, x * 2 AS y ORDER BY y"#,
+  )
+  .unwrap();
+  assert_eq!(r.rows.len(), 3);
+  assert_eq!(r.rows[2], vec![Cell::Text("main".into()), Cell::Int(6)]);
+  let r = run(
+    &kg,
+    "MATCH (f:Function) WITH collect(f.name) AS names UNWIND names AS n RETURN n ORDER BY n",
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["deserialize", "main", "parse", "validate"]);
+
+  // UNION dedups, UNION ALL keeps duplicates, arity is checked.
+  let r = run(
+    &kg,
+    r#"MATCH (f {name: "main"}) RETURN f.name AS n UNION MATCH (f {name: "parse"}) RETURN f.name AS n"#,
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["main", "parse"]);
+  let r = run(
+    &kg,
+    r#"MATCH (f {name: "main"}) RETURN f.name AS n UNION ALL MATCH (f {name: "main"}) RETURN f.name AS n"#,
+  )
+  .unwrap();
+  assert_eq!(r.rows.len(), 2);
+  let r = run(
+    &kg,
+    r#"MATCH (f {name: "main"}) RETURN f.name AS n UNION MATCH (f {name: "main"}) RETURN f.name AS n"#,
+  )
+  .unwrap();
+  assert_eq!(r.rows.len(), 1);
+  match run(&kg, "MATCH (f) RETURN f.name UNION MATCH (g) RETURN g.name, g.path") {
+    Err(QueryError::Plan(message)) => assert!(message.contains("must match"), "{message}"),
+    other => panic!("expected plan error, got {other:?}"),
+  }
+
+  // EXISTS: functions nobody calls — the dead-code idiom.
+  let r = run(
+    &kg,
+    "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:calls]-() } RETURN f.name",
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["main"]);
+  // … and a two-hop existence probe with a labelled target.
+  let r = run(
+    &kg,
+    r#"MATCH (f) WHERE EXISTS { (f)-[:calls]->()-[:calls]->(:Function {name: "deserialize"}) } RETURN f.name"#,
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["parse"]);
+
+  // Label tests, IN, IS NULL.
+  let r = run(&kg, "MATCH (f) WHERE f:Method|Class RETURN f.name ORDER BY f.name").unwrap();
+  assert_eq!(texts(&r.rows, 0), ["Config", "helper"]);
+  let r = run(
+    &kg,
+    r#"MATCH (f) WHERE f.name IN ["main", "parse", "nope"] RETURN f.name ORDER BY f.name"#,
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["main", "parse"]);
+  let r = run(&kg, "MATCH (f) WHERE f.scc_size IS NOT NULL RETURN count(*)").unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Int(6)]]);
+  let r = run(&kg, "MATCH (f:Function) WHERE f.exported RETURN count(*) AS exported").unwrap();
+  assert_eq!(r.columns, ["exported"]);
+  assert_eq!(r.rows, vec![vec![Cell::Int(3)]]);
 }

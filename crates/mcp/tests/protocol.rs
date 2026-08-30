@@ -668,7 +668,7 @@ fn query_tool_answers_text_and_ir_and_refuses_typed() {
         "node": {"var": "g", "props": [["name", "target"]]}
       }]
     },
-    "returns": {"rows": [{"var": "f", "prop": "name"}]}
+    "returns": {"items": [{"expr": {"prop": {"var": "f", "prop": "name"}}}]}
   });
   let response = request(
     &mut server,

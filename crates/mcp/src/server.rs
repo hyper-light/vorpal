@@ -1327,16 +1327,20 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
     ),
     tool(
       "query",
-      "Cypher-shaped READ-ONLY graph query. One MATCH with a linear pattern — \
-       (var:Kind {name: \"x\", path: \"suffix\"}) chained through up to 8 segments like \
-       -[:calls|data_flows*1..5 {grade: constrained}]-> — then WHERE (AND/OR/NOT with \
-       parentheses over =, <>, <, <=, >, >=, =~ (bounded regex), STARTS/ENDS WITH, CONTAINS on \
-       name/path/kind/exported/id/eid/in_degree/out_degree/scc_size), RETURN projections \
-       or COUNT(*) / COUNT(DISTINCT var.prop) with one grouping key, ORDER BY / SKIP / \
-       LIMIT. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, \
-       100k rows) and refuses with the ceiling's name rather than truncate. Example: \
-       MATCH (f:Function)-[:calls]->(g)-[:calls]->(h {name: \"resolve_target\"}) \
-       RETURN f.name, g.name LIMIT 20",
+      "Cypher-shaped READ-ONLY graph query (openCypher read subset). MATCH a linear \
+       pattern — (var:Kind|Kind2 {name: \"x\", path: \"suffix\"}) chained through up to 8 \
+       segments like -[:calls|data_flows*1..5 {grade: constrained}]-> — then WHERE with \
+       AND/OR/NOT over =, <>, <, <=, >, >=, =~ (bounded regex), STARTS/ENDS WITH, CONTAINS, \
+       IN [..], IS [NOT] NULL, n:Label, and EXISTS { (n)-[:calls]->() }; WITH / UNWIND \
+       pipeline stages; RETURN [DISTINCT] any expression: properties (name, path, kind, \
+       exported, id, eid, signature, in_degree, out_degree, scc_size), arithmetic, string \
+       and list functions (toLower, toUpper, size, trim, replace, substring, split, \
+       coalesce, …), CASE, and count/sum/avg/min/max/collect with implicit grouping; \
+       ORDER BY / SKIP / LIMIT; UNION [ALL]. Runs under explicit work ceilings (16KiB text, \
+       depth 10, 5M edge visits, 100k rows) and refuses with the ceiling's name rather \
+       than truncate. Example: MATCH (f:Function)-[:calls]->(g) WITH g, count(*) AS n \
+       WHERE n >= 20 AND NOT EXISTS { (g)-[:calls]->() } RETURN g.name, n ORDER BY n DESC \
+       LIMIT 20",
       json!({
         "text": {"type": "string", "description": "The query text"},
         "ir": {"type": "object", "description": "Alternative: a typed IR document (the parsed form; see the vorpal-query crate docs)"}
