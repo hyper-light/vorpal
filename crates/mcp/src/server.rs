@@ -98,6 +98,23 @@ pub struct Server {
   /// first (see `run_tool`), and the synchronous rebuild path drains it so two committers
   /// never race.
   persisting: Option<std::thread::JoinHandle<Result<PathBuf, String>>>,
+  /// The retained live overlay (SUBSECOND.md Phase 3): in-memory pipeline state that turns
+  /// a small semantic edit into a sealed scratch-identical graph without replaying the
+  /// corpus. Built in the background after a successful rebuild; any change it cannot
+  /// absorb exactly drops it (rebuilt later) — stale overlays never serve.
+  overlay: Option<vorpal_index::live::LiveOverlay>,
+  overlay_building: Option<std::thread::JoinHandle<Result<vorpal_index::live::LiveOverlay, String>>>,
+}
+
+/// The live overlay is on by default; `VORPAL_NO_LIVE_OVERLAY=1` (or `true`/`yes`) keeps the
+/// daemon on the replay pipeline for every semantic edit — the escape hatch while the
+/// overlay earns trust, and the knob for memory-constrained hosts (the overlay retains the
+/// pre-link pipeline state in RAM).
+fn overlay_enabled() -> bool {
+  !matches!(
+    std::env::var("VORPAL_NO_LIVE_OVERLAY").ok().as_deref(),
+    Some("1" | "true" | "yes")
+  )
 }
 
 /// Eager ANN warming is on by default; `VORPAL_NO_AUTOWARM=1` (or `true`/`yes`) switches the
@@ -155,7 +172,63 @@ impl Server {
       warm,
       warm_pending: false,
       persisting: None,
+      overlay: None,
+      overlay_building: None,
       watch,
+    }
+  }
+
+  /// Start building the live overlay from the committed generation, unless one is already
+  /// live, building, or disabled. Heavy (one product replay) — always a background thread.
+  fn spawn_overlay_build(&mut self) {
+    if !overlay_enabled() || self.overlay.is_some() || self.overlay_building.is_some() {
+      return;
+    }
+    // NEVER build from a generation a committer is still writing: reading stale CURRENT
+    // resurrects rows the daemon already retired (a deleted file's symbols would reappear).
+    // The committer reaps retrigger this the moment the commit lands.
+    if self.canonicalizing.is_some() || self.persisting.is_some() {
+      return;
+    }
+    let index_dir = self.index_dir.clone();
+    vorpal_kg::phase_stamp("overlay: builder spawned");
+    self.overlay_building = Some(std::thread::spawn(move || {
+      vorpal_index::live::LiveOverlay::build(&index_dir)
+    }));
+  }
+
+  /// Reap a finished overlay build (non-blocking). A failed build simply leaves the daemon
+  /// on the replay pipeline; the next successful rebuild retriggers construction.
+  fn reap_overlay_build(&mut self) {
+    if !self.overlay_building.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
+    }
+    if let Some(handle) = self.overlay_building.take()
+      && let Ok(Ok(overlay)) = handle.join()
+    {
+      vorpal_kg::phase_stamp("overlay: adopted");
+      self.overlay = Some(overlay);
+    }
+  }
+
+  /// Keep the overlay truthful across a NON-overlay mutation: absorb the change set when it
+  /// is completely known, drop the overlay when it is not (or when absorption fails, or the
+  /// tombstone debt says a fresh build is cheaper). Every path that changes the committed
+  /// index must pass through here.
+  fn overlay_absorb_or_drop(&mut self, hints: Option<&std::collections::HashSet<PathBuf>>) {
+    let Some(overlay) = &mut self.overlay else {
+      return;
+    };
+    let absorbed = match hints {
+      Some(paths) => overlay.absorb(paths).is_ok(),
+      None => false,
+    };
+    if !absorbed || overlay.dead_row_fraction() > 0.5 {
+      // Retire WITHOUT respawning: this runs before the caller's commit is durable, and a
+      // builder started now would read the pre-commit generation and resurrect retired
+      // rows. The post-commit sites (committer reaps, committed adopt branches) respawn.
+      vorpal_kg::phase_stamp("overlay: retired (sync-path change)");
+      self.overlay = None;
     }
   }
 
@@ -174,6 +247,7 @@ impl Server {
       Ok(Ok(dir)) => {
         self.kg_dir = Some(dir);
         self.request_warm();
+        self.spawn_overlay_build();
       }
       _ => {
         if let Some(watch) = &self.watch {
@@ -219,6 +293,23 @@ impl Server {
     // Reap a finished background persist (non-blocking) so `kg_dir` pins the committed
     // generation as soon as it exists.
     self.reap_persist(false);
+    self.reap_overlay_build();
+    // Reap a finished background canonicalization (non-blocking): a failure re-arms the
+    // dirty flag; a success is the overlay builder's green light (spawn_overlay_build
+    // itself re-checks every committer, so this can never read a mid-write generation).
+    if self.canonicalizing.as_ref().is_some_and(|h| h.is_finished()) {
+      let ok = self
+        .canonicalizing
+        .take()
+        .expect("checked above")
+        .join()
+        .unwrap_or(false);
+      if ok {
+        self.spawn_overlay_build();
+      } else if let Some(watch) = &self.watch {
+        watch.mark_dirty();
+      }
+    }
     let Some(watch) = &self.watch else {
       return Ok(());
     };
@@ -236,18 +327,6 @@ impl Server {
     // changed file) and canonicalize the stamps in a background build. Any doubt falls
     // through to the synchronous rebuild below. A failed or superseded background build
     // re-arms the dirty flag, so the next query retries.
-    // Reap a finished background canonicalization; a failed one re-arms retry.
-    if self.canonicalizing.as_ref().is_some_and(|h| h.is_finished()) {
-      let ok = self
-        .canonicalizing
-        .take()
-        .expect("checked above")
-        .join()
-        .unwrap_or(false);
-      if !ok {
-        watch.mark_dirty();
-      }
-    }
     if let Some(paths) = &hints
       && !paths.is_empty()
       && paths.len() <= 8
@@ -271,13 +350,60 @@ impl Server {
       }));
       return Ok(());
     }
+    let src = watch.src().to_path_buf();
+    // Live-overlay semantic serve (SUBSECOND.md Phase 3): a COMPLETE, small change set with
+    // a ready overlay skips the replay pipeline — extract the changed files, re-link the
+    // retained state, seal in canonical order, and serve. The sealed bytes are pinned
+    // byte-identical to a from-scratch build of this tree, so the background canonicalizer
+    // spawned here commits the very generation these answers came from; ordering holds
+    // because both committers are drained first, exactly like the synchronous path.
+    if overlay_enabled()
+      && let Some(paths) = &hints
+      && !paths.is_empty()
+      && paths.len() <= 8
+      && self.kg.is_some()
+      && self.overlay.is_some()
+    {
+      if let Some(handle) = self.canonicalizing.take() {
+        let _ = handle.join();
+      }
+      self.reap_persist(true);
+      let paths = paths.clone();
+      let overlay = self.overlay.as_mut().expect("checked above");
+      vorpal_kg::phase_stamp("overlay: serving");
+      match overlay.apply_and_link(&paths) {
+        Ok(kg) => {
+          let stale = overlay.dead_row_fraction() > 0.5;
+          self.kg = Some(Arc::new(kg));
+          self.kg_dir = None;
+          let index_dir = self.index_dir.clone();
+          let canon_src = src.clone();
+          self.canonicalizing = Some(std::thread::spawn(move || {
+            vorpal_index::build_index_watched(&canon_src, &index_dir, &paths).is_ok()
+          }));
+          if stale {
+            // Tombstone debt crossed the line: retire this overlay and rebuild it from the
+            // canonical generation in the background (fresh writer, fresh interner).
+            vorpal_kg::phase_stamp("overlay: retired (tombstone debt)");
+            self.overlay = None;
+            self.spawn_overlay_build();
+          }
+          return Ok(());
+        }
+        Err(err) => {
+          // Something the overlay cannot absorb exactly (unreadable file, extraction
+          // change, unknown spelling): drop it and take the replay pipeline below.
+          vorpal_kg::phase_stamp(&format!("overlay: dropped ({err})"));
+          self.overlay = None;
+        }
+      }
+    }
     // Synchronous rebuild: drain any in-flight background committer FIRST — commits must
     // land in order (an older generation must never supersede a newer one), and the build
     // about to run must see the freshest CURRENT.
     if let Some(handle) = self.canonicalizing.take() {
       let _ = handle.join();
     }
-    let src = watch.src().to_path_buf();
     self.reap_persist(true);
     self.hinted_rebuilds = self.hinted_rebuilds.wrapping_add(1);
     let use_hints = hints.as_ref().is_some_and(|set| !set.is_empty())
@@ -292,6 +418,11 @@ impl Server {
     match vorpal_index::build_index_live(&src, &self.index_dir, hint_set) {
       Ok(build) => {
         if let Some(kg) = build.kg {
+          // The committed tree moved without the overlay: absorb the exact change set or
+          // retire the overlay (rebuilt in the background from the new generation). A
+          // COMPLETE capture absorbs even on the every-64th reconciliation sweep — the
+          // sweep insures manifest patching, not capture exactness.
+          self.overlay_absorb_or_drop(hints.as_ref());
           self.kg = Some(kg);
           if let Some(pending) = build.pending {
             // No committed generation for this graph yet: leave `kg_dir` unpinned;
@@ -303,12 +434,14 @@ impl Server {
             self.kg_dir = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
             self.request_warm();
           }
+          self.spawn_overlay_build();
           return Ok(());
         }
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         if build.report.reused && self.kg.is_some() {
           self.kg_dir = Some(dir);
           self.request_warm();
+          self.spawn_overlay_build();
           return Ok(());
         }
         match Kg::load(&dir) {
@@ -316,6 +449,7 @@ impl Server {
             self.kg = Some(Arc::new(kg));
             self.kg_dir = Some(dir);
             self.request_warm();
+            self.spawn_overlay_build();
             Ok(())
           }
           Err(err) => {
@@ -458,6 +592,22 @@ impl Server {
     ];
     if GENERATION_BOUND.contains(&tool) {
       self.reap_persist(true);
+      // An overlay-served answer's generation is written by the canonicalizer: wait for it,
+      // then pin the fresh generation — its bytes (and therefore its ids) are the very ones
+      // the served graph was sealed from. A failed canonicalization leaves `kg_dir` unpinned
+      // (the tool reports unavailable) and re-arms the watch.
+      if let Some(handle) = self.canonicalizing.take() {
+        let ok = handle.join().unwrap_or(false);
+        if !ok && let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+      }
+      if self.kg_dir.is_none() && self.kg.is_some() {
+        let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+        if dir.join("nodes.vseg").exists() {
+          self.kg_dir = Some(dir);
+        }
+      }
     }
     if tool == "index"
       && let Some(handle) = self.canonicalizing.take()
@@ -503,6 +653,10 @@ impl Server {
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         self.kg = Some(Arc::new(Kg::load(&dir).map_err(|err| err.to_string())?));
         self.kg_dir = Some(dir);
+        // An explicit rebuild moved the committed tree with no change-set capture: the
+        // overlay cannot be trusted to match — retire it and rebuild from the new generation.
+        self.overlay = None;
+        self.spawn_overlay_build();
         let text = if report.reused {
           format!("unchanged — reused existing index ({} nodes)", report.nodes)
         } else {

@@ -234,6 +234,31 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   eager warming (it previously did nothing), and the boot-time warm resolves the
   generation directory (it silently never fired under the `gen/<id>` layout).
 
+- **Live overlay v1 — LANDED 2026-08-30** (`vorpal_index::live::LiveOverlay` over
+  `vorpal_ingest::RetainedIndex` + `vorpal_resolve::RefStore` + `KgWriter::seal_canonical`):
+  the daemon retains the post-absorb pipeline state; a small semantic edit tombstones the
+  file's row/heap/edge/ref footprints, re-applies its product at the tail, and re-links only
+  derived state (masked canonical-order table, alive-range resolution feed, canonical-order
+  seal) — no corpus replay. Sealed bytes are byte-identical to scratch (three independent
+  pins: canonical_seal, retained equivalence vs the Ingestor pipeline, live differential
+  through the daemon), so the background canonicalizer commits the very generation the
+  served answers came from. Kernel, live daemon: semantic edit→answer 1074→**497ms median**
+  (476–502ms typical; occasional ~1s guarded fallback when a committer overlaps); overlay
+  construction 0.7s background (batched parallel decode+ingest, serial absorb); steady
+  0.02–0.06ms. Env hatch: `VORPAL_NO_LIVE_OVERLAY=1`.
+  Bugs the oracles caught, recorded for the overlay era: (1) resolution EMISSION order
+  follows feed order — the retained ref feed must walk canonical file order, not append
+  order (graph.bin diverged); (2) `absorb` never advances the writer's canonical index, so
+  mixing absorb-based and define-based applies hands out node ids from 0 against tail rows
+  — every retained apply is now absorb-based; (3) an overlay builder spawned while a
+  commit was in flight reads stale CURRENT and resurrects retired rows (deleted symbols
+  reappeared) — builders spawn only from post-commit sites, enforced in
+  `spawn_overlay_build` itself. (4) A RAM-served `Kg` had no names.idx and paid a ~20ms
+  full scan on every named query — `Kg::build_names_index` now stamps served graphs.
+  Remaining serve-path spend (~500ms kernel): masked table + full resolution (181ms) +
+  canonical seal gather; next levers are scoped (dirty-bucket) resolution and a
+  parallel/zero-copy seal gather.
+
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
 The consensus lesson from Glean/SCIP/stack-graphs/Kythe: identity must be file-local or

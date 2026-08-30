@@ -818,6 +818,30 @@ impl Kg {
   /// instead of a full node scan. Bytes are a pure function of the node table (sorted,
   /// fixed-width): bit-identical across rebuilds. Also used to backfill dirs written before
   /// the sidecar existed.
+  /// Build the name→id index **in memory** — for a daemon serving a freshly sealed graph
+  /// that never touched disk. Same pairs, same `(hash, id)` order as the persisted
+  /// `names.idx`, so lookups behave identically to a loaded generation; without it every
+  /// name lookup on a live graph pays the full parallel scan (~20ms at kernel scale, on
+  /// EVERY named query).
+  pub fn build_names_index(&mut self) {
+    use rayon::prelude::*;
+    let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
+      .into_par_iter()
+      .filter_map(|i| {
+        self
+          .node_name(NodeId::new(i))
+          .map(|name| (xxhash_rust::xxh3::xxh3_64(name.as_bytes()), i))
+      })
+      .collect();
+    pairs.par_sort_unstable();
+    let hashes: Vec<u64> = pairs.iter().map(|&(h, _)| h).collect();
+    let ids: Vec<u64> = pairs.iter().map(|&(_, i)| i).collect();
+    self.names = Some((
+      vorpal_mem::PodColumn::from_vec(hashes),
+      vorpal_mem::PodColumn::from_vec(ids),
+    ));
+  }
+
   pub fn write_names_index(&self, dir: &Path) -> io::Result<()> {
     use std::io::Write;
     write_via_tmp(dir, "names.idx", |out| {

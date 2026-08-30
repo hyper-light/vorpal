@@ -11,6 +11,7 @@
 //! as deterministic as the serial loop was.
 
 pub mod annfiles;
+pub mod live;
 pub mod gendiff;
 pub mod impact;
 pub mod autowarm;
@@ -798,6 +799,10 @@ fn build_index_inner(
     // and move the artifact writes + content-addressed commit onto its background thread.
     // `PendingPersist::persist` is the exact tail below, so the committed generation is
     // byte-identical either way.
+    let mut kg = kg;
+    // A served-from-RAM graph needs the in-memory name index: without it, every named query
+    // pays the full parallel scan the persisted names.idx exists to avoid.
+    kg.build_names_index();
     let kg = Arc::new(kg);
     slots.kg = Some(kg.clone());
     slots.pending = Some(PendingPersist {

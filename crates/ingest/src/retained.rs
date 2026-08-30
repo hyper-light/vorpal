@@ -59,6 +59,22 @@ impl RetainedIndex {
     Ok(retained)
   }
 
+  /// An empty retained state — the daemon's builder applies the generation's products one
+  /// by one (pack or loose, in manifest order) through [`RetainedIndex::apply_file`].
+  pub fn empty(store_path: &Path) -> io::Result<Self> {
+    Ok(Self {
+      writer: KgWriter::new(),
+      store: RefStore::create(store_path)?,
+      files: BTreeMap::new(),
+      watermark: 0,
+    })
+  }
+
+  /// Whether `path` currently has a live footprint.
+  pub fn contains(&self, path: &str) -> bool {
+    self.files.contains_key(path)
+  }
+
   /// Apply one edit: `Some(bytes)` (re)ingests the file's encoded product at the writer
   /// tail after retiring its previous footprint; `None` retires it outright (delete).
   pub fn apply_file(
@@ -77,31 +93,62 @@ impl RetainedIndex {
     }
   }
 
+  /// Apply a batch of files with PARALLEL decode+ingest (per-file writers) and a serial,
+  /// batch-order absorb — the overlay builder's path (72k products would take minutes
+  /// serially; decode dominates and parallelizes perfectly). Byte-equivalent to serial
+  /// [`RetainedIndex::apply_file`] calls in the same order: `absorb` reproduces the exact
+  /// id assignment a single serial writer produces.
+  pub fn apply_files_parallel(
+    &mut self,
+    interner: &vorpal_resolve::Interner,
+    batch: &[(&str, &[u8])],
+  ) -> io::Result<()> {
+    use rayon::prelude::*;
+    let parts: Vec<io::Result<(KgWriter, Vec<vorpal_resolve::Reference<'_>>)>> = batch
+      .par_iter()
+      .map(|(path, bytes)| {
+        let view = crate::product::decode_product_view(bytes)?;
+        let mut writer = KgWriter::new();
+        let mut references = Vec::with_capacity(view.refs.len());
+        apply_product_view(interner, path, &view, &mut writer, &mut references);
+        Ok((writer, references))
+      })
+      .collect();
+    self.writer.truncate_edges(self.watermark);
+    for ((path, _), part) in batch.iter().zip(parts) {
+      let (file_writer, mut references) = part?;
+      let rows_start = self.writer.node_count() as u32;
+      let heap_start = self.writer.heap_len();
+      let edges_start = self.writer.edges_len() as u32;
+      let id_base = self.writer.absorb(file_writer);
+      for reference in &mut references {
+        reference.from = vorpal_kg::NodeId::new(reference.from.raw() + id_base);
+      }
+      let block = FileBlock {
+        rows: rows_start..self.writer.node_count() as u32,
+        heap: heap_start..self.writer.heap_len(),
+        edges: edges_start..self.writer.edges_len() as u32,
+      };
+      self.watermark = self.writer.edges_len();
+      self.files.insert((*path).to_string(), block);
+      self
+        .store
+        .append_file(interner.intern(path).to_bits(), references.iter())?;
+    }
+    Ok(())
+  }
+
+  /// Every apply is absorb-based (a batch of one): the retained writer's own canonical
+  /// index is NEVER advanced (absorb bypasses it by design), so defining directly into the
+  /// retained writer would hand out node ids from 0 while pushing rows at the tail —
+  /// silent id/row misalignment. One code path, one invariant.
   fn apply_product_bytes(
     &mut self,
     interner: &vorpal_resolve::Interner,
     path: &str,
     bytes: &[u8],
   ) -> io::Result<()> {
-    let view = crate::product::decode_product_view(bytes)?;
-    // Resolution edges from an earlier link would corrupt this file's edge range.
-    self.writer.truncate_edges(self.watermark);
-    let rows_start = self.writer.node_count() as u32;
-    let heap_start = self.writer.heap_len();
-    let edges_start = self.writer.edges_len() as u32;
-    let mut references = Vec::with_capacity(view.refs.len());
-    apply_product_view(interner, path, &view, &mut self.writer, &mut references);
-    let block = FileBlock {
-      rows: rows_start..self.writer.node_count() as u32,
-      heap: heap_start..self.writer.heap_len(),
-      edges: edges_start..self.writer.edges_len() as u32,
-    };
-    self.watermark = self.writer.edges_len();
-    self.files.insert(path.to_string(), block);
-    self
-      .store
-      .append_file(interner.intern(path).to_bits(), references.iter())?;
-    Ok(())
+    self.apply_files_parallel(interner, &[(path, bytes)])
   }
 
   /// Alive files currently retained.

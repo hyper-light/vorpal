@@ -165,8 +165,19 @@ impl RefStore {
 
   /// Delete the backing file. Best-effort cleanup at daemon shutdown.
   pub fn remove(self) -> io::Result<()> {
-    drop(self.out);
-    std::fs::remove_file(&self.path)
+    let path = self.path.clone();
+    drop(self);
+    match std::fs::remove_file(&path) {
+      Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+      _ => Ok(()),
+    }
+  }
+}
+
+/// The store is scratch state (process-private NameId bits) — never leave the file behind.
+impl Drop for RefStore {
+  fn drop(&mut self) {
+    let _ = std::fs::remove_file(&self.path);
   }
 }
 
