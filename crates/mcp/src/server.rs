@@ -81,6 +81,10 @@ pub struct Server {
   /// Hinted-rebuild counter — every 64th watched revalidation full-scans as reconciliation
   /// insurance, even when capture certainty held.
   hinted_rebuilds: u64,
+  /// The in-flight restamp-class background canonicalization, if any (serve-immediately
+  /// probe). The synchronous rebuild path drains this first so an older stamp-only commit
+  /// can never land after — and regress — a newer semantic one.
+  canonicalizing: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl Server {
@@ -104,6 +108,7 @@ impl Server {
       kg: None,
       kg_dir: None,
       hinted_rebuilds: 0,
+      canonicalizing: None,
       watch,
     }
   }
@@ -124,6 +129,50 @@ impl Server {
     // hinted rebuild (belt-and-braces reconciliation) take the full sweep; the committed
     // generation is identical either way (pinned by crates/index/tests/hinted_scan.rs).
     let hints = watch.take_changes();
+    // Serve-immediately probe (SUBSECOND.md Phase 3): when the capture is complete, small,
+    // and every changed file re-extracts byte-identical to its cached product, NO answer can
+    // differ from the loaded graph's — so answer now (single-digit ms: one re-extraction per
+    // changed file) and canonicalize the stamps in a background build. Any doubt falls
+    // through to the synchronous rebuild below. A failed or superseded background build
+    // re-arms the dirty flag, so the next query retries.
+    // Reap a finished background canonicalization; a failed one re-arms retry.
+    if self.canonicalizing.as_ref().is_some_and(|h| h.is_finished()) {
+      let ok = self
+        .canonicalizing
+        .take()
+        .expect("checked above")
+        .join()
+        .unwrap_or(false);
+      if !ok {
+        watch.mark_dirty();
+      }
+    }
+    if let Some(paths) = &hints
+      && !paths.is_empty()
+      && paths.len() <= 8
+      && self.kg.is_some()
+      && vorpal_index::extraction_unchanged(&self.index_dir, paths)
+    {
+      if self.canonicalizing.is_some() {
+        // A canonicalization is still in flight: answers are STILL provably unchanged, so
+        // keep serving — but leave the flag armed so the next quiet query re-probes and
+        // canonicalizes the accumulated stamps (certainty degraded via mark_dirty).
+        watch.mark_dirty();
+        return Ok(());
+      }
+      let src = watch.src().to_path_buf();
+      let index_dir = self.index_dir.clone();
+      let paths = paths.clone();
+      self.canonicalizing = Some(std::thread::spawn(move || {
+        vorpal_index::build_index_watched(&src, &index_dir, &paths).is_ok()
+      }));
+      return Ok(());
+    }
+    // Synchronous rebuild: drain any in-flight canonicalization FIRST — commits must land in
+    // order (an older stamp-only generation must never supersede a newer semantic one).
+    if let Some(handle) = self.canonicalizing.take() {
+      let _ = handle.join();
+    }
     self.hinted_rebuilds = self.hinted_rebuilds.wrapping_add(1);
     let use_hints = hints.as_ref().is_some_and(|set| !set.is_empty())
       && self.hinted_rebuilds % 64 != 0

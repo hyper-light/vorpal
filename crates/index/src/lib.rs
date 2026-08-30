@@ -440,7 +440,11 @@ pub fn build_index_full(
   // commit. Fresh per run (a crashed run's staging is swept by the next commit's GC).
   let staging = out
     .join("gen")
-    .join(format!(".staging-{}", std::process::id()));
+    .join(format!(
+      ".staging-{}-{}",
+      std::process::id(),
+      staging_nonce()
+    ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
 
@@ -739,6 +743,65 @@ const GENERATION_ARTIFACTS: [&str; 8] = [
 /// *new* opens in a collected generation fail, as a clean retryable error. A legacy flat root
 /// that served as the prior is swept the same way: its artifacts are superseded by the
 /// generation just committed from them.
+/// Whether `path`'s CURRENT extraction is byte-identical to its cached product outside the
+/// stamp window `[8..32)` — the "answers cannot have changed" predicate shared by the
+/// stamp-only commit cutoff and the daemon's serve-immediately probe.
+fn extraction_matches_cache(
+  pack: &PackReader,
+  extractor: &OutlineExtractor,
+  path: &str,
+  encode_buf: &mut Vec<u8>,
+) -> bool {
+  let Ok(source) = fs::read_to_string(path) else {
+    return false;
+  };
+  let Some(product) = extractor.extract_product(path, &source) else {
+    return false;
+  };
+  encode_buf.clear();
+  vorpal_ingest::encode_product_into(&product, encode_buf);
+  let Some(cached) = pack.get(path) else {
+    return false;
+  };
+  encode_buf.len() == cached.len()
+    && encode_buf.len() >= 32
+    && encode_buf[0..8] == cached[0..8]
+    && encode_buf[32..] == cached[32..]
+}
+
+/// Serve-immediately probe for the watched daemon: `true` iff EVERY hinted path's current
+/// extraction is byte-identical to its cached product — in which case no query answer can
+/// differ from the loaded graph's, and the caller may keep serving it while a background
+/// build canonicalizes the stamps. Conservative: any doubt (unreadable file, uncached path,
+/// unhandled extension change, missing pack, any body difference) returns `false`. Cost is
+/// one re-extraction per hinted file (single-digit milliseconds each).
+pub fn extraction_unchanged(
+  index_dir: &Path,
+  paths: &std::collections::HashSet<PathBuf>,
+) -> bool {
+  if paths.is_empty() {
+    return false;
+  }
+  let prior = vorpal_kg::resolve_index_dir(index_dir);
+  let Some(pack) = PackReader::open(&prior) else {
+    return false;
+  };
+  let Ok(extractor) = OutlineExtractor::new() else {
+    return false;
+  };
+  let mut encode_buf = Vec::new();
+  paths.iter().all(|path| {
+    let path_str = path.to_string_lossy();
+    if !extractor.handles(&path_str) {
+      // An unhandled path cannot change answers UNLESS it newly became relevant — which
+      // `handles` alone cannot prove. Files the index never carried are rejected by the
+      // pack lookup below; unhandled-but-hinted paths (editor lockfiles, .txt) are inert.
+      return true;
+    }
+    extraction_matches_cache(&pack, &extractor, &path_str, &mut encode_buf)
+  })
+}
+
 /// The stamp-only commit cutoff (Phase 1a). Returns `Ok(Some(report))` after committing a
 /// new generation whose graph artifacts are carried forward byte-identically, `Ok(None)` to
 /// fall through to the full pipeline. Never guesses: every changed file's fresh extraction
@@ -866,6 +929,8 @@ fn try_stamp_only_cutoff(
     {
       return Ok(None);
     }
+    // (The daemon's `extraction_unchanged` probe shares this exact window contract via
+    // `extraction_matches_cache`; the cutoff additionally needs the fresh stamps below.)
     let Some((body_off, _)) = pack.body_span(&entry.path) else {
       return Ok(None);
     };
@@ -881,7 +946,11 @@ fn try_stamp_only_cutoff(
   // provides the same atomic CURRENT swap, dedup guard, GC, and ANN carry-forward as the
   // full pipeline — and because nodes.vseg is unchanged, the carried ANN tier's stamp still
   // matches: the vector tier stays warm through the cutoff.
-  let staging = out.join(format!(".staging-{}", std::process::id()));
+  let staging = out.join(format!(
+    ".staging-{}-{}",
+    std::process::id(),
+    staging_nonce()
+  ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
   for artifact in CARRIED {
@@ -920,6 +989,13 @@ fn try_stamp_only_cutoff(
     external: 0,
     masked: 0,
   }))
+}
+
+/// Process-unique staging suffix: concurrent builds in ONE process (the daemon's background
+/// canonicalizer racing a synchronous rebuild) must never share a staging directory.
+fn staging_nonce() -> u64 {
+  static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<()> {
