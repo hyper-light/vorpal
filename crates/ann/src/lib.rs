@@ -71,3 +71,10 @@ impl Rng {
     (self.next() % bound.max(1) as u64) as usize
   }
 }
+
+/// Build-phase telemetry, VORPAL_PHASE_TRACE-gated like the pipeline's phase stamps.
+pub(crate) fn trace(label: &str) {
+  if std::env::var_os("VORPAL_PHASE_TRACE").is_some() {
+    eprintln!("[ann] {label}");
+  }
+}

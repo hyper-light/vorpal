@@ -293,7 +293,9 @@ impl AnnIndex {
         .for_each(|(i, row): (usize, &mut [f32])| fill(i, row));
       return Self::build_flat(dim, ids, vectors, None);
     }
+    let t0 = std::time::Instant::now();
     let quant = QuantMatrix::from_rows(n, dim, fill);
+    crate::trace(&format!("ann: quantize {} rows: {:?}", n, t0.elapsed()));
     Self::build_vamana(dim, ids, quant)
   }
 
@@ -312,6 +314,7 @@ impl AnnIndex {
     }
     // Exact quantized top-K per probe (integer-exact distances; ties broken by id) — the
     // oracle pool recall is measured against. ~probes × n dot products, fanned across cores.
+    let t_oracle = std::time::Instant::now();
     let oracle: Vec<Vec<u32>> = {
       use rayon::prelude::*;
       probes
@@ -336,7 +339,9 @@ impl AnnIndex {
         })
         .collect()
     };
+    crate::trace(&format!("ann: oracle probes: {:?}", t_oracle.elapsed()));
     // One build at the fixed fidelity, one measurement, one provenance stamp.
+    let t_build = std::time::Instant::now();
     let vamana = Vamana::build(
       &quant,
       &BuildParams {
@@ -346,7 +351,10 @@ impl AnnIndex {
         seed: BUILD_SEED,
       },
     );
+    crate::trace(&format!("ann: vamana graph: {:?}", t_build.elapsed()));
+    let t_recall = std::time::Instant::now();
     let measured = pool_recall(&quant, &vamana, &probes, &oracle);
+    crate::trace(&format!("ann: recall measure: {:?}", t_recall.elapsed()));
     let calibration = Some((VAMANA_L_BUILD as u32, measured as f32));
     Self::assemble_vamana(dim, ids, quant, vamana, calibration)
   }

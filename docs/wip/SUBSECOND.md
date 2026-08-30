@@ -300,6 +300,18 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   probe↔overlay double extraction (~10ms), retained persist to retire the canonicalizer's
   ~1s background CPU per edit, def-postings for repair-scan narrowing.
 
+- **ANN build findings — 2026-08-30 (negative results, recorded):** the build decomposes
+  as quantize 81ms / oracle 51ms / **vamana graph ~8.1-8.7s** / recall 6ms — the graph IS
+  the build, and its distance kernel is already SDOT-vectorized, so remaining levers are
+  algorithmic. (1) `l_build` 48→32: -35% build time but pool recall 0.9125→0.7781 and >half
+  the fused top-10 lines changed (visibly worse hits) — REJECTED, quality is the bar.
+  (2) Parallelizing the medoid centroid pass (f32 or f64, deterministic fixed-chunk folds):
+  picks a slightly different medoid; recall −0.3pp on the probe set, and build-time effects
+  were unmeasurable under machine contention (identical-byte builds varied 8.2→10.6s) —
+  REVERTED, no proven benefit. Kept: build-phase telemetry (VORPAL_PHASE_TRACE `[ann]`
+  stamps). Open quality-safe research items: multi-entry-point starts, partitioned builds,
+  PQ-fidelity build passes — all recall-gated, none free.
+
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
 The consensus lesson from Glean/SCIP/stack-graphs/Kythe: identity must be file-local or
