@@ -327,6 +327,18 @@ extraction temporaries; (2) rule dispatch — per-language kind→rule bitmap pr
 matching is tried per node×rule; (3) single-pass traversal — eliminate re-seeks behind
 ts_node_child_with_descendant; (4) background tree drops (ts_subtree_release 4.2%).
 
+**Cold-build allocation ground truth (jemalloc stats_print, one cold kernel build):**
+211.5M slab mallocs / 361M total requests in ~6.5s (~32M allocs/sec). Dominant bins:
+size-112 → 40.2M nmalloc; size-96 → 15.2M nmalloc but **187M requests** (tcache-served);
+size-80 → 6.7M, size-32 → 3.9M, size-16 → 3.6M. These counts fingerprint tree-sitter's
+per-subtree heap objects (SubtreeHeapData-class sizes), NOT our extraction Vecs — and the
+29.7k parse-error files' error recovery likely amplifies subtree churn. Levers (we vendor
+the runtime): (a) thread-local size-bucketed freelist behind ts_malloc/ts_free (ts_free is
+size-less → 8B header or usable-size query); (b) per-parse bump arena reset at tree drop
+(lifetime audit needed: parser-persistent allocations must not land in it); (c) jemalloc
+tcache tuning as a zero-code floor probe. Allocation COUNTS are the contention-immune
+gate metric; wall-clock confirmation deferred to a quiet machine.
+
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
 The consensus lesson from Glean/SCIP/stack-graphs/Kythe: identity must be file-local or
