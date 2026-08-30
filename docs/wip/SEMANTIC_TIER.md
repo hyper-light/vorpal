@@ -105,75 +105,126 @@ end** — our tokenizer, our math, our optimization — and **never an independe
   by 5 extra candidates; HAKARI −1.95 → −0.09 with rescore). **Binary quantization is
   unsafe below ~768 dims** — ruled out at d=256.
 
-## 3. The design, re-derived from the evidence
+## 3. Determinations (quality axes only; complexity absorbed by checks, per owner directive)
 
-**Tier 1 — corpus-derived subword semantics (the foundation).**
-Identifier-split + char-3–6-gram tokens hashed into bounded buckets (compositional OOV);
-definition-window co-occurrence with cds α=0.75; PPMI, no shift; truncated randomized SVD
-(fixed seed) with symmetric Σ^0.5; ABTT on the token space (mean + top d/100 PCs); uSIF
-pooling (closed-form a; piecewise top-5 PC removal) over name×2+signature+basename;
-d picked by the PIP criterion, capped at 256; L2 rows. Every step closed-form,
-deterministic, owned. Positioning per the ceiling data: the **vector channel of the
-existing fusion** — the exact/lexical channels stay authoritative for short queries.
+**D1 — Tier composition: BUILD Tiers 1+2, with a staged Tier 2.5 escalation.**
+Tier 1 (subword PPMI+SVD+ABTT+uSIF) is the maximally correct foundation at 10⁵–10⁸
+tokens — count-based factorization *beats* SGNS in this regime (D16-1099), and the
+closed-form post-processing is the same math the trained 2024–25 models converge on.
+Tier 2 (relation-aware retrofit) is the highest-evidence refinement for our inputs
+(typed, graded, hub-pruned edges). Tier 2.5 — NUDGE-style deterministic constrained
+optimization of the stored vectors with graph positives — is NOT rejected for
+complexity: it is staged behind Tier 2's eval, kept only if it measurably wins
+(NUDGE's +10% NDCG over adapters says the direction is live).
 
-**Tier 2 — relation-aware graph retrofitting of definition vectors.**
-Convex retrofit with per-relation weights (β per edge type × resolution grade),
-degree-normalized, omnipresent hubs and low-grade edges excluded, strong anchor α;
-evaluate identity-style vs per-relation linear (A_r) penalties — the +0.9-vs-+12.2 result
-says the linear form may matter for directional `calls`. 10 fixed-order Jacobi sweeps →
-bit-reproducible; est. ≤10 s at kernel scale (10M edges × 10 sweeps × 256 dims).
+**D2 — Dimension: ADAPTIVE via the PIP criterion, clamped to [64, 256], recorded in
+provenance.** Closed-form, corpus-appropriate (small corpora get smaller d — the PIP
+theory says optimal d shrinks with noise), robust by clamping, auditable by recording.
+Fixed-256 survives only as the clamp ceiling. Check: the corpus-size sweep must show
+adaptive ≥ fixed at every scale, else the gate reverts to fixed.
 
-**Storage/query.** int8 SQ per the settled recipe (calibrate 0.99-quantile per dim after
-retrofit; float originals kept for rescoring; oversampled beam + float rescore). 811 MB →
-~200 MB at kernel scale inside a ≤1% recall budget. Query embeds through the same model
-(sub-ms). Multi-phrase semantic AND becomes meaningful at Tier 1+ (per-phrase vectors are
-real semantics, not hash blends).
+**D3 — Storage: BOTH paths in one slice; f32 is the oracle, int8+rescore becomes the
+default only by measurement.** int8 scalar quantization (per-dim 0.99-quantile,
+calibrated after retrofit) with oversample+float-rescore is settled practice at ≤1%
+loss; the recall gate (fused NDCG@10 ≥ 99% of f32 on every query class, kernel scale)
+decides the default automatically. Binary quantization stays ruled out at d=256.
 
-**Determinism contract.** Double-warm → byte-identical `ann.bin` + `ann.model.json`
-(pinned by test): fixed seeds, fixed iteration orders, fixed thread counts in every
-reduction (the MKL/OpenBLAS thread-order pitfall is the known hazard). Machine-local, as
-today; cross-ISA bit-identity not required (stamp-gated sidecar).
+**D4 — BM25 postings channel: IN SCOPE.** Evidence-backed (ties distilled statics on
+retrieval), exact, deterministic; lands as its own stage with fusion weights re-tuned
+under the eval harness. The fused system must be ≥ current on every split.
 
-**Deliberately rejected/parked, with reasons attached:**
-- *Binary quantization*: unsafe at d=256 (evidence above).
-- *Query-side linear adapters*: need ~1.5k labeled query→symbol pairs we don't have, and
-  NUDGE-style corpus-vector editing dominates them anyway; revisit if usage data ever
-  exists.
-- *SGD-trained contrastive head as Tier 2*: retrofitting attacks the same objective with
-  a convex, evidence-backed method whose failure modes (noisy edges, directional
-  relations) we can control with signals we already compute. If eval shows Tier 2
-  plateauing, an InfoNCE head over graph positives is the named escalation — complexity
-  is not a counter-argument (owner directive), only its unproven marginal quality is.
-- *Vendored micro-transformer* (was rung 3): the calibrated numbers shrink its promise —
-  MiniLM-class sits at 0.562 NanoBEIR vs 0.503–0.512 for the best statics, and code-
-  specialized small models (CodeRankEmbed-137M > voyage-code-002; curation beats
-  parameters, CoRNStack 2024) would mean vendoring ~140 MB, ~10¹⁵ FLOPs per kernel-scale
-  re-embed, and third-party-trained weights — for a lift concentrated on long NL queries
-  that the fusion's lexical channels don't already serve. Stays a **post-eval decision
-  point**, with candidates named (all-MiniLM-L6 Apache-2.0 22M; gte-modernbert-base
-  Apache-2.0 149M; CodeRankEmbed 137M — license to verify), reopened only if Tiers 1+2
-  miss the eval bar on NL-intent queries.
+**D5 — Vendored encoder: a TRIGGERED stage, not a plan and not an outright rejection.**
+Trigger: the NL-intent split still misses its target after Tier 2.5. Firing it requires
+an owner waiver (third-party-trained weights — a values call, not a quality call) and
+release-size coordination. Candidates pre-named (all-MiniLM-L6 Apache-2.0 22M;
+gte-modernbert-base Apache-2.0 149M; CodeRankEmbed 137M, license to verify then);
+curation-beats-parameters (CoRNStack 2024) rules the choice if fired.
 
-**A separate lever the research surfaced**: our lexical channel is hashed-cosine, not
-BM25 — and BM25 ties distilled statics on retrieval benchmarks. A BM25-scored postings
-channel is an independent, cheap, deterministic upgrade to evaluate alongside Tier 1.
+**Fusion invariant (from the short-query collapse result):** the exact/lexical channels
+remain authoritative for short symbol-shaped queries in every configuration; the
+semantic tier only ever adds. This is enforced by the eval gates, not by hope.
 
-## 4. Evaluation gates (before any default change)
+## 4. Implementation plan — every stage carries its checks
 
-1. Labelled eval extended with **query-class splits**: short keyword (≤3 tokens — the
-   collapse regime; lexical must win or tie), long NL-intent paraphrases (the semantic
-   tier's raison d'être), and sparsely-named-symbol queries (Tier 2's target).
-2. Fusion-level metrics (NDCG@10 / MRR / recall@5), not channel-only; corpus-size sweep:
-   tiny fixture / cpython / kernel; per-tier ablation (T1 vs T1+T2 vs +int8).
-3. Perf gates: warm tier build ≤ 2× current wall; query embed ≤ 1 ms; double-warm
-   byte-identity; small-corpus floor demonstrated (below the floor: lexical fallback,
-   stated in provenance).
-4. Tier-vs-exact overlap methodology (the existing 8-query kernel harness) rerun per tier.
+Ordering rule: measurement precedes optimization; nothing advances past a stage whose
+gates aren't green; every stage lands behind the provenance gate (model id/version bump
+→ tier auto-invalidation → exact fallback), so a bad stage can never poison an index.
 
-## 5. Decision points (owner)
+**Stage 0 — the eval harness (first, before any model code).**
+Labelled sets with query-class splits: short-keyword (≤3 tokens — the collapse regime),
+NL-intent paraphrases (no vocabulary overlap with targets, by construction), and
+sparsely-named-symbol queries; fixture-scale (exact labels) + cpython/kernel (graded).
+Fusion-level NDCG@10/MRR/recall@5 per split; per-channel ablations; corpus-size sweep.
+CHECKS: baseline (current lexical fusion) scores recorded and pinned; harness
+determinism (two runs byte-equal); label review pass; the existing 8-query tier-vs-exact
+overlap runner wired in.
 
-1. License Tiers 1+2 (fully owned, zero download, corpus-adaptive; closed-form + convex)?
-2. Adaptive d via PIP (cap 256) vs fixed 256?
-3. int8-with-rescore from day one, or after f32 correctness lands?
-4. The BM25 postings-channel evaluation alongside — in scope?
-5. Vendored-model stance: reject outright, or keep as the named post-eval decision?
+**Stage 1 — Tier 1: tokenizer → counts → PPMI → randomized SVD → ABTT → uSIF.**
+Sub-steps and their oracles:
+- Subword tokenizer (identifier split + char-3–6-gram hash buckets, bucket count scaled
+  to corpus): golden tests incl. unicode/edge identifiers; OOV compositionality test
+  (unseen identifier gets a nonzero, deterministic vector).
+- Co-occurrence + PPMI (cds α=0.75, no shift): hand-computed values on a toy corpus,
+  exact equality; sparsity/ceiling guards return errors (no-panics rule).
+- Randomized SVD (fixed seed, symmetric Σ^0.5): against exact dense SVD on small
+  matrices (subspace angle ≤ 1e-5); orthonormality residual ‖QᵀQ−I‖ bound asserted;
+  power-iteration count fixed; NaN/Inf → typed error, never a panic.
+- ABTT + uSIF (closed-form a from the frequency table; top-5 sentence-PC piecewise
+  removal): property tests (removing components reduces the removed directions' energy
+  to ~0; weights monotone in frequency); pinned golden vectors on a fixture corpus.
+- PIP-based d selection: deterministic curve; clamps; d + every hyperparameter into
+  `ann.model.json` provenance.
+DETERMINISM GATES: double-warm byte-identity of `ann.bin` + `ann.model.json`; thread-count
+invariance (1 vs N threads byte-equal — fixed-order reductions proven, the MKL-class
+pitfall made structurally impossible); cross-run stamp stability.
+PERF GATES: warm tier ≤ 2× current wall at kernel scale (phase-stamped per sub-step);
+query embed ≤ 1 ms.
+EVAL GATE: fused NL-paraphrase split strictly better than baseline; short-keyword split
+not regressed; small-corpus floor demonstrated (below floor → lexical fallback, stated
+in provenance).
+
+**Stage 2 — Tier 2: relation-aware convex retrofit.**
+Per-relation weights β(type, grade); degree normalization; omnipresent hubs and
+below-grade edges excluded (reusing the existing hub machinery and evidence grades);
+strong anchor α; both penalty forms — identity and per-relation linear A_r — implemented
+and A/B'd on the eval (the +0.9 vs +12.2 result decides empirically for OUR graph).
+CHECKS: convexity exploited as an oracle — Ψ(Q) strictly non-increasing every sweep,
+asserted; fixed sweep order → byte-identity; ≤10 s at kernel scale (measured);
+REGRESSION GUARD (the noisy-graph lesson): if retrofit degrades short-keyword or
+exact-name results on a given corpus, the stage auto-disables for that corpus and says
+so in provenance — never a silent regression.
+
+**Stage 3 — int8 SQ + rescore (beside f32, gate decides the default).**
+Per-dim 0.99-quantile calibration on the real corpus, quantize after retrofit, float
+originals retained for top-k rescoring, oversampling factor tuned by measurement.
+CHECKS: quantize(dequantize) idempotence; calibration determinism; RECALL GATE ≥99% of
+f32 fused NDCG on all splits at kernel scale (else f32 stays default); size verified
+(~4×); format-policy row + torn/foreign-bytes tests for the new region.
+
+**Stage 4 — BM25 postings channel.**
+Exact Okapi BM25 (k1, b fixed and recorded) over the existing postings tier; fusion
+weights re-tuned on the eval harness.
+CHECKS: hand-computed BM25 scores on a toy corpus; determinism trivial but pinned;
+EVAL GATE: fused metrics ≥ current on every split, short-keyword split expected to
+improve.
+
+**Stage 5 (conditional) — Tier 2.5: constrained direct optimization (NUDGE-style).**
+Trigger: sparse-name or NL-intent splits show headroom after Stage 2. Deterministic
+seeded optimization of stored vectors in a norm ball around their Stage-2 positions;
+positives from typed, grade-weighted edges; fixed batch order; deterministic reductions.
+CHECKS: byte-identity (seeded); eval must beat Stage-2 output on the target splits
+without regressing others — else recorded as measured-and-rejected in this document.
+
+**Stage 6 (owner-gated) — vendored code-specialized encoder.** Per D5.
+
+**Ready-when-licensed:** multi-phrase semantic AND becomes real per-phrase semantics at
+Stage 1+; it remains separately unlicensed and is not scheduled here.
+
+## 5. Standing risks, named
+- Small-corpus PPMI noise → the demonstrated floor + fallback (Stage 1 gate).
+- Graph-noise regression in retrofit → the auto-disable guard (Stage 2).
+- Quantization drift on future model changes → the recall gate re-runs per model bump
+  (provenance ties them).
+- Eval overfitting to our own labels → the kernel overlap methodology and corpus sweep
+  are the counterweights; labels reviewed, splits reported separately, never averaged
+  into one number.
