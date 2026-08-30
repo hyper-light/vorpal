@@ -893,18 +893,20 @@ pub struct StreamStats {
 }
 
 /// What a shard committer receives for one admitted entry: its global sequence number and
-/// either a product to apply or a skip marker (skips still advance the in-shard order).
-enum Slot {
-  Product {
-    path: String,
-    product: crate::FileProduct,
-    parsed: bool,
-    reserved: u64,
-  },
-  Packed {
-    path: String,
-    reserved: u64,
-  },
+/// either a fully-applied per-file writer or a skip marker (skips still advance the in-shard
+/// order). Application (decode, intern, define, reference building) happens on the extraction
+/// workers — the wide side of the pipeline; the committer's whole job is a sequence-ordered
+/// `absorb` + reference rebase, which is what keeps 18 workers busy instead of 9 committers.
+struct AppliedFile<'i> {
+  writer: KgWriter,
+  references: Vec<Reference<'i>>,
+  parsed: bool,
+  reserved: u64,
+}
+
+enum Slot<'i> {
+  /// Boxed so channel sends and the reorder buffer move one pointer, not the whole writer.
+  Applied(Box<AppliedFile<'i>>),
   Skipped,
 }
 
@@ -1074,7 +1076,7 @@ where
   // Workers → committers: one bounded channel per committer thread; shard k routes to
   // committer k % committers.
   let (slot_txs, slot_rxs): (Vec<_>, Vec<_>) = (0..committers)
-    .map(|_| crossbeam_channel::bounded::<(usize, Slot)>(64))
+    .map(|_| crossbeam_channel::bounded::<(usize, Slot<'i>)>(64))
     .unzip();
 
   let total_sequences = entries.len();
@@ -1126,34 +1128,29 @@ where
             while let Some(slot) = queue.remove(expected) {
               *expected += 1;
               match slot {
-                Slot::Product {
-                  path,
-                  product,
-                  parsed: was_parsed,
-                  reserved,
-                } => {
+                Slot::Applied(applied) => {
+                  let AppliedFile {
+                    writer: file_writer,
+                    references: file_references,
+                    parsed: was_parsed,
+                    reserved,
+                  } = *applied;
+                  // File-granularity absorb: identical to applying the product directly at
+                  // this position (absorb is a pure additive-offset splice — the same
+                  // associativity the shard→merged absorb rests on, one level down), so the
+                  // shard writer's bytes are unchanged. References rebase by the same base.
                   let (writer, references) = writers.get_mut(&shard).expect("owned shard");
-                  apply_product(interner, &path, product, writer, references);
+                  let id_base = writer.absorb(file_writer);
+                  references.extend(file_references.into_iter().map(|mut reference| {
+                    reference.from = NodeId::new(reference.from.raw() + id_base);
+                    reference
+                  }));
                   budget.release(reserved);
                   if was_parsed {
                     parsed += 1;
                   } else {
                     replayed += 1;
                   }
-                }
-                Slot::Packed { path, reserved } => {
-                  // Decode views straight out of the mapped pack and apply — validated by
-                  // the producer, so a failure here is disk rot; the file is then absent
-                  // from this build rather than fatal.
-                  if let Some(view) = pack
-                    .and_then(|p| p.get(&path))
-                    .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
-                  {
-                    let (writer, references) = writers.get_mut(&shard).expect("owned shard");
-                    apply_product_view(interner, &path, &view, writer, references);
-                    replayed += 1;
-                  }
-                  budget.release(reserved);
                 }
                 Slot::Skipped => {}
               }
@@ -1193,20 +1190,50 @@ where
               continue;
             }
             let reserved = entry.size; // released with the same value; clamps match
+            // Apply HERE, on the worker: decode (for packed replays), intern, define, and
+            // reference building all run on the wide 18-way side into a private per-file
+            // writer; the committer only splices it in sequence order.
+            let apply_one = |go: &mut dyn FnMut(&mut KgWriter, &mut Vec<Reference<'i>>), parsed_flag: bool| {
+              let mut file_writer = KgWriter::new();
+              let mut file_references: Vec<Reference<'i>> = Vec::new();
+              go(&mut file_writer, &mut file_references);
+              Slot::Applied(Box::new(AppliedFile {
+                writer: file_writer,
+                references: file_references,
+                parsed: parsed_flag,
+                reserved,
+              }))
+            };
             let slot = match work(entry, &mut scratch) {
-              Ok(StreamWork::Parsed(path, product)) => Slot::Product {
-                path,
-                product,
-                parsed: true,
-                reserved,
-              },
-              Ok(StreamWork::Replayed(path, product)) => Slot::Product {
-                path,
-                product,
-                parsed: false,
-                reserved,
-              },
-              Ok(StreamWork::ReplayedPacked(path)) => Slot::Packed { path, reserved },
+              Ok(StreamWork::Parsed(path, product)) => {
+                let mut product = Some(product);
+                apply_one(&mut |w, r| {
+                  apply_product(interner, &path, product.take().expect("applied once"), w, r)
+                }, true)
+              }
+              Ok(StreamWork::Replayed(path, product)) => {
+                let mut product = Some(product);
+                apply_one(&mut |w, r| {
+                  apply_product(interner, &path, product.take().expect("applied once"), w, r)
+                }, false)
+              }
+              Ok(StreamWork::ReplayedPacked(path)) => {
+                // Decode views straight out of the mapped pack and apply — validated by the
+                // producer, so a failure here is disk rot; the file is then absent from this
+                // build rather than fatal (the skip still advances the in-shard order).
+                match pack
+                  .and_then(|p| p.get(&path))
+                  .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
+                {
+                  Some(view) => apply_one(&mut |w, r| {
+                    apply_product_view(interner, &path, &view, w, r)
+                  }, false),
+                  None => {
+                    budget.release(reserved);
+                    Slot::Skipped
+                  }
+                }
+              }
               Ok(StreamWork::Skipped) => {
                 budget.release(reserved);
                 Slot::Skipped
