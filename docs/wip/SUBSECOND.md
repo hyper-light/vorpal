@@ -213,6 +213,27 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   may not). Runs in <1s; extend with overlay-vs-scratch comparisons when the live view
   lands. Debug-mode left-right copy-compare still pending with the overlay itself.
 
+- **Live rebuild v1 — LANDED 2026-08-30** (`build_index_live` + `PendingPersist`): the
+  stepping stone to the overlay. A watched semantic rebuild now runs the real pipeline to
+  the sealed in-memory `Kg` and **serves it immediately**; the persistence tail (evidence +
+  segment saves, manifest, content-id hash, generation commit) moves to a daemon background
+  thread executing the *exact* synchronous code — so the committed generation is
+  byte-identical (pinned by crates/index/tests/live_build.rs, plus the differential
+  harness). Ordering discipline: one background committer at a time — the sync path drains
+  it, the serve-immediately probe defers to it (serving stays provably correct meanwhile),
+  the explicit `index` tool drains both committers, and generation-bound tools
+  (`fetch_span`, `why`, `search`, `health`, …) drain before pinning `kg_dir`; navigation
+  tools serve from the sealed graph at full speed during the window. Kernel, live daemon:
+  semantic edit→answer 1074→965ms median; steady 0.02–0.06ms. Honest negatives: adopting
+  the sealed graph instead of re-`Kg::load`ing saved only ~30ms (mmap load was never the
+  cost), and the deferred tail bought ~110ms — the remaining ~950ms is compute
+  (replay+link), which is exactly the Phase-3 overlay's target, not a persistence problem.
+- **ANN warm hygiene — LANDED 2026-08-30**: eager warms are now single-flight and
+  coalescing (an edit burst costs at most one running + one trailing warm, not one
+  9-second, core-saturating build per commit), `VORPAL_NO_AUTOWARM=1` actually disables
+  eager warming (it previously did nothing), and the boot-time warm resolves the
+  generation directory (it silently never fired under the `gen/<id>` layout).
+
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
 The consensus lesson from Glean/SCIP/stack-graphs/Kythe: identity must be file-local or

@@ -1,10 +1,10 @@
 //! MCP protocol handling + the warm-index tool implementations.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use vorpal_index::build_index;
 use vorpal_kg::Kg;
 
 use crate::watch::SourceWatch;
@@ -72,7 +72,7 @@ impl Profile {
 pub struct Server {
   index_dir: PathBuf,
   profile: Profile,
-  kg: Option<Kg>,
+  kg: Option<Arc<Kg>>,
   /// The resolved generation directory the cached graph was loaded from — the artifacts a
   /// `why` snippet is digest-verified against, so a concurrent `CURRENT` swap can never split
   /// an answer from the pinned graph that produced its ids.
@@ -85,6 +85,43 @@ pub struct Server {
   /// probe). The synchronous rebuild path drains this first so an older stamp-only commit
   /// can never land after — and regress — a newer semantic one.
   canonicalizing: Option<std::thread::JoinHandle<bool>>,
+  /// The in-flight background ANN warm, if any. Warms are **single-flight and coalescing**:
+  /// a rebuild that lands while one is running sets `warm_pending` instead of stacking a
+  /// second core-saturating build, and the trailing warm re-resolves `CURRENT` when it
+  /// finally spawns — so an edit burst costs at most one wasted warm, and the newest
+  /// generation always ends up warm.
+  warm: Option<std::thread::JoinHandle<()>>,
+  warm_pending: bool,
+  /// The in-flight deferred persistence of a live-adopted build (SUBSECOND.md live rebuild
+  /// v1): the daemon is already serving the sealed graph; this handle is writing its
+  /// generation. `kg_dir` stays `None` until it lands — generation-bound tools drain it
+  /// first (see `run_tool`), and the synchronous rebuild path drains it so two committers
+  /// never race.
+  persisting: Option<std::thread::JoinHandle<Result<PathBuf, String>>>,
+}
+
+/// Eager ANN warming is on by default; `VORPAL_NO_AUTOWARM=1` (or `true`/`yes`) switches the
+/// daemon to fully lazy vector-tier builds — the first semantic search pays instead. For
+/// benchmarking, constrained machines, and operators who never use semantic search.
+fn autowarm_enabled() -> bool {
+  !matches!(
+    std::env::var("VORPAL_NO_AUTOWARM").ok().as_deref(),
+    Some("1" | "true" | "yes")
+  )
+}
+
+/// A clean shutdown lets in-flight committers finish their (short) tails rather than
+/// abandoning staged generations to GC. The ANN warm is deliberately NOT joined: it can run
+/// for seconds and is stamp-validated + lazily rebuilt, so losing it costs nothing.
+impl Drop for Server {
+  fn drop(&mut self) {
+    if let Some(handle) = self.canonicalizing.take() {
+      let _ = handle.join();
+    }
+    if let Some(handle) = self.persisting.take() {
+      let _ = handle.join();
+    }
+  }
 }
 
 impl Server {
@@ -95,12 +132,18 @@ impl Server {
   pub fn with_profile(index_dir: PathBuf, profile: Profile) -> Self {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
-    // start building it now instead of on the first semantic search.
-    if index_dir.join("nodes.vseg").exists() {
+    // start building it now instead of on the first semantic search. The generation must be
+    // resolved first — artifacts live in `gen/<id>/`, never at the index root.
+    let mut warm = None;
+    if autowarm_enabled()
+      && vorpal_kg::resolve_index_dir(&index_dir)
+        .join("nodes.vseg")
+        .exists()
+    {
       let warm_dir = index_dir.clone();
-      std::thread::spawn(move || {
+      warm = Some(std::thread::spawn(move || {
         let _ = vorpal_index::warm_ann(&warm_dir);
-      });
+      }));
     }
     Self {
       index_dir,
@@ -109,15 +152,73 @@ impl Server {
       kg_dir: None,
       hinted_rebuilds: 0,
       canonicalizing: None,
+      warm,
+      warm_pending: false,
+      persisting: None,
       watch,
     }
   }
 
-  /// Bring the in-memory graph up to date with the watched source tree. With a clean watch
-  /// this is a single atomic load; with a dirty one it runs the incremental `build_index`
-  /// (stat manifest + product replay — only changed files parse) and reloads. Any failure
-  /// re-arms the dirty flag so the next query retries rather than serving stale data as fresh.
+  /// Reap (or, when `block`, drain) the background persistence of a live-adopted build. On
+  /// success the committed generation becomes the artifact pin and the ANN warm fires; on
+  /// failure the watch re-arms so the next query rebuilds — the served graph stays correct
+  /// (it reflects the source tree), only durability lagged.
+  fn reap_persist(&mut self, block: bool) {
+    if !block && !self.persisting.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
+    }
+    let Some(handle) = self.persisting.take() else {
+      return;
+    };
+    match handle.join() {
+      Ok(Ok(dir)) => {
+        self.kg_dir = Some(dir);
+        self.request_warm();
+      }
+      _ => {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+      }
+    }
+  }
+
+  /// Request an eager background ANN warm of the current generation. Single-flight: while a
+  /// warm is running this only marks the request, and the reap below (called from the same
+  /// places) spawns the trailing warm once the runner finishes. `warm_ann` re-resolves
+  /// `CURRENT` at spawn time, so the trailing warm covers everything the burst committed.
+  fn request_warm(&mut self) {
+    if !autowarm_enabled() {
+      return;
+    }
+    if self.warm.as_ref().is_some_and(|h| h.is_finished()) {
+      let _ = self.warm.take().map(std::thread::JoinHandle::join);
+    }
+    if self.warm.is_some() {
+      self.warm_pending = true;
+      return;
+    }
+    self.warm_pending = false;
+    let index_dir = self.index_dir.clone();
+    self.warm = Some(std::thread::spawn(move || {
+      let _ = vorpal_index::warm_ann(&index_dir);
+    }));
+  }
+
+  /// Bring the in-memory graph up to date with the watched source tree. A dirty watch runs
+  /// the incremental build and **adopts the sealed in-memory graph the build hands back**
+  /// (no reload of bytes we just wrote); fast paths keep the already-mapped graph, whose
+  /// artifacts the new generation hardlinks. Any failure re-arms the dirty flag so the next
+  /// query retries rather than serving stale data as fresh.
   fn ensure_fresh(&mut self) -> Result<(), String> {
+    // Trailing coalesced warm: if a warm finished while a newer request was pending, spawn
+    // the follow-up now (it warms whatever CURRENT is today).
+    if self.warm_pending && self.warm.as_ref().is_none_or(|h| h.is_finished()) {
+      self.request_warm();
+    }
+    // Reap a finished background persist (non-blocking) so `kg_dir` pins the committed
+    // generation as soon as it exists.
+    self.reap_persist(false);
     let Some(watch) = &self.watch else {
       return Ok(());
     };
@@ -153,10 +254,12 @@ impl Server {
       && self.kg.is_some()
       && vorpal_index::extraction_unchanged(&self.index_dir, paths)
     {
-      if self.canonicalizing.is_some() {
-        // A canonicalization is still in flight: answers are STILL provably unchanged, so
-        // keep serving — but leave the flag armed so the next quiet query re-probes and
-        // canonicalizes the accumulated stamps (certainty degraded via mark_dirty).
+      if self.canonicalizing.is_some() || self.persisting.is_some() {
+        // A background committer is still in flight (stamp canonicalization or a live
+        // build's persistence): answers are STILL provably unchanged — the probe verified
+        // the touched files against the cached products, and the pending generation was
+        // extracted from the same tree state — so keep serving; the armed flag makes the
+        // next quiet query re-probe once the committer lands.
         watch.mark_dirty();
         return Ok(());
       }
@@ -168,47 +271,65 @@ impl Server {
       }));
       return Ok(());
     }
-    // Synchronous rebuild: drain any in-flight canonicalization FIRST — commits must land in
-    // order (an older stamp-only generation must never supersede a newer semantic one).
+    // Synchronous rebuild: drain any in-flight background committer FIRST — commits must
+    // land in order (an older generation must never supersede a newer one), and the build
+    // about to run must see the freshest CURRENT.
     if let Some(handle) = self.canonicalizing.take() {
       let _ = handle.join();
     }
+    let src = watch.src().to_path_buf();
+    self.reap_persist(true);
     self.hinted_rebuilds = self.hinted_rebuilds.wrapping_add(1);
     let use_hints = hints.as_ref().is_some_and(|set| !set.is_empty())
       && self.hinted_rebuilds % 64 != 0
       && self.kg.is_some();
-    let rebuilt = if use_hints {
-      vorpal_index::build_index_watched(
-        watch.src(),
-        &self.index_dir,
-        hints.as_ref().expect("checked above"),
-      )
-    } else {
-      build_index(watch.src(), &self.index_dir)
-    }
-    .map_err(|err| err.to_string())
-      .and_then(|_| {
+    // Live adoption (SUBSECOND.md Phase 3, live rebuild v1): a full pipeline run returns
+    // with the sealed in-memory graph — serve it NOW; its artifact writes + content-
+    // addressed commit continue on a background thread. Fast paths (whole-tree reuse, the
+    // stamp-only cutoff) commit synchronously and hardlink the very artifacts the loaded
+    // graph has mapped, so the graph is kept and only `kg_dir` repoints.
+    let hint_set = use_hints.then(|| hints.as_ref().expect("checked above"));
+    match vorpal_index::build_index_live(&src, &self.index_dir, hint_set) {
+      Ok(build) => {
+        if let Some(kg) = build.kg {
+          self.kg = Some(kg);
+          if let Some(pending) = build.pending {
+            // No committed generation for this graph yet: leave `kg_dir` unpinned;
+            // generation-bound tools drain the handle, and `reap_persist` pins + warms
+            // the moment it lands.
+            self.kg_dir = None;
+            self.persisting = Some(std::thread::spawn(move || pending.persist()));
+          } else {
+            self.kg_dir = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
+            self.request_warm();
+          }
+          return Ok(());
+        }
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
-        Kg::load(&dir)
-          .map(|kg| (kg, dir))
-          .map_err(|err| err.to_string())
-      });
-    match rebuilt {
-      Ok((kg, dir)) => {
-        self.kg = Some(kg);
-        self.kg_dir = Some(dir);
-        // Warm the vector tier in the background so the *next* semantic search never pays
-        // the build. Best-effort: a failure just means the search that needs it builds it
-        // (and reports its own error); the in-process build lock prevents duplicate work
-        // if a search arrives mid-warm.
-        let index_dir = self.index_dir.clone();
-        std::thread::spawn(move || {
-          let _ = vorpal_index::warm_ann(&index_dir);
-        });
-        Ok(())
+        if build.report.reused && self.kg.is_some() {
+          self.kg_dir = Some(dir);
+          self.request_warm();
+          return Ok(());
+        }
+        match Kg::load(&dir) {
+          Ok(kg) => {
+            self.kg = Some(Arc::new(kg));
+            self.kg_dir = Some(dir);
+            self.request_warm();
+            Ok(())
+          }
+          Err(err) => {
+            if let Some(watch) = &self.watch {
+              watch.mark_dirty();
+            }
+            Err(format!("revalidating watched index failed: {err}"))
+          }
+        }
       }
       Err(err) => {
-        watch.mark_dirty();
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
         Err(format!("revalidating watched index failed: {err}"))
       }
     }
@@ -316,6 +437,35 @@ impl Server {
         .ensure_fresh()
         .map_err(|message| ToolError::coded("index-unavailable", message))?;
     }
+    // Generation-bound tools answer from committed artifacts (digest-verified spans, the
+    // product pack, ANN sidecars) rather than the served in-memory graph — they wait for an
+    // in-flight background persist so their generation pin exists. The navigation and
+    // pattern tools keep serving from the sealed graph at full speed during the window.
+    const GENERATION_BOUND: &[&str] = &[
+      "index",
+      "search",
+      "code_search",
+      "architecture",
+      "coverage",
+      "health",
+      "schema",
+      "fetch_span",
+      "dead_code",
+      "snippet",
+      "why",
+      "compare_generations",
+      "impact",
+    ];
+    if GENERATION_BOUND.contains(&tool) {
+      self.reap_persist(true);
+    }
+    if tool == "index"
+      && let Some(handle) = self.canonicalizing.take()
+    {
+      // The explicit `index` tool commits synchronously — it must not race the
+      // serve-immediately probe's stamp canonicalization either.
+      let _ = handle.join();
+    }
     match tool {
       "index" => {
         let src = str_arg("src")?;
@@ -351,7 +501,7 @@ impl Server {
         // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
         // new generation directory alongside it.
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
-        self.kg = Some(Kg::load(&dir).map_err(|err| err.to_string())?);
+        self.kg = Some(Arc::new(Kg::load(&dir).map_err(|err| err.to_string())?));
         self.kg_dir = Some(dir);
         let text = if report.reused {
           format!("unchanged — reused existing index ({} nodes)", report.nodes)
@@ -376,7 +526,7 @@ impl Server {
         let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::code_search(
@@ -400,7 +550,7 @@ impl Server {
         let top = args.get("top").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::architecture_report(kg, dir.as_deref(), top);
@@ -481,7 +631,7 @@ impl Server {
         let changed = vorpal_index::impact::changed_paths(&root, since.as_deref())
           .map_err(ToolError::from)?;
         self.kg()?;
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let (seeds, missing) = vorpal_index::impact::seeds_for_paths(kg, &root, &changed);
@@ -531,7 +681,7 @@ impl Server {
         if tool == "node" {
           if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
             self.kg()?;
-            let Some(kg) = self.kg.as_ref() else {
+            let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
             let text =
@@ -635,7 +785,7 @@ impl Server {
         // the call an agent makes before forming its first real query.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::schema_report(kg, dir.as_deref());
@@ -698,7 +848,7 @@ impl Server {
         // Slice against the pinned generation's digests: stale offsets refuse, never guess.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144))
@@ -720,7 +870,7 @@ impl Server {
         };
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::dead_records_page(
@@ -761,7 +911,7 @@ impl Server {
           .clamp(64, 262_144) as usize;
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let selected = vorpal_index::records::snippet_records(
@@ -804,7 +954,7 @@ impl Server {
         // that produced these ids, and the snippet digest-checks against the same generation.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let text = match (to_id, name.as_deref()) {
@@ -919,12 +1069,12 @@ impl Server {
           self.index_dir.display()
         )
       })?;
-      self.kg = Some(loaded);
+      self.kg = Some(Arc::new(loaded));
       self.kg_dir = Some(dir);
     }
     self
       .kg
-      .as_ref()
+      .as_deref()
       .ok_or_else(|| "index load raced away — retry the query".to_string())
   }
 }

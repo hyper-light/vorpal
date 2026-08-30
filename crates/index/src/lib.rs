@@ -271,6 +271,107 @@ pub fn build_index_full(
   policy: ParseHealthPolicy,
   hints: Option<&std::collections::HashSet<PathBuf>>,
 ) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_inner(src, out, cache_mode, policy, hints, None)
+}
+
+/// A full-pipeline build whose persistence tail was deferred (SUBSECOND.md Phase 3, live
+/// rebuild v1). Everything answer-affecting is already computed — the graph is sealed and
+/// [`PendingPersist::persist`] performs only writes: evidence + segments + manifest into the
+/// staged directory, then the content-addressed generation commit. It is the exact
+/// synchronous tail, byte for byte and in the same order — only the thread differs — so the
+/// committed generation is identical to what a synchronous build of the same tree commits.
+pub struct PendingPersist {
+  out: PathBuf,
+  prior: PathBuf,
+  staging: PathBuf,
+  evidence: Vec<vorpal_kg::EvidenceRow>,
+  manifest: Manifest,
+  kg: Arc<Kg>,
+}
+
+impl PendingPersist {
+  /// Run the deferred tail. Returns the committed generation directory — the pin for
+  /// artifact-grade tools (`fetch_span`, `why`) once the caller adopts it. `String` error
+  /// (not `Box<dyn Error>`) because this crosses a thread boundary.
+  pub fn persist(self) -> Result<PathBuf, String> {
+    let PendingPersist {
+      out,
+      prior,
+      staging,
+      evidence,
+      manifest,
+      kg,
+    } = self;
+    let (evidence_result, kg_result) = std::thread::scope(|scope| {
+      let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+      let kg_result = kg.save(&staging);
+      (
+        evidence_task.join().expect("evidence saver panicked"),
+        kg_result,
+      )
+    });
+    evidence_result.map_err(|err| format!("evidence save failed: {err}"))?;
+    kg_result.map_err(|err| format!("graph save failed: {err}"))?;
+    manifest
+      .save(&staging.join("manifest.bin"))
+      .map_err(|err| format!("manifest save failed: {err}"))?;
+    commit_generation(&out, &prior, staging)
+      .map_err(|err| format!("generation commit failed: {err}"))
+  }
+}
+
+/// What [`build_index_live`] hands the daemon.
+pub struct LiveBuild {
+  pub report: IndexReport,
+  /// The sealed in-memory graph when the full pipeline ran — the daemon serves it directly
+  /// instead of re-loading bytes it just wrote. Fast paths (whole-tree reuse, the stamp-only
+  /// cutoff) leave it `None`: the caller's loaded graph is already answer-identical, and the
+  /// generation those paths committed hardlinks the very artifacts it has mapped.
+  pub kg: Option<Arc<Kg>>,
+  /// The deferred persistence tail when the full pipeline ran; the caller runs it on a
+  /// background thread and serves `kg` meanwhile. `None` whenever `kg` is `None` (fast
+  /// paths commit synchronously — they are already cheap).
+  pub pending: Option<PendingPersist>,
+}
+
+#[derive(Default)]
+struct LiveSlots {
+  kg: Option<Arc<Kg>>,
+  pending: Option<PendingPersist>,
+}
+
+/// Daemon variant of [`build_index_full`]: identical computation, but a full pipeline run
+/// returns with the sealed graph in hand and persistence deferred to the caller — the
+/// edit→queryable latency stops paying artifact writes, content hashing, and the commit.
+pub fn build_index_live(
+  src: &Path,
+  out: &Path,
+  hints: Option<&std::collections::HashSet<PathBuf>>,
+) -> Result<LiveBuild, Box<dyn Error>> {
+  let mut slots = LiveSlots::default();
+  let report = build_index_inner(
+    src,
+    out,
+    CacheMode::from_env(),
+    ParseHealthPolicy::default(),
+    hints,
+    Some(&mut slots),
+  )?;
+  Ok(LiveBuild {
+    report,
+    kg: slots.kg,
+    pending: slots.pending,
+  })
+}
+
+fn build_index_inner(
+  src: &Path,
+  out: &Path,
+  cache_mode: CacheMode,
+  policy: ParseHealthPolicy,
+  hints: Option<&std::collections::HashSet<PathBuf>>,
+  live: Option<&mut LiveSlots>,
+) -> Result<IndexReport, Box<dyn Error>> {
   // The build session's string interner (scoped-interner contract, docs/EMBEDDING.md):
   // created here, dropped when this function returns — reclaim is `Drop`, and the `NameId`
   // lifetime brand makes anything holding a session id un-returnable at compile time.
@@ -677,6 +778,38 @@ pub fn build_index_full(
   // graph over the sharded table/resolve passes.
   let (kg, resolve, evidence) =
     link_writer_spilled(&interner, writer, spilled_refs, &Resolver::new())?;
+  let report = IndexReport {
+    reused: false,
+    cache_mode: cache_mode.label(),
+    indexed: reparsed,
+    skipped: replayed,
+    error_files: error_files.into_inner(),
+    error_nodes: error_nodes.into_inner(),
+    error_bytes: error_bytes.into_inner(),
+    excluded_files: excluded_files.into_inner(),
+    nodes: kg.node_count(),
+    resolved: resolve.resolved,
+    ambiguous: resolve.ambiguous,
+    external: resolve.external,
+    masked: resolve.masked,
+  };
+  if let Some(slots) = live {
+    // Deferred persistence: the sealed graph is answer-complete NOW — hand it to the daemon
+    // and move the artifact writes + content-addressed commit onto its background thread.
+    // `PendingPersist::persist` is the exact tail below, so the committed generation is
+    // byte-identical either way.
+    let kg = Arc::new(kg);
+    slots.kg = Some(kg.clone());
+    slots.pending = Some(PendingPersist {
+      out: out.to_path_buf(),
+      prior,
+      staging,
+      evidence,
+      manifest,
+      kg,
+    });
+    return Ok(report);
+  }
   // Persist the evidence sidecar (§5) and the graph segments CONCURRENTLY: they are
   // independent artifacts in the same staged generation, and running them serially left
   // 17 cores idle for the longer of the two. Evidence is canonically sorted (total order)
@@ -695,21 +828,7 @@ pub fn build_index_full(
   manifest.save(&staging.join("manifest.bin"))?;
   // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
   commit_generation(out, &prior, staging)?;
-  Ok(IndexReport {
-    reused: false,
-    cache_mode: cache_mode.label(),
-    indexed: reparsed,
-    skipped: replayed,
-    error_files: error_files.into_inner(),
-    error_nodes: error_nodes.into_inner(),
-    error_bytes: error_bytes.into_inner(),
-    excluded_files: excluded_files.into_inner(),
-    nodes: kg.node_count(),
-    resolved: resolve.resolved,
-    ambiguous: resolve.ambiguous,
-    external: resolve.external,
-    masked: resolve.masked,
-  })
+  Ok(report)
 }
 
 /// The core artifact set a generation is named by — the complete persisted index, in fixed
@@ -998,7 +1117,7 @@ fn staging_nonce() -> u64 {
   NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<()> {
+fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<PathBuf> {
   // Sweep staging scratch that is not part of the named artifact set (spill files, tmp names)
   // so the generation holds exactly its artifacts.
   for entry in fs::read_dir(&staging)?.flatten() {
@@ -1160,7 +1279,7 @@ fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<
       let _ = fs::remove_file(root.join(scratch));
     }
   }
-  Ok(())
+  Ok(final_dir)
 }
 
 /// Build the semantic tier over every KG node: each definition embeds its name (double-weighted),
