@@ -168,3 +168,32 @@ int free_fn() { return 1; }
 "#,
   );
 }
+
+
+#[test]
+fn c_struct_definition_with_trailing_declarator_mints_the_type() {
+  // `struct X { ... } tail;` is first and foremost a TYPE definition — the kernel's
+  // `__randomize_layout` / `__packed` idiom parses exactly like a variable declaration
+  // with an inline struct type, and the variable item used to swallow the subtree so the
+  // struct never existed (file_operations, cpuinfo_x86 at kernel scale). Named+body
+  // specifiers win; anonymous bodies and body-less type references keep their variables.
+  const RULES: &str = include_str!("../src/default_rules/c.yml");
+  common::assert_outline_snapshot(
+    SupportLang::C,
+    RULES,
+    r#"
+struct file_operations { int owner; } __randomize_layout;
+union addr { int v4; } __packed;
+struct { int x; } anonymous_var;
+struct forward_only decl_var;
+"#,
+    r#"
+- Struct item exported file_operations
+  - Field public owner
+- Struct item exported addr
+  - Field public v4
+- Variable item exported anonymous_var
+- Variable item exported decl_var
+"#,
+  );
+}
