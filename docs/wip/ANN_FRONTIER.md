@@ -115,10 +115,21 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
 | vamana build (kernel, 16 cores) | ~8.6s | ~19.5s (refinement round; Tier-2 1-bit tier is the designated claw-back) |
 | determinism | sha-stable | sha-stable + dist-eval/expansion counters as the noise-immune A/B instrument |
 
-Next up (in order): 1-bit RaBitQ traversal tier (build beams + search steering, exact-i8
-admission/prune/rerank; the build claw-back AND the search head-room that converts to more
-pool at iso-latency), then FastScan packing if profiling demands, then Tier-3 incremental
-tier for the daemon.
+- 1-bit steering, FLAT-SCALAR variant (Tier-2 item 10, first cut): **REJECTED by gate on
+  both axes** — build 19.5 → 31-37s AND pool recall 0.9812 → 0.9469 (deterministic, sha
+  ×2). Post-mortem, quantified: (a) a scalar 4-plane popcount estimator is ~40 scalar ops
+  vs SDOT's 16 vector instructions at dim 256 — the 32B-vs-256B memory win is swamped by
+  compute, per-insert query construction (dequant+rotate ≈ µs × 4.7M), and exact pool
+  re-scoring; (b) steering noise costs ~3.4pt pool recall — the same figure as the
+  i8-rotation experiment, i.e., estimator-ordered beams visit measurably worse pools at
+  fixed l on this geometry. CONSEQUENCE for the plan: the SymphonyQG numbers are only
+  reachable as the FULL package — NEON TBL FastScan over 32-candidate blocks, codes packed
+  INTO the adjacency rows (one stream per expansion), multiple-estimates admission, and l
+  reinvestment — a Branch-scale project, not an incremental tier swap. Implementation of
+  the flat variant preserved in git history (reverted commit range noted in the log).
+
+Next up: FastScan-packed SymphonyQG layout as a dedicated branch-scale effort (design
+above), and Tier-3 incremental daemon tier (unblocked, independent of Tier-2).
 
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
