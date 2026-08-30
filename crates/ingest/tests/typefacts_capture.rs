@@ -96,6 +96,32 @@ def run(w: Widget):
 }
 
 #[test]
+fn python_param_ledger_lists_every_parameter_in_order() {
+  // G-M5: the kwarg binder needs the FULL signature — untyped, defaulted, and splat
+  // parameters included, in declaration order, splats keeping their sigils.
+  let src = "def blend(alpha, beta: int, gamma=0, *args, **kwargs):\n    return alpha\n\n\
+             class P:\n    def draw(self, x):\n        return x\n";
+  let p = product("t.py", src);
+  let ledgers: Vec<Vec<&str>> = p
+    .entity_params
+    .iter()
+    .map(|(_, params)| params.iter().map(|(name, _)| name.as_str()).collect())
+    .collect();
+  assert!(
+    ledgers.contains(&vec!["alpha", "beta", "gamma", "*args", "**kwargs"]),
+    "{ledgers:?}"
+  );
+  assert!(ledgers.contains(&vec!["self", "x"]), "{ledgers:?}");
+  // Typed entries still carry their annotation (the receiver-typing map feeds off them).
+  let blend = p
+    .entity_params
+    .iter()
+    .find(|(_, params)| params.first().is_some_and(|(n, _)| n == "alpha"))
+    .expect("blend ledger");
+  assert_eq!(blend.1[1], ("beta".to_string(), Some("int".to_string())));
+}
+
+#[test]
 fn typescript_annotations_and_new_expressions() {
   let src = r#"
 class Widget { render(): void {} }

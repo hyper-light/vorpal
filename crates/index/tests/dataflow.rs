@@ -59,6 +59,12 @@ fn flows_persist_and_answer() {
     "{rows:?}"
   );
 
+  // Kwarg binding (G-M5): `other=` binds to sink's parameter POSITION 1 by name.
+  assert!(
+    rows.iter().any(|r| r.expr == Some("cfg.size") && r.param_index == 1),
+    "kwarg bound by name: {rows:?}"
+  );
+
   // Determinism: rebuild from scratch → identical generation id (dataflow.bin included in
   // the content fold).
   let out2 = base.join("index2");
@@ -66,6 +72,71 @@ fn flows_persist_and_answer() {
   assert_eq!(
     fs::read_to_string(out.join("CURRENT")).unwrap(),
     fs::read_to_string(out2.join("CURRENT")).unwrap()
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+/// G-M5: Python kwargs bind to the callee's parameter POSITION by name (reversed keyword
+/// order proves it), method calls shift positionals past an explicit `self`, and a keyword
+/// no parameter matches is the honest `?` sentinel — never a guessed position.
+#[test]
+fn python_kwargs_bind_by_name_with_self_offset() {
+  let base = std::env::temp_dir().join(format!("vorpal-kwflow-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(
+    src.join("m.py"),
+    "def blend(alpha, beta, **rest):\n    return alpha\n\n\
+     class Painter:\n    def draw(self, x, y=0):\n        return x\n\n\
+     def scrambled(a, b):\n    return blend(beta=a, alpha=b, gamma=a)\n\n\
+     def sketch(k):\n    p = Painter()\n    return p.draw(k, y=k)\n",
+  )
+  .unwrap();
+
+  build_index(&src, &out).unwrap();
+  let dir = vorpal_kg::resolve_index_dir(&out);
+  let store = DataflowStore::load(&dir).expect("sidecar loads");
+  let kg = Kg::load(&out).unwrap();
+  let id_of = |name: &str| {
+    kg.select(&vorpal_kg::SymbolSelector {
+      name: Some(name),
+      ..Default::default()
+    })
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| panic!("{name} node"))
+    .raw() as u32
+  };
+
+  // Reversed keywords: beta=(arg#0)→param#1, alpha=(arg#1)→param#0; gamma matches no
+  // parameter (**rest absorbs it) → the u16::MAX sentinel.
+  let rows = store.flows_between(id_of("scrambled"), id_of("blend"));
+  assert!(
+    rows.iter().any(|r| r.arg_index == 0 && r.param_index == 1 && r.expr == Some("a")),
+    "beta → param#1: {rows:?}"
+  );
+  assert!(
+    rows.iter().any(|r| r.arg_index == 1 && r.param_index == 0 && r.expr == Some("b")),
+    "alpha → param#0: {rows:?}"
+  );
+  assert!(
+    rows.iter().any(|r| r.param_index == u16::MAX),
+    "unmatched keyword is the sentinel: {rows:?}"
+  );
+
+  // Method call through a constructed receiver: positional x shifts past self to param#1;
+  // kwarg y binds param#2 by name.
+  let rows = store.flows_between(id_of("sketch"), id_of("draw"));
+  assert!(
+    rows.iter().any(|r| r.arg_index == 0 && r.param_index == 1 && r.expr == Some("k")),
+    "positional past self: {rows:?}"
+  );
+  assert!(
+    rows.iter().any(|r| r.param_index == 2),
+    "kwarg y → param#2: {rows:?}"
   );
 
   let _ = fs::remove_dir_all(&base);

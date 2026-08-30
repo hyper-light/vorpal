@@ -570,7 +570,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
             r.class,
             r.expr.as_deref().map(|e| format!(" {e}")).unwrap_or_default(),
             r.to_name,
-            r.param_index,
+            if r.param_index == u16::MAX { "?".to_string() } else { r.param_index.to_string() },
             r.to_path
           );
         }

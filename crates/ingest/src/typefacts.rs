@@ -21,7 +21,7 @@ use vorpal_language::SupportLang;
 
 /// Bump on ANY semantic change to the capture tables below — it folds into the extraction
 /// identity, so stale products can never replay into a build with different capture rules.
-pub const TYPEFACTS_VERSION: u64 = 1;
+pub const TYPEFACTS_VERSION: u64 = 2;
 
 /// Where a binding's type knowledge came from — persisted with the product, mapped onto the
 /// receiver-typed `ResolveReason`s in G-M2. Discriminants are the persisted tags.
@@ -73,6 +73,16 @@ pub(crate) struct BindSpec {
   name_field: &'static str,
   type_field: Option<&'static str>,
   value_field: Option<&'static str>,
+  /// How the node yields bindings: one binding at the node itself, or one per child of a
+  /// Python-shaped parameter list (the kwarg-binding ledger needs EVERY parameter — typed,
+  /// untyped, defaulted, and splats — in declaration order).
+  mode: BindMode,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum BindMode {
+  Single,
+  PyParamList,
 }
 
 pub(crate) struct TypeSpec {
@@ -87,6 +97,7 @@ const RUST_TF: TypeSpec = TypeSpec {
       name_field: "pattern",
       type_field: Some("type"),
       value_field: Some("value"),
+      mode: BindMode::Single,
     },
     BindSpec {
       kind: "parameter",
@@ -94,6 +105,7 @@ const RUST_TF: TypeSpec = TypeSpec {
       name_field: "pattern",
       type_field: Some("type"),
       value_field: None,
+      mode: BindMode::Single,
     },
     BindSpec {
       kind: "field_declaration",
@@ -101,6 +113,7 @@ const RUST_TF: TypeSpec = TypeSpec {
       name_field: "name",
       type_field: Some("type"),
       value_field: None,
+      mode: BindMode::Single,
     },
   ],
 };
@@ -113,22 +126,19 @@ const PYTHON_TF: TypeSpec = TypeSpec {
       name_field: "left",
       type_field: Some("type"),
       value_field: Some("right"),
+      mode: BindMode::Single,
     },
+    // The whole parameter list in one row: every parameter — typed, untyped, defaulted,
+    // splats — lands as a Param binding in declaration order, so the kwarg ledger sees the
+    // full signature (typed_parameter/typed_default_parameter children are read here; they
+    // no longer need rows of their own).
     BindSpec {
-      kind: "typed_parameter",
+      kind: "parameters",
       origin: BindOrigin::Param,
-      // typed_parameter's name is its first named child (no field); handled by the
-      // first-named-child fallback in `capture_at`.
       name_field: "",
-      type_field: Some("type"),
+      type_field: None,
       value_field: None,
-    },
-    BindSpec {
-      kind: "typed_default_parameter",
-      origin: BindOrigin::Param,
-      name_field: "name",
-      type_field: Some("type"),
-      value_field: None,
+      mode: BindMode::PyParamList,
     },
   ],
 };
@@ -141,6 +151,7 @@ const TS_TF: TypeSpec = TypeSpec {
       name_field: "name",
       type_field: Some("type"),
       value_field: Some("value"),
+      mode: BindMode::Single,
     },
     BindSpec {
       kind: "required_parameter",
@@ -148,6 +159,7 @@ const TS_TF: TypeSpec = TypeSpec {
       name_field: "pattern",
       type_field: Some("type"),
       value_field: None,
+      mode: BindMode::Single,
     },
     BindSpec {
       kind: "optional_parameter",
@@ -155,6 +167,7 @@ const TS_TF: TypeSpec = TypeSpec {
       name_field: "pattern",
       type_field: Some("type"),
       value_field: None,
+      mode: BindMode::Single,
     },
     BindSpec {
       kind: "public_field_definition",
@@ -162,6 +175,7 @@ const TS_TF: TypeSpec = TypeSpec {
       name_field: "name",
       type_field: Some("type"),
       value_field: Some("value"),
+      mode: BindMode::Single,
     },
   ],
 };
@@ -229,6 +243,9 @@ pub(crate) fn capture_at<'t>(
   node: &crate::references::SgNodeAlias<'t>,
   out: &mut Vec<RawBinding<'t>>,
 ) {
+  if bind.mode == BindMode::PyParamList {
+    return capture_py_params(node, out);
+  }
   // Name: the declared field, else the first named child (fieldless grammars).
   let name_node = if bind.name_field.is_empty() {
     node.children().find(|c| c.is_named())
@@ -314,5 +331,49 @@ fn constructor_name<'t>(value: &crate::references::SgNodeAlias<'t>) -> Option<Co
       is_simple_name(&text).then_some(text)
     }
     _ => None,
+  }
+}
+
+/// One binding per Python parameter, in declaration order. Splat parameters keep their
+/// sigils (`*args`, `**kwargs`) so the link-time kwarg binder can tell a real name from an
+/// absorber; separators (`/`, bare `*`) yield nothing.
+fn capture_py_params<'t>(
+  node: &crate::references::SgNodeAlias<'t>,
+  out: &mut Vec<RawBinding<'t>>,
+) {
+  for child in node.children() {
+    if !child.is_named() {
+      continue;
+    }
+    let start = child.range().start as u32;
+    let kind_cow = child.kind();
+    let (name, ty): (Option<Cow<'t, str>>, Option<Cow<'t, str>>) = match kind_cow.as_ref() {
+      "identifier" => (Some(child.text()), None),
+      "typed_parameter" => (
+        child.children().find(|c| c.is_named()).map(|c| c.text()),
+        child.field("type").and_then(|t| clean_type_text(t.text())),
+      ),
+      "default_parameter" => (child.field("name").map(|n| n.text()), None),
+      "typed_default_parameter" => (
+        child.field("name").map(|n| n.text()),
+        child.field("type").and_then(|t| clean_type_text(t.text())),
+      ),
+      "list_splat_pattern" | "dictionary_splat_pattern" => (Some(child.text()), None),
+      // `keyword_separator` / `positional_separator` / tuple patterns: no binding.
+      _ => (None, None),
+    };
+    let Some(name) = name else {
+      continue;
+    };
+    let plain = name.strip_prefix("**").or_else(|| name.strip_prefix('*')).unwrap_or(&name);
+    if plain.is_empty() || name.len() > 64 || !is_simple_name(plain) {
+      continue;
+    }
+    out.push(RawBinding {
+      name,
+      ty,
+      origin: BindOrigin::Param,
+      start,
+    });
   }
 }

@@ -818,7 +818,7 @@ impl Server {
             r.class,
             r.expr.as_deref().map(|e| format!(" {e}")).unwrap_or_default(),
             r.to_name,
-            r.param_index,
+            if r.param_index == u16::MAX { "?".to_string() } else { r.param_index.to_string() },
             r.to_path
           ));
         }
@@ -1299,7 +1299,8 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
     ),
     tool(
       "data_flow",
-      "Outgoing data flows for a definition: which call-site arguments (by position, with \
+      "Outgoing data flows for a definition: which call-site arguments (bound positionally \
+       or by Python keyword name — param#? marks a keyword no parameter matched, with \
        the expression for variables and field accesses) flow into which callees, from the \
        dataflow sidecar. Coverage note: flows are recorded for the typed-capture languages \
        (Rust, Python, TypeScript, TSX) at resolved calls with traceable arguments — absence \

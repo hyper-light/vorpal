@@ -161,7 +161,29 @@ pub(crate) struct ArgRec {
   pub(crate) span: (u32, u32),
   pub(crate) index: u16,
   pub(crate) class: u8,
+  /// The call had a receiver (`x.foo(...)`) — drives the Python self/cls offset when the
+  /// callee's parameter ledger starts with one.
+  pub(crate) has_receiver: bool,
   pub(crate) expr: Option<Box<str>>,
+  /// Keyword name at the call site (`f(x=1)`), bound to the callee's parameter position at
+  /// link time (G-M5).
+  pub(crate) kw: Option<Box<str>>,
+}
+
+/// One callee's ordered parameter names (Python only — the kwarg/self binding ledger).
+/// Splat entries keep their sigils (`*args`, `**kwargs`) so they can never match a keyword.
+pub(crate) struct ParamRec {
+  pub(crate) entity: NodeId,
+  pub(crate) names: Box<[Box<str>]>,
+}
+
+/// Flow-tracing rows a shard hands the absorber beside its references: call-site argument
+/// records and callee parameter ledgers — one struct so the absorb/committer plumbing keeps
+/// a fixed shape as flow data grows.
+#[derive(Default)]
+pub(crate) struct FlowSidecar {
+  pub(crate) args: Vec<ArgRec>,
+  pub(crate) params: Vec<ParamRec>,
 }
 
 /// Append-only arg spill (staging `.args.spill`): written by the absorber in absorb order,
@@ -187,10 +209,13 @@ impl ArgSpillWriter {
     self.file.write_all(&rec.span.0.to_le_bytes())?;
     self.file.write_all(&rec.span.1.to_le_bytes())?;
     self.file.write_all(&rec.index.to_le_bytes())?;
-    self.file.write_all(&[rec.class])?;
+    self.file.write_all(&[rec.class, rec.has_receiver as u8])?;
     let expr = rec.expr.as_deref().unwrap_or("");
     self.file.write_all(&(expr.len() as u16).to_le_bytes())?;
     self.file.write_all(expr.as_bytes())?;
+    let kw = rec.kw.as_deref().unwrap_or("");
+    self.file.write_all(&[kw.len() as u8])?;
+    self.file.write_all(kw.as_bytes())?;
     self.count += 1;
     Ok(())
   }
@@ -258,8 +283,9 @@ pub(crate) fn load_arg_spill(path: &std::path::Path, expected: u64) -> io::Resul
     let s1 = u32::from_le_bytes(take(off + 12, 4)?.try_into().expect("4B"));
     let index = u16::from_le_bytes(take(off + 16, 2)?.try_into().expect("2B"));
     let class = take(off + 18, 1)?[0];
-    let expr_len = u16::from_le_bytes(take(off + 19, 2)?.try_into().expect("2B")) as usize;
-    let expr_bytes = take(off + 21, expr_len)?;
+    let has_receiver = take(off + 19, 1)?[0] != 0;
+    let expr_len = u16::from_le_bytes(take(off + 20, 2)?.try_into().expect("2B")) as usize;
+    let expr_bytes = take(off + 22, expr_len)?;
     let expr = if expr_len == 0 {
       None
     } else {
@@ -269,14 +295,28 @@ pub(crate) fn load_arg_spill(path: &std::path::Path, expected: u64) -> io::Resul
           .into(),
       )
     };
-    off += 21 + expr_len;
+    off += 22 + expr_len;
+    let kw_len = take(off, 1)?[0] as usize;
+    let kw_bytes = take(off + 1, kw_len)?;
+    let kw = if kw_len == 0 {
+      None
+    } else {
+      Some(
+        std::str::from_utf8(kw_bytes)
+          .map_err(|_| io::Error::other("arg spill: non-utf8 keyword"))?
+          .into(),
+      )
+    };
+    off += 1 + kw_len;
     seen += 1;
     records.push(ArgRec {
       from: NodeId::new(from),
       span: (s0, s1),
       index,
       class,
+      has_receiver,
       expr,
+      kw,
     });
   }
   if seen != expected {
@@ -296,39 +336,145 @@ pub(crate) fn load_arg_spill(path: &std::path::Path, expected: u64) -> io::Resul
   Ok(ArgJoin { records, keys })
 }
 
+/// Append-only parameter-ledger spill (`.params.spill`), one record per Python entity with
+/// parameters: entity u64 · count u16 · (len u8 · bytes)*. Same lifecycle as the arg spill.
+pub(crate) struct ParamSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+impl ParamSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &ParamRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&rec.entity.raw().to_le_bytes())?;
+    self.file.write_all(&(rec.names.len() as u16).to_le_bytes())?;
+    for name in rec.names.iter() {
+      self.file.write_all(&[name.len() as u8])?;
+      self.file.write_all(name.as_bytes())?;
+    }
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+/// entity id → ordered parameter names, binary-searched (sorted by entity; one row per
+/// entity — later duplicates for the same id cannot exist because each entity's defining
+/// file lands exactly once per build).
+pub(crate) struct ParamTable {
+  rows: Vec<(u64, Box<[Box<str>]>)>,
+}
+
+impl ParamTable {
+  pub(crate) fn empty() -> Self {
+    Self { rows: Vec::new() }
+  }
+
+  pub(crate) fn is_empty(&self) -> bool {
+    self.rows.is_empty()
+  }
+
+  pub(crate) fn get(&self, entity: u64) -> Option<&[Box<str>]> {
+    let at = self.rows.binary_search_by_key(&entity, |(id, _)| *id).ok()?;
+    Some(&self.rows[at].1)
+  }
+}
+
+pub(crate) fn load_param_spill(path: &std::path::Path, expected: u64) -> io::Result<ParamTable> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  let mut rows: Vec<(u64, Box<[Box<str>]>)> = Vec::with_capacity(expected as usize);
+  let mut off = 0usize;
+  let mut seen = 0u64;
+  while off < bytes.len() {
+    let take = |o: usize, n: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(o..o + n)
+        .ok_or_else(|| io::Error::other("param spill truncated"))
+    };
+    let entity = u64::from_le_bytes(take(off, 8)?.try_into().expect("8B"));
+    let count = u16::from_le_bytes(take(off + 8, 2)?.try_into().expect("2B")) as usize;
+    off += 10;
+    let mut names = Vec::with_capacity(count);
+    for _ in 0..count {
+      let len = take(off, 1)?[0] as usize;
+      let name = std::str::from_utf8(take(off + 1, len)?)
+        .map_err(|_| io::Error::other("param spill: non-utf8 name"))?;
+      names.push(Box::from(name));
+      off += 1 + len;
+    }
+    rows.push((entity, names.into_boxed_slice()));
+    seen += 1;
+  }
+  if seen != expected {
+    return Err(io::Error::other(format!(
+      "param spill holds {seen} records, absorber wrote {expected} — torn scratch"
+    )));
+  }
+  rows.sort_unstable_by_key(|(id, _)| *id);
+  Ok(ParamTable { rows })
+}
+
 enum RefSink<'a, 'i> {
-  Ram(&'a mut Vec<Reference<'i>>, &'a mut Vec<ArgRec>),
-  Spill(&'a mut vorpal_resolve::RefSpillWriter<'i>, Option<&'a mut ArgSpillWriter>),
+  Ram(&'a mut Vec<Reference<'i>>, &'a mut FlowSidecar),
+  Spill(
+    &'a mut vorpal_resolve::RefSpillWriter<'i>,
+    Option<(&'a mut ArgSpillWriter, &'a mut ParamSpillWriter)>,
+  ),
 }
 
 impl<'i> RefSink<'_, 'i> {
   fn consume(
     &mut self,
     shard_references: Vec<Reference<'i>>,
-    shard_args: Vec<ArgRec>,
+    shard_flow: FlowSidecar,
     id_base: u64,
   ) -> io::Result<()> {
     let rebased = shard_references.into_iter().map(|mut reference| {
       reference.from = NodeId::new(reference.from.raw() + id_base);
       reference
     });
-    let rebased_args = shard_args.into_iter().map(|mut rec| {
+    let rebased_args = shard_flow.args.into_iter().map(|mut rec| {
       rec.from = NodeId::new(rec.from.raw() + id_base);
       rec
     });
+    let rebased_params = shard_flow.params.into_iter().map(|mut rec| {
+      rec.entity = NodeId::new(rec.entity.raw() + id_base);
+      rec
+    });
     match self {
-      RefSink::Ram(references, args) => {
+      RefSink::Ram(references, flow) => {
         references.extend(rebased);
-        args.extend(rebased_args);
+        flow.args.extend(rebased_args);
+        flow.params.extend(rebased_params);
         Ok(())
       }
-      RefSink::Spill(writer, arg_writer) => {
+      RefSink::Spill(writer, flow_writers) => {
         for reference in rebased {
           writer.push(&reference)?;
         }
-        if let Some(arg_writer) = arg_writer {
+        if let Some((arg_writer, param_writer)) = flow_writers {
           for rec in rebased_args {
             arg_writer.push(&rec)?;
+          }
+          for rec in rebased_params {
+            param_writer.push(&rec)?;
           }
         }
         Ok(())
@@ -345,10 +491,19 @@ fn absorb_shard<'i>(
   sink: &mut RefSink<'_, 'i>,
   shard_writer: KgWriter,
   shard_references: Vec<Reference<'i>>,
-  shard_args: Vec<ArgRec>,
+  shard_flow: FlowSidecar,
 ) -> io::Result<()> {
   let id_base = writer.absorb(shard_writer);
-  sink.consume(shard_references, shard_args, id_base)
+  sink.consume(shard_references, shard_flow, id_base)
+}
+
+/// Routes exactly like extraction: the parameter ledger is collected for files the registry
+/// hands to the Python grammar (kwarg call-site binding is a Python-shaped semantic).
+fn is_python_path(path: &str) -> bool {
+  matches!(
+    vorpal_lang_registry::from_path(std::path::Path::new(path)),
+    Some(vorpal_lang_registry::SgLang::Builtin(vorpal_language::SupportLang::Python))
+  )
 }
 
 /// Emit a phase stamp to stderr when `VORPAL_PHASE_TRACE` is set — for correlating RSS
@@ -441,25 +596,58 @@ pub fn link_writer_spilled<'i>(
 /// reference spill joins resolved CALLS edges by (from, span) — every traceable argument at
 /// a resolved call becomes a `dataflow.bin` row, and each (caller, callee) pair with at
 /// least one traceable argument gains one `DATA_FLOWS` edge carrying the call's confidence.
+/// Bind one call-site argument to a callee parameter position (G-M5). Keyword arguments
+/// bind by exact name against the callee's parameter ledger — a miss (typo, **kwargs
+/// absorption, no ledger) is the honest sentinel, never a guessed position. Positional
+/// arguments keep their index, shifted past an explicit self/cls when the call had a
+/// receiver and the ledger proves the parameter is there.
+fn bind_param_index(rec: &ArgRec, callee_params: Option<&[Box<str>]>) -> u16 {
+  const NO_PARAM: u16 = u16::MAX;
+  match (rec.kw.as_deref(), callee_params) {
+    (Some(kw), Some(params)) => params
+      .iter()
+      .position(|p| p.as_ref() == kw)
+      .map(|at| at as u16)
+      .unwrap_or(NO_PARAM),
+    (Some(_), None) => NO_PARAM,
+    (None, Some(params)) => {
+      let offset = (rec.has_receiver
+        && matches!(params.first().map(|p| p.as_ref()), Some("self") | Some("cls")))
+        as u16;
+      rec.index + offset
+    }
+    // No ledger (non-Python callee, or an external): positional v1 semantics.
+    (None, None) => rec.index,
+  }
+}
+
 pub fn link_writer_spilled_with_flows<'i>(
   interner: &'i vorpal_resolve::Interner,
   mut writer: KgWriter,
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
-  arg_spill: Option<(std::path::PathBuf, u64)>,
+  flow_spill: Option<FlowSpill>,
 ) -> io::Result<(
   Kg,
   ResolveStats,
   Vec<vorpal_kg::EvidenceRow>,
   Vec<vorpal_kg::DataflowRow>,
 )> {
-  let arg_join: ArgJoin = match &arg_spill {
-    Some((path, count)) if *count > 0 => load_arg_spill(path, *count)?,
-    Some((path, _)) => {
-      let _ = std::fs::remove_file(path);
+  let arg_join: ArgJoin = match &flow_spill {
+    Some(spill) if spill.args.1 > 0 => load_arg_spill(&spill.args.0, spill.args.1)?,
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.args.0);
       ArgJoin::empty()
     }
     None => ArgJoin::empty(),
+  };
+  let param_table: ParamTable = match &flow_spill {
+    Some(spill) if spill.params.1 > 0 => load_param_spill(&spill.params.0, spill.params.1)?,
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.params.0);
+      ParamTable::empty()
+    }
+    None => ParamTable::empty(),
   };
   let mut flows: Vec<vorpal_kg::DataflowRow> = Vec::new();
   let mut flow_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
@@ -500,14 +688,18 @@ pub fn link_writer_spilled_with_flows<'i>(
                 vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(edge.confidence),
               );
             }
+            let callee_params = if param_table.is_empty() {
+              None
+            } else {
+              param_table.get(edge.to.raw())
+            };
             for rec in records {
               flows.push(vorpal_kg::DataflowRow {
                 from: edge.from.raw() as u32,
                 to: edge.to.raw() as u32,
                 span: edge.span,
                 arg_index: rec.index,
-                // Positional binding v1 (kwarg matching is the G-M5 refinement).
-                param_index: rec.index,
+                param_index: bind_param_index(rec, callee_params),
                 class: rec.class,
                 expr: rec.expr.as_deref().map(str::to_string),
               });
@@ -555,6 +747,7 @@ pub fn link_writer_spilled_with_flows<'i>(
   phase_trace("link: resolve done");
   drop(table);
   drop(arg_join);
+  drop(param_table);
   drop(flow_pairs);
   let _ = spill.remove();
   // The link transients (spill chunks + table + arg join) just died — return their pages
@@ -649,9 +842,13 @@ pub(crate) fn apply_product_with_args<'i>(
   product: crate::FileProduct,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
-  args_out: Option<&mut Vec<ArgRec>>,
+  flow_out: Option<&mut FlowSidecar>,
 ) {
-  let crate::FileProduct { items, refs, .. } = product;
+  let crate::FileProduct { items, refs, entity_params, .. } = product;
+  let entity_params: Vec<(u32, Vec<&str>)> = entity_params
+    .iter()
+    .map(|(entity, params)| (*entity, params.iter().map(|(name, _)| name.as_str()).collect()))
+    .collect();
   apply_parts(
     interner,
     path,
@@ -672,9 +869,10 @@ pub(crate) fn apply_product_with_args<'i>(
         &r.args,
       )
     }),
+    &entity_params,
     writer,
     references,
-    args_out,
+    flow_out,
   );
 }
 
@@ -687,28 +885,36 @@ pub(crate) fn apply_product_view_with_args<'i>(
   view: &crate::ProductView<'_>,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
-  args_out: Option<&mut Vec<ArgRec>>,
+  flow_out: Option<&mut FlowSidecar>,
 ) {
+  let entity_params: Vec<(u32, Vec<&str>)> = view
+    .entity_params
+    .iter()
+    .map(|(entity, params)| (*entity, params.iter().map(|(name, _)| *name).collect()))
+    .collect();
   apply_parts(
     interner,
     path,
     &view.items,
     view.refs.iter().copied(),
+    &entity_params,
     writer,
     references,
-    args_out,
+    flow_out,
   );
 }
 
 /// The single application kernel both product forms share.
+#[allow(clippy::too_many_arguments)] // the single shared application kernel: every input is load-bearing
 fn apply_parts<'a, 'i>(
   interner: &'i vorpal_resolve::Interner,
   path: &str,
   items: &[vorpal_outline::model::OutlineItem<'_>],
   refs: impl Iterator<Item = crate::product::RefView<'a>>,
+  entity_params: &[(u32, Vec<&str>)],
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
-  mut args_out: Option<&mut Vec<ArgRec>>,
+  mut flow_out: Option<&mut FlowSidecar>,
 ) {
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
@@ -719,6 +925,25 @@ fn apply_parts<'a, 'i>(
   let (entities, _spans) = crate::outline_extractor::local_layout(items);
   // Intern the file's path once; every reference carries the 4-byte id.
   let path_id = interner.intern(path);
+  // Callee parameter ledgers (G-M5): Python entities only — the one language whose call
+  // sites bind by keyword and whose methods carry an explicit self/cls first parameter.
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    if !entity_params.is_empty() && is_python_path(path) {
+      for (entity_index, names) in entity_params {
+        let Some(entity) = entities.get(*entity_index as usize) else {
+          continue;
+        };
+        if let Some(id) = writer.entity_id(path, entity) {
+          if !names.is_empty() {
+            flow_out.params.push(ParamRec {
+              entity: id,
+              names: names.iter().map(|n| Box::from(*n)).collect(),
+            });
+          }
+        }
+      }
+    }
+  }
   for r in refs {
     let Some(entity) = entities.get(r.from_entity_index as usize) else {
       continue;
@@ -726,18 +951,21 @@ fn apply_parts<'a, 'i>(
     if let Some(from) = writer.entity_id(path, entity) {
       // Traceable call-site arguments ride beside the reference (G-M3): lazily decoded off
       // the view, captured only where a collector exists (the spilled index-build path).
-      if let Some(args_out) = args_out.as_deref_mut() {
+      if let Some(flow_out) = flow_out.as_deref_mut() {
         if crate::product::tag_refkind(r.kind) == vorpal_resolve::RefKind::Call
           && r.args_len() > 0
         {
+          let has_receiver = r.receiver.is_some();
           for arg in r.args() {
             if arg.class <= 2 {
-              args_out.push(ArgRec {
+              flow_out.args.push(ArgRec {
                 from,
                 span: (r.start, r.end),
                 index: arg.index,
                 class: arg.class,
+                has_receiver,
                 expr: arg.expr.map(Box::from),
+                kw: arg.kw_name.map(Box::from),
               });
             }
           }
@@ -1169,14 +1397,14 @@ where
 {
   let mut references = Vec::new();
   // The in-RAM path has no data-flow consumer yet (flows are a spilled-build product; see
-  // the G-M3 plan note) — args are collected for order parity and dropped here, stated.
-  let mut args = Vec::new();
+  // the G-M3 plan note) — flow rows are collected for order parity and dropped here, stated.
+  let mut flow = FlowSidecar::default();
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
     budget_bytes,
     work,
-    RefSink::Ram(&mut references, &mut args),
+    RefSink::Ram(&mut references, &mut flow),
     None,
     None,
   )?;
@@ -1199,26 +1427,37 @@ pub fn stream_apply_spilled<'i, F>(
   KgWriter,
   vorpal_resolve::RefSpill<'i>,
   StreamStats,
-  (std::path::PathBuf, u64),
+  FlowSpill,
 )>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
   let mut spill_writer = vorpal_resolve::RefSpillWriter::create(interner, spill_path)?;
-  // The arg spill rides beside the reference spill (G-M3), same absorber, same order.
+  // The flow spills ride beside the reference spill (G-M3/G-M5), same absorber, same order.
   let args_path = spill_path.with_extension("args");
   let mut arg_writer = ArgSpillWriter::create(&args_path)?;
+  let params_path = spill_path.with_extension("params");
+  let mut param_writer = ParamSpillWriter::create(&params_path)?;
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
     budget_bytes,
     work,
-    RefSink::Spill(&mut spill_writer, Some(&mut arg_writer)),
+    RefSink::Spill(&mut spill_writer, Some((&mut arg_writer, &mut param_writer))),
     heap_stream_path,
     pack,
   )?;
-  let arg_spill = arg_writer.finish()?;
-  Ok((writer, spill_writer.finish()?, stats, arg_spill))
+  let flow_spill = FlowSpill {
+    args: arg_writer.finish()?,
+    params: param_writer.finish()?,
+  };
+  Ok((writer, spill_writer.finish()?, stats, flow_spill))
+}
+
+/// The two flow scratch files a spilled build hands to link: (path, record count) each.
+pub struct FlowSpill {
+  pub(crate) args: (std::path::PathBuf, u64),
+  pub(crate) params: (std::path::PathBuf, u64),
 }
 
 fn stream_apply_impl<'i, F>(
@@ -1261,31 +1500,31 @@ where
     let mut scratch = ExtractScratch::default();
     let mut writer = KgWriter::new();
     let mut references = Vec::new();
-    let mut args = Vec::new();
+    let mut flow = FlowSidecar::default();
     let (mut parsed, mut replayed) = (0u64, 0u64);
     for entry in entries {
       match work(entry, &mut scratch)? {
         StreamWork::Parsed(path, product) => {
           parsed += 1;
-          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut args));
+          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut flow));
         }
         StreamWork::Replayed(path, product) => {
           replayed += 1;
-          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut args));
+          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut flow));
         }
         StreamWork::ReplayedPacked(path) => {
           if let Some(view) = pack
             .and_then(|p| p.get(&path))
             .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
           {
-            apply_product_view_with_args(interner, &path, &view, &mut writer, &mut references, Some(&mut args));
+            apply_product_view_with_args(interner, &path, &view, &mut writer, &mut references, Some(&mut flow));
             replayed += 1;
           }
         }
         StreamWork::Skipped => {}
       }
     }
-    sink.consume(references, args, 0)?;
+    sink.consume(references, flow, 0)?;
     return Ok((
       writer,
       StreamStats {
@@ -1331,7 +1570,7 @@ where
   }
   // Committers → absorber: completed shards, for rolling prefix absorption. Unbounded so a
   // committer never blocks handing off a finished shard.
-  let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>, Vec<ArgRec>)>();
+  let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>, FlowSidecar)>();
 
   let outputs = std::thread::scope(|scope| {
     // Committers: each owns its assigned shards' writers outright (single writer per shard)
@@ -1347,9 +1586,9 @@ where
         scope.spawn(move || {
           let owned_shards: Vec<usize> =
             (committer_index..num_shards).step_by(committers).collect();
-          let mut writers: HashMap<usize, (KgWriter, Vec<Reference>, Vec<ArgRec>)> = owned_shards
+          let mut writers: HashMap<usize, (KgWriter, Vec<Reference>, FlowSidecar)> = owned_shards
             .iter()
-            .map(|&shard| (shard, (KgWriter::new(), Vec::new(), Vec::new())))
+            .map(|&shard| (shard, (KgWriter::new(), Vec::new(), FlowSidecar::default())))
             .collect();
           let mut pending: HashMap<usize, std::collections::BTreeMap<usize, Slot>> = owned_shards
             .iter()
@@ -1377,8 +1616,8 @@ where
                   parsed: was_parsed,
                   reserved,
                 } => {
-                  let (writer, references, args) = writers.get_mut(&shard).expect("owned shard");
-                  apply_product_with_args(interner, &path, product, writer, references, Some(args));
+                  let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
+                  apply_product_with_args(interner, &path, product, writer, references, Some(flow));
                   budget.release(reserved);
                   if was_parsed {
                     parsed += 1;
@@ -1394,8 +1633,8 @@ where
                     .and_then(|p| p.get(&path))
                     .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
                   {
-                    let (writer, references, args) = writers.get_mut(&shard).expect("owned shard");
-                    apply_product_view_with_args(interner, &path, &view, writer, references, Some(args));
+                    let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
+                    apply_product_view_with_args(interner, &path, &view, writer, references, Some(flow));
                     replayed += 1;
                   }
                   budget.release(reserved);
@@ -1408,9 +1647,9 @@ where
             // with its merged copy in one final doubling spike.
             let shard_end = ((shard + 1) * shard_size).min(total_sequences);
             if *expected == shard_end
-              && let Some((shard_writer, shard_references, shard_args)) = writers.remove(&shard)
+              && let Some((shard_writer, shard_references, shard_flow)) = writers.remove(&shard)
             {
-              let _ = done_tx.send((shard, shard_writer, shard_references, shard_args));
+              let _ = done_tx.send((shard, shard_writer, shard_references, shard_flow));
             }
           }
           (writers, parsed, replayed)
@@ -1483,17 +1722,17 @@ where
       let mut sink = sink;
       let mut holdback: std::collections::BTreeMap<
         usize,
-        (KgWriter, Vec<Reference<'i>>, Vec<ArgRec>),
+        (KgWriter, Vec<Reference<'i>>, FlowSidecar),
       > = std::collections::BTreeMap::new();
       let mut next_absorb = 0usize;
       // First sink (spill IO) error: aborts absorption, surfaced after the scope joins.
       let mut sink_error: Option<io::Error> = None;
-      while let Ok((shard, shard_writer, shard_references, shard_args)) = done_rx.recv() {
-        holdback.insert(shard, (shard_writer, shard_references, shard_args));
-        while let Some((shard_writer, shard_references, shard_args)) = holdback.remove(&next_absorb)
+      while let Ok((shard, shard_writer, shard_references, shard_flow)) = done_rx.recv() {
+        holdback.insert(shard, (shard_writer, shard_references, shard_flow));
+        while let Some((shard_writer, shard_references, shard_flow)) = holdback.remove(&next_absorb)
         {
           if let Err(err) =
-            absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_args)
+            absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_flow)
             && sink_error.is_none()
           {
             sink_error = Some(err);
@@ -1558,9 +1797,9 @@ where
     }
   }
   phase_trace("stream: absorb tail");
-  while let Some((shard_writer, shard_references, shard_args)) = holdback.remove(&next_absorb) {
+  while let Some((shard_writer, shard_references, shard_flow)) = holdback.remove(&next_absorb) {
     if let Err(err) =
-      absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_args)
+      absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_flow)
       && sink_error.is_none()
     {
       sink_error = Some(err);
