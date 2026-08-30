@@ -323,3 +323,31 @@ fn degree_properties_and_ordered_comparisons() {
   .unwrap();
   assert_eq!(r.rows[0][0], Cell::Text("main".into())); // calls + data_flows out
 }
+
+#[test]
+fn scc_size_property_finds_recursion_knots() {
+  // alpha ⇄ beta (mutual recursion) + gamma → alpha (acyclic caller).
+  let mut writer = KgWriter::new();
+  let alpha = writer.define(def(SymbolKind::Function, "alpha", "src/knot.rs", true));
+  let beta = writer.define(def(SymbolKind::Function, "beta", "src/knot.rs", false));
+  let gamma = writer.define(def(SymbolKind::Function, "gamma", "src/main.rs", true));
+  writer.add_edge(alpha, beta, EdgeType::CALLS.with_confidence(100));
+  writer.add_edge(beta, alpha, EdgeType::CALLS.with_confidence(100));
+  writer.add_edge(gamma, alpha, EdgeType::CALLS.with_confidence(100));
+  let kg = writer.seal();
+
+  let r = run(
+    &kg,
+    "MATCH (f:Function) WHERE f.scc_size > 1 RETURN f.name, f.scc_size ORDER BY f.name",
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![
+      vec![Cell::Text("alpha".into()), Cell::Int(2)],
+      vec![Cell::Text("beta".into()), Cell::Int(2)],
+    ]
+  );
+  let r = run(&kg, r#"MATCH (f {name: "gamma"}) RETURN f.scc_size"#).unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Int(1)]]);
+}

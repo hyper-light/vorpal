@@ -51,6 +51,7 @@ fn min_confidence_for_grade(grade: Option<&str>) -> Result<u8, QueryError> {
 
 const PROPS: &[&str] = &[
   "id", "eid", "name", "path", "kind", "exported", "signature", "in_degree", "out_degree",
+  "scc_size",
 ];
 
 fn check_prop(prop: &str) -> Result<(), QueryError> {
@@ -73,7 +74,7 @@ enum PropType {
 
 fn prop_type(prop: &str) -> PropType {
   match prop {
-    "id" | "in_degree" | "out_degree" => PropType::Int,
+    "id" | "in_degree" | "out_degree" | "scc_size" => PropType::Int,
     "exported" => PropType::Bool,
     _ => PropType::Text,
   }
@@ -124,6 +125,10 @@ fn prop_cell(kg: &Kg, id: u32, prop: &str) -> Cell {
     "id" => Cell::Int(id as u64),
     "in_degree" => Cell::Int(kg.in_degree(NodeId::new(id as u64)) as u64),
     "out_degree" => Cell::Int(kg.out_degree(NodeId::new(id as u64)) as u64),
+    "scc_size" => match kg.scc_size(NodeId::new(id as u64)) {
+      Some(size) => Cell::Int(size as u64),
+      None => Cell::Null, // pre-column generation: unknown, never "acyclic"
+    },
     "eid" => match view.external_id {
       Some(eid) => Cell::Text(format!("{eid:032x}")),
       None => Cell::Null,

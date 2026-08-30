@@ -158,6 +158,8 @@ struct NodeColumns {
   /// Durable external id halves — `None` on pre-eid segments (external ids then read `None`).
   eid_lo: Option<usize>,
   eid_hi: Option<usize>,
+  /// Calls-SCC size (B6 v1.5) — `None` on segments sealed before the column existed.
+  scc_size: Option<usize>,
 }
 
 impl NodeColumns {
@@ -176,6 +178,7 @@ impl NodeColumns {
       span_end: segment.column_index("span_end"),
       eid_lo: segment.column_index("eid_lo"),
       eid_hi: segment.column_index("eid_hi"),
+      scc_size: segment.column_index("scc_size"),
     })
   }
 }
@@ -242,6 +245,14 @@ impl Kg {
 
   pub fn node_count(&self) -> usize {
     self.nodes.row_count() as usize
+  }
+
+  /// This node's calls-cycle component size: 1 outside any recursion, the knot's node
+  /// count inside one. `None` on segments sealed before the column existed — absence is
+  /// "unknown", never "acyclic".
+  pub fn scc_size(&self, id: NodeId) -> Option<u32> {
+    let (_segment, row) = self.directory.locate(id)?;
+    self.nodes.column_at(self.cols.scc_size?)?.get_u32(row)
   }
 
   /// Total directed edges (each stored edge counted once).

@@ -442,8 +442,13 @@ impl KgWriter {
   /// column's worth, not a second full copy of every column at once. The edge log is likewise
   /// dropped as soon as the compacted graph exists.
   pub fn seal(mut self) -> Kg {
-    crate::phase_stamp("seal: columns");
+    crate::phase_stamp("seal: scc");
     let n = self.kind.len() as u32;
+    // Strongly-connected-component sizes over calls edges (B6 v1.5): computed here from
+    // the finished edge log — a DERIVED column, so shard absorption has nothing to merge
+    // and the absorb/shrink column discipline does not apply to it.
+    let scc = crate::scc::scc_sizes(n as usize, &self.edges);
+    crate::phase_stamp("seal: columns");
     self.canonical.seal();
     drop(std::mem::take(&mut self.canonical));
 
@@ -487,6 +492,8 @@ impl KgWriter {
     let span_end = std::mem::take(&mut self.span_end);
     builder.add_u32("span_end", &span_end).unwrap();
     drop(span_end);
+    builder.add_u32("scc_size", &scc).unwrap();
+    drop(scc);
     let nodes = Segment::open_owned(builder.build().unwrap()).unwrap();
 
     crate::phase_stamp("seal: compact");
