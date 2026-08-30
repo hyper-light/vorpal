@@ -312,6 +312,21 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   stamps). Open quality-safe research items: multi-entry-point starts, partitioned builds,
   PQ-fidelity build passes — all recall-gated, none free.
 
+## CLI cold build — profile findings 2026-08-30 (clean-ish machine, `sample` 4s mid-parse)
+
+The "85% parse-bound" belief is STALE. Current cold build (6.5-7.0s wall, ~99 CPU-s,
+kernel) buckets: **allocator/memmove/mmap 26.7%**, **vorpal extraction code 20.9%**
+(extract_references 447 samples, combined_extractor OutlineItemIter 371, extract_product
+279, TsPre traversal 219, KgWriter::define 208), **tree-sitter CURSOR WALKING 15.6%**
+(goto_first_child/sibling/child_iterator + ts_node_child_with_descendant 462 — repeated
+descendant seeks), rule matching (Matcher::match_node_with_env 895 + relational Has 302),
+and only **8.2% actual parse+lex**. RawVecInner::finish_grow hot (Vec growth churn), heavy
+rallocx traffic. Attack list (quality-free, determinism-pinned): (1) allocation churn —
+capacity reservations, per-thread scratch reuse across files, bump-arena per file for
+extraction temporaries; (2) rule dispatch — per-language kind→rule bitmap prefilter if
+matching is tried per node×rule; (3) single-pass traversal — eliminate re-seeks behind
+ts_node_child_with_descendant; (4) background tree drops (ts_subtree_release 4.2%).
+
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
 The consensus lesson from Glean/SCIP/stack-graphs/Kythe: identity must be file-local or
