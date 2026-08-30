@@ -154,30 +154,38 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 
 ## Performance
 
-Release builds, Apple Silicon; wall-clock for the whole CLI invocation including process start.
+Release builds, Apple M5 Max (18 cores); wall-clock for the whole CLI invocation including
+process start. Measured 2026-08-30.
 
-**This repository** (~351 files, ~9.6k nodes):
-
-| Operation | Time |
-|---|---|
-| Full cold index | **0.05 s** |
-| Re-index after touching one file | 0.03 s |
-| Re-index, nothing changed | 0.01 s |
-| Graph / search query (mmap cold-open) | milliseconds |
-| `scan` regex rule over the **Linux kernel** (63,775 C files) | **1.0 s** — faster than ripgrep, with structural results |
-
-**Linux kernel scale** (72,541 files, ~30M LOC → 2.74M nodes, 6.8M references; M-series, 18 cores):
+**This repository** (856 files, 44k nodes — includes the vendored tree-sitter runtime and
+grammars):
 
 | Operation | Time |
 |---|---|
-| Cold index | **~7 s** at a sub-gigabyte peak footprint |
-| One-file incremental re-index | ~1.25 s |
-| Unchanged re-index | ~0.10 s |
-| Vector tier build (lazy, first search) | ~14 s, stamp-validated thereafter |
-| Warm MCP tool call (parse + freshness + query + render) | **2.8 µs** |
+| Full cold index | **3.8 s** — dominated by a single 33 MB generated `parser.c` |
+| Re-index after editing one file | 0.04 s |
+| Re-index, nothing changed | 0.02 s |
+| Structural `scan` rule over the **Linux kernel** (63,775 C files) | **1.4 s** — every file fully parsed and matched by AST, about 2× the time ripgrep needs for a plain text grep |
 
-Indexing is deterministic and bit-identical run to run. Full methodology — commands, datasets,
-hardware, cold/warm states, raw numbers: **[docs/wip/BENCHMARKS.md](docs/wip/BENCHMARKS.md)**.
+**Linux kernel** (72,541 files, ~30 M LOC → 2.75 M nodes, 6.8 M references):
+
+| Operation | Time |
+|---|---|
+| Cold index | **6.3 s**, under 1 GB peak memory |
+| Re-index after editing one file | **0.98 s** |
+| Re-index after a `touch` (contents unchanged) | 0.20 s |
+| Re-index, nothing changed | 0.10 s |
+| Search (CLI) | 0.02 s |
+| Search (running as an MCP server) | **27 ms** |
+| Graph query (running as an MCP server) | **< 1 ms** |
+| Save a file → queries reflect the change | ~0.5 s |
+| Semantic search index build | 19 s, once, in the background |
+
+Indexing the same tree always produces byte-identical output, and search results are
+identical with or without the acceleration indexes — they change latency, never answers.
+As an MCP server, vorpal watches your tree and keeps everything fresh as you edit; you
+never re-index by hand. Commands, datasets, and raw numbers:
+**[docs/wip/BENCHMARKS.md](docs/wip/BENCHMARKS.md)**.
 
 ## What it does
 
