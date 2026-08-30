@@ -179,7 +179,9 @@ overlapped the exact top-10 in **66/80** positions, ranging from 10/10 down to 4
 (`mutex lock acquire`). The fused ranking is deterministic — the misses are candidates the
 ANN beam never surfaced (e.g. `socket_alloc` at exact rank 3), consistent with the beam-width
 reduction in `a048aa0`. Recorded here as an open finding for the ANN owner; the exact path
-remains the reference answer.
+remains the reference answer. This figure is now tracked continuously:
+`cargo xtask searcheval <idx> xtask/labels/kernel.json --overlap` (see "Retrieval quality"
+below).
 
 ## Graph and query latency (linux index, warm, best-of-3)
 
@@ -215,9 +217,11 @@ vorpal query '<text>' --index /tmp/bench-lk
 - Grammar corpus: 5,787 upstream cases across 49 grammars — 5,738 pass, 60 skipped with
   written reasons, 0 fail — in **0.65 s**
   (`cargo test -p vorpal-language --test grammar_corpus`).
-- Retrieval quality: 10 labelled queries, recall@5 = 1.0 and MRR = 1.0 on every channel
-  (fusion, graph, name, vector), mean query 730 µs on the fixture corpus
-  (`cargo test -p vorpal-index --test retrieval_eval -- --nocapture`).
+- Retrieval quality: 17 labelled queries across 8 classes — exact / short-keyword /
+  subset / descriptive / graph-disambiguation stay at recall@5 = 1.0 (the fusion
+  invariant), paraphrase / sparse-name / conjunctive are PINNED at their honest lexical
+  floors so any movement is loud — plus per-channel ablations and a double-run
+  determinism gate (`cargo test -p vorpal-index --test retrieval_eval -- --nocapture`).
 - Incremental replay: one touched file → exactly one re-extract, N−1 replays
   (`cargo test -p vorpal-index --test incremental_replay`).
 
@@ -257,6 +261,46 @@ Regenerate with `cargo build --release -p vorpal -p vorpal-index && cargo xtask 
 
 Bytes an agent must read: baseline/vorpal = **83.3×** (baseline model: one grep + opening the first 5 matched files — generous; real exploration loops grep repeatedly).
 <!-- END GENERATED EVAL TABLE -->
+
+## Retrieval quality (`cargo xtask searcheval`, semantic-tier Stage 0)
+
+Graded labels (`xtask/labels/*.json`, grades 1–3; every labelled name existence-checked
+against the index at the start of each run, so a renamed symbol fails loudly instead of
+scoring as a miss) scored per class as NDCG@10 / MRR / recall@5, with a double-run
+determinism gate and a tier-vs-exact top-10 overlap mode:
+
+```
+cargo build --release -p xtask
+vorpal-index index <tree> <idx> && vorpal-index __warm-ann <idx>
+target/release/xtask searcheval <idx> xtask/labels/<set>.json [--overlap]
+```
+
+2026-08-30 lexical-fusion baselines (pre-semantic-tier — the "before" every stage of the
+semantic-tier plan measures against):
+
+| set | queries | NDCG@10 | MRR | recall@5 | tier-vs-exact top-10 |
+|---|---:|---:|---:|---:|---|
+| vorpal self-index | 10 | 0.559 | 0.544 | 0.550 | — |
+| cpython @ `b86a41cbf63` | 6 | 0.141 | 0.222 | 0.250 | 59/60 positions, 60/60 set |
+| linux @ `1590cf032971` | 8 | 0.208 | 0.250 | 0.167 | 47/80 positions, 75/80 set |
+
+Findings these baselines pin:
+
+- **The fixture's short-keyword supremacy does not survive scale.** The 17-query fixture
+  holds recall@5 = 1.0 on every fully-retrievable class, but the same class collapses at
+  kernel scale (NDCG@10 **0.103** over 7 short-keyword queries): "mutex lock acquire"
+  does not surface `mutex_lock` in the top 25 — thousands of definitions carry those name
+  tokens, and the token-subset tier plus in-degree fusion drown the definitive answers.
+  Stage 4 (BM25 postings channel: TF + length normalization) targets exactly this; these
+  rows are its before.
+- Self-index paraphrase and conjunctive floors are 0.0 by construction (zero vocabulary
+  overlap) — the Stage 1 / Stage AND before.
+- Tier-vs-exact at kernel scale: 47/80 positional agreement but **75/80 set agreement** —
+  the beam surfaces nearly every exact-path candidate, and the positional disagreement is
+  mostly pool-composition reordering (a candidate's per-channel rank shifts with pool
+  membership before RRF), not lost answers; only 5/80 were true beam misses. cpython:
+  59/60 positions, 60/60 set. Exact-path mean wall: linux 365 ms, cpython 75 ms — the
+  fallback cost a search pays when tiers are cold.
 
 ## History (earlier passes, kept for the record)
 

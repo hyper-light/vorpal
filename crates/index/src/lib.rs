@@ -1534,31 +1534,7 @@ pub fn search_records_filtered(
   k: usize,
   filter: &SearchFilter,
 ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
-  let searcher = cached_searcher(index_dir)?;
-  let ranked = searcher.run(query, k, filter)?;
-  let kg = &searcher.kg;
-  const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
-  Ok(
-    ranked
-      .into_iter()
-      .filter_map(|(row, score, ranks)| {
-        Some(records::SearchHitRecord {
-          node: records::node_record(kg, NodeId::new(row))?,
-          score,
-          channels: CHANNELS
-            .iter()
-            .zip(&ranks)
-            .filter_map(|(&channel, rank)| {
-              rank.map(|rank| records::ChannelRank {
-                channel,
-                rank: rank + 1,
-              })
-            })
-            .collect(),
-        })
-      })
-      .collect(),
-  )
+  cached_searcher(index_dir)?.records(query, k, filter)
 }
 
 fn search_index_impl(
@@ -1585,6 +1561,10 @@ pub struct Searcher {
   ann: Option<AnnIndex>,
   /// The persisted lexical posting tier — present only when its stamp matches this generation.
   postings: Option<postings::Postings>,
+  /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
+  /// effect (autowarm) so queries take the exact reference paths only. Set by
+  /// [`Searcher::open_exact`]; never used in serving.
+  exact_only: bool,
 }
 
 impl Searcher {
@@ -1607,7 +1587,66 @@ impl Searcher {
       kg,
       ann,
       postings,
+      exact_only: false,
     })
+  }
+
+  /// [`Searcher::open`] with every approximate tier deliberately refused: queries take the
+  /// exact reference paths (exhaustive semantic scan + full name scan) no matter what
+  /// sidecars exist on disk, and nothing is mutated (no autowarm). This is the measurement
+  /// seam — `cargo xtask searcheval --overlap` compares tier answers against it — never a
+  /// serving path.
+  pub fn open_exact(index_dir: &Path) -> Result<Searcher, Box<dyn Error>> {
+    let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
+    let kg = Kg::load(&generation_dir)?;
+    Ok(Searcher {
+      generation_dir,
+      kg,
+      ann: None,
+      postings: None,
+      exact_only: true,
+    })
+  }
+
+  /// Which warm tiers this handle holds, as `(ann, postings)` — fresh-and-open vs
+  /// absent/stale. Lets measurement tools state which path served their numbers.
+  pub fn tiers(&self) -> (bool, bool) {
+    (self.ann.is_some(), self.postings.is_some())
+  }
+
+  /// The typed-record surface over [`Searcher::run`]: one record per hit with the fused
+  /// score and per-channel provenance ranks. Shared by [`search_records_filtered`] and bulk
+  /// callers holding a persistent handle.
+  pub fn records(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
+    let ranked = self.run(query, k, filter)?;
+    let kg = &self.kg;
+    const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
+    Ok(
+      ranked
+        .into_iter()
+        .filter_map(|(row, score, ranks)| {
+          Some(records::SearchHitRecord {
+            node: records::node_record(kg, NodeId::new(row))?,
+            score,
+            channels: CHANNELS
+              .iter()
+              .zip(&ranks)
+              .filter_map(|(&channel, rank)| {
+                rank.map(|rank| records::ChannelRank {
+                  channel,
+                  rank: rank + 1,
+                })
+              })
+              .collect(),
+          })
+        })
+        .collect(),
+    )
   }
 
   /// The pinned-generation hybrid ranking shared by the rendered and typed search surfaces:
@@ -1646,7 +1685,10 @@ impl Searcher {
       .into_iter()
       .map(|(id, _)| id)
       .collect()
-  } else if let Some(overlay) = annfiles::OverlayView::assemble(index_dir, kg, embedder.dim()) {
+  } else if let Some(overlay) = (!self.exact_only)
+    .then(|| annfiles::OverlayView::assemble(index_dir, kg, embedder.dim()))
+    .flatten()
+  {
     autowarm::maybe_spawn(index_dir);
     // Overfetch by the dead-row count (bounded) so tombstoning cannot starve the pool.
     let bump = (overlay.tombstoned_nodes as usize).min(take);
@@ -1668,8 +1710,11 @@ impl Searcher {
     ids
   } else {
     // Kick a detached warm so the *next* search takes the fast tier — gated (registered
-    // binaries only, opt-out, once per process) and best-effort; see `autowarm`.
-    autowarm::maybe_spawn(index_dir);
+    // binaries only, opt-out, once per process) and best-effort; see `autowarm`. The
+    // exact-only seam measures the index as-is and must not mutate it.
+    if !self.exact_only {
+      autowarm::maybe_spawn(index_dir);
+    }
     let mut ids = semantic_row_ids(kg);
     // The exhaustive path filters BEFORE scoring: exact recall over exactly the admitted
     // population, no overfetch slack needed.

@@ -1,5 +1,6 @@
 mod eval;
 mod schema;
+mod searcheval;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value as JSON, from_str as parse_json, to_string_pretty};
 use std::env::args;
@@ -15,6 +16,13 @@ enum Task {
   ReleaseArtifacts(String),
   /// The agent-task evaluation suite (Phase E): vorpal vs file-exploration baseline.
   Eval { write_doc: bool },
+  /// Graded retrieval-quality eval (semantic-tier Stage 0): a labels file against an
+  /// arbitrary index — per-class NDCG@10 / MRR / recall@5, optional tier-vs-exact overlap.
+  SearchEval {
+    index: String,
+    labels: String,
+    overlap: bool,
+  },
 }
 
 fn get_task() -> Result<Task> {
@@ -23,6 +31,14 @@ fn get_task() -> Result<Task> {
   if arg == "eval" {
     return Ok(Task::Eval {
       write_doc: args().nth(2).as_deref() == Some("--write"),
+    });
+  }
+  if arg == "searcheval" {
+    let usage = "usage: cargo xtask searcheval <index-dir> <labels.json> [--overlap]";
+    return Ok(Task::SearchEval {
+      index: args().nth(2).context(usage)?,
+      labels: args().nth(3).context(usage)?,
+      overlap: args().skip(4).any(|a| a == "--overlap"),
     });
   }
   if arg == "schema" {
@@ -43,6 +59,11 @@ fn main() -> Result<()> {
     Task::Release(version) => release_new_version(&version),
     Task::ReleaseArtifacts(dir) => release_artifacts(Path::new(&dir)),
     Task::Eval { write_doc } => eval::run_eval(write_doc),
+    Task::SearchEval {
+      index,
+      labels,
+      overlap,
+    } => searcheval::run(Path::new(&index), Path::new(&labels), overlap),
   }
 }
 
