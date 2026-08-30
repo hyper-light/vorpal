@@ -32,6 +32,10 @@ static DEFAULT_EXTRACTORS: OnceLock<Result<Arc<LangExtractors>, String>> = OnceL
 /// against parsed files. Language is chosen from the file extension (§3.1 "all languages").
 pub struct OutlineExtractor {
   by_lang: Arc<LangExtractors>,
+  /// Reference-extraction specs supplied as data (F-M4): dynamic languages, or a user override
+  /// for a builtin. Consulted before the builtin const table, so a data spec wins for its
+  /// language — identity-correct because the spec source is folded into the rules digest.
+  dynamic_specs: HashMap<SgLang, crate::references::ResolvedRefSpec>,
   /// Digest of the exact outline-rule source this extractor was compiled from. Folded into each
   /// product's identity so editing an extraction rule invalidates products it produced — the
   /// grammar digest alone cannot see a rule change.
@@ -46,6 +50,7 @@ impl OutlineExtractor {
       .clone()?;
     Ok(Self {
       by_lang,
+      dynamic_specs: HashMap::new(),
       rules_digest: xxhash_rust::xxh3::xxh3_64(DEFAULT_OUTLINE_RULES.as_bytes()),
     })
   }
@@ -54,6 +59,7 @@ impl OutlineExtractor {
   pub fn from_rules(rules_yaml: &str) -> Result<Self, String> {
     Ok(Self {
       by_lang: Arc::new(compile_rules(rules_yaml)?),
+      dynamic_specs: HashMap::new(),
       rules_digest: xxhash_rust::xxh3::xxh3_64(rules_yaml.as_bytes()),
     })
   }
@@ -73,25 +79,50 @@ impl OutlineExtractor {
   /// replay-or-parse pass), exactly like editing the bundled rules. Per-language isolation
   /// comes from the grammar half of the identity, not the rules half.
   pub fn with_sources(sources: &[RuleSource]) -> Result<Self, String> {
-    if sources.is_empty() {
+    Self::with_env(sources, &[])
+  }
+
+  /// Extra outline rules AND serialized ref specs (F-M4). The canonical digest stream extends
+  /// F-M3's exactly: builtin bytes, origin-sorted outline frames, then origin-sorted ref-spec
+  /// frames under a distinct tag — an outline-only environment digests identically to F-M3,
+  /// and empty-everything identically to [`OutlineExtractor::new`]. Ref-spec kinds resolve
+  /// under the strict policy; a spec for an already-spec'd language must be deliberate (a data
+  /// spec overrides the builtin const for its language).
+  pub fn with_env(
+    outline_sources: &[RuleSource],
+    ref_spec_sources: &[RuleSource],
+  ) -> Result<Self, String> {
+    if outline_sources.is_empty() && ref_spec_sources.is_empty() {
       return Self::new();
     }
-    let mut sorted: Vec<&RuleSource> = sources.iter().collect();
-    sorted.sort_by(|a, b| a.origin.cmp(&b.origin).then(a.yaml.cmp(&b.yaml)));
-    sorted.dedup_by(|a, b| a.origin == b.origin && a.yaml == b.yaml);
-    for pair in sorted.windows(2) {
-      if pair[0].origin == pair[1].origin {
-        return Err(format!(
-          "outline-rule source '{}' provided twice with different contents",
-          pair[0].origin
-        ));
+    let canonical = |sources: &[RuleSource]| -> Result<Vec<RuleSource>, String> {
+      let mut sorted: Vec<&RuleSource> = sources.iter().collect();
+      sorted.sort_by(|a, b| a.origin.cmp(&b.origin).then(a.yaml.cmp(&b.yaml)));
+      sorted.dedup_by(|a, b| a.origin == b.origin && a.yaml == b.yaml);
+      for pair in sorted.windows(2) {
+        if pair[0].origin == pair[1].origin {
+          return Err(format!(
+            "rule source '{}' provided twice with different contents",
+            pair[0].origin
+          ));
+        }
       }
-    }
+      Ok(sorted.into_iter().cloned().collect())
+    };
+    let outline = canonical(outline_sources)?;
+    let ref_specs = canonical(ref_spec_sources)?;
 
     let mut h = xxhash_rust::xxh3::Xxh3::new();
     h.update(DEFAULT_OUTLINE_RULES.as_bytes());
-    for source in &sorted {
+    for source in &outline {
       h.update(b"\x00source\x00");
+      h.update(source.origin.as_bytes());
+      h.update(&[0]);
+      h.update(&(source.yaml.len() as u64).to_le_bytes());
+      h.update(source.yaml.as_bytes());
+    }
+    for source in &ref_specs {
+      h.update(b"\x00refspec\x00");
       h.update(source.origin.as_bytes());
       h.update(&[0]);
       h.update(&(source.yaml.len() as u64).to_le_bytes());
@@ -100,16 +131,60 @@ impl OutlineExtractor {
 
     let mut rules = parse_outline_rules::<SgLang>(DEFAULT_OUTLINE_RULES)
       .map_err(|e| format!("parse rules: {e}"))?;
-    for source in &sorted {
+    for source in &outline {
       rules.extend(
         parse_outline_rules::<SgLang>(&source.yaml)
           .map_err(|e| format!("parse outline rules from {}: {e}", source.origin))?,
       );
     }
+
+    let mut dynamic_specs: HashMap<SgLang, crate::references::ResolvedRefSpec> = HashMap::new();
+    for source in &ref_specs {
+      for spec in crate::refspec_config::parse_ref_specs(&source.yaml)
+        .map_err(|e| format!("{}: {e}", source.origin))?
+      {
+        let lang: SgLang = spec.language.parse().map_err(|_| {
+          format!(
+            "unknown language '{}' in ref spec {} — register the custom language first",
+            spec.language, source.origin
+          )
+        })?;
+        let data = spec.to_data(lang, &source.origin)?;
+        if dynamic_specs
+          .insert(
+            lang,
+            crate::references::ResolvedRefSpec::build(lang, Arc::new(data)),
+          )
+          .is_some()
+        {
+          return Err(format!(
+            "two ref specs target language '{}' (second in {}) — exactly one spec per language",
+            spec.language, source.origin
+          ));
+        }
+      }
+    }
+
     Ok(Self {
       by_lang: Arc::new(compile_groups(rules)?),
+      dynamic_specs,
       rules_digest: h.digest(),
     })
+  }
+
+  /// The dynamic languages this extractor can extract (outline rules and/or a data ref spec) —
+  /// sorted by name, so callers can report the unverified set deterministically.
+  pub fn dynamic_langs(&self) -> Vec<String> {
+    let mut names: Vec<String> = self
+      .by_lang
+      .keys()
+      .chain(self.dynamic_specs.keys())
+      .filter(|lang| matches!(lang, SgLang::Custom(_)))
+      .map(|lang| lang.to_string())
+      .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
   }
 
   /// How many languages have compiled extractors.
@@ -170,8 +245,11 @@ impl OutlineExtractor {
   /// Whether a file at `path` would be extracted: a known extension with compiled outline rules
   /// and/or a reference-extraction spec (a language may have either independently).
   pub fn handles(&self, path: &str) -> bool {
-    SgLang::from_path(path)
-      .is_some_and(|lang| self.by_lang.contains_key(&lang) || ref_spec(lang).is_some())
+    SgLang::from_path(path).is_some_and(|lang| {
+      self.by_lang.contains_key(&lang)
+        || self.dynamic_specs.contains_key(&lang)
+        || ref_spec(lang).is_some()
+    })
   }
 }
 
@@ -183,7 +261,8 @@ impl OutlineExtractor {
   pub fn extract_product(&self, path: &str, source: &str) -> Option<FileProduct> {
     let lang = SgLang::from_path(path)?;
     let combined = self.by_lang.get(&lang);
-    let spec = resolved_ref_spec(lang);
+    // A data spec (dynamic language, or a user override) wins over the builtin const table.
+    let spec = self.dynamic_specs.get(&lang).or_else(|| resolved_ref_spec(lang));
     if combined.is_none() && spec.is_none() {
       return None;
     }

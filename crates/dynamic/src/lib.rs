@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 
 mod custom_lang;
 
-pub use custom_lang::{CustomLang, LibraryPath};
+pub use custom_lang::{CustomLang, CustomLangCanary, LibraryPath};
 
 type LangIndex = u32;
 

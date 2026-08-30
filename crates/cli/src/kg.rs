@@ -303,17 +303,39 @@ fn extraction_env_from_project(
   };
   let mut pattern_only: Vec<&str> = Vec::new();
   for (name, lang) in customs {
-    let Some(declared) = lang.outline_rules.as_ref() else {
+    if lang.outline_rules.is_none() && lang.ref_spec.is_none() {
       pattern_only.push(name);
       continue;
-    };
-    let path = project.project_dir.join(declared);
-    let yaml = std::fs::read_to_string(&path)
-      .with_context(|| format!("reading outline rules for custom language '{name}': {}", path.display()))?;
-    env.outline_sources.push(vorpal_index::RuleSource {
-      origin: declared.to_string_lossy().into_owned(),
-      yaml,
-    });
+    }
+    if let Some(declared) = lang.outline_rules.as_ref() {
+      let path = project.project_dir.join(declared);
+      let yaml = std::fs::read_to_string(&path).with_context(|| {
+        format!("reading outline rules for custom language '{name}': {}", path.display())
+      })?;
+      env.outline_sources.push(vorpal_index::RuleSource {
+        origin: declared.to_string_lossy().into_owned(),
+        yaml,
+      });
+    }
+    if let Some(declared) = lang.ref_spec.as_ref() {
+      let path = project.project_dir.join(declared);
+      let yaml = std::fs::read_to_string(&path).with_context(|| {
+        format!("reading ref spec for custom language '{name}': {}", path.display())
+      })?;
+      env.ref_spec_sources.push(vorpal_index::RuleSource {
+        origin: declared.to_string_lossy().into_owned(),
+        yaml,
+      });
+    }
+    if let Some(canary) = lang.canary.as_ref() {
+      env.canaries.push(vorpal_index::DynamicCanary {
+        lang: name.clone(),
+        path: canary.path.clone(),
+        source: canary.source.clone(),
+        min_items: canary.min_items,
+        min_refs: canary.min_refs,
+      });
+    }
   }
   if !pattern_only.is_empty() {
     pattern_only.sort_unstable();
@@ -360,6 +382,13 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
         report.error_files, report.error_nodes
       );
     }
+  }
+  if !report.unverified_langs.is_empty() {
+    println!(
+      "note: {} dynamic language(s) indexed without a canary (best-effort, unverified): {} —        add `canary:` to their custom language config",
+      report.unverified_langs.len(),
+      report.unverified_langs.join(", ")
+    );
   }
   if report.cache_mode != "fast-stat" {
     println!("cache mode: {}", report.cache_mode);

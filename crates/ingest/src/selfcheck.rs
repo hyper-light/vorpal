@@ -300,6 +300,57 @@ pub fn verify_default_extraction(extractor: &OutlineExtractor) -> Result<(), Str
   VERDICT.get_or_init(|| verify_extraction(extractor)).clone()
 }
 
+/// The dynamic-language counterpart of the builtin canary gate (F-M4): each configured canary
+/// extracts under the *environment's* extractor and must reach its floors, or the build refuses
+/// exactly like a gutted builtin would. Not memoized — the verdict depends on the environment,
+/// not just the binary. Honors `VORPAL_NO_SELFCHECK=1` with the same warning.
+pub fn verify_env_extraction(
+  extractor: &OutlineExtractor,
+  canaries: &[crate::DynamicCanary],
+) -> Result<(), String> {
+  if canaries.is_empty() {
+    return Ok(());
+  }
+  if std::env::var_os("VORPAL_NO_SELFCHECK").is_some_and(|v| v == "1") {
+    eprintln!(
+      "warning: VORPAL_NO_SELFCHECK=1 — skipping the dynamic-language extraction self-check; a \
+       broken grammar or spec will index silently"
+    );
+    return Ok(());
+  }
+  for canary in canaries {
+    let Some(product) = extractor.extract_product(&canary.path, &canary.source) else {
+      return Err(format!(
+        "extraction self-check failed for dynamic language '{}': canary '{}' produced no \
+         product — the language is not extractable in this environment (missing rules/spec, or \
+         the extension is not registered)",
+        canary.lang, canary.path
+      ));
+    };
+    if product.items.len() < canary.min_items {
+      return Err(format!(
+        "extraction self-check failed for dynamic language '{}': canary '{}' yielded {} outline \
+         item(s), expected at least {} — grammar/rules mismatch",
+        canary.lang,
+        canary.path,
+        product.items.len(),
+        canary.min_items
+      ));
+    }
+    if product.refs.len() < canary.min_refs {
+      return Err(format!(
+        "extraction self-check failed for dynamic language '{}': canary '{}' yielded {} \
+         reference(s), expected at least {} — ref spec mismatch",
+        canary.lang,
+        canary.path,
+        product.refs.len(),
+        canary.min_refs
+      ));
+    }
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

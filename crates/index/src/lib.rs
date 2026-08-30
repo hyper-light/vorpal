@@ -37,12 +37,12 @@ use vorpal_ingest::{
 };
 // `Kg` is imported once and re-exported for downstream surfaces (CLI) that route all graph
 // access through this crate.
-pub use vorpal_ingest::{ExtractionEnv, RuleSource};
+pub use vorpal_ingest::{DynamicCanary, ExtractionEnv, RuleSource};
 pub use vorpal_kg::{Direction, EdgeType, Kg};
 use vorpal_kg::NodeId;
 
 /// Summary of an indexing run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReport {
   /// The tree was unchanged since the last index — reused without re-parsing (§3.4).
   pub reused: bool,
@@ -73,6 +73,10 @@ pub struct IndexReport {
   pub masked: u64,
   /// The cache-validity mode this run used (`fast-stat` / `verified`).
   pub cache_mode: &'static str,
+  /// Dynamic languages extracted this build WITHOUT a canary (F-M4): best-effort tier, named
+  /// on every report so an unverified grammar can never pass as a verified one. Empty for the
+  /// default environment and whenever every dynamic language has a canary.
+  pub unverified_langs: Vec<String>,
 }
 
 impl IndexReport {
@@ -228,6 +232,9 @@ pub fn build_index_env(
   let interner = vorpal_ingest::Interner::default();
   vorpal_kg::phase_stamp("build: enter");
   let extractor = env.extractor()?;
+  // Computed once, up front: reported on every exit path (fast-path reuse included) so an
+  // unverified dynamic language is never silently trusted.
+  let unverified_langs = env.unverified_langs(&extractor);
   vorpal_kg::phase_stamp("build: rules compiled");
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
@@ -326,6 +333,7 @@ pub fn build_index_env(
           ambiguous: 0,
           external: 0,
           masked: 0,
+          unverified_langs: unverified_langs.clone(),
         });
       }
     }
@@ -336,6 +344,9 @@ pub fn build_index_env(
   // internally inconsistent build otherwise seals a silently gutted graph with exit 0).
   // Once per process; the unchanged-tree fast path above returns before this line.
   vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
+  // Dynamic-language canaries (F-M4): environment-scoped, so not memoized — the same refusal
+  // gate builtin languages get, extended to grammars that arrived via dlopen.
+  vorpal_ingest::verify_env_extraction(&extractor, &env.canaries).map_err(io::Error::other)?;
 
   // Incremental path, streamed (§7.5): replay cached products for stat-unchanged files,
   // re-parse the rest — admission is byte-budget-gated, extraction fans out over scoped
@@ -618,6 +629,7 @@ pub fn build_index_env(
     ambiguous: resolve.ambiguous,
     external: resolve.external,
     masked: resolve.masked,
+    unverified_langs,
   })
 }
 

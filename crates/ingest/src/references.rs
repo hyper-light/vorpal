@@ -122,7 +122,8 @@ struct ImportSpec {
 }
 
 /// Classification of a call by its extracted callee text.
-enum TextAction {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TextAction {
   /// A definition form (`def`, `defmodule`, …): emit nothing and suppress the definition-head
   /// call (`def foo(x)` parses `foo(x)` as a call — it is a definition, not a call site).
   SkipDefinition,
@@ -183,6 +184,140 @@ const SPEC_DEFAULTS: RefSpec = RefSpec {
   method_callee_kinds: NO_KINDS,
   self_receivers: NO_KINDS,
 };
+
+// ---- Owned spec data (F-M4) ---------------------------------------------------------------
+//
+// The walk consumes these owned twins so specs can come from *data* (serialized YAML for
+// dynamic languages) as well as from the `&'static` authoring consts above. The consts remain
+// the builtin authoring format; `From<&RefSpec>` lifts them into data once, at dispatch-table
+// build. Field names mirror the static structs 1:1 so the walk reads identically.
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SelData {
+  Field(String),
+  FieldLast(String),
+  FirstNamedChild,
+  ChildOfKind(Vec<String>),
+}
+
+impl From<&Sel> for SelData {
+  fn from(sel: &Sel) -> Self {
+    match sel {
+      Sel::Field(name) => SelData::Field((*name).into()),
+      Sel::FieldLast(name) => SelData::FieldLast((*name).into()),
+      Sel::FirstNamedChild => SelData::FirstNamedChild,
+      Sel::ChildOfKind(kinds) => {
+        SelData::ChildOfKind(kinds.iter().map(|k| (*k).into()).collect())
+      }
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum QualSourceData {
+  None,
+  NodeField(String),
+  TargetPath,
+}
+
+impl From<QualSource> for QualSourceData {
+  fn from(source: QualSource) -> Self {
+    match source {
+      QualSource::None => QualSourceData::None,
+      QualSource::NodeField(field) => QualSourceData::NodeField(field.into()),
+      QualSource::TargetPath => QualSourceData::TargetPath,
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CallSpecData {
+  pub(crate) kind: String,
+  pub(crate) callee: SelData,
+  pub(crate) receiver_field: Option<String>,
+  pub(crate) scope_field: Option<String>,
+}
+
+impl From<&CallSpec> for CallSpecData {
+  fn from(spec: &CallSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      callee: SelData::from(&spec.callee),
+      receiver_field: spec.receiver_field.map(Into::into),
+      scope_field: spec.scope_field.map(Into::into),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImportSpecData {
+  pub(crate) kind: String,
+  pub(crate) target: SelData,
+  pub(crate) string_target: bool,
+  pub(crate) qualifier: QualSourceData,
+}
+
+impl From<&ImportSpec> for ImportSpecData {
+  fn from(spec: &ImportSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      target: SelData::from(&spec.target),
+      string_target: spec.string_target,
+      qualifier: spec.qualifier.into(),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImplSpecData {
+  pub(crate) kind: String,
+  pub(crate) target: Option<SelData>,
+}
+
+impl From<&ImplSpec> for ImplSpecData {
+  fn from(spec: &ImplSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      target: spec.target.as_ref().map(SelData::from),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RefSpecData {
+  pub(crate) calls: Vec<CallSpecData>,
+  pub(crate) imports: Vec<ImportSpecData>,
+  pub(crate) text_rules: Vec<(String, TextAction)>,
+  pub(crate) types: Vec<String>,
+  pub(crate) implements: Vec<ImplSpecData>,
+  pub(crate) type_params: Vec<String>,
+  pub(crate) type_placeholders: Vec<String>,
+  pub(crate) static_callee_kinds: Vec<String>,
+  pub(crate) method_callee_kinds: Vec<String>,
+  pub(crate) self_receivers: Vec<String>,
+}
+
+impl From<&RefSpec> for RefSpecData {
+  fn from(spec: &RefSpec) -> Self {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).into()).collect() };
+    Self {
+      calls: spec.calls.iter().map(CallSpecData::from).collect(),
+      imports: spec.imports.iter().map(ImportSpecData::from).collect(),
+      text_rules: spec
+        .text_rules
+        .iter()
+        .map(|(text, action)| ((*text).into(), *action))
+        .collect(),
+      types: owned(spec.types),
+      implements: spec.implements.iter().map(ImplSpecData::from).collect(),
+      type_params: owned(spec.type_params),
+      type_placeholders: owned(spec.type_placeholders),
+      static_callee_kinds: owned(spec.static_callee_kinds),
+      method_callee_kinds: owned(spec.method_callee_kinds),
+      self_receivers: owned(spec.self_receivers),
+    }
+  }
+}
 
 const RUST: RefSpec = RefSpec {
   calls: &[CallSpec {
@@ -619,7 +754,7 @@ enum Chain {
 /// build-once dispatch): the walk indexes one dense table per node instead of comparing the
 /// kind string against every spec entry.
 pub(crate) struct ResolvedRefSpec {
-  pub(crate) spec: &'static RefSpec,
+  pub(crate) spec: std::sync::Arc<RefSpecData>,
   /// `kind_id → chain arm`, dense over the ids the spec mentions.
   chain: Vec<Chain>,
   /// `kind_id → declares type parameters` (checked independently of the chain).
@@ -629,7 +764,7 @@ pub(crate) struct ResolvedRefSpec {
 }
 
 impl ResolvedRefSpec {
-  fn build(lang: SgLang, spec: &'static RefSpec) -> Self {
+  pub(crate) fn build(lang: SgLang, spec: std::sync::Arc<RefSpecData>) -> Self {
     let id_of = |kind: &str| -> Option<u16> {
       // `kind_to_id` returns 0 for kinds absent from the pinned grammar; such entries could
       // never have matched by string either, so they simply don't dispatch.
@@ -641,17 +776,17 @@ impl ResolvedRefSpec {
     let import_kind_ids: Vec<u16> = spec
       .imports
       .iter()
-      .map(|i| id_of(i.kind).unwrap_or(0))
+      .map(|i| id_of(&i.kind).unwrap_or(0))
       .collect();
 
     let max_id = spec
       .calls
       .iter()
-      .map(|c| c.kind)
-      .chain(spec.imports.iter().map(|i| i.kind))
-      .chain(spec.implements.iter().map(|i| i.kind))
-      .chain(spec.types.iter().copied())
-      .chain(spec.type_params.iter().copied())
+      .map(|c| c.kind.as_str())
+      .chain(spec.imports.iter().map(|i| i.kind.as_str()))
+      .chain(spec.implements.iter().map(|i| i.kind.as_str()))
+      .chain(spec.types.iter().map(String::as_str))
+      .chain(spec.type_params.iter().map(String::as_str))
       .filter_map(id_of)
       .max()
       .unwrap_or(0) as usize;
@@ -662,26 +797,26 @@ impl ResolvedRefSpec {
     // within calls/implements, reverse entry order so the FIRST spec entry sharing a kind wins
     // — the same tie-break the sequential `find()` dispatch had.
     for (idx, call) in spec.calls.iter().enumerate().rev() {
-      if let Some(id) = id_of(call.kind) {
+      if let Some(id) = id_of(&call.kind) {
         chain[id as usize] = Chain::Call(idx as u16);
       }
     }
     for (idx, imp) in spec.implements.iter().enumerate().rev() {
-      if let Some(id) = id_of(imp.kind) {
+      if let Some(id) = id_of(&imp.kind) {
         chain[id as usize] = Chain::Implements(idx as u16);
       }
     }
-    for kind in spec.types {
+    for kind in &spec.types {
       if let Some(id) = id_of(kind) {
         chain[id as usize] = Chain::Type;
       }
     }
-    for imp in spec.imports {
-      if let Some(id) = id_of(imp.kind) {
+    for imp in &spec.imports {
+      if let Some(id) = id_of(&imp.kind) {
         chain[id as usize] = Chain::Import;
       }
     }
-    for kind in spec.type_params {
+    for kind in &spec.type_params {
       if let Some(id) = id_of(kind) {
         type_params[id as usize] = true;
       }
@@ -747,9 +882,49 @@ static RESOLVED_SPECS: LazyLock<HashMap<SgLang, ResolvedRefSpec>> = LazyLock::ne
     // resolve only for compiled-in languages (their files are never walked anyway).
     .filter(|lang| lang.is_enabled())
     .map(SgLang::from)
-    .filter_map(|lang| Some((lang, ResolvedRefSpec::build(lang, ref_spec(lang)?))))
+    .filter_map(|lang| {
+      let data = std::sync::Arc::new(RefSpecData::from(ref_spec(lang)?));
+      Some((lang, ResolvedRefSpec::build(lang, data)))
+    })
     .collect()
 });
+
+/// Every builtin (language name, walk data) pair — the round-trip expressiveness test's
+/// ground truth. Test-only: production dispatch reads `RESOLVED_SPECS`.
+#[cfg(test)]
+pub(crate) fn builtin_specs_for_test() -> Vec<(String, RefSpecData)> {
+  use SupportLang as L;
+  let all = [
+    L::Rust,
+    L::Python,
+    L::Go,
+    L::JavaScript,
+    L::TypeScript,
+    L::Tsx,
+    L::C,
+    L::Cpp,
+    L::Java,
+    L::CSharp,
+    L::Kotlin,
+    L::Swift,
+    L::Ruby,
+    L::Php,
+    L::Dart,
+    L::Scala,
+    L::Lua,
+    L::Bash,
+    L::Elixir,
+    L::Haskell,
+    L::Solidity,
+    L::Nix,
+    L::Hcl,
+  ];
+  all
+    .into_iter()
+    .map(SgLang::from)
+    .filter_map(|lang| Some((lang.to_string(), RefSpecData::from(ref_spec(lang)?))))
+    .collect()
+}
 
 /// The kind-id-resolved extraction spec for `lang`, if it has one.
 pub(crate) fn resolved_ref_spec(lang: SgLang) -> Option<&'static ResolvedRefSpec> {
@@ -864,7 +1039,7 @@ pub(crate) fn extract_references<'t>(
   entities: &[String],
   out: &mut Vec<RawRef<'t>>,
 ) {
-  let spec = resolved.spec;
+  let spec = &*resolved.spec;
   // Generic type-parameter binders: (declaring item's span, binder name). Mentions of a binder
   // inside its declaring span are local bindings, not type uses.
   let mut binders: Vec<(Range<usize>, Cow<'t, str>)> = Vec::new();
@@ -1013,9 +1188,9 @@ const RECEIVER_FIELDS: &[&str] = &["value", "object", "operand", "argument", "ex
 ///   namespace evidence, and resolution must not treat it as such.
 fn classify_call<'t>(
   call: &SgNode<'t>,
-  cspec: &CallSpec,
+  cspec: &CallSpecData,
   callee: &SgNode<'t>,
-  spec: &RefSpec,
+  spec: &RefSpecData,
   entities: &[String],
   from: NodeId,
 ) -> (RefForm, Option<Cow<'t, str>>) {
@@ -1025,7 +1200,7 @@ fn classify_call<'t>(
       let trimmed = trim_cow(node.text(), str::trim);
       (!trimmed.is_empty() && !trimmed.contains(char::is_whitespace)).then_some(trimmed)
     })?;
-    if text.as_ref() == "Self" || spec.self_receivers.contains(&text.as_ref()) {
+    if text.as_ref() == "Self" || spec.self_receivers.iter().any(|s| s.as_str() == text.as_ref()) {
       return owner();
     }
     // Module-relative path heads (`crate::`, `super::`) name no owner we can check.
@@ -1033,13 +1208,13 @@ fn classify_call<'t>(
   };
 
   // Call-node-level fields first (Java/PHP/Ruby put receiver/scope beside the callee).
-  if let Some(scope_field) = cspec.scope_field {
-    if let Some(scope) = call.field(scope_field) {
+  if let Some(scope_field) = &cspec.scope_field {
+    if let Some(scope) = call.field(scope_field.as_str()) {
       return (RefForm::Static, qualifier_of(&scope));
     }
   }
-  if let Some(receiver_field) = cspec.receiver_field {
-    if let Some(receiver) = call.field(receiver_field) {
+  if let Some(receiver_field) = &cspec.receiver_field {
+    if let Some(receiver) = call.field(receiver_field.as_str()) {
       return classify_receiver(&receiver, spec, owner);
     }
     return (RefForm::Bare, None);
@@ -1047,11 +1222,11 @@ fn classify_call<'t>(
 
   let callee_kind_cow = callee.kind();
   let callee_kind = callee_kind_cow.as_ref();
-  if spec.static_callee_kinds.contains(&callee_kind) {
+  if spec.static_callee_kinds.iter().any(|k| k.as_str() == callee_kind) {
     let scope = callee.field("path").or_else(|| callee.field("scope"));
     return (RefForm::Static, scope.as_ref().and_then(qualifier_of));
   }
-  if spec.method_callee_kinds.contains(&callee_kind) {
+  if spec.method_callee_kinds.iter().any(|k| k.as_str() == callee_kind) {
     return match RECEIVER_FIELDS.iter().find_map(|f| callee.field(f)) {
       Some(receiver) => classify_receiver(&receiver, spec, owner),
       None => (RefForm::Method, None),
@@ -1072,11 +1247,11 @@ fn classify_call<'t>(
 /// - anything else (call results, chained accesses) is opaque: plain Method, no hint.
 fn classify_receiver<'t>(
   receiver: &SgNode<'t>,
-  spec: &RefSpec,
+  spec: &RefSpecData,
   owner: impl FnOnce() -> Option<Cow<'t, str>>,
 ) -> (RefForm, Option<Cow<'t, str>>) {
   let text = trim_cow(receiver.text(), str::trim);
-  if spec.self_receivers.contains(&text.as_ref()) || text.as_ref() == "Self" {
+  if spec.self_receivers.iter().any(|s| s.as_str() == text.as_ref()) || text.as_ref() == "Self" {
     return (RefForm::Method, owner());
   }
   let plain_name = !text.is_empty()
@@ -1134,7 +1309,7 @@ const IMPL_TARGET_KINDS: &[&str] = &["type_identifier", "identifier", "constant"
 /// dedup run in the post-pass, once the walk has seen every `type_parameters` declaration.
 fn stage_type_use<'t>(
   node: &SgNode<'t>,
-  spec: &RefSpec,
+  spec: &RefSpecData,
   span_cursor: &mut SpanCursor<'_>,
   pending: &mut Vec<Pending<'t>>,
 ) {
@@ -1159,7 +1334,7 @@ fn stage_type_use<'t>(
   let (Some(name), Some(from)) = (callee_name(node), span_cursor.enclosing(range.start)) else {
     return;
   };
-  if spec.type_placeholders.contains(&name.as_ref()) {
+  if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
     return;
   }
   pending.push(Pending::TypeUse {
@@ -1174,8 +1349,8 @@ fn stage_type_use<'t>(
 /// node itself) is reduced to a name directly when possible, else to its type leaves.
 fn emit_implements<'t>(
   node: &SgNode<'t>,
-  ispec: &ImplSpec,
-  spec: &RefSpec,
+  ispec: &ImplSpecData,
+  spec: &RefSpecData,
   span_cursor: &mut SpanCursor<'_>,
   seen: &mut HashSet<(u64, Cow<'t, str>)>,
   pending: &mut Vec<Pending<'t>>,
@@ -1198,7 +1373,7 @@ fn emit_implements<'t>(
         .collect()
     };
     for name in names {
-      if spec.type_placeholders.contains(&name.as_ref()) {
+      if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
         continue;
       }
       if seen.insert((from.raw(), name.clone())) {
@@ -1215,7 +1390,7 @@ fn emit_implements<'t>(
 }
 
 /// A call node that is its same-kind parent's selected callee is a chain link, not a call site.
-fn is_chain_link(node: &SgNode<'_>, spec: &RefSpec) -> bool {
+fn is_chain_link(node: &SgNode<'_>, spec: &RefSpecData) -> bool {
   let Some(parent) = node.parent() else {
     return false;
   };
@@ -1231,42 +1406,42 @@ fn is_chain_link(node: &SgNode<'_>, spec: &RefSpec) -> bool {
     .is_some_and(|callee| callee.node_id() == node.node_id())
 }
 
-fn select<'t>(node: &SgNode<'t>, sel: &Sel) -> Option<SgNode<'t>> {
+fn select<'t>(node: &SgNode<'t>, sel: &SelData) -> Option<SgNode<'t>> {
   match sel {
-    Sel::Field(name) => node.field(name),
-    Sel::FieldLast(name) => node.field_children(name).last(),
-    Sel::FirstNamedChild => node.children().find(|c| c.is_named()),
-    Sel::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds).into_iter().next(),
+    SelData::Field(name) => node.field(name.as_str()),
+    SelData::FieldLast(name) => node.field_children(name.as_str()).last(),
+    SelData::FirstNamedChild => node.children().find(|c| c.is_named()),
+    SelData::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds).into_iter().next(),
   }
 }
 
 /// All matching targets for an import node (repeated fields / multiple names per statement).
-fn select_all<'t>(node: &SgNode<'t>, sel: &Sel) -> Vec<SgNode<'t>> {
+fn select_all<'t>(node: &SgNode<'t>, sel: &SelData) -> Vec<SgNode<'t>> {
   match sel {
-    Sel::Field(name) => {
-      let all: Vec<_> = node.field_children(name).collect();
+    SelData::Field(name) => {
+      let all: Vec<_> = node.field_children(name.as_str()).collect();
       if all.is_empty() {
-        node.field(name).into_iter().collect()
+        node.field(name.as_str()).into_iter().collect()
       } else {
         all
       }
     }
-    Sel::FieldLast(name) => node.field_children(name).last().into_iter().collect(),
-    Sel::FirstNamedChild => node.children().find(|c| c.is_named()).into_iter().collect(),
-    Sel::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds),
+    SelData::FieldLast(name) => node.field_children(name.as_str()).last().into_iter().collect(),
+    SelData::FirstNamedChild => node.children().find(|c| c.is_named()).into_iter().collect(),
+    SelData::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds),
   }
 }
 
 /// Pre-order descendants whose kind is listed, without descending into matches (so an
 /// `aliased_import` match does not also yield its inner `dotted_name`).
-fn first_descendants_of_kinds<'t>(node: &SgNode<'t>, kinds: &[&str]) -> Vec<SgNode<'t>> {
+fn first_descendants_of_kinds<'t, K: AsRef<str>>(node: &SgNode<'t>, kinds: &[K]) -> Vec<SgNode<'t>> {
   let mut found = Vec::new();
   let mut queue: Vec<SgNode<'t>> = node.children().collect();
   let mut index = 0;
   while index < queue.len() {
     let current = queue[index].clone();
     index += 1;
-    if kinds.contains(&current.kind().as_ref()) {
+    if kinds.iter().any(|k| k.as_ref() == current.kind().as_ref()) {
       found.push(current);
     } else {
       queue.extend(current.children());
@@ -1277,7 +1452,7 @@ fn first_descendants_of_kinds<'t>(node: &SgNode<'t>, kinds: &[&str]) -> Vec<SgNo
 
 fn emit_imports<'t>(
   node: &SgNode<'t>,
-  ispec: &ImportSpec,
+  ispec: &ImportSpecData,
   def_spans: &[(Range<usize>, NodeId)],
   pending: &mut Vec<Pending<'t>>,
 ) {
@@ -1292,7 +1467,7 @@ fn emit_imports<'t>(
       callee_name(&target)
     };
     if let Some(name) = name {
-      let (form, qualifier) = match import_qualifier(node, &target, ispec.qualifier) {
+      let (form, qualifier) = match import_qualifier(node, &target, &ispec.qualifier) {
         Some(q) => (RefForm::Static, Some(q)),
         None => (RefForm::Bare, None),
       };
@@ -1327,18 +1502,18 @@ fn import_alias<'t>(target: &SgNode<'t>) -> Option<Cow<'t, str>> {
 fn import_qualifier<'t>(
   node: &SgNode<'t>,
   target: &SgNode<'t>,
-  source: QualSource,
+  source: &QualSourceData,
 ) -> Option<Cow<'t, str>> {
   match source {
-    QualSource::None => None,
-    QualSource::NodeField(field) => {
-      let module = node.field(field)?;
+    QualSourceData::None => None,
+    QualSourceData::NodeField(field) => {
+      let module = node.field(field.as_str())?;
       let seg = trim_cow(module.text(), |s| {
         s.trim().rsplit('.').next().unwrap_or("").trim()
       });
       (!seg.is_empty() && !seg.contains(char::is_whitespace)).then_some(seg)
     }
-    QualSource::TargetPath => {
+    QualSourceData::TargetPath => {
       // A scoped path carries its own `name`; a fieldless wrapper (`use_as_clause`) holds the
       // real path in its `path` field instead — unwrap once, then take that path's prefix.
       let path_node = if target.field("name").is_some() {
@@ -1792,12 +1967,12 @@ mod tests {
     entities: &[String],
     out: &mut Vec<RawRef<'t>>,
   ) {
-    let spec = resolved.spec;
+    let spec = &*resolved.spec;
     let mut binders: Vec<(Range<usize>, Cow<'t, str>)> = Vec::new();
     let mut stack = vec![root.clone()];
     while let Some(node) = stack.pop() {
       push_children(&mut stack, &node);
-      if spec.type_params.contains(&node.kind().as_ref()) {
+      if spec.type_params.iter().any(|t| t.as_str() == node.kind().as_ref()) {
         collect_binders_in(&node, &mut binders);
       }
     }
@@ -1822,7 +1997,7 @@ mod tests {
               callee_name(&target)
             };
             if let Some(name) = name {
-              let (form, qualifier) = match import_qualifier(&node, &target, ispec.qualifier) {
+              let (form, qualifier) = match import_qualifier(&node, &target, &ispec.qualifier) {
                 Some(q) => (RefForm::Static, Some(q)),
                 None => (RefForm::Bare, None),
               };
@@ -1844,7 +2019,7 @@ mod tests {
         continue;
       }
 
-      if spec.types.contains(&kind) {
+      if spec.types.iter().any(|t| t.as_str() == kind) {
         let Some(parent) = node.parent() else {
           continue;
         };
@@ -1872,7 +2047,7 @@ mod tests {
         else {
           continue;
         };
-        if spec.type_placeholders.contains(&name.as_ref()) {
+        if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
           continue;
         }
         if binders
@@ -1912,7 +2087,7 @@ mod tests {
               .collect()
           };
           for name in names {
-            if spec.type_placeholders.contains(&name.as_ref()) {
+            if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
               continue;
             }
             if seen.insert((from.raw(), name.clone(), 1)) {

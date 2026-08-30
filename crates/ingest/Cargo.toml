@@ -15,6 +15,8 @@ vorpal-kg.workspace = true
 vorpal-outline.workspace = true
 vorpal-core.workspace = true
 vorpal-lang-registry.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
 vorpal-language.workspace = true
 vorpal-resolve.workspace = true
 

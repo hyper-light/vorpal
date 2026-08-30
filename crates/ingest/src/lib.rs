@@ -14,6 +14,7 @@
 
 mod manifest;
 mod outline_extractor;
+pub mod refspec_config;
 mod pack;
 mod pipeline;
 mod product;
@@ -31,16 +32,46 @@ pub use outline_extractor::{OutlineExtractor, RuleSource};
 pub struct ExtractionEnv {
   /// Extra outline-rule documents, each labeled by a stable machine-independent origin.
   pub outline_sources: Vec<RuleSource>,
+  /// Serialized reference-extraction specs (F-M4), same labeling contract. Each document names
+  /// its language; kinds resolve under the strict policy (typos fail registration, loudly).
+  pub ref_spec_sources: Vec<RuleSource>,
+  /// Extraction canaries for dynamic languages — the same trust gate builtin languages get
+  /// from the compiled-in canary table. A dynamic language extracting without one is reported
+  /// as unverified on every build, never silently trusted.
+  pub canaries: Vec<DynamicCanary>,
+}
+
+/// One dynamic language's extraction canary: `source` is extracted as `path` and must yield at
+/// least `min_items` outline items and `min_refs` references.
+#[derive(Debug, Clone)]
+pub struct DynamicCanary {
+  pub lang: String,
+  pub path: String,
+  pub source: String,
+  pub min_items: usize,
+  pub min_refs: usize,
 }
 
 impl ExtractionEnv {
   /// The extractor this environment describes. Languages named by the sources must already be
   /// registered — dlopen is the caller's job (a one-shot at startup), never extraction's.
   pub fn extractor(&self) -> Result<OutlineExtractor, String> {
-    OutlineExtractor::with_sources(&self.outline_sources)
+    OutlineExtractor::with_env(&self.outline_sources, &self.ref_spec_sources)
+  }
+
+  /// Dynamic languages this environment extracts but does not canary-verify — computed against
+  /// what the extractor actually compiled, sorted, deduped. Empty for the default environment.
+  pub fn unverified_langs(&self, extractor: &OutlineExtractor) -> Vec<String> {
+    let verified: std::collections::HashSet<&str> =
+      self.canaries.iter().map(|c| c.lang.as_str()).collect();
+    extractor
+      .dynamic_langs()
+      .into_iter()
+      .filter(|lang| !verified.contains(lang.as_str()))
+      .collect()
   }
 }
-pub use selfcheck::{verify_default_extraction, verify_extraction};
+pub use selfcheck::{verify_default_extraction, verify_env_extraction, verify_extraction};
 pub use pack::{PackMsg, PackReader, PackWriter};
 pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,
