@@ -11,6 +11,7 @@
 //! as deterministic as the serial loop was.
 
 pub mod annfiles;
+pub mod artifact;
 pub mod gendiff;
 pub mod impact;
 pub mod autowarm;
@@ -637,7 +638,7 @@ pub fn build_index_env(
 /// (sorted) order. Lazy sidecars added after commit (the ANN tier) are deliberately excluded:
 /// they are stamp-validated against the node segment, deterministic given the generation, and
 /// must not change its identity.
-const GENERATION_ARTIFACTS: [&str; 8] = [
+pub(crate) const GENERATION_ARTIFACTS: [&str; 8] = [
   "evidence.bin",
   "graph.bin",
   "manifest.bin",
@@ -664,35 +665,16 @@ const GENERATION_ARTIFACTS: [&str; 8] = [
 /// *new* opens in a collected generation fail, as a clean retryable error. A legacy flat root
 /// that served as the prior is swept the same way: its artifacts are superseded by the
 /// generation just committed from them.
-fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<()> {
-  // Sweep staging scratch that is not part of the named artifact set (spill files, tmp names)
-  // so the generation holds exactly its artifacts.
-  for entry in fs::read_dir(&staging)?.flatten() {
-    let name = entry.file_name();
-    let keep = GENERATION_ARTIFACTS
-      .iter()
-      .any(|artifact| name.as_os_str() == *artifact);
-    if !keep {
-      let path = entry.path();
-      let _ = if path.is_dir() {
-        fs::remove_dir_all(&path)
-      } else {
-        fs::remove_file(&path)
-      };
-    }
-  }
-  // Content id over every artifact in fixed order. Chunked-parallel: each artifact is read
-  // and hashed in 8 MiB chunks fanned across the pool, and the id folds the per-chunk
-  // digests (with the artifact name and length) in deterministic order. The previous
-  // single-stream hash serialized ~2 GB of read+hash at kernel scale into one thread at the
-  // very end of the build. The id remains a pure function of the artifact bytes — the
-  // folding shape is an internal detail of this binary version (ids are content addresses,
-  // not a cross-version interchange format; see docs/INDEX_FORMAT.md).
-  vorpal_kg::phase_stamp("commit: content-id hash start");
+/// The content id of a generation directory: the deterministic fold over every artifact (in
+/// fixed order) that names `gen/<id>` dirs. Pure function of the artifact bytes; the folding
+/// shape is an internal detail of this binary version (ids are content addresses, not a
+/// cross-version interchange format — see docs on the shareable-artifact import for how that
+/// is handled honestly).
+pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
   const HASH_CHUNK: u64 = 8 << 20;
   let mut hasher = xxhash_rust::xxh3::Xxh3::new();
   for artifact in GENERATION_ARTIFACTS {
-    let path = staging.join(artifact);
+    let path = dir.join(artifact);
     let Ok(file) = fs::File::open(&path) else {
       continue; // an artifact a smaller index legitimately lacks still yields a stable id
     };
@@ -733,7 +715,35 @@ fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<
       hasher.update(&digest.to_le_bytes());
     }
   }
-  let id = format!("{:032x}", hasher.digest128());
+  Ok(format!("{:032x}", hasher.digest128()))
+}
+
+pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<String> {
+  // Sweep staging scratch that is not part of the named artifact set (spill files, tmp names)
+  // so the generation holds exactly its artifacts.
+  for entry in fs::read_dir(&staging)?.flatten() {
+    let name = entry.file_name();
+    let keep = GENERATION_ARTIFACTS
+      .iter()
+      .any(|artifact| name.as_os_str() == *artifact);
+    if !keep {
+      let path = entry.path();
+      let _ = if path.is_dir() {
+        fs::remove_dir_all(&path)
+      } else {
+        fs::remove_file(&path)
+      };
+    }
+  }
+  // Content id over every artifact in fixed order. Chunked-parallel: each artifact is read
+  // and hashed in 8 MiB chunks fanned across the pool, and the id folds the per-chunk
+  // digests (with the artifact name and length) in deterministic order. The previous
+  // single-stream hash serialized ~2 GB of read+hash at kernel scale into one thread at the
+  // very end of the build. The id remains a pure function of the artifact bytes — the
+  // folding shape is an internal detail of this binary version (ids are content addresses,
+  // not a cross-version interchange format; see docs/INDEX_FORMAT.md).
+  vorpal_kg::phase_stamp("commit: content-id hash start");
+  let id = generation_content_id(&staging)?;
   vorpal_kg::phase_stamp("commit: content-id hash done");
   let final_dir = root.join("gen").join(&id);
   // Dedup guard: an existing same-id generation is byte-identical *by construction*, but only
@@ -826,7 +836,7 @@ fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<
       let _ = fs::remove_file(root.join(scratch));
     }
   }
-  Ok(())
+  Ok(id)
 }
 
 /// Build the semantic tier over every KG node: each definition embeds its name (double-weighted),

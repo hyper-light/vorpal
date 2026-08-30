@@ -35,6 +35,8 @@ use vorpal_index::search_index;
 const USAGE: &str = "usage:
   vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F]
                                                     build + persist a knowledge graph
+  vorpal-index export       <index-root> <file.vidx>  pack the live generation into one shareable artifact
+  vorpal-index import       <file.vidx> <index-root>  verify + install an exported generation (atomic CURRENT swap)
   vorpal-index health       <index-dir>             per-file parse damage: byte ratios, error spans, affected entities
   vorpal-index schema       <index-dir>             kinds, relations, grades, tier state — with counts
   vorpal-index dead         <index-dir> [kind]      definitions with no semantic in-edges (suppression-honest)
@@ -148,6 +150,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             report.excluded_files
           );
         }
+      }
+      Ok(())
+    }
+    ["export", index, out] => {
+      let report = vorpal_index::artifact::export_generation(Path::new(index), Path::new(out))
+        .map_err(std::io::Error::other)?;
+      println!(
+        "exported generation {} ({} artifacts, {} bytes) → {}",
+        report.content_id, report.artifacts, report.bytes, out
+      );
+      Ok(())
+    }
+    ["import", vidx, index] => {
+      let report = vorpal_index::artifact::import_generation(Path::new(vidx), Path::new(index))
+        .map_err(std::io::Error::other)?;
+      println!(
+        "imported generation {} into {} (exporter recorded {})",
+        report.installed_id, index, report.exported_id
+      );
+      if let Some(note) = report.fold_note {
+        println!("note: {note}");
       }
       Ok(())
     }

@@ -49,6 +49,8 @@ regex = { version = "1.10.4" }
 serde = { version = "1.0.200", features = ["derive"] }
 serde_regex = "1.2.0"
 serde_yaml = "0.9.33"
+tar = "0.4.44"
+zstd = "0.13.3"
 tree-sitter = { version = "0.26.3" }
 thiserror = "2.0.0"
 schemars = "1.0.0"
