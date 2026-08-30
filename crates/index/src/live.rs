@@ -170,12 +170,12 @@ impl LiveOverlay {
   pub fn apply_and_link(&mut self, changed: &HashSet<PathBuf>) -> Result<Kg, String> {
     vorpal_kg::phase_stamp("overlay: apply start");
     self.absorb(changed)?;
-    let (mut kg, _stats) = self
+    let (kg, _stats) = self
       .index
       .link_for_serving(&self.interner, &Resolver::new())
       .map_err(|err| format!("overlay: link failed: {err}"))?;
-    // Served from RAM: name lookups need the in-memory index (see Kg::build_names_index).
-    kg.build_names_index();
+    // The canonical seal embeds the in-memory name index (built in parallel with the
+    // segment), so the served graph is lookup-ready as returned.
     vorpal_kg::phase_stamp("overlay: link done");
     Ok(kg)
   }

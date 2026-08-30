@@ -576,7 +576,7 @@ impl KgWriter {
   pub fn seal_canonical_with(
     &self,
     blocks: &[FileBlock],
-    resolution: impl Iterator<Item = (u32, u32, EdgeType)>,
+    resolution: impl Iterator<Item = (u32, u32, EdgeType)> + Send,
   ) -> (Kg, Vec<u32>) {
     crate::phase_stamp("seal-canonical: gather");
 
@@ -669,55 +669,94 @@ impl KgWriter {
     );
 
     let n = total_rows as u32;
-    let nodes = {
-      let mut builder = SegmentBuilder::new(0);
-      builder.add_u8("kind", &kind).unwrap();
-      builder.add_u32("name_off", &name_off).unwrap();
-      builder.add_u32("name_len", &name_len).unwrap();
-      builder.add_u32("path_off", &path_off).unwrap();
-      builder.add_u32("path_len", &path_len).unwrap();
-      builder.add_u32("sig_off", &sig_off).unwrap();
-      builder.add_u32("sig_len", &sig_len).unwrap();
-      builder.add_u64("content_hash", &content_hash).unwrap();
-      builder.add_u64("eid_lo", &eid_lo).unwrap();
-      builder.add_u64("eid_hi", &eid_hi).unwrap();
-      builder.add_u8("flags", &flags).unwrap();
-      builder.add_u32("span_start", &span_start).unwrap();
-      builder.add_u32("span_end", &span_end).unwrap();
-      Segment::open_owned(builder.build().unwrap()).unwrap()
-    };
-
-    crate::phase_stamp("seal-canonical: edges");
-    // Containment edges per block (scratch order = per-file, path-major), then this link's
-    // resolution edges. Dead-endpoint containment edges cannot exist (blocks only cover
-    // alive rows and containment never crosses files); a dead endpoint in a resolution edge
-    // is an upstream logic error — checked in debug, dropped defensively in release.
-    let mut new_edges = EdgeLog::new();
-    for block in blocks {
-      for i in block.edges.start as usize..block.edges.end as usize {
-        let (src, dst, etype) = self.edges.triple(i);
-        let (s, d) = (lut[src as usize], lut[dst as usize]);
-        debug_assert!(s != u32::MAX && d != u32::MAX, "containment edge touches a dead row");
-        if s != u32::MAX && d != u32::MAX {
-          new_edges.push(s, d, etype);
+    crate::phase_stamp("seal-canonical: tracks");
+    // Three independent tracks fan out: the node segment (zone maps + whole-segment digest),
+    // the in-memory name index (hash + sort over the gathered name column — the very pairs
+    // `build_names_index` would recompute from the sealed segment afterwards), and the graph
+    // (edge remap through the LUT + CSR/CSC compaction). Serially these were four ~25ms
+    // blocks on the serve path; the critical path is now the longest single track.
+    let ((nodes, names), graph) = rayon::join(
+      || {
+        rayon::join(
+          || {
+            let mut builder = SegmentBuilder::new(0);
+            builder.add_u8("kind", &kind).unwrap();
+            builder.add_u32("name_off", &name_off).unwrap();
+            builder.add_u32("name_len", &name_len).unwrap();
+            builder.add_u32("path_off", &path_off).unwrap();
+            builder.add_u32("path_len", &path_len).unwrap();
+            builder.add_u32("sig_off", &sig_off).unwrap();
+            builder.add_u32("sig_len", &sig_len).unwrap();
+            builder.add_u64("content_hash", &content_hash).unwrap();
+            builder.add_u64("eid_lo", &eid_lo).unwrap();
+            builder.add_u64("eid_hi", &eid_hi).unwrap();
+            builder.add_u8("flags", &flags).unwrap();
+            builder.add_u32("span_start", &span_start).unwrap();
+            builder.add_u32("span_end", &span_end).unwrap();
+            Segment::open_owned(builder.build().unwrap()).unwrap()
+          },
+          || {
+            use rayon::prelude::*;
+            // Same pairs, same order as Kg::build_names_index over the sealed graph: every
+            // row's (xxh3(name), id), sorted by (hash, id).
+            let mut pairs: Vec<(u64, u64)> = (0..total_rows as u64)
+              .into_par_iter()
+              .filter_map(|i| {
+                let off = name_off[i as usize] as usize;
+                let len = name_len[i as usize] as usize;
+                let name = std::str::from_utf8(new_heap.get(off..off + len)?).ok()?;
+                Some((xxhash_rust::xxh3::xxh3_64(name.as_bytes()), i))
+              })
+              .collect();
+            pairs.par_sort_unstable();
+            let hashes: Vec<u64> = pairs.iter().map(|&(h, _)| h).collect();
+            let ids: Vec<u64> = pairs.iter().map(|&(_, i)| i).collect();
+            (hashes, ids)
+          },
+        )
+      },
+      || {
+        // Containment edges per block (scratch order = per-file, path-major), then this
+        // link's resolution edges. Dead-endpoint containment edges cannot exist (blocks
+        // only cover alive rows and containment never crosses files); a dead endpoint in a
+        // resolution edge is an upstream logic error — checked in debug, dropped
+        // defensively in release.
+        let mut new_edges = EdgeLog::new();
+        for block in blocks {
+          for i in block.edges.start as usize..block.edges.end as usize {
+            let (src, dst, etype) = self.edges.triple(i);
+            let (s, d) = (lut[src as usize], lut[dst as usize]);
+            debug_assert!(
+              s != u32::MAX && d != u32::MAX,
+              "containment edge touches a dead row"
+            );
+            if s != u32::MAX && d != u32::MAX {
+              new_edges.push(s, d, etype);
+            }
+          }
         }
-      }
-    }
-    for (src, dst, etype) in resolution {
-      let (s, d) = (lut[src as usize], lut[dst as usize]);
-      debug_assert!(s != u32::MAX && d != u32::MAX, "resolution edge touches a dead row");
-      if s != u32::MAX && d != u32::MAX {
-        new_edges.push(s, d, etype);
-      }
-    }
-    crate::phase_stamp("seal-canonical: compact");
-    let graph = Graph::compact(n, &new_edges);
-    drop(new_edges);
+        for (src, dst, etype) in resolution {
+          let (s, d) = (lut[src as usize], lut[dst as usize]);
+          debug_assert!(
+            s != u32::MAX && d != u32::MAX,
+            "resolution edge touches a dead row"
+          );
+          if s != u32::MAX && d != u32::MAX {
+            new_edges.push(s, d, etype);
+          }
+        }
+        Graph::compact(n, &new_edges)
+      },
+    );
+    crate::phase_stamp("seal-canonical: assemble kg");
 
     let mut directory = SegmentDirectory::new();
     directory.insert(0, n as u64, 0);
-    let kg = Kg::new(nodes, new_heap, graph, directory)
+    let mut kg = Kg::new(nodes, new_heap, graph, directory)
       .expect("sealed segment carries every column the builder just wrote");
+    let (hashes, ids) = names;
+    kg.set_names_index(hashes, ids);
+    crate::phase_stamp("seal-canonical: done");
     (kg, lut)
   }
 }

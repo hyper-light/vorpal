@@ -818,6 +818,17 @@ impl Kg {
   /// instead of a full node scan. Bytes are a pure function of the node table (sorted,
   /// fixed-width): bit-identical across rebuilds. Also used to backfill dirs written before
   /// the sidecar existed.
+  /// Install a prebuilt in-memory name index (sorted `(xxh3(name), id)` pairs split into
+  /// columns) — the canonical seal computes it in parallel with the segment build instead
+  /// of paying a post-assembly scan.
+  pub(crate) fn set_names_index(&mut self, hashes: Vec<u64>, ids: Vec<u64>) {
+    debug_assert_eq!(hashes.len(), ids.len());
+    self.names = Some((
+      vorpal_mem::PodColumn::from_vec(hashes),
+      vorpal_mem::PodColumn::from_vec(ids),
+    ));
+  }
+
   /// Build the name→id index **in memory** — for a daemon serving a freshly sealed graph
   /// that never touched disk. Same pairs, same `(hash, id)` order as the persisted
   /// `names.idx`, so lookups behave identically to a loaded generation; without it every
@@ -825,6 +836,7 @@ impl Kg {
   /// EVERY named query).
   pub fn build_names_index(&mut self) {
     use rayon::prelude::*;
+    crate::phase_stamp("names index: start");
     let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
       .into_par_iter()
       .filter_map(|i| {
@@ -840,6 +852,7 @@ impl Kg {
       vorpal_mem::PodColumn::from_vec(hashes),
       vorpal_mem::PodColumn::from_vec(ids),
     ));
+    crate::phase_stamp("names index: done");
   }
 
   pub fn write_names_index(&self, dir: &Path) -> io::Result<()> {
