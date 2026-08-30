@@ -104,6 +104,11 @@ pub enum CmpOp {
   StartsWith,
   EndsWith,
   Contains,
+  /// Ordered comparisons apply to integer properties (`id`, `in_degree`, `out_degree`).
+  Lt,
+  Le,
+  Gt,
+  Ge,
 }
 
 /// The RETURN clause: plain projections, or a count — optionally grouped by one key

@@ -368,6 +368,24 @@ impl Parser {
         self.at += 1;
         (CmpOp::Ne, self.value()?)
       }
+      Some(Tok::Lt) => {
+        self.at += 1;
+        if self.peek() == Some(&Tok::Eq) {
+          self.at += 1;
+          (CmpOp::Le, self.value()?)
+        } else {
+          (CmpOp::Lt, self.value()?)
+        }
+      }
+      Some(Tok::Gt) => {
+        self.at += 1;
+        if self.peek() == Some(&Tok::Eq) {
+          self.at += 1;
+          (CmpOp::Ge, self.value()?)
+        } else {
+          (CmpOp::Gt, self.value()?)
+        }
+      }
       Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("STARTS") => {
         self.at += 1;
         self.expect_kw("WITH")?;

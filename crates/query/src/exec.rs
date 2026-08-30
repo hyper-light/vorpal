@@ -49,7 +49,9 @@ fn min_confidence_for_grade(grade: Option<&str>) -> Result<u8, QueryError> {
   })
 }
 
-const PROPS: &[&str] = &["id", "eid", "name", "path", "kind", "exported", "signature"];
+const PROPS: &[&str] = &[
+  "id", "eid", "name", "path", "kind", "exported", "signature", "in_degree", "out_degree",
+];
 
 fn check_prop(prop: &str) -> Result<(), QueryError> {
   if PROPS.contains(&prop) {
@@ -62,12 +64,66 @@ fn check_prop(prop: &str) -> Result<(), QueryError> {
   }
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum PropType {
+  Int,
+  Text,
+  Bool,
+}
+
+fn prop_type(prop: &str) -> PropType {
+  match prop {
+    "id" | "in_degree" | "out_degree" => PropType::Int,
+    "exported" => PropType::Bool,
+    _ => PropType::Text,
+  }
+}
+
+/// Plan-time predicate typing: ordered comparisons need integer properties and values;
+/// the substring operators need text on both sides — mistakes fail before any scan.
+fn check_predicate_types(prop: &str, op: CmpOp, value: &PropValue) -> Result<(), QueryError> {
+  let ty = prop_type(prop);
+  let value_ty = match value {
+    PropValue::Int(_) => PropType::Int,
+    PropValue::Text(_) => PropType::Text,
+    PropValue::Bool(_) => PropType::Bool,
+  };
+  match op {
+    CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+      if ty != PropType::Int || value_ty != PropType::Int {
+        return Err(QueryError::Plan(format!(
+          "ordered comparison on '{prop}' — <, <=, >, >= apply to integer properties \
+           (id, in_degree, out_degree) with integer values"
+        )));
+      }
+    }
+    CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => {
+      if ty != PropType::Text || value_ty != PropType::Text {
+        return Err(QueryError::Plan(format!(
+          "substring comparison on '{prop}' — STARTS/ENDS WITH and CONTAINS apply to text \
+           properties with string values"
+        )));
+      }
+    }
+    CmpOp::Eq | CmpOp::Ne => {
+      if ty != value_ty {
+        return Err(QueryError::Plan(format!(
+          "type mismatch: property '{prop}' does not compare to that value's type"
+        )));
+      }
+    }
+  }
+  Ok(())
+}
+
 fn prop_cell(kg: &Kg, id: u32, prop: &str) -> Cell {
   let Some(view) = kg.node(NodeId::new(id as u64)) else {
     return Cell::Null;
   };
   match prop {
     "id" => Cell::Int(id as u64),
+    "in_degree" => Cell::Int(kg.in_degree(NodeId::new(id as u64)) as u64),
+    "out_degree" => Cell::Int(kg.out_degree(NodeId::new(id as u64)) as u64),
     "eid" => match view.external_id {
       Some(eid) => Cell::Text(format!("{eid:032x}")),
       None => Cell::Null,
@@ -240,6 +296,10 @@ impl BoundPredicate {
       (CmpOp::StartsWith, PropValue::Text(want), Cell::Text(have)) => have.starts_with(want),
       (CmpOp::EndsWith, PropValue::Text(want), Cell::Text(have)) => have.ends_with(want),
       (CmpOp::Contains, PropValue::Text(want), Cell::Text(have)) => have.contains(want),
+      (CmpOp::Lt, PropValue::Int(want), Cell::Int(have)) => have < want,
+      (CmpOp::Le, PropValue::Int(want), Cell::Int(have)) => have <= want,
+      (CmpOp::Gt, PropValue::Int(want), Cell::Int(have)) => have > want,
+      (CmpOp::Ge, PropValue::Int(want), Cell::Int(have)) => have >= want,
       _ => false,
     }
   }
@@ -319,6 +379,7 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
   let mut predicates = Vec::new();
   for pred in &query.predicates {
     check_prop(&pred.target.prop)?;
+    check_predicate_types(&pred.target.prop, pred.op, &pred.value)?;
     predicates.push(BoundPredicate {
       side: side_of(&pred.target.var)?,
       prop: pred.target.prop.clone(),
@@ -439,10 +500,21 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
 
   match (&rel, &right) {
     (None, _) => {
-      for id in left.candidates(kg) {
-        if passes_where(kg, id, NO_NODE) {
-          emit(pure_count, &mut count_only, &mut bindings, id, NO_NODE)?;
-        }
+      // WHERE evaluates in parallel over the candidate set (a full-scan predicate like
+      // `in_degree >= 500` touches every node's view — serial, that was ~1s at kernel
+      // scale; the rayon filter preserves encounter order, so rows stay deterministic).
+      let candidates = left.candidates(kg);
+      let survivors: Vec<u32> = if predicates.is_empty() {
+        candidates
+      } else {
+        use rayon::prelude::*;
+        candidates
+          .into_par_iter()
+          .filter(|&id| passes_where(kg, id, NO_NODE))
+          .collect()
+      };
+      for id in survivors {
+        emit(pure_count, &mut count_only, &mut bindings, id, NO_NODE)?;
       }
     }
     (Some((bases, direction, range, min_conf)), Some(right_plan)) => {

@@ -273,3 +273,53 @@ fn parser_fuzz_never_panics() {
     let _ = parse(&text);
   }
 }
+
+#[test]
+fn degree_properties_and_ordered_comparisons() {
+  let kg = fixture();
+
+  // Hub finder: in_degree counts ALL incoming edges (parse: call + data-flow from main;
+  // deserialize: two calls).
+  let r = run(
+    &kg,
+    "MATCH (f:Function) WHERE f.in_degree >= 2 RETURN f.name, f.in_degree ORDER BY f.name",
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![
+      vec![Cell::Text("deserialize".into()), Cell::Int(2)],
+      vec![Cell::Text("parse".into()), Cell::Int(2)],
+    ]
+  );
+
+  let r = run(&kg, "MATCH (f:Function) WHERE f.out_degree = 0 RETURN f.name").unwrap();
+  assert_eq!(texts(&r.rows, 0), ["deserialize"]);
+
+  let r = run(
+    &kg,
+    "MATCH (f) WHERE f.in_degree < 1 AND f.kind <> \"class\" RETURN f.name ORDER BY f.name",
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["helper", "main"]);
+
+  // Ordered comparisons are typed at plan time.
+  let plan_err = |text: &str| match run(&kg, text) {
+    Err(QueryError::Plan(message)) => message,
+    other => panic!("expected a plan error for {text}, got {other:?}"),
+  };
+  assert!(plan_err("MATCH (f) WHERE f.name > 3 RETURN f.name").contains("ordered comparison"));
+  assert!(
+    plan_err(r#"MATCH (f) WHERE f.in_degree CONTAINS "x" RETURN f.name"#)
+      .contains("substring comparison")
+  );
+  assert!(plan_err(r#"MATCH (f) WHERE f.exported = "yes" RETURN f.name"#).contains("type mismatch"));
+
+  // Degrees project and order like any other column.
+  let r = run(
+    &kg,
+    "MATCH (f:Function) RETURN f.name, f.out_degree ORDER BY f.out_degree DESC, f.name LIMIT 2",
+  )
+  .unwrap();
+  assert_eq!(r.rows[0][0], Cell::Text("main".into())); // calls + data_flows out
+}
