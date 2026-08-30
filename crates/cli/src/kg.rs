@@ -280,6 +280,33 @@ pub struct McpArg {
   /// first query after a change instead of as soon as the tree goes quiet.
   #[clap(long)]
   no_watch_rebuild: bool,
+  /// Serve every enrolled project from this one daemon (registry: `vorpal mcp allow`).
+  #[clap(long)]
+  projects: bool,
+  #[clap(subcommand)]
+  action: Option<McpAction>,
+}
+
+/// Registry management — the HUMAN-ONLY enrollment surface. These commands exist exactly so
+/// that the MCP protocol never has to (and never can) touch the registry: a confirmation
+/// delivered through MCP would be answered by the same agent that may have been influenced.
+#[derive(clap::Subcommand)]
+pub enum McpAction {
+  /// Enroll a source root so `vorpal mcp --projects` may serve it.
+  Allow {
+    /// Source directory to enroll.
+    path: PathBuf,
+    /// Project name (default: the directory name).
+    #[clap(long)]
+    name: Option<String>,
+    /// Index root (default: `<path>/.vorpal/index`).
+    #[clap(long)]
+    index: Option<PathBuf>,
+  },
+  /// Remove an enrolled project by name.
+  Deny { name: String },
+  /// List enrolled projects.
+  Projects,
 }
 
 fn index_dir(explicit: Option<PathBuf>) -> PathBuf {
@@ -853,13 +880,50 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
 }
 
 pub fn run_mcp(arg: McpArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
+  if let Some(action) = arg.action {
+    return run_mcp_action(action);
+  }
   let profile = vorpal_mcp::Profile::parse(&arg.profile)
     .ok_or_else(|| anyhow!("--profile must be full, analysis, or scout"))?;
+  if arg.projects {
+    vorpal_mcp::serve_stdio_projects(profile)?;
+    return Ok(ExitCode::SUCCESS);
+  }
   // Custom languages were registered (the one-shot dlopen) at CLI setup, before serving
   // begins; the daemon itself can never load code. Its rebuilds run under the same
   // extraction environment `vorpal index` uses.
   let env = extraction_env_from_project(project.ok().as_ref())?;
   vorpal_mcp::serve_stdio_opts(index_dir(arg.index), profile, env, !arg.no_watch_rebuild)?;
+  Ok(ExitCode::SUCCESS)
+}
+
+fn run_mcp_action(action: McpAction) -> Result<ExitCode> {
+  match action {
+    McpAction::Allow { path, name, index } => {
+      let (name, entry, file) =
+        vorpal_mcp::registry::enroll(&path, name.as_deref(), index.as_deref())
+          .map_err(|err| anyhow!(err))?;
+      println!(
+        "enrolled '{name}': src={} index={} ({})",
+        entry.src.display(),
+        entry.index.display(),
+        file.display()
+      );
+    }
+    McpAction::Deny { name } => {
+      let file = vorpal_mcp::registry::remove(&name).map_err(|err| anyhow!(err))?;
+      println!("removed '{name}' ({})", file.display());
+    }
+    McpAction::Projects => {
+      let projects = vorpal_mcp::registry::load().map_err(|err| anyhow!(err))?;
+      if projects.is_empty() {
+        println!("no projects enrolled (enroll one: `vorpal mcp allow <path>`)");
+      }
+      for (name, entry) in projects {
+        println!("{name}  src={}  index={}", entry.src.display(), entry.index.display());
+      }
+    }
+  }
   Ok(ExitCode::SUCCESS)
 }
 

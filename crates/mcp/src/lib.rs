@@ -10,6 +10,17 @@
 //! is implemented directly on `serde_json` — small, dependency-light, and swappable for an SDK
 //! transport later without touching the tool logic.
 
+pub mod registry;
+mod router;
+
+/// Test-only handle: the multi-project router constructed from the CURRENT registry file
+/// (which tests point at a scratch path via `VORPAL_PROJECTS_FILE`).
+pub type MultiServerForTest = router::MultiServer;
+
+pub fn multi_server_for_test() -> MultiServerForTest {
+  let projects = registry::load().unwrap_or_default();
+  router::MultiServer::new(projects, Profile::Full)
+}
 mod server;
 mod supervised;
 mod tools;
@@ -35,6 +46,34 @@ pub fn serve_stdio_profiled(index_dir: PathBuf, profile: Profile) -> io::Result<
 /// [`serve_stdio_profiled`] under an explicit extraction environment (F-M6): the daemon's
 /// rebuilds see the same custom-language rules/specs/canaries the CLI build would. Any dlopen
 /// happened in the CALLER at startup; the serving loop can never load code.
+/// Serve every enrolled project from one daemon (D4): tools gain a `project` selector, a
+/// `list_projects` tool lists the registry, and nothing on this surface can enroll anything
+/// (human-only, via the CLI). Projects mode serves the builtin grammar set (per-project
+/// custom languages wait on registration scoping; run a single-project daemon for those).
+pub fn serve_stdio_projects(profile: Profile) -> io::Result<()> {
+  let projects = registry::load().map_err(io::Error::other)?;
+  if projects.is_empty() {
+    return Err(io::Error::other(
+      "no projects enrolled — a person can enroll one with `vorpal mcp allow <path>`",
+    ));
+  }
+  let mut server = router::MultiServer::new(projects, profile);
+  let stdin = io::stdin();
+  let mut stdout = io::stdout().lock();
+  for line in stdin.lock().lines() {
+    let line = line?;
+    if line.trim().is_empty() {
+      continue;
+    }
+    if let Some(response) = server.handle_line(&line) {
+      stdout.write_all(response.as_bytes())?;
+      stdout.write_all(b"\n")?;
+      stdout.flush()?;
+    }
+  }
+  Ok(())
+}
+
 pub fn serve_stdio_env(
   index_dir: PathBuf,
   profile: Profile,

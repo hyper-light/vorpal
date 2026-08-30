@@ -240,7 +240,7 @@ impl Server {
   /// **generation** content id the answer came from (`null` before any graph is loaded, e.g.
   /// pure-parse tools like `ast_dump`), so ids and spans are attributable to exactly one
   /// index state; failures state a **stable machine-readable code** alongside the message.
-  fn tools_call(&mut self, params: &Value) -> Value {
+  pub(crate) fn tools_call(&mut self, params: &Value) -> Value {
     let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params
       .get("arguments")
@@ -965,7 +965,7 @@ impl Server {
   }
 }
 
-fn initialize(params: &Value) -> Value {
+pub(crate) fn initialize(params: &Value) -> Value {
   let requested = params
     .get("protocolVersion")
     .and_then(Value::as_str)
@@ -982,7 +982,7 @@ fn initialize(params: &Value) -> Value {
   })
 }
 
-fn tools_list(profile: Profile) -> Value {
+pub(crate) fn tools_list(profile: Profile) -> Value {
   let name_only = json!({
     "name": {"type": "string", "description": "Exact symbol name"},
     "path": {"type": "string", "description": "Refine: definition file path must end with this suffix"},
@@ -1438,6 +1438,6 @@ fn watch_root(index_dir: &Path) -> Option<PathBuf> {
 }
 
 
-fn error_response(id: Value, code: i64, message: &str) -> String {
+pub(crate) fn error_response(id: Value, code: i64, message: &str) -> String {
   json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
 }

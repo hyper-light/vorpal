@@ -4110,6 +4110,7 @@ dependencies = [
  "notify",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tikv-jemallocator",
  "vorpal-config",
  "vorpal-core",
