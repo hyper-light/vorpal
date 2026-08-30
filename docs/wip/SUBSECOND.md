@@ -73,10 +73,13 @@ prefix sums (the `SymbolTable::from_shards` counting-scatter pattern, already in
   `ExtractScratch`), committers reduce to sequence-ordered `absorb`. File-scoped canonical
   index is already the semantics (`forget_identity_scope` per file). Drop the worker-side
   `validate_product` (decode *is* validation) — decode moves to the worker.
-- **A5. Prefix-sum scatter absorb**: shards report (node_count, heap_len, edge_count,
-  ref_count); exclusive prefix sums computed in shard order; shards scatter in parallel at
-  known offsets — positioned pwrites for the streamed heap and the fixed 34-byte spill
-  records. Preserves the rolling-absorb memory property (scatter-and-drop as bases arrive).
+- **A5. Prefix-sum scatter absorb — TRIED 2026-08-29, NO BENEFIT, REVERTED.** Implemented in
+  full (absorb_batch with parallel disjoint-region scatter, positioned heap + 34-byte-record
+  spill writes); bit-identical and all oracles green, but wall time did not move: after A4 the
+  copies already overlap the admission window, the live absorber sees size-1 batches (the
+  trickle pattern), and the tail is small on incremental runs. Interleaved A4-vs-A5 duel split
+  within thermal noise. Do not re-attempt without first changing the completion pattern
+  (e.g. committers handing off partial shards).
 
 ### 0.B Tail (link/seal/save ~840ms → ~600ms)
 
