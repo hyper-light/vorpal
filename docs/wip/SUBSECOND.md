@@ -204,8 +204,14 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
 - **Compactor**: pins an epoch (no fork; Tarantool read-view style), runs the Phase-0/1
   pipeline in background, swaps CURRENT. Compaction input is the *set* of live products —
   never edit order — so the emitted generation is bit-identical to from-scratch.
-- **Correctness harness**: differential testing — N seeded random edits live, compact,
-  cold-load, byte/semantics-diff every query surface. Debug-mode left-right copy-compare.
+- **Correctness harness — LANDED 2026-08-30** (crates/index/tests/differential.rs): 24
+  seeded random edits over a synthetic corpus spanning all seven edit classes (body edit,
+  add/remove function, add/delete file, comment restamp, pure touch); after EVERY step the
+  incremental index must equal a scratch build on two oracles — generation content-id
+  (total, byte-level) and a rendered-answer battery over six graph verbs + hybrid search
+  (the oracle that survives into the overlay era, where live bytes may differ but answers
+  may not). Runs in <1s; extend with overlay-vs-scratch comparisons when the live view
+  lands. Debug-mode left-right copy-compare still pending with the overlay itself.
 
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
