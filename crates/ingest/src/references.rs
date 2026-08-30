@@ -166,6 +166,45 @@ pub(crate) enum TextAction {
   ImportFirstArg,
 }
 
+/// Where a route construct's handler name lives.
+#[derive(Clone, Copy)]
+enum HandlerAt {
+  /// The last argument that names something (Express `app.get("/x", auth, handler)`, Go
+  /// `HandleFunc("/x", h)`, Django `path("x", views.detail, name=…)`); closures, objects,
+  /// literals, and keyword arguments name nothing and are skipped.
+  LastArgument,
+  /// The argument at `index` (0-based, named children), unwrapped once when it is itself a
+  /// call — axum's `route("/x", get(handler))` names the handler inside `get(…)`.
+  UnwrappedArgument(u8),
+  /// The declaration the construct decorates: the nearest ancestor of one of `ancestors`
+  /// (optionally through its `via` field), whose `name` field is the handler.
+  DecoratedDefinition {
+    ancestors: &'static [&'static str],
+    via: Option<&'static str>,
+  },
+  /// The next named sibling of one of `kinds` — its `name` field is the handler (Rust
+  /// attribute items, TypeScript method decorators).
+  NextSibling(&'static [&'static str]),
+}
+
+/// An HTTP route registration construct. The outline rule with the same predicate creates
+/// the `Route` item spanning the construct; the walk emits a `calls` reference from that
+/// item to the handler, so a route "calls" its handler like any other caller and every
+/// caller/reachability/impact surface sees endpoints without special cases.
+struct RouteSpec {
+  kind: &'static str,
+  /// Navigation from the construct to the node whose name is the verb or registrar (`get`,
+  /// `HandleFunc`, `GetMapping`), checked against `names`.
+  name: &'static [Sel],
+  names: &'static [&'static str],
+  /// Navigation to the argument list holding the path literal.
+  args: &'static [Sel],
+  /// Accept any string literal as the path. Otherwise the literal must start with `/` or be
+  /// a `VERB /path` pattern — the shape that separates `app.get("/x", h)` from `map.get(k)`.
+  path_any: bool,
+  handler: HandlerAt,
+}
+
 /// An implements/extends construct: matching nodes emit `implements` references for their type
 /// targets (`impl Trait for T`, `class C implements I`, `class Sub extends Base`).
 struct ImplSpec {
@@ -198,6 +237,8 @@ pub(crate) struct RefSpec {
   method_callee_kinds: &'static [&'static str],
   /// Receiver spellings that denote the enclosing type (`self`, `this`, `$this`).
   self_receivers: &'static [&'static str],
+  /// HTTP route registration constructs (see [`RouteSpec`]).
+  routes: &'static [RouteSpec],
 }
 
 const NONE_TEXT: &[(&str, TextAction)] = &[];
@@ -218,6 +259,7 @@ const SPEC_DEFAULTS: RefSpec = RefSpec {
   static_callee_kinds: NO_KINDS,
   method_callee_kinds: NO_KINDS,
   self_receivers: NO_KINDS,
+  routes: &[],
 };
 
 // ---- Owned spec data (F-M4) ---------------------------------------------------------------
@@ -319,6 +361,55 @@ impl From<&ImplSpec> for ImplSpecData {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) enum HandlerAtData {
+  LastArgument,
+  UnwrappedArgument(u8),
+  DecoratedDefinition {
+    ancestors: Vec<String>,
+    via: Option<String>,
+  },
+  NextSibling(Vec<String>),
+}
+
+impl From<&HandlerAt> for HandlerAtData {
+  fn from(at: &HandlerAt) -> Self {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).into()).collect() };
+    match at {
+      HandlerAt::LastArgument => HandlerAtData::LastArgument,
+      HandlerAt::UnwrappedArgument(index) => HandlerAtData::UnwrappedArgument(*index),
+      HandlerAt::DecoratedDefinition { ancestors, via } => HandlerAtData::DecoratedDefinition {
+        ancestors: owned(ancestors),
+        via: via.map(Into::into),
+      },
+      HandlerAt::NextSibling(kinds) => HandlerAtData::NextSibling(owned(kinds)),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RouteSpecData {
+  pub(crate) kind: String,
+  pub(crate) name: Vec<SelData>,
+  pub(crate) names: Vec<String>,
+  pub(crate) args: Vec<SelData>,
+  pub(crate) path_any: bool,
+  pub(crate) handler: HandlerAtData,
+}
+
+impl From<&RouteSpec> for RouteSpecData {
+  fn from(spec: &RouteSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      name: spec.name.iter().map(SelData::from).collect(),
+      names: spec.names.iter().map(|s| (*s).into()).collect(),
+      args: spec.args.iter().map(SelData::from).collect(),
+      path_any: spec.path_any,
+      handler: HandlerAtData::from(&spec.handler),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RefSpecData {
   pub(crate) calls: Vec<CallSpecData>,
   pub(crate) imports: Vec<ImportSpecData>,
@@ -330,6 +421,7 @@ pub(crate) struct RefSpecData {
   pub(crate) static_callee_kinds: Vec<String>,
   pub(crate) method_callee_kinds: Vec<String>,
   pub(crate) self_receivers: Vec<String>,
+  pub(crate) routes: Vec<RouteSpecData>,
 }
 
 impl From<&RefSpec> for RefSpecData {
@@ -350,6 +442,7 @@ impl From<&RefSpec> for RefSpecData {
       static_callee_kinds: owned(spec.static_callee_kinds),
       method_callee_kinds: owned(spec.method_callee_kinds),
       self_receivers: owned(spec.self_receivers),
+      routes: spec.routes.iter().map(RouteSpecData::from).collect(),
     }
   }
 }
@@ -377,6 +470,29 @@ const RUST: RefSpec = RefSpec {
   static_callee_kinds: &["scoped_identifier"],
   method_callee_kinds: &["field_expression"],
   self_receivers: &["self"],
+  routes: &[
+    // axum: `.route("/x", get(handler))` — the handler sits inside the method call.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["route"],
+      args: &[Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::UnwrappedArgument(1),
+    },
+    // actix-web / rocket: `#[get("/x")]` decorates the next function item.
+    RouteSpec {
+      kind: "attribute_item",
+      name: &[
+        Sel::ChildOfKind(&["attribute"]),
+        Sel::ChildOfKind(&["identifier", "scoped_identifier"]),
+      ],
+      names: &["get", "post", "put", "delete", "patch", "head", "options", "route"],
+      args: &[Sel::ChildOfKind(&["attribute"]), Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::NextSibling(&["function_item"]),
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -406,6 +522,32 @@ const PYTHON: RefSpec = RefSpec {
   }],
   method_callee_kinds: &["attribute"],
   self_receivers: &["self", "cls"],
+  routes: &[
+    // Flask / FastAPI: `@app.get("/items/{id}")` decorates the definition below it.
+    RouteSpec {
+      kind: "decorator",
+      name: &[Sel::ChildOfKind(&["call"]), Sel::Field("function")],
+      names: &[
+        "get", "post", "put", "delete", "patch", "head", "options", "route", "api_route",
+        "websocket",
+      ],
+      args: &[Sel::ChildOfKind(&["call"]), Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::DecoratedDefinition {
+        ancestors: &["decorated_definition"],
+        via: Some("definition"),
+      },
+    },
+    // Django: `path("users/<int:id>/", views.detail)` inside `urlpatterns`.
+    RouteSpec {
+      kind: "call",
+      name: &[Sel::Field("function")],
+      names: &["path"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -424,6 +566,21 @@ const GO: RefSpec = RefSpec {
   types: TYPE_ID,
   type_params: &["type_parameter_list"],
   method_callee_kinds: &["selector_expression"],
+  routes: &[
+    // net/http, gorilla, gin, echo, chi, fiber: `HandleFunc("/x", h)` / `r.GET("/x", h)` /
+    // Go 1.22 `mux.HandleFunc("GET /x", h)` patterns.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &[
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "Get", "Post", "Put",
+        "Delete", "Patch", "Head", "Options", "Any", "HandleFunc", "Handle",
+      ],
+      args: &[Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::LastArgument,
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -451,6 +608,26 @@ const JS_LIKE: RefSpec = RefSpec {
   type_params: &["type_parameters"],
   method_callee_kinds: &["member_expression"],
   self_receivers: &["this"],
+  routes: &[
+    // Express / Koa / Fastify / Hono: `app.get("/x", …, handler)`.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["get", "post", "put", "delete", "patch", "head", "options", "all"],
+      args: &[Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::LastArgument,
+    },
+    // NestJS: `@Get("cats/:id")` decorates the next method definition.
+    RouteSpec {
+      kind: "decorator",
+      name: &[Sel::ChildOfKind(&["call_expression"]), Sel::Field("function")],
+      names: &["Get", "Post", "Put", "Delete", "Patch", "Head", "Options", "All"],
+      args: &[Sel::ChildOfKind(&["call_expression"]), Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::NextSibling(&["method_definition"]),
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -507,6 +684,23 @@ const JAVA: RefSpec = RefSpec {
   // definable type) — the grammar surfaces it as a `type_identifier` leaf (verified by probe).
   type_placeholders: &["var"],
   self_receivers: &["this"],
+  routes: &[
+    // Spring: `@GetMapping("/users")` / `@RequestMapping(value = "/x", …)` on a method.
+    RouteSpec {
+      kind: "annotation",
+      name: &[Sel::Field("name")],
+      names: &[
+        "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
+        "RequestMapping",
+      ],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::DecoratedDefinition {
+        ancestors: &["method_declaration"],
+        via: None,
+      },
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -529,6 +723,20 @@ const CSHARP: RefSpec = RefSpec {
   type_params: &["type_parameter_list"],
   method_callee_kinds: &["member_access_expression"],
   self_receivers: &["this"],
+  routes: &[
+    // ASP.NET: `[HttpGet("users/{id}")]` on a method or local function.
+    RouteSpec {
+      kind: "attribute",
+      name: &[Sel::Field("name")],
+      names: &["HttpGet", "HttpPost", "HttpPut", "HttpDelete", "HttpPatch", "HttpHead", "HttpOptions"],
+      args: &[Sel::ChildOfKind(&["attribute_argument_list"])],
+      path_any: true,
+      handler: HandlerAt::DecoratedDefinition {
+        ancestors: &["method_declaration", "local_function_statement"],
+        via: None,
+      },
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -992,6 +1200,9 @@ pub(crate) struct ResolvedRefSpec {
   type_params: Vec<bool>,
   /// Resolved kind id per `spec.imports` entry (multiple import specs may share a kind).
   import_kind_ids: Vec<u16>,
+  /// Resolved kind id per `spec.routes` entry (routes share kinds with calls, so they
+  /// dispatch beside the chain, never through it).
+  route_kind_ids: Vec<u16>,
 }
 
 impl ResolvedRefSpec {
@@ -1008,6 +1219,11 @@ impl ResolvedRefSpec {
       .imports
       .iter()
       .map(|i| id_of(&i.kind).unwrap_or(0))
+      .collect();
+    let route_kind_ids: Vec<u16> = spec
+      .routes
+      .iter()
+      .map(|r| id_of(&r.kind).unwrap_or(0))
       .collect();
 
     let max_id = spec
@@ -1057,6 +1273,7 @@ impl ResolvedRefSpec {
       chain,
       type_params,
       import_kind_ids,
+      route_kind_ids,
     }
   }
 
@@ -1378,6 +1595,14 @@ pub(crate) fn extract_references_with_facts<'t>(
     }
     if resolved.declares_type_params(kind_id) {
       collect_binders_in(&node, &mut binders);
+    }
+    // Route registrations dispatch beside the chain: their kinds are usually also call
+    // kinds, and the same node legitimately yields both the framework call and the
+    // route → handler reference.
+    for (idx, &id) in resolved.route_kind_ids.iter().enumerate() {
+      if id != 0 && id == kind_id {
+        emit_route_handler(&node, &spec.routes[idx], spec, &mut span_cursor, &mut pending);
+      }
     }
     match resolved.chain_at(kind_id) {
       Chain::None => {}
@@ -1841,6 +2066,147 @@ fn select<'t>(node: &SgNode<'t>, sel: &SelData) -> Option<SgNode<'t>> {
     SelData::FirstNamedChild => node.children().find(|c| c.is_named()),
     SelData::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds).into_iter().next(),
   }
+}
+
+/// Apply a navigation path of selectors, hop by hop.
+fn select_path<'t>(node: &SgNode<'t>, path: &[SelData]) -> Option<SgNode<'t>> {
+  let mut current = node.clone();
+  for sel in path {
+    current = select(&current, sel)?;
+  }
+  Some(current)
+}
+
+/// Is `text` a Go 1.22 style `VERB /path` pattern?
+fn verb_pattern(text: &str) -> bool {
+  matches!(
+    text.split_once(' '),
+    Some((verb, rest))
+      if !verb.is_empty() && rest.starts_with('/') && verb.bytes().all(|b| b.is_ascii_uppercase())
+  )
+}
+
+/// The first string literal under `args` (pre-order) as its quote-stripped text — `None`
+/// when absent or (unless `any`) it neither starts with `/` nor is a `VERB /path` pattern.
+fn route_path_literal<'t>(args: &SgNode<'t>, any: bool) -> Option<Cow<'t, str>> {
+  let literal = args.dfs().skip(1).find(|n| {
+    let kind = n.kind();
+    kind.as_ref() == "string" || kind.as_ref().ends_with("string_literal")
+  })?;
+  let trimmed = trim_cow(literal.text(), |t| {
+    t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+  });
+  if trimmed.is_empty() {
+    return None;
+  }
+  (any || trimmed.starts_with('/') || verb_pattern(trimmed.as_ref())).then_some(trimmed)
+}
+
+/// A node that *refers* to something by name: an identifier leaf, or the language's
+/// member/static access shapes (`views.detail`, `pkg.Handler`, `Ctrl::show`). Keyword
+/// arguments, literals, and closures are none of these — they can never be a handler.
+fn reference_shaped(node: &SgNode<'_>, spec: &RefSpecData) -> bool {
+  let kind_cow = node.kind();
+  let kind = kind_cow.as_ref();
+  LEAF_KINDS.contains(&kind)
+    || spec.method_callee_kinds.iter().any(|k| k == kind)
+    || spec.static_callee_kinds.iter().any(|k| k == kind)
+}
+
+/// The handler node for a route construct, per its spec.
+fn route_handler_node<'t>(
+  construct: &SgNode<'t>,
+  args: &SgNode<'t>,
+  at: &HandlerAtData,
+  spec: &RefSpecData,
+) -> Option<SgNode<'t>> {
+  match at {
+    // The last reference-shaped argument is the handler — middleware-tolerant, and immune
+    // to trailing `name="…"` keyword arguments or option objects.
+    HandlerAtData::LastArgument => args
+      .children()
+      .filter(|c| c.is_named() && reference_shaped(c, spec))
+      .last(),
+    HandlerAtData::UnwrappedArgument(index) => {
+      let arg = args.children().filter(|c| c.is_named()).nth(*index as usize)?;
+      if arg.kind().as_ref().ends_with("call_expression") {
+        let inner = arg.field("arguments")?;
+        inner.children().find(|c| c.is_named())
+      } else {
+        Some(arg)
+      }
+    }
+    HandlerAtData::DecoratedDefinition { ancestors, via } => {
+      let holder = construct
+        .ancestors()
+        .find(|a| ancestors.iter().any(|k| a.kind().as_ref() == k.as_str()))?;
+      let target = match via {
+        Some(field) => holder.field(field.as_str())?,
+        None => holder,
+      };
+      target.field("name")
+    }
+    HandlerAtData::NextSibling(kinds) => {
+      let sibling = construct
+        .next_all()
+        .find(|s| s.is_named() && kinds.iter().any(|k| s.kind().as_ref() == k.as_str()))?;
+      sibling.field("name")
+    }
+  }
+}
+
+/// Emit the route → handler `calls` reference for a matched route construct (see
+/// [`RouteSpec`]). The predicate mirrors the outline rule that creates the `Route` item —
+/// fixtures pin the two in sync per framework.
+fn emit_route_handler<'t>(
+  node: &SgNode<'t>,
+  route: &RouteSpecData,
+  spec: &RefSpecData,
+  span_cursor: &mut SpanCursor<'_>,
+  pending: &mut Vec<Pending<'t>>,
+) {
+  let Some(name_node) = select_path(node, &route.name) else {
+    return;
+  };
+  let Some(verb) = callee_name(&name_node) else {
+    return;
+  };
+  if !route.names.iter().any(|n| n == verb.as_ref()) {
+    return;
+  }
+  let Some(args) = select_path(node, &route.args) else {
+    return;
+  };
+  if route_path_literal(&args, route.path_any).is_none() {
+    return;
+  }
+  let Some(handler) = route_handler_node(node, &args, &route.handler, spec) else {
+    return;
+  };
+  let Some(name) = callee_name(&handler) else {
+    return;
+  };
+  if name.is_empty() {
+    return;
+  }
+  let Some(from) = span_cursor.enclosing(node.range().start) else {
+    return;
+  };
+  // A member-shaped handler (`views.detail`, `handlers.Show`) carries its container as a
+  // MethodHinted qualifier: corroborated exactly like any receiver hint (`import views` in
+  // the registering file proves the module), and a hint can upgrade but never mask.
+  let qualifier = ["object", "operand", "value", "scope", "path"]
+    .iter()
+    .find_map(|field| handler.field(field))
+    .map(|container| trim_cow(container.text(), str::trim))
+    .filter(|text| !text.is_empty() && !text.contains(char::is_whitespace));
+  let range = handler.range();
+  let mut raw = RawRef::plain(from, name, RefKind::Call, range.start as u32, range.end as u32);
+  if qualifier.is_some() {
+    raw.qualifier = qualifier;
+    raw.form = RefForm::MethodHinted;
+  }
+  pending.push(Pending::Ready(raw));
 }
 
 /// All matching targets for an import node (repeated fields / multiple names per statement).

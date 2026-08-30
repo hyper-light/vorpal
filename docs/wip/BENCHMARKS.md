@@ -81,6 +81,18 @@ spill, pairing). The kernel's pairs are the v4/v6 twins one expects
 `bictcp_cong_avoid`/`cubictcp_cong_avoid`); `IGMP_V1_SEEN`/`IGMP_V2_SEEN` show macro
 bodies are signed too. Cold/update rows above predate the format bump.
 
+2026-08-30 HTTP route nodes (ADOPTION #25 slice 1): framework route registrations become
+`Route` nodes named `VERB /path`, each `calls` its handler — Express-family, NestJS,
+Flask/FastAPI, Django `urlpatterns`, Go net/http/gin/echo/chi (Go 1.22 `"GET /x"` patterns),
+axum, actix/Rocket attributes, Spring, ASP.NET, Rails/Sinatra, pinned by per-framework
+fixtures. Routes live inside function/class bodies, so they ride a dedicated `nested: true`
+outline pass that only runs for languages declaring such rules. Measured against the
+pre-route binary, interleaved: kernel cold **7.35 → 7.33 s** (parity — C declares no nested
+rules); cpython cold wall parity (0.90 / 0.93 s) at **+6% user CPU** (the Python nested
+pass), one-file update parity (0.26 / 0.24 s). cpython and the kernel truthfully report
+zero routes (no web code); the only ref-level delta is one extra *masked* reference — a
+handler probe that resolved to nothing, producing no edge.
+
 Index size (linux, one generation): 1.27 GiB before tiers — `products.pack` 595 MB,
 `evidence.bin` 268 MB, `nodes.vseg` 171 MB, `strings.heap` 150 MB, `graph.bin` 122 MB,
 `names.idx` 44 MB, `manifest.bin` 6.8 MB, `products.idx` 6.5 MB, `dataflow.bin` 0.75 MB

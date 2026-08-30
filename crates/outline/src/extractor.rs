@@ -108,6 +108,12 @@ pub struct SerializableItemRule<L> {
   /// the file's `Widget` item. An owner defined in another file leaves the item top-level
   /// (adoption is file-local by design; stated where it matters).
   pub member_of: Option<String>,
+  /// Collect matches ANYWHERE in the file, including inside other items' subtrees, in a
+  /// dedicated full-tree pass — for constructs that live in bodies by nature (HTTP route
+  /// registrations inside `main`, decorators inside classes). Nested items never carry
+  /// members and never suppress the traversal around them.
+  #[serde(default)]
+  pub nested: Option<bool>,
 }
 
 /// Member extractor for direct child structure under an item.
@@ -256,6 +262,8 @@ pub struct ItemExtractor<L: Language> {
   is_import: OutlinePredicate,
   is_exported: OutlinePredicate,
   member_of: Option<TemplateFix>,
+  /// See [`SerializableItemRule::nested`].
+  pub nested: bool,
 }
 
 impl<L: Language> ItemExtractor<L> {
@@ -269,6 +277,7 @@ impl<L: Language> ItemExtractor<L> {
       is_import,
       is_exported,
       member_of,
+      nested,
     } = item;
     let member_of = member_of
       .as_deref()
@@ -282,6 +291,7 @@ impl<L: Language> ItemExtractor<L> {
       is_import,
       is_exported,
       member_of,
+      nested: nested.unwrap_or(false),
     })
   }
 
@@ -724,6 +734,7 @@ name: member
   fn serializes_with_internal_role_tag() {
     let rule = SerializableOutlineRule::Item(SerializableItemRule {
       member_of: None,
+      nested: None,
       common: SerializableOutlineCommon {
         id: "ts-function".into(),
         language: SupportLang::TypeScript,

@@ -63,6 +63,15 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 | `health` | Per-file parse damage: ERROR-node counts, affected-byte ratios, and which definitions overlap damaged regions — the difference between "no edge" and "unknowable here." |
 
 **Graph navigation** (all take a symbol `name`; ambiguous names list candidates)
+
+> **Route nodes.** HTTP route registrations are first-class `Route` nodes named
+> `VERB /path` (`GET /users/:id`, `ROUTE /x` when the verb isn't in the source), extracted
+> for Express/Koa/Fastify, NestJS decorators, Flask/FastAPI, Django `urlpatterns`,
+> Go `net/http`/gin/echo/chi (Go 1.22 `"GET /x"` patterns included), axum,
+> actix-web/Rocket attributes, Spring, ASP.NET attributes, and Rails/Sinatra. A route
+> `calls` its handler, so `callers <handler>` names the endpoint, `reachable` from a route
+> walks its implementation, and `dead_code` never flags handlers. Literal path strings
+> only; a route built from variables is not extracted (nothing is guessed).
 | Tool | What it does |
 |---|---|
 | `node` | Nodes matching an exact symbol name. |

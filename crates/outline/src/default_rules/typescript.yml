@@ -1079,3 +1079,68 @@ rule:
         pattern: $NAME
 name: $NAME
 isExported: true
+---
+id: ts-http-route
+language: TypeScript
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: member_expression
+        has:
+          field: property
+          regex: '^(get|post|put|delete|patch|head|options|all)$'
+          pattern: $METHOD
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: string
+          has:
+            kind: string_fragment
+            regex: '^/'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+transform:
+  VERB:
+    convert:
+      source: $METHOD
+      toCase: upperCase
+name: $VERB $ROUTE
+---
+id: ts-http-route-decorator
+language: TypeScript
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: decorator
+  has:
+    kind: call_expression
+    all:
+      - has:
+          field: function
+          kind: identifier
+          regex: '^(Get|Post|Put|Delete|Patch|Head|Options|All)$'
+          pattern: $METHOD
+      - has:
+          field: arguments
+          has:
+            nthChild: 1
+            kind: string
+            has:
+              kind: string_fragment
+              pattern: $ROUTE
+transform:
+  VERB:
+    convert:
+      source: $METHOD
+      toCase: upperCase
+name: $VERB $ROUTE

@@ -16,7 +16,8 @@ use vorpal_core::Language;
 use vorpal_lang_registry::SgLang;
 
 use crate::references::{
-  CallSpecData, ImplSpecData, ImportSpecData, QualSourceData, RefSpecData, SelData, TextAction,
+  CallSpecData, HandlerAtData, ImplSpecData, ImportSpecData, QualSourceData, RefSpecData,
+  RouteSpecData, SelData, TextAction,
 };
 
 /// How to locate the referenced sub-node inside a matched node — the tagged mirror of
@@ -157,6 +158,97 @@ impl From<TextAction> for SerializableTextAction {
   }
 }
 
+/// Where a route construct's handler name lives — mirror of `references::HandlerAt`.
+/// YAML tag forms: `lastArgument`, `!unwrappedArgument 1`,
+/// `!decoratedDefinition {ancestors: […], via: …}`, `!nextSibling [kind, …]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SerializableHandlerAt {
+  LastArgument,
+  UnwrappedArgument(u8),
+  #[serde(rename_all = "camelCase")]
+  DecoratedDefinition {
+    ancestors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    via: Option<String>,
+  },
+  NextSibling(Vec<String>),
+}
+
+impl From<&SerializableHandlerAt> for HandlerAtData {
+  fn from(at: &SerializableHandlerAt) -> Self {
+    match at {
+      SerializableHandlerAt::LastArgument => HandlerAtData::LastArgument,
+      SerializableHandlerAt::UnwrappedArgument(index) => HandlerAtData::UnwrappedArgument(*index),
+      SerializableHandlerAt::DecoratedDefinition { ancestors, via } => {
+        HandlerAtData::DecoratedDefinition {
+          ancestors: ancestors.clone(),
+          via: via.clone(),
+        }
+      }
+      SerializableHandlerAt::NextSibling(kinds) => HandlerAtData::NextSibling(kinds.clone()),
+    }
+  }
+}
+
+impl From<&HandlerAtData> for SerializableHandlerAt {
+  fn from(at: &HandlerAtData) -> Self {
+    match at {
+      HandlerAtData::LastArgument => SerializableHandlerAt::LastArgument,
+      HandlerAtData::UnwrappedArgument(index) => SerializableHandlerAt::UnwrappedArgument(*index),
+      HandlerAtData::DecoratedDefinition { ancestors, via } => {
+        SerializableHandlerAt::DecoratedDefinition {
+          ancestors: ancestors.clone(),
+          via: via.clone(),
+        }
+      }
+      HandlerAtData::NextSibling(kinds) => SerializableHandlerAt::NextSibling(kinds.clone()),
+    }
+  }
+}
+
+/// An HTTP route registration construct — mirror of `references::RouteSpec`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SerializableRouteSpec {
+  pub kind: String,
+  pub name: Vec<SerializableSel>,
+  pub names: Vec<String>,
+  pub args: Vec<SerializableSel>,
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub path_any: bool,
+  pub handler: SerializableHandlerAt,
+  /// Strict-kind escape hatch: this entry may name a kind the grammar lacks (shared specs).
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub optional: bool,
+}
+
+impl SerializableRouteSpec {
+  fn to_route_data(&self) -> RouteSpecData {
+    RouteSpecData {
+      kind: self.kind.clone(),
+      name: self.name.iter().map(SelData::from).collect(),
+      names: self.names.clone(),
+      args: self.args.iter().map(SelData::from).collect(),
+      path_any: self.path_any,
+      handler: HandlerAtData::from(&self.handler),
+    }
+  }
+
+  #[cfg(test)] // the round-trip expressiveness test's lifting direction
+  fn from_route_data(data: &RouteSpecData) -> Self {
+    Self {
+      kind: data.kind.clone(),
+      name: data.name.iter().map(SerializableSel::from).collect(),
+      names: data.names.clone(),
+      args: data.args.iter().map(SerializableSel::from).collect(),
+      path_any: data.path_any,
+      handler: SerializableHandlerAt::from(&data.handler),
+      optional: false,
+    }
+  }
+}
+
 fn is_default_sel(sel: &SerializableSel) -> bool {
   *sel == SerializableSel::FirstNamedChild
 }
@@ -191,6 +283,8 @@ pub struct SerializableRefSpec {
   pub method_callee_kinds: Vec<String>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub self_receivers: Vec<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub routes: Vec<SerializableRouteSpec>,
 }
 
 impl SerializableRefSpec {
@@ -252,6 +346,13 @@ impl SerializableRefSpec {
       check(kind, "typeParams", false)?;
     }
 
+    let mut routes = Vec::with_capacity(self.routes.len());
+    for entry in &self.routes {
+      if check(&entry.kind, "routes", entry.optional)? {
+        routes.push(entry.to_route_data());
+      }
+    }
+
     Ok(RefSpecData {
       calls,
       imports,
@@ -267,6 +368,7 @@ impl SerializableRefSpec {
       static_callee_kinds: self.static_callee_kinds.clone(),
       method_callee_kinds: self.method_callee_kinds.clone(),
       self_receivers: self.self_receivers.clone(),
+      routes,
     })
   }
 
@@ -314,6 +416,7 @@ impl SerializableRefSpec {
       static_callee_kinds: self.static_callee_kinds.clone(),
       method_callee_kinds: self.method_callee_kinds.clone(),
       self_receivers: self.self_receivers.clone(),
+      routes: self.routes.iter().map(SerializableRouteSpec::to_route_data).collect(),
     }
   }
 
@@ -368,6 +471,7 @@ impl SerializableRefSpec {
       static_callee_kinds: data.static_callee_kinds.clone(),
       method_callee_kinds: data.method_callee_kinds.clone(),
       self_receivers: data.self_receivers.clone(),
+      routes: data.routes.iter().map(SerializableRouteSpec::from_route_data).collect(),
     }
   }
 }

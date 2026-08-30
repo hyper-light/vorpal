@@ -196,3 +196,39 @@ rule:
     pattern: $NAME
 name: $NAME
 isPublic: true
+---
+id: csharp-http-route
+language: CSharp
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: attribute
+  inside:
+    kind: attribute_list
+    inside:
+      any:
+        - kind: method_declaration
+        - kind: local_function_statement
+  all:
+    - has:
+        field: name
+        regex: '^Http(Get|Post|Put|Delete|Patch|Head|Options)$'
+        pattern: $ANN
+    - has:
+        stopBy: end
+        kind: string_literal
+        has:
+          kind: string_literal_content
+          pattern: $ROUTE
+transform:
+  VERB0:
+    replace:
+      source: $ANN
+      replace: '^Http'
+      by: ''
+  VERB:
+    convert:
+      source: $VERB0
+      toCase: upperCase
+name: $VERB $ROUTE

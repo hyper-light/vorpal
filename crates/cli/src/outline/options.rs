@@ -150,6 +150,7 @@ fn parse_symbol_type(raw: &str) -> Option<SymbolType> {
     "event" => SymbolType::Event,
     "operator" => SymbolType::Operator,
     "typeparameter" => SymbolType::TypeParameter,
+    "route" => SymbolType::Route,
     _ => return None,
   })
 }

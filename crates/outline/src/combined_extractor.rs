@@ -33,8 +33,12 @@ const POTENTIAL_KINDS_INVARIANT: &str =
 pub struct CombinedExtractors<L: Language> {
   /// Top-level item extractors matched during the file-wide AST traversal.
   item_extractors: Vec<ItemExtractor<L>>,
-  /// Dense node-kind index into `item_extractors`; shared across the whole file.
+  /// Dense node-kind index into `item_extractors`; shared across the whole file. Nested
+  /// extractors are excluded — they run in their own full-tree pass.
   item_kind_index: Vec<Vec<usize>>,
+  /// Node-kind index into `item_extractors` for `nested: true` rules (see
+  /// [`crate::extractor::SerializableItemRule::nested`]); empty for almost every language.
+  nested_kind_index: Vec<Vec<usize>>,
   /// Member extractors parsed once and referenced by parent-scoped groups below.
   member_extractors: Vec<MemberExtractor<L>>,
   /// Parent item extractor id to member extractors that may run inside it.
@@ -104,11 +108,13 @@ impl<L: Language> CombinedExtractors<L> {
     member_extractors: Vec<MemberExtractor<L>>,
     options: OutlineExtractorOptions,
   ) -> Self {
-    let item_kind_index = item_kind_index(&item_extractors);
+    let item_kind_index = kind_index(&item_extractors, |e| !e.nested);
+    let nested_kind_index = kind_index(&item_extractors, |e| e.nested);
     let member_index_by_parent = member_index_by_parent(&member_extractors);
     Self {
       item_extractors,
       item_kind_index,
+      nested_kind_index,
       member_extractors,
       member_index_by_parent,
       options,
@@ -150,7 +156,29 @@ impl<L: Language> CombinedExtractors<L> {
       traversal: Prune::new(&root),
     }
     .collect();
-    adopt_members(collected).into_iter()
+    let mut items = adopt_members(collected);
+    // Nested rules (`nested: true`): a dedicated full-tree pass, because the pruned item
+    // traversal above never enters a matched item's subtree — exactly where route
+    // registrations live. Skipped entirely (no walk) when the language declares none.
+    if self.nested_kind_index.iter().any(|list| !list.is_empty()) {
+      for node in root.dfs() {
+        for &idx in self
+          .nested_kind_index
+          .get(node.kind_id() as usize)
+          .map(Vec::as_slice)
+          .unwrap_or(&[])
+        {
+          if let Some(matched) = self.item_extractors[idx].match_node(&node) {
+            let item = self.item_extractors[idx].extract(&matched, vec![]);
+            if self.options.keep_item(&item) {
+              items.push(item);
+            }
+            break;
+          }
+        }
+      }
+    }
+    items.into_iter()
   }
 
   fn match_item<'tree>(
@@ -384,9 +412,15 @@ fn push_kind_mapping(mapping: &mut Vec<Vec<usize>>, kind: usize, idx: usize) {
   mapping[kind].push(idx);
 }
 
-fn item_kind_index<L: Language>(item_extractors: &[ItemExtractor<L>]) -> Vec<Vec<usize>> {
+fn kind_index<L: Language>(
+  item_extractors: &[ItemExtractor<L>],
+  retain: impl Fn(&ItemExtractor<L>) -> bool,
+) -> Vec<Vec<usize>> {
   let mut mapping = Vec::new();
   for (idx, extractor) in item_extractors.iter().enumerate() {
+    if !retain(extractor) {
+      continue;
+    }
     let kinds = extractor
       .common
       .rule

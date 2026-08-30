@@ -295,6 +295,7 @@ fn symbol_type_tag(sym: SymbolType) -> u8 {
     SymbolType::Event => 23,
     SymbolType::Operator => 24,
     SymbolType::TypeParameter => 25,
+    SymbolType::Route => 26,
   }
 }
 
@@ -326,6 +327,7 @@ fn tag_symbol_type(tag: u8) -> io::Result<SymbolType> {
     23 => SymbolType::Event,
     24 => SymbolType::Operator,
     25 => SymbolType::TypeParameter,
+    26 => SymbolType::Route,
     other => return Err(corrupt(format!("unknown symbol type tag {other}"))),
   })
 }

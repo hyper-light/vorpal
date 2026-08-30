@@ -45,6 +45,8 @@ pub enum SymbolType {
   Event,
   Operator,
   TypeParameter,
+  /// An HTTP route registration (`GET /users/:id`) — a framework endpoint declaration.
+  Route,
 }
 
 /// Entry placement in the outline tree.

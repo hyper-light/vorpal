@@ -457,6 +457,7 @@ fn symbol_type_name(symbol_type: SymbolType) -> &'static str {
     SymbolType::Event => "event",
     SymbolType::Operator => "operator",
     SymbolType::TypeParameter => "typeParameter",
+    SymbolType::Route => "route",
   }
 }
 
@@ -487,6 +488,7 @@ const SYMBOL_TYPE_ORDER: &[SymbolType] = &[
   SymbolType::Event,
   SymbolType::Operator,
   SymbolType::TypeParameter,
+  SymbolType::Route,
 ];
 
 struct OutlineTextStyle {
@@ -624,7 +626,9 @@ fn symbol_type_style(symbol_type: SymbolType) -> ansi_term::Style {
     SymbolType::Class | SymbolType::Struct | SymbolType::Object => Color::Blue,
     SymbolType::Enum | SymbolType::EnumMember => Color::Purple,
     SymbolType::Interface | SymbolType::TypeParameter => Color::Red,
-    SymbolType::Function | SymbolType::Method | SymbolType::Constructor => Color::Green,
+    SymbolType::Function | SymbolType::Method | SymbolType::Constructor | SymbolType::Route => {
+      Color::Green
+    }
     SymbolType::Property | SymbolType::Field | SymbolType::Key => Color::Yellow,
     SymbolType::Variable | SymbolType::Constant => Color::Fixed(214),
     SymbolType::String

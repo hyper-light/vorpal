@@ -470,3 +470,116 @@ transform:
 name: '$NAME'
 signature: '$SIG'
 isPublic: true
+---
+id: rust-http-route-axum
+language: Rust
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: field_expression
+        has:
+          field: field
+          regex: '^route$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: string_literal
+          has:
+            kind: string_content
+            regex: '^/'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+          kind: call_expression
+          has:
+            field: function
+            kind: identifier
+            regex: '^(get|post|put|delete|patch|head|options|any)$'
+            pattern: $METHOD
+transform:
+  VERB:
+    convert:
+      source: $METHOD
+      toCase: upperCase
+name: $VERB $ROUTE
+---
+id: rust-http-route-axum-chained
+language: Rust
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: field_expression
+        has:
+          field: field
+          regex: '^route$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: string_literal
+          has:
+            kind: string_content
+            regex: '^/'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+    - not:
+        has:
+          field: arguments
+          has:
+            nthChild: 2
+            kind: call_expression
+            has:
+              field: function
+              kind: identifier
+              regex: '^(get|post|put|delete|patch|head|options|any)$'
+name: ROUTE $ROUTE
+---
+id: rust-http-route-attribute
+language: Rust
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: attribute_item
+  has:
+    kind: attribute
+    all:
+      - has:
+          nthChild: 1
+          regex: '(^|::)(get|post|put|delete|patch|head|options|route)$'
+          pattern: $METHOD
+      - has:
+          field: arguments
+          has:
+            kind: string_literal
+            has:
+              kind: string_content
+              regex: '^/'
+              pattern: $ROUTE
+transform:
+  VERB0:
+    replace:
+      source: $METHOD
+      replace: '^.*::'
+      by: ''
+  VERB:
+    convert:
+      source: $VERB0
+      toCase: upperCase
+name: $VERB $ROUTE

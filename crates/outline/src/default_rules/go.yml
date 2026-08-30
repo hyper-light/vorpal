@@ -150,3 +150,96 @@ rule:
   has:
     pattern: $NAME
 name: $NAME
+---
+id: go-http-route-verb
+language: Go
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: selector_expression
+        has:
+          field: field
+          regex: '^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Get|Post|Put|Delete|Patch|Head|Options|Any)$'
+          pattern: $METHOD
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: interpreted_string_literal
+          has:
+            kind: interpreted_string_literal_content
+            regex: '^/'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+transform:
+  VERB:
+    convert:
+      source: $METHOD
+      toCase: upperCase
+name: $VERB $ROUTE
+---
+id: go-http-route-handle
+language: Go
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: selector_expression
+        has:
+          field: field
+          regex: '^(HandleFunc|Handle)$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: interpreted_string_literal
+          has:
+            kind: interpreted_string_literal_content
+            regex: '^/'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+name: ROUTE $ROUTE
+---
+id: go-http-route-pattern
+language: Go
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: selector_expression
+        has:
+          field: field
+          regex: '^(HandleFunc|Handle)$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: interpreted_string_literal
+          has:
+            kind: interpreted_string_literal_content
+            regex: '^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+name: $ROUTE

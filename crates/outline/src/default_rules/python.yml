@@ -149,3 +149,73 @@ rule:
     field: name
     pattern: $NAME
 name: $NAME
+---
+id: python-http-route-decorator
+language: Python
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: decorator
+  has:
+    kind: call
+    all:
+      - has:
+          field: function
+          kind: attribute
+          has:
+            field: attribute
+            regex: '^(get|post|put|delete|patch|head|options|route|api_route|websocket)$'
+            pattern: $METHOD
+      - has:
+          field: arguments
+          has:
+            nthChild: 1
+            kind: string
+            has:
+              kind: string_content
+              regex: '^/'
+              pattern: $ROUTE
+transform:
+  VERB:
+    convert:
+      source: $METHOD
+      toCase: upperCase
+name: $VERB $ROUTE
+---
+id: python-django-path
+language: Python
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call
+  all:
+    - has:
+        field: function
+        kind: identifier
+        regex: '^path$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: string
+          has:
+            kind: string_content
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+    - inside:
+        stopBy: end
+        any:
+          - kind: assignment
+            has:
+              field: left
+              regex: '^urlpatterns$'
+          - kind: augmented_assignment
+            has:
+              field: left
+              regex: '^urlpatterns$'
+name: ROUTE /$ROUTE
