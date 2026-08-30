@@ -5,6 +5,19 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use vorpal_index::{CacheMode, ExtractionEnv, ParseHealthPolicy, build_index_env};
+
+use crate::supervised::{BuildOutcome, Supervisor};
+
+/// Serializes IN-PROCESS builds within this daemon: staging dirs are per-PID, so two
+/// same-process builds (the D1 worker's fallback racing a query-path rebuild) would share —
+/// and clobber — one staging directory. Child-process builds need no lock (their PIDs differ).
+static IN_PROCESS_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn in_process_build_guard() -> std::sync::MutexGuard<'static, ()> {
+  IN_PROCESS_BUILD
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 use vorpal_kg::Kg;
 
 use crate::watch::SourceWatch;
@@ -77,6 +90,9 @@ pub struct Server {
   /// (any dlopen of a grammar .so) is the launching process's one-shot startup act; nothing
   /// reachable through the MCP surface can ever trigger a dlopen.
   env: ExtractionEnv,
+  /// Crash isolation for builds (D3): rebuilds run in a child indexer process when one can be
+  /// discovered, so a pathological input costs one build attempt, never the daemon.
+  supervisor: Supervisor,
   kg: Option<Kg>,
   /// The resolved generation directory the cached graph was loaded from — the artifacts a
   /// `why` snippet is digest-verified against, so a concurrent `CURRENT` swap can never split
@@ -95,6 +111,16 @@ impl Server {
   }
 
   pub fn with_profile_env(index_dir: PathBuf, profile: Profile, env: ExtractionEnv) -> Self {
+    Self::with_profile_env_rebuild(index_dir, profile, env, true)
+  }
+
+  /// Full-control constructor: `watch_rebuild` gates the proactive background rebuild (D1).
+  pub fn with_profile_env_rebuild(
+    index_dir: PathBuf,
+    profile: Profile,
+    env: ExtractionEnv,
+    watch_rebuild: bool,
+  ) -> Self {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
     // start building it now instead of on the first semantic search.
@@ -104,10 +130,25 @@ impl Server {
         let _ = vorpal_index::warm_ann(&warm_dir);
       });
     }
+    let supervisor = Supervisor::discover();
+    // Proactive rebuild worker (D1): its OWN watch on the same tree, debounced, building
+    // through the supervisor so a crash costs an error line on stderr, never the daemon.
+    // It never touches server state — the serving thread's `ensure_fresh` observes the
+    // committed CURRENT via its own dirty flag and pays only a fast-path check + mmap
+    // reload, so the first query after a save is already warm.
+    if watch_rebuild
+      && !std::env::var("VORPAL_WATCH_REBUILD").is_ok_and(|v| v == "0")
+      && watch.is_some()
+    {
+      if let Some(src) = watch.as_ref().map(|w| w.src().to_path_buf()) {
+        spawn_rebuild_worker(src, index_dir.clone(), supervisor.clone(), env.clone());
+      }
+    }
     Self {
       index_dir,
       profile,
       env,
+      supervisor,
       kg: None,
       kg_dir: None,
       watch,
@@ -125,20 +166,30 @@ impl Server {
     if self.kg.is_some() && !watch.take_dirty() {
       return Ok(());
     }
-    let rebuilt = build_index_env(
-      watch.src(),
-      &self.index_dir,
-      CacheMode::default(),
-      ParseHealthPolicy::default(),
-      &self.env,
-    )
-    .map_err(|err| err.to_string())
-      .and_then(|_| {
-        let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
-        Kg::load(&dir)
-          .map(|kg| (kg, dir))
-          .map_err(|err| err.to_string())
-      });
+    // Crash-isolated when possible (D3): the child process pays for any pathological input;
+    // in-process only when no indexer binary exists (library embedders, test harnesses).
+    let built = match self.supervisor.build(watch.src(), &self.index_dir) {
+      Ok(BuildOutcome::Supervised(_)) => Ok(()),
+      Ok(BuildOutcome::Unavailable) => {
+        let _guard = in_process_build_guard();
+        build_index_env(
+          watch.src(),
+          &self.index_dir,
+          CacheMode::default(),
+          ParseHealthPolicy::default(),
+          &self.env,
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+      }
+      Err(err) => Err(err),
+    };
+    let rebuilt = built.and_then(|()| {
+      let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+      Kg::load(&dir)
+        .map(|kg| (kg, dir))
+        .map_err(|err| err.to_string())
+    });
     match rebuilt {
       Ok((kg, dir)) => {
         self.kg = Some(kg);
@@ -291,18 +342,46 @@ impl Server {
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
         };
-        let report =
-          build_index_env(Path::new(&src), &self.index_dir, mode, policy, &self.env)
-            .map_err(|err| err.to_string())?;
+        // Supervised when a child indexer exists (D3): a crashing input costs this call,
+        // never the daemon. NOTE: the child runs the default cache/health policy; explicit
+        // policy args force the in-process path so they are honored exactly.
+        let wants_default_policy =
+          mode == CacheMode::default() && policy == ParseHealthPolicy::default();
+        let mut supervised_note: Option<String> = None;
+        let report = if wants_default_policy {
+          match self.supervisor.build(Path::new(&src), &self.index_dir) {
+            Err(err) => return Err(err.into()),
+            Ok(BuildOutcome::Supervised(child_text)) => {
+              supervised_note = Some(child_text);
+              None
+            }
+            Ok(BuildOutcome::Unavailable) => {
+              let _guard = in_process_build_guard();
+              Some(
+                build_index_env(Path::new(&src), &self.index_dir, mode, policy, &self.env)
+                  .map_err(|err| err.to_string())?,
+              )
+            }
+          }
+        } else {
+          let _guard = in_process_build_guard();
+          Some(
+            build_index_env(Path::new(&src), &self.index_dir, mode, policy, &self.env)
+              .map_err(|err| err.to_string())?,
+          )
+        };
         // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
         // new generation directory alongside it.
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         self.kg = Some(Kg::load(&dir).map_err(|err| err.to_string())?);
         self.kg_dir = Some(dir);
-        let mut text = if report.reused {
-          format!("unchanged — reused existing index ({} nodes)", report.nodes)
-        } else {
-          format!(
+        let mut text = match (&report, supervised_note) {
+          // Child ran: its stdout tail IS the report (counts, damage note, unverified note).
+          (None, Some(child_text)) => format!("(supervised) {child_text}"),
+          (Some(report), _) if report.reused => {
+            format!("unchanged — reused existing index ({} nodes)", report.nodes)
+          }
+          (Some(report), _) => format!(
             "indexed {} files ({} skipped) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",
             report.indexed,
             report.skipped,
@@ -311,15 +390,18 @@ impl Server {
             report.ambiguous,
             report.external,
             report.masked
-          )
+          ),
+          (None, None) => unreachable_report()?,
         };
-        if !report.unverified_langs.is_empty() {
-          text.push_str(&format!(
-            "\nnote: {} dynamic language(s) extracted without a canary (best-effort, \
-             unverified): {}",
-            report.unverified_langs.len(),
-            report.unverified_langs.join(", ")
-          ));
+        if let Some(report) = &report {
+          if !report.unverified_langs.is_empty() {
+            text.push_str(&format!(
+              "\nnote: {} dynamic language(s) extracted without a canary (best-effort, \
+               unverified): {}",
+              report.unverified_langs.len(),
+              report.unverified_langs.join(", ")
+            ));
+          }
         }
         Ok((text, json!({})))
       }
@@ -1274,6 +1356,67 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     "description": description,
     "inputSchema": {"type": "object", "properties": properties, "required": required}
   })
+}
+
+/// Coded error for a state the match above makes impossible (report and note both absent);
+/// returning an error keeps the no-panic contract even if a refactor breaks the invariant.
+fn unreachable_report() -> Result<String, String> {
+  Err("internal: index build produced neither a report nor a supervised note".to_string())
+}
+
+/// The D1 proactive rebuild worker: debounce dirtiness, build through the supervisor (or
+/// in-process when unavailable), repeat. Detached for the daemon's lifetime; it owns its own
+/// watch and touches no server state — commits publish via the atomic CURRENT swap, and the
+/// serving thread reloads on its own dirty signal.
+fn spawn_rebuild_worker(
+  src: PathBuf,
+  index_dir: PathBuf,
+  supervisor: Supervisor,
+  env: ExtractionEnv,
+) {
+  std::thread::spawn(move || {
+    let Some(watch) = SourceWatch::start(&src) else {
+      return;
+    };
+    // The flag starts dirty (changes since the last index produced no events): the first
+    // pass brings the index current before the first query needs it.
+    loop {
+      if !watch.take_dirty() {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        continue;
+      }
+      // Debounce: wait for a quiet half-second so an editor's save burst builds once.
+      loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !watch.take_dirty() {
+          break;
+        }
+      }
+      let outcome = match supervisor.build(&src, &index_dir) {
+        Ok(BuildOutcome::Supervised(_)) => Ok(()),
+        Ok(BuildOutcome::Unavailable) => {
+          let _guard = in_process_build_guard();
+          build_index_env(
+            &src,
+            &index_dir,
+            CacheMode::default(),
+            ParseHealthPolicy::default(),
+            &env,
+          )
+          .map(|_| ())
+          .map_err(|err| err.to_string())
+        }
+        Err(err) => Err(err),
+      };
+      if let Err(err) = outcome {
+        // stderr is free under stdio MCP (the protocol owns stdout). The serving thread's
+        // own dirty flag is still set, so queries retry and surface the error themselves.
+        eprintln!("vorpal-mcp: background rebuild failed: {err}");
+        watch.mark_dirty();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+      }
+    }
+  });
 }
 
 /// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`), if

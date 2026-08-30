@@ -118,3 +118,20 @@ registered at launch, and the daemon's rebuilds use the same extraction environm
 rules, ref specs, canaries, injection config) that `vorpal index` builds from the project
 config. A dynamic language without a `canary` is extracted best-effort and named in every
 `index` tool response as unverified — never silently trusted.
+
+## Freshness and crash isolation
+
+The daemon watches the source tree (FSEvents/inotify) and rebuilds **proactively**: after a
+save, once the tree is quiet for half a second, a background worker rebuilds the index so the
+first query after an edit is already warm (it pays a fast-path check plus an mmap reload, not
+the build). Disable with `--no-watch-rebuild` (or `VORPAL_WATCH_REBUILD=0`); queries then
+refresh lazily, exactly as before.
+
+Builds run **supervised** whenever an indexer binary can be found (`VORPAL_INDEX_BIN`
+override; the daemon's own executable when it is `vorpal`/`vorpal-index`; else a
+`vorpal-index` beside it): the indexer runs as a child process, so a pathological input — a
+grammar crash, a runaway allocation — costs one build attempt and an error string, never the
+server. The served graph keeps answering from the committed generation throughout; only the
+atomic `CURRENT` swap publishes new work, and `index` responses are prefixed `(supervised)`
+when a child ran. Without a discoverable binary the build runs in-process and says so.
+Child builds are killed after `VORPAL_MCP_BUILD_TIMEOUT_S` (default 1800).

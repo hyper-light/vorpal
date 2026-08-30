@@ -135,6 +135,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             report.error_files, report.error_nodes, report.error_bytes
           );
         }
+        if !report.unverified_langs.is_empty() {
+          println!(
+            "note: {} dynamic language(s) indexed without a canary (best-effort, unverified): {}",
+            report.unverified_langs.len(),
+            report.unverified_langs.join(", ")
+          );
+        }
         if report.excluded_files > 0 {
           println!(
             "note: {} unhealthy files excluded from the graph (parse-health policy)",

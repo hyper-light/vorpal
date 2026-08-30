@@ -210,6 +210,7 @@ mod test_cli {
       "search kfree($X) --code --lang c -k 30",
       "mcp --index /tmp/idx",
       "mcp --profile scout",
+      "mcp --no-watch-rebuild",
       "graph coverage",
       "graph coverage --format json --limit 10",
       "graph impact --since origin/main --src . --depth 3",

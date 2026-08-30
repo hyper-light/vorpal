@@ -11,6 +11,7 @@
 //! transport later without touching the tool logic.
 
 mod server;
+mod supervised;
 mod tools;
 mod watch;
 
@@ -39,7 +40,18 @@ pub fn serve_stdio_env(
   profile: Profile,
   env: vorpal_index::ExtractionEnv,
 ) -> io::Result<()> {
-  let mut server = Server::with_profile_env(index_dir, profile, env);
+  serve_stdio_opts(index_dir, profile, env, true)
+}
+
+/// [`serve_stdio_env`] plus the D1 toggle: `watch_rebuild` gates the proactive background
+/// rebuild worker (also disable-able at runtime with `VORPAL_WATCH_REBUILD=0`).
+pub fn serve_stdio_opts(
+  index_dir: PathBuf,
+  profile: Profile,
+  env: vorpal_index::ExtractionEnv,
+  watch_rebuild: bool,
+) -> io::Result<()> {
+  let mut server = Server::with_profile_env_rebuild(index_dir, profile, env, watch_rebuild);
   let stdin = io::stdin();
   let mut stdout = io::stdout().lock();
   for line in stdin.lock().lines() {
