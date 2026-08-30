@@ -124,7 +124,7 @@ pub(crate) fn rotate_row(row: &mut [f32]) {
   }
 }
 
-fn quantize_row(row: &[f32], codes: &mut [i8]) -> (f32, f32) {
+pub(crate) fn quantize_row(row: &[f32], codes: &mut [i8]) -> (f32, f32) {
   let max_abs = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
   if max_abs == 0.0 {
     codes.fill(0);
@@ -143,6 +143,11 @@ fn quantize_row(row: &[f32], codes: &mut [i8]) -> (f32, f32) {
 }
 
 impl QuantMatrix {
+  /// Row stride (dim padded to a 16 multiple) — overlay rows must match it exactly.
+  pub(crate) fn padded(&self) -> usize {
+    self.padded
+  }
+
   /// Build by filling and quantizing one row at a time, in parallel — the full-precision
   /// matrix never exists (at kernel scale it was 2.9 GB of pure transient).
   pub fn from_rows<F: Fn(usize, &mut [f32]) + Sync>(n: usize, dim: usize, fill: F) -> Self {
@@ -356,7 +361,7 @@ fn dot_i8_x4(a: [&[i8]; 4], b: &[i8]) -> [i32; 4] {
   ]
 }
 
-fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
   #[cfg(target_arch = "aarch64")]
   {
     // Apple Silicon builds enable `dotprod` at compile time, so this is a static branch;

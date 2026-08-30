@@ -154,6 +154,19 @@ is load-bearing, the third independent confirmation of that law.
   unroll at dim 256) judged diminishing; the structural time lever remains the FastScan
   package below.
 
+- Tier-3 incremental overlay, T3a — **LANDED** (`vorpal_ann::AnnOverlay`): immutable base
+  tier + tombstones + appended rows + per-node adjacency patches; every repair path prunes
+  with the build's α=1.2 (the FreshDiskANN no-decay condition); deletes tombstone in O(1)
+  and keep ROUTING (removal-from-routing is the documented collapse); searches never
+  return tombstones; deterministic replay pinned by test. Kernel-scale probe (2.34M rows):
+  insert 184µs, delete 88ns, search(l=80) 140µs, adopt 52ms per generation. A 100-del +
+  100-ins edit ≈ **18.5ms CPU vs ~330 CPU-s full rebuild (~18,000×)**. Churn test: 10
+  cycles × 5% delete+insert holds pool recall within ε of start. T3b (daemon wiring:
+  symbol-diff → vector ops in LiveOverlay, serve from AnnOverlay, consolidation triggers +
+  probe cadence + compactor reconciliation) is the next arc; integration points:
+  `crates/index/src/live.rs` absorb/retract paths already carry the per-file node-id
+  diffs, `warm_ann` becomes the compactor, `ann.files` OverlayView retires.
+
 Next up: FastScan-packed SymphonyQG layout as a dedicated branch-scale effort (design
 above), and Tier-3 incremental daemon tier (unblocked, independent of Tier-2).
 

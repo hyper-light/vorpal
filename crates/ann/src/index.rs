@@ -38,11 +38,11 @@ impl AnnConfig {
   }
 }
 
-const VAMANA_R: usize = 32;
-const VAMANA_ALPHA: f32 = 1.2;
+pub(crate) const VAMANA_R: usize = 32;
+pub(crate) const VAMANA_ALPHA: f32 = 1.2;
 const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
-const VAMANA_L_BUILD: usize = 48;
+pub(crate) const VAMANA_L_BUILD: usize = 48;
 
 // ---- Measured build calibration (SUBSECOND.md Phase 2a, measurement-only) ------------------
 // Every Vamana build measures its own graph against an exact seeded oracle and stamps the
@@ -129,18 +129,18 @@ fn read_le_slice<T: bytemuck::Pod, const W: usize>(
 pub struct AnnIndex {
   /// xxh3 of the node segment this index was built from — generation identity (v5).
   base_stamp: u64,
-  dim: usize,
+  pub(crate) dim: usize,
   /// Full-precision rows — flat tiers only (empty for Vamana, whose rows live in `quant`).
   vectors: Vec<f32>,
-  ids: PodColumn<u64>,
+  pub(crate) ids: PodColumn<u64>,
   config: AnnConfig,
   codes: Vec<u64>,
   code_words: usize,
   /// i8 rows + scale algebra — the Vamana tier's only vector storage.
-  quant: Option<QuantMatrix>,
+  pub(crate) quant: Option<QuantMatrix>,
   /// Vamana adjacency: per-node lists when just built, CSR columns when loaded (mapped).
-  graph: AnnGraphStore,
-  medoid: u32,
+  pub(crate) graph: AnnGraphStore,
+  pub(crate) medoid: u32,
   /// Phase-2a build calibration, when this index was constructed in-process:
   /// `(chosen l_build rung, measured pool recall)`. In-memory provenance only — the
   /// persisted form lives in `ann.model.json`; loaded indexes report `None`.
@@ -148,7 +148,7 @@ pub struct AnnIndex {
 }
 
 /// The Vamana graph's storage form. Both expose identical rows via [`Adjacency`].
-enum AnnGraphStore {
+pub(crate) enum AnnGraphStore {
   /// Freshly built: the construction slab (fixed-capacity rows + lengths).
   Flat {
     flat: Vec<u32>,
@@ -162,7 +162,7 @@ enum AnnGraphStore {
 }
 
 impl AnnGraphStore {
-  fn adjacency(&self) -> Adjacency<'_> {
+  pub(crate) fn adjacency(&self) -> Adjacency<'_> {
     match self {
       AnnGraphStore::Flat { flat, lens, cap } => Adjacency::FlatCap {
         flat,
