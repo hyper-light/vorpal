@@ -161,6 +161,12 @@ pub(crate) struct RefSpec {
   method_callee_kinds: &'static [&'static str],
   /// Receiver spellings that denote the enclosing type (`self`, `this`, `$this`).
   self_receivers: &'static [&'static str],
+  /// Body-less type WRAPPER kinds: in `struct X y;` the wrapper's `name` field IS the
+  /// type being used, so the generic definition-name skip must not eat it. A wrapper
+  /// WITH a body is the definition itself and stays skipped. Measured before this
+  /// existed: 7 of ~2,340 `struct file_operations`-typed kernel declarations produced a
+  /// type reference.
+  type_ref_wrappers: &'static [&'static str],
 }
 
 const NONE_TEXT: &[(&str, TextAction)] = &[];
@@ -181,6 +187,7 @@ const SPEC_DEFAULTS: RefSpec = RefSpec {
   static_callee_kinds: NO_KINDS,
   method_callee_kinds: NO_KINDS,
   self_receivers: NO_KINDS,
+  type_ref_wrappers: NO_KINDS,
 };
 
 const RUST: RefSpec = RefSpec {
@@ -300,6 +307,7 @@ const C_LIKE: RefSpec = RefSpec {
   static_callee_kinds: &["qualified_identifier"],
   method_callee_kinds: &["field_expression"],
   self_receivers: &["this"],
+  type_ref_wrappers: &["struct_specifier", "union_specifier", "enum_specifier"],
   ..SPEC_DEFAULTS
 };
 
@@ -1154,7 +1162,17 @@ fn stage_type_use<'t>(
     .field("name")
     .is_some_and(|name| name.node_id() == node.node_id())
   {
-    return;
+    // A parent's `name` is normally a DEFINITION's own name — never a use. The one
+    // exception: body-less type wrappers (`struct X y;` — declarations, parameters,
+    // fields), where the wrapped name is exactly the type in use.
+    let bodyless_wrapper = spec
+      .type_ref_wrappers
+      .iter()
+      .any(|k| *k == parent.kind().as_ref())
+      && parent.field("body").is_none();
+    if !bodyless_wrapper {
+      return;
+    }
   }
   // Parent and grandparent, straight off the walk stack (was two root-walking
   // `Node::parent` calls per type leaf).
@@ -1553,6 +1571,30 @@ mod tests {
   }
 
   #[test]
+  fn c_bodyless_struct_wrappers_stage_type_uses() {
+    // `struct fops` as a variable's or parameter's type is a USE of the type — the
+    // wrapper's name field must stage even though name-field nodes are normally
+    // definition names. The definition itself (body present) must not self-reference.
+    let var_refs = refs_for(
+      SupportLang::C,
+      "struct fops { int x; };\nstatic const struct fops my_ops = { 0 };\n",
+    );
+    let param_refs = refs_for(
+      SupportLang::C,
+      "struct fops { int x; };\nvoid takes(struct fops *f) { int y; }\n",
+    );
+    let count = |refs: &[(String, RefKind)]| {
+      refs.iter().filter(|(n, k)| n == "fops" && *k == RefKind::Type).count()
+    };
+    // (The shared test harness maps every span to one NodeId, so per-(from, name) dedup
+    // makes a combined-source count meaningless — the split sources are the real check.)
+    assert!(
+      count(&var_refs) >= 1 && count(&param_refs) >= 1,
+      "variable ({var_refs:?}) and parameter ({param_refs:?}) type uses must stage"
+    );
+  }
+
+  #[test]
   fn elixir_defs_skip_calls_emit_and_imports_resolve() {
     let refs = refs_for(
       SupportLang::Elixir,
@@ -1859,7 +1901,14 @@ mod tests {
           .field("name")
           .is_some_and(|name| name.node_id() == node.node_id())
         {
-          continue;
+          let bodyless_wrapper = spec
+            .type_ref_wrappers
+            .iter()
+            .any(|k| *k == parent.kind().as_ref())
+            && parent.field("body").is_none();
+          if !bodyless_wrapper {
+            continue;
+          }
         }
         let mut skip = false;
         let mut ancestor = Some(parent);
