@@ -73,7 +73,7 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 | `type_users` | Definitions using a type in fields, params, returns, or annotations. |
 | `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`; add `"data_flows"` to follow argument flow). |
 | `data_flow` | Where a symbol's arguments flow: per-argument rows (`arg#i` → callee `param#j`, with the argument expression when traceable) joined from the `dataflow.bin` sidecar. Captured for Rust/Python/TypeScript/TSX call sites; older generations without the sidecar answer empty. |
-| `query` | Cypher-shaped read-only queries: `MATCH (f:Function)-[:calls*1..3]->(g {name: "parse"}) WHERE f.path STARTS WITH "src/" RETURN f.name, f.path LIMIT 20`. One linear pattern, AND-combined predicates, projections or `COUNT(*)`/`COUNT(DISTINCT …)` with one grouping key, `ORDER BY`/`SKIP`/`LIMIT`. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, 100k rows) and refuses by naming the ceiling instead of truncating. |
+| `query` | Cypher-shaped read-only queries: `MATCH (f:Function)-[:calls*1..3]->(g)-[:imports]->(h) WHERE f.in_degree >= 20 AND (g.path CONTAINS "core" OR NOT g.exported = true) RETURN f.name, g.name LIMIT 20`. Linear patterns up to 8 segments, AND/OR/NOT predicate trees with parentheses and ordered comparisons, projections or `COUNT(*)`/`COUNT(DISTINCT …)` with one grouping key, `ORDER BY`/`SKIP`/`LIMIT`. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, 100k rows) and refuses by naming the ceiling instead of truncating. |
 
 **Search**
 | Tool | What it does |

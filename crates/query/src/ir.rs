@@ -20,15 +20,21 @@ pub struct Query {
   pub limit: Option<u64>,
 }
 
-/// A single linear pattern: one node, optionally connected through one relationship
-/// segment to a second node (the v1 grammar — no multi-segment chains or joins).
+/// One linear pattern: a start node followed by zero or more relationship segments
+/// (v1.2 — chains like `(a)-[:calls]->(b)-[:imports]->(c)`; still no joins or cycles:
+/// each pattern variable binds exactly once).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pattern {
   pub left: NodePattern,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub rel: Option<RelPattern>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub right: Option<NodePattern>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub segments: Vec<PatternSegment>,
+}
+
+/// One `-[rel]-> (node)` link in a pattern chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatternSegment {
+  pub rel: RelPattern,
+  pub node: NodePattern,
 }
 
 /// `(var:Kind {name: "x", path: "suffix", id: 7, eid: "hex"})` — every part optional.

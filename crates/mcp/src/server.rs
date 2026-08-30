@@ -1327,15 +1327,16 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
     ),
     tool(
       "query",
-      "Cypher-shaped READ-ONLY graph query. One MATCH with a single linear pattern — \
-       (var:Kind {name: \"x\", path: \"suffix\"}) optionally joined through \
-       -[:calls|data_flows*1..5 {grade: constrained}]-> to a second node — then WHERE \
-       (AND-combined =, <>, STARTS/ENDS WITH, CONTAINS over name/path/kind/exported/id/eid), \
-       RETURN projections or COUNT(*) / COUNT(DISTINCT var.prop) with one grouping key, \
-       ORDER BY / SKIP / LIMIT. Runs under explicit work ceilings (16KiB text, depth 10, \
-       5M edge visits, 100k rows) and refuses with the ceiling's name rather than truncate. \
-       Example: MATCH (f:Function)-[:calls*1..3]->(g {name: \"resolve_target\"}) \
-       RETURN f.name, f.path LIMIT 20",
+      "Cypher-shaped READ-ONLY graph query. One MATCH with a linear pattern — \
+       (var:Kind {name: \"x\", path: \"suffix\"}) chained through up to 8 segments like \
+       -[:calls|data_flows*1..5 {grade: constrained}]-> — then WHERE (AND/OR/NOT with \
+       parentheses over =, <>, <, <=, >, >=, STARTS/ENDS WITH, CONTAINS on \
+       name/path/kind/exported/id/eid/in_degree/out_degree/scc_size), RETURN projections \
+       or COUNT(*) / COUNT(DISTINCT var.prop) with one grouping key, ORDER BY / SKIP / \
+       LIMIT. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, \
+       100k rows) and refuses with the ceiling's name rather than truncate. Example: \
+       MATCH (f:Function)-[:calls]->(g)-[:calls]->(h {name: \"resolve_target\"}) \
+       RETURN f.name, g.name LIMIT 20",
       json!({
         "text": {"type": "string", "description": "The query text"},
         "ir": {"type": "object", "description": "Alternative: a typed IR document (the parsed form; see the vorpal-query crate docs)"}

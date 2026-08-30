@@ -33,6 +33,8 @@ pub const MAX_DEPTH: u32 = 10;
 pub const MAX_EDGE_VISITS: u64 = 5_000_000;
 /// Materialized result rows before SKIP/LIMIT (ungrouped counts stream and are exempt).
 pub const MAX_ROWS: usize = 100_000;
+/// Relationship segments one pattern may chain.
+pub const MAX_SEGMENTS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryError {

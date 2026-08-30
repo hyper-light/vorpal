@@ -164,21 +164,20 @@ impl Parser {
 
   fn pattern(&mut self) -> Result<Pattern, QueryError> {
     let left = self.node_pattern()?;
-    let (rel, right) = match self.peek() {
-      Some(Tok::Dash) | Some(Tok::Lt) => {
-        let rel = self.rel_pattern()?;
-        let right = self.node_pattern()?;
-        if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
-          return Err(QueryError::parse(
-            self.offset(),
-            "multi-segment patterns are not supported in v1 (one relationship per MATCH)",
-          ));
-        }
-        (Some(rel), Some(right))
+    let mut segments = Vec::new();
+    while matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+      let offset = self.offset();
+      if segments.len() >= crate::MAX_SEGMENTS {
+        return Err(QueryError::parse(
+          offset,
+          format!("patterns chain at most {} relationship segments", crate::MAX_SEGMENTS),
+        ));
       }
-      _ => (None, None),
-    };
-    Ok(Pattern { left, rel, right })
+      let rel = self.rel_pattern()?;
+      let node = self.node_pattern()?;
+      segments.push(PatternSegment { rel, node });
+    }
+    Ok(Pattern { left, segments })
   }
 
   fn node_pattern(&mut self) -> Result<NodePattern, QueryError> {

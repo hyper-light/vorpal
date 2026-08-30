@@ -663,8 +663,10 @@ fn query_tool_answers_text_and_ir_and_refuses_typed() {
   let ir = json!({
     "pattern": {
       "left": {"var": "f"},
-      "rel": {"types": ["calls"], "direction": "out"},
-      "right": {"var": "g", "props": [["name", "target"]]}
+      "segments": [{
+        "rel": {"types": ["calls"], "direction": "out"},
+        "node": {"var": "g", "props": [["name", "target"]]}
+      }]
     },
     "returns": {"rows": [{"var": "f", "prop": "name"}]}
   });

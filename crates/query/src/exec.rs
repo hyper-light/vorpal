@@ -270,15 +270,15 @@ impl SidePlan {
   }
 }
 
-/// A WHERE conjunct bound to a side (0 = left, 1 = right).
+/// A WHERE comparison bound to a pattern slot.
 struct BoundPredicate {
-  side: usize,
+  slot: usize,
   prop: String,
   op: CmpOp,
   value: PropValue,
 }
 
-/// The WHERE tree with every leaf's variable resolved to a side.
+/// The WHERE tree with every leaf's variable resolved to a slot.
 enum BoundPred {
   Cmp(BoundPredicate),
   And(Vec<BoundPred>),
@@ -287,15 +287,15 @@ enum BoundPred {
 }
 
 impl BoundPred {
-  fn eval(&self, kg: &Kg, l: u32, r: u32) -> bool {
+  fn eval(&self, kg: &Kg, row: &[u32]) -> bool {
     match self {
       BoundPred::Cmp(leaf) => {
-        let id = if leaf.side == 0 { l } else { r };
+        let id = row.get(leaf.slot).copied().unwrap_or(u32::MAX);
         id != u32::MAX && leaf.eval(kg, id)
       }
-      BoundPred::And(terms) => terms.iter().all(|t| t.eval(kg, l, r)),
-      BoundPred::Or(terms) => terms.iter().any(|t| t.eval(kg, l, r)),
-      BoundPred::Not(inner) => !inner.eval(kg, l, r),
+      BoundPred::And(terms) => terms.iter().all(|t| t.eval(kg, row)),
+      BoundPred::Or(terms) => terms.iter().any(|t| t.eval(kg, row)),
+      BoundPred::Not(inner) => !inner.eval(kg, row),
     }
   }
 }
@@ -314,7 +314,7 @@ impl BoundPredicate {
       (CmpOp::Eq, PropValue::Int(want), Cell::Int(have)) => want == have,
       (CmpOp::Eq, PropValue::Bool(want), Cell::Bool(have)) => want == have,
       (CmpOp::Ne, _, _) => !BoundPredicate {
-        side: self.side,
+        slot: self.slot,
         prop: self.prop.clone(),
         op: CmpOp::Eq,
         value: self.value.clone(),
@@ -332,109 +332,117 @@ impl BoundPredicate {
   }
 }
 
-/// One projected column bound to a side.
+/// One projected column bound to a pattern slot.
 struct BoundColumn {
   title: String,
-  side: usize,
+  slot: usize,
   prop: String,
 }
 
 pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError> {
-  // ---- Plan: sides, vars, relationship. ----
-  let left = SidePlan::compile(&query.pattern.left)?;
-  let right = match (&query.pattern.rel, &query.pattern.right) {
-    (Some(_), Some(node)) => Some(SidePlan::compile(node)?),
-    (None, None) => None,
-    _ => {
-      return Err(QueryError::Plan(
-        "a relationship needs nodes on both sides (and vice versa)".into(),
-      ));
-    }
-  };
-  if let (Some(l), Some(r)) = (&left.var, right.as_ref().and_then(|r| r.var.as_ref())) {
-    if l == r.as_str() {
-      return Err(QueryError::Plan(format!("variable '{l}' is bound twice")));
+  // ---- Plan: pattern slots (start node + one per segment), vars, relationships. ----
+  let mut nodes: Vec<SidePlan> = vec![SidePlan::compile(&query.pattern.left)?];
+  for segment in &query.pattern.segments {
+    nodes.push(SidePlan::compile(&segment.node)?);
+  }
+  for (index, node) in nodes.iter().enumerate() {
+    if let Some(var) = &node.var {
+      if nodes[..index].iter().any(|n| n.var.as_deref() == Some(var.as_str())) {
+        return Err(QueryError::Plan(format!(
+          "variable '{var}' is bound twice — cycle constraints are not supported"
+        )));
+      }
     }
   }
-  let side_of = |var: &str| -> Result<usize, QueryError> {
-    if left.var.as_deref() == Some(var) {
-      Ok(0)
-    } else if right.as_ref().and_then(|r| r.var.as_deref()) == Some(var) {
-      Ok(1)
-    } else {
-      Err(QueryError::Plan(format!("variable '{var}' is not bound in MATCH")))
-    }
+  let slot_of = |var: &str| -> Result<usize, QueryError> {
+    nodes
+      .iter()
+      .position(|n| n.var.as_deref() == Some(var))
+      .ok_or_else(|| QueryError::Plan(format!("variable '{var}' is not bound in MATCH")))
   };
 
-  let rel = match &query.pattern.rel {
-    Some(rel) => {
-      let mut bases: Vec<u16> = Vec::new();
-      for name in &rel.types {
-        let edge = EdgeType::from_name(name).ok_or_else(|| {
-          QueryError::Plan(format!(
-            "unknown relation '{name}' — `vorpal graph schema` lists this index's relations"
-          ))
-        })?;
-        if !bases.contains(&edge.base().0) {
-          bases.push(edge.base().0);
-        }
+  /// One compiled relationship: allowed bases, direction, var-length range, grade floor.
+  struct CompiledRel {
+    bases: Vec<u16>,
+    direction: RelDirection,
+    range: Option<(u32, u32)>,
+    min_conf: u8,
+  }
+  let mut rels: Vec<CompiledRel> = Vec::new();
+  for segment in &query.pattern.segments {
+    let rel = &segment.rel;
+    let mut bases: Vec<u16> = Vec::new();
+    for name in &rel.types {
+      let edge = EdgeType::from_name(name).ok_or_else(|| {
+        QueryError::Plan(format!(
+          "unknown relation '{name}' — `vorpal graph schema` lists this index's relations"
+        ))
+      })?;
+      if !bases.contains(&edge.base().0) {
+        bases.push(edge.base().0);
       }
-      let range = match rel.range {
-        None => None,
-        Some((min, max)) => {
-          if min == 0 {
-            return Err(QueryError::Plan("a range minimum of 0 is not supported (paths have at least one hop)".into()));
-          }
-          if min > max {
-            return Err(QueryError::Plan(format!("empty range *{min}..{max}")));
-          }
-          if max > MAX_DEPTH {
-            return Err(QueryError::Ceiling {
-              what: "depth",
-              limit: MAX_DEPTH as u64,
-            });
-          }
-          Some((min, max))
-        }
-      };
-      Some((bases, rel.direction, range, min_confidence_for_grade(rel.grade.as_deref())?))
     }
-    None => None,
-  };
+    let range = match rel.range {
+      None => None,
+      Some((min, max)) => {
+        if min == 0 {
+          return Err(QueryError::Plan(
+            "a range minimum of 0 is not supported (paths have at least one hop)".into(),
+          ));
+        }
+        if min > max {
+          return Err(QueryError::Plan(format!("empty range *{min}..{max}")));
+        }
+        if max > MAX_DEPTH {
+          return Err(QueryError::Ceiling {
+            what: "depth",
+            limit: MAX_DEPTH as u64,
+          });
+        }
+        Some((min, max))
+      }
+    };
+    rels.push(CompiledRel {
+      bases,
+      direction: rel.direction,
+      range,
+      min_conf: min_confidence_for_grade(rel.grade.as_deref())?,
+    });
+  }
 
   // ---- Plan: predicates, projections, order, aggregation. ----
   fn bind_pred(
     expr: &PredExpr,
-    side_of: &impl Fn(&str) -> Result<usize, QueryError>,
+    slot_of: &impl Fn(&str) -> Result<usize, QueryError>,
   ) -> Result<BoundPred, QueryError> {
     Ok(match expr {
       PredExpr::Cmp(pred) => {
         check_prop(&pred.target.prop)?;
         check_predicate_types(&pred.target.prop, pred.op, &pred.value)?;
         BoundPred::Cmp(BoundPredicate {
-          side: side_of(&pred.target.var)?,
+          slot: slot_of(&pred.target.var)?,
           prop: pred.target.prop.clone(),
           op: pred.op,
           value: pred.value.clone(),
         })
       }
       PredExpr::And(terms) => BoundPred::And(
-        terms.iter().map(|t| bind_pred(t, side_of)).collect::<Result<_, _>>()?,
+        terms.iter().map(|t| bind_pred(t, slot_of)).collect::<Result<_, _>>()?,
       ),
       PredExpr::Or(terms) => BoundPred::Or(
-        terms.iter().map(|t| bind_pred(t, side_of)).collect::<Result<_, _>>()?,
+        terms.iter().map(|t| bind_pred(t, slot_of)).collect::<Result<_, _>>()?,
       ),
-      PredExpr::Not(inner) => BoundPred::Not(Box::new(bind_pred(inner, side_of)?)),
+      PredExpr::Not(inner) => BoundPred::Not(Box::new(bind_pred(inner, slot_of)?)),
     })
   }
   let predicate: Option<BoundPred> =
-    query.predicate.as_ref().map(|p| bind_pred(p, &side_of)).transpose()?;
+    query.predicate.as_ref().map(|p| bind_pred(p, &slot_of)).transpose()?;
 
   let expand_projection =
     |proj: &Projection, out: &mut Vec<BoundColumn>| -> Result<(), QueryError> {
       match &proj.expr {
         ProjExpr::Var { var } => {
-          let side = side_of(var)?;
+          let slot = slot_of(var)?;
           if let Some(alias) = &proj.alias {
             return Err(QueryError::Plan(format!(
               "a bare variable expands to {var}.id/name/kind/path and cannot take AS {alias}"
@@ -443,7 +451,7 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
           for prop in ["id", "name", "kind", "path"] {
             out.push(BoundColumn {
               title: format!("{var}.{prop}"),
-              side,
+              slot,
               prop: prop.to_string(),
             });
           }
@@ -452,7 +460,7 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
           check_prop(prop)?;
           out.push(BoundColumn {
             title: proj.alias.clone().unwrap_or_else(|| format!("{var}.{prop}")),
-            side: side_of(var)?,
+            slot: slot_of(var)?,
             prop: prop.clone(),
           });
         }
@@ -482,7 +490,7 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
       let distinct = match distinct {
         Some(prop_ref) => {
           check_prop(&prop_ref.prop)?;
-          Some((side_of(&prop_ref.var)?, prop_ref.prop.clone()))
+          Some((slot_of(&prop_ref.var)?, prop_ref.prop.clone()))
         }
         None => None,
       };
@@ -504,79 +512,88 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
     }
   };
 
-  // ---- Materialize bindings: (left id, right id) pairs, deterministic order. ----
-  // A pure ungrouped COUNT(*) streams through a counter instead — the rows ceiling
-  // protects materialized memory, and a scalar count materializes nothing (the edge-visit
-  // budget still bounds its traversal work).
+  // ---- Materialize rows: one u32 per pattern slot, stride-flat, deterministic order. ----
+  // A pure ungrouped COUNT(*) streams its final stage through a counter (the rows ceiling
+  // protects materialized memory; intermediate chain stages still cap — a partial row is
+  // materialized memory too). Rows are unique by construction: candidates are distinct and
+  // each expansion step dedups its per-seed reach, so no output dedup pass exists.
   let pure_count =
     matches!(&consumer, Consumer::Count { distinct: None, group: None });
   let mut count_only: u64 = 0;
-  let mut bindings: Vec<(u32, u32)> = Vec::new(); // right == u32::MAX when unbound
+  let stride = nodes.len();
   const NO_NODE: u32 = u32::MAX;
-  fn emit(
-    pure_count: bool,
-    count_only: &mut u64,
-    bindings: &mut Vec<(u32, u32)>,
-    l: u32,
-    r: u32,
-  ) -> Result<(), QueryError> {
+  let mut rows_flat: Vec<u32> = Vec::new();
+  let passes_where =
+    |kg: &Kg, row: &[u32]| -> bool { predicate.as_ref().is_none_or(|p| p.eval(kg, row)) };
+
+  if rels.is_empty() {
+    // Single node: candidates + parallel WHERE (a full-scan predicate like
+    // `in_degree >= 500` was ~1s serial at kernel scale; the order-preserving rayon
+    // filter answers in ~10ms).
+    let candidates = nodes[0].candidates(kg);
+    let survivors: Vec<u32> = if predicate.is_none() {
+      candidates
+    } else {
+      use rayon::prelude::*;
+      candidates
+        .into_par_iter()
+        .filter(|&id| passes_where(kg, &[id]))
+        .collect()
+    };
     if pure_count {
-      *count_only += 1;
-      return Ok(());
-    }
-    bindings.push((l, r));
-    if bindings.len() > MAX_ROWS {
+      count_only = survivors.len() as u64;
+    } else if survivors.len() > MAX_ROWS {
       return Err(QueryError::Ceiling {
         what: "rows",
         limit: MAX_ROWS as u64,
       });
+    } else {
+      rows_flat = survivors;
     }
-    Ok(())
-  }
-  let passes_where = |kg: &Kg, l: u32, r: u32| -> bool {
-    predicate.as_ref().is_none_or(|p| p.eval(kg, l, r))
-  };
+  } else {
+    // Anchor at the cheaper END of the chain; when anchored right, the chain is walked in
+    // reverse with each segment's legs flipped. (Middle anchoring is a future planner.)
+    let last = nodes.len() - 1;
+    let anchor_left = nodes[0].cost() <= nodes[last].cost();
+    let steps: Vec<(usize, usize, usize)> = if anchor_left {
+      (0..rels.len()).map(|i| (i, i, i + 1)).collect()
+    } else {
+      (0..rels.len()).rev().map(|i| (i, i + 1, i)).collect()
+    };
+    let anchor_slot = if anchor_left { 0 } else { last };
+    let graph = kg.graph();
+    let mut budget: u64 = MAX_EDGE_VISITS;
 
-  match (&rel, &right) {
-    (None, _) => {
-      // WHERE evaluates in parallel over the candidate set (a full-scan predicate like
-      // `in_degree >= 500` touches every node's view — serial, that was ~1s at kernel
-      // scale; the rayon filter preserves encounter order, so rows stay deterministic).
-      let candidates = left.candidates(kg);
-      let survivors: Vec<u32> = if predicate.is_none() {
-        candidates
-      } else {
-        use rayon::prelude::*;
-        candidates
-          .into_par_iter()
-          .filter(|&id| passes_where(kg, id, NO_NODE))
-          .collect()
-      };
-      for id in survivors {
-        emit(pure_count, &mut count_only, &mut bindings, id, NO_NODE)?;
-      }
+    let mut partial: Vec<u32> = Vec::new();
+    for id in nodes[anchor_slot].candidates(kg) {
+      let base = partial.len();
+      partial.resize(base + stride, NO_NODE);
+      partial[base + anchor_slot] = id;
     }
-    (Some((bases, direction, range, min_conf)), Some(right_plan)) => {
-      // Anchor the cheaper side; expansion legs derive from direction and anchor side.
-      let anchor_left = left.cost() <= right_plan.cost();
-      let (anchor, other) = if anchor_left { (&left, right_plan) } else { (right_plan, &left) };
-      let seeds = anchor.candidates(kg);
-      // Which adjacency legs to walk from the anchor: Out means the edge points
-      // left → right, so an anchor on the right follows In-edges to find lefts.
-      let (walk_out, walk_in) = match (direction, anchor_left) {
+    let mut reached: Vec<u32> = Vec::new();
+    let total_steps = steps.len();
+    for (step_index, &(rel_index, from_slot, to_slot)) in steps.iter().enumerate() {
+      let rel = &rels[rel_index];
+      let final_step = step_index + 1 == total_steps;
+      // The authored direction reads left→right along the chain; a reversed walk flips it.
+      let forward = from_slot < to_slot;
+      let (walk_out, walk_in) = match (rel.direction, forward) {
         (RelDirection::Out, true) | (RelDirection::In, false) => (true, false),
         (RelDirection::Out, false) | (RelDirection::In, true) => (false, true),
         (RelDirection::Both, _) => (true, true),
       };
-      let graph = kg.graph();
-      let mut budget: u64 = MAX_EDGE_VISITS;
-      let mut reached: Vec<u32> = Vec::new();
-      for &seed in &seeds {
+      let target_plan = &nodes[to_slot];
+      let mut next: Vec<u32> = Vec::new();
+      for row in partial.chunks_exact(stride) {
+        let seed = row[from_slot];
         reached.clear();
-        match range {
-          None => one_hop(graph, seed, bases, *min_conf, walk_out, walk_in, &mut budget, &mut reached)?,
+        match rel.range {
+          None => one_hop(
+            graph, seed, &rel.bases, rel.min_conf, walk_out, walk_in, &mut budget,
+            &mut reached,
+          )?,
           Some((min, max)) => bounded_bfs(
-            graph, seed, bases, *min_conf, walk_out, walk_in, *min, *max, &mut budget,
+            graph, seed, &rel.bases, rel.min_conf, walk_out, walk_in, min, max, &mut budget,
             &mut reached,
           )?,
         }
@@ -586,25 +603,60 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
           let Some(view) = kg.node(NodeId::new(node as u64)) else {
             continue;
           };
-          if !other.matches(node, &view) {
+          if !target_plan.matches(node, &view) {
             continue;
           }
-          let (l, r) = if anchor_left { (seed, node) } else { (node, seed) };
-          if !passes_where(kg, l, r) {
-            continue;
+          if final_step {
+            // The row is complete: WHERE, then stream (pure count) or keep.
+            let base = next.len();
+            next.extend_from_slice(row);
+            next[base + to_slot] = node;
+            let complete = &next[base..base + stride];
+            if !passes_where(kg, complete) {
+              next.truncate(base);
+              continue;
+            }
+            if pure_count {
+              count_only += 1;
+              next.truncate(base);
+              continue;
+            }
+            if next.len() / stride > MAX_ROWS {
+              return Err(QueryError::Ceiling {
+                what: "rows",
+                limit: MAX_ROWS as u64,
+              });
+            }
+          } else {
+            if next.len() / stride >= MAX_ROWS {
+              return Err(QueryError::Ceiling {
+                what: "rows",
+                limit: MAX_ROWS as u64,
+              });
+            }
+            let base = next.len();
+            next.extend_from_slice(row);
+            next[base + to_slot] = node;
           }
-          // Pairs are unique by construction (distinct seeds × per-seed deduped reach),
-          // so the streaming counter and the materialized path agree exactly.
-          emit(pure_count, &mut count_only, &mut bindings, l, r)?;
         }
       }
-      bindings.sort_unstable();
-      bindings.dedup();
+      partial = next;
+      if partial.is_empty() {
+        break;
+      }
     }
-    _ => {
-      return Err(QueryError::Plan(
-        "a relationship needs nodes on both sides (and vice versa)".into(),
-      ));
+    rows_flat = partial;
+    // Deterministic output order regardless of anchoring: rows sort lexicographically by
+    // their slot ids (construction order already is a pure function of the graph; the sort
+    // makes the contract independent of the planner's anchor choice).
+    if !pure_count && stride > 0 && !rows_flat.is_empty() {
+      let mut order: Vec<usize> = (0..rows_flat.len() / stride).collect();
+      order.sort_by_key(|&row| &rows_flat[row * stride..(row + 1) * stride]);
+      let mut sorted = Vec::with_capacity(rows_flat.len());
+      for row in order {
+        sorted.extend_from_slice(&rows_flat[row * stride..(row + 1) * stride]);
+      }
+      rows_flat = sorted;
     }
   }
 
@@ -612,13 +664,13 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
   let (columns, mut rows): (Vec<String>, Vec<Vec<Cell>>) = match consumer {
     Consumer::Rows(cols) => {
       let titles: Vec<String> = cols.iter().map(|c| c.title.clone()).collect();
-      let rows = bindings
-        .iter()
-        .map(|&(l, r)| {
+      let rows = rows_flat
+        .chunks_exact(stride)
+        .map(|row| {
           cols
             .iter()
             .map(|c| {
-              let id = if c.side == 0 { l } else { r };
+              let id = row.get(c.slot).copied().unwrap_or(NO_NODE);
               if id == NO_NODE { Cell::Null } else { prop_cell(kg, id, &c.prop) }
             })
             .collect()
@@ -630,10 +682,10 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
       None => {
         let count = match distinct {
           None => count_only,
-          Some((side, prop)) => {
+          Some((slot, prop)) => {
             let mut seen: HashSet<Cell> = HashSet::new();
-            for &(l, r) in &bindings {
-              let id = if side == 0 { l } else { r };
+            for row in rows_flat.chunks_exact(stride) {
+              let id = row.get(slot).copied().unwrap_or(NO_NODE);
               if id != NO_NODE {
                 seen.insert(prop_cell(kg, id, &prop));
               }
@@ -645,14 +697,14 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
       }
       Some(key) => {
         let mut groups: HashMap<Cell, (u64, HashSet<Cell>)> = HashMap::new();
-        for &(l, r) in &bindings {
-          let key_id = if key.side == 0 { l } else { r };
+        for row in rows_flat.chunks_exact(stride) {
+          let key_id = row.get(key.slot).copied().unwrap_or(NO_NODE);
           let key_cell =
             if key_id == NO_NODE { Cell::Null } else { prop_cell(kg, key_id, &key.prop) };
           let entry = groups.entry(key_cell).or_default();
           entry.0 += 1;
-          if let Some((side, prop)) = &distinct {
-            let id = if *side == 0 { l } else { r };
+          if let Some((slot, prop)) = &distinct {
+            let id = row.get(*slot).copied().unwrap_or(NO_NODE);
             if id != NO_NODE {
               entry.1.insert(prop_cell(kg, id, prop));
             }

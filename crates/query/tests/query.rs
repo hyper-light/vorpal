@@ -212,8 +212,12 @@ fn typed_errors_name_the_boundary() {
     Err(QueryError::Parse { message, .. }) => message,
     other => panic!("expected a parse error for {text}, got {other:?}"),
   };
-  assert!(parse_err("MATCH (a)-[:calls]->(b)-[:calls]->(c) RETURN a.name").contains("multi-segment"));
   assert!(parse_err("MATCH (f) WHERE f.name IN ['a'] RETURN f.name").contains("IN lists"));
+  assert!(
+    parse_err(&format!("MATCH (a){} RETURN a.name", "-[:calls]->(x)".repeat(9)))
+      .contains("at most 8"),
+    "segment ceiling"
+  );
 }
 
 #[test]
@@ -397,6 +401,62 @@ fn boolean_predicate_trees() {
   // Plan errors surface from inside the tree.
   match run(&kg, r#"MATCH (f) WHERE f.name = "x" OR g.name = "y" RETURN f.name"#) {
     Err(QueryError::Plan(message)) => assert!(message.contains("not bound"), "{message}"),
+    other => panic!("expected plan error, got {other:?}"),
+  }
+}
+
+#[test]
+fn multi_segment_chains() {
+  let kg = fixture();
+
+  // Forward chain from a cheap left anchor.
+  let r = run(
+    &kg,
+    r#"MATCH (a {name: "main"})-[:calls]->(b)-[:calls]->(c) RETURN b.name, c.name"#,
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![vec![Cell::Text("parse".into()), Cell::Text("validate".into())]]
+  );
+
+  // Right-anchored chain: the planner starts at the named end and walks the chain
+  // backwards; output order is anchor-independent (rows sort by slot ids).
+  let r = run(
+    &kg,
+    r#"MATCH (a)-[:calls]->(b)-[:calls]->(c {name: "deserialize"}) RETURN a.name, b.name"#,
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![vec![Cell::Text("parse".into()), Cell::Text("validate".into())]]
+  );
+
+  // A var-length segment inside a chain.
+  let r = run(
+    &kg,
+    r#"MATCH (a {name: "main"})-[:calls*1..3]->(b)-[:calls]->(c) RETURN b.name, c.name ORDER BY b.name"#,
+  )
+  .unwrap();
+  assert_eq!(
+    r.rows,
+    vec![
+      vec![Cell::Text("parse".into()), Cell::Text("validate".into())],
+      vec![Cell::Text("validate".into()), Cell::Text("deserialize".into())],
+    ]
+  );
+
+  // WHERE spans slots across the whole chain; grouping keys any slot.
+  let r = run(
+    &kg,
+    r#"MATCH (a)-[:calls]->(b)-[:calls]->(c) WHERE c.name <> "validate" OR a.exported = false RETURN c.name, COUNT(*)"#,
+  )
+  .unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Text("deserialize".into()), Cell::Int(1)]]);
+
+  // Cycle constraints (a repeated variable) refuse with a teaching error.
+  match run(&kg, "MATCH (a)-[:calls]->(a) RETURN a.name") {
+    Err(QueryError::Plan(message)) => assert!(message.contains("bound twice"), "{message}"),
     other => panic!("expected plan error, got {other:?}"),
   }
 }
