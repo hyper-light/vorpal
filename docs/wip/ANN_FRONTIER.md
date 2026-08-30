@@ -128,6 +128,12 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
   reinvestment — a Branch-scale project, not an incremental tier swap. Implementation of
   the flat variant preserved in git history (reverted commit range noted in the log).
 
+- Refine-HALF (insertion-order prefix, mechanism-derived cost cut): **REJECTED** — pool
+  recall 0.9031 (below even the unrefined 0.9125) and unreachables ballooned to 122k.
+  Mechanism: partial refinement redistributes edges toward the refined half; merge prunes
+  on their targets evict back-edges the UNREFINED half depended on, orphaning it. Full
+  refinement re-balances symmetrically — the 19.5s build is the honest price of 0.9812.
+
 Next up: FastScan-packed SymphonyQG layout as a dedicated branch-scale effort (design
 above), and Tier-3 incremental daemon tier (unblocked, independent of Tier-2).
 
