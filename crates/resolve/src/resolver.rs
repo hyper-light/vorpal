@@ -375,6 +375,62 @@ impl Resolver {
       }
     }
 
+    // Typed-receiver narrowing (G-M2): the receiver's file-locally bound type refines the
+    // candidate set by OWNER. A hint that upgrades, never vetoes: a type that matches no
+    // in-tree owner (external type, spelling drift) falls through to untyped semantics.
+    if matches!(reference.form, RefForm::Method | RefForm::MethodHinted) {
+      if let Some(receiver_type) = reference.receiver_type {
+        scratch.refined.clear();
+        scratch.refined.extend(
+          candidates
+            .iter()
+            .filter(|s| s.owner == Some(receiver_type))
+            .copied(),
+        );
+        match scratch.refined.len() {
+          0 => {}
+          1 => {
+            let target = scratch.refined[0];
+            return Resolution {
+              target: Some(target.id),
+              edge,
+              confidence: typed_receiver_confidence(
+                interner,
+                reference,
+                target.path == reference.from_path,
+              ),
+              candidates: candidates.len(),
+              reason: typed_receiver_reason(reference.receiver_type_origin),
+              alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
+            };
+          }
+          _ => {
+            // Several methods on the SAME type (e.g. duplicate impl blocks): genuinely
+            // ambiguous, but the type narrowed the field — a labeled deterministic pick
+            // with the beaten set retained, exactly the QualifiedTie discipline.
+            let target = scratch.refined.iter().min_by_key(|s| s.id.raw()).map(|s| s.id);
+            let mut alts = [0u32; MAX_RETAINED_ALTERNATIVES];
+            let mut alt_count = 0u8;
+            for symbol in scratch.refined.iter() {
+              if Some(symbol.id) == target || (alt_count as usize) >= MAX_RETAINED_ALTERNATIVES {
+                continue;
+              }
+              alts[alt_count as usize] = symbol.id.raw() as u32;
+              alt_count += 1;
+            }
+            return Resolution {
+              target,
+              edge,
+              confidence: Confidence::AMBIGUOUS,
+              candidates: candidates.len(),
+              reason: ResolveReason::ReceiverTypedTie,
+              alternatives: (alts, alt_count),
+            };
+          }
+        }
+      }
+    }
+
     // Bare names may take a labeled approximate pick on a tie; member accesses on untyped
     // values (hinted or not) carry no proof beyond the name, so only a unique match binds.
     let guess_on_tie = !matches!(reference.form, RefForm::Method | RefForm::MethodHinted);
@@ -459,6 +515,36 @@ fn finish<'i>(
 /// that name, or — for static paths only — it is a top-level definition in a module file named
 /// `q` (`util::helper` → `…/util.rs`). Method receivers never module-match: a variable that
 /// happens to share a file's name is coincidence, not namespace evidence.
+/// The confidence a typed-receiver unique match earns. An explicit annotation in a
+/// statically-checked language is compiler-grade evidence — local/cross-file strength; a
+/// constructor-inferred, param-typed, or field-typed binding — and ANY binding in Python,
+/// whose annotations are unenforced hints — caps at `TYPE_BOUND`.
+fn typed_receiver_confidence<'i>(
+  interner: &'i Interner,
+  reference: &Reference<'i>,
+  local: bool,
+) -> Confidence {
+  let annotated = reference.receiver_type_origin == 0; // typefacts BindOrigin::Annotated
+  let path = interner.text_of(reference.from_path);
+  let python = path.ends_with(".py") || path.ends_with(".pyi");
+  if annotated && !python {
+    if local { Confidence::LOCAL } else { Confidence::CROSS_FILE }
+  } else {
+    Confidence::TYPE_BOUND
+  }
+}
+
+/// The reason tag for a typed-receiver unique match, by binding origin.
+fn typed_receiver_reason(origin: u8) -> ResolveReason {
+  match origin {
+    0 => ResolveReason::ReceiverAnnotated,
+    1 => ResolveReason::ReceiverConstructed,
+    2 => ResolveReason::ReceiverParamTyped,
+    3 => ResolveReason::ReceiverFieldTyped,
+    _ => ResolveReason::ReceiverAnnotated,
+  }
+}
+
 fn qualifier_matches<'i>(
   interner: &'i Interner,
   symbol: &Symbol<'i>,

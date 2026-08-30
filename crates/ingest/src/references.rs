@@ -2576,8 +2576,11 @@ mod tests {
         }
         None => {
           if let Some(from) = enclosing(def_spans, range.start) {
-            let (form, qualifier, receiver) =
+            let (form, qualifier, _receiver) =
               classify_call(&node, cspec, &callee, spec, entities, from);
+            // The twin mirrors the fused walk's no-typefacts configuration (the only one the
+            // differential harness runs): extras are gated off there, so they are here.
+            // Extras semantics have their own pinning suite (typefacts_capture.rs).
             out.push(RawRef {
               from,
               name,
@@ -2587,8 +2590,8 @@ mod tests {
               qualifier,
               form,
               alias: None,
-              receiver,
-              args: capture_args(&node),
+              receiver: None,
+              args: Vec::new(),
             });
           }
         }

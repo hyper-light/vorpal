@@ -502,7 +502,8 @@ fn apply_parts<'a, 'i>(
         .with_evidence(r.start, r.end)
         .with_qualifier_ref(interner, r.qualifier)
         .with_alias_ref(interner, r.alias)
-        .with_form(crate::product::tag_refform(r.form)),
+        .with_form(crate::product::tag_refform(r.form))
+        .with_receiver_type_ref(interner, r.receiver_type, r.receiver_type_origin),
       );
     }
   }

@@ -22,7 +22,9 @@ use crate::intern::{Interner, NameId};
 use crate::reference::{RefForm, RefKind, Reference};
 
 /// Bytes per spilled reference record.
-const RECORD: usize = 34;
+// 39 since G-M2: +4 receiver-type NameId bits (0 = none) +1 origin tag. Process-private
+// scratch — no versioning, both sides are this binary.
+const RECORD: usize = 39;
 
 /// References per read chunk (~1 MB in flight per chunk).
 pub const SPILL_CHUNK: usize = 32_768;
@@ -78,6 +80,9 @@ fn encode(reference: &Reference, buf: &mut [u8; RECORD]) {
   buf[29] = form_tag(reference.form);
   let alias = reference.alias.map(NameId::to_bits).unwrap_or(0);
   buf[30..34].copy_from_slice(&alias.to_le_bytes());
+  let receiver_type = reference.receiver_type.map(NameId::to_bits).unwrap_or(0);
+  buf[34..38].copy_from_slice(&receiver_type.to_le_bytes());
+  buf[38] = reference.receiver_type_origin;
 }
 
 fn decode<'i>(interner: &'i Interner, buf: &[u8; RECORD]) -> Reference<'i> {
@@ -96,6 +101,8 @@ fn decode<'i>(interner: &'i Interner, buf: &[u8; RECORD]) -> Reference<'i> {
     kind: kind_of(buf[28]),
     form: form_of(buf[29]),
     alias: interner.id_from_bits(u32_at(30)),
+    receiver_type: interner.id_from_bits(u32_at(34)),
+    receiver_type_origin: buf[38],
   }
 }
 

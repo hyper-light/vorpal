@@ -441,3 +441,100 @@ fn cpp_resolution_meets_published_labels() {
     ],
   });
 }
+
+#[test]
+fn typed_receivers_meet_published_labels() {
+  // G-M2: the receiver's file-locally bound type narrows same-named methods that untyped
+  // Method-form resolution must refuse. Every origin class is labelled, the Python cap is
+  // pinned, unknown types fall through (upgrade, never veto), and same-type duplicates tie.
+  run(&Fixture {
+    lang: "rust-typed",
+    files: &[
+      (
+        "tw.rs",
+        "pub struct Widget;\nimpl Widget {\n  pub fn render(&self) -> u32 { 1 }\n}\n\
+         pub struct Gadget;\nimpl Gadget {\n  pub fn render(&self) -> u32 { 2 }\n}\n",
+      ),
+      (
+        "tuse.rs",
+        "use crate::tw::Widget;\nuse crate::tw::Gadget;\n\
+         pub fn t_annotated() -> u32 {\n    let wa: Widget = make();\n    wa.render()\n}\n\
+         pub fn t_constructed() -> u32 {\n    let gc = Gadget::new();\n    gc.render()\n}\n\
+         pub fn t_param(wp: Widget) -> u32 {\n    wp.render()\n}\n\
+         pub fn t_unknown() -> u32 {\n    let x: Mystery = make();\n    x.render()\n}\n",
+      ),
+    ],
+    expected: &[
+      // Annotated in a checked language, cross-file target: compiler-grade evidence.
+      ("t_annotated", "render", "calls", "constrained", "receiver-annotated"),
+      // Constructor-inferred: capped at TYPE_BOUND — still constrained, differently earned.
+      ("t_constructed", "render", "calls", "constrained", "receiver-constructed"),
+      ("t_param", "render", "calls", "constrained", "receiver-param-typed"),
+      // Exhaustive-labelling contract: the use-lines' imports AND the annotations' type
+      // uses (an annotation is itself an of_type reference).
+      ("tuse.rs", "Widget", "imports", "constrained", "qualifier-match"),
+      ("tuse.rs", "Gadget", "imports", "constrained", "qualifier-match"),
+      ("t_annotated", "Widget", "of_type", "constrained", "import-bound"),
+      ("t_param", "Widget", "of_type", "constrained", "import-bound"),
+    ],
+    absent: &[
+      // Mystery names no in-tree owner: the hint upgrades, never vetoes — and untyped
+      // Method form on a two-way tie must refuse, exactly as before G-M2.
+      ("t_unknown", "render"),
+    ],
+  });
+}
+
+#[test]
+fn typed_receivers_python_cap_and_tie() {
+  run(&Fixture {
+    lang: "python-typed",
+    files: &[
+      (
+        "pw.py",
+        "class Widget:\n    def render(self):\n        return 1\n\n\
+         class Gadget:\n    def render(self):\n        return 2\n",
+      ),
+      (
+        "puse.py",
+        "from pw import Widget\n\n\
+         def p_annotated():\n    w: Widget = make()\n    return w.render()\n\n\
+         def p_constructed():\n    g = Widget()\n    return g.render()\n",
+      ),
+    ],
+    expected: &[
+      // Python annotations are unenforced hints: BOTH origins cap at TYPE_BOUND (grade
+      // constrained), and the labels say how each was earned.
+      ("p_annotated", "render", "calls", "constrained", "receiver-annotated"),
+      ("p_constructed", "render", "calls", "constrained", "receiver-constructed"),
+      // The constructor call itself is a call edge to the class, bound via the import.
+      ("p_constructed", "Widget", "calls", "constrained", "import-bound"),
+      ("puse.py", "Widget", "imports", "constrained", "qualifier-match"),
+    ],
+    absent: &[],
+  });
+}
+
+#[test]
+fn typed_receivers_typescript_and_same_type_tie() {
+  run(&Fixture {
+    lang: "ts-typed",
+    files: &[
+      (
+        "tsw.ts",
+        "export class Widget { render(): number { return 1 } }\n\
+         export class Gadget { render(): number { return 2 } }\n",
+      ),
+      (
+        "tsuse.ts",
+        "import { Widget } from \"./tsw\";\n\
+         export function s_new(): number {\n  const b = new Widget();\n  return b.render();\n}\n",
+      ),
+    ],
+    expected: &[
+      ("s_new", "render", "calls", "constrained", "receiver-constructed"),
+      ("tsuse.ts", "tsw.ts", "imports", "constrained", "import-path"),
+    ],
+    absent: &[],
+  });
+}
