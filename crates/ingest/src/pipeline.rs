@@ -959,16 +959,23 @@ pub fn link_writer_spilled_with_flows<'i>(
   } else {
     let mut routes: Vec<(u64, String)> = Vec::new();
     writer.for_each_definition(|id, name, _path, kind, _exported| {
-      if kind == vorpal_kg::SymbolKind::Route {
+      if matches!(kind, vorpal_kg::SymbolKind::Route | vorpal_kg::SymbolKind::Channel) {
         routes.push((id.raw(), name.to_string()));
       }
     });
-    let (request_edges, report) = crate::requests::match_requests(&routes, &req_rows);
-    for &(from, to, confidence) in &request_edges {
+    let (matched, report) = crate::requests::match_requests(&routes, &req_rows);
+    for &(from, to, confidence) in &matched.requests {
       writer.add_edge(
         NodeId::new(from),
         NodeId::new(to),
         vorpal_kg::EdgeType::REQUESTS.with_confidence(confidence),
+      );
+    }
+    for &(from, to, confidence) in &matched.notifies {
+      writer.add_edge(
+        NodeId::new(from),
+        NodeId::new(to),
+        vorpal_kg::EdgeType::NOTIFIES.with_confidence(confidence),
       );
     }
     report

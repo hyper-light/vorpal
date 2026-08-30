@@ -48,6 +48,11 @@ impl EdgeType {
   /// for a literal-exact path, 85 when template parameters absorbed segments. Derived at
   /// link from extraction-time request records; ambiguity refuses, never guesses.
   pub const REQUESTS: EdgeType = EdgeType(13);
+  /// An event/message emitter whose literal topic matches a `Channel` node's registration
+  /// (`emit("user.created")` → `EVENT user.created`): emitter → channel, directional, one
+  /// edge per matching listener registration (pub/sub is one-to-many by design; the
+  /// fan-out is capped and counted, never silently truncated). Confidence 90.
+  pub const NOTIFIES: EdgeType = EdgeType(14);
 
   /// The user-facing relation name (the spelling accepted by [`EdgeType::from_name`] and shown
   /// in traversal results). Confidence is ignored — this reports the base type.
@@ -66,6 +71,7 @@ impl EdgeType {
       EdgeType::CHANGES_WITH => "changes_with",
       EdgeType::SIMILAR_TO => "similar_to",
       EdgeType::REQUESTS => "requests",
+      EdgeType::NOTIFIES => "notifies",
       _ => "unknown",
     }
   }
@@ -87,6 +93,7 @@ impl EdgeType {
       "changes_with" => Some(EdgeType::CHANGES_WITH),
       "similar_to" => Some(EdgeType::SIMILAR_TO),
       "requests" => Some(EdgeType::REQUESTS),
+      "notifies" => Some(EdgeType::NOTIFIES),
       _ => None,
     }
   }

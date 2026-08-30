@@ -151,6 +151,7 @@ fn parse_symbol_type(raw: &str) -> Option<SymbolType> {
     "operator" => SymbolType::Operator,
     "typeparameter" => SymbolType::TypeParameter,
     "route" => SymbolType::Route,
+    "channel" => SymbolType::Channel,
     _ => return None,
   })
 }

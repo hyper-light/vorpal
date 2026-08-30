@@ -219,3 +219,31 @@ rule:
               field: left
               regex: '^urlpatterns$'
 name: ROUTE /$ROUTE
+---
+id: python-event-channel
+language: Python
+role: item
+symbolType: channel
+nested: true
+rule:
+  kind: call
+  all:
+    - has:
+        field: function
+        kind: attribute
+        has:
+          field: attribute
+          regex: '^(subscribe|on)$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: string
+          has:
+            kind: string_content
+            pattern: $TOPIC
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+name: EVENT $TOPIC

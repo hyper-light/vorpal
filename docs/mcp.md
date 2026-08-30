@@ -74,8 +74,11 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 > with literal URLs (`fetch("/api/users")`, `requests.get(url)`, `http.NewRequest`)
 > gain a directional `requests` edge to the route their path uniquely matches — template
 > parameters absorb segments, cross-language (a TS frontend into a Go backend is one
-> graph), ambiguity refuses and is counted. Literal strings only; a URL or route built
-> from variables is not extracted (nothing is guessed).
+> graph), ambiguity refuses and is counted. Event listeners (`bus.on("user.created", h)`,
+> `Subscribe`) are `Channel` nodes (`EVENT user.created`) that `call` their handlers, and
+> emitters (`emit`, `publish`) gain `notifies` edges to EVERY matching registration —
+> pub/sub fan-out is the semantics, capped and counted. Literal strings only; a URL,
+> route, or topic built from variables is not extracted (nothing is guessed).
 | Tool | What it does |
 |---|---|
 | `node` | Nodes matching an exact symbol name. |

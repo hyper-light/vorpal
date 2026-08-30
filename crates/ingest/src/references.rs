@@ -216,6 +216,10 @@ struct RequestSpec {
   verb_names: &'static [&'static str],
   /// Callee names implying GET (`fetch` without an options argument is a GET).
   get_names: &'static [&'static str],
+  /// Callee names that EMIT an event (`emit`, `publish`): the record's method is `EVENT`
+  /// and the first string literal (any shape) is the topic — matched against `Channel`
+  /// registrations, where fan-out is expected and every match links.
+  event_names: &'static [&'static str],
   /// Receiver spellings that mark an HTTP client (`axios`, `requests`, `http`); empty
   /// means the callee name alone suffices (`fetch`).
   receivers: &'static [&'static str],
@@ -438,6 +442,7 @@ pub(crate) struct RequestSpecData {
   pub(crate) name: Vec<SelData>,
   pub(crate) verb_names: Vec<String>,
   pub(crate) get_names: Vec<String>,
+  pub(crate) event_names: Vec<String>,
   pub(crate) receivers: Vec<String>,
   pub(crate) args: Vec<SelData>,
   pub(crate) method_from_arg: Option<u8>,
@@ -451,6 +456,7 @@ impl From<&RequestSpec> for RequestSpecData {
       name: spec.name.iter().map(SelData::from).collect(),
       verb_names: owned(spec.verb_names),
       get_names: owned(spec.get_names),
+      event_names: owned(spec.event_names),
       receivers: owned(spec.receivers),
       args: spec.args.iter().map(SelData::from).collect(),
       method_from_arg: spec.method_from_arg,
@@ -550,6 +556,7 @@ const RUST: RefSpec = RefSpec {
     name: &[Sel::Field("function")],
     verb_names: &["get", "post", "put", "delete", "patch", "head"],
     get_names: &[],
+    event_names: &[],
     receivers: &["client", "reqwest", "http_client"],
     args: &[Sel::Field("arguments")],
     method_from_arg: None,
@@ -608,17 +615,40 @@ const PYTHON: RefSpec = RefSpec {
       path_any: true,
       handler: HandlerAt::LastArgument,
     },
+    // Event listeners: `bus.subscribe("user.created", handler)`.
+    RouteSpec {
+      kind: "call",
+      name: &[Sel::Field("function")],
+      names: &["subscribe", "on"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
   ],
-  requests: &[RequestSpec {
-    // requests.get("http://svc/x"), httpx.post(...), session/client verbs.
-    kind: "call",
-    name: &[Sel::Field("function")],
-    verb_names: &["get", "post", "put", "delete", "patch", "head", "options", "request"],
-    get_names: &[],
-    receivers: &["requests", "httpx", "client", "session", "http", "api"],
-    args: &[Sel::Field("arguments")],
-    method_from_arg: None,
-  }],
+  requests: &[
+    RequestSpec {
+      // requests.get("http://svc/x"), httpx.post(...), session/client verbs.
+      kind: "call",
+      name: &[Sel::Field("function")],
+      verb_names: &["get", "post", "put", "delete", "patch", "head", "options", "request"],
+      get_names: &[],
+      event_names: &[],
+      receivers: &["requests", "httpx", "client", "session", "http", "api"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    RequestSpec {
+      // bus.emit("user.created") / broker.publish("topic", …).
+      kind: "call",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &[],
+      event_names: &["emit", "publish", "dispatch"],
+      receivers: &[],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -638,6 +668,15 @@ const GO: RefSpec = RefSpec {
   type_params: &["type_parameter_list"],
   method_callee_kinds: &["selector_expression"],
   routes: &[
+    // nc.Subscribe("subject", handler) — NATS-style listeners (Channel items).
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["Subscribe"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
     // net/http, gorilla, gin, echo, chi, fiber: `HandleFunc("/x", h)` / `r.GET("/x", h)` /
     // Go 1.22 `mux.HandleFunc("GET /x", h)` patterns.
     RouteSpec {
@@ -653,12 +692,24 @@ const GO: RefSpec = RefSpec {
     },
   ],
   requests: &[
+    // nc.Publish("subject", data) — NATS-style emitters.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &[],
+      event_names: &["Publish"],
+      receivers: &[],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
     // http.Get(url) / http.Head / http.PostForm — package-level client calls.
     RequestSpec {
       kind: "call_expression",
       name: &[Sel::Field("function")],
       verb_names: &["Get", "Post", "Head", "PostForm"],
       get_names: &[],
+      event_names: &[],
       receivers: &["http", "client", "resty"],
       args: &[Sel::Field("arguments")],
       method_from_arg: None,
@@ -669,6 +720,7 @@ const GO: RefSpec = RefSpec {
       name: &[Sel::Field("function")],
       verb_names: &["NewRequest", "NewRequestWithContext"],
       get_names: &[],
+      event_names: &[],
       receivers: &["http"],
       args: &[Sel::Field("arguments")],
       method_from_arg: Some(0),
@@ -720,6 +772,16 @@ const JS_LIKE: RefSpec = RefSpec {
       path_any: true,
       handler: HandlerAt::NextSibling(&["method_definition"]),
     },
+    // Event listeners: `bus.on("user.created", handler)` — the registration is a Channel
+    // item (outline rule) and calls its handler like a route does.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["on", "once", "addListener", "subscribe"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
   ],
   requests: &[
     // fetch("/api/users") — GET unless options say otherwise (v1 records GET).
@@ -728,6 +790,7 @@ const JS_LIKE: RefSpec = RefSpec {
       name: &[Sel::Field("function")],
       verb_names: &[],
       get_names: &["fetch"],
+      event_names: &[],
       receivers: &[],
       args: &[Sel::Field("arguments")],
       method_from_arg: None,
@@ -738,7 +801,20 @@ const JS_LIKE: RefSpec = RefSpec {
       name: &[Sel::Field("function")],
       verb_names: &["get", "post", "put", "delete", "patch", "head", "options"],
       get_names: &[],
+      event_names: &[],
       receivers: &["axios", "http", "https", "client", "api", "ky", "got", "superagent", "agent"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    // bus.emit("user.created", …) — event emitters, any receiver; the topic must still
+    // match a registered Channel to link, so the match is the precision gate.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &[],
+      event_names: &["emit", "publish", "dispatch", "trigger", "broadcast"],
+      receivers: &[],
       args: &[Sel::Field("arguments")],
       method_from_arg: None,
     },
@@ -2379,6 +2455,24 @@ fn request_url_literal<'t>(args: &SgNode<'t>) -> Option<Cow<'t, str>> {
     })
 }
 
+/// The first non-empty string literal under `args` — an event topic (any shape, but never
+/// whitespace: `emit(f"...")` and message bodies stay out).
+fn event_topic_literal<'t>(args: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  args
+    .dfs()
+    .skip(1)
+    .filter(|n| {
+      let kind = n.kind();
+      kind.as_ref() == "string" || kind.as_ref().ends_with("string_literal")
+    })
+    .map(|literal| {
+      trim_cow(literal.text(), |t| {
+        t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+      })
+    })
+    .find(|text| !text.is_empty() && !text.contains(char::is_whitespace) && text.len() <= 256)
+}
+
 /// Record an HTTP client call site (see [`RequestSpec`]) for link-time route matching.
 fn emit_request<'t>(
   node: &SgNode<'t>,
@@ -2392,10 +2486,13 @@ fn emit_request<'t>(
   let Some(name) = callee_name(&callee) else {
     return;
   };
+  let event = request.event_names.iter().any(|n| n == name.as_ref());
   let method = if request.verb_names.iter().any(|n| n == name.as_ref()) {
     name.to_ascii_uppercase()
   } else if request.get_names.iter().any(|n| n == name.as_ref()) {
     "GET".to_string()
+  } else if event {
+    "EVENT".to_string()
   } else {
     return;
   };
@@ -2424,7 +2521,12 @@ fn emit_request<'t>(
       text.to_string()
     }
   };
-  let Some(path) = request_url_literal(&args) else {
+  let literal = if event {
+    event_topic_literal(&args)
+  } else {
+    request_url_literal(&args)
+  };
+  let Some(path) = literal else {
     return;
   };
   let range = node.range();

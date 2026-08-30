@@ -260,6 +260,8 @@ pub struct SerializableRequestSpec {
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub get_names: Vec<String>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub event_names: Vec<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub receivers: Vec<String>,
   pub args: Vec<SerializableSel>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,6 +278,7 @@ impl SerializableRequestSpec {
       name: self.name.iter().map(SelData::from).collect(),
       verb_names: self.verb_names.clone(),
       get_names: self.get_names.clone(),
+      event_names: self.event_names.clone(),
       receivers: self.receivers.clone(),
       args: self.args.iter().map(SelData::from).collect(),
       method_from_arg: self.method_from_arg,
@@ -289,6 +292,7 @@ impl SerializableRequestSpec {
       name: data.name.iter().map(SerializableSel::from).collect(),
       verb_names: data.verb_names.clone(),
       get_names: data.get_names.clone(),
+      event_names: data.event_names.clone(),
       receivers: data.receivers.clone(),
       args: data.args.iter().map(SerializableSel::from).collect(),
       method_from_arg: data.method_from_arg,

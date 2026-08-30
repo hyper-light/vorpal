@@ -154,7 +154,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if report.request_sites > 0 {
           println!(
-            "requests: {} of {} client call sites linked to routes",
+            "requests: {} of {} request/emit sites linked to routes/channels",
             report.request_edges, report.request_sites
           );
         }

@@ -1144,3 +1144,31 @@ transform:
       source: $METHOD
       toCase: upperCase
 name: $VERB $ROUTE
+---
+id: ts-event-channel
+language: TypeScript
+role: item
+symbolType: channel
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: member_expression
+        has:
+          field: property
+          regex: '^(on|once|addListener|subscribe)$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: string
+          has:
+            kind: string_fragment
+            pattern: $TOPIC
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+name: EVENT $TOPIC

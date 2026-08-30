@@ -1256,7 +1256,7 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
         "name": {"type": "string", "description": "Exact symbol name"},
         "direction": {"type": "string", "enum": ["in", "out", "both"]},
         "relations": {"type": "array", "items": {"type": "string"},
-          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides, data_flows, changes_with, similar_to, requests (default [\"calls\"])"},
+          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides, data_flows, changes_with, similar_to, requests, notifies (default [\"calls\"])"},
         "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"},
         "min_grade": {"type": "string", "enum": ["exact", "constrained", "heuristic"],
           "description": "Only traverse edges at this resolution grade or better (absent = include structural edges too)"},

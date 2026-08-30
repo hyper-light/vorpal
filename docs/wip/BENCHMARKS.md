@@ -106,6 +106,20 @@ pack +4 bytes per product (the empty section count: kernel +304 KB = +0.05%). cp
 the wild: 1 client call site found, 0 linked, stated on the report ("this tree defines no
 routes — all external"). Cross-repo linking waits on the fleet index merge (R2).
 
+2026-08-30 channel nodes + `notifies` edges (ADOPTION #25 slice 3): event listener
+registrations (`bus.on("user.created", handler)`, `queue.subscribe`, Go `Subscribe`)
+become `Channel` nodes named `EVENT <topic>` that `call` their handlers (the same
+nested-rule + handler machinery as routes), and emitters (`emit`, `publish`, `dispatch`)
+are matched at link by exact topic — pub/sub is one-to-many by design, so an emitter
+links to EVERY matching registration via `notifies` (confidence 90, fan-out capped at 16
+per site and counted). Channels and routes never cross-match. Measured against the
+request-slice binary, interleaved: cpython cold 2.38/0.94 → 2.24/0.96 s (+2.4% user CPU),
+update parity (0.26 s); kernel cold 7.56/7.53 → 7.69/7.67 s (**+0.14 s ≈ +2% wall**, user
+CPU parity; a first pair read +0.96 s under a load spike and was discarded). In the wild:
+cpython gains 74 Channel nodes (d3 listeners in a vendored flamegraph HTML's embedded JS
+— truthfully extracted) and reports 266 emit sites, 0 linked, all counted; the kernel has
+53 emit sites and no channels, stated on the report.
+
 Index size (linux, one generation): 1.27 GiB before tiers — `products.pack` 595 MB,
 `evidence.bin` 268 MB, `nodes.vseg` 171 MB, `strings.heap` 150 MB, `graph.bin` 122 MB,
 `names.idx` 44 MB, `manifest.bin` 6.8 MB, `products.idx` 6.5 MB, `dataflow.bin` 0.75 MB

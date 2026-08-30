@@ -228,7 +228,7 @@ pub struct GraphArg {
   direction: String,
   /// (reachable) Comma-separated edge types to follow (calls, references, imports,
   /// implements, of_type, defines, has_method, has_field, overrides, data_flows,
-  /// changes_with, similar_to, requests).
+  /// changes_with, similar_to, requests, notifies).
   /// Default `calls`.
   #[clap(long, value_name = "RELS", default_value = "calls")]
   relations: String,
@@ -594,7 +594,7 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
     }
     if report.request_sites > 0 {
       println!(
-        "requests: {} of {} client call sites linked to routes",
+        "requests: {} of {} request/emit sites linked to routes/channels",
         report.request_edges, report.request_sites
       );
     }
