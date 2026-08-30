@@ -31,9 +31,13 @@ impl Graph {
 
   /// Build both directions from parallel `(src, dst, etype)` columns.
   pub(crate) fn from_parts(node_count: u32, srcs: &[u32], dsts: &[u32], etypes: &[u16]) -> Self {
-    // out-CSR keys on src; in-CSC keys on dst (so its "targets" are the sources).
-    let out = DirectedCsr::build(node_count, srcs, dsts, etypes);
-    let inc = DirectedCsr::build(node_count, dsts, srcs, etypes);
+    // out-CSR keys on src; in-CSC keys on dst (so its "targets" are the sources). The two
+    // directions share no state — build them concurrently (each build is itself a
+    // deterministic counting scatter, so the output bytes are unchanged).
+    let (out, inc) = rayon::join(
+      || DirectedCsr::build(node_count, srcs, dsts, etypes),
+      || DirectedCsr::build(node_count, dsts, srcs, etypes),
+    );
     Self {
       node_count,
       out,

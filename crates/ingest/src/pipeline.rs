@@ -284,7 +284,10 @@ pub fn link_writer_spilled<'i>(
   // edge vector was ~90 MB alive under the seal at kernel scale. Evidence rows are collected
   // alongside (24 bytes per emitted edge; they must all exist before the canonical sort that
   // makes the sidecar deterministic, so streaming them out is not an option).
-  let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::new();
+  // Reserved to the spill's exact record count (an upper bound on emitted rows): at kernel
+  // scale this vector reaches ~6.8M rows, and growing it from empty cost ~23 doubling
+  // reallocations — the last a full-vector memcpy — on the ordered-sink thread.
+  let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::with_capacity(spill.count() as usize);
   let stats = {
     let writer = &mut writer;
     let evidence = std::cell::RefCell::new(&mut evidence);
@@ -527,10 +530,7 @@ fn build_symbol_table<'i>(
       || etype.base() == EdgeType::HAS_METHOD
       || etype.base() == EdgeType::HAS_FIELD;
     if containment
-      && writer
-        .definition(src as usize)
-        .map(|(_, _, _, kind, _)| kind)
-        != Some(SymbolKind::File)
+      && writer.node_kind(src as usize) != Some(SymbolKind::File)
       && (dst as usize) < owner_of.len()
     {
       owner_of[dst as usize] = Some(src);
@@ -543,6 +543,14 @@ fn build_symbol_table<'i>(
   let insert_range = |range: std::ops::Range<usize>| {
     let mut table = SymbolTable::new();
     table.reserve(range.len());
+    // Rows are contiguous per file and members are contiguous per owner, so both the path
+    // intern and the owner peek repeat their previous answer almost every row. Memoize on the
+    // heap slice identity (writer paths intern once per file into the heap, so equal paths ARE
+    // the same `&str` — pointer+length equality is exact), collapsing ~node_count interner
+    // round-trips per build to ~distinct-file count. `intern`/`peek` are idempotent, so the
+    // memo returns byte-identical ids and the table layout is unchanged.
+    let mut last_path: Option<(*const u8, usize, vorpal_resolve::NameId<'i>)> = None;
+    let mut last_owner: Option<(u32, Option<vorpal_resolve::NameId<'i>>)> = None;
     for row in range {
       let (id, name, path, kind, exported) = writer.definition(row).expect("row < node_count");
       if kind == SymbolKind::File {
@@ -554,20 +562,36 @@ fn build_symbol_table<'i>(
         // Owners resolve by `peek`: an owner name no reference ever interned can never match
         // a qualifier, but member-ness must survive — the unmatchable sentinel keeps such
         // members out of the top-level (module-stem) matching path.
-        let owner = owner_of[row]
-          .and_then(|src| writer.definition(src as usize))
-          .map(|(_, owner_name, _, _, _)| {
-            interner
-              .peek(owner_name)
-              .unwrap_or_else(|| unmatchable_owner(interner))
-          });
+        let owner = match owner_of[row] {
+          None => None,
+          Some(src) => match last_owner {
+            Some((cached_src, cached)) if cached_src == src => cached,
+            _ => {
+              let looked_up = writer.definition(src as usize).map(|(_, owner_name, _, _, _)| {
+                interner
+                  .peek(owner_name)
+                  .unwrap_or_else(|| unmatchable_owner(interner))
+              });
+              last_owner = Some((src, looked_up));
+              looked_up
+            }
+          },
+        };
+        let path_id = match last_path {
+          Some((ptr, len, id)) if ptr == path.as_ptr() && len == path.len() => id,
+          _ => {
+            let id = interner.intern(path);
+            last_path = Some((path.as_ptr(), path.len(), id));
+            id
+          }
+        };
         table.insert_if_referenced(
           interner,
           name,
           Symbol {
             id,
             kind,
-            path: interner.intern(path),
+            path: path_id,
             exported,
             owner,
           },

@@ -822,21 +822,36 @@ impl Kg {
     use std::io::Write;
     write_via_tmp(dir, "names.idx", |out| {
       use rayon::prelude::*;
+      // Name-only extraction in parallel: `node_name` reads one heap string, where the full
+      // `NodeView` materialized three per row — and the scan itself fans out (rayon's ordered
+      // collect keeps row order, so the sorted result is unchanged).
       let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
+        .into_par_iter()
         .filter_map(|i| {
           self
-            .node(NodeId::new(i))
-            .map(|view| (xxhash_rust::xxh3::xxh3_64(view.name.as_bytes()), i))
+            .node_name(NodeId::new(i))
+            .map(|name| (xxhash_rust::xxh3::xxh3_64(name.as_bytes()), i))
         })
         .collect();
       pairs.par_sort_unstable();
       out.write_all(&NAMES_MAGIC.to_le_bytes())?;
       out.write_all(&(pairs.len() as u32).to_le_bytes())?;
-      for &(hash, _) in &pairs {
-        out.write_all(&hash.to_le_bytes())?;
-      }
-      for &(_, id) in &pairs {
-        out.write_all(&id.to_le_bytes())?;
+      // The on-disk format is little-endian. Split the sorted pairs into the two columns and
+      // write each as one bulk slice on LE hosts (byte-identical to the per-element
+      // `to_le_bytes` loop it replaces — that loop did 2×n eight-byte `write_all`s); the
+      // per-element form remains the portable path for big-endian targets.
+      let hashes: Vec<u64> = pairs.iter().map(|&(h, _)| h).collect();
+      let ids: Vec<u64> = pairs.iter().map(|&(_, i)| i).collect();
+      if cfg!(target_endian = "little") {
+        out.write_all(bytemuck::cast_slice(&hashes))?;
+        out.write_all(bytemuck::cast_slice(&ids))?;
+      } else {
+        for &hash in &hashes {
+          out.write_all(&hash.to_le_bytes())?;
+        }
+        for &id in &ids {
+          out.write_all(&id.to_le_bytes())?;
+        }
       }
       Ok(())
     })

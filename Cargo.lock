@@ -286,6 +286,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]
@@ -3727,6 +3728,7 @@ version = "0.2.0"
 dependencies = [
  "bit-set",
  "bytemuck",
+ "rayon",
  "vorpal-mem",
 ]
 
@@ -3772,6 +3774,7 @@ dependencies = [
 name = "vorpal-kg"
 version = "0.2.0"
 dependencies = [
+ "bytemuck",
  "rayon",
  "tikv-jemalloc-ctl",
  "vorpal-canonical",
@@ -3945,6 +3948,7 @@ version = "0.2.0"
 dependencies = [
  "blake3",
  "bytemuck",
+ "rayon",
  "thiserror 2.0.18",
  "vorpal-mem",
  "xxhash-rust",

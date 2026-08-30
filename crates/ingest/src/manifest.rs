@@ -41,6 +41,22 @@ impl Manifest {
   pub fn scan(root: &Path, handled: impl Fn(&str) -> bool + Sync) -> io::Result<Self> {
     let entries = Mutex::new(Vec::new());
     let first_error: Mutex<Option<io::Error>> = Mutex::new(None);
+    // Per-walker-thread accumulation: each visitor pushes into its own vector and flushes
+    // once into the shared sink when the walker retires it (the Drop below) — the previous
+    // form took the global mutex once per accepted file (~72k lock round-trips at kernel
+    // scale, on the sweep that IS the whole cost of a no-change re-index). The final sort
+    // makes arrival order unobservable, exactly as before.
+    struct Flush<'a> {
+      local: Vec<FileStat>,
+      sink: &'a Mutex<Vec<FileStat>>,
+    }
+    impl Drop for Flush<'_> {
+      fn drop(&mut self) {
+        if !self.local.is_empty() {
+          self.sink.lock().unwrap().append(&mut self.local);
+        }
+      }
+    }
     ignore::WalkBuilder::new(root)
       .threads(
         std::thread::available_parallelism()
@@ -50,7 +66,15 @@ impl Manifest {
       )
       .build_parallel()
       .run(|| {
-        Box::new(|result| {
+        // Capture shared state by reference (references to Sync values are Send); `move`
+        // then transfers only the per-thread `flush` buffer and these borrows.
+        let handled = &handled;
+        let first_error = &first_error;
+        let mut flush = Flush {
+          local: Vec::new(),
+          sink: &entries,
+        };
+        Box::new(move |result| {
           let entry = match result {
             Ok(entry) => entry,
             Err(err) => {
@@ -68,10 +92,16 @@ impl Manifest {
           if !handled(&path_str) {
             return WalkState::Continue;
           }
-          let meta = match entry.path().metadata() {
+          // `entry.metadata()` reuses the walk's own entry instead of a second path
+          // resolution + stat(2) per file. Symlinks never reach here (the dirent file-type
+          // gate above rejects them), so the semantics match the follow-stat exactly.
+          let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(err) => {
-              first_error.lock().unwrap().get_or_insert(err);
+              first_error
+                .lock()
+                .unwrap()
+                .get_or_insert(io::Error::other(err));
               return WalkState::Quit;
             }
           };
@@ -86,7 +116,7 @@ impl Manifest {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-          entries.lock().unwrap().push(FileStat {
+          flush.local.push(FileStat {
             path: path_str.into_owned(),
             size: meta.len(),
             mtime_ns,
@@ -98,7 +128,11 @@ impl Manifest {
       return Err(err);
     }
     let mut entries = entries.into_inner().unwrap();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    // Paths are unique, so the unstable parallel sort is deterministic.
+    {
+      use rayon::prelude::*;
+      entries.par_sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    }
     Ok(Self {
       entries,
       grammar_stamp: 0,

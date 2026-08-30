@@ -383,6 +383,14 @@ impl KgWriter {
     }
   }
 
+  /// A row's kind alone — one column byte, no heap-string reads. The owner pass over the
+  /// containment edge log needs only this, and paying `definition`'s three heap reads per
+  /// edge (~2.75M random reads into the mapped heap at kernel scale) to look at one byte was
+  /// the bulk of that pass.
+  pub fn node_kind(&self, row: usize) -> Option<SymbolKind> {
+    self.kind.get(row).map(|&tag| SymbolKind::from_tag(tag))
+  }
+
   /// One interned definition by dense row (`row == id`): random access for sharded table
   /// builds, where contiguous row ranges are processed on independent threads (§7.5).
   pub fn definition(&self, row: usize) -> Option<(NodeId, &str, &str, SymbolKind, bool)> {
@@ -447,47 +455,41 @@ impl KgWriter {
     self.canonical.seal();
     drop(std::mem::take(&mut self.canonical));
 
-    let mut builder = SegmentBuilder::new(0);
-    let kind = std::mem::take(&mut self.kind);
-    builder.add_u8("kind", &kind).unwrap();
-    drop(kind);
-    let name_off = std::mem::take(&mut self.name_off);
-    builder.add_u32("name_off", &name_off).unwrap();
-    drop(name_off);
-    let name_len = std::mem::take(&mut self.name_len);
-    builder.add_u32("name_len", &name_len).unwrap();
-    drop(name_len);
-    let path_off = std::mem::take(&mut self.path_off);
-    builder.add_u32("path_off", &path_off).unwrap();
-    drop(path_off);
-    let path_len = std::mem::take(&mut self.path_len);
-    builder.add_u32("path_len", &path_len).unwrap();
-    drop(path_len);
-    let sig_off = std::mem::take(&mut self.sig_off);
-    builder.add_u32("sig_off", &sig_off).unwrap();
-    drop(sig_off);
-    let sig_len = std::mem::take(&mut self.sig_len);
-    builder.add_u32("sig_len", &sig_len).unwrap();
-    drop(sig_len);
-    let content_hash = std::mem::take(&mut self.content_hash);
-    builder.add_u64("content_hash", &content_hash).unwrap();
-    drop(content_hash);
-    let eid_lo = std::mem::take(&mut self.eid_lo);
-    builder.add_u64("eid_lo", &eid_lo).unwrap();
-    drop(eid_lo);
-    let eid_hi = std::mem::take(&mut self.eid_hi);
-    builder.add_u64("eid_hi", &eid_hi).unwrap();
-    drop(eid_hi);
-    let flags = std::mem::take(&mut self.flags);
-    builder.add_u8("flags", &flags).unwrap();
-    drop(flags);
-    let span_start = std::mem::take(&mut self.span_start);
-    builder.add_u32("span_start", &span_start).unwrap();
-    drop(span_start);
-    let span_end = std::mem::take(&mut self.span_end);
-    builder.add_u32("span_end", &span_end).unwrap();
-    drop(span_end);
-    let nodes = Segment::open_owned(builder.build().unwrap()).unwrap();
+    // The builder borrows the writer's columns directly — zero copies into the builder (the
+    // previous owned form copied every column once into the builder and again into the output
+    // buffer). The only materialization is the output buffer itself; the columns are freed
+    // immediately after, BEFORE edge compaction, so peak transient memory during seal is
+    // strictly lower than the old one-column-at-a-time streaming dance.
+    let nodes = {
+      let mut builder = SegmentBuilder::new(0);
+      builder.add_u8("kind", &self.kind).unwrap();
+      builder.add_u32("name_off", &self.name_off).unwrap();
+      builder.add_u32("name_len", &self.name_len).unwrap();
+      builder.add_u32("path_off", &self.path_off).unwrap();
+      builder.add_u32("path_len", &self.path_len).unwrap();
+      builder.add_u32("sig_off", &self.sig_off).unwrap();
+      builder.add_u32("sig_len", &self.sig_len).unwrap();
+      builder.add_u64("content_hash", &self.content_hash).unwrap();
+      builder.add_u64("eid_lo", &self.eid_lo).unwrap();
+      builder.add_u64("eid_hi", &self.eid_hi).unwrap();
+      builder.add_u8("flags", &self.flags).unwrap();
+      builder.add_u32("span_start", &self.span_start).unwrap();
+      builder.add_u32("span_end", &self.span_end).unwrap();
+      Segment::open_owned(builder.build().unwrap()).unwrap()
+    };
+    drop(std::mem::take(&mut self.kind));
+    drop(std::mem::take(&mut self.name_off));
+    drop(std::mem::take(&mut self.name_len));
+    drop(std::mem::take(&mut self.path_off));
+    drop(std::mem::take(&mut self.path_len));
+    drop(std::mem::take(&mut self.sig_off));
+    drop(std::mem::take(&mut self.sig_len));
+    drop(std::mem::take(&mut self.content_hash));
+    drop(std::mem::take(&mut self.eid_lo));
+    drop(std::mem::take(&mut self.eid_hi));
+    drop(std::mem::take(&mut self.flags));
+    drop(std::mem::take(&mut self.span_start));
+    drop(std::mem::take(&mut self.span_end));
 
     crate::phase_stamp("seal: compact");
     let edges = std::mem::take(&mut self.edges);
