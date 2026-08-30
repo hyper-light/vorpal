@@ -14,6 +14,8 @@
 //! token similarity, not a neural model). Neural embedders plug in behind the same trait.
 //! RaBitQ-grade quantization and IVF sharding are the §10 successors behind the same seams.
 
+#[cfg(test)]
+mod fastscan_probe;
 mod embed;
 mod index;
 mod overlay;

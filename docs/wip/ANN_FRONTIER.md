@@ -211,9 +211,29 @@ is load-bearing, the third independent confirmation of that law.
   bursts: retire → re-adopt with 2,486/2,544 reconciliations, ~1-2s background, zero
   full builds).
 
-Next up: FastScan-packed SymphonyQG layout as a dedicated branch-scale effort (design
-above). T3 follow-ups: quality-probe cadence on the live tier (probe machinery exists),
-persistence policy for long-lived overlays (warm-as-compactor already wired).
+- 1-bit steering, ROTATED-RaBitQ variant (proper shape: rotation + per-row correction +
+  asymmetric f32-query × 1-bit-code, codes precomputed once): **fidelity PROVEN, wiring
+  REJECTED by gate — and the two now separate cleanly.** Measured first
+  (`crates/ann/src/fastscan_probe.rs`, kernel corpus, build-salt probes): full-scan
+  estimator recall@200 = 0.9938, @400 = 1.0000; estimator-STEERED greedy on the FINISHED
+  graph at l=200 = pool recall 0.9938 — parity with exact steering at identical expansion
+  counts. The old post-mortem's "−3.4pt steering noise" was the flat-scalar estimator's
+  construction, NOT this geometry. Then the wired build (est-steered insertion+refine,
+  exact SDOT pruning, exact re-score of visited pools) failed BOTH axes for NEW reasons:
+  build 21.6 → 60.1s (a scalar set-bit-iteration estimator costs more per eval than
+  SDOT-x4, whose interleave also hides the very misses the 32B codes were meant to
+  shrink), and recall 0.9937 → 0.9875 (steering noise localizes to PARTIAL mid-build
+  graphs — insertion rounds — consistent with the "insertion fidelity is load-bearing"
+  law; finished-graph parity stands). Reverted to sha cfa8db6a998f4ccc / 0.9937.
+  **Surviving path, gated before any wiring:** (1) M3 microbench — a NEON bit-sign kernel
+  with x4-style miss interleave must beat SDOT-x4 wall-clock on beam-shaped RANDOM access;
+  (2) if it does, steer ONLY the refinement passes (finished-graph parity is proven there;
+  insertion stays exact) — refine is ~2/3 of build cost, so even 2× there ≈ −6.5s with
+  recall protected by construction.
+
+Next up: T3 follow-ups: persistence policy for long-lived overlays (warm-as-compactor
+already wired). FastScan: M3 kernel microbench is the gate; the full packed-adjacency
+package stays parked until a kernel actually beats SDOT-x4 on random access.
 
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
