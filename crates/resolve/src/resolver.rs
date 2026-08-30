@@ -636,8 +636,8 @@ pub fn seed_import_bindings<'i>(
   qualified_imports: &[Reference<'i>],
   resolver: &Resolver,
 ) -> usize {
-  let mut bindings: std::collections::HashMap<(NameId<'i>, NameId<'i>), NodeId> =
-    std::collections::HashMap::new();
+  let mut bindings: rustc_hash::FxHashMap<(NameId<'i>, NameId<'i>), NodeId> =
+    rustc_hash::FxHashMap::default();
   let mut scratch = ResolveScratch::default();
   for reference in qualified_imports {
     let resolution = resolver.resolve_with(interner, table, reference, &mut scratch);
