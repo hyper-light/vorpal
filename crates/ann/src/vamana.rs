@@ -348,13 +348,37 @@ fn robust_prune(
   // the search beam width (DiskANN prunes from an L-bounded pool) bounds the cost without
   // changing what the loop would have kept in practice.
   candidates.truncate(pool_cap);
+  // α-domination without the O(r·n) element-shifting that `Vec::retain` incurred every round:
+  // dominated candidates are marked in a side mask and skipped, instead of compacting the
+  // vector each iteration. Bit-identical to the retain form — `candidates` stays sorted, so the
+  // next `closest` is the first unmasked entry and both survivors and their order match exactly
+  // — with the per-round memmove eliminated (the build's hottest non-search cost).
+  let mut removed = vec![false; candidates.len()];
   let mut result: Vec<u32> = Vec::new();
-  while let Some(&(closest, _)) = candidates.first() {
+  let mut scan = 0usize;
+  loop {
+    while scan < candidates.len() && removed[scan] {
+      scan += 1;
+    }
+    if scan == candidates.len() {
+      break;
+    }
+    let closest = candidates[scan].0;
     result.push(closest);
     if result.len() >= r {
       break;
     }
-    candidates.retain(|&(v, dist_p)| v != closest && alpha * matrix.dist_sq(closest, v) > dist_p);
+    removed[scan] = true;
+    for i in (scan + 1)..candidates.len() {
+      if removed[i] {
+        continue;
+      }
+      let (v, dist_p) = candidates[i];
+      // `retain` KEPT iff (v != closest && α·dist_sq(closest,v) > dist_p); remove the complement.
+      if !(v != closest && alpha * matrix.dist_sq(closest, v) > dist_p) {
+        removed[i] = true;
+      }
+    }
   }
   let _ = p;
   result
