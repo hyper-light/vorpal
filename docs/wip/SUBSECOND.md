@@ -151,7 +151,16 @@ SHA A/B for 0.D; streamed≡batch; full workspace suite; retrieval_eval; resolut
 
 ## Phase 2 — ANN adaptive fidelity & incremental consolidation
 
-- **2a. Oracle-fused self-calibration** (replaces the l_build constant): during
+- **2a. LANDED as measurement-only (2026-08-29) — the ladder is dead, the oracle lives.**
+  The escalation ladder was implemented and the kernel measurement killed it: pool-recall@10
+  at the production search contract is **0.9156 at the historical l_build=48** (lower rungs
+  lower still), so no absolute floor below ~0.92 is reachable and the ladder just built the
+  graph 2-3× for the same final rung (20.9s vs 9.8s). What ships: every Vamana build runs the
+  seeded exact oracle (32 probes × n integer dots, ~30ms) + one production-shaped
+  pool-recall measurement, stamped into `ann.calibration.json` — a per-corpus honesty stamp
+  and the foundation for any future adaptive policy (a prefix-build predictor is the viable
+  successor, not an absolute floor). ann.bin remains bit-identical to the historical graph;
+  build time unchanged (9.2-9.6s cooled). Original design:
   `QuantMatrix::from_rows` (which touches every row anyway), score Q seeded probe queries
   exactly (~50ms parallel at kernel scale). Build at the derived floor (scaled from n, degree
   budget, cores), measure pool-recall@K through the production search path against the oracle,

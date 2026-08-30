@@ -1208,10 +1208,19 @@ fn build_ann(kg: &Kg, out: &Path, base_stamp: u64) -> Result<(), Box<dyn Error +
   let index = AnnIndex::build_rows(dim, ids, |i, row| {
     embed_node_into(kg, &embedder, row_ids[i], row)
   });
+  let calibration = index.calibration();
   vorpal_kg::phase_stamp("ann: save start");
   index
     .with_base_stamp(base_stamp)
     .save(&out.join("ann.bin"))?;
+  // Persist the Phase-2a calibration beside the tier so provenance survives the process:
+  // a sidecar line the model-provenance reader ignores and humans/tools can read.
+  if let Some((l_build, recall)) = calibration {
+    let _ = fs::write(
+      out.join("ann.calibration.json"),
+      format!("{{\"l_build\":{l_build},\"pool_recall\":{recall:.4},\"probes\":32,\"k\":10,\"search_l\":200}}\n"),
+    );
+  }
   // The per-file identity map for this generation — what lets a later search remap
   // unchanged files and overlay changed ones instead of rebuilding (§ overlay).
   annfiles::save(out, base_stamp, &annfiles::file_runs_of(kg))?;

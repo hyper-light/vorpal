@@ -39,9 +39,33 @@ impl AnnConfig {
 }
 
 const VAMANA_R: usize = 32;
-const VAMANA_L_BUILD: usize = 48;
 const VAMANA_ALPHA: f32 = 1.2;
 const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+const VAMANA_L_BUILD: usize = 48;
+
+// ---- Measured build calibration (SUBSECOND.md Phase 2a, measurement-only) ------------------
+// Every Vamana build measures its own graph against an exact seeded oracle and stamps the
+// result into provenance (`ann.calibration.json`). The measurement is a few dozen
+// milliseconds; it does NOT drive an escalation ladder — that was tried on the kernel corpus
+// (2026-08-29) and the data killed it: pool-recall@10 at the production contract is ~0.92
+// even at the historical l_build=48 (rungs 24/32 lower still), so no absolute floor under
+// 0.92 is reachable and the ladder just built the graph 2-3 times for the same final rung.
+// The search-side beam (per-query, cheap) is the recall lever; build fidelity stays fixed
+// until a cheaper predictor (prefix-build measurement) exists. The measurement remains: an
+// index that KNOWS its own pool recall is the foundation for any future adaptive policy,
+// and a per-corpus honesty stamp today.
+//
+/// Seeded probe count (distinct rows whose own vectors serve as queries).
+const CALIBRATION_PROBES: usize = 32;
+/// Oracle depth — matches the default user k.
+const CALIBRATION_K: usize = 10;
+/// The beam the *production* search runs for k = 10 with no filter: the rerank pool is
+/// (k·4).max(50) = 50, the tier fetch is pool·2 = 100, and the search beam is
+/// (take · default beam multiplier 2).clamp(64, n) = 200. Calibration measures at that
+/// contract with the DEFAULT multiplier regardless of the VORPAL_ANN_BEAM override, so the
+/// chosen rung never depends on the environment.
+const CALIBRATION_SEARCH_L: usize = 200;
 /// "ANN5" — v2 moved the Vamana tier's vectors to per-row-scaled i8 codes (4× smaller,
 /// integer-exact distances; flat tiers still store f32); v3 dropped Import nodes from the
 /// row set (wiring, not semantic targets); v4 lays the Vamana tier out as aligned sections
@@ -50,6 +74,38 @@ const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 /// never pair one generation's bin with another generation's sidecars. Older files fail the
 /// magic check and are rebuilt (the ANN tier is a cache — see `ensure_ann`).
 const MAGIC: u32 = 0x414E_4E35;
+
+/// One calibration measurement: run the production-shaped beam search from the graph's
+/// medoid for every probe and report what fraction of the exact oracle pool it visited.
+/// Serial over ≤32 probes (milliseconds) — trivially deterministic.
+fn pool_recall(
+  quant: &QuantMatrix,
+  vamana: &Vamana,
+  probes: &[u32],
+  oracle: &[Vec<u32>],
+) -> f64 {
+  let mut stamps = VisitStamps::new(quant.len());
+  let adjacency = Adjacency::FlatCap {
+    flat: &vamana.flat,
+    lens: &vamana.lens,
+    cap: vamana.cap,
+  };
+  let (mut hits, mut want) = (0usize, 0usize);
+  for (probe, truth) in probes.iter().zip(oracle) {
+    let visited = greedy_search(
+      &adjacency,
+      vamana.medoid,
+      CALIBRATION_SEARCH_L.min(quant.len()),
+      &mut stamps,
+      |x| quant.dist_sq(x, *probe),
+      |x| quant.prefetch_row(x),
+    );
+    let pool: std::collections::HashSet<u32> = visited.iter().map(|&(v, _)| v).collect();
+    hits += truth.iter().filter(|t| pool.contains(*t)).count();
+    want += truth.len();
+  }
+  if want == 0 { 1.0 } else { hits as f64 / want as f64 }
+}
 
 /// Decode a packed little-endian section into a typed vec: a straight `pod_collect` on LE
 /// targets, the per-element decoder elsewhere.
@@ -84,6 +140,10 @@ pub struct AnnIndex {
   /// Vamana adjacency: per-node lists when just built, CSR columns when loaded (mapped).
   graph: AnnGraphStore,
   medoid: u32,
+  /// Phase-2a build calibration, when this index was constructed in-process:
+  /// `(chosen l_build rung, measured pool recall)`. In-memory provenance only — the
+  /// persisted form lives in `ann.model.json`; loaded indexes report `None`.
+  calibration: Option<(u32, f32)>,
 }
 
 /// The Vamana graph's storage form. Both expose identical rows via [`Adjacency`].
@@ -211,6 +271,7 @@ impl AnnIndex {
         cap: 0,
       },
       medoid: 0,
+      calibration: None,
     }
   }
 
@@ -237,6 +298,45 @@ impl AnnIndex {
   }
 
   fn build_vamana(dim: usize, ids: Vec<u64>, quant: QuantMatrix) -> AnnIndex {
+    let n = quant.len();
+    // Seeded, distinct probe rows — deterministic, corpus-derived.
+    let probe_count = CALIBRATION_PROBES.min(n);
+    let mut rng = crate::Rng::new(BUILD_SEED ^ 0x5EED_CA11_0B5E_7B01);
+    let mut probes: Vec<u32> = Vec::with_capacity(probe_count);
+    let mut chosen = std::collections::HashSet::new();
+    while probes.len() < probe_count {
+      let candidate = rng.below(n) as u32;
+      if chosen.insert(candidate) {
+        probes.push(candidate);
+      }
+    }
+    // Exact quantized top-K per probe (integer-exact distances; ties broken by id) — the
+    // oracle pool recall is measured against. ~probes × n dot products, fanned across cores.
+    let oracle: Vec<Vec<u32>> = {
+      use rayon::prelude::*;
+      probes
+        .par_iter()
+        .map(|&probe| {
+          let mut best: Vec<(f32, u32)> = Vec::with_capacity(CALIBRATION_K + 1);
+          for row in 0..n as u32 {
+            if row == probe {
+              continue;
+            }
+            let key = (quant.dist_sq(probe, row), row);
+            if best.len() < CALIBRATION_K {
+              let at = best.partition_point(|entry| *entry < key);
+              best.insert(at, key);
+            } else if key < *best.last().expect("k > 0") {
+              let at = best.partition_point(|entry| *entry < key);
+              best.insert(at, key);
+              best.pop();
+            }
+          }
+          best.into_iter().map(|(_, row)| row).collect()
+        })
+        .collect()
+    };
+    // One build at the fixed fidelity, one measurement, one provenance stamp.
     let vamana = Vamana::build(
       &quant,
       &BuildParams {
@@ -246,6 +346,18 @@ impl AnnIndex {
         seed: BUILD_SEED,
       },
     );
+    let measured = pool_recall(&quant, &vamana, &probes, &oracle);
+    let calibration = Some((VAMANA_L_BUILD as u32, measured as f32));
+    Self::assemble_vamana(dim, ids, quant, vamana, calibration)
+  }
+
+  fn assemble_vamana(
+    dim: usize,
+    ids: Vec<u64>,
+    quant: QuantMatrix,
+    vamana: Vamana,
+    calibration: Option<(u32, f32)>,
+  ) -> AnnIndex {
     AnnIndex {
       base_stamp: 0,
       dim,
@@ -261,6 +373,7 @@ impl AnnIndex {
         cap: vamana.cap,
       },
       medoid: vamana.medoid,
+      calibration,
     }
   }
 
@@ -274,6 +387,12 @@ impl AnnIndex {
 
   pub fn config(&self) -> AnnConfig {
     self.config
+  }
+
+  /// The calibrated build parameters, when this index was built (not loaded) in-process:
+  /// `(l_build rung, measured pool recall at the default search contract)`.
+  pub fn calibration(&self) -> Option<(u32, f32)> {
+    self.calibration
   }
 
   /// Top-`k` nearest rows as `(stable id, squared L2 distance)`, closest first. Every tier ends
@@ -532,6 +651,7 @@ impl AnnIndex {
       })?;
       return Ok(AnnIndex {
         base_stamp,
+        calibration: None,
         dim,
         vectors: Vec::new(),
         ids,
@@ -557,6 +677,7 @@ impl AnnIndex {
     );
     Ok(AnnIndex {
       base_stamp,
+      calibration: None,
       dim,
       vectors,
       ids,
