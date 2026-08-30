@@ -98,6 +98,7 @@ fn pool_recall(
       CALIBRATION_SEARCH_L.min(quant.len()),
       &mut stamps,
       |x| quant.dist_sq(x, *probe),
+      |xs| quant.dist_sq_x4(xs, *probe),
       |x| quant.prefetch_row(x),
     );
     let pool: std::collections::HashSet<u32> = visited.iter().map(|&(v, _)| v).collect();
@@ -453,6 +454,7 @@ impl AnnIndex {
           l,
           &mut stamps,
           |i| quant.dist_to_query(i, &query),
+          |xs| xs.map(|i| quant.dist_to_query(i, &query)),
           |i| quant.prefetch_row(i),
         );
         pool.sort_by(|a, b| {

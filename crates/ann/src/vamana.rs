@@ -154,6 +154,7 @@ pub(crate) fn greedy_search(
   l: usize,
   stamps: &mut VisitStamps,
   dist: impl Fn(u32) -> f32,
+  dist4: impl Fn([u32; 4]) -> [f32; 4],
   prefetch: impl Fn(u32),
 ) -> Vec<Scored> {
   if graph.is_empty() {
@@ -203,7 +204,17 @@ pub(crate) fn greedy_search(
       prefetch(nb);
       fresh.push(nb);
     }
-    for &nb in &fresh {
+    // Quads through the interleaved kernel (four candidates' misses overlap), remainder
+    // through the single-pair kernel — identical numbers either way, so batching is
+    // invisible to output bytes (sha-pinned).
+    let mut quads = fresh.chunks_exact(4);
+    for quad in &mut quads {
+      let ds = dist4([quad[0], quad[1], quad[2], quad[3]]);
+      for k in 0..4 {
+        cand.push((ds[k], quad[k]));
+      }
+    }
+    for &nb in quads.remainder() {
       cand.push((dist(nb), nb));
     }
     if counters_enabled() {
@@ -299,6 +310,7 @@ fn run_round(
           l_search,
           &mut stamps,
           |x| matrix.dist_sq(x, p),
+          |xs| matrix.dist_sq_x4(xs, p),
           |x| matrix.prefetch_row(x),
         );
         let mut candidates: Vec<Scored> = visited.into_iter().filter(|&(v, _)| v != p).collect();

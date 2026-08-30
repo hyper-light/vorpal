@@ -238,6 +238,30 @@ impl QuantMatrix {
       - 2.0 * self.scales[a as usize] * self.scales[b as usize] * dot as f32
   }
 
+  /// Four [`QuantMatrix::dist_sq`] evaluations against one shared row, batched so the four
+  /// candidates' memory stalls overlap. Per-pair arithmetic identical to the single form.
+  #[inline]
+  pub fn dist_sq_x4(&self, rows: [u32; 4], q: u32) -> [f32; 4] {
+    let qc = self.row_codes(q);
+    let dots = dot_i8_x4(
+      [
+        self.row_codes(rows[0]),
+        self.row_codes(rows[1]),
+        self.row_codes(rows[2]),
+        self.row_codes(rows[3]),
+      ],
+      qc,
+    );
+    let qs = self.scales[q as usize];
+    let qn = self.snorm[q as usize];
+    let mut out = [0.0f32; 4];
+    for k in 0..4 {
+      let i = rows[k] as usize;
+      out[k] = self.snorm[i] + qn - 2.0 * self.scales[i] * qs * dots[k] as f32;
+    }
+    out
+  }
+
   /// Squared L2 between dequantized row `i` and a quantized query.
   #[inline]
   pub fn dist_to_query(&self, i: u32, query: &QuantQuery) -> f32 {
@@ -250,6 +274,88 @@ impl QuantMatrix {
 /// widening-multiply NEON, scalar — computes the identical integer, so dispatch can never
 /// affect results.
 #[inline]
+/// Four independent dot products against one shared query, with interleaved accumulator
+/// chains: the four candidate rows' cache misses overlap instead of serializing call by
+/// call (the beam's dominant stall). Each lane computes the IDENTICAL integer the
+/// single-pair kernel computes — dispatch and batching can never affect results.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_i8_sdot_x4(a: [&[i8]; 4], b: &[i8]) -> [i32; 4] {
+  debug_assert!(a.iter().all(|row| row.len() == b.len()));
+  debug_assert_eq!(b.len() % 16, 0);
+  let mut p0 = a[0].as_ptr();
+  let mut p1 = a[1].as_ptr();
+  let mut p2 = a[2].as_ptr();
+  let mut p3 = a[3].as_ptr();
+  let mut pb = b.as_ptr();
+  let mut steps = b.len() / 16;
+  let (acc0, acc1, acc2, acc3): (i32, i32, i32, i32);
+  // SAFETY: pointers stay within the equal-length slices (steps·16 == len); loads only.
+  unsafe {
+    std::arch::asm!(
+      ".arch_extension dotprod",
+      "movi v0.4s, #0",
+      "movi v1.4s, #0",
+      "movi v2.4s, #0",
+      "movi v3.4s, #0",
+      "2:",
+      "ldr q4, [{pb}], #16",
+      "ldr q5, [{p0}], #16",
+      "ldr q6, [{p1}], #16",
+      "ldr q7, [{p2}], #16",
+      "ldr q16, [{p3}], #16",
+      "sdot v0.4s, v5.16b, v4.16b",
+      "sdot v1.4s, v6.16b, v4.16b",
+      "sdot v2.4s, v7.16b, v4.16b",
+      "sdot v3.4s, v16.16b, v4.16b",
+      "subs {steps}, {steps}, #1",
+      "b.ne 2b",
+      "addv s0, v0.4s",
+      "addv s1, v1.4s",
+      "addv s2, v2.4s",
+      "addv s3, v3.4s",
+      "fmov {a0:w}, s0",
+      "fmov {a1:w}, s1",
+      "fmov {a2:w}, s2",
+      "fmov {a3:w}, s3",
+      p0 = inout(reg) p0,
+      p1 = inout(reg) p1,
+      p2 = inout(reg) p2,
+      p3 = inout(reg) p3,
+      pb = inout(reg) pb,
+      steps = inout(reg) steps,
+      a0 = out(reg) acc0,
+      a1 = out(reg) acc1,
+      a2 = out(reg) acc2,
+      a3 = out(reg) acc3,
+      out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+      out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+      out("v16") _,
+      options(nostack, readonly),
+    );
+  }
+  let _ = (p0, p1, p2, p3, pb, steps);
+  [acc0, acc1, acc2, acc3]
+}
+
+/// Batched form of [`dot_i8`]: identical integers per pair on every path (the fallback IS
+/// four single calls), so batching is invisible to output bytes.
+fn dot_i8_x4(a: [&[i8]; 4], b: &[i8]) -> [i32; 4] {
+  #[cfg(target_arch = "aarch64")]
+  {
+    if cfg!(target_feature = "dotprod") || std::arch::is_aarch64_feature_detected!("dotprod") {
+      // SAFETY: dotprod verified; equal 16-multiple lengths by construction.
+      return unsafe { dot_i8_sdot_x4(a, b) };
+    }
+  }
+  [
+    dot_i8(a[0], b),
+    dot_i8(a[1], b),
+    dot_i8(a[2], b),
+    dot_i8(a[3], b),
+  ]
+}
+
 fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
   #[cfg(target_arch = "aarch64")]
   {
