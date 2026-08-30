@@ -225,15 +225,27 @@ is load-bearing, the third independent confirmation of that law.
   shrink), and recall 0.9937 → 0.9875 (steering noise localizes to PARTIAL mid-build
   graphs — insertion rounds — consistent with the "insertion fidelity is load-bearing"
   law; finished-graph parity stands). Reverted to sha cfa8db6a998f4ccc / 0.9937.
-  **Surviving path, gated before any wiring:** (1) M3 microbench — a NEON bit-sign kernel
-  with x4-style miss interleave must beat SDOT-x4 wall-clock on beam-shaped RANDOM access;
-  (2) if it does, steer ONLY the refinement passes (finished-graph parity is proven there;
-  insertion stays exact) — refine is ~2/3 of build cost, so even 2× there ≈ −6.5s with
-  recall protected by construction.
+  The follow-up gates ran the same day and CLOSED the line:
+  * M3 kernel microbench (8M random rows, kernel corpus, ×2 identical): symmetric
+    XOR+CNT over 32B codes = 8.7 ns/candidate vs SDOT-x4's 23.4 — the kernel win exists
+    (2.68×) and only for the SYMMETRIC form (asymmetric sign-select needs more compute
+    than SDOT by construction — that is what the 60.1s wired build measured).
+  * Steering at the BUILD's beam width (l_build = 48, finished graph, same probes):
+    exact 0.9625, asym 0.9281, sym 0.8594; sym l=64 → 0.9062, l=96 → 0.9281,
+    l=200 → 0.9719. Small-beam steering noise is INTRINSIC on this geometry — the old
+    cut's "−3.4pt" reappears exactly for asym at l=48 regardless of estimator
+    construction. Iso-cost: 2.68× buys sym l≈128 ⇒ ~0.94-0.95, still below exact l=48.
+    Estimator-ordered beams lose at equal cost precisely where the build runs; parity
+    exists only at l≈200, where the build never runs.
+  **VERDICT: 1-bit/FastScan steering for the BUILD is closed** — no admissible operating
+  point at build beam widths, independent of kernel quality. The packed-adjacency
+  SymphonyQG layout remains a SEARCH-side idea only (asym parity at serve-shaped l=200 is
+  proven, kernel 2.68×), parked: search is 47-70ms end-to-end and not the bottleneck.
+  The measurement harness (`fastscan_probe.rs`) stays as the evidence and the template.
 
 Next up: T3 follow-ups: persistence policy for long-lived overlays (warm-as-compactor
-already wired). FastScan: M3 kernel microbench is the gate; the full packed-adjacency
-package stays parked until a kernel actually beats SDOT-x4 on random access.
+already wired). Build-time levers for the vector tier are exhausted at this design point
+(x4 SDOT landed; steering closed; refinement is the honest price of 0.9937).
 
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.

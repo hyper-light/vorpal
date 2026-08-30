@@ -245,8 +245,17 @@ mod tests {
       ("asym  l=300", 300),
       ("asym  l=400", 400),
       ("asym  l=600", 600),
+      // The BUILD's beam width: steering noise has no slack here — this row is what the
+      // wired experiment's recall loss traces to, and what refine-only steering must hold.
+      ("exact l=48", 48),
+      ("asym  l=48", 48),
+      ("sym   l=48", 48),
+      ("sym   l=64", 64),
+      ("sym   l=96", 96),
+      ("sym   l=200", CALIBRATION_SEARCH_L),
     ] {
       let exact = label.starts_with("exact");
+      let symmetric = label.starts_with("sym");
       let (mut hits, mut want) = (0usize, 0usize);
       let mut steps = 0usize;
       for (probe_at, &probe) in probes.iter().enumerate() {
@@ -254,9 +263,14 @@ mod tests {
         rotated_row(quant, probe, &mut q_rot);
         let q_sum: f32 = q_rot.iter().sum();
         let q_norm_sq = quant.snorm[probe as usize];
+        let q_norm = q_norm_sq.sqrt();
         let dist = |x: u32| -> f32 {
           if exact {
             quant.dist_sq(x, probe)
+          } else if symmetric {
+            let c_norm_sq = quant.snorm[x as usize];
+            q_norm_sq + c_norm_sq
+              - 2.0 * est_dot_sym(&bits, probe, x, q_norm, c_norm_sq.sqrt())
           } else {
             let c_norm_sq = quant.snorm[x as usize];
             q_norm_sq + c_norm_sq
@@ -281,6 +295,49 @@ mod tests {
         "  {label}: pool recall {:.4} (avg expansions {:.0})",
         hits as f64 / want as f64,
         steps as f64 / probes.len() as f64
+      );
+    }
+
+    // ---- M3: kernel wall-clock on beam-shaped RANDOM access — the gate the ledger set
+    // before any further wiring. SDOT-x4 (256B rows, 4-way miss interleave) vs symmetric
+    // XOR+CNT over 32B sign codes (the only formulation with FEWER ops than SDOT; the
+    // asymmetric sign-select costs more compute than SDOT by construction). ----
+    let stream_len = 8_000_000usize;
+    let mut lcg = 0x2545F4914F6CDD1Du64;
+    let stream: Vec<u32> = (0..stream_len)
+      .map(|_| {
+        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((lcg >> 33) as usize % n) as u32
+      })
+      .collect();
+    let probe = probes[0];
+    for round in 0..2 {
+      let t = std::time::Instant::now();
+      let mut acc = 0f32;
+      for quad in stream.chunks_exact(4) {
+        let ds = quant.dist_sq_x4([quad[0], quad[1], quad[2], quad[3]], probe);
+        acc += ds[0] + ds[1] + ds[2] + ds[3];
+      }
+      let sdot_ns = t.elapsed().as_nanos() as f64 / stream_len as f64;
+      let t = std::time::Instant::now();
+      let mut ham_acc = 0u32;
+      let qa = probe as usize * bits.words_per_row;
+      let qw: Vec<u64> = bits.words[qa..qa + bits.words_per_row].to_vec();
+      for quad in stream.chunks_exact(4) {
+        for &row in quad {
+          let at = row as usize * bits.words_per_row;
+          let mut ham = 0u32;
+          for (w, &qword) in qw.iter().enumerate() {
+            ham += (bits.words[at + w] ^ qword).count_ones();
+          }
+          ham_acc = ham_acc.wrapping_add(ham);
+        }
+      }
+      let xor_ns = t.elapsed().as_nanos() as f64 / stream_len as f64;
+      eprintln!(
+        "M3 round {round}: SDOT-x4 {sdot_ns:.1} ns/cand vs XOR+CNT {xor_ns:.1} ns/cand \
+         (ratio {:.2}; sinks {acc:.0}/{ham_acc})",
+        sdot_ns / xor_ns
       );
     }
   }
