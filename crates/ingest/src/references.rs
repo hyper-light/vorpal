@@ -742,6 +742,9 @@ static RESOLVED_SPECS: LazyLock<HashMap<SupportLang, ResolvedRefSpec>> = LazyLoc
   ];
   all
     .into_iter()
+    // Slim builds: a disabled grammar's kind_to_id is an unimplemented!() stub — specs
+    // resolve only for compiled-in languages (their files are never walked anyway).
+    .filter(|lang| lang.is_enabled())
     .filter_map(|lang| Some((lang, ResolvedRefSpec::build(lang, ref_spec(lang)?))))
     .collect()
 });

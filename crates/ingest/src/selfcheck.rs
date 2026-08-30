@@ -250,6 +250,10 @@ const CANARIES: &[Canary] = &[
 pub fn verify_extraction(extractor: &OutlineExtractor) -> Result<(), String> {
   let mut broken: Vec<String> = Vec::new();
   for canary in CANARIES {
+    // A slim build legitimately lacks some grammars; its selfcheck covers what it ships.
+    if !canary.lang.is_enabled() {
+      continue;
+    }
     let product = extractor.extract_product(canary.path, canary.source);
     let (items, refs) = product
       .as_ref()
@@ -355,6 +359,7 @@ mod tests {
   fn canary_table_covers_every_extractable_language() {
     let extractor = OutlineExtractor::new().expect("default rules compile");
     for &lang in SupportLang::all_langs() {
+      // all_langs() is the ENABLED set, so this coverage check matches what selfcheck runs.
       let canary = CANARIES.iter().find(|c| c.lang == lang);
       let has_ref_spec = crate::references::ref_spec(lang).is_some();
       match canary {

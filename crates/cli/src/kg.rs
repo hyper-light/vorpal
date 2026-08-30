@@ -715,6 +715,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
         .map_err(anyhow::Error::msg)?;
         let mut value = value;
         value["staleFiles"] = report.stale_files.into();
+        value["unreadableFiles"] = report.unreadable_files.into();
         value["scannedFiles"] = report.scanned_files.into();
         value["totalMatches"] = report.total_matches.into();
         print!("{}", emit_machine(machine, &value)?);

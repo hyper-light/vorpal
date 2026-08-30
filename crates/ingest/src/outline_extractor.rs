@@ -76,6 +76,11 @@ fn compile_rules(rules_yaml: &str) -> Result<LangExtractors, String> {
 
   let mut grouped: HashMap<SupportLang, Vec<SerializableOutlineRule<SupportLang>>> = HashMap::new();
   for rule in rules {
+    // Slim builds: rules for disabled grammars parse (vocabulary) but never compile
+    // (compiling a pattern parses it with the grammar — an unimplemented!() stub there).
+    if !rule.common().language.is_enabled() {
+      continue;
+    }
     grouped
       .entry(rule.common().language)
       .or_default()

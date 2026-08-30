@@ -288,13 +288,126 @@ pub enum SupportLang {
 }
 
 impl SupportLang {
+  /// The languages COMPILED INTO this build (feature-gated). Every capability surface —
+  /// extension routing, digests, specs, canaries — iterates this set; a slim build simply
+  /// has a shorter list and never touches a disabled grammar's `unimplemented!()` stub.
   pub const fn all_langs() -> &'static [SupportLang] {
+    use SupportLang::*;
+    &[
+      #[cfg(feature = "tree-sitter-bash")]
+      Bash,
+      #[cfg(feature = "tree-sitter-c")]
+      C,
+      #[cfg(feature = "tree-sitter-cpp")]
+      Cpp,
+      #[cfg(feature = "tree-sitter-c-sharp")]
+      CSharp,
+      #[cfg(feature = "tree-sitter-css")]
+      Css,
+      #[cfg(feature = "tree-sitter-dart")]
+      Dart,
+      #[cfg(feature = "tree-sitter-elixir")]
+      Elixir,
+      #[cfg(feature = "tree-sitter-go")]
+      Go,
+      #[cfg(feature = "tree-sitter-haskell")]
+      Haskell,
+      #[cfg(feature = "tree-sitter-hcl")]
+      Hcl,
+      #[cfg(feature = "tree-sitter-html")]
+      Html,
+      #[cfg(feature = "tree-sitter-java")]
+      Java,
+      #[cfg(feature = "tree-sitter-javascript")]
+      JavaScript,
+      #[cfg(feature = "tree-sitter-json")]
+      Json,
+      #[cfg(feature = "tree-sitter-kotlin")]
+      Kotlin,
+      #[cfg(feature = "tree-sitter-lua")]
+      Lua,
+      #[cfg(feature = "tree-sitter-md")]
+      Markdown,
+      #[cfg(feature = "tree-sitter-nix")]
+      Nix,
+      #[cfg(feature = "tree-sitter-php")]
+      Php,
+      #[cfg(feature = "tree-sitter-python")]
+      Python,
+      #[cfg(feature = "tree-sitter-ruby")]
+      Ruby,
+      #[cfg(feature = "tree-sitter-rust")]
+      Rust,
+      #[cfg(feature = "tree-sitter-scala")]
+      Scala,
+      #[cfg(feature = "tree-sitter-solidity")]
+      Solidity,
+      #[cfg(feature = "tree-sitter-swift")]
+      Swift,
+      #[cfg(feature = "tree-sitter-typescript")]
+      Tsx,
+      #[cfg(feature = "tree-sitter-typescript")]
+      TypeScript,
+      #[cfg(feature = "tree-sitter-yaml")]
+      Yaml,
+    ]
+  }
+
+  /// EVERY variant, enabled or not — the vocabulary surface. Serde/config parsing accepts
+  /// all of these (a full-language rule file must parse on a slim build; disabled groups
+  /// are dropped before compilation), while `FromStr` — the "please use this language now"
+  /// path — rejects disabled ones with a build-shape error.
+  pub const fn all_variants() -> &'static [SupportLang] {
     use SupportLang::*;
     &[
       Bash, C, Cpp, CSharp, Css, Dart, Elixir, Go, Haskell, Hcl, Html, Java, JavaScript, Json,
       Kotlin, Lua, Markdown, Nix, Php, Python, Ruby, Rust, Scala, Solidity, Swift, Tsx, TypeScript,
       Yaml,
     ]
+  }
+
+  /// Whether this variant's grammar is compiled into the current build.
+  pub const fn is_enabled(self) -> bool {
+    use SupportLang::*;
+    match self {
+      Bash => cfg!(feature = "tree-sitter-bash"),
+      C => cfg!(feature = "tree-sitter-c"),
+      Cpp => cfg!(feature = "tree-sitter-cpp"),
+      CSharp => cfg!(feature = "tree-sitter-c-sharp"),
+      Css => cfg!(feature = "tree-sitter-css"),
+      Dart => cfg!(feature = "tree-sitter-dart"),
+      Elixir => cfg!(feature = "tree-sitter-elixir"),
+      Go => cfg!(feature = "tree-sitter-go"),
+      Haskell => cfg!(feature = "tree-sitter-haskell"),
+      Hcl => cfg!(feature = "tree-sitter-hcl"),
+      Html => cfg!(feature = "tree-sitter-html"),
+      Java => cfg!(feature = "tree-sitter-java"),
+      JavaScript => cfg!(feature = "tree-sitter-javascript"),
+      Json => cfg!(feature = "tree-sitter-json"),
+      Kotlin => cfg!(feature = "tree-sitter-kotlin"),
+      Lua => cfg!(feature = "tree-sitter-lua"),
+      Markdown => cfg!(feature = "tree-sitter-md"),
+      Nix => cfg!(feature = "tree-sitter-nix"),
+      Php => cfg!(feature = "tree-sitter-php"),
+      Python => cfg!(feature = "tree-sitter-python"),
+      Ruby => cfg!(feature = "tree-sitter-ruby"),
+      Rust => cfg!(feature = "tree-sitter-rust"),
+      Scala => cfg!(feature = "tree-sitter-scala"),
+      Solidity => cfg!(feature = "tree-sitter-solidity"),
+      Swift => cfg!(feature = "tree-sitter-swift"),
+      Tsx => cfg!(feature = "tree-sitter-typescript"),
+      TypeScript => cfg!(feature = "tree-sitter-typescript"),
+      Yaml => cfg!(feature = "tree-sitter-yaml"),
+    }
+  }
+
+  /// Vocabulary lookup over EVERY variant (aliases included), no enablement gate — the
+  /// serde/config path.
+  pub fn from_name_any(s: &str) -> Option<SupportLang> {
+    Self::all_variants()
+      .iter()
+      .copied()
+      .find(|&lang| alias(lang).iter().any(|moniker| s.eq_ignore_ascii_case(moniker)))
   }
 
   pub fn file_types(&self) -> Types {
@@ -311,6 +424,8 @@ impl fmt::Display for SupportLang {
 #[derive(Debug)]
 pub enum SupportLangErr {
   LanguageNotSupported(String),
+  /// The name is a known language, but its grammar is not compiled into this build.
+  LanguageDisabled(String),
 }
 
 impl Display for SupportLangErr {
@@ -318,6 +433,10 @@ impl Display for SupportLangErr {
     use SupportLangErr::*;
     match self {
       LanguageNotSupported(lang) => write!(f, "{lang} is not supported!"),
+      LanguageDisabled(lang) => write!(
+        f,
+        "{lang} is not compiled into this build (slim feature set) — use a full build"
+      ),
     }
   }
 }
@@ -346,7 +465,11 @@ impl Visitor<'_> for SupportLangVisitor {
   where
     E: de::Error,
   {
-    v.parse().map_err(de::Error::custom)
+    // Vocabulary, not capability: config/rule files must PARSE with every known language
+    // name even on slim builds (disabled groups are dropped before compilation); the
+    // FromStr path is where enablement gates.
+    SupportLang::from_name_any(v)
+      .ok_or_else(|| de::Error::custom(SupportLangErr::LanguageNotSupported(v.to_string())))
   }
 }
 struct AliasVisitor {
@@ -404,18 +527,17 @@ impl_aliases! {
   Yaml => &["yaml", "yml"],
 }
 
-/// Implements the language names and aliases.
+/// Implements the language names and aliases. Known-but-disabled languages get the
+/// build-shape error, not "not supported" — the user's spelling was right; the binary is
+/// slim.
 impl FromStr for SupportLang {
   type Err = SupportLangErr;
   fn from_str(s: &str) -> Result<Self, Self::Err> {
-    for &lang in Self::all_langs() {
-      for moniker in alias(lang) {
-        if s.eq_ignore_ascii_case(moniker) {
-          return Ok(lang);
-        }
-      }
+    match Self::from_name_any(s) {
+      Some(lang) if lang.is_enabled() => Ok(lang),
+      Some(lang) => Err(SupportLangErr::LanguageDisabled(format!("{lang:?}"))),
+      None => Err(SupportLangErr::LanguageNotSupported(s.to_string())),
     }
-    Err(SupportLangErr::LanguageNotSupported(s.to_string()))
   }
 }
 

@@ -65,7 +65,8 @@ Per-language cost in our discipline: vendor + `grammars/PROVENANCE.json` (licens
 several of their grammars are forks), `SupportLang` variant + feature flag + extension map,
 outline rules YAML, ref spec in `crates/ingest/src/references.rs`, selfcheck canary,
 upstream corpus tests. Rules + spec are the real work (~a day per language done properly).
-Wave 1 costs roughly +25–40 MB binary on today's 47 MB; offer `slim`/`full` feature sets.
+Wave 1 costs roughly +25–40 MB binary on today's 47 MB — accepted: EVERY vorpal artifact
+ships EVERY grammar (product policy, user-set 2026-08-29; no slim presets, ever).
 
 - **Wave 1 (ubiquitous, low grammar risk):** TOML, Dockerfile, Make, CMake, SQL, XML,
   protobuf, INI/properties, GraphQL, Objective-C, Perl, Groovy (Gradle), Zig, Erlang,

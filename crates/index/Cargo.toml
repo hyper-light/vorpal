@@ -33,8 +33,12 @@ tikv-jemalloc-sys = { version = "0.7.1", optional = true }
 # through it — see main.rs). On by default so the shipped binary keeps its measured memory
 # profile; embedded hosts take `default-features = false` and keep their own allocator —
 # the library never sets a global allocator either way (docs/EMBEDDING.md).
-default = ["jemalloc"]
+default = ["jemalloc", "builtin-parser"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "vorpal-kg/alloc-stats"]
+# Every vorpal artifact ships EVERY grammar (product policy); these forwards keep the
+# feature graph composable for non-vorpal embedders only.
+builtin-parser = ["vorpal-ingest/builtin-parser", "vorpal-language/builtin-parser"]
+napi-langs = ["vorpal-ingest/napi-langs", "vorpal-language/napi-lang"]
 
 [dev-dependencies]
 fd-lock = "4.0.4"

@@ -24,3 +24,11 @@ ignore.workspace = true
 rayon.workspace = true
 vorpal-mem.workspace = true
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+[features]
+# Every vorpal artifact ships EVERY grammar — that is product policy, not a default to
+# slim down. These forwards exist only so the language feature graph stays composable for
+# non-vorpal embedders; vorpal's own binaries never subset.
+default = ["builtin-parser"]
+builtin-parser = ["vorpal-language/builtin-parser"]
+napi-langs = ["vorpal-language/napi-lang"]

@@ -321,6 +321,7 @@ impl Server {
         let text = vorpal_index::records::render_code_search(&report);
         let mut data = paged(report.records, args, "hits")?;
         data["staleFiles"] = report.stale_files.into();
+        data["unreadableFiles"] = report.unreadable_files.into();
         data["scannedFiles"] = report.scanned_files.into();
         data["totalMatches"] = report.total_matches.into();
         Ok((text, data))

@@ -985,6 +985,8 @@ pub struct CodeSearchReport {
   pub records: Vec<CodeMatchRecord>,
   /// Files whose current bytes no longer match the generation (skipped, not guessed).
   pub stale_files: u64,
+  /// Files that vanished since indexing or are not valid UTF-8 (skipped, and said so).
+  pub unreadable_files: u64,
   /// Files scanned (post lang/prefix filters).
   pub scanned_files: u64,
   pub total_matches: u64,
@@ -1026,16 +1028,19 @@ pub fn code_search(
     mask
   };
 
-  struct FileHits {
-    stale: bool,
-    /// (definition id, match count, first match offset).
-    defs: Vec<(u64, u32, u32)>,
+  enum FileOutcome {
+    /// Read + parsed + matched (defs may be empty — matchless is still scanned).
+    Scanned(Vec<(u64, u32, u32)>),
+    /// Current bytes no longer match the generation — never half-trusted.
+    Stale,
+    /// Vanished since indexing, or not valid UTF-8 — excluded, and SAID so.
+    Unreadable,
   }
 
   // Pattern compilation is ~a parse of the pattern itself: per-chunk, per-language reuse
   // keeps it to a few hundred compiles across a monorepo instead of one per file (the
   // difference between 69 s and parse-bound wall time on the kernel's 63K C files).
-  let per_file: Vec<Option<FileHits>> = runs
+  let per_file: Vec<Option<FileOutcome>> = runs
     .par_chunks(256)
     .flat_map_iter(|chunk| {
       let mut compiled: Vec<(SupportLang, vorpal_core::matcher::Pattern)> = Vec::new();
@@ -1062,16 +1067,11 @@ pub fn code_search(
       let bytes = match crate::read_indexed_source_with(pack_ref, &run.path) {
         Ok(crate::IndexedRead::Verified(bytes)) => bytes,
         Ok(crate::IndexedRead::Unverified(bytes)) => bytes,
-        Ok(crate::IndexedRead::Changed) => {
-          return Some(FileHits {
-            stale: true,
-            defs: Vec::new(),
-          });
-        }
-        Err(_) => return None, // unreadable (deleted since indexing): not scanned
+        Ok(crate::IndexedRead::Changed) => return Some(FileOutcome::Stale),
+        Err(_) => return Some(FileOutcome::Unreadable),
       };
       let Ok(source) = String::from_utf8(bytes) else {
-        return None;
+        return Some(FileOutcome::Unreadable);
       };
       let grep = lang.grep(&source);
       let mut match_starts: Vec<u32> = grep
@@ -1081,10 +1081,7 @@ pub fn code_search(
         .collect();
       if match_starts.is_empty() {
         // Scanned, clean, matchless — counted as scanned (silence must be attributable).
-        return Some(FileHits {
-          stale: false,
-          defs: Vec::new(),
-        });
+        return Some(FileOutcome::Scanned(Vec::new()));
       }
       match_starts.sort_unstable();
       // Attribute to the innermost containing definition span within this file's run.
@@ -1109,9 +1106,8 @@ pub fn code_search(
         entry.0 += 1;
         entry.1 = entry.1.min(start);
       }
-      Some(FileHits {
-        stale: false,
-        defs: defs
+      Some(FileOutcome::Scanned(
+        defs
           .into_iter()
           .map(|(id, (count, first))| {
             let line = source.as_bytes()[..first as usize]
@@ -1122,24 +1118,27 @@ pub fn code_search(
             (id, count, line)
           })
           .collect(),
-      })
+      ))
       })
     })
     .collect();
 
   let mut stale_files = 0u64;
+  let mut unreadable_files = 0u64;
   let mut scanned_files = 0u64;
   let mut total_matches = 0u64;
   let mut hits: Vec<(u64, u32, u32)> = Vec::new();
   for file in per_file.into_iter().flatten() {
-    if file.stale {
-      stale_files += 1;
-      continue;
-    }
-    scanned_files += 1;
-    for (id, count, first) in file.defs {
-      total_matches += u64::from(count);
-      hits.push((id, count, first));
+    match file {
+      FileOutcome::Stale => stale_files += 1,
+      FileOutcome::Unreadable => unreadable_files += 1,
+      FileOutcome::Scanned(defs) => {
+        scanned_files += 1;
+        for (id, count, first) in defs {
+          total_matches += u64::from(count);
+          hits.push((id, count, first));
+        }
+      }
     }
   }
 
@@ -1178,6 +1177,7 @@ pub fn code_search(
   Ok(CodeSearchReport {
     records,
     stale_files,
+    unreadable_files,
     scanned_files,
     total_matches,
   })
@@ -1189,8 +1189,8 @@ pub fn render_code_search(report: &CodeSearchReport) -> String {
   let mut out = String::new();
   let _ = writeln!(
     out,
-    "{} matches across {} scanned files ({} stale skipped); top definitions by in-degree:",
-    report.total_matches, report.scanned_files, report.stale_files
+    "{} matches across {} scanned files ({} stale, {} unreadable — skipped, not guessed); top definitions by in-degree:",
+    report.total_matches, report.scanned_files, report.stale_files, report.unreadable_files
   );
   for record in &report.records {
     let _ = writeln!(
