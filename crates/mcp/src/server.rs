@@ -73,7 +73,7 @@ impl Profile {
       "callers", "references", "importers", "implementors", "type_users", "similar", "reachable",
       "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
-      "code_search", "data_flow", "query",
+      "code_search", "data_flow", "observed", "query",
     ];
     match self {
       Profile::Full => true,
@@ -829,6 +829,48 @@ impl Server {
           json!({"records": records, "sidecarPresent": sidecar_present}),
         ))
       }
+      "observed" => {
+        // Runtime-observed calls (ADOPTION #26): rows from ingested traces, each flagged
+        // with whether the static graph already carries the edge — `false` is dynamic
+        // dispatch or a function pointer no static resolver can prove. Absence of the
+        // sidecar (never ingested, or invalidated by a rebuild) is stated.
+        let target = graph_target(args, str_arg("name")?);
+        self.kg()?;
+        let dir = self
+          .kg_dir
+          .clone()
+          .ok_or_else(|| ToolError::coded("index-unavailable", "no generation dir pinned"))?;
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
+        let (records, sidecar_present) =
+          vorpal_index::records::observed_records(kg, &dir, &target).map_err(ToolError::from)?;
+        let mut lines = Vec::new();
+        if !sidecar_present {
+          lines.push(
+            "no observed-calls sidecar for this generation — ingest runtime traces with \
+             `vorpal-index ingest-traces <index> <folded-stacks>` (a rebuild invalidates \
+             it until traces are re-ingested)"
+              .to_string(),
+          );
+        } else if records.is_empty() {
+          lines.push("no observed calls recorded for this selection".to_string());
+        }
+        for r in &records {
+          lines.push(format!(
+            "{} {} x{} {}{}",
+            if r.direction == "in" { "<-observed-" } else { "-observed->" },
+            r.counterpart_name,
+            r.count,
+            r.counterpart_path,
+            if r.in_static_graph { "" } else { "  (not in the static graph)" }
+          ));
+        }
+        Ok((
+          lines.join("\n") + "\n",
+          json!({"records": records, "sidecarPresent": sidecar_present}),
+        ))
+      }
       "query" => {
         // Cypher-shaped read-only queries (G-M4): `text` in the query language, or `ir`
         // carrying the typed IR document. Ceilings (text bytes, depth, edge visits, rows)
@@ -1336,6 +1378,17 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
         "id": {"type": "integer", "description": "Refine: exactly this node id"},
         "eid": {"type": "string", "description": "Refine: durable external id (32 hex chars)"}
       }),
+      &["name"],
+    ),
+    tool(
+      "observed",
+      "Runtime-observed calls for a symbol, both directions, from traces ingested with \
+       `vorpal-index ingest-traces` (folded stacks: perf, py-spy, inferno). Each row \
+       carries its sample count and whether the static graph already has the edge — \
+       `false` means dynamic dispatch or a function pointer that static resolution can \
+       never prove. A rebuild invalidates the sidecar until traces are re-ingested; \
+       absence is stated, never silent.",
+      name_only.clone(),
       &["name"],
     ),
     tool(

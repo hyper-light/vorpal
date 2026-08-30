@@ -107,6 +107,7 @@ fn initialize_handshake_and_tool_listing() {
       "ast_dump",
       "fetch_span",
       "data_flow",
+      "observed",
       "query",
       "snippet",
       "why",

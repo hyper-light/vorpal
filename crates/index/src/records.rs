@@ -169,6 +169,70 @@ pub fn flow_records(
   Ok((records, present))
 }
 
+/// One runtime-observed call for a selected definition (from the `observed.bin` sidecar,
+/// ingested with `vorpal-index ingest-traces`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedRecord {
+  /// `out` = the selection was seen calling the counterpart; `in` = the reverse.
+  pub direction: &'static str,
+  pub counterpart_id: u64,
+  pub counterpart_name: String,
+  pub counterpart_path: String,
+  /// Summed sample/occurrence count across the ingested stacks.
+  pub count: u64,
+  /// Whether the static graph already carries a `calls` edge for this pair — `false` is
+  /// the interesting case: dynamic dispatch or a function pointer static resolution can
+  /// never prove.
+  pub in_static_graph: bool,
+}
+
+fn static_calls(kg: &vorpal_kg::Kg, from: vorpal_kg::NodeId, to: u32) -> bool {
+  kg.out_neighbors(from)
+    .into_iter()
+    .any(|(t, e)| t.raw() as u32 == to && e.base() == vorpal_kg::EdgeType::CALLS)
+}
+
+/// Observed calls touching one selected definition, both directions. Absent or stale
+/// sidecar (a rebuild renumbers nodes) answers empty with `sidecar_present = false` — the
+/// caller says "not ingested for this generation" instead of implying "never ran".
+pub fn observed_records(
+  kg: &vorpal_kg::Kg,
+  kg_dir: &std::path::Path,
+  target: &crate::GraphTarget,
+) -> Result<(Vec<ObservedRecord>, bool), String> {
+  let matches = crate::resolve_target(kg, target).map_err(|err| err.to_string())?;
+  let store = vorpal_kg::observed::ObservedStore::load(kg_dir, kg.node_segment_stamp())
+    .map_err(|err| err.to_string())?;
+  let present = !store.is_empty();
+  let mut records = Vec::new();
+  let mut describe = |direction: &'static str, counterpart: u32, count: u64, statically: bool| {
+    let id = vorpal_kg::NodeId::new(counterpart as u64);
+    let (name, path) = kg
+      .node(id)
+      .map(|v| (v.name.to_string(), v.path.to_string()))
+      .unwrap_or_default();
+    records.push(ObservedRecord {
+      direction,
+      counterpart_id: counterpart as u64,
+      counterpart_name: name,
+      counterpart_path: path,
+      count,
+      in_static_graph: statically,
+    });
+  };
+  for &id in &matches {
+    for (to, count) in store.observed_from(id.raw() as u32) {
+      describe("out", to, count, static_calls(kg, id, to));
+    }
+    for (from, count) in store.observed_into(id.raw() as u32) {
+      let statically = static_calls(kg, vorpal_kg::NodeId::new(from as u64), id.raw() as u32);
+      describe("in", from, count, statically);
+    }
+  }
+  Ok((records, present))
+}
+
 #[derive(Serialize, Debug)]
 pub struct SnippetRecord {
   #[serde(flatten)]

@@ -674,6 +674,13 @@ impl Kg {
   /// `names.idx` when the index dir carries one (two binary searches + per-hit string
   /// verification against hash collisions); the parallel scan fallback returns the identical
   /// list for older dirs.
+  /// The node-segment identity stamp additive sidecars are keyed by (ANN tier,
+  /// `communities.bin`, `observed.bin`): any regeneration changes it, so stale sidecars
+  /// read as absent instead of answering with renumbered ids.
+  pub fn node_segment_stamp(&self) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(self.node_segment_bytes())
+  }
+
   pub fn nodes_named(&self, name: &str) -> Vec<NodeId> {
     if let Some((hashes, ids)) = &self.names {
       let hash = xxhash_rust::xxh3::xxh3_64(name.as_bytes());

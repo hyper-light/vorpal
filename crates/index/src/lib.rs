@@ -13,6 +13,7 @@
 pub mod annfiles;
 pub mod artifact;
 pub mod cochange;
+pub mod traces;
 pub mod gendiff;
 pub mod impact;
 pub mod autowarm;

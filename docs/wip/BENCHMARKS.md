@@ -120,6 +120,20 @@ cpython gains 74 Channel nodes (d3 listeners in a vendored flamegraph HTML's emb
 — truthfully extracted) and reports 266 emit sites, 0 linked, all counted; the kernel has
 53 emit sites and no channels, stated on the report.
 
+2026-08-30 runtime-trace ingestion (`observed.bin`, ADOPTION #26):
+`vorpal-index ingest-traces <index> <folded-stacks>` turns collapsed stacks (perf +
+stackcollapse, py-spy, inferno) into observed caller→callee rows — evidence of calls the
+static graph can never prove (function pointers, dynamic dispatch), kept BESIDE the graph
+as an additive sidecar stamped to the node segment: a rebuild invalidates it (re-ingest)
+rather than carrying renumbered ids. Frame names normalize (`+0x…`, ` [module]`,
+`(file:line)` stripped) and resolve only when exactly one callable matches (qualified
+frames fall back to their last segment); unknown/ambiguous frames break the chain — a
+gap never fabricates a direct call — and are counted and sampled on the report. Surfaces:
+`vorpal graph observed <name>` and the MCP `observed` tool, each row flagged
+`in_static_graph` (false = the interesting ones). Zero indexing cost by construction —
+ingestion is a separate offline command, O(stack lines); nothing rides extraction, link,
+or the generation id.
+
 Index size (linux, one generation): 1.27 GiB before tiers — `products.pack` 595 MB,
 `evidence.bin` 268 MB, `nodes.vseg` 171 MB, `strings.heap` 150 MB, `graph.bin` 122 MB,
 `names.idx` 44 MB, `manifest.bin` 6.8 MB, `products.idx` 6.5 MB, `dataflow.bin` 0.75 MB

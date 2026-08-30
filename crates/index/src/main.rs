@@ -191,6 +191,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       Ok(())
     }
+    ["ingest-traces", index, folded] => {
+      // Folded stacks (perf/py-spy/inferno collapsed format) → observed.bin sidecar.
+      let report = vorpal_index::traces::ingest_traces(
+        std::path::Path::new(index),
+        std::path::Path::new(folded),
+      )?;
+      print!("{}", vorpal_index::traces::render_trace_report(&report));
+      Ok(())
+    }
     ["health", index] => {
       print!("{}", vorpal_index::parse_health_report(Path::new(index))?);
       Ok(())

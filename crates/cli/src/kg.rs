@@ -121,6 +121,8 @@ enum GraphVerb {
   Flows,
   /// Near-clones of a definition (`similar_to` edges; confidence = estimated similarity).
   Similar,
+  /// Runtime-observed calls for a definition (from ingested traces), both directions.
+  Observed,
 }
 
 impl GraphVerb {
@@ -142,6 +144,7 @@ impl GraphVerb {
       GraphVerb::Architecture => "architecture",
       GraphVerb::Flows => "flows",
       GraphVerb::Similar => "similar",
+      GraphVerb::Observed => "observed",
     }
   }
 }
@@ -682,6 +685,68 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
             r.to_name,
             if r.param_index == u16::MAX { "?".to_string() } else { r.param_index.to_string() },
             r.to_path
+          );
+        }
+      }
+      _ => {
+        let value = serde_json::json!({
+          "sidecarPresent": sidecar_present,
+          "records": records,
+        });
+        match arg.format {
+          OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+          _ => print!("{}", emit_machine(arg.format, &value)?),
+        }
+      }
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Observed) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let name = arg
+      .name
+      .clone()
+      .ok_or_else(|| anyhow!("`graph observed` needs a symbol name"))?;
+    let eid = match arg.eid.as_deref() {
+      Some(hex) => Some(
+        u128::from_str_radix(hex, 16)
+          .map_err(|_| anyhow::anyhow!("malformed external id '{hex}' (expect 32 hex chars)"))?,
+      ),
+      None => None,
+    };
+    let target = vorpal_index::GraphTarget {
+      name,
+      id: arg.id,
+      external_id: eid,
+      path_suffix: arg.path.clone(),
+      kind: arg.kind.clone(),
+      merge_all: arg.all,
+      show_ids: arg.ids,
+    };
+    let (records, sidecar_present) =
+      vorpal_index::records::observed_records(&kg, &gen_dir, &target).map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => {
+        if !sidecar_present {
+          println!(
+            "no observed-calls sidecar for this generation — ingest runtime traces with \
+             `vorpal-index ingest-traces <index> <folded-stacks>` (a rebuild invalidates it)"
+          );
+        } else if records.is_empty() {
+          println!("no observed calls recorded for this selection");
+        }
+        for r in &records {
+          println!(
+            "{} {} x{} {}{}",
+            if r.direction == "in" { "<-observed-" } else { "-observed->" },
+            r.counterpart_name,
+            r.count,
+            r.counterpart_path,
+            if r.in_static_graph { "" } else { "  (not in the static graph)" }
           );
         }
       }
