@@ -5,7 +5,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-use crate::utils::ErrorContext as EC;
+use crate::RegistryError as EC;
 use anyhow::{Context, Result};
 
 // both use vec since lang will be small

@@ -30,6 +30,7 @@ vorpal-graph = { path = "crates/graph", version = "0.2.0" }
 vorpal-index = { path = "crates/index", version = "0.2.0", default-features = false }
 vorpal-ingest = { path = "crates/ingest", version = "0.2.0" }
 vorpal-kg = { path = "crates/kg", version = "0.2.0" }
+vorpal-lang-registry = { path = "crates/lang-registry", version = "0.2.0" }
 vorpal-language = { path = "crates/language", version = "0.2.0" }
 vorpal-loader = { path = "crates/loader", version = "0.2.0" }
 vorpal-lsp = { path = "crates/lsp", version = "0.2.0" }

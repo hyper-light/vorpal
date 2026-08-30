@@ -12,6 +12,7 @@ version.workspace = true
 
 [dependencies]
 vorpal-index.workspace = true
+vorpal-ingest.workspace = true
 vorpal-kg.workspace = true
 
 ignore.workspace = true

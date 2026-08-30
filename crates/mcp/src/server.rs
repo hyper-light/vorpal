@@ -598,10 +598,10 @@ impl Server {
               std::fs::read_to_string(path).map_err(|err| format!("read {path}: {err}"))?;
             let lang = match args.get("lang").and_then(Value::as_str) {
               Some(lang) => lang.to_string(),
-              None => <vorpal_language::SupportLang as vorpal_core::Language>::from_path(
+              None => <vorpal_ingest::SgLang as vorpal_core::Language>::from_path(
                 std::path::Path::new(path),
               )
-              .map(|l: vorpal_language::SupportLang| l.to_string())
+              .map(|l: vorpal_ingest::SgLang| l.to_string())
               .ok_or_else(|| format!("cannot infer language from {path}; pass lang"))?,
             };
             (source, lang)

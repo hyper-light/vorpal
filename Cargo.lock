@@ -3952,7 +3952,6 @@ version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "rayon",
- "rustc-hash",
  "vorpal-kg",
  "vorpal-outline",
  "xxhash-rust",

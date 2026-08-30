@@ -7,7 +7,8 @@ use std::sync::{Arc, OnceLock};
 use rayon::prelude::*;
 use vorpal_core::Language;
 use vorpal_kg::KgWriter;
-use vorpal_language::{LanguageExt, SupportLang};
+use vorpal_lang_registry::SgLang;
+use vorpal_language::LanguageExt;
 use vorpal_outline::DEFAULT_OUTLINE_RULES;
 use vorpal_outline::combined_extractor::CombinedExtractors;
 use vorpal_outline::extractor::{SerializableOutlineRule, parse_outline_rules};
@@ -20,7 +21,7 @@ use crate::pipeline::FileExtractor;
 use crate::product::{self, FileProduct, ProductRef};
 use crate::references::{extract_references, ref_spec, resolved_ref_spec};
 
-type LangExtractors = HashMap<SupportLang, CombinedExtractors<SupportLang>>;
+type LangExtractors = HashMap<SgLang, CombinedExtractors<SgLang>>;
 
 /// The compiled default rule set, shared process-wide: compiling ~20 languages' rules costs
 /// ~15 ms and every `OutlineExtractor::new` (CLI one-shots, MCP daemon re-indexes) was paying
@@ -72,9 +73,9 @@ impl OutlineExtractor {
 /// (they are independent), with any failure surfaced eagerly, exactly as the serial path did.
 fn compile_rules(rules_yaml: &str) -> Result<LangExtractors, String> {
   let rules =
-    parse_outline_rules::<SupportLang>(rules_yaml).map_err(|e| format!("parse rules: {e}"))?;
+    parse_outline_rules::<SgLang>(rules_yaml).map_err(|e| format!("parse rules: {e}"))?;
 
-  let mut grouped: HashMap<SupportLang, Vec<SerializableOutlineRule<SupportLang>>> = HashMap::new();
+  let mut grouped: HashMap<SgLang, Vec<SerializableOutlineRule<SgLang>>> = HashMap::new();
   for rule in rules {
     // Slim builds: rules for disabled grammars parse (vocabulary) but never compile
     // (compiling a pattern parses it with the grammar — an unimplemented!() stub there).
@@ -101,7 +102,7 @@ impl OutlineExtractor {
   /// Whether a file at `path` would be extracted: a known extension with compiled outline rules
   /// and/or a reference-extraction spec (a language may have either independently).
   pub fn handles(&self, path: &str) -> bool {
-    SupportLang::from_path(path)
+    SgLang::from_path(path)
       .is_some_and(|lang| self.by_lang.contains_key(&lang) || ref_spec(lang).is_some())
   }
 }
@@ -112,12 +113,16 @@ impl OutlineExtractor {
   /// the single extraction path — live ingest applies the product immediately; incremental
   /// re-index replays persisted products for unchanged files.
   pub fn extract_product(&self, path: &str, source: &str) -> Option<FileProduct> {
-    let lang = SupportLang::from_path(path)?;
+    let lang = SgLang::from_path(path)?;
     let combined = self.by_lang.get(&lang);
     let spec = resolved_ref_spec(lang);
     if combined.is_none() && spec.is_none() {
       return None;
     }
+    // A language with rules or a spec always has a linked grammar (rule compilation and spec
+    // resolution are enablement-gated), so this is total here; `None` would mean a language we
+    // cannot stamp an identity for, whose products could never validate — not extractable.
+    let grammar_generation = vorpal_lang_registry::grammar_digest(lang)?;
     // The parse tree (`grep`) is owned locally; everything extracted is copied into the owned
     // product before it drops. Reference extraction runs even without outline rules (the file
     // node is the only definition span).
@@ -193,10 +198,7 @@ impl OutlineExtractor {
       source_xxh3: xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
       // Extraction identity: the language's grammar generation folded with the outline-rule
       // digest, so the cache invalidates a product once either the parser or the rules change.
-      grammar_digest: crate::extraction_identity(
-        vorpal_language::grammar_digest(lang),
-        self.rules_digest,
-      ),
+      grammar_digest: crate::extraction_identity(grammar_generation, self.rules_digest),
       error_nodes,
       error_bytes,
       error_spans,

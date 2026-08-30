@@ -361,7 +361,7 @@ mod tests {
     for &lang in SupportLang::all_langs() {
       // all_langs() is the ENABLED set, so this coverage check matches what selfcheck runs.
       let canary = CANARIES.iter().find(|c| c.lang == lang);
-      let has_ref_spec = crate::references::ref_spec(lang).is_some();
+      let has_ref_spec = crate::references::ref_spec(vorpal_lang_registry::SgLang::from(lang)).is_some();
       match canary {
         Some(canary) => {
           assert!(

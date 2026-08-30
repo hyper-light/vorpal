@@ -1,5 +1,5 @@
 use super::SgLang;
-use crate::utils::ErrorContext as EC;
+use crate::RegistryError as EC;
 use vorpal_config::{DeserializeEnv, RuleCore, SerializableRuleCore};
 use vorpal_core::{
   Doc, Node,

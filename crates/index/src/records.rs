@@ -1007,7 +1007,8 @@ pub fn code_search(
   k: usize,
 ) -> Result<CodeSearchReport, String> {
   use rayon::prelude::*;
-  use vorpal_language::{Language, LanguageExt, SupportLang};
+  use vorpal_ingest::SgLang;
+  use vorpal_language::{Language, LanguageExt};
 
   let runs = crate::cached_runs(kg, artifacts_dir);
   let pack = artifacts_dir.and_then(crate::cached_pack);
@@ -1043,9 +1044,9 @@ pub fn code_search(
   let per_file: Vec<Option<FileOutcome>> = runs
     .par_chunks(256)
     .flat_map_iter(|chunk| {
-      let mut compiled: Vec<(SupportLang, vorpal_core::matcher::Pattern)> = Vec::new();
+      let mut compiled: Vec<(SgLang, vorpal_core::matcher::Pattern)> = Vec::new();
       chunk.iter().map(move |run| {
-      let lang = SupportLang::from_path(&run.path)?;
+      let lang = SgLang::from_path(&run.path)?;
       if let Some(filter) = lang_filter {
         if !format!("{lang:?}").eq_ignore_ascii_case(filter) && lang.to_string() != filter {
           return None;

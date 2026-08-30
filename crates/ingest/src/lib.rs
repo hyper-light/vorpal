@@ -47,8 +47,8 @@ pub use vorpal_resolve::Interner;
 /// supported language. The product-cache replay gate compares this against the digest a cached
 /// product was stamped with, so editing a grammar invalidates exactly its language's products.
 pub fn grammar_digest_for_path(path: &str) -> Option<u64> {
-  use vorpal_language::Language;
-  vorpal_language::SupportLang::from_path(path).map(vorpal_language::grammar_digest)
+  vorpal_lang_registry::from_path(std::path::Path::new(path))
+    .and_then(vorpal_lang_registry::grammar_digest)
 }
 
 /// The full extraction-identity a product is keyed on: its language's grammar generation folded
@@ -68,33 +68,35 @@ pub fn extraction_identity(grammar_digest: u64, rules_digest: u64) -> u64 {
   xxhash_rust::xxh3::xxh3_64(&buf)
 }
 
-/// A single digest over every supported grammar — the coarse stamp the whole-tree fast path
-/// records in the manifest, so editing any grammar forces a re-index (which then re-parses,
-/// via [`grammar_digest_for_path`], only the files whose language actually changed).
+/// A single digest over the whole runtime language universe — builtins plus any registered
+/// dynamic grammars — the coarse stamp the whole-tree fast path records in the manifest, so a
+/// change to any grammar forces a re-index (which then re-parses, via
+/// [`grammar_digest_for_path`], only the files whose language actually changed). Sorted-fold
+/// formula (v2): registration order can never perturb it.
 pub fn global_grammar_stamp() -> u64 {
-  vorpal_language::global_grammar_stamp()
+  vorpal_lang_registry::global_grammar_stamp()
 }
 
 /// Whether `lang` has reference-extraction semantics (calls/imports/types) — pure-structural
 /// languages (CSS, HTML, JSON, Markdown, YAML) do not. Public so the language matrix can be
 /// generated from code truth instead of a hand-maintained list.
-pub fn has_reference_extraction(lang: vorpal_language::SupportLang) -> bool {
-  references::ref_spec(lang).is_some()
+pub fn has_reference_extraction(lang: impl Into<SgLang>) -> bool {
+  references::ref_spec(lang.into()).is_some()
 }
 
+pub use vorpal_lang_registry::SgLang;
 pub use vorpal_language::SupportLang;
 
 /// The canonical language name for a user-supplied alias (`"ts"` → `"TypeScript"`), or `None`
 /// for an unknown language — the shared vocabulary of search-filter `lang` arguments.
 pub fn canonical_language(name: &str) -> Option<String> {
   name
-    .parse::<vorpal_language::SupportLang>()
+    .parse::<SgLang>()
     .ok()
     .map(|lang| lang.to_string())
 }
 
 /// The canonical language name `path` maps to by extension, or `None` for unsupported paths.
 pub fn language_name_of(path: &str) -> Option<String> {
-  use vorpal_language::Language;
-  vorpal_language::SupportLang::from_path(path).map(|lang| lang.to_string())
+  vorpal_lang_registry::from_path(std::path::Path::new(path)).map(|lang| lang.to_string())
 }

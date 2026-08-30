@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use vorpal_language::{SupportLang, global_grammar_stamp, grammar_info};
+use vorpal_language::{SupportLang, grammar_info};
 
 #[derive(clap::Args)]
 pub struct GrammarsArg {
@@ -42,7 +42,12 @@ pub fn run_grammars(arg: GrammarsArg) -> Result<ExitCode> {
       return Err(anyhow::anyhow!("no compiled-in grammar named '{f}'"));
     }
   } else {
-    println!("\nglobal grammar stamp: {:016x}", global_grammar_stamp());
+    // The registry stamp — the value index manifests actually record — so what this command
+    // prints always matches what the whole-tree fast path compares (dynamic langs included).
+    println!(
+      "\nglobal grammar stamp: {:016x}",
+      vorpal_lang_registry::global_grammar_stamp()
+    );
     println!("provenance (vendored / upstream commit / local patches): docs/UPSTREAM.md");
   }
   Ok(ExitCode::SUCCESS)

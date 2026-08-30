@@ -23,10 +23,11 @@ use std::sync::LazyLock;
 use vorpal_core::tree_sitter::StrDoc;
 use vorpal_core::{Language, Node};
 use vorpal_kg::NodeId;
+use vorpal_lang_registry::SgLang;
 use vorpal_language::SupportLang;
 use vorpal_resolve::{RefForm, RefKind};
 
-type SgNode<'t> = Node<'t, StrDoc<SupportLang>>;
+type SgNode<'t> = Node<'t, StrDoc<SgLang>>;
 
 /// One extracted reference, file-locally attributed: `from` indexes the file's local
 /// definition layout (see `local_layout`). Deliberately path-free — the enclosing file's path
@@ -628,7 +629,7 @@ pub(crate) struct ResolvedRefSpec {
 }
 
 impl ResolvedRefSpec {
-  fn build(lang: SupportLang, spec: &'static RefSpec) -> Self {
+  fn build(lang: SgLang, spec: &'static RefSpec) -> Self {
     let id_of = |kind: &str| -> Option<u16> {
       // `kind_to_id` returns 0 for kinds absent from the pinned grammar; such entries could
       // never have matched by string either, so they simply don't dispatch.
@@ -713,7 +714,7 @@ impl ResolvedRefSpec {
 }
 
 /// Kind ids resolved once per language, process-wide.
-static RESOLVED_SPECS: LazyLock<HashMap<SupportLang, ResolvedRefSpec>> = LazyLock::new(|| {
+static RESOLVED_SPECS: LazyLock<HashMap<SgLang, ResolvedRefSpec>> = LazyLock::new(|| {
   use SupportLang as L;
   let all = [
     L::Rust,
@@ -745,19 +746,24 @@ static RESOLVED_SPECS: LazyLock<HashMap<SupportLang, ResolvedRefSpec>> = LazyLoc
     // Slim builds: a disabled grammar's kind_to_id is an unimplemented!() stub — specs
     // resolve only for compiled-in languages (their files are never walked anyway).
     .filter(|lang| lang.is_enabled())
+    .map(SgLang::from)
     .filter_map(|lang| Some((lang, ResolvedRefSpec::build(lang, ref_spec(lang)?))))
     .collect()
 });
 
 /// The kind-id-resolved extraction spec for `lang`, if it has one.
-pub(crate) fn resolved_ref_spec(lang: SupportLang) -> Option<&'static ResolvedRefSpec> {
+pub(crate) fn resolved_ref_spec(lang: SgLang) -> Option<&'static ResolvedRefSpec> {
   RESOLVED_SPECS.get(&lang)
 }
 
 /// Reference-extraction spec for a language. Pure-structural languages (CSS, HTML, JSON,
 /// Markdown, YAML) have no call/import semantics and return `None`.
-pub(crate) fn ref_spec(lang: SupportLang) -> Option<&'static RefSpec> {
+pub(crate) fn ref_spec(lang: SgLang) -> Option<&'static RefSpec> {
   use SupportLang as L;
+  // Dynamic languages gain serialized specs in F-M4; until then they are structural-only.
+  let SgLang::Builtin(lang) = lang else {
+    return None;
+  };
   match lang {
     L::Rust => Some(&RUST),
     L::Python => Some(&PYTHON),
@@ -1514,6 +1520,7 @@ mod tests {
   }
 
   fn full_refs_for(lang: SupportLang, src: &str) -> Vec<OwnedRef> {
+    let lang = SgLang::from(lang);
     let spec = resolved_ref_spec(lang).expect("language has a ref spec");
     let grep = lang.grep(src);
     let spans = vec![(0..usize::MAX, NodeId::new(0))];
@@ -1638,8 +1645,8 @@ mod tests {
   #[test]
   fn rust_static_and_self_calls_carry_qualifier_evidence() {
     let src = "impl Kg {\n  fn a(&self) {\n    self.helper();\n    Self::assoc();\n    Manifest::scan();\n    Vec::new();\n    plain();\n    value.method();\n  }\n}\n";
-    let spec = resolved_ref_spec(SupportLang::Rust).unwrap();
-    let grep = SupportLang::Rust.grep(src);
+    let spec = resolved_ref_spec(SgLang::from(SupportLang::Rust)).unwrap();
+    let grep = SgLang::from(SupportLang::Rust).grep(src);
     // Mimic extract_product's local layout: file + the `Kg` impl item spanning the source.
     let spans = vec![
       (0..usize::MAX, NodeId::new(0)),
@@ -1998,6 +2005,7 @@ mod tests {
     entities: &[String],
     context: &str,
   ) {
+    let lang = SgLang::from(lang);
     let Some(resolved) = resolved_ref_spec(lang) else {
       return;
     };
@@ -2080,7 +2088,7 @@ mod tests {
       let Some(lang) = SupportLang::from_path(&path) else {
         continue;
       };
-      if resolved_ref_spec(lang).is_none() {
+      if resolved_ref_spec(SgLang::from(lang)).is_none() {
         continue;
       }
       let Ok(source) = std::fs::read_to_string(entry.path()) else {
@@ -2220,7 +2228,7 @@ mod tests {
       SupportLang::Markdown,
       SupportLang::Yaml,
     ] {
-      assert!(ref_spec(lang).is_none(), "{lang:?}");
+      assert!(ref_spec(SgLang::from(lang)).is_none(), "{lang:?}");
     }
   }
 }

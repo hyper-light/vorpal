@@ -638,9 +638,10 @@ pub fn grammar_digest(lang: SupportLang) -> u64 {
     .unwrap_or(0)
 }
 
-/// A single digest over **every** supported grammar, in `all_langs` order — the coarse stamp the
-/// whole-tree fast path checks so that editing any grammar forces a re-index that then re-parses
-/// (via the per-file [`grammar_digest`] gate) only the files whose language actually changed.
+/// A single digest over **every builtin** grammar, in `all_langs` order. NOTE: since F-M2 the
+/// stamp index manifests record is `vorpal-lang-registry::global_grammar_stamp`, which folds
+/// registered dynamic languages too (sorted, v2 formula); this builtin-only fold remains as a
+/// component identity for callers that deliberately want the compiled-in set alone.
 pub fn global_grammar_stamp() -> u64 {
   use std::sync::OnceLock;
   static STAMP: OnceLock<u64> = OnceLock::new();

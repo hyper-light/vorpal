@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use vorpal_core::tree_sitter::LanguageExt as _;
 use vorpal_core::{Language as _, Pattern};
-use vorpal_language::SupportLang;
+use vorpal_ingest::SgLang;
 
 /// Run `pattern` (parsed under `lang`) over every matching-language file beneath `root`,
 /// honoring ignore files, and render up to `limit` matches as `path:line  matched-text`
@@ -20,7 +20,7 @@ pub fn structural_search(
   path_suffix: Option<&str>,
   limit: usize,
 ) -> Result<String, String> {
-  let lang: SupportLang = lang
+  let lang: SgLang = lang
     .parse()
     .map_err(|_| format!("unknown language '{lang}'"))?;
   let pattern = Pattern::try_new(pattern, lang).map_err(|err| format!("bad pattern: {err}"))?;
@@ -30,7 +30,7 @@ pub fn structural_search(
     .flatten()
     .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
     .map(|entry| entry.into_path())
-    .filter(|path| SupportLang::from_path(path) == Some(lang))
+    .filter(|path| SgLang::from_path(path) == Some(lang))
     .filter(|path| path_suffix.is_none_or(|suffix| path.to_string_lossy().ends_with(suffix)))
     .collect();
   files.sort();
@@ -77,7 +77,7 @@ pub fn rule_search(
   path_suffix: Option<&str>,
   limit: usize,
 ) -> Result<String, String> {
-  let configs = vorpal_config::from_yaml_string::<SupportLang>(rule_yaml, &Default::default())
+  let configs = vorpal_config::from_yaml_string::<SgLang>(rule_yaml, &Default::default())
     .map_err(|err| format!("bad rule: {err}"))?;
   if configs.is_empty() {
     return Err("no rule documents in input".to_string());
@@ -92,7 +92,7 @@ pub fn rule_search(
       .flatten()
       .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
       .map(|entry| entry.into_path())
-      .filter(|path| SupportLang::from_path(path) == Some(lang))
+      .filter(|path| SgLang::from_path(path) == Some(lang))
       .filter(|path| path_suffix.is_none_or(|suffix| path.to_string_lossy().ends_with(suffix)))
       .collect();
     files.sort();
@@ -143,7 +143,7 @@ pub fn rule_search(
 /// text — the ground truth a rule author needs to pick `kind`/field targets. Capped at
 /// `max_nodes` nodes with an explicit truncation note.
 pub fn ast_dump(source: &str, lang: &str, max_nodes: usize) -> Result<String, String> {
-  let lang: SupportLang = lang
+  let lang: SgLang = lang
     .parse()
     .map_err(|_| format!("unknown language '{lang}'"))?;
   let grep = lang.grep(source);

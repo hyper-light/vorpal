@@ -136,13 +136,28 @@ fn custom_language_outline_rules(
 
 fn register_custom_language(project_dir: &Path, sg_config: VorpalConfig) -> Result<()> {
   if let Some(custom_langs) = sg_config.custom_languages {
-    SgLang::register_custom_language(project_dir, custom_langs)?;
+    SgLang::register_custom_language(project_dir, custom_langs).map_err(registry_err_to_ec)?;
   }
   if let Some(globs) = sg_config.language_globs {
-    SgLang::register_globs(globs)?;
+    SgLang::register_globs(globs).map_err(registry_err_to_ec)?;
   }
-  SgLang::register_injections(sg_config.language_injections)?;
+  SgLang::register_injections(sg_config.language_injections).map_err(registry_err_to_ec)?;
   Ok(())
+}
+
+/// The registry crate reports registration failures as its own [`RegistryError`]; re-wrap them
+/// in the CLI's `ErrorContext` so `exit_with_error` keeps the exact exit codes and help text
+/// these failures carried before the module moved out of the CLI (F-M2).
+fn registry_err_to_ec(err: anyhow::Error) -> anyhow::Error {
+  use vorpal_lang_registry::RegistryError as RE;
+  let ec = match err.downcast_ref::<RE>() {
+    Some(RE::UnrecognizableLanguage(lang)) => EC::UnrecognizableLanguage(lang.clone()),
+    Some(RE::CustomLanguage) => EC::CustomLanguage,
+    Some(RE::LangInjection) => EC::LangInjection,
+    Some(RE::ParseConfiguration) => EC::ParseConfiguration,
+    None => return err,
+  };
+  err.context(ec)
 }
 
 fn build_util_walker(base_dir: &Path, util_dirs: &Option<Vec<PathBuf>>) -> Option<WalkBuilder> {
