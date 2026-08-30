@@ -580,6 +580,10 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
         report.error_files, report.error_nodes
       );
     }
+    match &report.cochange_note {
+      Some(note) => println!("note: {note}"),
+      None => println!("co-change: {} file pairs from git history", report.cochange_edges),
+    }
   }
   if !report.unverified_langs.is_empty() {
     println!(

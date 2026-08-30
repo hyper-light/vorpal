@@ -53,6 +53,17 @@ variant was built and A/B'd against that base — dead even (2.09–2.22 s vs 2.
 identical user CPU), so it did not land: validation is not on the incremental critical
 path; re-link + seal is.
 
+2026-08-30 co-change edges (`changes_with`, ADOPTION #27): the pass reads the last 2,000
+non-merge commits with `git log --name-only`. Measured on the kernel: run after the stream it
+cost 1,135 ms serial (over the +10% cold line), so it now runs as a child process *beside*
+extraction and is joined before link — the serial cost is the join + pair count, **82 ms**
+cold; the git work itself (~1 s of CPU) hides under parsing. Incremental builds never
+re-run git: results cache by `HEAD` + window (`cochange.cache` at the index root), and a
+cache hit costs **14 ms** (the kind-gated File-node scan), so the one-file update stays at
+2.06–2.22 s. Kernel: 178 file pairs (its commits are small); cpython: 1,216 pairs, cold
+0.95 s. Cold rows above were measured before the pass landed; the user-CPU column grows by
+the overlapped git work.
+
 Index size (linux, one generation): 1.27 GiB before tiers — `products.pack` 595 MB,
 `evidence.bin` 268 MB, `nodes.vseg` 171 MB, `strings.heap` 150 MB, `graph.bin` 122 MB,
 `names.idx` 44 MB, `manifest.bin` 6.8 MB, `products.idx` 6.5 MB, `dataflow.bin` 0.75 MB
@@ -129,7 +140,9 @@ Every build above is bit-reproducible: two cold kernel builds from the same tree
 same generation content id and `diff -rq` over the two generation directories is clean —
 the standing gate every format change re-verifies. (Product headers carry the source
 mtime, so `touch`ing a file changes its product bytes and therefore the generation id —
-by design: the id is the content, mtimes included.)
+by design: the id is the content, mtimes included.) With the co-change pass on (default),
+the id also folds the last 2,000 commits of git history — see docs/wip/INDEX_FORMAT.md,
+"Git history in the generation id"; `VORPAL_COCHANGE_COMMITS=0` restores tree-only identity.
 
 ## Agent-task evaluation (`cargo xtask eval`)
 

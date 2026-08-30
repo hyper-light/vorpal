@@ -35,6 +35,10 @@ impl EdgeType {
   /// (G-M0) so every surface speaks the name before any edge exists; id 9 stays free for a
   /// future structural relation to keep the semantic block contiguous from 10.
   pub const DATA_FLOWS: EdgeType = EdgeType(10);
+  /// Temporal coupling from version control: the two files changed together in the
+  /// indexed repository's recent history (symmetric; confidence encodes the co-change
+  /// count, ×20 capped at 100). Derived at seal from `git log`, never from source text.
+  pub const CHANGES_WITH: EdgeType = EdgeType(11);
 
   /// The user-facing relation name (the spelling accepted by [`EdgeType::from_name`] and shown
   /// in traversal results). Confidence is ignored — this reports the base type.
@@ -50,6 +54,7 @@ impl EdgeType {
       EdgeType::HAS_METHOD => "has_method",
       EdgeType::HAS_FIELD => "has_field",
       EdgeType::DATA_FLOWS => "data_flows",
+      EdgeType::CHANGES_WITH => "changes_with",
       _ => "unknown",
     }
   }
@@ -68,6 +73,7 @@ impl EdgeType {
       "has_method" => Some(EdgeType::HAS_METHOD),
       "has_field" => Some(EdgeType::HAS_FIELD),
       "data_flows" => Some(EdgeType::DATA_FLOWS),
+      "changes_with" => Some(EdgeType::CHANGES_WITH),
       _ => None,
     }
   }

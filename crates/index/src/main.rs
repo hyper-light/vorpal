@@ -144,6 +144,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             report.unverified_langs.join(", ")
           );
         }
+        match &report.cochange_note {
+          Some(note) => println!("note: {note}"),
+          None => println!("co-change: {} file pairs from git history", report.cochange_edges),
+        }
         if report.excluded_files > 0 {
           println!(
             "note: {} unhealthy files excluded from the graph (parse-health policy)",

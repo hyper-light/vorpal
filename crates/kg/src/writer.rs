@@ -383,6 +383,20 @@ impl KgWriter {
     }
   }
 
+  /// Visit every File node with its path — the kind column gates the string decode, so a
+  /// pass that relates files (co-change) touches 76k rows' strings at kernel scale, not 2.7M.
+  pub fn for_each_file<F: FnMut(NodeId, &str)>(&self, mut visit: F) {
+    let file_tag = SymbolKind::File.tag();
+    for row in 0..self.kind.len() {
+      if self.kind[row] == file_tag {
+        visit(
+          NodeId::new(row as u64),
+          self.heap_str(self.path_off[row], self.path_len[row]),
+        );
+      }
+    }
+  }
+
   /// One interned definition by dense row (`row == id`): random access for sharded table
   /// builds, where contiguous row ranges are processed on independent threads (§7.5).
   pub fn definition(&self, row: usize) -> Option<(NodeId, &str, &str, SymbolKind, bool)> {

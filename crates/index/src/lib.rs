@@ -12,6 +12,7 @@
 
 pub mod annfiles;
 pub mod artifact;
+pub mod cochange;
 pub mod gendiff;
 pub mod impact;
 pub mod autowarm;
@@ -78,6 +79,11 @@ pub struct IndexReport {
   /// on every report so an unverified grammar can never pass as a verified one. Empty for the
   /// default environment and whenever every dynamic language has a canary.
   pub unverified_langs: Vec<String>,
+  /// Symmetric `changes_with` pairs sealed from git history (each pair counted once).
+  pub cochange_edges: u64,
+  /// Why the co-change pass produced nothing (not a repository, disabled, no history) —
+  /// stated on the report, never a silent zero. `None` when edges were computed.
+  pub cochange_note: Option<String>,
 }
 
 impl IndexReport {
@@ -335,6 +341,8 @@ pub fn build_index_env(
           external: 0,
           masked: 0,
           unverified_langs: unverified_langs.clone(),
+          cochange_edges: 0,
+          cochange_note: None,
         });
       }
     }
@@ -359,6 +367,10 @@ pub fn build_index_env(
   // per-shard application keeps the output bit-identical to the batch path.
   // The loose bank lives at the *root* (outside any generation): concurrent searches feed it
   // and every build consumes it, whichever generation is live.
+  // Co-change pass in flight (ADOPTION #27): a HEAD-keyed cache hit costs two `git
+  // rev-parse` calls; otherwise `git log` runs as a child beside the extraction stream and
+  // is joined before link — its serial cost (1.1 s at kernel scale) hides under parsing.
+  let cochange_pending = cochange::start(src, &out.join("cochange.cache"));
   let products_dir = out.join("products");
   fs::create_dir_all(&products_dir)?;
   // Stage the new generation in a scratch dir under `gen/`; it becomes `gen/<content-id>` at
@@ -536,7 +548,7 @@ pub fn build_index_env(
   );
   drop(pack_sink);
   let pack_result = pack_thread.join().expect("pack writer panicked");
-  let (writer, spilled_refs, stream, arg_spill) = stream_result?;
+  let (mut writer, spilled_refs, stream, arg_spill) = stream_result?;
   pack_result?;
   // Fail policy judges here — before sealing, before the generation commits: nothing is
   // published, and the message lists the worst offenders with their damage ratios.
@@ -585,6 +597,44 @@ pub fn build_index_env(
   // is dead now — hand its pages back before the link pass allocates the table and edges.
   vorpal_ingest::release_freed_pages();
   let (reparsed, replayed) = (stream.parsed, stream.replayed);
+
+  // Temporal coupling (ADOPTION #27): files that changed together in recent git history
+  // gain symmetric `changes_with` edges between their File nodes — derived from `git log`,
+  // bounded, and stated on the report when nothing could be computed.
+  vorpal_kg::phase_stamp("cochange: start");
+  let cochange = cochange::finish(
+    cochange_pending,
+    src,
+    manifest.entries().iter().map(|e| e.path.as_str()),
+  );
+  let mut cochange_edges = 0u64;
+  if !cochange.edges.is_empty() {
+    // File-node lookup by an on-demand scan of the writer's rows — per-file identity keys
+    // are shed as files land (`forget_identity_scope`), and a resident path map would sit
+    // in memory through the whole stream phase to answer this once. Only the paths the
+    // pass actually relates are collected.
+    let wanted: HashSet<&str> = cochange
+      .edges
+      .iter()
+      .flat_map(|e| [e.a.as_str(), e.b.as_str()])
+      .collect();
+    let mut file_ids: HashMap<&str, NodeId> = HashMap::with_capacity(wanted.len());
+    writer.for_each_file(|id, path| {
+      if let Some(&key) = wanted.get(path) {
+        file_ids.insert(key, id);
+      }
+    });
+    for edge in &cochange.edges {
+      if let (Some(&a), Some(&b)) = (file_ids.get(edge.a.as_str()), file_ids.get(edge.b.as_str())) {
+        let label = vorpal_kg::EdgeType::CHANGES_WITH.with_confidence(edge.confidence);
+        writer.add_edge(a, b, label);
+        writer.add_edge(b, a, label);
+        cochange_edges += 1;
+      }
+    }
+  }
+  let cochange_note = cochange.note;
+  vorpal_kg::phase_stamp("cochange: done");
 
   // Loose-file hygiene: everything snapshotted above is now consolidated in the pack (or
   // superseded by a re-parse, or stale) — delete it. Files banked by searches *during* this
@@ -639,6 +689,8 @@ pub fn build_index_env(
     external: resolve.external,
     masked: resolve.masked,
     unverified_langs,
+    cochange_edges,
+    cochange_note,
   })
 }
 
