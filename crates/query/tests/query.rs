@@ -685,3 +685,28 @@ fn with_unwind_union_and_exists() {
   assert_eq!(r.columns, ["exported"]);
   assert_eq!(r.rows, vec![vec![Cell::Int(3)]]);
 }
+
+#[test]
+fn equality_is_exact_except_for_kind_and_eid() {
+  let kg = fixture();
+  // Names compare exactly — "Main" is not `main`.
+  let r = run(&kg, r#"MATCH (f) WHERE f.name = "Main" RETURN f.name"#).unwrap();
+  assert!(r.rows.is_empty(), "{:?}", r.rows);
+  let r = run(&kg, r#"MATCH (f) WHERE f.name = "main" RETURN f.name"#).unwrap();
+  assert_eq!(texts(&r.rows, 0), ["main"]);
+  // Kind labels are enum spellings and stay case-insensitive.
+  let r = run(&kg, r#"MATCH (f) WHERE f.kind = "Function" RETURN count(*)"#).unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Int(4)]]);
+  let r = run(&kg, r#"MATCH (f) WHERE f.kind <> "FUNCTION" RETURN count(*)"#).unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Int(2)]]);
+
+  // An item mixing an aggregate with a non-aggregated value has no single value per group
+  // — refused at plan time, never evaluated against an arbitrary row.
+  match run(&kg, "MATCH (f:Function) RETURN count(*) * f.in_degree") {
+    Err(QueryError::Plan(message)) => assert!(message.contains("mixes an aggregate"), "{message}"),
+    other => panic!("expected plan error, got {other:?}"),
+  }
+  // …while aggregate-only arithmetic and keyed items are fine.
+  let r = run(&kg, "MATCH (f:Function) RETURN count(*) * 2 AS twice, sum(f.in_degree) + 1 AS bumped").unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Int(8), Cell::Int(6)]]);
+}

@@ -1024,7 +1024,7 @@ pub fn eval_pred(pred: &PredExpr, env: &Env<'_>, row: &dyn RowAccess) -> bool {
     PredExpr::Cmp { left, op, right } => {
       let l = eval(left, env, row);
       let r = eval(right, env, row);
-      compare(*op, &l, &r, env, right)
+      compare(*op, &l, &r, env, left)
     }
     PredExpr::In { item, list } => {
       let item = eval(item, env, row);
@@ -1050,19 +1050,24 @@ pub fn eval_pred(pred: &PredExpr, env: &Env<'_>, row: &dyn RowAccess) -> bool {
   }
 }
 
-fn compare(op: CmpOp, l: &Cell, r: &Cell, env: &Env<'_>, right_expr: &Expr) -> bool {
+/// Only `kind` and `eid` — enum labels and hex — compare case-insensitively; every other
+/// text property (names, paths, signatures) is exact.
+fn case_insensitive_property(expr: &Expr) -> bool {
+  matches!(expr, Expr::Prop { prop, .. } if prop == "kind" || prop == "eid")
+}
+
+fn compare(op: CmpOp, l: &Cell, r: &Cell, env: &Env<'_>, left_expr: &Expr) -> bool {
   if l.is_null() || r.is_null() {
     return false;
   }
   match op {
-    CmpOp::Eq => {
-      // Kind and eid text compare case-insensitively (hex / label spellings).
-      match (l, r) {
-        (Cell::Text(a), Cell::Text(b)) => a == b || a.eq_ignore_ascii_case(b) && looks_enum(a),
-        _ => l == r,
+    CmpOp::Eq => match (l, r) {
+      (Cell::Text(a), Cell::Text(b)) if case_insensitive_property(left_expr) => {
+        a.eq_ignore_ascii_case(b)
       }
-    }
-    CmpOp::Ne => !compare(CmpOp::Eq, l, r, env, right_expr),
+      _ => l == r,
+    },
+    CmpOp::Ne => !compare(CmpOp::Eq, l, r, env, left_expr),
     CmpOp::Lt => l.rank() == r.rank() && l < r,
     CmpOp::Le => l.rank() == r.rank() && l <= r,
     CmpOp::Gt => l.rank() == r.rank() && l > r,
@@ -1081,22 +1086,11 @@ fn compare(op: CmpOp, l: &Cell, r: &Cell, env: &Env<'_>, right_expr: &Expr) -> b
     },
     CmpOp::Matches => match (l, r) {
       (Cell::Text(a), Cell::Text(pattern)) => {
-        let _ = right_expr;
         env.regexes.get(pattern).is_some_and(|re| re.is_match(a))
       }
       _ => false,
     },
   }
-}
-
-/// Kind labels and eids are the only text values compared case-insensitively — both are
-/// spellings of an enum/hex, never user prose. Heuristic: all-lowercase ASCII alnum with no
-/// spaces on the LEFT (property side) — kinds are `function`, eids are 32 hex chars.
-fn looks_enum(text: &str) -> bool {
-  !text.is_empty()
-    && text
-      .chars()
-      .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// A stable rendering of an expression, used for column titles.

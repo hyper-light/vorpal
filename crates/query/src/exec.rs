@@ -722,6 +722,12 @@ fn project(
     }
     let ty = check_expr(&item.expr, &table.scope, Position::Projection, &mut aggs, false)?.ty;
     let title = item.alias.clone().unwrap_or_else(|| render_expr(&item.expr));
+    if contains_agg(&item.expr) && refs_outside_aggs(&item.expr) {
+      return Err(QueryError::Plan(format!(
+        "'{title}' mixes an aggregate with non-aggregated values — every non-aggregated \
+         value must be its own returned item (the grouping key)"
+      )));
+    }
     if columns.iter().any(|c| c.title == title) {
       return Err(QueryError::Plan(format!(
         "column '{title}' is projected twice — alias one of them"
@@ -943,6 +949,31 @@ fn sort_keyed(keyed: &mut [(Vec<Cell>, Vec<Cell>)], order_keys: &[(Expr, bool)])
     }
     a.0.cmp(&b.0)
   });
+}
+
+/// Does the expression read the scope anywhere OUTSIDE an aggregate's argument? Such a
+/// read has no single value per group, so Cypher (and we) refuse it at plan time.
+fn refs_outside_aggs(expr: &Expr) -> bool {
+  match expr {
+    Expr::Agg { .. } | Expr::Lit(_) | Expr::Null => false,
+    Expr::Prop { .. } | Expr::Var { .. } => true,
+    Expr::Pred(_) => true,
+    Expr::List(items) => items.iter().any(refs_outside_aggs),
+    Expr::Call { args, .. } => args.iter().any(refs_outside_aggs),
+    Expr::Case {
+      subject,
+      whens,
+      otherwise,
+    } => {
+      subject.as_deref().is_some_and(refs_outside_aggs)
+        || whens
+          .iter()
+          .any(|(w, t)| refs_outside_aggs(w) || refs_outside_aggs(t))
+        || otherwise.as_deref().is_some_and(refs_outside_aggs)
+    }
+    Expr::Binary { left, right, .. } => refs_outside_aggs(left) || refs_outside_aggs(right),
+    Expr::Neg(inner) => refs_outside_aggs(inner),
+  }
 }
 
 fn contains_agg(expr: &Expr) -> bool {
