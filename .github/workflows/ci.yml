@@ -26,5 +26,9 @@ jobs:
       # a red-forever check is worse than no check. Clippy at -D warnings is the lint gate.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # vorpal-py's bindings are behind the off-by-default `python` feature, so the
+      # workspace pass never compiles them — lint them the way the wheel build does.
+      - name: Clippy (python bindings)
+        run: cargo clippy -p vorpal-py --features python --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
