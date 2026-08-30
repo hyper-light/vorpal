@@ -790,60 +790,12 @@ pub fn peek_product_error_bytes(bytes: &[u8]) -> Option<u64> {
 }
 
 pub fn validate_product(bytes: &[u8]) -> bool {
-  fn walk_entry(r: &mut Reader<'_>) -> io::Result<()> {
-    tag_role(r.u8()?)?;
-    tag_symbol_type(r.u8()?)?;
-    r.str_borrowed()?;
-    for _ in 0..6 {
-      r.u32()?;
-    }
-    r.str_borrowed()?;
-    r.str_borrowed()?;
-    Ok(())
-  }
-  fn walk(bytes: &[u8]) -> io::Result<()> {
-    let mut r = Reader { bytes, off: 0 };
-    if r.take(4)? != PRODUCT_MAGIC {
-      return Err(corrupt("bad product magic"));
-    }
-    if r.u32()? != PRODUCT_FORMAT_VERSION {
-      return Err(corrupt("product from a different format generation"));
-    }
-    r.u64()?; // source_size
-    r.u64()?; // source_mtime_ns
-    r.u64()?; // source_xxh3
-    r.u64()?; // grammar_digest
-    r.u32()?; // error_nodes
-    r.u64()?; // error_bytes
-    for _ in 0..r.count()? {
-      r.u32()?; // error span start
-      r.u32()?; // error span end
-    }
-    for _ in 0..r.count()? {
-      walk_entry(&mut r)?;
-      r.u8()?;
-      for _ in 0..r.count()? {
-        walk_entry(&mut r)?;
-        r.u8()?;
-      }
-    }
-    for _ in 0..r.count()? {
-      r.u32()?;
-      r.str_borrowed()?;
-      r.u8()?;
-      r.u32()?;
-      r.u32()?;
-      r.u8()?;
-      if r.u8()? != 0 {
-        r.str_borrowed()?;
-      }
-      if r.u8()? != 0 {
-        r.str_borrowed()?;
-      }
-    }
-    Ok(())
-  }
-  walk(bytes).is_ok()
+  // ONE decoder. This used to be a hand-rolled byte walker mirroring the layout — and it
+  // silently fell behind the v14/v15 reference extras (flags byte, args, entity params,
+  // returns): every product with references failed validation and re-parsed, so incremental
+  // builds re-extracted ~80% of the tree for weeks while cold builds looked fine. The view
+  // decoder is exact by construction and allocates only the item/ref vectors.
+  decode_product_view(bytes).is_ok()
 }
 
 /// Decode a product as views over `bytes` (see [`ProductView`]). Same validation as
@@ -972,6 +924,9 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     let name = r.str_borrowed()?;
     let ret = r.str_borrowed()?;
     returns.push((name, ret));
+  }
+  if r.off != bytes.len() {
+    return Err(corrupt("trailing bytes after product"));
   }
   Ok(ProductView {
     source_size,
