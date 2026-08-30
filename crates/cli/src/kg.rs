@@ -8,6 +8,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 
+use crate::config::ProjectConfig;
+
 
 /// Default index location relative to the indexed tree / working directory. Hidden, so the
 /// ignore-respecting walker never indexes the index itself.
@@ -284,16 +286,60 @@ fn boxed(err: Box<dyn std::error::Error>) -> anyhow::Error {
   anyhow!(err.to_string())
 }
 
-pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
+/// The extraction environment a project configures (F-M3): each custom language's declared
+/// `outlineRules` file becomes a rule source whose origin is the path exactly as written in
+/// the config — relative, so the rules digest is machine-independent. An unreadable rules
+/// file is a hard error naming it; a custom language declaring none is reported (pattern-only,
+/// not indexed), never silently skipped.
+fn extraction_env_from_project(
+  project: Option<&ProjectConfig>,
+) -> Result<vorpal_index::ExtractionEnv> {
+  let mut env = vorpal_index::ExtractionEnv::default();
+  let Some(project) = project else {
+    return Ok(env);
+  };
+  let Some(customs) = project.custom_languages.as_ref() else {
+    return Ok(env);
+  };
+  let mut pattern_only: Vec<&str> = Vec::new();
+  for (name, lang) in customs {
+    let Some(declared) = lang.outline_rules.as_ref() else {
+      pattern_only.push(name);
+      continue;
+    };
+    let path = project.project_dir.join(declared);
+    let yaml = std::fs::read_to_string(&path)
+      .with_context(|| format!("reading outline rules for custom language '{name}': {}", path.display()))?;
+    env.outline_sources.push(vorpal_index::RuleSource {
+      origin: declared.to_string_lossy().into_owned(),
+      yaml,
+    });
+  }
+  if !pattern_only.is_empty() {
+    pattern_only.sort_unstable();
+    println!(
+      "note: {} custom language(s) declare no outlineRules and are pattern-only, not indexed: {}",
+      pattern_only.len(),
+      pattern_only.join(", ")
+    );
+  }
+  Ok(env)
+}
+
+pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
   let out = arg.out.unwrap_or_else(|| arg.src.join(DEFAULT_INDEX_DIR));
   let mode = if arg.verify {
     vorpal_index::CacheMode::Verified
   } else {
     vorpal_index::CacheMode::default()
   };
-  let report = vorpal_index::build_index_with(&arg.src, &out, mode)
-    .map_err(boxed)
-    .with_context(|| format!("indexing {}", arg.src.display()))?;
+  // Custom/dynamic languages were registered at CLI setup (the one-shot dlopen); here their
+  // configured outline rules extend extraction (F-M3). No project config = bundled behavior.
+  let env = extraction_env_from_project(project.ok().as_ref())?;
+  let report =
+    vorpal_index::build_index_env(&arg.src, &out, mode, Default::default(), &env)
+      .map_err(boxed)
+      .with_context(|| format!("indexing {}", arg.src.display()))?;
   if report.reused {
     println!("unchanged — reused existing index ({} nodes)", report.nodes);
   } else {

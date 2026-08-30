@@ -21,7 +21,25 @@ mod references;
 mod selfcheck;
 
 pub use manifest::{FileStat, Manifest};
-pub use outline_extractor::OutlineExtractor;
+pub use outline_extractor::{OutlineExtractor, RuleSource};
+
+/// The extraction environment an index build runs under (F-M3): everything beyond the bundled
+/// defaults that shapes what extraction sees. Today that is extra outline-rule sources
+/// (custom/dynamic languages); serialized ref specs and canaries join it in F-M4. The default
+/// environment is byte-for-byte the bundled behavior — same rules digest, same products.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractionEnv {
+  /// Extra outline-rule documents, each labeled by a stable machine-independent origin.
+  pub outline_sources: Vec<RuleSource>,
+}
+
+impl ExtractionEnv {
+  /// The extractor this environment describes. Languages named by the sources must already be
+  /// registered — dlopen is the caller's job (a one-shot at startup), never extraction's.
+  pub fn extractor(&self) -> Result<OutlineExtractor, String> {
+    OutlineExtractor::with_sources(&self.outline_sources)
+  }
+}
 pub use selfcheck::{verify_default_extraction, verify_extraction};
 pub use pack::{PackMsg, PackReader, PackWriter};
 pub use pipeline::{

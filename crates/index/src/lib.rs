@@ -37,6 +37,7 @@ use vorpal_ingest::{
 };
 // `Kg` is imported once and re-exported for downstream surfaces (CLI) that route all graph
 // access through this crate.
+pub use vorpal_ingest::{ExtractionEnv, RuleSource};
 pub use vorpal_kg::{Direction, EdgeType, Kg};
 use vorpal_kg::NodeId;
 
@@ -205,13 +206,28 @@ pub fn build_index_full(
   cache_mode: CacheMode,
   policy: ParseHealthPolicy,
 ) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_env(src, out, cache_mode, policy, &vorpal_ingest::ExtractionEnv::default())
+}
+
+/// [`build_index_full`] under an explicit [`ExtractionEnv`] (F-M3): extra outline-rule sources
+/// extend extraction to registered custom/dynamic languages. The default environment is
+/// byte-identical to the bundled behavior. Registration (any dlopen) is the caller's one-shot
+/// startup act — this function never loads code, so serving surfaces (MCP tools) can never
+/// trigger a dlopen through it.
+pub fn build_index_env(
+  src: &Path,
+  out: &Path,
+  cache_mode: CacheMode,
+  policy: ParseHealthPolicy,
+  env: &vorpal_ingest::ExtractionEnv,
+) -> Result<IndexReport, Box<dyn Error>> {
   // The build session's string interner (scoped-interner contract, docs/EMBEDDING.md):
   // created here, dropped when this function returns — reclaim is `Drop`, and the `NameId`
   // lifetime brand makes anything holding a session id un-returnable at compile time.
   // Embedded hosts get bounded memory with no reclaim call at all.
   let interner = vorpal_ingest::Interner::default();
   vorpal_kg::phase_stamp("build: enter");
-  let extractor = OutlineExtractor::new()?;
+  let extractor = env.extractor()?;
   vorpal_kg::phase_stamp("build: rules compiled");
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on

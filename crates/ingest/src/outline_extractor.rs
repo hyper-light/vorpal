@@ -58,6 +58,60 @@ impl OutlineExtractor {
     })
   }
 
+  /// The bundled rules plus extra sources (custom/dynamic languages, F-M3). Languages the
+  /// sources name must already be registered — dlopen is the caller's job, never this crate's.
+  ///
+  /// The rules digest becomes a canonical stream: the builtin bytes first, then each source
+  /// framed as `(origin, len, yaml)` in origin-sorted order — machine- and registration-order
+  /// independent, and **byte-identical to [`OutlineExtractor::new`]'s digest when `sources` is
+  /// empty**, so pure-builtin indexes never invalidate across this feature's introduction.
+  /// `origin` must therefore be a stable label (the config-declared relative path), never an
+  /// absolute filesystem path. Two sources sharing an origin with different contents are
+  /// rejected loudly — an ambiguous identity must never fold into product digests.
+  ///
+  /// Note the digest is global: adding or editing any source re-keys every product (one full
+  /// replay-or-parse pass), exactly like editing the bundled rules. Per-language isolation
+  /// comes from the grammar half of the identity, not the rules half.
+  pub fn with_sources(sources: &[RuleSource]) -> Result<Self, String> {
+    if sources.is_empty() {
+      return Self::new();
+    }
+    let mut sorted: Vec<&RuleSource> = sources.iter().collect();
+    sorted.sort_by(|a, b| a.origin.cmp(&b.origin).then(a.yaml.cmp(&b.yaml)));
+    sorted.dedup_by(|a, b| a.origin == b.origin && a.yaml == b.yaml);
+    for pair in sorted.windows(2) {
+      if pair[0].origin == pair[1].origin {
+        return Err(format!(
+          "outline-rule source '{}' provided twice with different contents",
+          pair[0].origin
+        ));
+      }
+    }
+
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(DEFAULT_OUTLINE_RULES.as_bytes());
+    for source in &sorted {
+      h.update(b"\x00source\x00");
+      h.update(source.origin.as_bytes());
+      h.update(&[0]);
+      h.update(&(source.yaml.len() as u64).to_le_bytes());
+      h.update(source.yaml.as_bytes());
+    }
+
+    let mut rules = parse_outline_rules::<SgLang>(DEFAULT_OUTLINE_RULES)
+      .map_err(|e| format!("parse rules: {e}"))?;
+    for source in &sorted {
+      rules.extend(
+        parse_outline_rules::<SgLang>(&source.yaml)
+          .map_err(|e| format!("parse outline rules from {}: {e}", source.origin))?,
+      );
+    }
+    Ok(Self {
+      by_lang: Arc::new(compile_groups(rules)?),
+      rules_digest: h.digest(),
+    })
+  }
+
   /// How many languages have compiled extractors.
   pub fn languages(&self) -> usize {
     self.by_lang.len()
@@ -69,12 +123,26 @@ impl OutlineExtractor {
   }
 }
 
+/// One extra outline-rule document for [`OutlineExtractor::with_sources`]: `origin` is the
+/// stable, machine-independent label folded into the rules digest (the config-declared
+/// relative path), `yaml` the document's exact bytes.
+#[derive(Debug, Clone)]
+pub struct RuleSource {
+  pub origin: String,
+  pub yaml: String,
+}
+
 /// Parse the YAML rule set and compile each language's rules — languages compile in parallel
 /// (they are independent), with any failure surfaced eagerly, exactly as the serial path did.
 fn compile_rules(rules_yaml: &str) -> Result<LangExtractors, String> {
   let rules =
     parse_outline_rules::<SgLang>(rules_yaml).map_err(|e| format!("parse rules: {e}"))?;
+  compile_groups(rules)
+}
 
+/// Group parsed rules by language and compile each group (shared by the bundled-rules path and
+/// [`OutlineExtractor::with_sources`]).
+fn compile_groups(rules: Vec<SerializableOutlineRule<SgLang>>) -> Result<LangExtractors, String> {
   let mut grouped: HashMap<SgLang, Vec<SerializableOutlineRule<SgLang>>> = HashMap::new();
   for rule in rules {
     // Slim builds: rules for disabled grammars parse (vocabulary) but never compile
@@ -272,5 +340,49 @@ mod identity_tests {
     let b = OutlineExtractor::from_rules(vorpal_outline::DEFAULT_OUTLINE_RULES).unwrap();
     assert_eq!(a.rules_digest(), b.rules_digest());
     assert_ne!(a.rules_digest(), 0);
+  }
+
+  #[test]
+  fn with_sources_digest_is_canonical() {
+    use super::RuleSource;
+    let src = |origin: &str, yaml: &str| RuleSource {
+      origin: origin.into(),
+      yaml: yaml.into(),
+    };
+    // A rule document for an always-compiled builtin keeps the fixture cheap; the digest
+    // logic under test is language-agnostic.
+    let rule_a = "id: xa\nlanguage: Rust\nrole: item\nsymbolType: function\nrule: {kind: function_item, has: {field: name, pattern: $N}}\nname: '$N'\n";
+    let rule_b = "id: xb\nlanguage: Rust\nrole: item\nsymbolType: function\nrule: {kind: function_item, has: {field: name, pattern: $M}}\nname: '$M'\n";
+
+    // Empty sources are byte-for-byte the bundled digest — introducing this feature must not
+    // re-key any existing pure-builtin index.
+    assert_eq!(
+      OutlineExtractor::with_sources(&[]).unwrap().rules_digest(),
+      OutlineExtractor::new().unwrap().rules_digest()
+    );
+    // Source order never matters (canonical origin sort)…
+    let ab = OutlineExtractor::with_sources(&[src("a.yml", rule_a), src("b.yml", rule_b)])
+      .unwrap()
+      .rules_digest();
+    let ba = OutlineExtractor::with_sources(&[src("b.yml", rule_b), src("a.yml", rule_a)])
+      .unwrap()
+      .rules_digest();
+    assert_eq!(ab, ba);
+    // …but origin and content both do.
+    let renamed = OutlineExtractor::with_sources(&[src("c.yml", rule_a), src("b.yml", rule_b)])
+      .unwrap()
+      .rules_digest();
+    assert_ne!(ab, renamed, "origin participates in identity");
+    let edited = OutlineExtractor::with_sources(&[src("a.yml", rule_b), src("b.yml", rule_b)])
+      .unwrap()
+      .rules_digest();
+    assert_ne!(ab, edited, "content participates in identity");
+    // Exact duplicates collapse; same origin with different contents is refused loudly.
+    let deduped = OutlineExtractor::with_sources(&[src("a.yml", rule_a), src("a.yml", rule_a), src("b.yml", rule_b)])
+      .unwrap()
+      .rules_digest();
+    assert_eq!(ab, deduped);
+    let conflict = OutlineExtractor::with_sources(&[src("a.yml", rule_a), src("a.yml", rule_b)]);
+    assert!(conflict.is_err(), "conflicting same-origin sources must be rejected");
   }
 }

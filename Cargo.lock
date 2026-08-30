@@ -3745,6 +3745,7 @@ dependencies = [
  "tree-sitter",
  "vorpal-ann",
  "vorpal-core",
+ "vorpal-dynamic",
  "vorpal-ingest",
  "vorpal-kg",
  "vorpal-language",
