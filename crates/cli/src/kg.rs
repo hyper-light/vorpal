@@ -848,10 +848,14 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
   Ok(ExitCode::SUCCESS)
 }
 
-pub fn run_mcp(arg: McpArg) -> Result<ExitCode> {
+pub fn run_mcp(arg: McpArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
   let profile = vorpal_mcp::Profile::parse(&arg.profile)
     .ok_or_else(|| anyhow!("--profile must be full, analysis, or scout"))?;
-  vorpal_mcp::serve_stdio_profiled(index_dir(arg.index), profile)?;
+  // Custom languages were registered (the one-shot dlopen) at CLI setup, before serving
+  // begins; the daemon itself can never load code. Its rebuilds run under the same
+  // extraction environment `vorpal index` uses.
+  let env = extraction_env_from_project(project.ok().as_ref())?;
+  vorpal_mcp::serve_stdio_env(index_dir(arg.index), profile, env)?;
   Ok(ExitCode::SUCCESS)
 }
 

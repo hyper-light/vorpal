@@ -177,7 +177,7 @@ pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
     Commands::Graph(arg) => run_graph(arg),
     Commands::Search(arg) => run_search(arg),
     Commands::Grammars(arg) => run_grammars(arg),
-    Commands::Mcp(arg) => run_mcp(arg),
+    Commands::Mcp(arg) => run_mcp(arg, project),
     Commands::Completions(arg) => run_shell_completion::<App>(arg),
     #[cfg(debug_assertions)]
     Commands::Docs => todo!("todo, generate rule docs based on current config"),

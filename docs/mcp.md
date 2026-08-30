@@ -107,3 +107,14 @@ The agent picks the right tool, and every claim is grounded in your actual index
   `<project>/.vorpal/index` layout for auto-indexing.
 - **Server doesn't start** — confirm `vorpal mcp --index <abs path>` runs in your terminal; if it
   does, the issue is the client's `command`/`PATH`. Use an absolute path to the binary.
+
+## Custom languages and the daemon
+
+Custom/dynamic languages (grammar `.so` files) are registered by the **launching process at
+startup** — `vorpal mcp` performs the one-shot registration (the only `dlopen`) while reading
+`vorpalconfig.yml`, before the first request is served. Nothing reachable through the MCP
+surface can load code: the serving loop and every tool run against the fixed set of grammars
+registered at launch, and the daemon's rebuilds use the same extraction environment (outline
+rules, ref specs, canaries, injection config) that `vorpal index` builds from the project
+config. A dynamic language without a `canary` is extracted best-effort and named in every
+`index` tool response as unverified — never silently trusted.

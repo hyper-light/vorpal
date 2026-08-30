@@ -28,7 +28,18 @@ pub fn serve_stdio(index_dir: PathBuf) -> io::Result<()> {
 /// [`serve_stdio`] with a tool profile: `scout` (read-only navigation), `analysis`
 /// (+ traversal/evidence/health), `full` (everything, including index builds and rule tools).
 pub fn serve_stdio_profiled(index_dir: PathBuf, profile: Profile) -> io::Result<()> {
-  let mut server = Server::with_profile(index_dir, profile);
+  serve_stdio_env(index_dir, profile, vorpal_index::ExtractionEnv::default())
+}
+
+/// [`serve_stdio_profiled`] under an explicit extraction environment (F-M6): the daemon's
+/// rebuilds see the same custom-language rules/specs/canaries the CLI build would. Any dlopen
+/// happened in the CALLER at startup; the serving loop can never load code.
+pub fn serve_stdio_env(
+  index_dir: PathBuf,
+  profile: Profile,
+  env: vorpal_index::ExtractionEnv,
+) -> io::Result<()> {
+  let mut server = Server::with_profile_env(index_dir, profile, env);
   let stdin = io::stdin();
   let mut stdout = io::stdout().lock();
   for line in stdin.lock().lines() {

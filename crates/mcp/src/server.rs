@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use vorpal_index::build_index;
+use vorpal_index::{CacheMode, ExtractionEnv, ParseHealthPolicy, build_index_env};
 use vorpal_kg::Kg;
 
 use crate::watch::SourceWatch;
@@ -72,6 +72,11 @@ impl Profile {
 pub struct Server {
   index_dir: PathBuf,
   profile: Profile,
+  /// The extraction environment every rebuild runs under (F-M6): custom/dynamic language
+  /// rules, ref specs, canaries, and injection config. Fixed at construction — REGISTRATION
+  /// (any dlopen of a grammar .so) is the launching process's one-shot startup act; nothing
+  /// reachable through the MCP surface can ever trigger a dlopen.
+  env: ExtractionEnv,
   kg: Option<Kg>,
   /// The resolved generation directory the cached graph was loaded from — the artifacts a
   /// `why` snippet is digest-verified against, so a concurrent `CURRENT` swap can never split
@@ -86,6 +91,10 @@ impl Server {
   }
 
   pub fn with_profile(index_dir: PathBuf, profile: Profile) -> Self {
+    Self::with_profile_env(index_dir, profile, ExtractionEnv::default())
+  }
+
+  pub fn with_profile_env(index_dir: PathBuf, profile: Profile, env: ExtractionEnv) -> Self {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
     // start building it now instead of on the first semantic search.
@@ -98,6 +107,7 @@ impl Server {
     Self {
       index_dir,
       profile,
+      env,
       kg: None,
       kg_dir: None,
       watch,
@@ -115,8 +125,14 @@ impl Server {
     if self.kg.is_some() && !watch.take_dirty() {
       return Ok(());
     }
-    let rebuilt = build_index(watch.src(), &self.index_dir)
-      .map_err(|err| err.to_string())
+    let rebuilt = build_index_env(
+      watch.src(),
+      &self.index_dir,
+      CacheMode::default(),
+      ParseHealthPolicy::default(),
+      &self.env,
+    )
+    .map_err(|err| err.to_string())
       .and_then(|_| {
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         Kg::load(&dir)
@@ -276,14 +292,14 @@ impl Server {
             .unwrap_or(0.0),
         };
         let report =
-          vorpal_index::build_index_full(Path::new(&src), &self.index_dir, mode, policy)
+          build_index_env(Path::new(&src), &self.index_dir, mode, policy, &self.env)
             .map_err(|err| err.to_string())?;
         // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
         // new generation directory alongside it.
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         self.kg = Some(Kg::load(&dir).map_err(|err| err.to_string())?);
         self.kg_dir = Some(dir);
-        let text = if report.reused {
+        let mut text = if report.reused {
           format!("unchanged — reused existing index ({} nodes)", report.nodes)
         } else {
           format!(
@@ -297,6 +313,14 @@ impl Server {
             report.masked
           )
         };
+        if !report.unverified_langs.is_empty() {
+          text.push_str(&format!(
+            "\nnote: {} dynamic language(s) extracted without a canary (best-effort, \
+             unverified): {}",
+            report.unverified_langs.len(),
+            report.unverified_langs.join(", ")
+          ));
+        }
         Ok((text, json!({})))
       }
       "code_search" => {
