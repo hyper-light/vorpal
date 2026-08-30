@@ -251,7 +251,7 @@ fn parser_fuzz_never_panics() {
   };
   let vocab = [
     "MATCH", "WHERE", "RETURN", "ORDER", "BY", "SKIP", "LIMIT", "COUNT", "DISTINCT", "AND",
-    "OR", "NOT",
+    "OR", "NOT", "=~",
     "AS", "STARTS", "ENDS", "WITH", "CONTAINS", "(", ")", "[", "]", "{", "}", ":", ",", ".",
     "..", "|", "*", "<", ">", "-", "->", "<-", "=", "<>", "!=", "'x'", "\"y\"", "42", "f",
     "calls", "name", "grade", "true", "false", "\\", "\u{1F980}", "\0",
@@ -315,7 +315,7 @@ fn degree_properties_and_ordered_comparisons() {
   assert!(plan_err("MATCH (f) WHERE f.name > 3 RETURN f.name").contains("ordered comparison"));
   assert!(
     plan_err(r#"MATCH (f) WHERE f.in_degree CONTAINS "x" RETURN f.name"#)
-      .contains("substring comparison")
+      .contains("text comparison")
   );
   assert!(plan_err(r#"MATCH (f) WHERE f.exported = "yes" RETURN f.name"#).contains("type mismatch"));
 
@@ -457,6 +457,44 @@ fn multi_segment_chains() {
   // Cycle constraints (a repeated variable) refuse with a teaching error.
   match run(&kg, "MATCH (a)-[:calls]->(a) RETURN a.name") {
     Err(QueryError::Plan(message)) => assert!(message.contains("bound twice"), "{message}"),
+    other => panic!("expected plan error, got {other:?}"),
+  }
+}
+
+#[test]
+fn regex_predicates_are_bounded() {
+  let kg = fixture();
+
+  let r = run(
+    &kg,
+    r#"MATCH (f:Function) WHERE f.name =~ "^(par|val)" RETURN f.name ORDER BY f.name"#,
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["parse", "validate"]);
+
+  // Composes with the boolean tree.
+  let r = run(
+    &kg,
+    r#"MATCH (f) WHERE f.path =~ "src/(main|serde)" AND NOT f.kind = "class" RETURN f.name ORDER BY f.name"#,
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["deserialize", "main"]);
+
+  // Invalid patterns and oversized patterns refuse with their own names.
+  match run(&kg, r#"MATCH (f) WHERE f.name =~ "(" RETURN f.name"#) {
+    Err(QueryError::Plan(message)) => assert!(message.contains("invalid regex"), "{message}"),
+    other => panic!("expected plan error, got {other:?}"),
+  }
+  match run(
+    &kg,
+    &format!(r#"MATCH (f) WHERE f.name =~ "{}" RETURN f.name"#, "a".repeat(600)),
+  ) {
+    Err(QueryError::Ceiling { what: "regex pattern bytes", .. }) => {}
+    other => panic!("expected the pattern ceiling, got {other:?}"),
+  }
+  // Type discipline: =~ is a text operator.
+  match run(&kg, r#"MATCH (f) WHERE f.in_degree =~ "3" RETURN f.name"#) {
+    Err(QueryError::Plan(message)) => assert!(message.contains("text comparison"), "{message}"),
     other => panic!("expected plan error, got {other:?}"),
   }
 }

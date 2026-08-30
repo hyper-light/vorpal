@@ -28,6 +28,8 @@ pub(crate) enum Tok {
   Eq,
   /// `<>` or `!=`.
   Ne,
+  /// `=~` (regex match).
+  Match,
 }
 
 pub(crate) struct Lexed {
@@ -93,8 +95,13 @@ pub(crate) fn lex(text: &str) -> Result<Lexed, QueryError> {
         i += 1;
       }
       b'=' => {
-        tokens.push((Tok::Eq, i));
-        i += 1;
+        if bytes.get(i + 1) == Some(&b'~') {
+          tokens.push((Tok::Match, i));
+          i += 2;
+        } else {
+          tokens.push((Tok::Eq, i));
+          i += 1;
+        }
       }
       b'<' => {
         if bytes.get(i + 1) == Some(&b'>') {

@@ -127,6 +127,9 @@ pub enum CmpOp {
   Le,
   Gt,
   Ge,
+  /// `=~` — anchored-nowhere regex match on text properties (compiled once at plan time,
+  /// bounded pattern length and compiled size).
+  Matches,
 }
 
 /// The RETURN clause: plain projections, or a count — optionally grouped by one key

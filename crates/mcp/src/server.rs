@@ -1330,7 +1330,7 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
       "Cypher-shaped READ-ONLY graph query. One MATCH with a linear pattern — \
        (var:Kind {name: \"x\", path: \"suffix\"}) chained through up to 8 segments like \
        -[:calls|data_flows*1..5 {grade: constrained}]-> — then WHERE (AND/OR/NOT with \
-       parentheses over =, <>, <, <=, >, >=, STARTS/ENDS WITH, CONTAINS on \
+       parentheses over =, <>, <, <=, >, >=, =~ (bounded regex), STARTS/ENDS WITH, CONTAINS on \
        name/path/kind/exported/id/eid/in_degree/out_degree/scc_size), RETURN projections \
        or COUNT(*) / COUNT(DISTINCT var.prop) with one grouping key, ORDER BY / SKIP / \
        LIMIT. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, \

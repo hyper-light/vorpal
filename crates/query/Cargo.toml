@@ -17,3 +17,4 @@ vorpal-graph.workspace = true
 serde = { workspace = true }
 serde_json = "1"
 rayon.workspace = true
+regex.workspace = true

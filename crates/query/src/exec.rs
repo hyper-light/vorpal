@@ -98,10 +98,10 @@ fn check_predicate_types(prop: &str, op: CmpOp, value: &PropValue) -> Result<(),
         )));
       }
     }
-    CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains => {
+    CmpOp::StartsWith | CmpOp::EndsWith | CmpOp::Contains | CmpOp::Matches => {
       if ty != PropType::Text || value_ty != PropType::Text {
         return Err(QueryError::Plan(format!(
-          "substring comparison on '{prop}' — STARTS/ENDS WITH and CONTAINS apply to text \
+          "text comparison on '{prop}' — STARTS/ENDS WITH, CONTAINS, and =~ apply to text \
            properties with string values"
         )));
       }
@@ -270,12 +270,31 @@ impl SidePlan {
   }
 }
 
-/// A WHERE comparison bound to a pattern slot.
+/// A WHERE comparison bound to a pattern slot. `=~` leaves carry their regex, compiled
+/// once at plan time under explicit bounds (pattern length, compiled program size) — a
+/// hostile pattern is a typed refusal before any scan, never a runaway compile.
 struct BoundPredicate {
   slot: usize,
   prop: String,
   op: CmpOp,
   value: PropValue,
+  regex: Option<regex::Regex>,
+}
+
+/// Compile a `=~` pattern under the DoS bounds.
+fn compile_match_regex(pattern: &str) -> Result<regex::Regex, QueryError> {
+  const MAX_PATTERN: usize = 512;
+  if pattern.len() > MAX_PATTERN {
+    return Err(QueryError::Ceiling {
+      what: "regex pattern bytes",
+      limit: MAX_PATTERN as u64,
+    });
+  }
+  regex::RegexBuilder::new(pattern)
+    .size_limit(1 << 20)
+    .dfa_size_limit(1 << 20)
+    .build()
+    .map_err(|err| QueryError::Plan(format!("invalid regex: {err}")))
 }
 
 /// The WHERE tree with every leaf's variable resolved to a slot.
@@ -318,8 +337,12 @@ impl BoundPredicate {
         prop: self.prop.clone(),
         op: CmpOp::Eq,
         value: self.value.clone(),
+        regex: None,
       }
       .eval(kg, id),
+      (CmpOp::Matches, _, Cell::Text(have)) => {
+        self.regex.as_ref().is_some_and(|re| re.is_match(have))
+      }
       (CmpOp::StartsWith, PropValue::Text(want), Cell::Text(have)) => have.starts_with(want),
       (CmpOp::EndsWith, PropValue::Text(want), Cell::Text(have)) => have.ends_with(want),
       (CmpOp::Contains, PropValue::Text(want), Cell::Text(have)) => have.contains(want),
@@ -419,11 +442,16 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
       PredExpr::Cmp(pred) => {
         check_prop(&pred.target.prop)?;
         check_predicate_types(&pred.target.prop, pred.op, &pred.value)?;
+        let regex = match (&pred.op, &pred.value) {
+          (CmpOp::Matches, PropValue::Text(pattern)) => Some(compile_match_regex(pattern)?),
+          _ => None,
+        };
         BoundPred::Cmp(BoundPredicate {
           slot: slot_of(&pred.target.var)?,
           prop: pred.target.prop.clone(),
           op: pred.op,
           value: pred.value.clone(),
+          regex,
         })
       }
       PredExpr::And(terms) => BoundPred::And(

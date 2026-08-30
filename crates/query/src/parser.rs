@@ -405,6 +405,10 @@ impl Parser {
         self.at += 1;
         (CmpOp::Ne, self.value()?)
       }
+      Some(Tok::Match) => {
+        self.at += 1;
+        (CmpOp::Matches, self.value()?)
+      }
       Some(Tok::Lt) => {
         self.at += 1;
         if self.peek() == Some(&Tok::Eq) {
