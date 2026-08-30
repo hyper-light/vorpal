@@ -530,6 +530,11 @@ pub(crate) fn local_layout(
     }
   }
   debug_assert_eq!(entities.len(), spans.len(), "layout entity/span count mismatch");
+  // SpanCursor's contract is DOCUMENT order. Layout order (item, then its members) breaks
+  // it for semantically-adopted members whose bytes live elsewhere in the file (Go methods
+  // under their receiver type) — attribution silently lost every ref inside them until the
+  // table was sorted. Each pair carries its layout id, so sorting cannot shift identity.
+  spans.sort_by_key(|(range, _)| range.start);
   (entities, spans)
 }
 

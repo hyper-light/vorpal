@@ -102,6 +102,12 @@ pub struct SerializableItemRule<L> {
   pub is_import: Option<SerializablePredicate>,
   /// Whether this item belongs to the file/module public surface.
   pub is_exported: Option<SerializablePredicate>,
+  /// Name template (metavariables allowed) of the SAME-FILE item this one belongs to,
+  /// for declarations that are members semantically but not syntactically — Go's
+  /// `func (w Widget) Render()` declares `memberOf: $RECV` and is adopted as a member of
+  /// the file's `Widget` item. An owner defined in another file leaves the item top-level
+  /// (adoption is file-local by design; stated where it matters).
+  pub member_of: Option<String>,
 }
 
 /// Member extractor for direct child structure under an item.
@@ -249,6 +255,7 @@ pub struct ItemExtractor<L: Language> {
   pub common: ExtractorCommon<L>,
   is_import: OutlinePredicate,
   is_exported: OutlinePredicate,
+  member_of: Option<TemplateFix>,
 }
 
 impl<L: Language> ItemExtractor<L> {
@@ -261,7 +268,12 @@ impl<L: Language> ItemExtractor<L> {
       common,
       is_import,
       is_exported,
+      member_of,
     } = item;
+    let member_of = member_of
+      .as_deref()
+      .map(|tmpl| compile_template(tmpl, &common.language, &transform_vars(&common.matcher)))
+      .transpose()?;
     let common = ExtractorCommon::try_from(common, globals, detail)?;
     let is_import = common.compile_predicate(is_import, false)?;
     let is_exported = common.compile_predicate(is_exported, true)?;
@@ -269,6 +281,7 @@ impl<L: Language> ItemExtractor<L> {
       common,
       is_import,
       is_exported,
+      member_of,
     })
   }
 
@@ -287,6 +300,17 @@ impl<L: Language> ItemExtractor<L> {
       is_exported: self.is_exported.evaluate(node_match),
       members,
     }
+  }
+
+  /// The resolved owner name for `memberOf` items — `None` when the rule declares no
+  /// owner or the template renders empty (no receiver captured: nothing to adopt into).
+  pub fn resolve_member_of<'tree, D: Doc>(
+    &self,
+    node_match: &NodeMatch<'tree, D>,
+  ) -> Option<String> {
+    let template = self.member_of.as_ref()?;
+    let owner = render_template(template, node_match);
+    (!owner.is_empty()).then_some(owner)
   }
 }
 
@@ -699,6 +723,7 @@ name: member
   #[test]
   fn serializes_with_internal_role_tag() {
     let rule = SerializableOutlineRule::Item(SerializableItemRule {
+      member_of: None,
       common: SerializableOutlineCommon {
         id: "ts-function".into(),
         language: SupportLang::TypeScript,

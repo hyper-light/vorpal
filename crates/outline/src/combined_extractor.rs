@@ -142,10 +142,15 @@ impl<L: Language> CombinedExtractors<L> {
   where
     L: LanguageExt,
   {
-    OutlineItemIter {
+    // Materialize, then run the semantic-adoption pass (`memberOf` rules): items whose
+    // declared owner is a same-file item become its members — Go's detached methods being
+    // the motivating shape. File item counts are small; the traversal cost is identical.
+    let collected: Vec<(OutlineItem<'tree>, Option<String>)> = OutlineItemIter {
       combined: self,
       traversal: Prune::new(&root),
     }
+    .collect();
+    adopt_members(collected).into_iter()
   }
 
   fn match_item<'tree>(
@@ -195,7 +200,7 @@ struct OutlineItemIter<'a, 'tree, L: LanguageExt> {
 }
 
 impl<'a, 'tree, L: LanguageExt> Iterator for OutlineItemIter<'a, 'tree, L> {
-  type Item = OutlineItem<'tree>;
+  type Item = (OutlineItem<'tree>, Option<String>);
 
   fn next(&mut self) -> Option<Self::Item> {
     loop {
@@ -207,17 +212,92 @@ impl<'a, 'tree, L: LanguageExt> Iterator for OutlineItemIter<'a, 'tree, L> {
   }
 }
 
+/// The `memberOf` adoption pass. Deterministic and total:
+/// * the adoption target for a name is the FIRST non-import, non-adopting item bearing it
+///   (file order);
+/// * adopted items append to the target's members after its syntactic ones, in file order,
+///   with `role: Member` and `is_public` taken from the item's exported flag;
+/// * an item whose owner is absent from this file (defined elsewhere, or a template that
+///   matched nothing) stays a top-level item in its original position — adoption is
+///   file-local, never a guess;
+/// * an item that already has members of its own is never adopted (nesting members under
+///   members has no model), and an item can never adopt into itself.
+fn adopt_members(collected: Vec<(OutlineItem<'_>, Option<String>)>) -> Vec<OutlineItem<'_>> {
+  use std::collections::HashMap;
+  if collected.iter().all(|(_, owner)| owner.is_none()) {
+    return collected.into_iter().map(|(item, _)| item).collect();
+  }
+  // Target per name: first non-import item that is not itself adopting.
+  let mut targets: HashMap<&str, usize> = HashMap::new();
+  for (index, (item, owner)) in collected.iter().enumerate() {
+    if owner.is_none() && !item.is_import {
+      targets.entry(item.entry.name.as_ref()).or_insert(index);
+    }
+  }
+  let adopts: Vec<Option<usize>> = collected
+    .iter()
+    .enumerate()
+    .map(|(index, (item, owner))| {
+      let owner = owner.as_deref()?;
+      if !item.members.is_empty() {
+        return None;
+      }
+      let target = *targets.get(owner)?;
+      (target != index).then_some(target)
+    })
+    .collect();
+  // Build the surviving top-level list, remembering where each original index landed.
+  let mut placed: HashMap<usize, usize> = HashMap::new();
+  let mut result: Vec<OutlineItem<'_>> = Vec::new();
+  let mut adopted: Vec<(usize, OutlineItem<'_>)> = Vec::new();
+  for (index, ((item, _), adopt)) in collected.into_iter().zip(&adopts).enumerate() {
+    match adopt {
+      Some(target) => adopted.push((*target, item)),
+      None => {
+        placed.insert(index, result.len());
+        result.push(item);
+      }
+    }
+  }
+  for (target, item) in adopted {
+    let Some(&at) = placed.get(&target) else {
+      // The target itself was adopted elsewhere (cannot happen: targets never adopt) —
+      // keep the item top-level rather than lose it.
+      result.push(item);
+      continue;
+    };
+    let OutlineItem {
+      mut entry,
+      is_exported,
+      ..
+    } = item;
+    entry.role = crate::model::EntryRole::Member;
+    result[at].members.push(crate::model::OutlineMember {
+      entry,
+      is_public: is_exported,
+    });
+  }
+  result
+}
+
 impl<'a, 'tree, L: LanguageExt> OutlineItemIter<'a, 'tree, L> {
-  fn visit_current_node(&mut self, node: Node<'tree, StrDoc<L>>) -> Option<OutlineItem<'tree>> {
+  fn visit_current_node(
+    &mut self,
+    node: Node<'tree, StrDoc<L>>,
+  ) -> Option<(OutlineItem<'tree>, Option<String>)> {
     let combined = self.combined;
     let item_subtree = self.traversal.current_subtree();
     let Some((extractor, node_match)) = combined.match_item(&node) else {
       self.traversal.descend();
       return None;
     };
+    let member_of = extractor.resolve_member_of(&node_match);
     let members = self.collect_members_for_item(&extractor.common.rule.id, item_subtree);
     let item = extractor.extract(&node_match, members);
-    combined.options.keep_item(&item).then_some(item)
+    combined
+      .options
+      .keep_item(&item)
+      .then_some((item, member_of))
   }
 
   fn collect_members_for_item(

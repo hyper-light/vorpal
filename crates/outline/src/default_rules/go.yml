@@ -27,10 +27,22 @@ role: item
 symbolType: method
 rule:
   kind: method_declaration
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: receiver
+        has:
+          kind: type_identifier
+          stopBy: end
+          pattern: $RECV
 name: $NAME
+# Semantic membership: `func (w Widget) Render()` belongs to Widget. Adoption is
+# file-local — a method beside its type (the dominant Go layout) nests under it, giving
+# the method an owner (typed-receiver resolution) and a `Widget.Render` entity path;
+# a method whose type lives in another file stays top-level, exactly as before.
+memberOf: $RECV
 ---
 id: go-struct-type
 language: Go

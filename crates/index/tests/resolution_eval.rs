@@ -541,14 +541,11 @@ fn typed_receivers_typescript_and_same_type_tie() {
 
 #[test]
 fn typed_receivers_go_all_origins() {
-  // G-M5: Go joins the capture set — annotations (`var v Widget`), composite literals
-  // (`x := Gadget{}`) and typed parameters are captured into products (pinned by the
-  // typefacts_capture suite). The RESOLVER upgrade is blocked on Go method OWNERSHIP:
-  // `func (w Widget) Render()` is a top-level item in the outline (not a member of
-  // Widget — Go methods aren't syntactically inside their type, and parentRuleIds
-  // attaches by enclosure), so owner==receiver_type has no owner to meet and the
-  // same-named tie refuses, exactly as before. Labels below pin TODAY's truth; the
-  // calls land when Go method ownership does (follow-up work item).
+  // G-M5 + Go method ownership: annotations (`var v Widget`), composite literals
+  // (`x := Gadget{}`) and typed parameters narrow same-named methods — the go-method
+  // outline rule declares `memberOf: $RECV`, so a method beside its type is adopted as
+  // its member (file-local), giving owner==receiver_type something to meet. A method
+  // whose type lives in another file stays top-level and the tie still refuses.
   run(&Fixture {
     lang: "go-typed",
     files: &[
@@ -565,6 +562,9 @@ fn typed_receivers_go_all_origins() {
       ),
     ],
     expected: &[
+      ("gAnnotated", "Render", "calls", "constrained", "receiver-annotated"),
+      ("gComposite", "Render", "calls", "constrained", "receiver-constructed"),
+      ("gParam", "Render", "calls", "constrained", "receiver-param-typed"),
       // Type mentions resolve (annotation, composite literal, parameter, receivers).
       ("gAnnotated", "Widget", "of_type", "constrained", "visible-export"),
       ("gComposite", "Gadget", "of_type", "constrained", "visible-export"),
@@ -572,13 +572,7 @@ fn typed_receivers_go_all_origins() {
       ("Render", "Widget", "of_type", "exact", "same-file"),
       ("Render", "Gadget", "of_type", "exact", "same-file"),
     ],
-    absent: &[
-      // Two same-named methods, no ownership to narrow by → the tie refuses (conservative;
-      // see the header comment). These flip to expected edges with Go method ownership.
-      ("gAnnotated", "Render"),
-      ("gComposite", "Render"),
-      ("gParam", "Render"),
-    ],
+    absent: &[],
   });
 }
 
