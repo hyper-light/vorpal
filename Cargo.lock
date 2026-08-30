@@ -3362,6 +3362,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-erlang"
+version = "0.20.0"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
 dependencies = [
@@ -3434,6 +3442,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-julia"
+version = "0.23.1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-kotlin-sg"
 version = "0.4.1"
 dependencies = [
@@ -3480,8 +3496,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-objc"
+version = "3.0.2"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-ocaml"
+version = "0.25.0"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-perl"
+version = "1.1.2"
+dependencies = [
+ "cc",
+ "tree-sitter",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-php"
 version = "0.24.2"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-powershell"
+version = "0.26.4"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -3498,6 +3547,14 @@ dependencies = [
 [[package]]
 name = "tree-sitter-python"
 version = "0.25.0"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-r"
+version = "1.3.0"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -3522,6 +3579,14 @@ dependencies = [
 [[package]]
 name = "tree-sitter-scala"
 version = "0.26.0"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-sequel"
+version = "0.3.11"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -3570,6 +3635,14 @@ dependencies = [
 [[package]]
 name = "tree-sitter-yaml"
 version = "0.7.2"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-zig"
+version = "1.1.2"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -3884,6 +3957,7 @@ dependencies = [
  "tree-sitter-dart",
  "tree-sitter-dockerfile",
  "tree-sitter-elixir",
+ "tree-sitter-erlang",
  "tree-sitter-go",
  "tree-sitter-graphql",
  "tree-sitter-haskell",
@@ -3893,23 +3967,31 @@ dependencies = [
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-json",
+ "tree-sitter-julia",
  "tree-sitter-kotlin-sg",
  "tree-sitter-lua",
  "tree-sitter-make",
  "tree-sitter-md",
  "tree-sitter-nix",
+ "tree-sitter-objc",
+ "tree-sitter-ocaml",
+ "tree-sitter-perl",
  "tree-sitter-php",
+ "tree-sitter-powershell",
  "tree-sitter-proto",
  "tree-sitter-python",
+ "tree-sitter-r",
  "tree-sitter-ruby",
  "tree-sitter-rust",
  "tree-sitter-scala",
+ "tree-sitter-sequel",
  "tree-sitter-solidity",
  "tree-sitter-swift",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-xml",
  "tree-sitter-yaml",
+ "tree-sitter-zig",
  "vorpal-core",
  "xxhash-rust",
 ]

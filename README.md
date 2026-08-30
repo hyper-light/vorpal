@@ -192,14 +192,15 @@ hardware, cold/warm states, raw numbers: **[docs/wip/BENCHMARKS.md](docs/wip/BEN
   graph in-degree (reciprocal rank fusion), with per-channel provenance on every hit.
 - **Incremental by construction** — per-file extraction is cached; re-indexing re-parses only what
   changed and always re-links the whole graph, so renames and deletions never leave stale nodes.
-- **36 languages** — one pipeline, tree-sitter grammars compiled in. No plugins to install.
+- **45 languages** — one pipeline, tree-sitter grammars compiled in. No plugins to install.
 
 ## Supported languages
 
-All **36** grammars are compiled into the binary: Bash, C, C++, C#, CMake, CSS, Dart,
-Dockerfile, Elixir, Go, GraphQL, Haskell, HCL/Terraform, HTML, INI, Java, JavaScript, JSON,
-Kotlin, Lua, Make, Markdown, Nix, PHP, Protobuf, Python, Ruby, Rust, Scala, Solidity, Swift,
-TOML, TSX, TypeScript, XML, YAML. The relation edges each supports are in
+All **45** grammars are compiled into the binary: Bash, C, C++, C#, CMake, CSS, Dart,
+Dockerfile, Elixir, Erlang, Go, GraphQL, Haskell, HCL/Terraform, HTML, INI, Java, JavaScript,
+JSON, Julia, Kotlin, Lua, Make, Markdown, Nix, Objective-C, OCaml, Perl, PHP, PowerShell,
+Protobuf, Python, R, Ruby, Rust, Scala, Solidity, SQL, Swift, TOML, TSX, TypeScript, XML,
+YAML, Zig. The relation edges each supports are in
 the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simply absent — never guessed.
 
 ## Documentation
@@ -209,7 +210,7 @@ the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simp
 | [Getting started](docs/getting-started.md) | Install, first index, every CLI command with examples |
 | [MCP setup](docs/mcp.md) | Wire vorpal into Claude / Codex / any MCP client; the tool reference |
 | [Python](docs/python.md) · [TypeScript/JS](docs/typescript.md) | Library quickstarts (patterns + index API) |
-| [Supported languages](docs/wip/LANGUAGES.md) | The full matrix of what each of the 36 grammars extracts |
+| [Supported languages](docs/wip/LANGUAGES.md) | The full matrix of what each of the 45 grammars extracts |
 | [Architecture](docs/wip/ARCHITECTURE.md) | Storage format, memory model, concurrency, scaling roadmap |
 | [Benchmarks](docs/wip/BENCHMARKS.md) | Reproducible perf: commands, datasets, hardware, results |
 | [Index format](docs/wip/INDEX_FORMAT.md) | On-disk compatibility & migration policy |
@@ -217,7 +218,7 @@ the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simp
 ## How it works
 
 ```
-parse (tree-sitter, 36 grammars)
+parse (tree-sitter, 45 grammars)
   → extract   definitions (YAML outline rules) + references (AST walk: calls/imports/types/impl)
   → intern    blake3 path-qualified identity → dense node ids (dedup, incremental skip)
   → store     columnar node segment (mmap, checksummed) + string heap + edge lists

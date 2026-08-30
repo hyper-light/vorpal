@@ -738,6 +738,202 @@ const HCL: RefSpec = RefSpec {
   ..SPEC_DEFAULTS
 };
 
+/// SQL (dialect-tolerant): function invocations are the one reliable reference class.
+const SQL: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "invocation",
+    callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
+  }],
+  ..SPEC_DEFAULTS
+};
+
+/// Objective-C rides the C surface (call_expression/preproc_include/type_identifier) and adds
+/// message sends and @interface superclasses.
+const OBJC: RefSpec = RefSpec {
+  calls: &[
+    CallSpec {
+      kind: "call_expression",
+      callee: Sel::Field("function"),
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "message_expression",
+      callee: Sel::Field("method"),
+      receiver_field: Some("receiver"),
+      ..CALL_DEFAULTS
+    },
+  ],
+  imports: &[ImportSpec {
+    kind: "preproc_include",
+    target: Sel::Field("path"),
+    string_target: true,
+    qualifier: QualSource::None,
+  }],
+  implements: &[
+    ImplSpec {
+      kind: "class_interface",
+      target: Some(Sel::Field("superclass")),
+    },
+    ImplSpec {
+      kind: "class_implementation",
+      target: Some(Sel::Field("superclass")),
+    },
+  ],
+  types: TYPE_ID,
+  self_receivers: &["self"],
+  ..SPEC_DEFAULTS
+};
+
+const PERL: RefSpec = RefSpec {
+  calls: &[
+    CallSpec {
+      kind: "call_expression_with_bareword",
+      callee: Sel::FirstNamedChild,
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "call_expression_with_args_with_brackets",
+      callee: Sel::FirstNamedChild,
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "call_expression_with_spaced_args",
+      callee: Sel::FirstNamedChild,
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "method_invocation",
+      callee: Sel::Field("function_name"),
+      receiver_field: Some("object"),
+      ..CALL_DEFAULTS
+    },
+  ],
+  imports: &[
+    ImportSpec {
+      kind: "use_no_statement",
+      target: Sel::Field("package_name"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+    ImportSpec {
+      kind: "require_statement",
+      target: Sel::Field("package_name"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+  ],
+  ..SPEC_DEFAULTS
+};
+
+/// Zig: `@import("x")` is a builtin call whose first argument names the module.
+const ZIG: RefSpec = RefSpec {
+  calls: &[
+    CallSpec {
+      kind: "call_expression",
+      callee: Sel::Field("function"),
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "builtin_function",
+      callee: Sel::ChildOfKind(&["builtin_identifier"]),
+      ..CALL_DEFAULTS
+    },
+  ],
+  text_rules: &[("@import", TextAction::ImportFirstArg)],
+  ..SPEC_DEFAULTS
+};
+
+const ERLANG: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "call",
+    callee: Sel::Field("expr"),
+    ..CALL_DEFAULTS
+  }],
+  imports: &[ImportSpec {
+    kind: "import_attribute",
+    target: Sel::Field("module"),
+    string_target: false,
+    qualifier: QualSource::None,
+  }],
+  implements: &[ImplSpec {
+    kind: "behaviour_attribute",
+    target: Some(Sel::Field("name")),
+  }],
+  ..SPEC_DEFAULTS
+};
+
+const OCAML: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "application_expression",
+    callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
+  }],
+  imports: &[
+    ImportSpec {
+      kind: "open_module",
+      target: Sel::Field("module"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+    ImportSpec {
+      kind: "include_module",
+      target: Sel::Field("module"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+  ],
+  ..SPEC_DEFAULTS
+};
+
+/// R: `library(x)` / `require(x)` are ordinary calls importing their first argument.
+const R_SPEC: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "call",
+    callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
+  }],
+  text_rules: &[
+    ("library", TextAction::ImportFirstArg),
+    ("require", TextAction::ImportFirstArg),
+    ("requireNamespace", TextAction::ImportFirstArg),
+  ],
+  ..SPEC_DEFAULTS
+};
+
+const JULIA: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "call_expression",
+    callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
+  }],
+  imports: &[
+    ImportSpec {
+      kind: "import_statement",
+      target: Sel::ChildOfKind(&["identifier", "scoped_identifier", "import_path"]),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+    ImportSpec {
+      kind: "using_statement",
+      target: Sel::ChildOfKind(&["identifier", "scoped_identifier", "import_path"]),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+  ],
+  ..SPEC_DEFAULTS
+};
+
+/// PowerShell: cmdlet/function calls are `command` nodes named by their command_name.
+const POWERSHELL: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "command",
+    callee: Sel::Field("command_name"),
+    ..CALL_DEFAULTS
+  }],
+  ..SPEC_DEFAULTS
+};
+
 /// One node's dispatch outcome in the fused walk — mirrors the priority of the original
 /// if-chain (imports > types > implements > calls); a kind belongs to exactly one chain arm.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -875,6 +1071,15 @@ static RESOLVED_SPECS: LazyLock<HashMap<SgLang, ResolvedRefSpec>> = LazyLock::ne
     L::Solidity,
     L::Nix,
     L::Hcl,
+    L::Sql,
+    L::ObjectiveC,
+    L::Perl,
+    L::Zig,
+    L::Erlang,
+    L::OCaml,
+    L::R,
+    L::Julia,
+    L::PowerShell,
   ];
   all
     .into_iter()
@@ -918,6 +1123,15 @@ pub(crate) fn builtin_specs_for_test() -> Vec<(String, RefSpecData)> {
     L::Solidity,
     L::Nix,
     L::Hcl,
+    L::Sql,
+    L::ObjectiveC,
+    L::Perl,
+    L::Zig,
+    L::Erlang,
+    L::OCaml,
+    L::R,
+    L::Julia,
+    L::PowerShell,
   ];
   all
     .into_iter()
@@ -958,6 +1172,15 @@ pub(crate) fn ref_spec(lang: SgLang) -> Option<&'static RefSpec> {
     L::Elixir => Some(&ELIXIR),
     L::Haskell => Some(&HASKELL),
     L::Solidity => Some(&SOLIDITY),
+    L::Sql => Some(&SQL),
+    L::ObjectiveC => Some(&OBJC),
+    L::Perl => Some(&PERL),
+    L::Zig => Some(&ZIG),
+    L::Erlang => Some(&ERLANG),
+    L::OCaml => Some(&OCAML),
+    L::R => Some(&R_SPEC),
+    L::Julia => Some(&JULIA),
+    L::PowerShell => Some(&POWERSHELL),
     L::Nix => Some(&NIX),
     L::Hcl => Some(&HCL),
     _ => None,
@@ -1602,6 +1825,13 @@ const LEAF_KINDS: &[&str] = &[
   "constant",
   "module_id",
   "attr_identifier",
+  // Erlang: unquoted atoms name functions/modules in call and import position.
+  "atom",
+  // Zig: `@import` and friends.
+  "builtin_identifier",
+  // OCaml: the leaves of value/module paths.
+  "value_name",
+  "module_name",
 ];
 
 /// Fieldless wrapper kinds: recurse into the last named child (the rightmost simple name,
@@ -1626,6 +1856,11 @@ const DESCEND_KINDS: &[&str] = &[
   "aliased_import",
   // Solidity wraps callees in a generic `expression` node.
   "expression",
+  // OCaml paths (`Mod.value`) and Erlang remote calls (`mod:fun`) end in their rightmost name.
+  "value_path",
+  "module_path",
+  "constructor_path",
+  "remote",
 ];
 
 /// The rightmost identifier of a callee/import expression — one universal navigator; unmatched

@@ -1,0 +1,40 @@
+id: ocaml-value
+language: OCaml
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: value_definition
+    - has:
+        kind: let_binding
+        has:
+          field: pattern
+          pattern: $NAME
+name: '$NAME'
+---
+id: ocaml-module
+language: OCaml
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: module_definition
+    - has:
+        stopBy: end
+        kind: module_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: ocaml-type
+language: OCaml
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: type_definition
+    - has:
+        kind: type_binding
+        has:
+          field: name
+          pattern: $NAME
+name: '$NAME'

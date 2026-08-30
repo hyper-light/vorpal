@@ -331,6 +331,8 @@ langs! { $
   C { parser: language_c(tree_sitter_c), feature: "tree-sitter-c", kind: expando('𐀀'), aliases: ["c"], extensions: ["c", "h"], }
   // CMake: `$` only appears in ${var} references, never in raw identifiers/arguments.
   CMake { parser: language_cmake(tree_sitter_cmake), feature: "tree-sitter-cmake", kind: expando('µ'), aliases: ["cmake"], extensions: ["cmake"], filenames: ["CMakeLists.txt"], }
+  // Erlang atoms/vars are ASCII+_; `$` prefixes char literals.
+  Erlang { parser: language_erlang(tree_sitter_erlang), feature: "tree-sitter-erlang", kind: expando('_'), aliases: ["erlang", "erl"], extensions: ["erl", "hrl"], }
   Cpp { parser: language_cpp(tree_sitter_cpp), feature: "tree-sitter-cpp", kind: expando('𐀀'), aliases: ["cc", "c++", "cpp", "cxx"], extensions: ["cc", "hpp", "cpp", "c++", "hh", "cxx", "cu", "ino"], }
   // https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/lexical-structure#643-identifiers
   // all letter number is accepted: https://www.compart.com/en/unicode/category/Nl
@@ -357,6 +359,8 @@ langs! { $
   Ini { parser: language_ini(tree_sitter_ini), feature: "tree-sitter-ini", kind: expando('_'), aliases: ["ini", "properties"], extensions: ["ini", "cfg", "properties"], filenames: [".editorconfig"], }
   Java { parser: language_java(tree_sitter_java), feature: "tree-sitter-java", kind: plain, aliases: ["java"], extensions: ["java"], }
   JavaScript { parser: language_javascript(tree_sitter_javascript), feature: "tree-sitter-javascript", kind: plain, aliases: ["javascript", "js", "jsx"], extensions: ["cjs", "js", "mjs", "jsx"], }
+  // Julia identifiers admit unicode letters (µ), never `$` (interpolation sigil).
+  Julia { parser: language_julia(tree_sitter_julia), feature: "tree-sitter-julia", kind: expando('µ'), aliases: ["julia", "jl"], extensions: ["jl"], }
   Json { parser: language_json(tree_sitter_json), feature: "tree-sitter-json", kind: plain, aliases: ["json"], extensions: ["json"], }
   // https://github.com/fwcd/tree-sitter-kotlin/pull/93
   Kotlin { parser: language_kotlin(tree_sitter_kotlin), feature: "tree-sitter-kotlin", kind: expando('µ'), aliases: ["kotlin", "kt"], extensions: ["kt", "ktm", "kts"], }
@@ -364,6 +368,10 @@ langs! { $
   // Make: `$` is THE macro character; it can never appear raw in a target/variable name.
   Make { parser: language_make(tree_sitter_make), feature: "tree-sitter-make", kind: expando('µ'), aliases: ["make", "makefile", "gnumake"], extensions: ["mk", "mak", "make"], filenames: ["Makefile", "makefile", "GNUmakefile"], }
   Markdown { parser: language_markdown(tree_sitter_md), feature: "tree-sitter-md", kind: plain, aliases: ["markdown", "md"], extensions: ["markdown", "md"], }
+  // Objective-C rides the C identifier rules.
+  ObjectiveC { parser: language_objc(tree_sitter_objc), feature: "tree-sitter-objc", kind: expando('𐀀'), aliases: ["objc", "objective-c", "objectivec"], extensions: ["m"], }
+  // OCaml identifiers are [A-Za-z0-9_'].
+  OCaml { parser: language_ocaml(tree_sitter_ocaml, LANGUAGE_OCAML), feature: "tree-sitter-ocaml", kind: expando('_'), aliases: ["ocaml", "ml"], extensions: ["ml"], }
   // Nix uses $ for string interpolation, e.g. "${pkgs.hello}"
   Nix { parser: language_nix(tree_sitter_nix), feature: "tree-sitter-nix", kind: expando('_'), aliases: ["nix"], extensions: ["nix"], }
   // PHP accepts unicode in some names (not variable names, though)
@@ -372,12 +380,20 @@ langs! { $
   Proto { parser: language_proto(tree_sitter_proto), feature: "tree-sitter-proto", kind: expando('_'), aliases: ["proto", "protobuf"], extensions: ["proto"], }
   // any char in [:XID_Start:]: https://docs.python.org/3/reference/lexical_analysis.html#identifiers
   // see also PEP 3131 (https://peps.python.org/pep-3131/)
+  // Perl sigils make `$` structural; identifiers are [A-Za-z0-9_].
+  Perl { parser: language_perl(tree_sitter_perl), feature: "tree-sitter-perl", kind: expando('_'), aliases: ["perl", "pl"], extensions: ["pl", "pm", "t"], }
+  // PowerShell variables are `$x`; function/command names admit unicode letters.
+  PowerShell { parser: language_powershell(tree_sitter_powershell), feature: "tree-sitter-powershell", kind: expando('µ'), aliases: ["powershell", "pwsh", "ps1"], extensions: ["ps1", "psm1", "psd1"], }
   Python { parser: language_python(tree_sitter_python), feature: "tree-sitter-python", kind: expando('µ'), aliases: ["py", "python"], extensions: ["py", "py3", "pyi", "bzl", "bazel"], }
   // https://github.com/tree-sitter/tree-sitter-ruby/blob/f257f3f57833d584050336921773738a3fd8ca22/grammar.js#L30C26-L30C78
+  // R identifiers are letters, digits, `.` and `_`.
+  R { parser: language_r(tree_sitter_r), feature: "tree-sitter-r", kind: expando('_'), aliases: ["r"], extensions: ["r", "R"], }
   Ruby { parser: language_ruby(tree_sitter_ruby), feature: "tree-sitter-ruby", kind: expando('µ'), aliases: ["rb", "ruby"], extensions: ["rb", "rbw", "gemspec"], }
   // any char in [:XID_Start:]: https://doc.rust-lang.org/reference/identifiers.html
   Rust { parser: language_rust(tree_sitter_rust), feature: "tree-sitter-rust", kind: expando('µ'), aliases: ["rs", "rust"], extensions: ["rs"], }
   Scala { parser: language_scala(tree_sitter_scala), feature: "tree-sitter-scala", kind: plain, aliases: ["scala"], extensions: ["scala", "sc", "sbt"], }
+  // SQL identifiers: `$` only appears in dialect-specific dollar quoting.
+  Sql { parser: language_sql(tree_sitter_sequel), feature: "tree-sitter-sequel", kind: expando('_'), aliases: ["sql"], extensions: ["sql"], }
   Solidity { parser: language_solidity(tree_sitter_solidity), feature: "tree-sitter-solidity", kind: plain, aliases: ["sol", "solidity"], extensions: ["sol"], }
   // https://docs.swift.org/swift-book/documentation/the-swift-programming-language/lexicalstructure/#Identifiers
   Swift { parser: language_swift(tree_sitter_swift), feature: "tree-sitter-swift", kind: expando('µ'), aliases: ["swift"], extensions: ["swift"], }
@@ -387,6 +403,8 @@ langs! { $
   TypeScript { parser: language_typescript(tree_sitter_typescript, LANGUAGE_TYPESCRIPT), feature: "tree-sitter-typescript", kind: plain, aliases: ["ts", "typescript"], extensions: ["ts", "cts", "mts"], }
   // XML Names exclude `$` (and µ — NameStartChar begins at U+00C0); `_` is valid.
   Xml { parser: language_xml(tree_sitter_xml, LANGUAGE_XML), feature: "tree-sitter-xml", kind: expando('_'), aliases: ["xml"], extensions: ["xml", "xsd", "xsl", "xslt", "svg", "rss", "atom", "plist", "xaml", "csproj", "props", "targets"], }
+  // Zig identifiers are [A-Za-z0-9_]; `$` never lexes.
+  Zig { parser: language_zig(tree_sitter_zig), feature: "tree-sitter-zig", kind: expando('_'), aliases: ["zig"], extensions: ["zig"], }
   Yaml { parser: language_yaml(tree_sitter_yaml), feature: "tree-sitter-yaml", kind: plain, aliases: ["yaml", "yml"], extensions: ["yaml", "yml"], }
 }
 

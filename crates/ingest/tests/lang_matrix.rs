@@ -125,6 +125,46 @@ const CALL_ROWS: &[(&str, &str, &str)] = &[
     "a.sol",
     "contract App {\n  function helper() public pure returns (uint) { return 1; }\n  function run() public pure returns (uint) { return helper(); }\n}\n",
   ),
+  (
+    "objc",
+    "a.m",
+    "void helper(void) {}\n\n@implementation Canary\n- (void)run { helper(); }\n@end\n",
+  ),
+  (
+    "perl",
+    "a.pl",
+    "sub helper {\n  return 1;\n}\n\nsub run {\n  helper();\n}\n",
+  ),
+  (
+    "zig",
+    "a.zig",
+    "fn helper() void {}\n\nfn run() void {\n    helper();\n}\n",
+  ),
+  (
+    "erlang",
+    "a.erl",
+    "-module(canary).\n\nhelper() -> 1.\n\nrun() ->\n    helper().\n",
+  ),
+  (
+    "ocaml",
+    "a.ml",
+    "let helper x = x\n\nlet run x = helper x\n",
+  ),
+  (
+    "r",
+    "a.R",
+    "helper <- function(x) x\n\nrun <- function(x) {\n  helper(x)\n}\n",
+  ),
+  (
+    "julia",
+    "a.jl",
+    "function helper(x)\n    x\nend\n\nfunction run(x)\n    helper(x)\nend\n",
+  ),
+  (
+    "powershell",
+    "a.ps1",
+    "function helper {\n  1\n}\n\nfunction run {\n  helper\n}\n",
+  ),
 ];
 
 #[test]
@@ -146,6 +186,19 @@ fn every_code_language_resolves_a_call_edge() {
     }
   }
   assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+fn sql_invocations_attribute_to_the_enclosing_file() {
+  // SQL calls live in top-level statements, so the caller is the FILE node — the honest
+  // attribution for a language whose call sites rarely sit inside another definition.
+  let (kg, stats) = kg_for(&[(
+    "a.sql",
+    "CREATE FUNCTION helper() RETURNS int AS 'SELECT 1';\nSELECT helper();\n",
+  )]);
+  assert!(stats.resolved >= 1, "{stats:?}");
+  let callers = names_of(&kg, &kg.callers_of("helper"));
+  assert!(callers.iter().any(|n| n == "a.sql"), "{callers:?}");
 }
 
 #[test]

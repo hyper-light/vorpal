@@ -1,0 +1,37 @@
+id: erlang-module
+language: Erlang
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: module_attribute
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: erlang-function
+language: Erlang
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: fun_decl
+    - has:
+        kind: function_clause
+        has:
+          field: name
+          pattern: $NAME
+name: '$NAME'
+---
+id: erlang-record
+language: Erlang
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: record_decl
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
