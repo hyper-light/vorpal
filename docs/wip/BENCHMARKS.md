@@ -111,3 +111,30 @@ answering from incompatible vectors.
 Every build above is bit-reproducible: rebuilding an unchanged tree produces the same
 generation content id (`diff -r` clean across double builds at kernel scale — the standing
 gate every format change re-verifies).
+
+## Agent-task evaluation (`cargo xtask eval`)
+
+Ten code-navigation questions over this repository, answered by one vorpal CLI invocation
+against a fresh index vs a file-exploration baseline (one `grep -rn` + opening the first
+five matched files — deliberately generous to the baseline). Correctness is judged against
+hand-labelled expectations; the suite fails loudly if any vorpal answer misses its label.
+Regenerate with `cargo build --release -p vorpal -p vorpal-index && cargo xtask eval --write`.
+
+<!-- BEGIN GENERATED EVAL TABLE -->
+
+| Question | vorpal calls | bytes | ms | ok | baseline calls | bytes | ms | ok |
+|---|---:|---:|---:|---|---:|---:|---:|---|
+| where-defined | 1 | 186 | 4 | ✓ | 2 | 5253 | 26 | ✓ |
+| who-calls | 1 | 105 | 4 | ✓ | 2 | 73399 | 28 | ✓ |
+| snippet | 1 | 759 | 5 | ✓ | 2 | 73233 | 26 | ✓ |
+| type-users | 1 | 84 | 4 | ✓ | 4 | 91014 | 19 | ✓ |
+| impact | 1 | 2993 | 4 | ✓ | 6 | 107947 | 18 | ✓ |
+| data-flow | 1 | 2891 | 3 | ✓ | 3 | 119203 | 29 | ✓ |
+| schema | 1 | 567 | 4 | ✓ | 6 | 52340 | 19 | ✓ |
+| hubs | 1 | 259 | 5 | ✓ | 6 | 93805 | 25 | ✓ |
+| reachable | 1 | 920 | 3 | ✓ | 3 | 119374 | 26 | ✓ |
+| search | 1 | 431 | 12 | ✓ | 2 | 25689 | 25 | ✓ |
+| **total** | **10** | **9195** | | **10/10** | **36** | **761257** | | **10/10** |
+
+Bytes an agent must read: baseline/vorpal = **82.8×** (baseline model: one grep + opening the first 5 matched files — generous; real exploration loops grep repeatedly).
+<!-- END GENERATED EVAL TABLE -->

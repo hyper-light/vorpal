@@ -1,3 +1,4 @@
+mod eval;
 mod schema;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value as JSON, from_str as parse_json, to_string_pretty};
@@ -12,11 +13,18 @@ enum Task {
   Release(String),
   /// Checksums + optional detached signatures + a provenance record over a dist directory.
   ReleaseArtifacts(String),
+  /// The agent-task evaluation suite (Phase E): vorpal vs file-exploration baseline.
+  Eval { write_doc: bool },
 }
 
 fn get_task() -> Result<Task> {
   let message = "argument is missing. Example usage: \ncargo xtask 0.1.3\ncargo xtask schema";
   let arg = args().nth(1).context(message)?;
+  if arg == "eval" {
+    return Ok(Task::Eval {
+      write_doc: args().nth(2).as_deref() == Some("--write"),
+    });
+  }
   if arg == "schema" {
     Ok(Task::Schema)
   } else if arg == "release-artifacts" {
@@ -34,6 +42,7 @@ fn main() -> Result<()> {
     Task::Schema => schema::generate_schema(),
     Task::Release(version) => release_new_version(&version),
     Task::ReleaseArtifacts(dir) => release_artifacts(Path::new(&dir)),
+    Task::Eval { write_doc } => eval::run_eval(write_doc),
   }
 }
 
