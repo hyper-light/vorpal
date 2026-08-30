@@ -21,6 +21,13 @@ pub fn multi_server_for_test() -> MultiServerForTest {
   let projects = registry::load().unwrap_or_default();
   router::MultiServer::new(projects, Profile::Full)
 }
+
+pub fn multi_server_for_test_with_envs(
+  envs: std::collections::BTreeMap<String, vorpal_index::ExtractionEnv>,
+) -> MultiServerForTest {
+  let projects = registry::load().unwrap_or_default();
+  router::MultiServer::with_envs(projects, Profile::Full, envs)
+}
 mod server;
 mod supervised;
 mod tools;
@@ -48,16 +55,40 @@ pub fn serve_stdio_profiled(index_dir: PathBuf, profile: Profile) -> io::Result<
 /// happened in the CALLER at startup; the serving loop can never load code.
 /// Serve every enrolled project from one daemon (D4): tools gain a `project` selector, a
 /// `list_projects` tool lists the registry, and nothing on this surface can enroll anything
-/// (human-only, via the CLI). Projects mode serves the builtin grammar set (per-project
-/// custom languages wait on registration scoping; run a single-project daemon for those).
+/// (human-only, via the CLI). This env-less form serves builtin grammars with default
+/// environments; the CLI launcher uses [`serve_stdio_projects_with_envs`] after
+/// union-registering every enrolled project's custom languages.
 pub fn serve_stdio_projects(profile: Profile) -> io::Result<()> {
+  serve_stdio_projects_with_envs(profile, std::collections::BTreeMap::new())
+}
+
+/// The enrolled registry, for launchers that must prepare per-project state (custom-language
+/// union registration, extraction environments) BEFORE serving begins.
+pub fn enrolled_projects() -> io::Result<Vec<(String, std::path::PathBuf, std::path::PathBuf)>> {
+  let projects = registry::load().map_err(io::Error::other)?;
+  Ok(
+    projects
+      .iter()
+      .map(|(name, entry)| (name.clone(), entry.src.clone(), entry.index.clone()))
+      .collect(),
+  )
+}
+
+/// [`serve_stdio_projects`] with a per-project extraction environment (union-registered
+/// custom languages): each project's rebuilds run under ITS OWN rules/specs/canaries. Any
+/// dlopen happened in the CALLER at startup — one union registration for every enrolled
+/// project — so the serving loop still can never load code.
+pub fn serve_stdio_projects_with_envs(
+  profile: Profile,
+  envs: std::collections::BTreeMap<String, vorpal_index::ExtractionEnv>,
+) -> io::Result<()> {
   let projects = registry::load().map_err(io::Error::other)?;
   if projects.is_empty() {
     return Err(io::Error::other(
       "no projects enrolled — a person can enroll one with `vorpal mcp allow <path>`",
     ));
   }
-  let mut server = router::MultiServer::new(projects, profile);
+  let mut server = router::MultiServer::with_envs(projects, profile, envs);
   let stdin = io::stdin();
   let mut stdout = io::stdout().lock();
   for line in stdin.lock().lines() {

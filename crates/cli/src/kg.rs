@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 
 use crate::config::ProjectConfig;
+use crate::lang::CustomLang;
 
 
 /// Default index location relative to the indexed tree / working directory. Hidden, so the
@@ -390,6 +391,94 @@ fn boxed(err: Box<dyn std::error::Error>) -> anyhow::Error {
 /// the config — relative, so the rules digest is machine-independent. An unreadable rules
 /// file is a hard error naming it; a custom language declaring none is reported (pattern-only,
 /// not indexed), never silently skipped.
+/// Union every enrolled project's custom-language declarations into ONE registration map
+/// (D4 v2): library paths absolutize per project; an extension may have one owner; an
+/// extension routing to a builtin grammar refuses (shadowing cannot be consented to
+/// per-project); one language name must mean one definition. Every refusal names the
+/// projects involved.
+fn union_custom_languages(
+  declared: Vec<(String, PathBuf, std::collections::HashMap<String, CustomLang>)>,
+) -> Result<std::collections::HashMap<String, CustomLang>> {
+  let mut union: std::collections::HashMap<String, (CustomLang, String)> = Default::default();
+  let mut claimed_ext: std::collections::HashMap<String, (String, String)> = Default::default();
+  for (project, project_dir, customs) in declared {
+    let mut customs: Vec<(String, CustomLang)> = customs.into_iter().collect();
+    customs.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic refusal order
+    for (lang_name, custom) in customs {
+      let custom = absolutized_custom(custom, &project_dir);
+      for ext in &custom.extensions {
+        let probe = format!("probe.{ext}");
+        // Customs are not yet registered, so the registry router answers builtins only.
+        if matches!(
+          vorpal_lang_registry::from_path(std::path::Path::new(&probe)),
+          Some(vorpal_lang_registry::SgLang::Builtin(_))
+        ) {
+          return Err(anyhow!(
+            "project '{project}': custom language '{lang_name}' claims extension '.{ext}', \
+             which routes to a builtin grammar — shadowing a builtin cannot be consented \
+             to per-project; multi-project serving refuses it"
+          ));
+        }
+        if let Some((other_lang, other_project)) =
+          claimed_ext.insert(ext.clone(), (lang_name.clone(), project.clone()))
+        {
+          if other_lang != lang_name {
+            return Err(anyhow!(
+              "extension '.{ext}' is claimed by custom language '{lang_name}' \
+               (project '{project}') and '{other_lang}' (project '{other_project}') — \
+               multi-project serving needs one owner per extension"
+            ));
+          }
+        }
+      }
+      match union.entry(lang_name.clone()) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+          slot.insert((custom, project.clone()));
+        }
+        std::collections::hash_map::Entry::Occupied(existing) => {
+          let (registered, first_project) = existing.get();
+          if !same_custom(registered, &custom) {
+            return Err(anyhow!(
+              "custom language '{lang_name}' is declared differently by projects \
+               '{first_project}' and '{project}' (library/symbol/extensions differ) — \
+               multi-project serving needs one definition per language name"
+            ));
+          }
+        }
+      }
+    }
+  }
+  Ok(union.into_iter().map(|(lang, (custom, _))| (lang, custom)).collect())
+}
+
+/// Resolve a custom language's library paths against its project dir, so the union
+/// registration's shared base is inert (Path::join with an absolute path yields it).
+fn absolutized_custom(mut custom: CustomLang, project_dir: &Path) -> CustomLang {
+  use vorpal_dynamic::LibraryPath;
+  custom.library_path = match custom.library_path {
+    LibraryPath::Single(path) => LibraryPath::Single(project_dir.join(path)),
+    LibraryPath::Platform(map) => LibraryPath::Platform(
+      map.into_iter().map(|(target, path)| (target, project_dir.join(path))).collect(),
+    ),
+  };
+  custom
+}
+
+/// Two declarations describe the same registration (name-collision check).
+fn same_custom(a: &CustomLang, b: &CustomLang) -> bool {
+  use vorpal_dynamic::LibraryPath;
+  let libs_equal = match (&a.library_path, &b.library_path) {
+    (LibraryPath::Single(x), LibraryPath::Single(y)) => x == y,
+    (LibraryPath::Platform(x), LibraryPath::Platform(y)) => x == y,
+    _ => false,
+  };
+  libs_equal
+    && a.language_symbol == b.language_symbol
+    && a.extensions == b.extensions
+    && a.expando_char == b.expando_char
+    && a.meta_var_char == b.meta_var_char
+}
+
 fn extraction_env_from_project(
   project: Option<&ProjectConfig>,
 ) -> Result<vorpal_index::ExtractionEnv> {
@@ -1019,7 +1108,41 @@ pub fn run_mcp(arg: McpArg, project: Result<ProjectConfig>) -> Result<ExitCode> 
   let profile = vorpal_mcp::Profile::parse(&arg.profile)
     .ok_or_else(|| anyhow!("--profile must be full, analysis, or scout"))?;
   if arg.projects {
-    vorpal_mcp::serve_stdio_projects(profile)?;
+    // Per-project custom languages (D4 v2): union-register every enrolled project's
+    // dynamic grammars in THIS process, at launch — the serving loop still can never
+    // dlopen — and hand each project its own extraction environment.
+    let mut envs = std::collections::BTreeMap::new();
+    let mut declared: Vec<(String, PathBuf, std::collections::HashMap<String, CustomLang>)> =
+      Vec::new();
+    for (name, src, _index) in vorpal_mcp::enrolled_projects()? {
+      let Some(config) = ProjectConfig::load_unregistered(&src)
+        .with_context(|| format!("loading project '{name}' config at {}", src.display()))?
+      else {
+        continue; // no config file: builtin grammars, default env
+      };
+      if config.language_globs.is_some() {
+        return Err(anyhow!(
+          "project '{name}' declares languageGlobs, which rebind builtin file routing \
+           process-wide — multi-project serving refuses them (run that project as a \
+           single-project daemon: `vorpal mcp --index …`)"
+        ));
+      }
+      declared.push((
+        name.clone(),
+        config.project_dir.clone(),
+        config.custom_languages.clone().unwrap_or_default(),
+      ));
+      envs.insert(name.clone(), extraction_env_from_project(Some(&config))?);
+      // Injectable registrations are per-env on the index path (C3a); the global
+      // injectable set only affects run/scan, which this daemon never serves.
+    }
+    let merged = union_custom_languages(declared)?;
+    if !merged.is_empty() {
+      // Library paths were absolutized per project inside the union; the base is inert.
+      vorpal_lang_registry::SgLang::register_custom_language(std::path::Path::new("/"), merged)
+        .map_err(|err| anyhow!("union custom-language registration failed: {err}"))?;
+    }
+    vorpal_mcp::serve_stdio_projects_with_envs(profile, envs)?;
     return Ok(ExitCode::SUCCESS);
   }
   // Custom languages were registered (the one-shot dlopen) at CLI setup, before serving
@@ -1078,5 +1201,98 @@ fn snippet_error(err: vorpal_index::records::SnippetError) -> anyhow::Error {
   match err {
     vorpal_index::records::SnippetError::Stale(message)
     | vorpal_index::records::SnippetError::Other(message) => anyhow!(message),
+  }
+}
+
+#[cfg(test)]
+mod union_tests {
+  use super::*;
+  use std::collections::HashMap;
+  use vorpal_dynamic::LibraryPath;
+
+  fn custom(lib: &str, exts: &[&str]) -> CustomLang {
+    CustomLang {
+      library_path: LibraryPath::Single(PathBuf::from(lib)),
+      language_symbol: None,
+      meta_var_char: None,
+      expando_char: None,
+      extensions: exts.iter().map(|e| e.to_string()).collect(),
+      outline_rules: None,
+      ref_spec: None,
+      canary: None,
+    }
+  }
+
+  #[test]
+  fn union_absolutizes_and_shares_identical_declarations() {
+    let merged = union_custom_languages(vec![
+      (
+        "a".into(),
+        PathBuf::from("/proj/a"),
+        HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+      ),
+      (
+        // The SAME declaration from another project dir differs after absolutization —
+        // identical only when the resolved paths agree.
+        "b".into(),
+        PathBuf::from("/proj/a"),
+        HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+      ),
+    ])
+    .expect("identical declarations merge");
+    assert_eq!(merged.len(), 1);
+    match &merged["zed"].library_path {
+      LibraryPath::Single(path) => assert_eq!(path, &PathBuf::from("/proj/a/libs/zed.so")),
+      LibraryPath::Platform(_) => panic!("single-path declaration must stay single"),
+    }
+  }
+
+  #[test]
+  fn union_refuses_conflicts_by_name() {
+    let refusals = [
+      // Same name, different libraries (different project dirs absolutize apart).
+      union_custom_languages(vec![
+        (
+          "a".into(),
+          PathBuf::from("/proj/a"),
+          HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+        ),
+        (
+          "b".into(),
+          PathBuf::from("/proj/b"),
+          HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+        ),
+      ]),
+      // Same extension, two owners.
+      union_custom_languages(vec![
+        (
+          "a".into(),
+          PathBuf::from("/proj/a"),
+          HashMap::from([("zed".to_string(), custom("z.so", &["zz"]))]),
+        ),
+        (
+          "b".into(),
+          PathBuf::from("/proj/b"),
+          HashMap::from([("qux".to_string(), custom("q.so", &["zz"]))]),
+        ),
+      ]),
+      // Shadowing a builtin extension.
+      union_custom_languages(vec![(
+        "a".into(),
+        PathBuf::from("/proj/a"),
+        HashMap::from([("pyx".to_string(), custom("p.so", &["py"]))]),
+      )]),
+    ];
+    let messages: Vec<String> = refusals
+      .into_iter()
+      .map(|r| match r {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("must refuse"),
+      })
+      .collect();
+    assert!(messages[0].contains("declared differently"), "{}", messages[0]);
+    assert!(messages[0].contains("'a'") && messages[0].contains("'b'"), "{}", messages[0]);
+    assert!(messages[1].contains("one owner per extension"), "{}", messages[1]);
+    assert!(messages[2].contains("routes to a builtin"), "{}", messages[2]);
   }
 }

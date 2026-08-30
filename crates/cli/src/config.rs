@@ -120,6 +120,36 @@ impl ProjectConfig {
     register_custom_language(&config.project_dir, sg_config)?;
     Ok(Ok(config))
   }
+
+  /// [`ProjectConfig::setup`] WITHOUT the registration side effects — for launchers that
+  /// must union several projects' custom languages into ONE one-shot registration
+  /// (multi-project MCP). Returns `Ok(None)` when the directory has no config file.
+  pub fn load_unregistered(project_root: &Path) -> Result<Option<Self>> {
+    let yml = project_root.join(CONFIG_FILE_YML);
+    let yaml = project_root.join(CONFIG_FILE_YAML);
+    let config_file = if yml.is_file() {
+      yml
+    } else if yaml.is_file() {
+      yaml
+    } else {
+      return Ok(None);
+    };
+    let Some((project_dir, mut sg_config)) = Self::discover_project(Some(config_file))? else {
+      return Ok(None);
+    };
+    let outline_rules =
+      custom_language_outline_rules(&project_dir, sg_config.custom_languages.as_ref());
+    Ok(Some(ProjectConfig {
+      project_dir,
+      rule_dirs: std::mem::take(&mut sg_config.rule_dirs),
+      outline_rules,
+      test_configs: sg_config.test_configs.take(),
+      util_dirs: sg_config.util_dirs.take(),
+      custom_languages: sg_config.custom_languages.clone(),
+      language_globs: sg_config.language_globs.clone(),
+      language_injections: sg_config.language_injections.clone(),
+    }))
+  }
 }
 
 fn custom_language_outline_rules(

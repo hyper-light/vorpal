@@ -28,3 +28,6 @@ serde_yaml.workspace = true
 # MSVC has no jemalloc; the binary's #[global_allocator] is cfg-gated to match.
 [target.'cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))'.dependencies]
 tikv-jemallocator = "0.7.0"
+
+[dev-dependencies]
+vorpal-dynamic.workspace = true

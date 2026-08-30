@@ -4,10 +4,13 @@
 //! LIST projects and nothing else about the registry — enrollment is the human-typed CLI's
 //! exclusive power (see `registry.rs` for the threat model).
 //!
-//! v1 boundary, stated rather than hidden: projects mode serves the BUILTIN grammar set.
-//! Custom-language registration is a process-wide one-shot, so per-project dynamic languages
-//! wait on the registration-scoping rework (the F-track non-goal list); a project needing
-//! them runs its own single-project daemon today.
+//! Custom/dynamic languages in projects mode (v2): the LAUNCHER union-registers every
+//! enrolled project's custom languages at startup (one one-shot dlopen set, name/extension
+//! collisions refused loudly, builtin-extension shadowing refused — see the CLI's union
+//! builder), and hands each project its own extraction environment, so rebuilds run under
+//! that project's rules/specs/canaries. The grammar UNIVERSE is process-wide by necessity;
+//! per-project behavior lives in the envs. Projects declaring languageGlobs are refused at
+//! launch (globs rebind builtin routing process-wide — consent cannot be per-project).
 
 use std::collections::BTreeMap;
 
@@ -25,12 +28,21 @@ pub struct MultiServer {
 
 impl MultiServer {
   pub fn new(projects: Projects, profile: Profile) -> Self {
+    Self::with_envs(projects, profile, BTreeMap::new())
+  }
+
+  pub fn with_envs(
+    projects: Projects,
+    profile: Profile,
+    mut envs: BTreeMap<String, vorpal_index::ExtractionEnv>,
+  ) -> Self {
     let servers = projects
       .iter()
       .map(|(name, entry)| {
+        let env = envs.remove(name).unwrap_or_default();
         (
           name.clone(),
-          Server::with_profile(entry.index.clone(), profile),
+          Server::with_profile_env(entry.index.clone(), profile, env),
         )
       })
       .collect();

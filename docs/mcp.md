@@ -121,6 +121,14 @@ rules, ref specs, canaries, injection config) that `vorpal index` builds from th
 config. A dynamic language without a `canary` is extracted best-effort and named in every
 `index` tool response as unverified — never silently trusted.
 
+Multi-project mode (`vorpal mcp --projects`) supports custom languages too: at launch the
+CLI union-registers every enrolled project's dynamic grammars (still one startup-only
+registration) and hands each project its own extraction environment, so a language declared
+by one project is never *walked* in another. Conflicts refuse loudly at launch — one
+definition per language name, one owner per extension, and no shadowing of builtin
+extensions; a project declaring `languageGlobs` (which rebind builtin routing process-wide)
+must run as a single-project daemon.
+
 ## Freshness and crash isolation
 
 The daemon watches the source tree (FSEvents/inotify) and rebuilds **proactively**: after a

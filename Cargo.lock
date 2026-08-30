@@ -4115,6 +4115,7 @@ dependencies = [
  "tikv-jemallocator",
  "vorpal-config",
  "vorpal-core",
+ "vorpal-dynamic",
  "vorpal-index",
  "vorpal-ingest",
  "vorpal-kg",
