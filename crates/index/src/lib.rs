@@ -192,18 +192,84 @@ pub fn build_index_with(
   out: &Path,
   cache_mode: CacheMode,
 ) -> Result<IndexReport, Box<dyn Error>> {
-  build_index_full(src, out, cache_mode, ParseHealthPolicy::default())
+  build_index_full(src, out, cache_mode, ParseHealthPolicy::default(), None)
+}
+
+/// Watched-daemon build: `hints` is a COMPLETE set of every file changed since the prior
+/// manifest (the watcher's certainty contract — see `SourceWatch::take_changes`). The stat
+/// sweep is replaced by patching the prior manifest for exactly those paths; any hint the
+/// patch cannot prove equivalent to a full scan (a path the prior manifest never held — a
+/// nested .gitignore could make the walker disagree with the watcher about it) falls back to
+/// the full sweep. The committed generation is identical either way (pinned by test).
+pub fn build_index_watched(
+  src: &Path,
+  out: &Path,
+  hints: &std::collections::HashSet<PathBuf>,
+) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_full(
+    src,
+    out,
+    CacheMode::from_env(),
+    ParseHealthPolicy::default(),
+    Some(hints),
+  )
 }
 
 /// [`build_index_with`] plus an explicit [`ParseHealthPolicy`] (IMPROVEMENTS #11): warn is
 /// today's behavior; exclude drops unhealthy files from the graph; fail aborts before the
 /// generation commits, listing offenders. Non-warn policies bypass the unchanged-tree fast
 /// path (its prior generation was built under some other policy and proves nothing).
+/// Patch a prior manifest with a COMPLETE set of changed paths in place of a stat sweep.
+/// `None` = the patch cannot be proven equivalent to a full scan (a hinted path the prior
+/// manifest never carried — the walker's ignore rules could disagree with the watcher about
+/// it) → the caller sweeps. Modified files re-stat; vanished files drop; hints the extractor
+/// does not handle are irrelevant by construction (the sweep would skip them too).
+fn patch_manifest(
+  prior: &Manifest,
+  hints: &std::collections::HashSet<PathBuf>,
+  handled: impl Fn(&str) -> bool,
+) -> Option<Manifest> {
+  let mut entries = prior.entries().to_vec();
+  for hint in hints {
+    let path_str = hint.to_string_lossy();
+    if !handled(&path_str) {
+      continue;
+    }
+    let at = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path_str));
+    match (at, fs::metadata(hint)) {
+      (Ok(found), Ok(meta)) if meta.is_file() => {
+        let mtime_ns = meta
+          .modified()
+          .ok()
+          .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+          .map(|d| d.as_nanos() as u64)
+          .unwrap_or(0);
+        entries[found].size = meta.len();
+        entries[found].mtime_ns = mtime_ns;
+      }
+      (Ok(found), _) => {
+        // Vanished (deleted, or replaced by a non-file): drop it, as the sweep would.
+        entries.remove(found);
+      }
+      (Err(_), Err(_)) => {
+        // Never indexed and no longer present — transient noise, nothing to patch.
+      }
+      (Err(_), Ok(_)) => {
+        // A path the prior manifest never carried: only the ignore-aware walk can decide
+        // whether it belongs. Fall back to the sweep.
+        return None;
+      }
+    }
+  }
+  Some(Manifest::from_entries(entries))
+}
+
 pub fn build_index_full(
   src: &Path,
   out: &Path,
   cache_mode: CacheMode,
   policy: ParseHealthPolicy,
+  hints: Option<&std::collections::HashSet<PathBuf>>,
 ) -> Result<IndexReport, Box<dyn Error>> {
   // The build session's string interner (scoped-interner contract, docs/EMBEDDING.md):
   // created here, dropped when this function returns — reclaim is `Drop`, and the `NameId`
@@ -217,9 +283,21 @@ pub fn build_index_full(
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
   // it, so editing a grammar OR an outline rule invalidates reuse just as a file edit would.
   let rules_digest = extractor.rules_digest();
-  vorpal_kg::phase_stamp("scan: manifest start");
-  let mut manifest = Manifest::scan(src, |p| extractor.handles(p))?;
-  vorpal_kg::phase_stamp("scan: manifest done");
+  // The prior generation resolves before the scan so a hinted build can patch its manifest.
+  let hinted_prior = vorpal_kg::resolve_index_dir(out);
+  let mut manifest = 'scan: {
+    if let Some(hints) = hints
+      && let Ok(prior_manifest) = Manifest::load(&hinted_prior.join("manifest.bin"))
+      && let Some(patched) = patch_manifest(&prior_manifest, hints, |p| extractor.handles(p))
+    {
+      vorpal_kg::phase_stamp("scan: hinted patch");
+      break 'scan patched;
+    }
+    vorpal_kg::phase_stamp("scan: manifest start");
+    let swept = Manifest::scan(src, |p| extractor.handles(p))?;
+    vorpal_kg::phase_stamp("scan: manifest done");
+    swept
+  };
   manifest.set_grammar_stamp(vorpal_ingest::extraction_identity(
     vorpal_ingest::global_grammar_stamp(),
     rules_digest,

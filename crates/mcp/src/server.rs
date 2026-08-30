@@ -78,6 +78,9 @@ pub struct Server {
   /// an answer from the pinned graph that produced its ids.
   kg_dir: Option<PathBuf>,
   watch: Option<SourceWatch>,
+  /// Hinted-rebuild counter — every 64th watched revalidation full-scans as reconciliation
+  /// insurance, even when capture certainty held.
+  hinted_rebuilds: u64,
 }
 
 impl Server {
@@ -100,6 +103,7 @@ impl Server {
       profile,
       kg: None,
       kg_dir: None,
+      hinted_rebuilds: 0,
       watch,
     }
   }
@@ -115,8 +119,25 @@ impl Server {
     if self.kg.is_some() && !watch.take_dirty() {
       return Ok(());
     }
-    let rebuilt = build_index(watch.src(), &self.index_dir)
-      .map_err(|err| err.to_string())
+    // Hinted revalidation: a COMPLETE captured change set patches the prior manifest in
+    // place of the stat sweep (SUBSECOND.md 1c). Certainty gaps (`None`) and every 64th
+    // hinted rebuild (belt-and-braces reconciliation) take the full sweep; the committed
+    // generation is identical either way (pinned by crates/index/tests/hinted_scan.rs).
+    let hints = watch.take_changes();
+    self.hinted_rebuilds = self.hinted_rebuilds.wrapping_add(1);
+    let use_hints = hints.as_ref().is_some_and(|set| !set.is_empty())
+      && self.hinted_rebuilds % 64 != 0
+      && self.kg.is_some();
+    let rebuilt = if use_hints {
+      vorpal_index::build_index_watched(
+        watch.src(),
+        &self.index_dir,
+        hints.as_ref().expect("checked above"),
+      )
+    } else {
+      build_index(watch.src(), &self.index_dir)
+    }
+    .map_err(|err| err.to_string())
       .and_then(|_| {
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         Kg::load(&dir)
@@ -276,7 +297,7 @@ impl Server {
             .unwrap_or(0.0),
         };
         let report =
-          vorpal_index::build_index_full(Path::new(&src), &self.index_dir, mode, policy)
+          vorpal_index::build_index_full(Path::new(&src), &self.index_dir, mode, policy, None)
             .map_err(|err| err.to_string())?;
         // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
         // new generation directory alongside it.

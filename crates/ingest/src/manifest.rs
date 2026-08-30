@@ -139,6 +139,19 @@ impl Manifest {
     })
   }
 
+  /// Rebuild a manifest from explicit entries — the hinted-patch path (SUBSECOND.md 1c):
+  /// the caller took the prior manifest's entries and re-stated only the files a complete
+  /// watcher capture named. Entries are re-sorted, so the result is byte-compatible with a
+  /// scan of the same logical tree; the grammar stamp starts unset exactly like `scan`'s.
+  pub fn from_entries(mut entries: Vec<FileStat>) -> Self {
+    use rayon::prelude::*;
+    entries.par_sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    Self {
+      entries,
+      grammar_stamp: 0,
+    }
+  }
+
   /// Record the grammar-set digest this manifest was built under. Callers set this to
   /// [`crate::global_grammar_stamp`] before saving / before the fast-path comparison.
   pub fn set_grammar_stamp(&mut self, stamp: u64) {

@@ -115,7 +115,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
       }
       let report =
-        vorpal_index::build_index_full(Path::new(src), Path::new(out), mode, policy)?;
+        vorpal_index::build_index_full(Path::new(src), Path::new(out), mode, policy, None)?;
       if report.reused {
         if report.indexed > 0 {
       // The stamp-only cutoff: files re-extracted and proven extraction-identical, stamps

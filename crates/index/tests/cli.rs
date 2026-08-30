@@ -1649,7 +1649,7 @@ fn parse_health_policies_and_report() {
     mode: vorpal_index::ParseHealthMode::Fail,
     max_error_ratio: 0.0,
   };
-  let err = vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), strict)
+  let err = vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), strict, None)
     .expect_err("strict fail policy must abort");
   assert!(err.to_string().contains("broken.rs"), "{err}");
   assert!(
@@ -1660,7 +1660,7 @@ fn parse_health_policies_and_report() {
     mode: vorpal_index::ParseHealthMode::Fail,
     max_error_ratio: 0.99,
   };
-  vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), lenient)
+  vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), lenient, None)
     .expect("under-threshold damage passes a lenient fail policy");
 
   // Exclude: the unhealthy file contributes nothing; clean files are untouched.
@@ -1670,7 +1670,7 @@ fn parse_health_policies_and_report() {
     max_error_ratio: 0.0,
   };
   let report =
-    vorpal_index::build_index_full(&src, &out_excl, vorpal_index::CacheMode::default(), exclude)
+    vorpal_index::build_index_full(&src, &out_excl, vorpal_index::CacheMode::default(), exclude, None)
       .unwrap();
   assert_eq!(report.excluded_files, 1);
   let kg = vorpal_index::Kg::load(&live(&out_excl)).unwrap();
