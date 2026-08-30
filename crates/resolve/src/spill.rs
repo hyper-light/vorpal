@@ -22,7 +22,7 @@ use crate::intern::{Interner, NameId};
 use crate::reference::{RefForm, RefKind, Reference};
 
 /// Bytes per spilled reference record.
-const RECORD: usize = 34;
+pub(crate) const RECORD: usize = 34;
 
 /// References per read chunk (~1 MB in flight per chunk).
 pub const SPILL_CHUNK: usize = 32_768;
@@ -65,7 +65,7 @@ fn form_of(tag: u8) -> RefForm {
   }
 }
 
-fn encode(reference: &Reference, buf: &mut [u8; RECORD]) {
+pub(crate) fn encode_record(reference: &Reference, buf: &mut [u8; RECORD]) {
   buf[0..8].copy_from_slice(&reference.from.raw().to_le_bytes());
   buf[8..12].copy_from_slice(&reference.name.to_bits().to_le_bytes());
   buf[12..16].copy_from_slice(&reference.from_path.to_bits().to_le_bytes());
@@ -80,7 +80,7 @@ fn encode(reference: &Reference, buf: &mut [u8; RECORD]) {
   buf[30..34].copy_from_slice(&alias.to_le_bytes());
 }
 
-fn decode<'i>(interner: &'i Interner, buf: &[u8; RECORD]) -> Reference<'i> {
+pub(crate) fn decode_record<'i>(interner: &'i Interner, buf: &[u8; RECORD]) -> Reference<'i> {
   let u64_at = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
   let u32_at = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
   Reference {
@@ -129,7 +129,7 @@ impl<'i> RefSpillWriter<'i> {
       self.qualified_imports.push(*reference);
     }
     let mut buf = [0u8; RECORD];
-    encode(reference, &mut buf);
+    encode_record(reference, &mut buf);
     self.out.write_all(&buf)?;
     self.count += 1;
     Ok(())
@@ -183,7 +183,7 @@ impl<'i> RefSpill<'i> {
     debug_assert_eq!(bytes.len() % RECORD, 0);
     bytes
       .chunks_exact(RECORD)
-      .map(|record| decode(self.interner, record.try_into().expect("record-sized chunk")))
+      .map(|record| decode_record(self.interner, record.try_into().expect("record-sized chunk")))
       .collect()
   }
 
@@ -246,7 +246,7 @@ impl<'i> Iterator for RefSpillChunks<'i> {
       if let Err(err) = self.reader.read_exact(&mut buf) {
         return Some(Err(err));
       }
-      chunk.push(decode(self.interner, &buf));
+      chunk.push(decode_record(self.interner, &buf));
     }
     self.remaining -= take as u64;
     Some(Ok(chunk))

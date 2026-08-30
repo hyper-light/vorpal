@@ -738,6 +738,55 @@ pub fn resolve_all_spilled_into<'i>(
   table: &SymbolTable<'i>,
   spill: &crate::RefSpill<'i>,
   resolver: &Resolver,
+  sink: impl FnMut(&ResolvedEdge),
+  unresolved_sink: impl FnMut(&UnresolvedEvidence),
+) -> std::io::Result<ResolveStats> {
+  let raw_chunks = spill.raw_chunks()?;
+  resolve_chunks_into(
+    interner,
+    table,
+    resolver,
+    raw_chunks,
+    |bytes| spill.decode_chunk(bytes),
+    sink,
+    unresolved_sink,
+  )
+}
+
+/// [`resolve_all_spilled_into`] over a retained [`crate::RefStore`] — the memory-primary
+/// daemon's link path. Identical pump; only the chunk source differs (alive ranges instead
+/// of the whole file).
+pub fn resolve_all_store_into<'i>(
+  interner: &'i Interner,
+  table: &SymbolTable<'i>,
+  store: &mut crate::RefStore,
+  resolver: &Resolver,
+  sink: impl FnMut(&ResolvedEdge),
+  unresolved_sink: impl FnMut(&UnresolvedEvidence),
+) -> std::io::Result<ResolveStats> {
+  let raw_chunks = store.raw_chunks()?;
+  let store = &*store;
+  resolve_chunks_into(
+    interner,
+    table,
+    resolver,
+    raw_chunks,
+    |bytes| store.decode_chunk(interner, bytes),
+    sink,
+    unresolved_sink,
+  )
+}
+
+/// The shared feed→decode→resolve→ordered-drain pump behind the spilled and retained link
+/// paths. Chunk provenance is invisible to resolution (a pure per-reference read of the
+/// immutable table), so both sources produce output identical to an in-RAM `resolve_all`
+/// over the same reference sequence.
+fn resolve_chunks_into<'i>(
+  interner: &'i Interner,
+  table: &SymbolTable<'i>,
+  resolver: &Resolver,
+  raw_chunks: impl Iterator<Item = std::io::Result<Vec<u8>>> + Send,
+  decode: impl Fn(&[u8]) -> Vec<Reference<'i>> + Sync,
   mut sink: impl FnMut(&ResolvedEdge),
   mut unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
@@ -764,14 +813,14 @@ pub fn resolve_all_spilled_into<'i>(
     let unresolved_sink = &mut unresolved_sink;
     let stats = &mut stats;
     let feed_error = &mut feed_error;
-    let raw_chunks = spill.raw_chunks()?;
+    let decode = &decode;
     std::thread::scope(|scope| {
       for _ in 0..threads {
         let work_rx = work_rx.clone();
         let out_tx = out_tx.clone();
         scope.spawn(move || {
           while let Ok((index, bytes)) = work_rx.recv() {
-            let chunk = spill.decode_chunk(&bytes);
+            let chunk = decode(&bytes);
             drop(bytes);
             let (edges, unresolved, stats) = resolve_chunk(interner, table, &chunk, resolver);
             if out_tx.send((index, edges, unresolved, stats)).is_err() {
