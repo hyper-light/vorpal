@@ -1,0 +1,101 @@
+# ANN frontier synthesis — 2026-08-30
+
+Seven parallel research sweeps (DiskANN-family build engineering; kNN-first constructions;
+build fidelity + entry points; quantization frontier 2023-2026; distance-computation
+pruning; frontier graph structures; incremental maintenance) distilled into one program.
+Context: n≈2.34M × 256d L2-normalized lexical-hash vectors, per-row-scaled i8 + SDOT,
+Vamana R=32 α=1.2 l_build=48, build ≈135 CPU-s / ~8.5s wall, pool recall 0.9125
+(top-10 ⊂ l=200 visited pool, 32 probes; exact rerank + rank fusion downstream).
+Quality is the bar: pool recall must go UP, never traded away. Byte-deterministic builds.
+
+## Calibration facts the sweeps established
+
+- We already hold ParlayANN's structural wins (prefix-doubling batch build, counting-scatter
+  back-edge transpose, append-if-fits reverse merge) and are ~5× more CPU-efficient than
+  their published throughput at matched work. Remaining gains are algorithmic/memory-shape,
+  not parallelization.
+- The build is memory-latency-bound: ~10⁹ distance evals whose cost is dominated by random
+  256B row fetches (600MB pool ≫ LLC), not SDOT arithmetic (~2.5-3ns compute vs ~10-25ns
+  effective). Byte reduction and layout beat kernel swaps.
+- Incremental insertion structurally caps early nodes' candidate quality (FastKCNA k-CNA
+  ≤0.5 expected) — the theory behind refinement passes and our batch-cap gap.
+- Classic triangle-inequality pruning is dead at 256d (measured 0.08% eliminations);
+  FINGER-style per-edge sketches conflict with a mutating build graph.
+
+## The program (each increment gated: pool recall ≥ prior, retrieval_eval, determinism
+## A/B — two builds byte-identical, full suites, clippy; ANN is a lazy sidecar so
+## generation ids never move)
+
+### Tier 0 — build engineering, quality-invariant semantics
+1. Deterministic instrumentation: dist-eval + expansion counters (pure functions of
+   input+binary — the contention-immune A/B metric), VORPAL_PHASE_TRACE-gated.
+2. Lazy memoized occlusion in robust_prune (DiskANN-Rust `prune.rs` structure: per-candidate
+   occlude_factor cache + last_checked resume, first-occluder early exit) — same selected
+   set for a fixed α sequence, 30-60% fewer prune-side evals.
+3. Batched expansion: collect unvisited survivors, prefetch all rows, then one interleaved
+   4-8-chain SDOT batch (memory-level parallelism; today's pipeline is 1-deep).
+
+### Tier 1 — graph quality at fixed R (the priority)
+4. Round-size cap = n/50 (ParlayANN batch truncation): today's final round inserts HALF the
+   corpus against a frozen graph, forfeiting every same-batch true-NN edge. Cap → recall up,
+   modest time cost; ParlayANN reports parity-with-sequential under the cap.
+5. Progressive α inside the prune (cur_α = 1.0 → ×1.2 → α): admit strict-RNG edges first,
+   relax only to fill — diverse-but-close slots. Production-DiskANN standard.
+6. Saturate-to-R: after α-prune, fill remaining slots with nearest unselected candidates —
+   denser navigable graph at zero extra distance evals.
+7. In-degree floor post-pass: count in-degrees, force-attach starved vertices (< derived
+   floor) into their nearest neighbors' lists via α-eviction — protects the weakly-referenced
+   tail that pool recall measures.
+8. Final refinement round (two-pass Vamana, k-CNA-grounded): re-search + re-prune every node
+   against the FINISHED graph, deterministic reverse merge. +0.5-2pt pool recall at +40-70%
+   build — paid for by Tier 0/2 savings.
+
+### Tier 2 — rotation + 1-bit traversal tier (quality up AND build/search down)
+9. Seeded blocked fast-Walsh-Hadamard rotation (±1 diagonal → FHT-256 → fixed permutation,
+   2-3 rounds; exact power-of-two scales; seed in the index header) and re-encode the
+   existing i8 tier in the rotated domain: strictly tighter distance fidelity at identical
+   bytes (Weaviate-RQ measured +1-5 recall pts vs plain SQ8; ExRaBitQ error 1.3-3.1× lower
+   than LVQ). Zero storage cost, format version bump.
+10. 1-bit RaBitQ side-tier (32B codes + 2 f32 factors ≈ 100MB — largely LLC-resident at our
+    scale): unbiased estimator with error bound; traversal reads 32B not 256B. Search: beam
+    steering on the 1-bit tier, exact i8 on expansion + pool rerank (the architecture we
+    already have — SymphonyQG-shaped). Spend the 2-3.5× as l=200→300+ at iso-latency →
+    pool recall up. Build: candidate beams on the tier, ALL prune comparisons exact i8
+    (approximate traversal is safe; approximate pruning is where quality dies — Weaviate's
+    −3.2%, QuIVer's cliff). Expected build 135 → 60-90 CPU-s at equal-or-better graphs.
+    Escape hatch: B=2 (+75MB) halves the estimator error.
+11. Conditional (profile-gated): FastScan packed-adjacency blocks (codes-alongside-edges,
+    SymphonyQG proper, +~2.4GB) only if the flat tier still shows miss-bound traversal;
+    ExRaBitQ-4 middle tier (nibble-split) as the rerank-fidelity middle rung.
+
+### Tier 3 — daemon incremental tier (kills the ~8.5s per-generation rebuild)
+12. FreshDiskANN-consensus design, adapted: tombstone bitmap + slot versions; per-edit
+    micro-inserts (one beam+prune each, ~60-120µs); same-edit opportunistic repair (the
+    edit's own insert beams walk the damaged region); Alg-4 consolidation at ≥1% dead /
+    probe-drop / 15min; α=1.2 in EVERY repair path (the no-decay condition, flat over 50
+    churn cycles in FreshDiskANN's data); the existing canonical rebuild stays as compactor
+    + reconciliation anchor (oplog replay = bit-exact state identity). ~15-25ms CPU per
+    edit; staleness bounded by one edit-apply instead of 8.5s.
+
+### Rejected with cause (recorded so we do not re-litigate)
+- l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
+- kNN-first wholesale (NN-descent/RNN-descent/HCNNG): 10-16× more distance evals; honest
+  ceiling 1.3-2.5× via GEMM shaping; worse risk profile than Tier 2 which composes.
+- FINGER / per-edge sketches (mutating graph + memory 3-4× + GloVe-200 recall collapse),
+  classic triangle inequality (0.08%), PDX vertical layout for graph random access (authors'
+  own limitation), TRIM-during-build (42-60% build tax), patience/saturation-stop in build
+  (measured ~1pt recall loss), HNSW++-style approximate beam ordering (trades our currency),
+  RoarGraph (near-IID queries: no win, big build tax), DEG continuous refinement (hours-scale
+  stochastic optimizer, determinism-hostile), LeanVec/PCA-nav (flat lexical-hash spectrum is
+  its failure mode — revisit only if the measured spectrum is skewed), anisotropic PQ/SOAR
+  (benefits accrue to quantized-final-score systems; α-RNG pruning already IS the graph
+  analog of SOAR's orthogonal redundancy), NF4 (rotation manufactures the Gaussian premise,
+  then a uniform grid is optimal), plain unrotated i4 (dominated by rotated 4-bit).
+- Medoid micro-optimization: no literature support for build-cost sensitivity among
+  near-central starts; our 8.1↔10.4s swing was machine noise (counters now decide).
+
+Full agent reports live in the session task outputs; citations inline there (ParlayANN
+PPoPP'24, DiskANN cpp+Rust sources, FastKCNA PVLDB'25, SymphonyQG SIGMOD'25, RaBitQ
+SIGMOD'24 + Extended SIGMOD'25, LVQ VLDB'23, ADSampling/DADE/DDC + ICDE'26 benchmark,
+FreshDiskANN/IP-DiskANN/CleANN, GASS SIGMOD'25, CAGRA ICDE'24, Flash SIGMOD'25,
+EnhanceGraph, τ-MNG SIGMOD'23, Weaviate/Elastic/Milvus/Qdrant/Vespa engineering).
