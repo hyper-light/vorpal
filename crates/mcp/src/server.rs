@@ -1563,7 +1563,7 @@ fn tools_list(profile: Profile) -> Value {
         "lang": {"type": "string", "description": "Restrict to one language (rust, c, py, …)"},
         "prefix": {"type": "string", "description": "Restrict to paths starting with this prefix"},
         "k": {"type": "integer", "description": "Top definitions to return (default 20, max 1000)"},
-        "format": {"type": "string", "enum": ["toon", "lean", "ids"], "description": "Token-oriented text rendering"},
+        "format": {"type": "string", "enum": ["toon", "lean", "ids"], "description": "Text rendering: lean = minimal columns (cheapest structured form), toon = lossless tab-grid grouped by directory, ids = durable handles only"},
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),

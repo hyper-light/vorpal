@@ -1214,6 +1214,41 @@ pub fn render_code_search(report: &CodeSearchReport) -> String {
 /// the values themselves. Lossless for scalars; nested values inline as compact JSON; tabs
 /// and newlines escape. Records arrive as serialized `Value`s so one renderer serves every
 /// record type on every surface.
+/// The longest common ABSOLUTE directory prefix across a page's `path` values (never
+/// including a basename), or `None` when paths are relative, mixed, or share too little
+/// to be worth a header line. Factoring it out once cuts the single largest token cost in
+/// tabular renders — kernel-scale pages repeat a ~30-40 byte prefix on every row.
+fn common_abs_root(rows: &[serde_json::Value]) -> Option<String> {
+  let mut paths = rows
+    .iter()
+    .filter_map(|row| row.get("path").and_then(serde_json::Value::as_str));
+  let first = paths.next()?;
+  if !first.starts_with('/') {
+    return None;
+  }
+  let mut root: Vec<&str> = first.split('/').collect();
+  root.pop(); // never include the basename
+  for path in paths {
+    if !path.starts_with('/') {
+      return None;
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    let keep = root
+      .iter()
+      .zip(segments.iter().take(segments.len().saturating_sub(1)))
+      .take_while(|(a, b)| a == b)
+      .count();
+    root.truncate(keep);
+    if root.len() <= 1 {
+      return None;
+    }
+  }
+  if root.len() <= 2 {
+    return None; // a single top-level segment is not worth the header line
+  }
+  Some(root.join("/") + "/")
+}
+
 pub fn toon_from_values(rows: &[serde_json::Value]) -> String {
   use std::fmt::Write;
   if rows.is_empty() {
@@ -1259,12 +1294,26 @@ pub fn toon_from_values(rows: &[serde_json::Value]) -> String {
   };
   let mut out = String::new();
   let _ = writeln!(out, "cols: {}", columns.join("\t"));
+  let root = common_abs_root(rows);
+  if let Some(root) = &root {
+    let _ = writeln!(out, "root: {root}");
+  }
   let mut current_dir: Option<String> = None;
   for row in rows {
     let full_path = row.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
     let (dir, base) = full_path.rsplit_once('/').unwrap_or(("", full_path));
     if !dir.is_empty() && current_dir.as_deref() != Some(dir) {
-      let _ = writeln!(out, "{dir}/");
+      match root.as_deref().and_then(|r| format!("{dir}/").strip_prefix(r).map(str::to_string)) {
+        Some(rel) if rel.is_empty() => {
+          let _ = writeln!(out, "./");
+        }
+        Some(rel) => {
+          let _ = writeln!(out, "{rel}");
+        }
+        None => {
+          let _ = writeln!(out, "{dir}/");
+        }
+      }
       current_dir = Some(dir.to_string());
     }
     let mut first = true;
@@ -1296,6 +1345,11 @@ pub fn lean_from_values(rows: &[serde_json::Value]) -> String {
     return "records[0]:\n".to_string();
   }
   const PRIORITY: [&str; 6] = ["change", "name", "kind", "path", "depth", "grade"];
+  // LEAN is the MINIMAL rendering: identity + ranking columns only. The auxiliary fat —
+  // `signature` (~60 B/row), `external_id` (36 B/row), `span` — lives in the default
+  // text, `toon` (lossless), `ids` (durable handles), and `snippet`/`fetch_span`;
+  // measured before the cut, "lean" cost 2.3x the DEFAULT rendering on kernel pages.
+  const OMIT: [&str; 3] = ["signature", "span", "external_id"];
   let mut columns: Vec<String> = Vec::new();
   for lead in PRIORITY {
     if rows.iter().any(|row| row.get(lead).is_some()) {
@@ -1305,7 +1359,7 @@ pub fn lean_from_values(rows: &[serde_json::Value]) -> String {
   for row in rows {
     if let Some(map) = row.as_object() {
       for key in map.keys() {
-        if !columns.iter().any(|c| c == key) {
+        if !OMIT.contains(&key.as_str()) && !columns.iter().any(|c| c == key) {
           columns.push(key.clone());
         }
       }
@@ -1342,6 +1396,10 @@ pub fn lean_from_values(rows: &[serde_json::Value]) -> String {
   }
   let mut out = String::new();
   let _ = writeln!(out, "records[{}]:{}", rows.len(), columns.join("\t"));
+  let root = common_abs_root(rows);
+  if let Some(root) = &root {
+    let _ = writeln!(out, "root: {root}");
+  }
   for row in rows {
     out.push_str("  ");
     let mut first = true;
@@ -1350,6 +1408,16 @@ pub fn lean_from_values(rows: &[serde_json::Value]) -> String {
         out.push('\t');
       }
       first = false;
+      if column == "path"
+        && let Some(root) = &root
+        && let Some(rel) = row
+          .get("path")
+          .and_then(serde_json::Value::as_str)
+          .and_then(|p| p.strip_prefix(root.as_str()))
+      {
+        out.push_str(&lean_cell(Some(&serde_json::Value::String(rel.to_string()))));
+        continue;
+      }
       out.push_str(&lean_cell(row.get(column.as_str())));
     }
     out.push('\n');
@@ -1850,6 +1918,33 @@ mod paging_tests {
       serde_json::json!({"id": 9}),
     ]);
     assert_eq!(ids, "eid:00ff\nid:9\n");
+  }
+
+  #[test]
+  fn lean_omits_fat_columns_and_factors_absolute_roots() {
+    let rows = vec![
+      serde_json::json!({"name": "a", "kind": "Function", "path": "/repo/src/fs/x.c",
+        "signature": "static int a(void)", "span": [1, 2], "external_id": "eid:ff", "id": 1}),
+      serde_json::json!({"name": "b", "kind": "Function", "path": "/repo/src/mm/y.c",
+        "signature": "static int b(void)", "span": [3, 4], "external_id": "eid:aa", "id": 2}),
+    ];
+    let lean = lean_from_values(&rows);
+    let lines: Vec<&str> = lean.lines().collect();
+    assert_eq!(lines[0], "records[2]:name\tkind\tpath\tid");
+    assert_eq!(lines[1], "root: /repo/src/");
+    assert_eq!(lines[2], "  a\tFunction\tfs/x.c\t1");
+    assert!(!lean.contains("signature") && !lean.contains("eid:"), "fat columns omitted");
+
+    let toon = toon_from_values(&rows);
+    let tlines: Vec<&str> = toon.lines().collect();
+    assert_eq!(tlines[1], "root: /repo/src/");
+    assert_eq!(tlines[2], "fs/");
+    // toon stays LOSSLESS: signature/eid columns survive there.
+    assert!(toon.contains("eid:ff") && toon.contains("static int a(void)"));
+
+    // Relative paths (tests, non-canonical callers): no root line, cells untouched.
+    let rel = vec![serde_json::json!({"name": "n", "path": "src/x.rs"})];
+    assert!(!lean_from_values(&rel).contains("root:"));
   }
 
   #[test]
