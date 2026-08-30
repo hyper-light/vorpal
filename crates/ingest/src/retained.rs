@@ -83,6 +83,21 @@ pub struct RetainedIndex {
   /// referencing file to re-resolve. Values may themselves die later — lookups chase.
   repair: HashMap<u32, u32>,
   pending: PendingScope,
+  /// The persistent symbol table (SUBSECOND.md Phase 3 — the ~69ms-per-link full rebuild
+  /// becomes per-name maintenance). Interner brand erased for storage; rebound per link.
+  table: Option<vorpal_resolve::RetainedSymbolTable>,
+  /// Names (bits) whose candidate runs must rebuild before the next resolve — every name
+  /// defined by an edited file (their row ids moved even when nothing semantic changed).
+  table_dirty_names: std::collections::HashSet<u32>,
+  /// Edited paths (bits) whose file-node entries must repoint; deleted paths to drop.
+  table_dirty_files: std::collections::HashSet<u32>,
+  /// Latch: rebuild the table from scratch this link (first-ever-referenced name appeared —
+  /// the admission flip — or a change diffing could not cover, or garbage crossed the line).
+  table_full: bool,
+  /// Garbage candidate slots accumulated by `replace_candidates` repointing.
+  table_garbage: usize,
+  /// Path bits → path string, for canonical ordering and file-node repoints.
+  bits_to_path: HashMap<u32, String>,
   /// Containment watermark: the edge-log length with NO resolution edges appended. The edge
   /// log holds containment ONLY between links (resolution lives in the buckets), so this
   /// tracks the log length after the latest apply.
@@ -106,6 +121,12 @@ impl RetainedIndex {
       postings: HashMap::new(),
       repair: HashMap::new(),
       pending: PendingScope::Full,
+      table: None,
+      table_dirty_names: std::collections::HashSet::new(),
+      table_dirty_files: std::collections::HashSet::new(),
+      table_full: false,
+      table_garbage: 0,
+      bits_to_path: HashMap::new(),
       watermark: 0,
     };
     for (path, bytes) in products {
@@ -125,6 +146,12 @@ impl RetainedIndex {
       postings: HashMap::new(),
       repair: HashMap::new(),
       pending: PendingScope::Full,
+      table: None,
+      table_dirty_names: std::collections::HashSet::new(),
+      table_dirty_files: std::collections::HashSet::new(),
+      table_full: false,
+      table_garbage: 0,
+      bits_to_path: HashMap::new(),
       watermark: 0,
     })
   }
@@ -159,8 +186,11 @@ impl RetainedIndex {
             .rows
             .clone()
             .any(|row| self.writer.node_kind(row as usize).map(crate::SymbolKind::tag) == Some(import_tag));
+          self.table_dirty_names.extend(names.iter().copied());
+          self.table_dirty_files.insert(bits);
           if had_imports {
             self.escalate_full();
+            self.table_full = true;
           } else {
             self.escalate_scoped(names, bits);
           }
@@ -217,10 +247,25 @@ impl RetainedIndex {
       self.watermark = self.writer.edges_len();
       // Dirty-set reasoning (scoped rederive): diff the definition rows by durable eid.
       let new_rows = self.block_rows(interner, &block);
+      // Table maintenance inputs: every name this file defines (old and new — the rows'
+      // ids moved regardless), its def-postings, and its file-node repoint.
+      self.bits_to_path.insert(bits, (*path).to_string());
+      self.table_dirty_files.insert(bits);
+      for row in &new_rows {
+        self.table_dirty_names.insert(row.name_bits);
+      }
+      if let Some(old_rows) = &old_rows {
+        for row in old_rows {
+          self.table_dirty_names.insert(row.name_bits);
+        }
+      }
       match old_rows {
         Some(old_rows) => match self.diff_blocks(&old_rows, &new_rows) {
           Some(dirty) => self.escalate_scoped(dirty, bits),
-          None => self.escalate_full(),
+          None => {
+            self.escalate_full();
+            self.table_full = true;
+          }
         },
         None => {
           // A brand-new file: nobody holds edges into it yet, so only names it defines can
@@ -229,6 +274,7 @@ impl RetainedIndex {
           let import_tag = crate::SymbolKind::Import.tag();
           if new_rows.iter().any(|row| row.kind_tag == import_tag) {
             self.escalate_full();
+            self.table_full = true;
           } else {
             let names: Vec<u32> = new_rows.iter().map(|row| row.name_bits).collect();
             self.escalate_scoped(names, bits);
@@ -425,11 +471,6 @@ impl RetainedIndex {
   ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
     self.writer.truncate_edges(self.watermark);
     let blocks: Vec<FileBlock> = self.files.values().cloned().collect();
-    let row_ranges: Vec<std::ops::Range<usize>> = blocks
-      .iter()
-      .map(|b| b.rows.start as usize..b.rows.end as usize)
-      .collect();
-    let mut table = build_symbol_table_over(interner, &self.writer, &row_ranges);
     // Canonical file order for every order-sensitive consumer below: the same path-sorted
     // sequence a from-scratch build processes.
     let order: Vec<u32> = self
@@ -437,9 +478,6 @@ impl RetainedIndex {
       .keys()
       .map(|path| interner.intern(path).to_bits())
       .collect();
-    let qualified = self.store.qualified_imports(interner, order.iter().copied());
-    vorpal_resolve::seed_import_bindings(interner, &mut table, &qualified, resolver);
-
     // Scope decision (SUBSECOND.md dirty-bucket rederive): the applies since the last link
     // recorded which candidate sets changed; expand through the reference postings to every
     // file whose resolution could differ, and re-resolve ONLY those buckets. Everything
@@ -500,12 +538,153 @@ impl RetainedIndex {
     if scope.is_none() {
       self.repair.clear();
     }
+    // Persistent-table lifecycle: maintain per-name candidate runs when the edit footprint
+    // allows, rebuild from scratch when it does not (first link, admission flip, import
+    // wiring, oversized per-name scans, garbage past half the store). Maintenance computes
+    // every run and file repoint FIRST (immutable phase), then applies (mutable phase).
+    let dirty_names: Vec<u32> = self.table_dirty_names.drain().collect();
+    let dirty_files: Vec<u32> = self.table_dirty_files.drain().collect();
+    let mut rebuild = self.table.is_none() || self.table_full;
+    if !rebuild && !(dirty_names.is_empty() && dirty_files.is_empty()) {
+      // Splice maintenance: a dirty name's run keeps every symbol from UNEDITED files
+      // (their ids are stable — that is the whole retained-writer design) and swaps only
+      // the edited files' contributions, collected from ONE scan of each edited block.
+      // O(run length) copies per dirty name; definer counts are irrelevant, so hub names
+      // (a static defined in thousands of files) cost a memcpy, not a corpus scan.
+      let edited_bits: std::collections::HashSet<u32> = dirty_files.iter().copied().collect();
+      // path string → per-name new contributions, canonical (BTreeMap) order.
+      let mut contributions: BTreeMap<&str, HashMap<u32, Vec<vorpal_resolve::Symbol<'_>>>> =
+        BTreeMap::new();
+      for &bits in &dirty_files {
+        let Some(path) = self.bits_to_path.get(&bits) else {
+          continue;
+        };
+        let Some(block) = self.files.get(path.as_str()) else {
+          continue; // deleted: contributes nothing, its old entries filter out below
+        };
+        let mut owner_of: HashMap<u32, u32> = HashMap::new();
+        let log = self.writer.edge_log();
+        for i in block.edges.start as usize..(block.edges.end as usize).min(log.len()) {
+          let (src, dst, _) = log.triple(i);
+          if self.writer.node_kind(src as usize) != Some(crate::SymbolKind::File) {
+            owner_of.insert(dst, src);
+          }
+        }
+        let mut per_name: HashMap<u32, Vec<vorpal_resolve::Symbol<'_>>> = HashMap::new();
+        for row in block.rows.clone() {
+          let Some((id, name, row_path, kind, exported)) =
+            self.writer.definition(row as usize)
+          else {
+            continue;
+          };
+          if kind == crate::SymbolKind::File || kind == crate::SymbolKind::Import {
+            continue;
+          }
+          let owner = owner_of.get(&row).and_then(|&src| {
+            self.writer.definition(src as usize).map(|(_, owner_name, _, _, _)| {
+              interner
+                .peek(owner_name)
+                .unwrap_or_else(|| crate::pipeline::unmatchable_owner(interner))
+            })
+          });
+          per_name
+            .entry(interner.intern(name).to_bits())
+            .or_default()
+            .push(vorpal_resolve::Symbol {
+              id,
+              kind,
+              path: interner.intern(row_path),
+              exported,
+              owner,
+            });
+        }
+        contributions.insert(path.as_str(), per_name);
+      }
+      let repoints: Vec<(u32, Option<vorpal_kg::NodeId>)> = dirty_files
+        .iter()
+        .map(|&bits| {
+          let id = self
+            .bits_to_path
+            .get(&bits)
+            .and_then(|path| self.files.get(path))
+            .map(|block| {
+              debug_assert_eq!(
+                self.writer.node_kind(block.rows.start as usize),
+                Some(crate::SymbolKind::File),
+                "a block's first row is its file node"
+              );
+              vorpal_kg::NodeId::new(block.rows.start as u64)
+            });
+          (bits, id)
+        })
+        .collect();
+      let garbage = &mut self.table_garbage;
+      let table = self
+        .table
+        .as_mut()
+        .expect("checked above")
+        .borrow_mut(interner);
+      for &bits in &dirty_names {
+        let Some(name) = interner.id_from_bits(bits) else {
+          continue;
+        };
+        let old_run = table.candidates(name);
+        *garbage += old_run.len();
+        // Keep unedited files' symbols (canonical order preserved), then insert each edited
+        // file's new entries at its canonical position (runs are path-major by invariant).
+        let mut merged: Vec<vorpal_resolve::Symbol<'_>> = old_run
+          .iter()
+          .filter(|sym| !edited_bits.contains(&sym.path.to_bits()))
+          .copied()
+          .collect();
+        for (path, per_name) in &contributions {
+          let Some(rows) = per_name.get(&bits) else {
+            continue;
+          };
+          let at = merged.partition_point(|sym| interner.text_of(sym.path) < *path);
+          merged.splice(at..at, rows.iter().copied());
+        }
+        table.replace_candidates(name, &merged);
+      }
+      for (bits, id) in repoints {
+        let Some(path_id) = interner.id_from_bits(bits) else {
+          continue;
+        };
+        match id {
+          Some(id) => table.update_file(path_id, id),
+          None => table.remove_file(path_id),
+        }
+      }
+      if *garbage * 2 > table.grouped_len() {
+        rebuild = true; // tombstone debt: a fresh dense build is cheaper than the waste
+      }
+    }
+    if rebuild {
+      let row_ranges: Vec<std::ops::Range<usize>> = blocks
+        .iter()
+        .map(|b| b.rows.start as usize..b.rows.end as usize)
+        .collect();
+      vorpal_kg::phase_stamp("retained: table rebuild");
+      let fresh = build_symbol_table_over(interner, &self.writer, &row_ranges);
+      self.table = Some(vorpal_resolve::RetainedSymbolTable::erase(fresh));
+      self.table_full = false;
+      self.table_garbage = 0;
+    } else {
+      vorpal_kg::phase_stamp("retained: table maintained");
+    }
+    let table = self
+      .table
+      .as_mut()
+      .expect("built or maintained above")
+      .borrow_mut(interner);
+    let qualified = self.store.qualified_imports(interner, order.iter().copied());
+    vorpal_resolve::seed_import_bindings(interner, table, &qualified, resolver);
     let _pump_stats = {
       let resolution = std::cell::RefCell::new(&mut self.resolution);
       let store = &mut self.store;
       vorpal_resolve::resolve_all_store_into(
         interner,
-        &table,
+        table,
         store,
         feed.iter().copied(),
         resolver,
@@ -563,7 +742,6 @@ impl RetainedIndex {
         },
       )?
     };
-    drop(table);
     self.assemble(&blocks, &order, want_evidence)
   }
 

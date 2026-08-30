@@ -514,7 +514,9 @@ const MIN_DEFS_PER_SHARD: usize = 4096;
 /// The owner id for members whose owner's name no reference ever interned: a reserved,
 /// unparseable string (control character) that can never equal a real qualifier, preserving
 /// "is a member" without admitting a match.
-fn unmatchable_owner<'i>(interner: &'i vorpal_resolve::Interner) -> vorpal_resolve::NameId<'i> {
+pub(crate) fn unmatchable_owner<'i>(
+  interner: &'i vorpal_resolve::Interner,
+) -> vorpal_resolve::NameId<'i> {
   interner.intern("\u{1}vorpal:unreferenced-owner")
 }
 

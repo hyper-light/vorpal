@@ -31,6 +31,6 @@ pub use resolver::{
 };
 pub use spill::{RefSpill, RefSpillWriter};
 pub use store::{RefStore, StoreRawChunks};
-pub use table::{Symbol, SymbolTable};
+pub use table::{Symbol, SymbolTable, RetainedSymbolTable};
 
 pub use vorpal_kg::{EdgeType, NodeId, SymbolKind};

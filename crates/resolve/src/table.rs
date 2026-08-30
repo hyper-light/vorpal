@@ -257,6 +257,50 @@ impl<'i> SymbolTable<'i> {
     table
   }
 
+  /// Replace one name's candidate run in place (the retained daemon's table maintenance):
+  /// the new run appends at the tail of `grouped` and the name's slot repoints to it; the
+  /// old run becomes garbage (tracked by the caller via [`SymbolTable::grouped_len`] deltas
+  /// and retired by a full rebuild past a threshold). Candidate ORDER within the name is the
+  /// caller's contract — pass the run in canonical (path-major, row-ascending) order and
+  /// `candidates()` behaves exactly as a from-scratch build's.
+  pub fn replace_candidates(&mut self, name: NameId<'i>, run: &[Symbol<'i>]) {
+    debug_assert!(self.pending.is_empty(), "maintenance only after finalize");
+    let slot = self.ranges.slot_mut(name);
+    let had = slot.1 > 0;
+    if run.is_empty() {
+      if had {
+        self.ranges.names -= 1;
+      }
+      *self.ranges.slot_mut(name) = (u32::MAX, 0);
+      return;
+    }
+    let start = self.grouped.len() as u32;
+    self.grouped.extend_from_slice(run);
+    *self.ranges.slot_mut(name) = (start, run.len() as u32);
+    if !had {
+      self.ranges.names += 1;
+    }
+  }
+
+  /// Update (or insert) the file-node entry for `path` — an edited file's node id moves.
+  pub fn update_file(&mut self, path: NameId<'i>, id: NodeId) {
+    self.files.insert(path, id);
+  }
+
+  /// Drop the file-node entry for `path` — the file was deleted; path-form imports of it
+  /// must stop resolving instead of pointing at a retired row.
+  pub fn remove_file(&mut self, path: NameId<'i>) {
+    self.files.remove(&path);
+  }
+
+  /// Current length of the grouped candidate store — tail growth from
+  /// [`SymbolTable::replace_candidates`] minus nothing (garbage is never reclaimed in
+  /// place); callers difference this against live candidate counts to decide when a full
+  /// rebuild is cheaper than the accumulated waste.
+  pub fn grouped_len(&self) -> usize {
+    self.grouped.len()
+  }
+
   /// Every definition carrying `name` (the candidate set for resolution), in insertion order.
   pub fn candidates(&self, name: NameId<'i>) -> &[Symbol<'i>] {
     debug_assert!(
@@ -272,5 +316,31 @@ impl<'i> SymbolTable<'i> {
   /// Total distinct names in the table (post-finalize).
   pub fn names(&self) -> usize {
     self.ranges.names
+  }
+}
+
+/// A finalized table with its interner brand erased, so a retained daemon can own it beside
+/// the `Interner` that built it (SUBSECOND.md Phase 3 — the same lifetime-free discipline as
+/// `RefStore`). Sound because the table stores interned IDS only — `NameId` is an index plus
+/// a phantom brand, never a pointer — and the brand exists solely to prevent cross-interner
+/// id confusion. [`RetainedSymbolTable::borrow_mut`] restores the brand; callers uphold the
+/// one rule that matters: **rebind only with the interner that built the table.**
+pub struct RetainedSymbolTable(SymbolTable<'static>);
+
+impl RetainedSymbolTable {
+  pub fn erase(table: SymbolTable<'_>) -> Self {
+    // SAFETY: `SymbolTable` transitively contains no references — `NameId<'i>` is
+    // `(NonZeroU32, PhantomData<&'i str>)` — so the only effect of the transmute is the
+    // phantom brand. The public contract above confines rebinding to the originating
+    // interner, which is exactly the invariant the brand encodes.
+    Self(unsafe { std::mem::transmute::<SymbolTable<'_>, SymbolTable<'static>>(table) })
+  }
+
+  pub fn borrow_mut<'i>(&mut self, _interner: &'i Interner) -> &mut SymbolTable<'i> {
+    // SAFETY: inverse of `erase` under the same no-references argument; `_interner` pins
+    // the caller to naming the session the ids belong to.
+    unsafe {
+      std::mem::transmute::<&mut SymbolTable<'static>, &mut SymbolTable<'i>>(&mut self.0)
+    }
   }
 }
