@@ -40,6 +40,83 @@ pub(crate) struct QuantQuery {
 
 /// Quantize one row: `scale = max|x| / 127`, codes rounded to nearest. Exactly reversible
 /// ordering-wise for the common case; the all-zero row gets scale 0 and a zero self term.
+/// Deterministic random rotation (RaBitQ-style fast JL transform): three rounds of
+/// {seeded ±1 sign flips → 64-point fast Walsh-Hadamard per block → seeded permutation}.
+/// An L2 isometry (up to one global power-of-two scale), pure function of
+/// (row, ROTATION_SEED) — byte-deterministic everywhere.
+///
+/// NOT applied to the i8 tier: gated on-corpus and rejected there (pool recall 0.9812 →
+/// 0.9469 — the spiky lexical-hash coordinates the rotation smooths out were acting as
+/// natural navigation signposts, and at 8 bits the fidelity gain cannot repay that; see
+/// docs/wip/ANN_FRONTIER.md). Retained as the foundation the 1-bit RaBitQ tier requires:
+/// sign-bit codes are only unbiased estimators AFTER this rotation.
+const ROTATION_SEED: u64 = 0x0517_AC1E_D0_7A7E5;
+const ROTATION_ROUNDS: usize = 3;
+
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+  *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+  let mut z = *state;
+  z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+  z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+  z ^ (z >> 31)
+}
+
+fn fht64(block: &mut [f32]) {
+  debug_assert_eq!(block.len(), 64);
+  let mut h = 1;
+  while h < 64 {
+    let mut i = 0;
+    while i < 64 {
+      for j in i..i + h {
+        let x = block[j];
+        let y = block[j + h];
+        block[j] = x + y;
+        block[j + h] = x - y;
+      }
+      i += h * 2;
+    }
+    h *= 2;
+  }
+  // Exact power-of-two normalization (1/sqrt(64) = 2^-3): the transform stays an isometry
+  // and every operation is exactly representable.
+  for x in block.iter_mut() {
+    *x *= 0.125;
+  }
+}
+
+pub(crate) fn rotate_row(row: &mut [f32]) {
+  let d = row.len();
+  if d == 0 || d % 64 != 0 {
+    return;
+  }
+  let mut state = ROTATION_SEED;
+  for _round in 0..ROTATION_ROUNDS {
+    // Seeded sign flips: one bit per element, drawn in fixed order.
+    let mut bits = 0u64;
+    let mut left = 0u32;
+    for x in row.iter_mut() {
+      if left == 0 {
+        bits = splitmix64(&mut state);
+        left = 64;
+      }
+      if bits & 1 == 1 {
+        *x = -*x;
+      }
+      bits >>= 1;
+      left -= 1;
+    }
+    for block in row.chunks_mut(64) {
+      fht64(block);
+    }
+    // Seeded Fisher-Yates over the whole row: mixes across blocks between rounds.
+    for i in (1..d).rev() {
+      let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+      row.swap(i, j);
+    }
+  }
+}
+
 fn quantize_row(row: &[f32], codes: &mut [i8]) -> (f32, f32) {
   let max_abs = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
   if max_abs == 0.0 {

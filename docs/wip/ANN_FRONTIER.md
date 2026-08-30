@@ -93,6 +93,20 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
   transfer to this embedding geometry; single-α=1.2 stands. (Lazy memoized single-α prune
   kept — sha-identical, structural win.)
 
+- Refinement round (Tier-1 item 8): **ADOPTED** — pool recall 0.9125 → **0.9812** (+6.9pt,
+  the campaign's largest quality move); unreachables 66k → 31k pre-repair; fused output
+  visibly stronger. Cost 8.8 → 19.4s vamana (Tier-2 is the claw-back).
+- In-coverage repair (Tier-1 item 7, in-degree-0 form): **ADOPTED** — 66k structurally
+  unreachable nodes rejoined; probe recall unchanged; correctness-shaped.
+- Two-pass expansion (Tier-0 item 3): **ADOPTED**, sha-pinned inert; wall within noise
+  (256B rows = 2 lines mute the MLP win); kept as the 1-bit tier's required shape.
+- Rotation on the i8 tier (Tier-2 item 9): **REJECTED by gate** — pool recall 0.9812 →
+  0.9469. Mechanism: the pool oracle lives in the quantized domain, so i8-fidelity gains
+  don't score; meanwhile Gaussianizing the spiky lexical coordinates removed natural
+  navigation signposts and made the ANN problem harder. `rotate_row` retained (tested,
+  deterministic) as the 1-bit tier's required foundation — sign-bit estimators are only
+  unbiased AFTER rotation.
+
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
 - kNN-first wholesale (NN-descent/RNN-descent/HCNNG): 10-16× more distance evals; honest
