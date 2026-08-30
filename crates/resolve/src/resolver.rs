@@ -15,6 +15,9 @@ impl Confidence {
   pub const NONE: Confidence = Confidence(0);
   /// Multiple candidates; the edge is approximate (labeled, not faked).
   pub const AMBIGUOUS: Confidence = Confidence(40);
+  /// Typed-receiver resolution (G-M2): the candidate set was narrowed by the receiver's
+  /// inferred type — stronger than a bare-name pick, weaker than an explicit local binding.
+  pub const TYPE_BOUND: Confidence = Confidence(85);
   /// A single visible exported definition in another file.
   pub const CROSS_FILE: Confidence = Confidence(90);
   /// A single definition in the same file — the strongest binding.
@@ -48,7 +51,9 @@ impl ResolutionGrade {
   pub fn from_confidence(c: Confidence) -> Self {
     if c >= Confidence::LOCAL {
       Self::Exact
-    } else if c >= Confidence::CROSS_FILE {
+    } else if c >= Confidence::TYPE_BOUND {
+      // The constrained floor moved 90 → 85 when TYPE_BOUND landed (G-M0). No existing edge
+      // lives in (40, 90), so no historical label shifts.
       Self::Constrained
     } else if c > Confidence::NONE {
       Self::Heuristic
@@ -94,6 +99,16 @@ pub enum ResolveReason {
   /// of this name resolved to a single corroborated target, and no local definition shadows
   /// it. The strongest cross-file evidence a bare use can carry.
   ImportBound = 8,
+  /// Typed-receiver resolution (G-M2): the receiver's type came from an explicit annotation.
+  ReceiverAnnotated = 9,
+  /// The receiver's type came from a constructor-shaped initializer.
+  ReceiverConstructed = 10,
+  /// The receiver's type came from a typed parameter binding.
+  ReceiverParamTyped = 11,
+  /// The receiver's type came from a typed field on the enclosing type.
+  ReceiverFieldTyped = 12,
+  /// Type narrowing left several candidates; deterministic tie pick (approximate).
+  ReceiverTypedTie = 13,
 }
 
 impl ResolveReason {
@@ -107,6 +122,11 @@ impl ResolveReason {
       6 => Self::VisibleExport,
       7 => Self::VisibleTie,
       8 => Self::ImportBound,
+      9 => Self::ReceiverAnnotated,
+      10 => Self::ReceiverConstructed,
+      11 => Self::ReceiverParamTyped,
+      12 => Self::ReceiverFieldTyped,
+      13 => Self::ReceiverTypedTie,
       _ => Self::None,
     }
   }
@@ -123,6 +143,11 @@ impl ResolveReason {
       Self::VisibleExport => "visible-export",
       Self::VisibleTie => "visible-tie",
       Self::ImportBound => "import-bound",
+      Self::ReceiverAnnotated => "receiver-annotated",
+      Self::ReceiverConstructed => "receiver-constructed",
+      Self::ReceiverParamTyped => "receiver-param-typed",
+      Self::ReceiverFieldTyped => "receiver-field-typed",
+      Self::ReceiverTypedTie => "receiver-typed-tie",
     }
   }
 }

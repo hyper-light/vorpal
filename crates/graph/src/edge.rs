@@ -31,6 +31,10 @@ impl EdgeType {
   pub const OVERRIDES: EdgeType = EdgeType(6);
   pub const HAS_METHOD: EdgeType = EdgeType(7);
   pub const HAS_FIELD: EdgeType = EdgeType(8);
+  /// Static argument→parameter flow recorded at extraction (G-M3). Reserved here first
+  /// (G-M0) so every surface speaks the name before any edge exists; id 9 stays free for a
+  /// future structural relation to keep the semantic block contiguous from 10.
+  pub const DATA_FLOWS: EdgeType = EdgeType(10);
 
   /// The user-facing relation name (the spelling accepted by [`EdgeType::from_name`] and shown
   /// in traversal results). Confidence is ignored — this reports the base type.
@@ -45,6 +49,7 @@ impl EdgeType {
       EdgeType::OVERRIDES => "overrides",
       EdgeType::HAS_METHOD => "has_method",
       EdgeType::HAS_FIELD => "has_field",
+      EdgeType::DATA_FLOWS => "data_flows",
       _ => "unknown",
     }
   }
@@ -62,6 +67,7 @@ impl EdgeType {
       "overrides" => Some(EdgeType::OVERRIDES),
       "has_method" => Some(EdgeType::HAS_METHOD),
       "has_field" => Some(EdgeType::HAS_FIELD),
+      "data_flows" => Some(EdgeType::DATA_FLOWS),
       _ => None,
     }
   }

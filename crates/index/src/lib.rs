@@ -2172,7 +2172,8 @@ pub fn min_confidence_for_grade(grade: Option<&str>) -> Result<u8, Box<dyn Error
   Ok(match grade.map(str::to_ascii_lowercase).as_deref() {
     None | Some("") => 0,
     Some("heuristic") => 1,
-    Some("constrained") => 90,
+    // 90 -> 85 with TYPE_BOUND (G-M0): the constrained floor now admits typed-receiver edges.
+    Some("constrained") => 85,
     Some("exact") => 100,
     Some(other) => {
       return Err(format!("unknown grade '{other}' (exact | constrained | heuristic)").into());
