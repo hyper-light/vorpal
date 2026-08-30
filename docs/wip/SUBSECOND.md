@@ -392,5 +392,5 @@ Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B,
 retrieval/resolution evals, full suite): 0.B tail → 0.A stream → 0.C cache surgery → 0.D ANN.
 Then 1a/1b/1c (new convergence tests), then 2 (recall gates + new ANN lineage tests), then 3
 (differential harness gates every merge), then 4 (format-version bump, migration test matrix,
-nightly golden convergence). Perf numbers recorded per chunk in docs/wip/BENCHMARKS.md
+nightly golden convergence). Perf numbers recorded per chunk in README.md#performance
 methodology: release builds, best-of-3, fixed tree state, thermal notes.

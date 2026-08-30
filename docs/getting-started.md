@@ -155,4 +155,4 @@ text.
 - **[Python quickstart](./python.md)** — `pip install vorpal-py`.
 - **[TypeScript / JavaScript quickstart](./typescript.md)** — the pattern engine for Node & the browser.
 - **[Supported languages](./wip/LANGUAGES.md)** — the full matrix of what each grammar extracts.
-- **[How it works](./wip/ARCHITECTURE.md)** and **[benchmarks](./wip/BENCHMARKS.md)** — for the curious.
+- **[How it works](./wip/ARCHITECTURE.md)** and **[benchmarks](../README.md#performance)** — for the curious.

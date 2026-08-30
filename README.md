@@ -154,38 +154,84 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 
 ## Performance
 
-Release builds, Apple M5 Max (18 cores); wall-clock for the whole CLI invocation including
-process start. Measured 2026-08-30.
+All numbers below are release builds on an Apple M5 Max (18 cores, 128 GB, macOS 26.4.1,
+rustc 1.98.0), measured 2026-08-30, wall-clock for the whole CLI invocation including
+process start. Datasets are pinned so you can re-run them: Linux kernel @ `1590cf032971`
+(72,541 indexable files), CPython @ `b86a41cbf63` (3,592 files). Cold times are best of 3.
 
-**This repository** (856 files, 44k nodes — includes the vendored tree-sitter runtime and
-grammars):
+### Indexing
+
+```
+vorpal index <source-tree> --out <index-dir>
+```
+
+| Tree | Cold index | Edit one file, re-index | `touch` one file | Nothing changed |
+|---|---|---|---|---|
+| **Linux kernel** (72,541 files, ~30 M LOC → 2.75 M nodes, 6.8 M references) | **6.3 s** | **0.98 s** | 0.20 s | 0.10 s |
+| **CPython** (3,592 files → 143k nodes) | 0.67 s | — | — | — |
+| **This repository** (856 files → 44k nodes, incl. vendored tree-sitter runtime + grammars) | 3.8 s¹ | 0.04 s | — | 0.02 s |
+
+¹ Dominated by a single 33 MB generated `parser.c`; the other 855 files parse in parallel
+underneath it.
+
+Peak memory for the kernel cold index stays under 1 GB. The index on disk for the kernel
+is a 2.0 GB generation (that includes the 811 MB semantic-search index and a 581 MB cache
+of parsed files that makes the 0.98 s re-index possible); the previous generation is kept
+until the next commit, then swept.
+
+### Search (Linux kernel index, k = 10)
+
+```
+vorpal search "socket buffer alloc" -k 10 --index <index-dir>
+```
+
+| State | Time | What runs |
+|---|---|---|
+| First searches, before the semantic index exists | 0.28 s | exact scan of every candidate |
+| Semantic index built | **0.03 s** | accelerated lookup |
+
+The semantic index builds once in the background (19 s for the kernel) and is validated
+before every use; results are **identical** with or without it — it changes latency, never
+answers. Building it is never on your critical path: searches work immediately after
+indexing.
+
+### Running as an MCP server
+
+`vorpal mcp` watches your tree, keeps the index fresh as you edit, and answers over
+stdio — you never re-index by hand. Round-trip times measured from the client side
+(medians of 50 calls, kernel tree):
 
 | Operation | Time |
 |---|---|
-| Full cold index | **3.8 s** — dominated by a single 33 MB generated `parser.c` |
-| Re-index after editing one file | 0.04 s |
-| Re-index, nothing changed | 0.02 s |
-| Structural `scan` rule over the **Linux kernel** (63,775 C files) | **1.4 s** — every file fully parsed and matched by AST, about 2× the time ripgrep needs for a plain text grep |
-
-**Linux kernel** (72,541 files, ~30 M LOC → 2.75 M nodes, 6.8 M references):
-
-| Operation | Time |
-|---|---|
-| Cold index | **6.3 s**, under 1 GB peak memory |
-| Re-index after editing one file | **0.98 s** |
-| Re-index after a `touch` (contents unchanged) | 0.20 s |
-| Re-index, nothing changed | 0.10 s |
-| Search (CLI) | 0.02 s |
-| Search (running as an MCP server) | **27 ms** |
-| Graph query (running as an MCP server) | **< 1 ms** |
+| Graph query (callers, references, …) | **< 1 ms** |
+| Hybrid search | **27 ms** |
 | Save a file → queries reflect the change | ~0.5 s |
-| Semantic search index build | 19 s, once, in the background |
+| Keeping the semantic index current after an edit | ~140 ms, in the background |
+| Server start → fully warm on an existing index | 2–4 s |
 
-Indexing the same tree always produces byte-identical output, and search results are
-identical with or without the acceleration indexes — they change latency, never answers.
-As an MCP server, vorpal watches your tree and keeps everything fresh as you edit; you
-never re-index by hand. Commands, datasets, and raw numbers:
-**[docs/wip/BENCHMARKS.md](docs/wip/BENCHMARKS.md)**.
+Editing never triggers index rebuilds — changes are applied incrementally, including to
+the semantic-search index.
+
+### Structural scan vs. text grep (Linux kernel, 63,775 C files)
+
+```
+vorpal scan --rule rule.yml ~/linux     # kind: call_expression + regex: kmalloc
+rg 'kmalloc\(' -t c ~/linux             # comparison
+```
+
+| Tool | Time | What you get |
+|---|---|---|
+| `vorpal scan` | 1.4 s | 42.6k structural matches — real `call_expression` nodes, not lines that happen to contain the text |
+| `ripgrep` | 0.7 s | raw text lines |
+
+Full parsing plus AST matching of 63,775 files costs about 2× a plain text grep of the
+same tree.
+
+### Determinism
+
+Indexing the same tree always produces byte-identical output — two independent cold
+builds of the kernel commit the exact same content-addressed generation. Every release
+re-verifies this.
 
 ## What it does
 
@@ -218,7 +264,6 @@ the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simp
 | [Python](docs/python.md) · [TypeScript/JS](docs/typescript.md) | Library quickstarts (patterns + index API) |
 | [Supported languages](docs/wip/LANGUAGES.md) | The full matrix of what each of the 28 grammars extracts |
 | [Architecture](docs/wip/ARCHITECTURE.md) | Storage format, memory model, concurrency, scaling roadmap |
-| [Benchmarks](docs/wip/BENCHMARKS.md) | Reproducible perf: commands, datasets, hardware, results |
 | [Index format](docs/wip/INDEX_FORMAT.md) | On-disk compatibility & migration policy |
 
 ## How it works
