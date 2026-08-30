@@ -1479,6 +1479,18 @@ pub struct HubRecord {
   pub semantic_in_degree: u64,
 }
 
+/// One `calls`-graph community: its size, its most-called member, and the module that
+/// holds most of it.
+#[derive(Serialize, Debug)]
+pub struct ClusterRow {
+  pub community: u32,
+  pub members: u64,
+  /// The member with the highest semantic in-degree — the cluster's face.
+  pub representative: NodeRecord,
+  /// The directory holding the plurality of members.
+  pub dominant_module: String,
+}
+
 /// The orientation summary an agent asks for first: where the mass is, what everything
 /// leans on, and where execution enters.
 #[derive(Serialize, Debug)]
@@ -1490,6 +1502,13 @@ pub struct ArchitectureReport {
   /// Exported definitions nothing semantic reaches: entry-point candidates — capped by `top`.
   pub entries: Vec<NodeRecord>,
   pub total_modules: u64,
+  /// `calls`-graph communities by size (desc, then id) — capped by `top`; empty with
+  /// `clusters_note` set when the sidecar has not been built for this generation.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub clusters: Vec<ClusterRow>,
+  pub total_clusters: u64,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub clusters_note: Option<String>,
 }
 
 /// Compute the summary: one parallel pass over every node's in-edge types (semantic
@@ -1628,11 +1647,100 @@ pub fn architecture_report(
     }
   }
 
+  // Clusters from the warm-time community sidecar. Community ids are dense, so sizing is
+  // one integer pass; only the `top` largest multi-member communities are then walked for
+  // a face (highest semantic in-degree member) and a plurality module — no strings touched
+  // for the millions of rows outside them. An unbuilt sidecar is stated, never rendered as
+  // "no communities".
+  let (clusters, total_clusters, clusters_note) = match kg.communities() {
+    None => (
+      Vec::new(),
+      0,
+      Some(
+        "communities not built for this generation — a search warm (or the daemon's \
+         background warm) builds them"
+          .to_string(),
+      ),
+    ),
+    Some(table) => {
+      let is_file = |row: usize| match kind_tags {
+        Some(tags) => tags.get(row) == Some(&vorpal_kg::SymbolKind::File.tag()),
+        None => kg.node_kind(NodeId::new(row as u64)) == Some(vorpal_kg::SymbolKind::File),
+      };
+      let community_count = table.iter().copied().max().map_or(0, |m| m as usize + 1);
+      let mut members = vec![0u64; community_count];
+      for (row, &community) in table.iter().enumerate() {
+        if !is_file(row) {
+          members[community as usize] += 1;
+        }
+      }
+      let total = members.iter().filter(|&&m| m > 1).count() as u64;
+      let mut ranked: Vec<(u64, u32)> = members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m > 1)
+        .map(|(community, &m)| (m, community as u32))
+        .collect();
+      ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+      ranked.truncate(top);
+      // slot[community] = rank within the top list, for the single gathering pass.
+      let mut slot = vec![u32::MAX; community_count];
+      for (rank, &(_, community)) in ranked.iter().enumerate() {
+        slot[community as usize] = rank as u32;
+      }
+      struct Face<'a> {
+        best: u64,
+        best_degree: u32,
+        modules: std::collections::HashMap<&'a str, u64>,
+      }
+      let mut faces: Vec<Option<Face>> = (0..ranked.len()).map(|_| None).collect();
+      for (row, &community) in table.iter().enumerate() {
+        let rank = slot[community as usize];
+        if rank == u32::MAX || is_file(row) {
+          continue;
+        }
+        let degree = in_semantic[row];
+        let face = faces[rank as usize].get_or_insert_with(|| Face {
+          best: row as u64,
+          best_degree: degree,
+          modules: std::collections::HashMap::new(),
+        });
+        if degree > face.best_degree {
+          face.best_degree = degree;
+          face.best = row as u64;
+        }
+        if let Some(path) = kg.node_path(NodeId::new(row as u64)) {
+          *face.modules.entry(dir_of(path)).or_insert(0) += 1;
+        }
+      }
+      let clusters = ranked
+        .into_iter()
+        .zip(faces)
+        .filter_map(|((count, community), face)| {
+          let face = face?;
+          let representative = node_record(kg, NodeId::new(face.best))?;
+          let mut modules: Vec<(&str, u64)> = face.modules.into_iter().collect();
+          modules.sort_unstable_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(y.0)));
+          Some(ClusterRow {
+            community,
+            members: count,
+            representative,
+            dominant_module: modules.first().map(|(m, _)| (*m).to_string()).unwrap_or_default(),
+          })
+        })
+        .collect();
+      (clusters, total, None)
+    }
+  };
+
   ArchitectureReport {
     modules,
     hubs,
     entries,
     total_modules,
+    clusters,
+    total_clusters,
+    clusters_note,
   }
 }
 
@@ -1659,6 +1767,30 @@ pub fn render_architecture(report: &ArchitectureReport) -> String {
   let _ = writeln!(out, "entry-point candidates (exported, semantically unreached):");
   for entry in &report.entries {
     let _ = writeln!(out, "  {} [{}] {}", entry.name, entry.kind, entry.path);
+  }
+  match &report.clusters_note {
+    Some(note) => {
+      let _ = writeln!(out, "clusters: {note}");
+    }
+    None => {
+      let _ = writeln!(
+        out,
+        "clusters ({} calls-graph communities; top by size):",
+        report.total_clusters
+      );
+      for row in &report.clusters {
+        let _ = writeln!(
+          out,
+          "  #{:<6} {:>6} members  {} [{}] {}  ({})",
+          row.community,
+          row.members,
+          row.representative.name,
+          row.representative.kind,
+          row.representative.path,
+          row.dominant_module
+        );
+      }
+    }
   }
   out
 }

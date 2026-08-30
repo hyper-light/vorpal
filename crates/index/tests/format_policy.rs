@@ -86,6 +86,13 @@ fn version_table_matches_the_constants() {
       version_of("crates/ann/src/embed.rs", "LEXICAL_EMBED_VERSION"),
       "ANN tier distrusted → exact fallback → warm rebuilds",
     ),
+    (
+      "calls-graph communities (`communities.bin`)",
+      "VERSION",
+      "crates/kg/src/communities.rs",
+      version_of("crates/kg/src/communities.rs", "VERSION"),
+      "sidecar treated as absent → `community` answers `null`, `architecture` says not built → warm rebuilds",
+    ),
   ];
 
   let mut table = String::from("| Artifact | Constant | Value | On mismatch |\n|---|---|---|---|\n");

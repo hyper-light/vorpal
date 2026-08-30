@@ -87,6 +87,19 @@ vorpal-index search /tmp/bench-lk "socket buffer alloc" 10     # tiers warm
 Tier build (one-time per generation, heals in the background in daemon use): 12.8 s wall /
 178 s user for both tiers at kernel scale.
 
+The calls-graph community sidecar (`communities.bin`, built by the same warm right after the
+search tiers; `VORPAL_PHASE_TRACE=1 vorpal-index __warm-ann /tmp/bench-lk` prints its
+`communities:` stamps) costs **0.36 s wall** and a 40 MB transient at kernel scale, and is
+11 MB on disk (one `u32` per node). Deterministic Louvain over the `calls` graph with exact
+integer modularity gains; 69 omnipresent nodes (degree above √(2m) = 2,274 — `kfree`,
+`memcpy`, `printk`, …) are held out as singletons, and the reported community is a
+size-bounded cut of the dendrogram (`VORPAL_COMMUNITY_CAP`, default 512, 0 = the top Louvain
+level). On the kernel that yields 80,485 clusters of ≥2 members over 686k participating
+functions (sizes p50 3, p90 12, p99 113, max 5,879 — a first-level group, the floor); the
+top Louvain level instead was a few 46k-member hub basins over a dust of pairs.
+`tcp_v4_rcv`'s community is `tcp_v4_do_rcv`, `tcp_v4_fill_cb`, `tcp_v4_restore_cb`,
+`tcp_v4_cookie_check`, `tcp_child_process`, `tcp_inbound_hash`, `tcp_inbound_md5_hash`.
+
 **Tier answers are approximate at this scale — measured, not assumed.** The previous edition
 of this document claimed tier and exact results were byte-identical (a fixture test pins
 that). At kernel scale they are not: over eight queries (`socket buffer alloc`, `page fault
@@ -119,6 +132,9 @@ vorpal query '<text>' --index /tmp/bench-lk
 | `query 'MATCH (f:Function) WHERE f.name =~ "^tcp_v[46]_(rcv\|do_rcv)$" RETURN f.name'` | 20 ms |
 | `query 'MATCH (f:Function) RETURN COUNT(*)'` (765,791 functions, streamed) | 10 ms |
 | `query 'MATCH (f:Function) WHERE f.scc_size > 3 RETURN … LIMIT 5'` | 10 ms |
+| `query 'MATCH (f:Function {name: "tcp_v4_rcv"}) RETURN f.community'` | < 5 ms |
+| `query 'MATCH (g:Function) WHERE g.community = 1919789 RETURN count(*)'` (2.76M-node scan) | 20 ms |
+| `graph architecture` (modules, hubs, entries, 80k-community cluster pass) | 50 ms |
 | `search "socket buffer alloc" -k 10` (tiers warm) | 30 ms |
 
 `/usr/bin/time -p` resolves 10 ms on this machine; "< 5 ms" rows reported `0.00`.

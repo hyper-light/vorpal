@@ -21,6 +21,7 @@ pub use kg::{Kg, NodeView, SymbolSelector, resolve_index_dir};
 pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
 pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
 pub use model::SymbolKind;
+pub mod communities;
 mod scc;
 pub use writer::{KgWriter, NodeDef, layout_entity_paths};
 
@@ -122,9 +123,14 @@ fn fit_exponent(samples: &[(f64, f64)]) -> Option<f64> {
   (den > f64::EPSILON).then(|| num / den)
 }
 
+/// Is `VORPAL_PHASE_TRACE` set? Lets callers skip computing trace-only statistics.
+pub fn phase_trace_enabled() -> bool {
+  std::env::var_os("VORPAL_PHASE_TRACE").is_some()
+}
+
 /// Phase stamp for RSS-timeline profiling, active only under `VORPAL_PHASE_TRACE`.
 pub fn phase_stamp(label: &str) {
-  if std::env::var_os("VORPAL_PHASE_TRACE").is_some() {
+  if phase_trace_enabled() {
     #[cfg(feature = "alloc-stats")]
     let stats = {
       use tikv_jemalloc_ctl::{epoch, stats};

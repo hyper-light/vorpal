@@ -201,6 +201,9 @@ pub struct Kg {
   evidence: Option<crate::evidence::EvidenceStore>,
   graph: Graph,
   directory: SegmentDirectory,
+  /// The community sidecar (`communities.bin`), loaded on first use and validated against
+  /// the node-segment stamp — absent or stale reads as `None` for every node.
+  communities: std::sync::OnceLock<Option<Vec<u32>>>,
 }
 
 impl Kg {
@@ -240,7 +243,25 @@ impl Kg {
       evidence: None,
       graph,
       directory,
+      communities: std::sync::OnceLock::new(),
     })
+  }
+
+  /// This node's `calls`-graph community (dense id), from the warm-time sidecar. `None`
+  /// until a warm has built it for this generation — "unknown", never "alone".
+  pub fn community(&self, id: NodeId) -> Option<u32> {
+    let table = self.communities.get_or_init(|| {
+      let dir = self.heap_file.as_ref()?.parent()?;
+      let stamp = xxhash_rust::xxh3::xxh3_64(self.node_segment_bytes());
+      crate::communities::load(dir, stamp, self.node_count())
+    });
+    table.as_ref()?.get(id.raw() as usize).copied()
+  }
+
+  /// The whole community table, when built (for summaries that walk every node once).
+  pub fn communities(&self) -> Option<&[u32]> {
+    self.community(NodeId::new(0));
+    self.communities.get().and_then(|t| t.as_deref())
   }
 
   pub fn node_count(&self) -> usize {

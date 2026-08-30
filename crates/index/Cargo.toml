@@ -43,5 +43,6 @@ builtin-parser = ["vorpal-ingest/builtin-parser", "vorpal-language/builtin-parse
 napi-langs = ["vorpal-ingest/napi-langs", "vorpal-language/napi-lang"]
 
 [dev-dependencies]
+vorpal-query.workspace = true
 fd-lock = "4.0.4"
 vorpal-dynamic.workspace = true

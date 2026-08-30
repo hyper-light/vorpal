@@ -186,12 +186,12 @@ impl ExprType {
 
 pub const PROPS: &[&str] = &[
   "id", "eid", "name", "path", "kind", "exported", "signature", "in_degree", "out_degree",
-  "scc_size",
+  "scc_size", "community",
 ];
 
 pub fn prop_type(prop: &str) -> ExprType {
   match prop {
-    "id" | "in_degree" | "out_degree" | "scc_size" => ExprType::Int,
+    "id" | "in_degree" | "out_degree" | "scc_size" | "community" => ExprType::Int,
     "exported" => ExprType::Bool,
     _ => ExprType::Text,
   }
@@ -219,6 +219,10 @@ pub fn prop_cell(kg: &Kg, id: u32, prop: &str) -> Cell {
     "scc_size" => match kg.scc_size(NodeId::new(id as u64)) {
       Some(size) => Cell::Int(size as i64),
       None => Cell::Null, // pre-column generation: unknown, never "acyclic"
+    },
+    "community" => match kg.community(NodeId::new(id as u64)) {
+      Some(c) => Cell::Int(c as i64),
+      None => Cell::Null, // sidecar not built for this generation: unknown
     },
     "eid" => match view.external_id {
       Some(eid) => Cell::Text(format!("{eid:032x}")),

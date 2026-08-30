@@ -1158,8 +1158,10 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
     tool(
       "architecture",
       "Orientation summary: modules by definition mass with cross-module import margins, \
-       hub definitions by semantic in-degree, and entry-point candidates (exported, \
-       semantically unreached). The first call to make in an unfamiliar codebase.",
+       hub definitions by semantic in-degree, entry-point candidates (exported, \
+       semantically unreached), and calls-graph clusters (Louvain communities from the \
+       warm-time sidecar: size, representative, dominant module; stated as not built when \
+       the sidecar is absent). The first call to make in an unfamiliar codebase.",
       json!({
         "top": {"type": "integer", "description": "Rows per section (default 20, max 500)"}
       }),
@@ -1333,7 +1335,8 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
        AND/OR/NOT over =, <>, <, <=, >, >=, =~ (bounded regex), STARTS/ENDS WITH, CONTAINS, \
        IN [..], IS [NOT] NULL, n:Label, and EXISTS { (n)-[:calls]->() }; WITH / UNWIND \
        pipeline stages; RETURN [DISTINCT] any expression: properties (name, path, kind, \
-       exported, id, eid, signature, in_degree, out_degree, scc_size), arithmetic, string \
+       exported, id, eid, signature, in_degree, out_degree, scc_size, community), \
+       arithmetic, string \
        and list functions (toLower, toUpper, size, trim, replace, substring, split, \
        coalesce, …), CASE, and count/sum/avg/min/max/collect with implicit grouping; \
        ORDER BY / SKIP / LIMIT; UNION [ALL]. Runs under explicit work ceilings (16KiB text, \

@@ -3959,6 +3959,7 @@ dependencies = [
  "vorpal-ingest",
  "vorpal-kg",
  "vorpal-language",
+ "vorpal-query",
  "xxhash-rust",
  "zstd",
 ]

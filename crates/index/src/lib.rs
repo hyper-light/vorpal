@@ -1067,6 +1067,7 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
     if !postings::postings_are_fresh(index_dir, current) {
       postings::build_postings(&kg, index_dir, current)?;
     }
+    ensure_communities(&kg, index_dir, current)?;
     return Ok(());
   }
   build_ann(&kg, index_dir, current).map_err(|err| err as Box<dyn Error>)?;
@@ -1085,6 +1086,37 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   if !postings::postings_are_fresh(index_dir, current) {
     postings::build_postings(&kg, index_dir, current)?;
   }
+  ensure_communities(&kg, index_dir, current)?;
+  Ok(())
+}
+
+/// The community sidecar warms beside the search tiers: same stamp discipline, same
+/// absent-tolerant read (queries answer `null` for `community` until it exists).
+/// Member cap for the community dendrogram cut: `VORPAL_COMMUNITY_CAP` (default
+/// [`vorpal_kg::communities::DEFAULT_CAP`]; 0 reports the top Louvain level). A value that
+/// is not a non-negative integer is an error, never a silent default.
+fn community_cap() -> Result<u32, Box<dyn Error>> {
+  match std::env::var_os("VORPAL_COMMUNITY_CAP") {
+    None => Ok(vorpal_kg::communities::DEFAULT_CAP),
+    Some(raw) => {
+      let text = raw.to_string_lossy();
+      text.trim().parse::<u32>().map_err(|e| {
+        format!("VORPAL_COMMUNITY_CAP must be a non-negative integer (0 disables the cap), got {text:?}: {e}")
+          .into()
+      })
+    }
+  }
+}
+
+fn ensure_communities(kg: &Kg, index_dir: &Path, current: u64) -> Result<(), Box<dyn Error>> {
+  let cap = community_cap()?;
+  if vorpal_kg::communities::is_fresh(index_dir, current, cap) {
+    return Ok(());
+  }
+  vorpal_kg::phase_stamp("communities: build start");
+  let membership = vorpal_kg::communities::compute(kg, cap);
+  vorpal_kg::communities::save(index_dir, current, cap, &membership)?;
+  vorpal_kg::phase_stamp("communities: saved");
   Ok(())
 }
 
