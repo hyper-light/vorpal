@@ -750,20 +750,29 @@ pub fn resolve_all_spilled_into<'i>(
   let threads = std::thread::available_parallelism()
     .map(|n| n.get())
     .unwrap_or(1);
-  let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, Vec<Reference<'i>>)>(threads * 2);
+  // Raw record bytes travel to the workers; decode happens beside resolution on the worker
+  // threads. The feeder below is pure sequential file reads, and the calling thread does
+  // nothing but the ordered drain into the sinks — three formerly-competing roles
+  // (read+decode / drain / sink) on one thread become three threads.
+  let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, Vec<u8>)>(threads * 2);
   let (out_tx, out_rx) = crossbeam_channel::unbounded::<ChunkOut>();
 
   let mut stats = ResolveStats::default();
+  let mut feed_error: Option<std::io::Error> = None;
   {
     let sink = &mut sink;
     let unresolved_sink = &mut unresolved_sink;
     let stats = &mut stats;
-    std::thread::scope(|scope| -> std::io::Result<()> {
+    let feed_error = &mut feed_error;
+    let raw_chunks = spill.raw_chunks()?;
+    std::thread::scope(|scope| {
       for _ in 0..threads {
         let work_rx = work_rx.clone();
         let out_tx = out_tx.clone();
         scope.spawn(move || {
-          while let Ok((index, chunk)) = work_rx.recv() {
+          while let Ok((index, bytes)) = work_rx.recv() {
+            let chunk = spill.decode_chunk(&bytes);
+            drop(bytes);
             let (edges, unresolved, stats) = resolve_chunk(interner, table, &chunk, resolver);
             if out_tx.send((index, edges, unresolved, stats)).is_err() {
               break;
@@ -774,30 +783,26 @@ pub fn resolve_all_spilled_into<'i>(
       drop(work_rx);
       drop(out_tx);
 
+      // Feeder: sequential reads only. Its first IO error stops the feed and is surfaced
+      // after the scope joins (the drain below still consumes everything already sent).
+      scope.spawn(move || {
+        for (sent, bytes) in raw_chunks.enumerate() {
+          let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(err) => {
+              *feed_error = Some(err);
+              break;
+            }
+          };
+          if work_tx.send((sent, bytes)).is_err() {
+            break;
+          }
+        }
+      });
+
       type Held = (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats);
       let mut holdback: std::collections::BTreeMap<usize, Held> = std::collections::BTreeMap::new();
       let mut next_out = 0usize;
-
-      for (sent, chunk) in spill.chunks()?.enumerate() {
-        if work_tx.send((sent, chunk?)).is_err() {
-          break;
-        }
-        while let Ok((index, chunk_edges, chunk_unresolved, chunk_stats)) = out_rx.try_recv() {
-          holdback.insert(index, (chunk_edges, chunk_unresolved, chunk_stats));
-        }
-        while let Some((chunk_edges, chunk_unresolved, chunk_stats)) = holdback.remove(&next_out) {
-          for edge in &chunk_edges {
-            sink(edge);
-          }
-          for row in &chunk_unresolved {
-            unresolved_sink(row);
-          }
-          *stats += chunk_stats;
-          next_out += 1;
-        }
-      }
-      drop(work_tx);
-
       while let Ok((index, chunk_edges, chunk_unresolved, chunk_stats)) = out_rx.recv() {
         holdback.insert(index, (chunk_edges, chunk_unresolved, chunk_stats));
         while let Some((chunk_edges, chunk_unresolved, chunk_stats)) = holdback.remove(&next_out) {
@@ -811,8 +816,10 @@ pub fn resolve_all_spilled_into<'i>(
           next_out += 1;
         }
       }
-      Ok(())
-    })?;
+    });
+  }
+  if let Some(err) = feed_error {
+    return Err(err);
   }
   Ok(stats)
 }

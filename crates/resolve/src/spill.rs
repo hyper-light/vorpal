@@ -166,6 +166,27 @@ impl<'i> RefSpill<'i> {
     &self.qualified_imports
   }
 
+  /// Sequential RAW chunk reader: yields each chunk's undecoded record bytes, in write
+  /// order. Decoding is pure per-record work — callers fan it out to the threads that will
+  /// consume the references (the resolve workers), leaving the reading thread with nothing
+  /// but sequential `read_exact`s.
+  pub fn raw_chunks(&self) -> io::Result<RefSpillRawChunks> {
+    Ok(RefSpillRawChunks {
+      reader: BufReader::with_capacity(1 << 20, File::open(&self.path)?),
+      remaining: self.count,
+    })
+  }
+
+  /// Decode one raw chunk (as yielded by [`RefSpill::raw_chunks`]) against this session's
+  /// interner — byte-for-byte the records the sequential reader would have produced.
+  pub fn decode_chunk(&self, bytes: &[u8]) -> Vec<Reference<'i>> {
+    debug_assert_eq!(bytes.len() % RECORD, 0);
+    bytes
+      .chunks_exact(RECORD)
+      .map(|record| decode(self.interner, record.try_into().expect("record-sized chunk")))
+      .collect()
+  }
+
   /// Sequential chunk reader over the spilled records, in write order.
   pub fn chunks(&self) -> io::Result<RefSpillChunks<'i>> {
     Ok(RefSpillChunks {
@@ -178,6 +199,29 @@ impl<'i> RefSpill<'i> {
   /// Delete the spill file. Errors are the caller's to ignore where cleanup is best-effort.
   pub fn remove(self) -> io::Result<()> {
     std::fs::remove_file(&self.path)
+  }
+}
+
+/// Iterator of raw record-byte chunks (each `SPILL_CHUNK` records long except the last).
+pub struct RefSpillRawChunks {
+  reader: BufReader<File>,
+  remaining: u64,
+}
+
+impl Iterator for RefSpillRawChunks {
+  type Item = io::Result<Vec<u8>>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.remaining == 0 {
+      return None;
+    }
+    let take = (self.remaining as usize).min(SPILL_CHUNK);
+    let mut bytes = vec![0u8; take * RECORD];
+    if let Err(err) = self.reader.read_exact(&mut bytes) {
+      return Some(Err(err));
+    }
+    self.remaining -= take as u64;
+    Some(Ok(bytes))
   }
 }
 
