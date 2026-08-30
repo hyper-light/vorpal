@@ -272,7 +272,22 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   Remaining 251ms floor: symbol table full rebuild ~69ms, qualified seed + repair scan
   ~40ms, edge LUT remap ~31ms, Graph::compact ~33ms, names index ~20ms, extract/apply
   ~11ms, probe/glue ~30ms.
-  **Next-session design — persistent bits-keyed SymbolTable (~69→~1ms):** store name/path/
+- **Persistent symbol table + three-track seal — LANDED 2026-08-30 (same session):**
+  `RetainedSymbolTable` erases the interner brand for storage (the table holds interned IDS
+  only; rebind confined to the originating interner) and maintenance is SPLICE, not
+  rebuild-from-definers — a dirty name's run keeps unedited files' id-stable symbols and
+  swaps only the edited blocks' contributions (telemetry killed the definer-scan design:
+  145 dirty names touched 46k definer files via hub statics like s_show). Admission flips
+  are non-events (the polluted-marks table is total). The canonical seal then fans out
+  three tracks under rayon::join — segment build, in-memory name index straight off the
+  gathered name column, edge remap + compaction — critical path = longest track. Kernel
+  scoreboard, semantic edit→answer: … → 251 (evidence skip) → 185-207 (table splice) →
+  **157-170ms warm** (parallel tail). Remaining floor ≈ pre-link ~55 (extract/apply ~15,
+  repair scan ~10-15, qualified seed ~10, scope/splice ~5) + longest seal track ~50 +
+  gather 3 + probe/glue ~20. Next levers: Phase-4 file-local ids (kills the full remap +
+  renumber), retained persist (kills the canonicalizer's ~1s background CPU per edit),
+  probe↔overlay shared extraction.
+  Superseded design note (kept for the record): store name/path/
   owner as u32 bits (no interner lifetime), maintain per-name candidate lists through the
   def-postings (rebuild only names defined by edited files, in canonical file order),
   reset import bindings per link, patch surviving candidate ids via the repair map. The
