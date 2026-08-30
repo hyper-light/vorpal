@@ -446,6 +446,15 @@ impl Vamana {
 
 /// DiskANN's robust prune: repeatedly keep the closest candidate and discard candidates it
 /// α-dominates, bounding degree at `r` while preserving reach in all directions.
+///
+/// Lazily memoized (the DiskANN-Rust `prune.rs` structure): instead of the eager form —
+/// each selected neighbor rescanning every remaining candidate — each candidate, taken in
+/// (distance, id) order, checks the already-selected list from where it last stopped and
+/// halts at its FIRST occluder. A candidate is selected iff no earlier-selected neighbor
+/// α-dominates it, which is exactly the eager loop's condition, in the same order — the
+/// selected set is bit-identical (pinned by the unchanged ann.bin sha) — but a rejected
+/// candidate now costs ~1 pairwise distance instead of being rescanned by every later
+/// selection.
 fn robust_prune(
   matrix: &QuantMatrix,
   p: u32,
@@ -460,47 +469,33 @@ fn robust_prune(
       .unwrap_or(std::cmp::Ordering::Equal)
   });
   candidates.dedup_by_key(|c| c.0);
-  // The α-domination loop re-scores survivors per kept neighbor — quadratic in pool size.
   // The farthest tail of a big visited pool never survives domination anyway; capping at
   // the search beam width (DiskANN prunes from an L-bounded pool) bounds the cost without
   // changing what the loop would have kept in practice.
   candidates.truncate(pool_cap);
-  // α-domination without the O(r·n) element-shifting that `Vec::retain` incurred every round:
-  // dominated candidates are marked in a side mask and skipped, instead of compacting the
-  // vector each iteration. Bit-identical to the retain form — `candidates` stays sorted, so the
-  // next `closest` is the first unmasked entry and both survivors and their order match exactly
-  // — with the per-round memmove eliminated (the build's hottest non-search cost).
-  let mut removed = vec![false; candidates.len()];
-  let mut result: Vec<u32> = Vec::new();
-  let mut scan = 0usize;
-  loop {
-    while scan < candidates.len() && removed[scan] {
-      scan += 1;
+  let mut result: Vec<u32> = Vec::with_capacity(r.min(candidates.len()));
+  let mut prune_evals = 0u64;
+  'candidates: for &(v, dist_p) in &candidates {
+    // Check against selected neighbors in selection order; first occluder rejects. The
+    // eager form removed `v` the moment its first occluder was SELECTED — same pairs, same
+    // outcome, no rescans. (`result` only grows, so no memo index is even needed: every
+    // candidate is visited once and scans the selected prefix exactly once.)
+    for &s_id in &result {
+      if v == s_id {
+        continue 'candidates;
+      }
+      prune_evals += 1;
+      if alpha * matrix.dist_sq(s_id, v) <= dist_p {
+        continue 'candidates;
+      }
     }
-    if scan == candidates.len() {
-      break;
-    }
-    let closest = candidates[scan].0;
-    result.push(closest);
+    result.push(v);
     if result.len() >= r {
       break;
     }
-    removed[scan] = true;
-    let mut prune_evals = 0u64;
-    for i in (scan + 1)..candidates.len() {
-      if removed[i] {
-        continue;
-      }
-      let (v, dist_p) = candidates[i];
-      prune_evals += 1;
-      // `retain` KEPT iff (v != closest && α·dist_sq(closest,v) > dist_p); remove the complement.
-      if !(v != closest && alpha * matrix.dist_sq(closest, v) > dist_p) {
-        removed[i] = true;
-      }
-    }
-    if counters_enabled() && prune_evals > 0 {
-      BUILD_DIST_EVALS.fetch_add(prune_evals, std::sync::atomic::Ordering::Relaxed);
-    }
+  }
+  if counters_enabled() && prune_evals > 0 {
+    BUILD_DIST_EVALS.fetch_add(prune_evals, std::sync::atomic::Ordering::Relaxed);
   }
   let _ = p;
   result
