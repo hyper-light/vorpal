@@ -258,6 +258,29 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   Remaining serve-path spend (~500ms kernel): masked table + full resolution (181ms) +
   canonical seal gather; next levers are scoped (dirty-bucket) resolution and a
   parallel/zero-copy seal gather.
+- **Scoped rederive — LANDED 2026-08-30** (same day, three follow-on commits): per-file
+  resolution buckets (edges in emission order + evidence + stats, writer-id space); applies
+  diff definition rows by durable eid (name/kind/exported/owner-eid) into a pending-scope
+  lattice (Clean ⊑ Scoped ⊑ Full; import wiring → Full); link expands dirty names through
+  reference postings, re-resolves only those buckets, and heals every untouched bucket in
+  place by chasing dead edge/evidence targets through the eid repair map — an unrepairable
+  target outside the dirty set recomputes in full, loudly. Serve-path link also stopped
+  materializing the evidence sidecar (~7M discarded clones, ~100ms). Kernel scoreboard,
+  semantic edit→answer: 1074 (session start) → 965 (deferred persist) → 497 (overlay v1)
+  → 401 (coalesced feed + parallel gathers) → 342 (scoped rederive: "1 dirty file" for a
+  local edit) → **251ms median**. Steady 0.02–0.06ms; touch/comment ~8–15ms.
+  Remaining 251ms floor: symbol table full rebuild ~69ms, qualified seed + repair scan
+  ~40ms, edge LUT remap ~31ms, Graph::compact ~33ms, names index ~20ms, extract/apply
+  ~11ms, probe/glue ~30ms.
+  **Next-session design — persistent bits-keyed SymbolTable (~69→~1ms):** store name/path/
+  owner as u32 bits (no interner lifetime), maintain per-name candidate lists through the
+  def-postings (rebuild only names defined by edited files, in canonical file order),
+  reset import bindings per link, patch surviving candidate ids via the repair map. The
+  catch to gate carefully: DenseRanges' flat candidate layout is deliberate (cache-dense
+  full-link resolution); per-name indirection must NOT regress the cold/full path —
+  resolve-eval + full-link A/B before adopting. Backlog: parallel edge remap (~15ms),
+  probe↔overlay double extraction (~10ms), retained persist to retire the canonicalizer's
+  ~1s background CPU per edit, def-postings for repair-scan narrowing.
 
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
