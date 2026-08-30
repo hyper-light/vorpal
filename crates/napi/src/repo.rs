@@ -395,6 +395,7 @@ impl Index {
       kind: options.kind,
       lang: options.lang,
       exported_only: options.exported.unwrap_or(false),
+      exclude_tests: options.exclude_tests.unwrap_or(false),
     };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
@@ -423,4 +424,6 @@ pub struct SearchOptions {
   pub lang: Option<String>,
   /// Only exported definitions.
   pub exported: Option<bool>,
+  /// Exclude definitions in test files from results.
+  pub exclude_tests: Option<bool>,
 }
