@@ -1179,11 +1179,13 @@ pub(crate) fn builtin_specs_for_test() -> Vec<(String, RefSpecData)> {
 /// resolve exactly once against the same grammars.
 static RESOLVED_TYPEFACTS: LazyLock<HashMap<SgLang, crate::typefacts::ResolvedTypeFacts>> =
   LazyLock::new(|| {
-    use SupportLang as L;
-    [L::Rust, L::Python, L::TypeScript, L::Tsx]
-      .into_iter()
+    // `type_spec` is the single authority on which languages capture — enumerating every
+    // enabled builtin here means a new capture table can never be silently dropped by a
+    // stale second list (the RESOLVED_SPECS hazard, relearned once with Go/Java).
+    SupportLang::all_langs()
+      .iter()
       .filter(|lang| lang.is_enabled())
-      .map(SgLang::from)
+      .map(|lang| SgLang::from(*lang))
       .filter_map(|lang| {
         let spec = crate::typefacts::type_spec(lang)?;
         Some((lang, crate::typefacts::ResolvedTypeFacts::build(lang, spec)))

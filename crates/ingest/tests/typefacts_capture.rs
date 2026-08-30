@@ -173,3 +173,94 @@ fn v14_round_trips_the_new_fields_bit_exactly() {
     }
   }
 }
+
+#[test]
+fn go_receiver_typing_from_params_vars_and_composites() {
+  let src = r#"package m
+
+func run(w Widget, n int) {
+	w.Render()
+	var v Widget
+	v.Draw()
+	x := Widget{}
+	x.Paint()
+	p := &Widget{}
+	p.Fill()
+}
+"#;
+  let p = product("t.go", src);
+  let by_receiver = |recv: &str| {
+    p.refs
+      .iter()
+      .find(|r| r.receiver.as_deref() == Some(recv))
+      .unwrap_or_else(|| panic!("{recv} call extracted"))
+  };
+  let w = by_receiver("w");
+  assert_eq!(w.receiver_type.as_deref(), Some("Widget"), "{w:?}");
+  assert_eq!(w.receiver_type_origin, 2, "param-typed");
+  let v = by_receiver("v");
+  assert_eq!(v.receiver_type.as_deref(), Some("Widget"));
+  assert_eq!(v.receiver_type_origin, 0, "var annotation");
+  let x = by_receiver("x");
+  assert_eq!(x.receiver_type.as_deref(), Some("Widget"), "{x:?}");
+  assert_eq!(x.receiver_type_origin, 1, "composite literal is constructor-shaped");
+  let ptr = by_receiver("p");
+  assert_eq!(ptr.receiver_type.as_deref(), Some("Widget"), "&Widget{{}} unwraps: {ptr:?}");
+}
+
+#[test]
+fn java_receiver_typing_from_declarations_params_fields_and_var() {
+  let src = r#"class Painter {
+  Widget canvas;
+
+  void run(Widget p) {
+    Widget x = make();
+    x.render();
+    p.render();
+    canvas.render();
+    var y = new Widget();
+    y.render();
+    List<Widget> zs = mk();
+    zs.iterate();
+  }
+}
+"#;
+  let p = product("T.java", src);
+  let by_receiver = |recv: &str| {
+    p.refs
+      .iter()
+      .find(|r| r.receiver.as_deref() == Some(recv))
+      .unwrap_or_else(|| panic!("{recv} call extracted"))
+  };
+  let x = by_receiver("x");
+  assert_eq!(x.receiver_type.as_deref(), Some("Widget"));
+  assert_eq!(x.receiver_type_origin, 0, "declared type");
+  let par = by_receiver("p");
+  assert_eq!(par.receiver_type.as_deref(), Some("Widget"));
+  assert_eq!(par.receiver_type_origin, 2, "formal parameter");
+  let field = by_receiver("canvas");
+  assert_eq!(field.receiver_type.as_deref(), Some("Widget"));
+  assert_eq!(field.receiver_type_origin, 3, "field declaration");
+  let var = by_receiver("y");
+  assert_eq!(var.receiver_type.as_deref(), Some("Widget"), "{var:?}");
+  assert_eq!(var.receiver_type_origin, 1, "var + new Widget() is constructor-shaped");
+  let generic = by_receiver("zs");
+  assert_eq!(generic.receiver_type.as_deref(), Some("List"), "generics strip: {generic:?}");
+}
+
+#[test]
+fn rust_reference_params_strip_to_the_owner_name() {
+  // `&Widget` / `&mut Widget` annotations must meet the owner comparison — the sigils are
+  // stripped at capture (v3), which is what lets `fn f(w: &Widget)` type `w.draw()`.
+  let src = "struct Widget;\nfn f(a: &Widget, b: &mut Widget, c: Box<Widget>) {\n    a.draw();\n    b.draw();\n    c.draw();\n}\n";
+  let p = product("t.rs", src);
+  let by_receiver = |recv: &str| {
+    p.refs
+      .iter()
+      .find(|r| r.receiver.as_deref() == Some(recv))
+      .unwrap_or_else(|| panic!("{recv} call extracted"))
+  };
+  assert_eq!(by_receiver("a").receiver_type.as_deref(), Some("Widget"));
+  assert_eq!(by_receiver("b").receiver_type.as_deref(), Some("Widget"));
+  assert_eq!(by_receiver("c").receiver_type.as_deref(), Some("Box"), "wrapper name, not the parameter");
+}

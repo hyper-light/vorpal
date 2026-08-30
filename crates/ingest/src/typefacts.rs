@@ -10,7 +10,7 @@
 //! judgment (G-M2), made against real candidates. Disagreeing bindings for one name poison it
 //! to "no type": conservative by design.
 //!
-//! Launch languages: Rust, Python, TypeScript, TSX. `TYPEFACTS_VERSION` folds into the
+//! Capture languages: Rust, Python, TypeScript, TSX, Go, Java. `TYPEFACTS_VERSION` folds into the
 //! extraction identity, so ANY change to these tables re-keys products without a format bump.
 
 use std::borrow::Cow;
@@ -21,7 +21,7 @@ use vorpal_language::SupportLang;
 
 /// Bump on ANY semantic change to the capture tables below — it folds into the extraction
 /// identity, so stale products can never replay into a build with different capture rules.
-pub const TYPEFACTS_VERSION: u64 = 2;
+pub const TYPEFACTS_VERSION: u64 = 3;
 
 /// Where a binding's type knowledge came from — persisted with the product, mapped onto the
 /// receiver-typed `ResolveReason`s in G-M2. Discriminants are the persisted tags.
@@ -83,6 +83,9 @@ pub(crate) struct BindSpec {
 pub(crate) enum BindMode {
   Single,
   PyParamList,
+  /// Java-shaped declarations: the TYPE lives on the declaration node (`type` field), the
+  /// names live on its `variable_declarator` children — one binding per declarator.
+  JavaDeclaratorList,
 }
 
 pub(crate) struct TypeSpec {
@@ -180,6 +183,74 @@ const TS_TF: TypeSpec = TypeSpec {
   ],
 };
 
+const GO_TF: TypeSpec = TypeSpec {
+  binds: &[
+    BindSpec {
+      kind: "var_spec",
+      origin: BindOrigin::Annotated,
+      name_field: "name",
+      type_field: Some("type"),
+      value_field: Some("value"),
+      mode: BindMode::Single,
+    },
+    // `x := Foo{...}` — no annotation exists; the type comes from constructor-shape
+    // recovery on the right (the expression_list unwrap in `constructor_name`).
+    BindSpec {
+      kind: "short_var_declaration",
+      origin: BindOrigin::Annotated,
+      name_field: "left",
+      type_field: None,
+      value_field: Some("right"),
+      mode: BindMode::Single,
+    },
+    BindSpec {
+      kind: "parameter_declaration",
+      origin: BindOrigin::Param,
+      name_field: "name",
+      type_field: Some("type"),
+      value_field: None,
+      mode: BindMode::Single,
+    },
+    BindSpec {
+      kind: "field_declaration",
+      origin: BindOrigin::Field,
+      name_field: "name",
+      type_field: Some("type"),
+      value_field: None,
+      mode: BindMode::Single,
+    },
+  ],
+};
+
+const JAVA_TF: TypeSpec = TypeSpec {
+  binds: &[
+    BindSpec {
+      kind: "local_variable_declaration",
+      origin: BindOrigin::Annotated,
+      name_field: "",
+      type_field: Some("type"),
+      value_field: None,
+      mode: BindMode::JavaDeclaratorList,
+    },
+    BindSpec {
+      kind: "formal_parameter",
+      origin: BindOrigin::Param,
+      name_field: "name",
+      type_field: Some("type"),
+      value_field: None,
+      mode: BindMode::Single,
+    },
+    BindSpec {
+      kind: "field_declaration",
+      origin: BindOrigin::Field,
+      name_field: "",
+      type_field: Some("type"),
+      value_field: None,
+      mode: BindMode::JavaDeclaratorList,
+    },
+  ],
+};
+
 /// The capture tables for a language, if it has any (launch set: Rust, Python, TS, TSX).
 pub(crate) fn type_spec(lang: SgLang) -> Option<&'static TypeSpec> {
   let SgLang::Builtin(lang) = lang else {
@@ -189,6 +260,8 @@ pub(crate) fn type_spec(lang: SgLang) -> Option<&'static TypeSpec> {
     SupportLang::Rust => Some(&RUST_TF),
     SupportLang::Python => Some(&PYTHON_TF),
     SupportLang::TypeScript | SupportLang::Tsx => Some(&TS_TF),
+    SupportLang::Go => Some(&GO_TF),
+    SupportLang::Java => Some(&JAVA_TF),
     _ => None,
   }
 }
@@ -246,6 +319,9 @@ pub(crate) fn capture_at<'t>(
   if bind.mode == BindMode::PyParamList {
     return capture_py_params(node, out);
   }
+  if bind.mode == BindMode::JavaDeclaratorList {
+    return capture_java_declarators(bind, node, out);
+  }
   // Name: the declared field, else the first named child (fieldless grammars).
   let name_node = if bind.name_field.is_empty() {
     node.children().find(|c| c.is_named())
@@ -301,9 +377,27 @@ fn is_simple_name(text: &str) -> bool {
       .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
-/// Annotation text, cleaned: leading `:` and whitespace stripped, capped at 64 bytes.
+/// Annotation text, cleaned to the ownable simple name the resolver's owner comparison can
+/// meet: leading `:`/whitespace, reference sigils (`&`, `*`) and `mut `/`const ` stripped,
+/// one trailing generic argument list removed (`Wrapper<T>` → `Wrapper` — a method's owner
+/// can never encode the parameter, so nothing is lost). Capped at 64 bytes.
 fn clean_type_text(text: Cow<'_, str>) -> Option<Cow<'_, str>> {
-  let trimmed = text.trim().trim_start_matches(':').trim();
+  let mut trimmed = text.trim().trim_start_matches(':').trim();
+  loop {
+    let before = trimmed;
+    trimmed = trimmed
+      .trim_start_matches(['&', '*'])
+      .trim_start()
+      .trim_start_matches("mut ")
+      .trim_start_matches("const ")
+      .trim_start();
+    if trimmed == before {
+      break;
+    }
+  }
+  if let (Some(open), true) = (trimmed.find('<'), trimmed.ends_with('>')) {
+    trimmed = trimmed[..open].trim_end();
+  }
   if trimmed.is_empty() || trimmed.len() > 64 {
     return None;
   }
@@ -311,15 +405,33 @@ fn clean_type_text(text: Cow<'_, str>) -> Option<Cow<'_, str>> {
 }
 
 /// The constructor's simple name for constructor-shaped initializers:
-/// `T::new(...)` → `T`; `new T(...)` → `T`; `T(...)` → `T`; `T { .. }` (Rust) → `T`.
-/// Everything else is not constructor-shaped.
+/// `T::new(...)` → `T`; `new T(...)` → `T` (TS and Java); `T(...)` → `T`; `T { .. }` (Rust
+/// struct expressions and Go composite literals) → `T`. Wrapper nodes (Go expression
+/// lists, `&T{...}` unaries) unwrap one step, bounded — everything else is not
+/// constructor-shaped.
 fn constructor_name<'t>(value: &crate::references::SgNodeAlias<'t>) -> Option<Cow<'t, str>> {
+  constructor_name_at(value, 0)
+}
+
+fn constructor_name_at<'t>(
+  value: &crate::references::SgNodeAlias<'t>,
+  depth: u8,
+) -> Option<Cow<'t, str>> {
+  if depth > 3 {
+    return None;
+  }
   let kind_cow = value.kind();
   match kind_cow.as_ref() {
     "struct_expression" => value.field("name").map(|n| n.text()),
     "new_expression" => value
       .field("constructor")
       .map(|n| n.text())
+      .filter(|t| is_simple_name(t)),
+    // Java: `new Foo(...)` / `new ArrayList<T>(...)` — the generic suffix is dropped (an
+    // owner name can never carry it).
+    "object_creation_expression" | "composite_literal" => value
+      .field("type")
+      .and_then(|t| clean_type_text(t.text()))
       .filter(|t| is_simple_name(t)),
     "call_expression" | "call" => {
       let callee = value.field("function")?;
@@ -329,6 +441,15 @@ fn constructor_name<'t>(value: &crate::references::SgNodeAlias<'t>) -> Option<Co
         return is_simple_name(simple).then(|| Cow::Owned(simple.to_string()));
       }
       is_simple_name(&text).then_some(text)
+    }
+    // Go `x := Foo{...}` wraps both sides in expression_lists; `&Foo{...}` in a unary.
+    "expression_list" => {
+      let first = value.children().find(|c| c.is_named())?;
+      constructor_name_at(&first, depth + 1)
+    }
+    "unary_expression" => {
+      let operand = value.field("operand")?;
+      constructor_name_at(&operand, depth + 1)
     }
     _ => None,
   }
@@ -374,6 +495,49 @@ fn capture_py_params<'t>(
       ty,
       origin: BindOrigin::Param,
       start,
+    });
+  }
+}
+
+/// Java-shaped declarations: one binding per `variable_declarator` child, all sharing the
+/// declaration's `type`. Java 10 `var` carries no type of its own — those recover the
+/// constructor's name from the declarator's value instead (`var x = new Foo()` → `Foo`).
+fn capture_java_declarators<'t>(
+  bind: &'static BindSpec,
+  node: &crate::references::SgNodeAlias<'t>,
+  out: &mut Vec<RawBinding<'t>>,
+) {
+  let declared = bind
+    .type_field
+    .and_then(|f| node.field(f))
+    .and_then(|t| clean_type_text(t.text()))
+    .filter(|t| t.as_ref() != "var");
+  for child in node.children() {
+    if !child.is_named() || child.kind().as_ref() != "variable_declarator" {
+      continue;
+    }
+    let Some(name_node) = child.field("name") else {
+      continue;
+    };
+    let name = name_node.text();
+    if name.is_empty() || name.len() > 64 || !is_simple_name(&name) {
+      continue;
+    }
+    let (ty, origin) = match &declared {
+      Some(ty) => (Some(ty.clone()), bind.origin),
+      None => (
+        child.field("value").as_ref().and_then(constructor_name),
+        BindOrigin::Constructed,
+      ),
+    };
+    if ty.is_none() && bind.origin != BindOrigin::Param {
+      continue;
+    }
+    out.push(RawBinding {
+      name,
+      ty,
+      origin,
+      start: child.range().start as u32,
     });
   }
 }

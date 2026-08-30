@@ -538,3 +538,82 @@ fn typed_receivers_typescript_and_same_type_tie() {
     absent: &[],
   });
 }
+
+#[test]
+fn typed_receivers_go_all_origins() {
+  // G-M5: Go joins the capture set — annotations (`var v Widget`), composite literals
+  // (`x := Gadget{}`) and typed parameters are captured into products (pinned by the
+  // typefacts_capture suite). The RESOLVER upgrade is blocked on Go method OWNERSHIP:
+  // `func (w Widget) Render()` is a top-level item in the outline (not a member of
+  // Widget — Go methods aren't syntactically inside their type, and parentRuleIds
+  // attaches by enclosure), so owner==receiver_type has no owner to meet and the
+  // same-named tie refuses, exactly as before. Labels below pin TODAY's truth; the
+  // calls land when Go method ownership does (follow-up work item).
+  run(&Fixture {
+    lang: "go-typed",
+    files: &[
+      (
+        "gw.go",
+        "package m\n\ntype Widget struct{}\n\nfunc (w Widget) Render() int { return 1 }\n\n\
+         type Gadget struct{}\n\nfunc (g Gadget) Render() int { return 2 }\n",
+      ),
+      (
+        "guse.go",
+        "package m\n\nfunc gAnnotated() int {\n\tvar v Widget\n\treturn v.Render()\n}\n\n\
+         func gComposite() int {\n\tx := Gadget{}\n\treturn x.Render()\n}\n\n\
+         func gParam(p Widget) int {\n\treturn p.Render()\n}\n",
+      ),
+    ],
+    expected: &[
+      // Type mentions resolve (annotation, composite literal, parameter, receivers).
+      ("gAnnotated", "Widget", "of_type", "constrained", "visible-export"),
+      ("gComposite", "Gadget", "of_type", "constrained", "visible-export"),
+      ("gParam", "Widget", "of_type", "constrained", "visible-export"),
+      ("Render", "Widget", "of_type", "exact", "same-file"),
+      ("Render", "Gadget", "of_type", "exact", "same-file"),
+    ],
+    absent: &[
+      // Two same-named methods, no ownership to narrow by → the tie refuses (conservative;
+      // see the header comment). These flip to expected edges with Go method ownership.
+      ("gAnnotated", "Render"),
+      ("gComposite", "Render"),
+      ("gParam", "Render"),
+    ],
+  });
+}
+
+#[test]
+fn typed_receivers_java_all_origins() {
+  // G-M5: Java joins the capture set — declared locals, fields, formal parameters, and
+  // `var` + constructor recovery all narrow; generic heads strip to the owner name.
+  run(&Fixture {
+    lang: "java-typed",
+    files: &[
+      (
+        "Jw.java",
+        "class Widget {\n  int render() { return 1; }\n}\n\
+         class Gadget {\n  int render() { return 2; }\n}\n",
+      ),
+      (
+        "Juse.java",
+        "class Runner {\n  Widget canvas;\n\n\
+         \x20 int jAnnotated() {\n    Widget x = make();\n    return x.render();\n  }\n\n\
+         \x20 int jVar() {\n    var y = new Widget();\n    return y.render();\n  }\n\n\
+         \x20 int jParam(Gadget p) {\n    return p.render();\n  }\n\n\
+         \x20 int jField() {\n    return canvas.render();\n  }\n}\n",
+      ),
+    ],
+    expected: &[
+      ("jAnnotated", "render", "calls", "constrained", "receiver-annotated"),
+      ("jVar", "render", "calls", "constrained", "receiver-constructed"),
+      ("jParam", "render", "calls", "constrained", "receiver-param-typed"),
+      ("jField", "render", "calls", "constrained", "receiver-field-typed"),
+      // Exhaustive-labelling contract: the declarations' type mentions.
+      ("canvas", "Widget", "of_type", "constrained", "visible-export"),
+      ("jAnnotated", "Widget", "of_type", "constrained", "visible-export"),
+      ("jVar", "Widget", "of_type", "constrained", "visible-export"),
+      ("jParam", "Gadget", "of_type", "constrained", "visible-export"),
+    ],
+    absent: &[],
+  });
+}
