@@ -18,12 +18,14 @@ mod pack;
 mod pipeline;
 mod product;
 mod references;
+mod retained;
 mod selfcheck;
 
 pub use manifest::{FileStat, Manifest};
 pub use outline_extractor::OutlineExtractor;
 pub use selfcheck::{verify_default_extraction, verify_extraction};
 pub use pack::{PackMsg, PackReader, PackWriter};
+pub use retained::RetainedIndex;
 pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,
   StreamWork, apply_products_sharded, link_writer, link_writer_spilled, release_freed_pages,

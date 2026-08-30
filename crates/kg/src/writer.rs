@@ -546,10 +546,16 @@ impl KgWriter {
   /// containment (gathered per block, both endpoints alive by construction); edges at or
   /// after it are this link's resolution edges (remapped through the same id LUT). The
   /// tombstoned rows left behind by retract-and-append edits are simply never gathered.
-  pub fn seal_canonical(mut self, blocks: &[FileBlock], resolution_edges_from: usize) -> Kg {
+  /// Also returns the old→new id LUT (dead rows hold `u32::MAX`): a retained caller remaps
+  /// its evidence rows through the same permutation the edges took, so sidecar ids and
+  /// sealed ids can never disagree. Borrows the writer — a retained daemon seals a snapshot
+  /// per link and keeps ingesting into the same writer afterward.
+  pub fn seal_canonical(
+    &self,
+    blocks: &[FileBlock],
+    resolution_edges_from: usize,
+  ) -> (Kg, Vec<u32>) {
     crate::phase_stamp("seal-canonical: gather");
-    self.canonical.seal();
-    drop(std::mem::take(&mut self.canonical));
 
     let total_rows: usize = blocks.iter().map(|b| b.rows.len()).sum();
     // Old→new id LUT; dead rows keep u32::MAX and must never appear in a surviving edge.
@@ -606,21 +612,6 @@ impl KgWriter {
     let flags = gather(&self.flags, blocks, total_rows);
     let span_start = gather(&self.span_start, blocks, total_rows);
     let span_end = gather(&self.span_end, blocks, total_rows);
-    drop(std::mem::take(&mut self.kind));
-    drop(std::mem::take(&mut self.name_off));
-    drop(std::mem::take(&mut self.name_len));
-    drop(std::mem::take(&mut self.path_off));
-    drop(std::mem::take(&mut self.path_len));
-    drop(std::mem::take(&mut self.sig_off));
-    drop(std::mem::take(&mut self.sig_len));
-    drop(std::mem::take(&mut self.content_hash));
-    drop(std::mem::take(&mut self.eid_lo));
-    drop(std::mem::take(&mut self.eid_hi));
-    drop(std::mem::take(&mut self.flags));
-    drop(std::mem::take(&mut self.span_start));
-    drop(std::mem::take(&mut self.span_end));
-    let heap = std::mem::take(&mut self.heap);
-    drop(heap);
 
     let n = total_rows as u32;
     let nodes = {
@@ -666,16 +657,15 @@ impl KgWriter {
         new_edges.push(s, d, etype);
       }
     }
-    drop(std::mem::take(&mut self.edges));
-
     crate::phase_stamp("seal-canonical: compact");
     let graph = Graph::compact(n, &new_edges);
     drop(new_edges);
 
     let mut directory = SegmentDirectory::new();
     directory.insert(0, n as u64, 0);
-    Kg::new(nodes, new_heap, graph, directory)
-      .expect("sealed segment carries every column the builder just wrote")
+    let kg = Kg::new(nodes, new_heap, graph, directory)
+      .expect("sealed segment carries every column the builder just wrote");
+    (kg, lut)
   }
 }
 

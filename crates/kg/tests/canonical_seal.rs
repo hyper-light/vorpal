@@ -123,7 +123,7 @@ fn tombstone_and_append_seals_byte_identical_to_scratch() {
   );
   // Canonical order: path-sorted alive blocks (x.py, y.py→new block, z.py).
   let blocks = [bx.clone(), by_new.clone(), bz.clone()];
-  let live = retained.seal_canonical(&blocks, resolution_from);
+  let (live, _lut) = retained.seal_canonical(&blocks, resolution_from);
 
   // Scratch writer over the same live set, same logical resolution edge.
   let mut scratch = KgWriter::new();
@@ -167,7 +167,7 @@ fn seal_canonical_of_untouched_writer_matches_plain_seal() {
     ingest(&mut a, "z.py", &z_items()),
   ];
   let watermark = a.edges_len();
-  let live = a.seal_canonical(&ba, watermark);
+  let (live, _lut) = a.seal_canonical(&ba, watermark);
 
   let mut b = KgWriter::new();
   ingest(&mut b, "x.py", &x_items());

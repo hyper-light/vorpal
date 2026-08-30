@@ -760,11 +760,12 @@ pub fn resolve_all_store_into<'i>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   store: &mut crate::RefStore,
+  order: impl IntoIterator<Item = u32>,
   resolver: &Resolver,
   sink: impl FnMut(&ResolvedEdge),
   unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
-  let raw_chunks = store.raw_chunks()?;
+  let raw_chunks = store.raw_chunks(order)?;
   let store = &*store;
   resolve_chunks_into(
     interner,

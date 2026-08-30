@@ -522,9 +522,20 @@ fn build_symbol_table<'i>(
   interner: &'i vorpal_resolve::Interner,
   writer: &KgWriter,
 ) -> SymbolTable<'i> {
-  // Derive each member's owner row from the containment edges (`Kg` for `Kg.load`) — the
-  // target side of qualified-reference matching. Containment from a File node is not
-  // ownership: top-level items match by module file instead. One cheap serial pass.
+  build_symbol_table_over(interner, writer, std::slice::from_ref(&(0..writer.node_count())))
+}
+
+/// [`build_symbol_table`] over an explicit, ordered list of alive row ranges — the retained
+/// (tombstone-and-append) writer's table build. Insertion order is the ranges' order, so a
+/// caller passing canonical (path-sorted) blocks reproduces exactly the candidate order a
+/// from-scratch build inserts; dead rows are simply never visited. The owner pass still
+/// walks the full containment log: containment never crosses files, so a dead edge only
+/// writes an owner for a dead row, which no range visits.
+pub(crate) fn build_symbol_table_over<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  writer: &KgWriter,
+  ranges: &[std::ops::Range<usize>],
+) -> SymbolTable<'i> {
   let node_count = writer.node_count();
   let mut owner_of: Vec<Option<u32>> = vec![None; node_count];
   for (src, dst, etype) in writer.edge_log().iter() {
@@ -542,9 +553,9 @@ fn build_symbol_table<'i>(
   // §7.5 sharded table build: contiguous row ranges each fill a private table on their own
   // thread, absorbed in row order — candidate lists end up in the exact order the serial
   // insertion produced (pinned by test). Small graphs build serially.
-  let insert_range = |range: std::ops::Range<usize>| {
+  let insert_ranges = |ranges: &[std::ops::Range<usize>]| {
     let mut table = SymbolTable::new();
-    table.reserve(range.len());
+    table.reserve(ranges.iter().map(std::ops::Range::len).sum());
     // Rows are contiguous per file and members are contiguous per owner, so both the path
     // intern and the owner peek repeat their previous answer almost every row. Memoize on the
     // heap slice identity (writer paths intern once per file into the heap, so equal paths ARE
@@ -553,7 +564,7 @@ fn build_symbol_table<'i>(
     // memo returns byte-identical ids and the table layout is unchanged.
     let mut last_path: Option<(*const u8, usize, vorpal_resolve::NameId<'i>)> = None;
     let mut last_owner: Option<(u32, Option<vorpal_resolve::NameId<'i>>)> = None;
-    for row in range {
+    for row in ranges.iter().flat_map(Clone::clone) {
       let (id, name, path, kind, exported) = writer.definition(row).expect("row < node_count");
       if kind == SymbolKind::File {
         // File nodes are the targets of path-form imports (`import "./util"`).
@@ -603,19 +614,41 @@ fn build_symbol_table<'i>(
     table
   };
 
-  if node_count <= MIN_DEFS_PER_SHARD {
-    let mut table = insert_range(0..node_count);
+  let total: usize = ranges.iter().map(std::ops::Range::len).sum();
+  if total <= MIN_DEFS_PER_SHARD {
+    let mut table = insert_ranges(ranges);
     table.finalize();
     return table;
   }
   use rayon::prelude::*;
   vorpal_kg::phase_stamp("table: owner pass done");
   let threads = rayon::current_num_threads().max(1);
-  let shard_size = node_count.div_ceil(threads * 2).max(MIN_DEFS_PER_SHARD);
-  let starts: Vec<usize> = (0..node_count).step_by(shard_size).collect();
-  let shards: Vec<SymbolTable> = starts
+  let shard_size = total.div_ceil(threads * 2).max(MIN_DEFS_PER_SHARD);
+  // Pack the ordered ranges into contiguous groups of ~shard_size rows (splitting a large
+  // range across groups); groups absorb in order, so the merged table's insertion order is
+  // identical to the serial pass over the same ranges.
+  let mut groups: Vec<Vec<std::ops::Range<usize>>> = Vec::new();
+  let mut current: Vec<std::ops::Range<usize>> = Vec::new();
+  let mut current_rows = 0usize;
+  for range in ranges {
+    let mut rest = range.clone();
+    while !rest.is_empty() {
+      let take = (shard_size - current_rows).min(rest.len());
+      current.push(rest.start..rest.start + take);
+      rest.start += take;
+      current_rows += take;
+      if current_rows == shard_size {
+        groups.push(std::mem::take(&mut current));
+        current_rows = 0;
+      }
+    }
+  }
+  if !current.is_empty() {
+    groups.push(current);
+  }
+  let shards: Vec<SymbolTable> = groups
     .par_iter()
-    .map(|&start| insert_range(start..(start + shard_size).min(node_count)))
+    .map(|group| insert_ranges(group))
     .collect();
   vorpal_kg::phase_stamp("table: shards built");
   let table = SymbolTable::from_shards(shards);

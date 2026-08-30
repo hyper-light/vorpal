@@ -108,14 +108,20 @@ impl RefStore {
     self.dead as f64 / self.total as f64
   }
 
-  /// The alive qualifier-carrying imports, decoded against `interner`, in record order —
-  /// the import-binding pre-pass input, byte-equivalent to what a fresh spill of the same
-  /// live set would have retained.
-  pub fn qualified_imports<'i>(&self, interner: &'i Interner) -> Vec<Reference<'i>> {
-    let mut ranges: Vec<&FileRefs> = self.files.values().collect();
-    ranges.sort_unstable_by_key(|f| f.records.start);
+  /// The alive qualifier-carrying imports, decoded against `interner`, **in the caller's
+  /// file order** — resolution downstream is order-sensitive in its *emissions* (edge-log
+  /// and adjacency order), so the retained feed must follow the same canonical (path-sorted)
+  /// file order a from-scratch build processes. Files absent from the store are skipped.
+  pub fn qualified_imports<'i>(
+    &self,
+    interner: &'i Interner,
+    order: impl IntoIterator<Item = u32>,
+  ) -> Vec<Reference<'i>> {
     let mut out = Vec::new();
-    for file in ranges {
+    for path_bits in order {
+      let Some(file) = self.files.get(&path_bits) else {
+        continue;
+      };
       for record in file.qualified.chunks_exact(RECORD) {
         out.push(decode_record(
           interner,
@@ -126,13 +132,19 @@ impl RefStore {
     out
   }
 
-  /// Raw chunk reader over the ALIVE ranges only, in record order. Chunks never span two
+  /// Raw chunk reader over the ALIVE ranges only, **in the caller's file order** (see
+  /// [`RefStore::qualified_imports`] for why order is the caller's). Chunks never span two
   /// ranges; each holds at most [`SPILL_CHUNK`] records. The writer is flushed first so the
   /// reader sees every appended record.
-  pub fn raw_chunks(&mut self) -> io::Result<StoreRawChunks> {
+  pub fn raw_chunks(
+    &mut self,
+    order: impl IntoIterator<Item = u32>,
+  ) -> io::Result<StoreRawChunks> {
     self.out.flush()?;
-    let mut ranges: Vec<Range<u64>> = self.files.values().map(|f| f.records.clone()).collect();
-    ranges.sort_unstable_by_key(|r| r.start);
+    let ranges: Vec<Range<u64>> = order
+      .into_iter()
+      .filter_map(|bits| self.files.get(&bits).map(|f| f.records.clone()))
+      .collect();
     Ok(StoreRawChunks {
       file: File::open(&self.path)?,
       ranges,
@@ -210,10 +222,10 @@ mod tests {
     Reference::new(itn(), NodeId::new(from), path, name, RefKind::Call).with_evidence(1, 2)
   }
 
-  fn drain(store: &mut RefStore) -> Vec<Reference<'static>> {
+  fn drain(store: &mut RefStore, order: &[u32]) -> Vec<Reference<'static>> {
     let mut out = Vec::new();
     let chunks: Vec<Vec<u8>> = store
-      .raw_chunks()
+      .raw_chunks(order.iter().copied())
       .unwrap()
       .collect::<io::Result<Vec<_>>>()
       .unwrap();
@@ -246,19 +258,23 @@ mod tests {
     assert_eq!(store.count(), 12);
     assert!(store.dead_fraction() > 0.99);
 
-    let fed = drain(&mut store);
+    // Canonical (path-sorted) order: a.py, b.py, c.py — the store follows it even though
+    // b's alive range now sits at the file tail.
+    let c_bits = c[0].from_path.to_bits();
+    let order = [a_bits, b_bits, c_bits];
+    let fed = drain(&mut store, &order);
     let mut expect = Vec::new();
     expect.extend(a.iter().copied());
+    expect.extend(b2.iter().copied());
     expect.extend(c.iter().copied());
-    expect.extend(b2.iter().copied()); // b2 appended after c: record order
     assert_eq!(fed, expect);
 
     // Delete a entirely.
     store.retract_file(a_bits);
-    let fed = drain(&mut store);
+    let fed = drain(&mut store, &order);
     let mut expect = Vec::new();
-    expect.extend(c.iter().copied());
     expect.extend(b2.iter().copied());
+    expect.extend(c.iter().copied());
     assert_eq!(fed, expect);
     store.remove().unwrap();
     let _ = std::fs::remove_dir(&dir);
@@ -277,11 +293,11 @@ mod tests {
     let bits = plain.from_path.to_bits();
     let both = [plain, qualified];
     store.append_file(bits, both.iter()).unwrap();
-    assert_eq!(store.qualified_imports(itn()), vec![qualified]);
+    assert_eq!(store.qualified_imports(itn(), [bits]), vec![qualified]);
 
     let replacement = make_ref("m.py", "other", 3);
     store.append_file(bits, std::iter::once(&replacement)).unwrap();
-    assert!(store.qualified_imports(itn()).is_empty());
+    assert!(store.qualified_imports(itn(), [bits]).is_empty());
     store.remove().unwrap();
     let _ = std::fs::remove_dir(&dir);
   }
