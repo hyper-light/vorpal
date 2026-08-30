@@ -59,6 +59,27 @@ fn flows_persist_and_answer() {
     "{rows:?}"
   );
 
+  // Trace rendering (G-M5): a reachable walk over data_flows annotates each hop with its
+  // flowing arguments (`expr→#param`), joined from the sidecar.
+  let rendered = vorpal_index::reachable_query_on(
+    &kg,
+    Some(&dir),
+    &vorpal_index::GraphTarget {
+      name: "source".into(),
+      ..vorpal_index::GraphTarget::default()
+    },
+    vorpal_index::Direction::Out,
+    &[EdgeType::CALLS, EdgeType::DATA_FLOWS],
+    Some(3),
+    0,
+  )
+  .unwrap();
+  assert!(
+    rendered.contains("[count→#0, cfg.size→#1]→ sink"),
+    "hop annotated with flowing args:
+{rendered}"
+  );
+
   // Kwarg binding (G-M5): `other=` binds to sink's parameter POSITION 1 by name.
   assert!(
     rows.iter().any(|r| r.expr == Some("cfg.size") && r.param_index == 1),

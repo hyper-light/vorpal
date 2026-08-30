@@ -50,6 +50,10 @@ pub struct RelatedRecord {
 /// was first reached from, and the edge that reached it.
 #[derive(Serialize, Debug)]
 pub struct ReachRecord {
+  /// For `data_flows` hops with a sidecar: the arguments flowing along this hop, rendered
+  /// `expr→param#k` (empty otherwise — absence of a sidecar is stated by the tool text).
+  #[serde(skip_serializing_if = "Vec::is_empty", default)]
+  pub flow_exprs: Vec<String>,
   #[serde(flatten)]
   pub node: NodeRecord,
   pub depth: u32,
@@ -990,8 +994,10 @@ pub fn selected_page_value<T: Serialize>(
 /// but the heap-string record construction is paid per page, not per closure. An
 /// undirected kernel walk reaches 200K+ nodes; building 200K records to emit 100 was the
 /// dominant cost of the paged surface.
+#[allow(clippy::too_many_arguments)] // one traversal surface; every input is load-bearing
 pub fn reach_records_page(
   kg: &Kg,
+  flows_dir: Option<&std::path::Path>,
   target: &GraphTarget,
   dir: vorpal_kg::Direction,
   relations: &[vorpal_kg::EdgeType],
@@ -1012,6 +1018,8 @@ pub fn reach_records_page(
   for &seed in &matches {
     steps.extend(kg.reachable_via_paths(seed, dir, relations, max_depth, min_confidence));
   }
+  // The flow sidecar joins per data_flows hop (G-M5): loaded once, absent-tolerant.
+  let flow_store = crate::flow_store_for(flows_dir, relations);
   let PageBounds { start, end, total } = page_bounds(steps.len(), page.cursor, page.limit)?;
   let records = steps[start..end]
     .iter()
@@ -1023,6 +1031,12 @@ pub fn reach_records_page(
         relation: step.via.1.name().to_string(),
         grade: crate::confidence_label(step.via.1.confidence()).to_string(),
         edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        flow_exprs: crate::flow_exprs_for_hop(
+          flow_store.as_ref(),
+          step.via.0,
+          step.node,
+          step.inbound,
+        ),
       })
     })
     .collect();
@@ -1793,6 +1807,8 @@ pub fn impact_page(
         relation: step.via.1.name().to_string(),
         grade: crate::confidence_label(step.via.1.confidence()).to_string(),
         edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        // Impact semantics are blast-radius, not argument tracing — no sidecar join here.
+        flow_exprs: Vec::new(),
       })
     })
     .collect();
@@ -1872,6 +1888,8 @@ pub fn reach_records(
         relation: step.via.1.name().to_string(),
         grade: crate::confidence_label(step.via.1.confidence()).to_string(),
         edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        // The unpaged variant serves dir-less callers; annotations need the sidecar.
+        flow_exprs: Vec::new(),
       });
     }
   }

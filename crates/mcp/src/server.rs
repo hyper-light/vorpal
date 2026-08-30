@@ -995,12 +995,22 @@ impl Server {
           args.get("min_grade").and_then(Value::as_str),
         )
         .map_err(|err| err.to_string())?;
-        let kg = self.kg()?;
+        self.kg()?;
+        // Freshness first: kg() pins the generation and its dir together, so the sidecar
+        // read can never come from a different generation than the ids it annotates.
+        let flows_dir = self.kg_dir.clone();
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded(
+            "index-unavailable",
+            "no graph is loaded — run the 'index' tool first",
+          ));
+        };
         // Page-materialized: the BFS runs whole (that IS the deterministic vector), but
         // record construction is paid per page — an undirected kernel walk reaches 200K+
         // nodes and building all their records to serve one page dominated this tool.
         let selected = vorpal_index::records::reach_records_page(
           kg,
+          flows_dir.as_deref(),
           &target,
           dir,
           &relations,
@@ -1019,7 +1029,7 @@ impl Server {
         )
         .map_err(|message| ToolError::coded("bad-argument", message))?;
         // Text stays human-shaped but capped: a full undirected closure renders tens of MB.
-        let text = vorpal_index::reachable_query_on(kg, &target, dir, &relations, max_depth, min_confidence)
+        let text = vorpal_index::reachable_query_on(kg, flows_dir.as_deref(), &target, dir, &relations, max_depth, min_confidence)
           .map_err(|err| err.to_string())
           .map_err(ToolError::from)?;
         const TEXT_CAP: usize = 200;

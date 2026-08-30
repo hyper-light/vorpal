@@ -879,7 +879,8 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       let kg = vorpal_index::Kg::load(&dir)
         .map_err(|err| anyhow::anyhow!(err.to_string()))
         .with_context(|| missing_index_hint(&dir))?;
-      vorpal_index::reachable_query_on(&kg, &target, *direction, relations, *max_depth, *min_confidence)
+      let gen_dir = vorpal_index::resolve_index_dir(&dir);
+      vorpal_index::reachable_query_on(&kg, Some(&gen_dir), &target, *direction, relations, *max_depth, *min_confidence)
         .map_err(boxed)?
     }
     (OutputFormat::Text, None) => vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
@@ -895,6 +896,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
           vorpal_index::records::selected_page_value(
             vorpal_index::records::reach_records_page(
               &kg,
+              Some(vorpal_index::resolve_index_dir(&dir)).as_deref(),
               &target,
               *direction,
               relations,

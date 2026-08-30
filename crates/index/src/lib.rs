@@ -2268,8 +2268,54 @@ pub fn snippet_query_on(
   }
 }
 
+/// Open the data-flow sidecar when a traversal will render `data_flows` hops. Absent or
+/// unreadable sidecars degrade to no annotations — the hop itself still renders.
+pub(crate) fn flow_store_for(
+  dir: Option<&std::path::Path>,
+  relations: &[vorpal_kg::EdgeType],
+) -> Option<vorpal_kg::DataflowStore> {
+  let dir = dir?;
+  if !relations.iter().any(|e| e.base() == vorpal_kg::EdgeType::DATA_FLOWS) {
+    return None;
+  }
+  vorpal_kg::DataflowStore::load(dir).ok().filter(|s| !s.is_empty())
+}
+
+/// The `expr→param#k` annotations for one traversal hop with sidecar rows on its
+/// (from, to) pair. Deliberately NOT gated on the hop's winning edge type: a call edge and
+/// its derived DATA_FLOWS edge share endpoints, and BFS crowns whichever the CSR lists
+/// first — the rows describe the call either way. `parent`/`node` orient by `inbound`
+/// (the stored edge always points from → to).
+pub(crate) fn flow_exprs_for_hop(
+  store: Option<&vorpal_kg::DataflowStore>,
+  parent: u32,
+  node: u32,
+  inbound: bool,
+) -> Vec<String> {
+  let Some(store) = store else {
+    return Vec::new();
+  };
+  let (from, to) = if inbound { (node, parent) } else { (parent, node) };
+  store
+    .flows_between(from, to)
+    .iter()
+    .map(|flow| {
+      let expr = flow.expr.unwrap_or(match flow.class {
+        2 => "(call-result)",
+        _ => "(arg)",
+      });
+      if flow.param_index == u16::MAX {
+        format!("{expr}→#?")
+      } else {
+        format!("{expr}→#{}", flow.param_index)
+      }
+    })
+    .collect()
+}
+
 pub fn reachable_query_on(
   kg: &Kg,
+  flows_dir: Option<&std::path::Path>,
   target: &GraphTarget,
   dir: vorpal_kg::Direction,
   relations: &[vorpal_kg::EdgeType],
@@ -2295,6 +2341,7 @@ pub fn reachable_query_on(
     return Ok(out);
   }
 
+  let flow_store = flow_store_for(flows_dir, relations);
   let mut out = String::new();
   for &seed in &matches {
     // Parent-edge map for path reconstruction; steps arrive in BFS order (deterministic).
@@ -2322,10 +2369,18 @@ pub fn reachable_query_on(
         };
         // Pure In/Out keeps the historical arrow; Both labels each hop's real orientation
         // (`←rel-` = the stored edge points from this node toward its parent).
+        let flow_note = {
+          let exprs = flow_exprs_for_hop(flow_store.as_ref(), up, at, inbound);
+          if exprs.is_empty() {
+            String::new()
+          } else {
+            format!("[{}]", exprs.join(", "))
+          }
+        };
         if matches!(dir, vorpal_kg::Direction::Both) && inbound {
-          chain.push(format!("←{}- {}", edge.name(), name_of(at)));
+          chain.push(format!("←{}{}- {}", edge.name(), flow_note, name_of(at)));
         } else {
-          chain.push(format!("-{}→ {}", edge.name(), name_of(at)));
+          chain.push(format!("-{}{}→ {}", edge.name(), flow_note, name_of(at)));
         }
         at = up;
       }

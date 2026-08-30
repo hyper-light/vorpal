@@ -496,6 +496,7 @@ fn reachable_returns_paths_and_respects_grade_floor() {
   let query = |grade: Option<&str>| {
     vorpal_index::reachable_query_on(
       &kg,
+      None,
       &vorpal_index::GraphTarget {
         name: "top".into(),
         ..vorpal_index::GraphTarget::default()
@@ -526,6 +527,7 @@ fn reachable_returns_paths_and_respects_grade_floor() {
   // Selector consistency: an ambiguous seed lists candidates instead of unioning namesakes.
   let ambiguous = vorpal_index::reachable_query_on(
     &kg,
+    None,
     &vorpal_index::GraphTarget {
       name: "amb".into(),
       ..vorpal_index::GraphTarget::default()
