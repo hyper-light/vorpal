@@ -240,6 +240,14 @@ const CANARIES: &[Canary] = &[
     min_items: 1,
     min_refs: 0,
   },
+  Canary {
+    lang: SupportLang::Toml,
+    path: "vorpal-selfcheck/canary.toml",
+    source: "top = 1\n\n[package]\nname = \"canary\"\n",
+    // Top-level items only (the [package] member pair nests inside the table item).
+    min_items: 2,
+    min_refs: 0,
+  },
 ];
 
 /// Run every canary through `extractor` and report all shortfalls at once.

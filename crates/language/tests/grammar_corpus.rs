@@ -224,6 +224,7 @@ fn corpus_roots() -> Vec<(PathBuf, SupportLang)> {
     ("tree-sitter-solidity/test/corpus", Solidity),
     ("tree-sitter-swift/test/corpus", Swift),
     ("tree-sitter-typescript/test/corpus", TypeScript),
+    ("tree-sitter-toml-ng/test/corpus", Toml),
     ("tree-sitter-yaml/test/corpus", Yaml),
   ];
   map

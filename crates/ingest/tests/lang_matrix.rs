@@ -248,6 +248,12 @@ fn structural_languages_extract_structure_nodes() {
       &["server", "port"],
     ),
     (
+      "toml",
+      "cfg.toml",
+      "top = 1\n\n[server]\nport = 8080\n",
+      &["top", "server", "port"],
+    ),
+    (
       "markdown",
       "doc.md",
       "# Title\n\nintro\n\n## Section One\n\nbody\n",

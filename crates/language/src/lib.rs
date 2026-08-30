@@ -33,7 +33,6 @@ mod kotlin;
 mod lua;
 mod markdown;
 mod nix;
-mod parsers;
 mod php;
 mod python;
 mod ruby;
@@ -185,222 +184,190 @@ macro_rules! impl_alias {
     }
   };
 }
-/// Generates as convenience conversions between the lang types
-/// and `SupportedType`.
-macro_rules! impl_aliases {
-  ($($lang:ident => $as:expr),* $(,)?) => {
-    $(impl_alias!($lang => $as);)*
+
+/// Imports the tree-sitter parser crate when its feature flag is on; a disabled flag leaves
+/// an `unimplemented!()` stub (kept unreachable by `is_enabled` gating — vorpal artifacts
+/// enable every grammar; the stub exists for library embedders' subset builds and wasm).
+macro_rules! conditional_lang {
+  ($lang: ident, $flag: literal, $field: ident) => {{
+    #[cfg(feature = $flag)]
+    {
+      $lang::$field.into()
+    }
+    #[cfg(not(feature = $flag))]
+    {
+      unimplemented!("tree-sitter parser is not implemented when feature flag is off.")
+    }
+  }};
+  ($lang: ident, $flag: literal) => {
+    conditional_lang!($lang, $flag, LANGUAGE)
+  };
+}
+
+/// One declarative row per built-in language (F-M5) — THE single authority every capability
+/// surface is generated from: the parser binding (the `parsers` module), the struct + trait
+/// impls, the `SupportLang` variant, the compiled-in (`all_langs`) and vocabulary
+/// (`all_variants`) tables, `is_enabled`, name aliases, extension routing, and the
+/// `execute_lang_method!` dispatch. Adding a language = one row here + the Cargo entries +
+/// data files (outline rules, ref spec, canary, corpus fixtures) — nothing else to keep in
+/// sync by hand.
+///
+/// Row shape (fields in this exact order):
+/// ```text
+/// Variant { parser: fn_name(ts_crate[, SYMBOL]), feature: "cargo-feature",
+///           kind: plain | expando('c') | custom, aliases: [..], extensions: [..] }
+/// ```
+/// `kind: custom` skips struct emission (the type is hand-written — `Html`, which carries
+/// injection support); `expando` selects the metavariable expando char for grammars where `$`
+/// is not a valid identifier character. The leading `$` argument is the standard macro-in-
+/// macro dollar-escape (it lets this macro emit `execute_lang_method!`).
+macro_rules! langs {
+  ($d:tt $(
+    $variant:ident {
+      parser: $parser:ident($ts_crate:ident $(, $ts_field:ident)?),
+      feature: $feature:literal,
+      kind: $kind:tt $(($kchar:literal))?,
+      aliases: [$($alias:literal),+ $(,)?],
+      extensions: [$($ext:literal),+ $(,)?],
+    }
+  )*) => {
+    /// One binding per language row; a disabled feature leaves an `unimplemented!()` stub
+    /// that `is_enabled` gating keeps unreachable (vorpal artifacts enable every grammar).
+    pub mod parsers {
+      use vorpal_core::tree_sitter::TSLanguage;
+      $(
+        pub fn $parser() -> TSLanguage {
+          conditional_lang!($ts_crate, $feature $(, $ts_field)?)
+        }
+      )*
+    }
+
+    $( lang_struct!($variant, $parser, $kind $(($kchar))?); )*
+
+    /// Represents all built-in languages.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Hash)]
+    pub enum SupportLang {
+      $($variant,)*
+    }
+
+    impl SupportLang {
+      /// The languages COMPILED INTO this build (feature-gated). Every capability surface —
+      /// extension routing, digests, specs, canaries — iterates this set; a subset build
+      /// simply has a shorter list and never touches a disabled grammar's stub.
+      pub const fn all_langs() -> &'static [SupportLang] {
+        &[
+          $(
+            #[cfg(feature = $feature)]
+            SupportLang::$variant,
+          )*
+        ]
+      }
+
+      /// EVERY variant, enabled or not — the vocabulary surface. Serde/config parsing accepts
+      /// all of these (a full-language rule file must parse on a subset build; disabled groups
+      /// are dropped before compilation), while `FromStr` — the "please use this language now"
+      /// path — rejects disabled ones with a build-shape error.
+      pub const fn all_variants() -> &'static [SupportLang] {
+        &[ $(SupportLang::$variant,)* ]
+      }
+
+      /// Whether this variant's grammar is compiled into the current build.
+      pub const fn is_enabled(self) -> bool {
+        match self {
+          $(SupportLang::$variant => cfg!(feature = $feature),)*
+        }
+      }
+    }
+
+    $( impl_alias!($variant => &[$($alias),+]); )*
+
     const fn alias(lang: SupportLang) -> &'static [&'static str] {
       match lang {
-        $(SupportLang::$lang => $lang::ALIAS),*
+        $(SupportLang::$variant => $variant::ALIAS,)*
       }
+    }
+
+    /// File extensions per language (adapted from ripgrep's default types).
+    fn extensions(lang: SupportLang) -> &'static [&'static str] {
+      match lang {
+        $(SupportLang::$variant => &[$($ext),+],)*
+      }
+    }
+
+    macro_rules! execute_lang_method {
+      ($d me: path, $d method: ident, $d($d pname:tt),*) => {
+        match $d me {
+          $(SupportLang::$variant => $variant.$d method($d($d pname,)*),)*
+        }
+      };
     }
   };
 }
 
-/* Customized Language with expando_char / pre_process_pattern */
-// https://en.cppreference.com/w/cpp/language/identifiers
-impl_lang_expando!(C, language_c, '𐀀');
-impl_lang_expando!(Cpp, language_cpp, '𐀀');
-// https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/lexical-structure#643-identifiers
-// all letter number is accepted
-// https://www.compart.com/en/unicode/category/Nl
-impl_lang_expando!(CSharp, language_c_sharp, 'µ');
-// https://www.w3.org/TR/CSS21/grammar.html#scanner
-impl_lang_expando!(Css, language_css, '_');
-// https://github.com/elixir-lang/tree-sitter-elixir/blob/a2861e88a730287a60c11ea9299c033c7d076e30/grammar.js#L245
-impl_lang_expando!(Elixir, language_elixir, 'µ');
-// we can use any Unicode code point categorized as "Letter"
-// https://go.dev/ref/spec#letter
-impl_lang_expando!(Go, language_go, 'µ');
-// GHC supports Unicode syntax per
-// https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/unicode_syntax.html
-// and the tree-sitter-haskell grammar parses it too.
-impl_lang_expando!(Haskell, language_haskell, 'µ');
-// https://developer.hashicorp.com/terraform/language/syntax/configuration#identifiers
-impl_lang_expando!(Hcl, language_hcl, 'µ');
-// https://github.com/fwcd/tree-sitter-kotlin/pull/93
-impl_lang_expando!(Kotlin, language_kotlin, 'µ');
-// Nix uses $ for string interpolation (e.g., "${pkgs.hello}")
-impl_lang_expando!(Nix, language_nix, '_');
-// PHP accepts unicode to be used as some name not var name though
-impl_lang_expando!(Php, language_php, 'µ');
-// we can use any char in unicode range [:XID_Start:]
-// https://docs.python.org/3/reference/lexical_analysis.html#identifiers
-// see also [PEP 3131](https://peps.python.org/pep-3131/) for further details.
-impl_lang_expando!(Python, language_python, 'µ');
-// https://github.com/tree-sitter/tree-sitter-ruby/blob/f257f3f57833d584050336921773738a3fd8ca22/grammar.js#L30C26-L30C78
-impl_lang_expando!(Ruby, language_ruby, 'µ');
-// we can use any char in unicode range [:XID_Start:]
-// https://doc.rust-lang.org/reference/identifiers.html
-impl_lang_expando!(Rust, language_rust, 'µ');
-//https://docs.swift.org/swift-book/documentation/the-swift-programming-language/lexicalstructure/#Identifiers
-impl_lang_expando!(Swift, language_swift, 'µ');
+/// Struct emission per `kind`: the standard shapes delegate to the existing helper macros;
+/// `custom` emits nothing (the type is hand-written elsewhere in this crate).
+macro_rules! lang_struct {
+  ($v:ident, $p:ident, plain) => {
+    impl_lang!($v, $p);
+  };
+  ($v:ident, $p:ident, custom) => {};
+  ($v:ident, $p:ident, expando($c:literal)) => {
+    impl_lang_expando!($v, $p, $c);
+  };
+}
 
-// Stub Language without preprocessing
-// Language Name, tree-sitter-name, alias, extension
-impl_lang!(Bash, language_bash);
-impl_lang!(Java, language_java);
-impl_lang!(JavaScript, language_javascript);
-impl_lang!(Json, language_json);
-impl_lang!(Lua, language_lua);
-impl_lang!(Markdown, language_markdown);
-impl_lang!(Scala, language_scala);
-impl_lang!(Solidity, language_solidity);
-impl_lang!(Tsx, language_tsx);
-impl_lang!(TypeScript, language_typescript);
-impl_lang!(Dart, language_dart);
-impl_lang!(Yaml, language_yaml);
-// See ripgrep for extensions
-// https://github.com/BurntSushi/ripgrep/blob/master/crates/ignore/src/default_types.rs
-
-/// Represents all built-in languages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Hash)]
-pub enum SupportLang {
-  Bash,
-  C,
-  Cpp,
-  CSharp,
-  Css,
-  Dart,
-  Go,
-  Elixir,
-  Haskell,
-  Hcl,
-  Html,
-  Java,
-  JavaScript,
-  Json,
-  Kotlin,
-  Lua,
-  Markdown,
-  Nix,
-  Php,
-  Python,
-  Ruby,
-  Rust,
-  Scala,
-  Solidity,
-  Swift,
-  Tsx,
-  TypeScript,
-  Yaml,
+langs! { $
+  Bash { parser: language_bash(tree_sitter_bash), feature: "tree-sitter-bash", kind: plain, aliases: ["bash"], extensions: ["bash", "bats", "cgi", "command", "env", "fcgi", "ksh", "sh", "tmux", "tool", "zsh"], }
+  // https://en.cppreference.com/w/cpp/language/identifiers
+  C { parser: language_c(tree_sitter_c), feature: "tree-sitter-c", kind: expando('𐀀'), aliases: ["c"], extensions: ["c", "h"], }
+  Cpp { parser: language_cpp(tree_sitter_cpp), feature: "tree-sitter-cpp", kind: expando('𐀀'), aliases: ["cc", "c++", "cpp", "cxx"], extensions: ["cc", "hpp", "cpp", "c++", "hh", "cxx", "cu", "ino"], }
+  // https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/lexical-structure#643-identifiers
+  // all letter number is accepted: https://www.compart.com/en/unicode/category/Nl
+  CSharp { parser: language_c_sharp(tree_sitter_c_sharp), feature: "tree-sitter-c-sharp", kind: expando('µ'), aliases: ["cs", "csharp"], extensions: ["cs"], }
+  // https://www.w3.org/TR/CSS21/grammar.html#scanner
+  Css { parser: language_css(tree_sitter_css), feature: "tree-sitter-css", kind: expando('_'), aliases: ["css"], extensions: ["css", "scss"], }
+  Dart { parser: language_dart(tree_sitter_dart), feature: "tree-sitter-dart", kind: plain, aliases: ["dart"], extensions: ["dart"], }
+  // https://github.com/elixir-lang/tree-sitter-elixir/blob/a2861e88a730287a60c11ea9299c033c7d076e30/grammar.js#L245
+  Elixir { parser: language_elixir(tree_sitter_elixir), feature: "tree-sitter-elixir", kind: expando('µ'), aliases: ["ex", "elixir"], extensions: ["ex", "exs"], }
+  // any Unicode code point categorized as "Letter": https://go.dev/ref/spec#letter
+  Go { parser: language_go(tree_sitter_go), feature: "tree-sitter-go", kind: expando('µ'), aliases: ["go", "golang"], extensions: ["go"], }
+  // GHC supports Unicode syntax (https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/unicode_syntax.html)
+  // and the tree-sitter-haskell grammar parses it too.
+  Haskell { parser: language_haskell(tree_sitter_haskell), feature: "tree-sitter-haskell", kind: expando('µ'), aliases: ["hs", "haskell"], extensions: ["hs"], }
+  // https://developer.hashicorp.com/terraform/language/syntax/configuration#identifiers
+  Hcl { parser: language_hcl(tree_sitter_hcl), feature: "tree-sitter-hcl", kind: expando('µ'), aliases: ["hcl"], extensions: ["hcl", "nomad", "tf", "tfvars", "workflow"], }
+  // Hand-written type: carries the injection machinery (crates/language/src/html.rs).
+  Html { parser: language_html(tree_sitter_html), feature: "tree-sitter-html", kind: custom, aliases: ["html"], extensions: ["html", "htm", "xhtml"], }
+  Java { parser: language_java(tree_sitter_java), feature: "tree-sitter-java", kind: plain, aliases: ["java"], extensions: ["java"], }
+  JavaScript { parser: language_javascript(tree_sitter_javascript), feature: "tree-sitter-javascript", kind: plain, aliases: ["javascript", "js", "jsx"], extensions: ["cjs", "js", "mjs", "jsx"], }
+  Json { parser: language_json(tree_sitter_json), feature: "tree-sitter-json", kind: plain, aliases: ["json"], extensions: ["json"], }
+  // https://github.com/fwcd/tree-sitter-kotlin/pull/93
+  Kotlin { parser: language_kotlin(tree_sitter_kotlin), feature: "tree-sitter-kotlin", kind: expando('µ'), aliases: ["kotlin", "kt"], extensions: ["kt", "ktm", "kts"], }
+  Lua { parser: language_lua(tree_sitter_lua), feature: "tree-sitter-lua", kind: plain, aliases: ["lua"], extensions: ["lua"], }
+  Markdown { parser: language_markdown(tree_sitter_md), feature: "tree-sitter-md", kind: plain, aliases: ["markdown", "md"], extensions: ["markdown", "md"], }
+  // Nix uses $ for string interpolation, e.g. "${pkgs.hello}"
+  Nix { parser: language_nix(tree_sitter_nix), feature: "tree-sitter-nix", kind: expando('_'), aliases: ["nix"], extensions: ["nix"], }
+  // PHP accepts unicode in some names (not variable names, though)
+  Php { parser: language_php(tree_sitter_php, LANGUAGE_PHP_ONLY), feature: "tree-sitter-php", kind: expando('µ'), aliases: ["php"], extensions: ["php"], }
+  // any char in [:XID_Start:]: https://docs.python.org/3/reference/lexical_analysis.html#identifiers
+  // see also PEP 3131 (https://peps.python.org/pep-3131/)
+  Python { parser: language_python(tree_sitter_python), feature: "tree-sitter-python", kind: expando('µ'), aliases: ["py", "python"], extensions: ["py", "py3", "pyi", "bzl", "bazel"], }
+  // https://github.com/tree-sitter/tree-sitter-ruby/blob/f257f3f57833d584050336921773738a3fd8ca22/grammar.js#L30C26-L30C78
+  Ruby { parser: language_ruby(tree_sitter_ruby), feature: "tree-sitter-ruby", kind: expando('µ'), aliases: ["rb", "ruby"], extensions: ["rb", "rbw", "gemspec"], }
+  // any char in [:XID_Start:]: https://doc.rust-lang.org/reference/identifiers.html
+  Rust { parser: language_rust(tree_sitter_rust), feature: "tree-sitter-rust", kind: expando('µ'), aliases: ["rs", "rust"], extensions: ["rs"], }
+  Scala { parser: language_scala(tree_sitter_scala), feature: "tree-sitter-scala", kind: plain, aliases: ["scala"], extensions: ["scala", "sc", "sbt"], }
+  Solidity { parser: language_solidity(tree_sitter_solidity), feature: "tree-sitter-solidity", kind: plain, aliases: ["sol", "solidity"], extensions: ["sol"], }
+  // https://docs.swift.org/swift-book/documentation/the-swift-programming-language/lexicalstructure/#Identifiers
+  Swift { parser: language_swift(tree_sitter_swift), feature: "tree-sitter-swift", kind: expando('µ'), aliases: ["swift"], extensions: ["swift"], }
+  // TOML bare keys are [A-Za-z0-9_-] — `$` is not valid, so patterns need an expando char.
+  Toml { parser: language_toml(tree_sitter_toml), feature: "tree-sitter-toml", kind: expando('_'), aliases: ["toml"], extensions: ["toml"], }
+  Tsx { parser: language_tsx(tree_sitter_typescript, LANGUAGE_TSX), feature: "tree-sitter-typescript", kind: plain, aliases: ["tsx"], extensions: ["tsx"], }
+  TypeScript { parser: language_typescript(tree_sitter_typescript, LANGUAGE_TYPESCRIPT), feature: "tree-sitter-typescript", kind: plain, aliases: ["ts", "typescript"], extensions: ["ts", "cts", "mts"], }
+  Yaml { parser: language_yaml(tree_sitter_yaml), feature: "tree-sitter-yaml", kind: plain, aliases: ["yaml", "yml"], extensions: ["yaml", "yml"], }
 }
 
 impl SupportLang {
-  /// The languages COMPILED INTO this build (feature-gated). Every capability surface —
-  /// extension routing, digests, specs, canaries — iterates this set; a slim build simply
-  /// has a shorter list and never touches a disabled grammar's `unimplemented!()` stub.
-  pub const fn all_langs() -> &'static [SupportLang] {
-    use SupportLang::*;
-    &[
-      #[cfg(feature = "tree-sitter-bash")]
-      Bash,
-      #[cfg(feature = "tree-sitter-c")]
-      C,
-      #[cfg(feature = "tree-sitter-cpp")]
-      Cpp,
-      #[cfg(feature = "tree-sitter-c-sharp")]
-      CSharp,
-      #[cfg(feature = "tree-sitter-css")]
-      Css,
-      #[cfg(feature = "tree-sitter-dart")]
-      Dart,
-      #[cfg(feature = "tree-sitter-elixir")]
-      Elixir,
-      #[cfg(feature = "tree-sitter-go")]
-      Go,
-      #[cfg(feature = "tree-sitter-haskell")]
-      Haskell,
-      #[cfg(feature = "tree-sitter-hcl")]
-      Hcl,
-      #[cfg(feature = "tree-sitter-html")]
-      Html,
-      #[cfg(feature = "tree-sitter-java")]
-      Java,
-      #[cfg(feature = "tree-sitter-javascript")]
-      JavaScript,
-      #[cfg(feature = "tree-sitter-json")]
-      Json,
-      #[cfg(feature = "tree-sitter-kotlin")]
-      Kotlin,
-      #[cfg(feature = "tree-sitter-lua")]
-      Lua,
-      #[cfg(feature = "tree-sitter-md")]
-      Markdown,
-      #[cfg(feature = "tree-sitter-nix")]
-      Nix,
-      #[cfg(feature = "tree-sitter-php")]
-      Php,
-      #[cfg(feature = "tree-sitter-python")]
-      Python,
-      #[cfg(feature = "tree-sitter-ruby")]
-      Ruby,
-      #[cfg(feature = "tree-sitter-rust")]
-      Rust,
-      #[cfg(feature = "tree-sitter-scala")]
-      Scala,
-      #[cfg(feature = "tree-sitter-solidity")]
-      Solidity,
-      #[cfg(feature = "tree-sitter-swift")]
-      Swift,
-      #[cfg(feature = "tree-sitter-typescript")]
-      Tsx,
-      #[cfg(feature = "tree-sitter-typescript")]
-      TypeScript,
-      #[cfg(feature = "tree-sitter-yaml")]
-      Yaml,
-    ]
-  }
-
-  /// EVERY variant, enabled or not — the vocabulary surface. Serde/config parsing accepts
-  /// all of these (a full-language rule file must parse on a slim build; disabled groups
-  /// are dropped before compilation), while `FromStr` — the "please use this language now"
-  /// path — rejects disabled ones with a build-shape error.
-  pub const fn all_variants() -> &'static [SupportLang] {
-    use SupportLang::*;
-    &[
-      Bash, C, Cpp, CSharp, Css, Dart, Elixir, Go, Haskell, Hcl, Html, Java, JavaScript, Json,
-      Kotlin, Lua, Markdown, Nix, Php, Python, Ruby, Rust, Scala, Solidity, Swift, Tsx, TypeScript,
-      Yaml,
-    ]
-  }
-
-  /// Whether this variant's grammar is compiled into the current build.
-  pub const fn is_enabled(self) -> bool {
-    use SupportLang::*;
-    match self {
-      Bash => cfg!(feature = "tree-sitter-bash"),
-      C => cfg!(feature = "tree-sitter-c"),
-      Cpp => cfg!(feature = "tree-sitter-cpp"),
-      CSharp => cfg!(feature = "tree-sitter-c-sharp"),
-      Css => cfg!(feature = "tree-sitter-css"),
-      Dart => cfg!(feature = "tree-sitter-dart"),
-      Elixir => cfg!(feature = "tree-sitter-elixir"),
-      Go => cfg!(feature = "tree-sitter-go"),
-      Haskell => cfg!(feature = "tree-sitter-haskell"),
-      Hcl => cfg!(feature = "tree-sitter-hcl"),
-      Html => cfg!(feature = "tree-sitter-html"),
-      Java => cfg!(feature = "tree-sitter-java"),
-      JavaScript => cfg!(feature = "tree-sitter-javascript"),
-      Json => cfg!(feature = "tree-sitter-json"),
-      Kotlin => cfg!(feature = "tree-sitter-kotlin"),
-      Lua => cfg!(feature = "tree-sitter-lua"),
-      Markdown => cfg!(feature = "tree-sitter-md"),
-      Nix => cfg!(feature = "tree-sitter-nix"),
-      Php => cfg!(feature = "tree-sitter-php"),
-      Python => cfg!(feature = "tree-sitter-python"),
-      Ruby => cfg!(feature = "tree-sitter-ruby"),
-      Rust => cfg!(feature = "tree-sitter-rust"),
-      Scala => cfg!(feature = "tree-sitter-scala"),
-      Solidity => cfg!(feature = "tree-sitter-solidity"),
-      Swift => cfg!(feature = "tree-sitter-swift"),
-      Tsx => cfg!(feature = "tree-sitter-typescript"),
-      TypeScript => cfg!(feature = "tree-sitter-typescript"),
-      Yaml => cfg!(feature = "tree-sitter-yaml"),
-    }
-  }
-
   /// Vocabulary lookup over EVERY variant (aliases included), no enablement gate — the
   /// serde/config path.
   pub fn from_name_any(s: &str) -> Option<SupportLang> {
@@ -496,37 +463,6 @@ impl Visitor<'_> for AliasVisitor {
   }
 }
 
-impl_aliases! {
-  Bash => &["bash"],
-  C => &["c"],
-  Cpp => &["cc", "c++", "cpp", "cxx"],
-  CSharp => &["cs", "csharp"],
-  Css => &["css"],
-  Dart => &["dart"],
-  Elixir => &["ex", "elixir"],
-  Go => &["go", "golang"],
-  Haskell => &["hs", "haskell"],
-  Hcl => &["hcl"],
-  Html => &["html"],
-  Java => &["java"],
-  JavaScript => &["javascript", "js", "jsx"],
-  Json => &["json"],
-  Kotlin => &["kotlin", "kt"],
-  Lua => &["lua"],
-  Markdown => &["markdown", "md"],
-  Nix => &["nix"],
-  Php => &["php"],
-  Python => &["py", "python"],
-  Ruby => &["rb", "ruby"],
-  Rust => &["rs", "rust"],
-  Scala => &["scala"],
-  Solidity => &["sol", "solidity"],
-  Swift => &["swift"],
-  TypeScript => &["ts", "typescript"],
-  Tsx => &["tsx"],
-  Yaml => &["yaml", "yml"],
-}
-
 /// Implements the language names and aliases. Known-but-disabled languages get the
 /// build-shape error, not "not supported" — the user's spelling was right; the binary is
 /// slim.
@@ -537,42 +473,6 @@ impl FromStr for SupportLang {
       Some(lang) if lang.is_enabled() => Ok(lang),
       Some(lang) => Err(SupportLangErr::LanguageDisabled(format!("{lang:?}"))),
       None => Err(SupportLangErr::LanguageNotSupported(s.to_string())),
-    }
-  }
-}
-
-macro_rules! execute_lang_method {
-  ($me: path, $method: ident, $($pname:tt),*) => {
-    use SupportLang as S;
-    match $me {
-      S::Bash => Bash.$method($($pname,)*),
-      S::C => C.$method($($pname,)*),
-      S::Cpp => Cpp.$method($($pname,)*),
-      S::CSharp => CSharp.$method($($pname,)*),
-      S::Css => Css.$method($($pname,)*),
-      S::Dart => Dart.$method($($pname,)*),
-      S::Elixir => Elixir.$method($($pname,)*),
-      S::Go => Go.$method($($pname,)*),
-      S::Haskell => Haskell.$method($($pname,)*),
-      S::Hcl => Hcl.$method($($pname,)*),
-      S::Html => Html.$method($($pname,)*),
-      S::Java => Java.$method($($pname,)*),
-      S::JavaScript => JavaScript.$method($($pname,)*),
-      S::Json => Json.$method($($pname,)*),
-      S::Kotlin => Kotlin.$method($($pname,)*),
-      S::Lua => Lua.$method($($pname,)*),
-      S::Markdown => Markdown.$method($($pname,)*),
-      S::Nix => Nix.$method($($pname,)*),
-      S::Php => Php.$method($($pname,)*),
-      S::Python => Python.$method($($pname,)*),
-      S::Ruby => Ruby.$method($($pname,)*),
-      S::Rust => Rust.$method($($pname,)*),
-      S::Scala => Scala.$method($($pname,)*),
-      S::Solidity => Solidity.$method($($pname,)*),
-      S::Swift => Swift.$method($($pname,)*),
-      S::Tsx => Tsx.$method($($pname,)*),
-      S::TypeScript => TypeScript.$method($($pname,)*),
-      S::Yaml => Yaml.$method($($pname,)*),
     }
   }
 }
@@ -777,42 +677,6 @@ pub fn grammar_digest_of(ts: &TSLanguage) -> u64 {
 
 fn compute_grammar_digest(lang: SupportLang) -> u64 {
   grammar_digest_of(&lang.get_ts_language())
-}
-
-fn extensions(lang: SupportLang) -> &'static [&'static str] {
-  use SupportLang::*;
-  match lang {
-    Bash => &[
-      "bash", "bats", "cgi", "command", "env", "fcgi", "ksh", "sh", "tmux", "tool", "zsh",
-    ],
-    C => &["c", "h"],
-    Cpp => &["cc", "hpp", "cpp", "c++", "hh", "cxx", "cu", "ino"],
-    CSharp => &["cs"],
-    Css => &["css", "scss"],
-    Dart => &["dart"],
-    Elixir => &["ex", "exs"],
-    Go => &["go"],
-    Haskell => &["hs"],
-    Hcl => &["hcl", "nomad", "tf", "tfvars", "workflow"],
-    Html => &["html", "htm", "xhtml"],
-    Java => &["java"],
-    JavaScript => &["cjs", "js", "mjs", "jsx"],
-    Json => &["json"],
-    Kotlin => &["kt", "ktm", "kts"],
-    Lua => &["lua"],
-    Markdown => &["markdown", "md"],
-    Nix => &["nix"],
-    Php => &["php"],
-    Python => &["py", "py3", "pyi", "bzl", "bazel"],
-    Ruby => &["rb", "rbw", "gemspec"],
-    Rust => &["rs"],
-    Scala => &["scala", "sc", "sbt"],
-    Solidity => &["sol"],
-    Swift => &["swift"],
-    TypeScript => &["ts", "cts", "mts"],
-    Tsx => &["tsx"],
-    Yaml => &["yaml", "yml"],
-  }
 }
 
 /// Guess which programming language a file is written in

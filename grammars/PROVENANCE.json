@@ -270,6 +270,15 @@
     "source_digest": "xxh3:7b1b1dadd0d67a36",
     "version": "0.7.3"
   },
+  "tree-sitter-toml-ng": {
+    "abi": 14,
+    "commit": "64b56832c2cf",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-toml",
+    "source_digest": "xxh3:55ac0991b76fda72",
+    "version": "0.7.0"
+  },
   "tree-sitter-typescript": {
     "abi": 14,
     "commit": "f975a621f4e7",

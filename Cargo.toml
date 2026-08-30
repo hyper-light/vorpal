@@ -94,5 +94,6 @@ tree-sitter-rust = { path = "grammars/tree-sitter-rust" }
 tree-sitter-scala = { path = "grammars/tree-sitter-scala" }
 tree-sitter-solidity = { path = "grammars/tree-sitter-solidity" }
 tree-sitter-swift = { path = "grammars/tree-sitter-swift" }
+tree-sitter-toml-ng = { path = "grammars/tree-sitter-toml-ng" }
 tree-sitter-typescript = { path = "grammars/tree-sitter-typescript" }
 tree-sitter-yaml = { path = "grammars/tree-sitter-yaml" }

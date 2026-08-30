@@ -192,13 +192,13 @@ hardware, cold/warm states, raw numbers: **[docs/wip/BENCHMARKS.md](docs/wip/BEN
   graph in-degree (reciprocal rank fusion), with per-channel provenance on every hit.
 - **Incremental by construction** — per-file extraction is cached; re-indexing re-parses only what
   changed and always re-links the whole graph, so renames and deletions never leave stale nodes.
-- **28 languages** — one pipeline, tree-sitter grammars compiled in. No plugins to install.
+- **29 languages** — one pipeline, tree-sitter grammars compiled in. No plugins to install.
 
 ## Supported languages
 
-All **28** grammars are compiled into the binary: Bash, C, C++, C#, CSS, Dart, Elixir, Go,
+All **29** grammars are compiled into the binary: Bash, C, C++, C#, CSS, Dart, Elixir, Go,
 Haskell, HCL/Terraform, HTML, Java, JavaScript, JSON, Kotlin, Lua, Markdown, Nix, PHP, Python,
-Ruby, Rust, Scala, Solidity, Swift, TSX, TypeScript, YAML. The relation edges each supports are in
+Ruby, Rust, Scala, Solidity, Swift, TOML, TSX, TypeScript, YAML. The relation edges each supports are in
 the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simply absent — never guessed.
 
 ## Documentation
@@ -208,7 +208,7 @@ the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simp
 | [Getting started](docs/getting-started.md) | Install, first index, every CLI command with examples |
 | [MCP setup](docs/mcp.md) | Wire vorpal into Claude / Codex / any MCP client; the tool reference |
 | [Python](docs/python.md) · [TypeScript/JS](docs/typescript.md) | Library quickstarts (patterns + index API) |
-| [Supported languages](docs/wip/LANGUAGES.md) | The full matrix of what each of the 28 grammars extracts |
+| [Supported languages](docs/wip/LANGUAGES.md) | The full matrix of what each of the 29 grammars extracts |
 | [Architecture](docs/wip/ARCHITECTURE.md) | Storage format, memory model, concurrency, scaling roadmap |
 | [Benchmarks](docs/wip/BENCHMARKS.md) | Reproducible perf: commands, datasets, hardware, results |
 | [Index format](docs/wip/INDEX_FORMAT.md) | On-disk compatibility & migration policy |
@@ -216,7 +216,7 @@ the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simp
 ## How it works
 
 ```
-parse (tree-sitter, 28 grammars)
+parse (tree-sitter, 29 grammars)
   → extract   definitions (YAML outline rules) + references (AST walk: calls/imports/types/impl)
   → intern    blake3 path-qualified identity → dense node ids (dedup, incremental skip)
   → store     columnar node segment (mmap, checksummed) + string heap + edge lists

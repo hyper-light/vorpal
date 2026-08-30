@@ -53,6 +53,8 @@ pub const DEFAULT_OUTLINE_RULES: &str = concat!(
   "\n---\n",
   include_str!("default_rules/json.yml"),
   "\n---\n",
+  include_str!("default_rules/toml.yml"),
+  "\n---\n",
   include_str!("default_rules/yaml.yml"),
   "\n---\n",
   include_str!("default_rules/css.yml"),

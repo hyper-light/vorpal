@@ -198,6 +198,7 @@ All under `grammars/<crate>/`, patched into the workspace. `Local patches` is "�
 | tree-sitter-solidity | 1.2.13 | `4e938a46c703` | — |
 | tree-sitter-swift | 0.7.3 | `b8b22bffbb34` | — |
 | tree-sitter-typescript | 0.23.2 | `f975a621f4e7` | — (typescript + tsx parsers) |
+| tree-sitter-toml-ng | 0.7.0 | `64b56832c2cf` | — |
 | tree-sitter-yaml | 0.7.2 | `7708026449be` | — |
 
 ## Planned

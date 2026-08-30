@@ -1,0 +1,53 @@
+id: toml-table
+language: Toml
+role: item
+symbolType: object
+rule:
+  all:
+    - any:
+        - kind: table
+        - kind: table_array_element
+    - has:
+        pattern: $NAME
+        any:
+          - kind: bare_key
+          - kind: quoted_key
+          - kind: dotted_key
+name: '$NAME'
+---
+id: toml-top-pair
+language: Toml
+role: item
+symbolType: key
+rule:
+  all:
+    - kind: pair
+    - not:
+        inside:
+          any:
+            - kind: table
+            - kind: table_array_element
+          stopBy: end
+    - has:
+        pattern: $NAME
+        any:
+          - kind: bare_key
+          - kind: quoted_key
+          - kind: dotted_key
+name: '$NAME'
+---
+id: toml-table-pair
+language: Toml
+role: member
+parentRuleIds: [toml-table]
+symbolType: key
+rule:
+  all:
+    - kind: pair
+    - has:
+        pattern: $NAME
+        any:
+          - kind: bare_key
+          - kind: quoted_key
+          - kind: dotted_key
+name: '$NAME'
