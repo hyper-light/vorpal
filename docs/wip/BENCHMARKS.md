@@ -33,10 +33,22 @@ vorpal-index index ~/Projects/cpython /tmp/bench-py
 
 | Measurement | wall | user CPU | notes |
 |---|---|---|---|
-| linux cold | 7.01 s (best-of-3) | 109.6 s | 72,541 files → 2,748,638 nodes; 2.17 M refs resolved |
-| linux warm-unchanged | 0.11 s | — | manifest fast path, no file reads |
+| linux cold | 8.34 s (best-of-3) | — | 75,954 files → 2,763,928 nodes; 2.18 M refs resolved (49 grammars) |
+| linux warm-unchanged | 0.12 s | — | manifest fast path, no file reads |
 | linux one-file update | 2.30 s | — | product replay + deterministic re-link |
-| cpython cold | 0.71 s | — | 3,592 files → 143,450 nodes |
+| cpython cold | 1.09 s (best-of-3) | — | 3,841 files → 150,470 nodes (49 grammars, HTML script injections) |
+
+2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal now
+indexes its Makefiles, Perl, SQL, TOML, INI and more (+3,413 files, +3.4k resolved refs), and
+cpython gains pyproject/TOML, INI, and HTML docs whose embedded scripts extract through real
+injected parses (C3a). Cold times above therefore cover a *larger corpus* than the 7.01 s row
+they replace (72,541 files); the marginal cost is the new files' own parse time — the C-file
+path is unchanged. Historical single-corpus comparisons live in git history.
+
+| (superseded 28-grammar corpus) | | | |
+|---|---|---|---|
+| linux cold, 28 grammars | 7.01 s (best-of-3) | 109.6 s | 72,541 files → 2,748,638 nodes |
+| cpython cold, 28 grammars | 0.71 s | — | 3,592 files → 143,450 nodes |
 
 2026-08-29 tree-sitter runtime pass (7.85 s → 7.01 s, output bit-identical — kernel generation
 id unchanged): the runtime is now vendored (`vendor/tree-sitter`, see docs/UPSTREAM.md), and
