@@ -1230,6 +1230,13 @@ where
     });
 
     // Admission, on the calling thread: manifest order, budget-gated — and nothing else.
+    // The scaling probe rides admission: the byte budget ties admission rate to completion
+    // rate, so a growing per-unit cost shows up here as a superlinear exponent (D7). The
+    // unit is BYTES, not files — parse work scales with bytes, and real trees order their
+    // paths with heavy byte skew (the kernel's midsection carries most of its bytes), which
+    // a per-file fit would misread as a fake quadratic.
+    let mut scaling = vorpal_kg::ScalingProbe::new("stream");
+    let mut bytes_admitted: u64 = 0;
     for (sequence, entry) in entries.iter().enumerate() {
       if abort.load(std::sync::atomic::Ordering::Acquire) {
         break;
@@ -1238,7 +1245,10 @@ where
       if work_tx.send((sequence, entry)).is_err() {
         break;
       }
+      bytes_admitted += entry.size.max(1);
+      scaling.tick(bytes_admitted);
     }
+    scaling.finish(bytes_admitted);
     drop(work_tx);
     // Drop the caller's sender so the absorber's drain ends when the committers exit.
     drop(done_tx);

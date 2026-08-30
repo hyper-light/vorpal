@@ -207,6 +207,13 @@ impl ResolveStats {
   }
 }
 
+impl ResolveStats {
+  /// Every reference this stats block accounts for, across all four outcomes.
+  pub fn total(&self) -> u64 {
+    self.resolved + self.ambiguous + self.external + self.masked
+  }
+}
+
 impl std::ops::AddAssign for ResolveStats {
   fn add_assign(&mut self, other: ResolveStats) {
     self.resolved += other.resolved;
@@ -777,6 +784,10 @@ pub fn resolve_all_spilled_into<'i>(
       type Held = (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats);
       let mut holdback: std::collections::BTreeMap<usize, Held> = std::collections::BTreeMap::new();
       let mut next_out = 0usize;
+      // Superlinearity probe over drained references (D7): chunk granularity, one tick per
+      // drained chunk — far off the per-reference hot path.
+      let mut scaling = vorpal_kg::ScalingProbe::new("link");
+      let mut refs_done: u64 = 0;
 
       for (sent, chunk) in spill.chunks()?.enumerate() {
         if work_tx.send((sent, chunk?)).is_err() {
@@ -792,10 +803,13 @@ pub fn resolve_all_spilled_into<'i>(
           for row in &chunk_unresolved {
             unresolved_sink(row);
           }
+          refs_done += chunk_stats.total();
+          scaling.tick(refs_done);
           *stats += chunk_stats;
           next_out += 1;
         }
       }
+      scaling.finish(refs_done);
       drop(work_tx);
 
       while let Ok((index, chunk_edges, chunk_unresolved, chunk_stats)) = out_rx.recv() {
