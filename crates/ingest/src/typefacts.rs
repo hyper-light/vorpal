@@ -21,7 +21,7 @@ use vorpal_language::SupportLang;
 
 /// Bump on ANY semantic change to the capture tables below — it folds into the extraction
 /// identity, so stale products can never replay into a build with different capture rules.
-pub const TYPEFACTS_VERSION: u64 = 3;
+pub const TYPEFACTS_VERSION: u64 = 4;
 
 /// Where a binding's type knowledge came from — persisted with the product, mapped onto the
 /// receiver-typed `ResolveReason`s in G-M2. Discriminants are the persisted tags.
@@ -35,6 +35,10 @@ pub enum BindOrigin {
   Param = 2,
   /// A typed field on an enclosing type.
   Field = 3,
+  /// A function/method's declared RETURN type — never persisted onto references (tag 4 is
+  /// process-internal): these bindings feed the link-time chained-call return map, keyed by
+  /// the function's NAME, and must never type a receiver variable directly.
+  Return = 4,
 }
 
 impl BindOrigin {
@@ -86,6 +90,9 @@ pub(crate) enum BindMode {
   /// Java-shaped declarations: the TYPE lives on the declaration node (`type` field), the
   /// names live on its `variable_declarator` children — one binding per declarator.
   JavaDeclaratorList,
+  /// A function/method declaration: bind the function's NAME to its declared return type
+  /// (`type_field`); no return annotation → no binding.
+  ReturnType,
 }
 
 pub(crate) struct TypeSpec {
@@ -118,6 +125,22 @@ const RUST_TF: TypeSpec = TypeSpec {
       value_field: None,
       mode: BindMode::Single,
     },
+    BindSpec {
+      kind: "function_item",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("return_type"),
+      value_field: None,
+      mode: BindMode::ReturnType,
+    },
+    BindSpec {
+      kind: "function_signature_item",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("return_type"),
+      value_field: None,
+      mode: BindMode::ReturnType,
+    },
   ],
 };
 
@@ -142,6 +165,14 @@ const PYTHON_TF: TypeSpec = TypeSpec {
       type_field: None,
       value_field: None,
       mode: BindMode::PyParamList,
+    },
+    BindSpec {
+      kind: "function_definition",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("return_type"),
+      value_field: None,
+      mode: BindMode::ReturnType,
     },
   ],
 };
@@ -179,6 +210,22 @@ const TS_TF: TypeSpec = TypeSpec {
       type_field: Some("type"),
       value_field: Some("value"),
       mode: BindMode::Single,
+    },
+    BindSpec {
+      kind: "function_declaration",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("return_type"),
+      value_field: None,
+      mode: BindMode::ReturnType,
+    },
+    BindSpec {
+      kind: "method_definition",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("return_type"),
+      value_field: None,
+      mode: BindMode::ReturnType,
     },
   ],
 };
@@ -219,6 +266,22 @@ const GO_TF: TypeSpec = TypeSpec {
       value_field: None,
       mode: BindMode::Single,
     },
+    BindSpec {
+      kind: "function_declaration",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("result"),
+      value_field: None,
+      mode: BindMode::ReturnType,
+    },
+    BindSpec {
+      kind: "method_declaration",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("result"),
+      value_field: None,
+      mode: BindMode::ReturnType,
+    },
   ],
 };
 
@@ -247,6 +310,14 @@ const JAVA_TF: TypeSpec = TypeSpec {
       type_field: Some("type"),
       value_field: None,
       mode: BindMode::JavaDeclaratorList,
+    },
+    BindSpec {
+      kind: "method_declaration",
+      origin: BindOrigin::Return,
+      name_field: "name",
+      type_field: Some("type"),
+      value_field: None,
+      mode: BindMode::ReturnType,
     },
   ],
 };
@@ -321,6 +392,9 @@ pub(crate) fn capture_at<'t>(
   }
   if bind.mode == BindMode::JavaDeclaratorList {
     return capture_java_declarators(bind, node, out);
+  }
+  if bind.mode == BindMode::ReturnType {
+    return capture_return_type(bind, node, out);
   }
   // Name: the declared field, else the first named child (fieldless grammars).
   let name_node = if bind.name_field.is_empty() {
@@ -540,4 +614,34 @@ fn capture_java_declarators<'t>(
       start: child.range().start as u32,
     });
   }
+}
+
+/// Bind a function's NAME to its declared return type. Unit-ish returns (`void`, `None`)
+/// yield nothing — no owner can ever match them, and they would only bloat the chain map.
+fn capture_return_type<'t>(
+  bind: &'static BindSpec,
+  node: &crate::references::SgNodeAlias<'t>,
+  out: &mut Vec<RawBinding<'t>>,
+) {
+  let Some(name_node) = node.field(bind.name_field) else {
+    return;
+  };
+  let name = name_node.text();
+  if name.is_empty() || name.len() > 64 || !is_simple_name(&name) {
+    return;
+  }
+  let Some(ty) = bind
+    .type_field
+    .and_then(|f| node.field(f))
+    .and_then(|t| clean_type_text(t.text()))
+    .filter(|t| !matches!(t.as_ref(), "void" | "None") && is_simple_name(t))
+  else {
+    return;
+  };
+  out.push(RawBinding {
+    name,
+    ty: Some(ty),
+    origin: BindOrigin::Return,
+    start: node.range().start as u32,
+  });
 }

@@ -109,6 +109,9 @@ pub enum ResolveReason {
   ReceiverFieldTyped = 12,
   /// Type narrowing left several candidates; deterministic tie pick (approximate).
   ReceiverTypedTie = 13,
+  /// Chained-call typing (G-M5): the receiver was bound from a call whose callee's declared
+  /// return type uniquely narrowed the candidates (`let x = make(); x.render()`).
+  ReceiverChained = 14,
 }
 
 impl ResolveReason {
@@ -127,6 +130,7 @@ impl ResolveReason {
       11 => Self::ReceiverParamTyped,
       12 => Self::ReceiverFieldTyped,
       13 => Self::ReceiverTypedTie,
+      14 => Self::ReceiverChained,
       _ => Self::None,
     }
   }
@@ -148,7 +152,47 @@ impl ResolveReason {
       Self::ReceiverParamTyped => "receiver-param-typed",
       Self::ReceiverFieldTyped => "receiver-field-typed",
       Self::ReceiverTypedTie => "receiver-typed-tie",
+      Self::ReceiverChained => "receiver-chained",
     }
+  }
+}
+
+/// The chained-call return ledger (G-M5): function name → declared return type, both as
+/// interned ids. Built once at link from the per-file capture rows; a name bound to
+/// DISAGREEING return types across the corpus is poisoned out (absent) — conservative by
+/// design, exactly the receiver-typing discipline.
+pub struct ChainReturns<'i> {
+  map: std::collections::HashMap<NameId<'i>, Option<NameId<'i>>>,
+}
+
+impl<'i> ChainReturns<'i> {
+  pub fn build(
+    interner: &'i Interner,
+    rows: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+  ) -> Self {
+    let mut map: std::collections::HashMap<NameId<'i>, Option<NameId<'i>>> =
+      std::collections::HashMap::new();
+    for (name, ret) in rows {
+      let name = interner.intern(name.as_ref());
+      let ret = interner.intern(ret.as_ref());
+      map
+        .entry(name)
+        .and_modify(|slot| {
+          if *slot != Some(ret) {
+            *slot = None; // disagreement → poisoned, forever
+          }
+        })
+        .or_insert(Some(ret));
+    }
+    Self { map }
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.map.is_empty()
+  }
+
+  pub fn get(&self, name: NameId<'i>) -> Option<NameId<'i>> {
+    *self.map.get(&name)?
   }
 }
 
@@ -274,7 +318,7 @@ impl Resolver {
     table: &SymbolTable<'i>,
     reference: &Reference<'i>,
   ) -> Resolution {
-    self.resolve_with(interner, table, reference, &mut ResolveScratch::default())
+    self.resolve_with(interner, table, reference, &mut ResolveScratch::default(), None)
   }
 
   /// [`Resolver::resolve`] with caller-owned scratch buffers — batch resolution reuses one
@@ -286,6 +330,7 @@ impl Resolver {
     table: &SymbolTable<'i>,
     reference: &Reference<'i>,
     scratch: &mut ResolveScratch<'i>,
+    chain: Option<&ChainReturns<'i>>,
   ) -> Resolution {
     let edge = reference.kind.edge();
     if reference.kind == RefKind::Import {
@@ -388,7 +433,29 @@ impl Resolver {
             .copied(),
         );
         match scratch.refined.len() {
-          0 => {}
+          0 => {
+            // Chained-call fallback (G-M5): the "type" may really be a CALLEE NAME
+            // (`let x = make()` records `make`). If the corpus-wide return ledger maps it
+            // to exactly one return type that uniquely narrows, that is the edge; any
+            // ambiguity refuses (inference on inference earns no tie picks).
+            if let Some(ret) = chain.and_then(|c| c.get(receiver_type)) {
+              scratch.refined.extend(
+                candidates.iter().filter(|s| s.owner == Some(ret)).copied(),
+              );
+              if scratch.refined.len() == 1 {
+                let target = scratch.refined[0];
+                return Resolution {
+                  target: Some(target.id),
+                  edge,
+                  confidence: Confidence::TYPE_BOUND,
+                  candidates: candidates.len(),
+                  reason: ResolveReason::ReceiverChained,
+                  alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
+                };
+              }
+              scratch.refined.clear();
+            }
+          }
           1 => {
             let target = scratch.refined[0];
             return Resolution {
@@ -758,7 +825,7 @@ pub fn seed_import_bindings<'i>(
     std::collections::HashMap::new();
   let mut scratch = ResolveScratch::default();
   for reference in qualified_imports {
-    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch);
+    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, None);
     let Some(target) = resolution.target else {
       continue;
     };
@@ -798,7 +865,7 @@ pub fn resolve_all<'i>(
   resolver: &Resolver,
 ) -> (Vec<ResolvedEdge>, ResolveStats) {
   if references.len() <= MIN_REFS_PER_SHARD {
-    let (edges, _unresolved, stats) = resolve_chunk(interner, table, references, resolver);
+    let (edges, _unresolved, stats) = resolve_chunk(interner, table, references, resolver, None);
     return (edges, stats);
   }
   use rayon::prelude::*;
@@ -809,7 +876,7 @@ pub fn resolve_all<'i>(
     .max(MIN_REFS_PER_SHARD);
   let shards: Vec<(Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats)> = references
     .par_chunks(chunk_size)
-    .map(|chunk| resolve_chunk(interner, table, chunk, resolver))
+    .map(|chunk| resolve_chunk(interner, table, chunk, resolver, None))
     .collect();
   // Reserve what actually resolved, not one slot per reference — at kernel scale roughly
   // half of all references yield edges, and the difference is ~80 MB of dead reservation.
@@ -840,6 +907,7 @@ pub fn resolve_all_spilled<'i>(
     table,
     spill,
     resolver,
+    None,
     |edge| edges.push(*edge),
     |_| {},
   )?;
@@ -856,6 +924,7 @@ pub fn resolve_all_spilled_into<'i>(
   table: &SymbolTable<'i>,
   spill: &crate::RefSpill<'i>,
   resolver: &Resolver,
+  chain: Option<&ChainReturns<'i>>,
   mut sink: impl FnMut(&ResolvedEdge),
   mut unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
@@ -882,7 +951,7 @@ pub fn resolve_all_spilled_into<'i>(
         let out_tx = out_tx.clone();
         scope.spawn(move || {
           while let Ok((index, chunk)) = work_rx.recv() {
-            let (edges, unresolved, stats) = resolve_chunk(interner, table, &chunk, resolver);
+            let (edges, unresolved, stats) = resolve_chunk(interner, table, &chunk, resolver, chain);
             if out_tx.send((index, edges, unresolved, stats)).is_err() {
               break;
             }
@@ -948,13 +1017,14 @@ fn resolve_chunk<'i>(
   table: &SymbolTable<'i>,
   references: &[Reference<'i>],
   resolver: &Resolver,
+  chain: Option<&ChainReturns<'i>>,
 ) -> (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats) {
   let mut edges = Vec::new();
   let mut unresolved = Vec::new();
   let mut stats = ResolveStats::default();
   let mut scratch = ResolveScratch::default();
   for reference in references {
-    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch);
+    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, chain);
     let name_hash =
       xxhash_rust::xxh3::xxh3_64(interner.text_of(reference.name).as_bytes()) as u32;
     match resolution.target {

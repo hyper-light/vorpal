@@ -399,6 +399,11 @@ impl OutlineExtractor {
     // never matters (a use-before-assign types identically), so the map is order-free.
     let mut typed: HashMap<&str, Option<(&str, crate::typefacts::BindOrigin)>> = HashMap::new();
     for binding in &bindings {
+      // Return bindings key a FUNCTION's name to its return type — they feed the chained-
+      // call ledger below and must never type a same-named receiver variable.
+      if binding.origin == crate::typefacts::BindOrigin::Return {
+        continue;
+      }
       let Some(ty) = binding.ty.as_deref() else {
         continue;
       };
@@ -439,6 +444,14 @@ impl OutlineExtractor {
       }
       entity_params.extend(by_entity);
     }
+
+    // The chained-call return ledger (v15): function name → declared return type, file-
+    // local rows; the link-time map poisons cross-file disagreements.
+    let returns: Vec<(String, String)> = bindings
+      .iter()
+      .filter(|b| b.origin == crate::typefacts::BindOrigin::Return)
+      .filter_map(|b| Some((b.name.to_string(), b.ty.as_deref()?.to_string())))
+      .collect();
 
     // The single ownership point: names/qualifiers rode through extraction as borrows of
     // `source`; they are copied exactly once, here, into the detachable product.
@@ -492,6 +505,7 @@ impl OutlineExtractor {
       items: items.into_iter().map(product::own_item).collect(),
       refs,
       entity_params,
+      returns,
     })
   }
 }

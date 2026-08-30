@@ -146,7 +146,7 @@ function run(w: Widget) {
 }
 
 #[test]
-fn v14_round_trips_the_new_fields_bit_exactly() {
+fn v15_round_trips_the_new_fields_bit_exactly() {
   let src = "struct W;\nfn run(w: W) {\n    let a: W = mk();\n    a.go(w, 1);\n}\n";
   let mut p = product("t.rs", src);
   p.source_size = 77;

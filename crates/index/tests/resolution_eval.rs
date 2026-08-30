@@ -617,3 +617,78 @@ fn typed_receivers_java_all_origins() {
     absent: &[],
   });
 }
+
+#[test]
+fn chained_call_return_typing() {
+  // G-M5: `let m = make(); m.render()` — the receiver's "type" is really the callee name;
+  // the corpus-wide return ledger (fn name → declared return type, disagreements poisoned)
+  // upgrades it at TYPE_BOUND with its own reason. Inference on inference never tie-picks,
+  // and a poisoned name falls through to the untyped refusal.
+  run(&Fixture {
+    lang: "rust-chained",
+    files: &[
+      (
+        "cw.rs",
+        "pub struct Widget;\nimpl Widget {\n  pub fn render(&self) -> u32 { 1 }\n}\n\
+         pub struct Gadget;\nimpl Gadget {\n  pub fn render(&self) -> u32 { 2 }\n}\n\
+         pub fn make() -> Widget { Widget }\n\
+         pub fn fickle() -> Widget { Widget }\n",
+      ),
+      (
+        "cuse.rs",
+        "use crate::cw::make;\nuse crate::cw::fickle;\n\
+         pub fn c_chained() -> u32 {\n    let m = make();\n    m.render()\n}\n\
+         pub fn c_poisoned() -> u32 {\n    let f = fickle();\n    f.render()\n}\n",
+      ),
+      (
+        // A second `fickle` with a DIFFERENT return type poisons the name corpus-wide.
+        "cnoise.rs",
+        "pub struct Other;\npub fn fickle() -> Other { Other }\n",
+      ),
+    ],
+    expected: &[
+      ("c_chained", "render", "calls", "constrained", "receiver-chained"),
+      // The let-bindings' initializer calls resolve through the imports.
+      ("c_chained", "make", "calls", "constrained", "import-bound"),
+      ("c_poisoned", "fickle", "calls", "constrained", "import-bound"),
+      ("cuse.rs", "make", "imports", "constrained", "qualifier-match"),
+      ("cuse.rs", "fickle", "imports", "constrained", "qualifier-match"),
+      // Return-type annotations are of_type references from the declaring functions.
+      ("make", "Widget", "of_type", "exact", "same-file"),
+      ("fickle", "Widget", "of_type", "exact", "same-file"),
+      ("fickle", "Other", "of_type", "exact", "same-file"),
+    ],
+    absent: &[
+      // fickle() returns Widget in one file, Other in another → poisoned → no upgrade.
+      ("c_poisoned", "render"),
+    ],
+  });
+}
+
+#[test]
+fn chained_call_return_typing_python() {
+  run(&Fixture {
+    lang: "python-chained",
+    files: &[
+      (
+        "cpw.py",
+        "class Widget:\n    def render(self):\n        return 1\n\n\
+         class Gadget:\n    def render(self):\n        return 2\n\n\
+         def mk() -> Widget:\n    return Widget()\n",
+      ),
+      (
+        "cpuse.py",
+        "from cpw import mk\n\n\
+         def p_chained():\n    m = mk()\n    return m.render()\n",
+      ),
+    ],
+    expected: &[
+      ("p_chained", "render", "calls", "constrained", "receiver-chained"),
+      ("p_chained", "mk", "calls", "constrained", "import-bound"),
+      ("cpuse.py", "mk", "imports", "constrained", "qualifier-match"),
+      // mk's body constructs a Widget — a same-file constructor call.
+      ("mk", "Widget", "calls", "exact", "same-file"),
+    ],
+    absent: &[],
+  });
+}

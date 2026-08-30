@@ -34,7 +34,7 @@ use vorpal_resolve::{RefForm, RefKind};
 /// v14 (G-M1): refs carry receiver/receiver-type/args; products carry per-entity params.
 /// The version check itself is this bump's invalidation — v13 bytes never decode, so every
 /// file re-extracts exactly once.
-pub const PRODUCT_FORMAT_VERSION: u32 = 14;
+pub const PRODUCT_FORMAT_VERSION: u32 = 15;
 
 /// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
 pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
@@ -80,6 +80,11 @@ pub struct FileProduct {
   /// Per-entity parameter lists (G-M1): `(local entity index, [(name, type_text?)])`, sorted
   /// by entity index; captured for the typefacts launch languages, empty elsewhere.
   pub entity_params: EntityParams,
+  /// `(function name, declared return type)` — v15, the chained-call return ledger. Name-
+  /// keyed on purpose: link joins it against receiver "types" that are really callee names
+  /// (`let x = make(); x.render()`), poisoning same-named functions with disagreeing
+  /// returns. Only capture languages with a return annotation produce rows.
+  pub returns: Vec<(String, String)>,
 }
 
 /// A reference keyed by its enclosing definition's position in the file's local layout
@@ -469,6 +474,11 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
       }
     }
   }
+  push_u32(buf, product.returns.len() as u32);
+  for (name, ret) in &product.returns {
+    push_str(buf, name);
+    push_str(buf, ret);
+  }
 }
 
 struct Reader<'a> {
@@ -592,6 +602,8 @@ pub struct ProductView<'a> {
   pub refs: Vec<RefView<'a>>,
   /// Per-entity parameter lists, borrowed (see `FileProduct::entity_params`).
   pub entity_params: EntityParamsView<'a>,
+  /// Borrowed twin of `FileProduct::returns` (v15).
+  pub returns: Vec<(&'a str, &'a str)>,
 }
 
 /// One reference occurrence as a borrowed view (see [`ProductRef`] for field semantics).
@@ -954,6 +966,13 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     }
     entity_params.push((entity, params));
   }
+  let return_count = r.count()?;
+  let mut returns = Vec::with_capacity(return_count.min(1024));
+  for _ in 0..return_count {
+    let name = r.str_borrowed()?;
+    let ret = r.str_borrowed()?;
+    returns.push((name, ret));
+  }
   Ok(ProductView {
     source_size,
     source_mtime_ns,
@@ -965,6 +984,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     items,
     refs,
     entity_params,
+    returns,
   })
 }
 
@@ -1067,6 +1087,13 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     }
     entity_params.push((entity, params));
   }
+  let return_count = r.count()?;
+  let mut returns = Vec::with_capacity(return_count.min(1024));
+  for _ in 0..return_count {
+    let name = r.str()?;
+    let ret = r.str()?;
+    returns.push((name, ret));
+  }
   if r.off != bytes.len() {
     return Err(corrupt("trailing bytes after product"));
   }
@@ -1082,6 +1109,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     items,
     refs,
     entity_params,
+    returns,
   })
 }
 

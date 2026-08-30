@@ -177,6 +177,13 @@ pub(crate) struct ParamRec {
   pub(crate) names: Box<[Box<str>]>,
 }
 
+/// One `function name → declared return type` row (G-M5 chained-call typing). Name-keyed —
+/// no id to rebase — and deduplicated/poisoned when the link-time ledger builds.
+pub(crate) struct RetRec {
+  pub(crate) name: Box<str>,
+  pub(crate) ret: Box<str>,
+}
+
 /// Flow-tracing rows a shard hands the absorber beside its references: call-site argument
 /// records and callee parameter ledgers — one struct so the absorb/committer plumbing keeps
 /// a fixed shape as flow data grows.
@@ -184,6 +191,7 @@ pub(crate) struct ParamRec {
 pub(crate) struct FlowSidecar {
   pub(crate) args: Vec<ArgRec>,
   pub(crate) params: Vec<ParamRec>,
+  pub(crate) rets: Vec<RetRec>,
 }
 
 /// Append-only arg spill (staging `.args.spill`): written by the absorber in absorb order,
@@ -372,6 +380,77 @@ impl ParamSpillWriter {
   }
 }
 
+/// Append-only return-ledger spill (`.rets.spill`): (len u8 · name)(len u8 · ret) rows.
+/// Name-keyed, so the absorber never rebases them; the link pass folds them into the
+/// resolver's `ChainReturns` (dedup + disagreement poison there).
+pub(crate) struct RetSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+impl RetSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &RetRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&[rec.name.len() as u8])?;
+    self.file.write_all(rec.name.as_bytes())?;
+    self.file.write_all(&[rec.ret.len() as u8])?;
+    self.file.write_all(rec.ret.as_bytes())?;
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+pub(crate) fn load_ret_spill(
+  path: &std::path::Path,
+  expected: u64,
+) -> io::Result<Vec<(Box<str>, Box<str>)>> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  let mut rows = Vec::with_capacity(expected as usize);
+  let mut off = 0usize;
+  let mut seen = 0u64;
+  while off < bytes.len() {
+    let take = |o: usize, n: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(o..o + n)
+        .ok_or_else(|| io::Error::other("ret spill truncated"))
+    };
+    let name_len = take(off, 1)?[0] as usize;
+    let name = std::str::from_utf8(take(off + 1, name_len)?)
+      .map_err(|_| io::Error::other("ret spill: non-utf8 name"))?;
+    off += 1 + name_len;
+    let ret_len = take(off, 1)?[0] as usize;
+    let ret = std::str::from_utf8(take(off + 1, ret_len)?)
+      .map_err(|_| io::Error::other("ret spill: non-utf8 type"))?;
+    off += 1 + ret_len;
+    rows.push((Box::from(name), Box::from(ret)));
+    seen += 1;
+  }
+  if seen != expected {
+    return Err(io::Error::other(format!(
+      "ret spill holds {seen} records, absorber wrote {expected} — torn scratch"
+    )));
+  }
+  Ok(rows)
+}
+
 /// entity id → ordered parameter names, binary-searched (sorted by entity; one row per
 /// entity — later duplicates for the same id cannot exist because each entity's defining
 /// file lands exactly once per build).
@@ -435,7 +514,7 @@ enum RefSink<'a, 'i> {
   Ram(&'a mut Vec<Reference<'i>>, &'a mut FlowSidecar),
   Spill(
     &'a mut vorpal_resolve::RefSpillWriter<'i>,
-    Option<(&'a mut ArgSpillWriter, &'a mut ParamSpillWriter)>,
+    Option<(&'a mut ArgSpillWriter, &'a mut ParamSpillWriter, &'a mut RetSpillWriter)>,
   ),
 }
 
@@ -463,18 +542,22 @@ impl<'i> RefSink<'_, 'i> {
         references.extend(rebased);
         flow.args.extend(rebased_args);
         flow.params.extend(rebased_params);
+        flow.rets.extend(shard_flow.rets);
         Ok(())
       }
       RefSink::Spill(writer, flow_writers) => {
         for reference in rebased {
           writer.push(&reference)?;
         }
-        if let Some((arg_writer, param_writer)) = flow_writers {
+        if let Some((arg_writer, param_writer, ret_writer)) = flow_writers {
           for rec in rebased_args {
             arg_writer.push(&rec)?;
           }
           for rec in rebased_params {
             param_writer.push(&rec)?;
+          }
+          for rec in &shard_flow.rets {
+            ret_writer.push(rec)?;
           }
         }
         Ok(())
@@ -649,6 +732,18 @@ pub fn link_writer_spilled_with_flows<'i>(
     }
     None => ParamTable::empty(),
   };
+  // The chained-call return ledger (G-M5): name-keyed, disagreements poisoned at build.
+  let chain: Option<vorpal_resolve::ChainReturns<'i>> = match &flow_spill {
+    Some(spill) if spill.rets.1 > 0 => {
+      let rows = load_ret_spill(&spill.rets.0, spill.rets.1)?;
+      Some(vorpal_resolve::ChainReturns::build(interner, rows))
+    }
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.rets.0);
+      None
+    }
+    None => None,
+  };
   let mut flows: Vec<vorpal_kg::DataflowRow> = Vec::new();
   let mut flow_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
   phase_trace("link: table build start");
@@ -671,6 +766,7 @@ pub fn link_writer_spilled_with_flows<'i>(
       &table,
       &spill,
       resolver,
+      chain.as_ref(),
       |edge| {
         writer.add_edge(
           edge.from,
@@ -748,6 +844,7 @@ pub fn link_writer_spilled_with_flows<'i>(
   drop(table);
   drop(arg_join);
   drop(param_table);
+  drop(chain);
   drop(flow_pairs);
   let _ = spill.remove();
   // The link transients (spill chunks + table + arg join) just died — return their pages
@@ -842,9 +939,17 @@ pub(crate) fn apply_product_with_args<'i>(
   product: crate::FileProduct,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
-  flow_out: Option<&mut FlowSidecar>,
+  mut flow_out: Option<&mut FlowSidecar>,
 ) {
-  let crate::FileProduct { items, refs, entity_params, .. } = product;
+  let crate::FileProduct { items, refs, entity_params, returns, .. } = product;
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    for (name, ret) in &returns {
+      flow_out.rets.push(RetRec {
+        name: Box::from(name.as_str()),
+        ret: Box::from(ret.as_str()),
+      });
+    }
+  }
   let entity_params: Vec<(u32, Vec<&str>)> = entity_params
     .iter()
     .map(|(entity, params)| (*entity, params.iter().map(|(name, _)| name.as_str()).collect()))
@@ -885,8 +990,16 @@ pub(crate) fn apply_product_view_with_args<'i>(
   view: &crate::ProductView<'_>,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
-  flow_out: Option<&mut FlowSidecar>,
+  mut flow_out: Option<&mut FlowSidecar>,
 ) {
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    for (name, ret) in &view.returns {
+      flow_out.rets.push(RetRec {
+        name: Box::from(*name),
+        ret: Box::from(*ret),
+      });
+    }
+  }
   let entity_params: Vec<(u32, Vec<&str>)> = view
     .entity_params
     .iter()
@@ -1438,18 +1551,24 @@ where
   let mut arg_writer = ArgSpillWriter::create(&args_path)?;
   let params_path = spill_path.with_extension("params");
   let mut param_writer = ParamSpillWriter::create(&params_path)?;
+  let rets_path = spill_path.with_extension("rets");
+  let mut ret_writer = RetSpillWriter::create(&rets_path)?;
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
     budget_bytes,
     work,
-    RefSink::Spill(&mut spill_writer, Some((&mut arg_writer, &mut param_writer))),
+    RefSink::Spill(
+      &mut spill_writer,
+      Some((&mut arg_writer, &mut param_writer, &mut ret_writer)),
+    ),
     heap_stream_path,
     pack,
   )?;
   let flow_spill = FlowSpill {
     args: arg_writer.finish()?,
     params: param_writer.finish()?,
+    rets: ret_writer.finish()?,
   };
   Ok((writer, spill_writer.finish()?, stats, flow_spill))
 }
@@ -1458,6 +1577,7 @@ where
 pub struct FlowSpill {
   pub(crate) args: (std::path::PathBuf, u64),
   pub(crate) params: (std::path::PathBuf, u64),
+  pub(crate) rets: (std::path::PathBuf, u64),
 }
 
 fn stream_apply_impl<'i, F>(
