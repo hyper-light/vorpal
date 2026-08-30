@@ -13,9 +13,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use vorpal_ingest::{
-  Manifest, OutlineExtractor, PackReader, RetainedIndex, Resolver, cache_file_name,
-  encode_product_into, peek_product_grammar_digest,
+  FileStat, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, RetainedIndex,
+  Resolver, cache_file_name, encode_product_into, peek_product_grammar_digest,
 };
 use vorpal_kg::Kg;
 
@@ -28,9 +30,16 @@ pub enum ProbedPath {
   /// Not an extractable source file: inert for the unchanged check, skipped by the overlay
   /// (unless it was indexed before, which the overlay treats as its own failure signal).
   Unhandled,
-  /// Fresh extraction, encoded. `matches_cache` = byte-identical to the cached product
-  /// outside the stamp window `[8..32)` — the serve-immediately criterion.
-  Extracted { bytes: Vec<u8>, matches_cache: bool },
+  /// Fresh extraction, encoded (stamps zeroed). `matches_cache` = byte-identical to the
+  /// cached product outside the stamp window `[8..32)` — the serve-immediately criterion.
+  /// `size`/`mtime_ns` are the probe-time stat, derived exactly as the manifest scan does —
+  /// they stamp the product and the manifest entry when a served build persists.
+  Extracted {
+    bytes: Vec<u8>,
+    matches_cache: bool,
+    size: u64,
+    mtime_ns: u64,
+  },
   /// Unreadable or unextractable — callers take the full pipeline.
   Failed,
 }
@@ -74,28 +83,42 @@ pub fn probe_extraction(
     } else if !extractor.handles(&key) {
       ProbedPath::Unhandled
     } else {
-      match fs::read_to_string(path) {
-        Err(_) => ProbedPath::Failed,
-        Ok(source) => match extractor.extract_product(&key, &source) {
-          None => ProbedPath::Failed,
-          Some(product) => {
-            let mut bytes = Vec::new();
-            encode_product_into(&product, &mut bytes);
-            let matches_cache = pack
-              .as_ref()
-              .and_then(|p| p.get(&key))
-              .is_some_and(|cached| {
-                bytes.len() == cached.len()
-                  && bytes.len() >= 32
-                  && bytes[0..8] == cached[0..8]
-                  && bytes[32..] == cached[32..]
-              });
-            ProbedPath::Extracted {
-              bytes,
-              matches_cache,
+      // Stat before read — the pipeline's scan-then-parse ordering, same TOCTOU class.
+      let stat = fs::metadata(path).ok().map(|meta| {
+        let mtime_ns = meta
+          .modified()
+          .ok()
+          .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+          .map(|d| d.as_nanos() as u64)
+          .unwrap_or(0);
+        (meta.len(), mtime_ns)
+      });
+      match (stat, fs::read_to_string(path)) {
+        (Some((size, mtime_ns)), Ok(source)) => {
+          match extractor.extract_product(&key, &source) {
+            None => ProbedPath::Failed,
+            Some(product) => {
+              let mut bytes = Vec::new();
+              encode_product_into(&product, &mut bytes);
+              let matches_cache = pack
+                .as_ref()
+                .and_then(|p| p.get(&key))
+                .is_some_and(|cached| {
+                  bytes.len() == cached.len()
+                    && bytes.len() >= 32
+                    && bytes[0..8] == cached[0..8]
+                    && bytes[32..] == cached[32..]
+                });
+              ProbedPath::Extracted {
+                bytes,
+                matches_cache,
+                size,
+                mtime_ns,
+              }
             }
           }
-        },
+        }
+        _ => ProbedPath::Failed,
       }
     };
     per_path.push((path.clone(), probed));
@@ -107,6 +130,10 @@ pub struct LiveOverlay {
   interner: vorpal_ingest::Interner,
   index: RetainedIndex,
   extractor: OutlineExtractor,
+  /// The current tree's manifest, maintained per absorb (probe-time stats) — a served
+  /// build's persistence writes it verbatim, byte-equal to what the pipeline's
+  /// `patch_manifest` would produce from the same stats.
+  manifest: Manifest,
 }
 
 impl LiveOverlay {
@@ -207,6 +234,7 @@ impl LiveOverlay {
       interner,
       index,
       extractor,
+      manifest,
     })
   }
 
@@ -226,8 +254,18 @@ impl LiveOverlay {
           .index
           .apply_file(&self.interner, &key, None)
           .map_err(|err| format!("overlay: retract {key} failed: {err}"))?;
+        self.manifest.remove(&key);
         continue;
       }
+      let stat = fs::metadata(path).ok().map(|meta| {
+        let mtime_ns = meta
+          .modified()
+          .ok()
+          .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+          .map(|d| d.as_nanos() as u64)
+          .unwrap_or(0);
+        (meta.len(), mtime_ns)
+      });
       if !self.extractor.handles(&key) {
         if self.index.contains(&key) {
           return Err(format!("overlay: {key} indexed before but unhandled now"));
@@ -245,6 +283,14 @@ impl LiveOverlay {
         .index
         .apply_file(&self.interner, &key, Some(&bytes))
         .map_err(|err| format!("overlay: apply {key} failed: {err}"))?;
+      let Some((size, mtime_ns)) = stat else {
+        return Err(format!("overlay: stat {key} failed"));
+      };
+      self.manifest.upsert(FileStat {
+        path: key.into_owned(),
+        size,
+        mtime_ns,
+      });
     }
     Ok(())
   }
@@ -260,17 +306,28 @@ impl LiveOverlay {
             .index
             .apply_file(&self.interner, &key, None)
             .map_err(|err| format!("overlay: retract {key} failed: {err}"))?;
+          self.manifest.remove(&key);
         }
         ProbedPath::Unhandled => {
           if self.index.contains(&key) {
             return Err(format!("overlay: {key} indexed before but unhandled now"));
           }
         }
-        ProbedPath::Extracted { bytes, .. } => {
+        ProbedPath::Extracted {
+          bytes,
+          size,
+          mtime_ns,
+          ..
+        } => {
           self
             .index
             .apply_file(&self.interner, &key, Some(bytes))
             .map_err(|err| format!("overlay: apply {key} failed: {err}"))?;
+          self.manifest.upsert(FileStat {
+            path: key.into_owned(),
+            size: *size,
+            mtime_ns: *mtime_ns,
+          });
         }
         ProbedPath::Failed => {
           return Err(format!("overlay: {key} failed extraction"));
@@ -278,6 +335,21 @@ impl LiveOverlay {
       }
     }
     Ok(())
+  }
+
+  /// Record probe-time stats for a stamp-preserving serve (content unchanged, stamps moved):
+  /// no graph work, but the retained manifest must track the tree or a LATER served
+  /// persistence would commit stale stamps and fork the generation id.
+  pub fn note_stamps(&mut self, probe: &ExtractionProbe) {
+    for (path, probed) in &probe.per_path {
+      if let ProbedPath::Extracted { size, mtime_ns, .. } = probed {
+        self.manifest.upsert(FileStat {
+          path: path.to_string_lossy().into_owned(),
+          size: *size,
+          mtime_ns: *mtime_ns,
+        });
+      }
+    }
   }
 
   /// [`LiveOverlay::apply_and_link`], reusing the probe's extractions.
@@ -306,9 +378,124 @@ impl LiveOverlay {
     Ok(kg)
   }
 
+  /// The retained-persist serve path: absorb the probe, link WITH evidence, and hand back
+  /// the served graph plus a [`ServedPersist`] job that commits the generation these
+  /// answers came from — no replay pipeline anywhere. Every artifact is byte-equal to what
+  /// a from-scratch build of this tree commits: graph bytes by the canonical-seal theorem,
+  /// evidence by the edit≡build pin, manifest from the same stats the scan derives, pack
+  /// via the same canonical consolidating writer.
+  pub fn apply_and_link_probed_persisting(
+    &mut self,
+    probe: ExtractionProbe,
+    prior: PathBuf,
+    out: PathBuf,
+  ) -> Result<(Arc<Kg>, ServedPersist), String> {
+    vorpal_kg::phase_stamp("overlay: apply start");
+    self.absorb_probed(&probe)?;
+    let (kg, _stats, evidence) = self
+      .index
+      .link(&self.interner, &Resolver::new())
+      .map_err(|err| format!("overlay: link failed: {err}"))?;
+    vorpal_kg::phase_stamp("overlay: link done");
+    let mut new_products = Vec::new();
+    for (path, probed) in probe.per_path {
+      if let ProbedPath::Extracted {
+        mut bytes,
+        size,
+        mtime_ns,
+        ..
+      } = probed
+      {
+        // Stamp window [8..24): source size and mtime, exactly as the parse branch stamps
+        // from the scan's stats. The xxh3 at [24..32) was stamped by extraction itself.
+        if bytes.len() >= 24 {
+          bytes[8..16].copy_from_slice(&size.to_le_bytes());
+          bytes[16..24].copy_from_slice(&mtime_ns.to_le_bytes());
+        }
+        new_products.push((path.to_string_lossy().into_owned(), bytes));
+      }
+    }
+    let kg = Arc::new(kg);
+    let persist = ServedPersist {
+      kg: kg.clone(),
+      evidence,
+      manifest: self.manifest.clone(),
+      prior,
+      out,
+      new_products,
+    };
+    Ok((kg, persist))
+  }
+
   /// Tombstoned share of the retained rows — the caller's rebuild-the-overlay trigger
   /// (garbage collects the writer tail and resets interner growth).
   pub fn dead_row_fraction(&self) -> f64 {
     self.index.dead_row_fraction()
+  }
+}
+
+/// A served build's persistence tail: everything already computed, only writes remain. Runs
+/// on a daemon background thread; the committed generation is bit-identical to a
+/// from-scratch build of the served tree, so this replaces the full replay pipeline the
+/// canonicalizer used to run (~10+ core-seconds per edit at kernel scale).
+pub struct ServedPersist {
+  kg: Arc<Kg>,
+  evidence: Vec<vorpal_kg::EvidenceRow>,
+  manifest: Manifest,
+  prior: PathBuf,
+  out: PathBuf,
+  new_products: Vec<(String, Vec<u8>)>,
+}
+
+impl ServedPersist {
+  pub fn persist(self) -> Result<PathBuf, String> {
+    let ServedPersist {
+      kg,
+      evidence,
+      manifest,
+      prior,
+      out,
+      new_products,
+    } = self;
+    vorpal_kg::phase_stamp("served persist: start");
+    let staging = out.join("gen").join(format!(
+      ".staging-{}-{}",
+      std::process::id(),
+      crate::staging_nonce()
+    ));
+    fs::create_dir_all(&staging).map_err(|err| format!("served persist: staging: {err}"))?;
+    // Three independent artifact groups write concurrently; the manifest stays last (the
+    // commit point), exactly like the pipeline's tail.
+    let (pack_result, evidence_result, kg_result) = std::thread::scope(|scope| {
+      let pack_task = scope.spawn(|| -> std::io::Result<()> {
+        let reader = PackReader::open(&prior).map(Arc::new);
+        let writer = PackWriter::new(&staging, reader);
+        let sink = writer.sink();
+        for (path, body) in new_products {
+          sink
+            .send(PackMsg { path, body })
+            .map_err(|_| std::io::Error::other("pack sink closed"))?;
+        }
+        drop(sink);
+        writer.finish(manifest.entries().iter().map(|entry| entry.path.clone()))
+      });
+      let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+      let kg_result = kg.save(&staging);
+      (
+        pack_task.join().expect("pack writer panicked"),
+        evidence_task.join().expect("evidence saver panicked"),
+        kg_result,
+      )
+    });
+    pack_result.map_err(|err| format!("served persist: pack: {err}"))?;
+    evidence_result.map_err(|err| format!("served persist: evidence: {err}"))?;
+    kg_result.map_err(|err| format!("served persist: graph: {err}"))?;
+    manifest
+      .save(&staging.join("manifest.bin"))
+      .map_err(|err| format!("served persist: manifest: {err}"))?;
+    let committed = crate::commit_generation(&out, &prior, staging)
+      .map_err(|err| format!("served persist: commit: {err}"))?;
+    vorpal_kg::phase_stamp("served persist: committed");
+    Ok(committed)
   }
 }

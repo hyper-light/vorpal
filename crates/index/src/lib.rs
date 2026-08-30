@@ -1117,12 +1117,12 @@ fn try_stamp_only_cutoff(
 
 /// Process-unique staging suffix: concurrent builds in ONE process (the daemon's background
 /// canonicalizer racing a synchronous rebuild) must never share a staging directory.
-fn staging_nonce() -> u64 {
+pub(crate) fn staging_nonce() -> u64 {
   static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
   NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<PathBuf> {
+pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<PathBuf> {
   // Sweep staging scratch that is not part of the named artifact set (spill files, tmp names)
   // so the generation holds exactly its artifacts.
   for entry in fs::read_dir(&staging)?.flatten() {

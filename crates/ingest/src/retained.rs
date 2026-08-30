@@ -836,26 +836,39 @@ impl RetainedIndex {
     if !want_evidence {
       return Ok((kg, stats, Vec::new()));
     }
+    // Materialize sealed-id evidence copies in parallel per bucket (the saver's canonical
+    // total-order sort makes concatenation order irrelevant): ~7M row clones were ~100ms
+    // serial — the reason the serve path used to skip evidence entirely.
+    use rayon::prelude::*;
+    let lut = &lut;
+    let per_bucket: Vec<Vec<vorpal_kg::EvidenceRow>> = order
+      .par_iter()
+      .filter_map(|bits| self.resolution.get(bits))
+      .map(|bucket| {
+        bucket
+          .evidence
+          .iter()
+          .map(|row| {
+            let mut row = row.clone();
+            debug_assert_ne!(lut[row.from as usize], u32::MAX, "evidence from a dead row");
+            row.from = lut[row.from as usize];
+            if row.to != vorpal_kg::NO_EDGE {
+              debug_assert_ne!(lut[row.to as usize], u32::MAX, "evidence to a dead row");
+              row.to = lut[row.to as usize];
+            }
+            for alt in &mut row.alternatives {
+              debug_assert_ne!(lut[*alt as usize], u32::MAX, "alternative is a dead row");
+              *alt = lut[*alt as usize];
+            }
+            row
+          })
+          .collect()
+      })
+      .collect();
     let mut evidence: Vec<vorpal_kg::EvidenceRow> =
-      Vec::with_capacity(order.iter().filter_map(|bits| self.resolution.get(bits)).map(|b| b.evidence.len()).sum());
-    for bits in order {
-      let Some(bucket) = self.resolution.get(bits) else {
-        continue;
-      };
-      for row in &bucket.evidence {
-        let mut row = row.clone();
-        debug_assert_ne!(lut[row.from as usize], u32::MAX, "evidence from a dead row");
-        row.from = lut[row.from as usize];
-        if row.to != vorpal_kg::NO_EDGE {
-          debug_assert_ne!(lut[row.to as usize], u32::MAX, "evidence to a dead row");
-          row.to = lut[row.to as usize];
-        }
-        for alt in &mut row.alternatives {
-          debug_assert_ne!(lut[*alt as usize], u32::MAX, "alternative is a dead row");
-          *alt = lut[*alt as usize];
-        }
-        evidence.push(row);
-      }
+      Vec::with_capacity(per_bucket.iter().map(Vec::len).sum());
+    for mut bucket in per_bucket {
+      evidence.append(&mut bucket);
     }
     Ok((kg, stats, evidence))
   }

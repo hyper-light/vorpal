@@ -177,6 +177,28 @@ impl Manifest {
   }
 
   /// All scanned files, sorted by path.
+  /// Insert or replace one file's stat (sorted position preserved) — the retained daemon
+  /// keeps its manifest current per apply instead of re-scanning.
+  pub fn upsert(&mut self, stat: FileStat) {
+    match self
+      .entries
+      .binary_search_by(|entry| entry.path.as_str().cmp(stat.path.as_str()))
+    {
+      Ok(i) => self.entries[i] = stat,
+      Err(i) => self.entries.insert(i, stat),
+    }
+  }
+
+  /// Drop one file's entry, if present.
+  pub fn remove(&mut self, path: &str) {
+    if let Ok(i) = self
+      .entries
+      .binary_search_by(|entry| entry.path.as_str().cmp(path))
+    {
+      self.entries.remove(i);
+    }
+  }
+
   pub fn entries(&self) -> &[FileStat] {
     &self.entries
   }

@@ -110,6 +110,16 @@ pub struct Server {
 /// daemon on the replay pipeline for every semantic edit — the escape hatch while the
 /// overlay earns trust, and the knob for memory-constrained hosts (the overlay retains the
 /// pre-link pipeline state in RAM).
+/// Retained persistence (a served build commits its own generation — no replay pipeline in
+/// the background) is on by default; `VORPAL_NO_RETAINED_PERSIST=1` restores the full
+/// hinted canonicalizer build behind every overlay serve.
+fn retained_persist_enabled() -> bool {
+  !matches!(
+    std::env::var("VORPAL_NO_RETAINED_PERSIST").ok().as_deref(),
+    Some("1" | "true" | "yes")
+  )
+}
+
 fn overlay_enabled() -> bool {
   !matches!(
     std::env::var("VORPAL_NO_LIVE_OVERLAY").ok().as_deref(),
@@ -330,7 +340,7 @@ impl Server {
     // One extraction per changed file serves BOTH fast paths: the serve-immediately
     // decision (byte-identical to cached products?) and, failing that, the overlay's
     // absorb — which previously re-extracted the same files.
-    let probe = if let Some(paths) = &hints
+    let mut probe = if let Some(paths) = &hints
       && !paths.is_empty()
       && paths.len() <= 8
       && self.kg.is_some()
@@ -352,6 +362,12 @@ impl Server {
       let src = watch.src().to_path_buf();
       let index_dir = self.index_dir.clone();
       let paths = hints.as_ref().expect("a probe implies captured hints").clone();
+      // The overlay saw no graph change here, but its retained manifest must track the
+      // moved stamps or a LATER served persistence would commit stale ones and fork the
+      // generation id from what a scratch build produces.
+      if let (Some(overlay), Some(probe)) = (self.overlay.as_mut(), probe.as_ref()) {
+        overlay.note_stamps(probe);
+      }
       self.canonicalizing = Some(std::thread::spawn(move || {
         vorpal_index::build_index_watched(&src, &index_dir, &paths).is_ok()
       }));
@@ -365,10 +381,10 @@ impl Server {
     // spawned here commits the very generation these answers came from; ordering holds
     // because both committers are drained first, exactly like the synchronous path.
     if overlay_enabled()
-      && let Some(probe) = &probe
-      && let Some(paths) = &hints
       && self.kg.is_some()
       && self.overlay.is_some()
+      && let Some(probe) = probe.take()
+      && let Some(paths) = &hints
     {
       if let Some(handle) = self.canonicalizing.take() {
         let _ = handle.join();
@@ -377,30 +393,57 @@ impl Server {
       let paths = paths.clone();
       let overlay = self.overlay.as_mut().expect("checked above");
       vorpal_kg::phase_stamp("overlay: serving");
-      match overlay.apply_and_link_probed(probe) {
-        Ok(kg) => {
-          let stale = overlay.dead_row_fraction() > 0.5;
-          self.kg = Some(Arc::new(kg));
-          self.kg_dir = None;
-          let index_dir = self.index_dir.clone();
-          let canon_src = src.clone();
-          self.canonicalizing = Some(std::thread::spawn(move || {
-            vorpal_index::build_index_watched(&canon_src, &index_dir, &paths).is_ok()
-          }));
-          if stale {
-            // Tombstone debt crossed the line: retire this overlay and rebuild it from the
-            // canonical generation in the background (fresh writer, fresh interner).
-            vorpal_kg::phase_stamp("overlay: retired (tombstone debt)");
-            self.overlay = None;
-            self.spawn_overlay_build();
+      if retained_persist_enabled() {
+        // Retained persistence: the served build commits its OWN generation on the
+        // background thread — same bytes a from-scratch build of this tree produces, at a
+        // fraction of the replay pipeline's CPU. All the `persisting` ordering machinery
+        // (drain-before-sync, generation-bound drains, reap→pin→warm→overlay-greenlight)
+        // applies unchanged.
+        let prior = vorpal_kg::resolve_index_dir(&self.index_dir);
+        match overlay.apply_and_link_probed_persisting(probe, prior, self.index_dir.clone()) {
+          Ok((kg, pending)) => {
+            let stale = overlay.dead_row_fraction() > 0.5;
+            self.kg = Some(kg);
+            self.kg_dir = None;
+            self.persisting = Some(std::thread::spawn(move || pending.persist()));
+            if stale {
+              vorpal_kg::phase_stamp("overlay: retired (tombstone debt)");
+              self.overlay = None;
+              self.spawn_overlay_build();
+            }
+            return Ok(());
           }
-          return Ok(());
+          Err(err) => {
+            vorpal_kg::phase_stamp(&format!("overlay: dropped ({err})"));
+            self.overlay = None;
+          }
         }
-        Err(err) => {
-          // Something the overlay cannot absorb exactly (unreadable file, extraction
-          // change, unknown spelling): drop it and take the replay pipeline below.
-          vorpal_kg::phase_stamp(&format!("overlay: dropped ({err})"));
-          self.overlay = None;
+      } else {
+        match overlay.apply_and_link_probed(&probe) {
+          Ok(kg) => {
+            let stale = overlay.dead_row_fraction() > 0.5;
+            self.kg = Some(Arc::new(kg));
+            self.kg_dir = None;
+            let index_dir = self.index_dir.clone();
+            let canon_src = src.clone();
+            self.canonicalizing = Some(std::thread::spawn(move || {
+              vorpal_index::build_index_watched(&canon_src, &index_dir, &paths).is_ok()
+            }));
+            if stale {
+              // Tombstone debt crossed the line: retire this overlay and rebuild it from
+              // the canonical generation in the background (fresh writer, fresh interner).
+              vorpal_kg::phase_stamp("overlay: retired (tombstone debt)");
+              self.overlay = None;
+              self.spawn_overlay_build();
+            }
+            return Ok(());
+          }
+          Err(err) => {
+            // Something the overlay cannot absorb exactly (unreadable file, extraction
+            // change, unknown spelling): drop it and take the replay pipeline below.
+            vorpal_kg::phase_stamp(&format!("overlay: dropped ({err})"));
+            self.overlay = None;
+          }
         }
       }
     }

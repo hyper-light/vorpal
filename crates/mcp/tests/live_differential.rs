@@ -112,7 +112,7 @@ fn watched_daemon_answers_equal_scratch_after_every_edit_class() {
   let index: PathBuf = src.join(".vorpal").join("index");
   vorpal_index::build_index(&src, &index).expect("initial index");
 
-  let mut daemon = Server::new(index);
+  let mut daemon = Server::new(index.clone());
   let mut id = 0u64;
   let mut step = 0usize;
 
@@ -229,6 +229,28 @@ fn watched_daemon_answers_equal_scratch_after_every_edit_class() {
   )
   .unwrap();
   converge_and_compare(&mut daemon, &mut id, &mut step, Some("probe_10"));
+
+  // Generation convergence (the retained-persist pin): once the daemon's background
+  // committers land, its CURRENT must name the SAME content-addressed generation a
+  // from-scratch build of the final tree commits — stamps, pack, evidence, manifest, all
+  // of it, bit for bit. Steady queries nudge the reaps along while we poll.
+  let scratch_out = base.join("final-scratch");
+  vorpal_index::build_index(&src, &scratch_out).expect("final scratch build");
+  let want = fs::read_to_string(scratch_out.join("CURRENT")).expect("scratch CURRENT");
+  let deadline = Instant::now() + Duration::from_secs(30);
+  loop {
+    id += 1;
+    let _ = call_tool(&mut daemon, id, "node", json!({"name": "alpha"}));
+    let got = fs::read_to_string(index.join("CURRENT")).unwrap_or_default();
+    if got == want {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "daemon generation never converged to scratch: got {got:?}, want {want:?}"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+  }
 
   let _ = fs::remove_dir_all(&base);
 }
