@@ -513,6 +513,172 @@ impl KgWriter {
   }
 }
 
+/// One retained file's footprint inside a long-lived writer — everything a canonical-order
+/// seal needs to gather it back out: its contiguous row block, its heap slice, and its
+/// containment edge range. All three are contiguous by construction: `absorb` (and direct
+/// sequential ingest) appends a file's rows, heap bytes, and containment edges as one block.
+#[derive(Debug, Clone)]
+pub struct FileBlock {
+  pub rows: Range<u32>,
+  pub heap: Range<u64>,
+  pub edges: Range<u32>,
+}
+
+impl KgWriter {
+  /// Total edges recorded so far — the containment **watermark** a retained writer captures
+  /// after its last ingest, so each re-link can roll resolution edges back with
+  /// [`KgWriter::truncate_edges`].
+  pub fn edges_len(&self) -> usize {
+    self.edges.len()
+  }
+
+  /// Roll the edge log back to `len` (see [`KgWriter::edges_len`]).
+  pub fn truncate_edges(&mut self, len: usize) {
+    self.edges.truncate(len);
+  }
+
+  /// Seal in **canonical order**: gather only the rows/heap/edges of `blocks` (alive files,
+  /// pre-sorted by path by the caller), renumbering ids densely in that order — the exact
+  /// assignment a from-scratch build of the same live file set produces, so the sealed
+  /// segment, heap, and graph are byte-identical to that build's.
+  ///
+  /// `resolution_edges_from` is the containment watermark: edges before it are per-file
+  /// containment (gathered per block, both endpoints alive by construction); edges at or
+  /// after it are this link's resolution edges (remapped through the same id LUT). The
+  /// tombstoned rows left behind by retract-and-append edits are simply never gathered.
+  pub fn seal_canonical(mut self, blocks: &[FileBlock], resolution_edges_from: usize) -> Kg {
+    crate::phase_stamp("seal-canonical: gather");
+    self.canonical.seal();
+    drop(std::mem::take(&mut self.canonical));
+
+    let total_rows: usize = blocks.iter().map(|b| b.rows.len()).sum();
+    // Old→new id LUT; dead rows keep u32::MAX and must never appear in a surviving edge.
+    let mut lut = vec![u32::MAX; self.kind.len()];
+    let mut next = 0u32;
+    for block in blocks {
+      for old in block.rows.clone() {
+        lut[old as usize] = next;
+        next += 1;
+      }
+    }
+
+    fn gather<T: Copy>(col: &[T], blocks: &[FileBlock], total: usize) -> Vec<T> {
+      let mut out = Vec::with_capacity(total);
+      for block in blocks {
+        out.extend_from_slice(&col[block.rows.start as usize..block.rows.end as usize]);
+      }
+      out
+    }
+
+    // Heap: block-concat in canonical order. Offsets rebase per block by the delta between
+    // the block's old heap base and its new one — within a block every offset is
+    // block-relative-stable (absorb rebased them uniformly when the block landed).
+    let heap_total: usize = blocks.iter().map(|b| (b.heap.end - b.heap.start) as usize).sum();
+    let mut new_heap = Vec::with_capacity(heap_total);
+    let mut heap_delta = Vec::with_capacity(blocks.len());
+    for block in blocks {
+      heap_delta.push(new_heap.len() as i64 - block.heap.start as i64);
+      new_heap
+        .extend_from_slice(&self.heap.bytes()[block.heap.start as usize..block.heap.end as usize]);
+    }
+    let gather_off = |col: &[u32]| -> Vec<u32> {
+      let mut out = Vec::with_capacity(total_rows);
+      for (block, delta) in blocks.iter().zip(&heap_delta) {
+        out.extend(
+          col[block.rows.start as usize..block.rows.end as usize]
+            .iter()
+            .map(|&off| (off as i64 + delta) as u32),
+        );
+      }
+      out
+    };
+
+    let kind = gather(&self.kind, blocks, total_rows);
+    let name_off = gather_off(&self.name_off);
+    let name_len = gather(&self.name_len, blocks, total_rows);
+    let path_off = gather_off(&self.path_off);
+    let path_len = gather(&self.path_len, blocks, total_rows);
+    let sig_off = gather_off(&self.sig_off);
+    let sig_len = gather(&self.sig_len, blocks, total_rows);
+    let content_hash = gather(&self.content_hash, blocks, total_rows);
+    let eid_lo = gather(&self.eid_lo, blocks, total_rows);
+    let eid_hi = gather(&self.eid_hi, blocks, total_rows);
+    let flags = gather(&self.flags, blocks, total_rows);
+    let span_start = gather(&self.span_start, blocks, total_rows);
+    let span_end = gather(&self.span_end, blocks, total_rows);
+    drop(std::mem::take(&mut self.kind));
+    drop(std::mem::take(&mut self.name_off));
+    drop(std::mem::take(&mut self.name_len));
+    drop(std::mem::take(&mut self.path_off));
+    drop(std::mem::take(&mut self.path_len));
+    drop(std::mem::take(&mut self.sig_off));
+    drop(std::mem::take(&mut self.sig_len));
+    drop(std::mem::take(&mut self.content_hash));
+    drop(std::mem::take(&mut self.eid_lo));
+    drop(std::mem::take(&mut self.eid_hi));
+    drop(std::mem::take(&mut self.flags));
+    drop(std::mem::take(&mut self.span_start));
+    drop(std::mem::take(&mut self.span_end));
+    let heap = std::mem::take(&mut self.heap);
+    drop(heap);
+
+    let n = total_rows as u32;
+    let nodes = {
+      let mut builder = SegmentBuilder::new(0);
+      builder.add_u8("kind", &kind).unwrap();
+      builder.add_u32("name_off", &name_off).unwrap();
+      builder.add_u32("name_len", &name_len).unwrap();
+      builder.add_u32("path_off", &path_off).unwrap();
+      builder.add_u32("path_len", &path_len).unwrap();
+      builder.add_u32("sig_off", &sig_off).unwrap();
+      builder.add_u32("sig_len", &sig_len).unwrap();
+      builder.add_u64("content_hash", &content_hash).unwrap();
+      builder.add_u64("eid_lo", &eid_lo).unwrap();
+      builder.add_u64("eid_hi", &eid_hi).unwrap();
+      builder.add_u8("flags", &flags).unwrap();
+      builder.add_u32("span_start", &span_start).unwrap();
+      builder.add_u32("span_end", &span_end).unwrap();
+      Segment::open_owned(builder.build().unwrap()).unwrap()
+    };
+
+    crate::phase_stamp("seal-canonical: edges");
+    // Containment edges per block (scratch order = per-file, path-major), then this link's
+    // resolution edges. Dead-endpoint containment edges cannot exist (blocks only cover
+    // alive rows and containment never crosses files); a dead endpoint in a resolution edge
+    // is an upstream logic error — checked in debug, dropped defensively in release.
+    let mut new_edges = EdgeLog::new();
+    for block in blocks {
+      let (start, end) = (block.edges.start as usize, block.edges.end.min(resolution_edges_from as u32) as usize);
+      for i in start..end {
+        let (src, dst, etype) = self.edges.triple(i);
+        let (s, d) = (lut[src as usize], lut[dst as usize]);
+        debug_assert!(s != u32::MAX && d != u32::MAX, "containment edge touches a dead row");
+        if s != u32::MAX && d != u32::MAX {
+          new_edges.push(s, d, etype);
+        }
+      }
+    }
+    for i in resolution_edges_from..self.edges.len() {
+      let (src, dst, etype) = self.edges.triple(i);
+      let (s, d) = (lut[src as usize], lut[dst as usize]);
+      debug_assert!(s != u32::MAX && d != u32::MAX, "resolution edge touches a dead row");
+      if s != u32::MAX && d != u32::MAX {
+        new_edges.push(s, d, etype);
+      }
+    }
+    drop(std::mem::take(&mut self.edges));
+
+    crate::phase_stamp("seal-canonical: compact");
+    let graph = Graph::compact(n, &new_edges);
+    drop(new_edges);
+
+    let mut directory = SegmentDirectory::new();
+    directory.insert(0, n as u64, 0);
+    Kg::new(nodes, new_heap, graph, directory)
+      .expect("sealed segment carries every column the builder just wrote")
+  }
+}
+
 /// The within-file entity paths for a file's outline, in **layout order**: index 0 is the file
 /// (entity `""`), then each item immediately followed by its members — exactly the order
 /// [`KgWriter::ingest_file_with_spans`] walks and `local_layout` reproduces for reference

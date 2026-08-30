@@ -102,6 +102,19 @@ impl EdgeLog {
     self.etypes.clear();
   }
 
+  /// Truncate to the first `len` edges — the retained-writer link path rolls the log back
+  /// to its containment watermark before re-appending fresh resolution edges.
+  pub fn truncate(&mut self, len: usize) {
+    self.srcs.truncate(len);
+    self.dsts.truncate(len);
+    self.etypes.truncate(len);
+  }
+
+  /// One `(src, dst, etype)` triple by index — random access for range-gathering seals.
+  pub fn triple(&self, index: usize) -> (u32, u32, EdgeType) {
+    (self.srcs[index], self.dsts[index], EdgeType(self.etypes[index]))
+  }
+
   /// Release growth slack (capacity beyond length) back to the allocator.
   pub fn shrink_to_fit(&mut self) {
     self.srcs.shrink_to_fit();

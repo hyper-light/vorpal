@@ -19,7 +19,7 @@ mod writer;
 pub use kg::{Kg, NodeView, SymbolSelector, resolve_index_dir};
 pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
 pub use model::SymbolKind;
-pub use writer::{KgWriter, NodeDef, layout_entity_paths};
+pub use writer::{FileBlock, KgWriter, NodeDef, layout_entity_paths};
 
 pub use vorpal_graph::{Direction, EdgeLog, EdgeType, ReachStep};
 pub use vorpal_segment::NodeId;
