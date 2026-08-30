@@ -383,6 +383,14 @@ impl KgWriter {
     }
   }
 
+  /// A row's durable external id — the halves of `blake3(path, entity_path)` (§2). Stable
+  /// across rebuilds and dense-id shifts, which is exactly what the retained daemon's
+  /// edge-repair pass keys on: an edited file's unchanged entities keep their eid, so edges
+  /// into them heal by eid lookup instead of forcing a re-resolve.
+  pub fn node_eid(&self, row: usize) -> Option<(u64, u64)> {
+    Some((*self.eid_lo.get(row)?, *self.eid_hi.get(row)?))
+  }
+
   /// A row's kind alone — one column byte, no heap-string reads. The owner pass over the
   /// containment edge log needs only this, and paying `definition`'s three heap reads per
   /// edge (~2.75M random reads into the mapped heap at kernel scale) to look at one byte was

@@ -37,6 +37,35 @@ struct FileResolution {
   stats: crate::ResolveStats,
 }
 
+/// One definition row's dirty-set summary. `owner_eid` is the owner's durable eid (None for
+/// top-level rows): owner identity feeds qualified-reference resolution, so an entity moving
+/// between owners must dirty its name even though its own eid, name, kind, and export bit
+/// all survive.
+struct RowSummary {
+  eid: (u64, u64),
+  name_bits: u32,
+  kind_tag: u8,
+  exported: bool,
+  owner_eid: Option<(u64, u64)>,
+  row: u32,
+}
+
+/// What the applies since the last link demand of the next one (a lattice: Clean ⊑ Scoped ⊑
+/// Full — every apply can only move it up).
+enum PendingScope {
+  /// Nothing applied: assemble straight from the existing buckets.
+  Clean,
+  /// Re-resolve only the dirty files: the edited files themselves plus (via the postings)
+  /// every file referencing a name whose candidate set changed.
+  Scoped {
+    dirty_names: std::collections::HashSet<u32>,
+    dirty_files: std::collections::HashSet<u32>,
+  },
+  /// Something scoped reasoning does not cover (import wiring changed, or the state
+  /// predates the first link): recompute every bucket.
+  Full,
+}
+
 /// Retained pipeline state: everything an incremental re-link needs, minus the interner.
 pub struct RetainedIndex {
   writer: KgWriter,
@@ -45,6 +74,15 @@ pub struct RetainedIndex {
   files: BTreeMap<String, FileBlock>,
   /// Path bits → that file's resolution bucket (see [`FileResolution`]).
   resolution: HashMap<u32, FileResolution>,
+  /// Name bits → files whose references mention that name (resolved or not). Stale entries
+  /// are tolerated (they only overapproximate the dirty set); rebuilt by every full link's
+  /// applies... entries accrue at apply time and reset with the overlay.
+  postings: HashMap<u32, Vec<u32>>,
+  /// Dead row → its eid-identical successor row. An edited file's unchanged entities keep
+  /// their durable eid, so edges into their old rows heal by lookup instead of forcing the
+  /// referencing file to re-resolve. Values may themselves die later — lookups chase.
+  repair: HashMap<u32, u32>,
+  pending: PendingScope,
   /// Containment watermark: the edge-log length with NO resolution edges appended. The edge
   /// log holds containment ONLY between links (resolution lives in the buckets), so this
   /// tracks the log length after the latest apply.
@@ -65,6 +103,9 @@ impl RetainedIndex {
       store: RefStore::create(store_path)?,
       files: BTreeMap::new(),
       resolution: HashMap::new(),
+      postings: HashMap::new(),
+      repair: HashMap::new(),
+      pending: PendingScope::Full,
       watermark: 0,
     };
     for (path, bytes) in products {
@@ -81,6 +122,9 @@ impl RetainedIndex {
       store: RefStore::create(store_path)?,
       files: BTreeMap::new(),
       resolution: HashMap::new(),
+      postings: HashMap::new(),
+      repair: HashMap::new(),
+      pending: PendingScope::Full,
       watermark: 0,
     })
   }
@@ -102,6 +146,25 @@ impl RetainedIndex {
       Some(bytes) => self.apply_product_bytes(interner, path, bytes),
       None => {
         let bits = interner.intern(path).to_bits();
+        if let Some(block) = self.files.get(path).cloned() {
+          // Every name this file defined loses a candidate; no successors exist, so edges
+          // into these rows are unrepairable — exactly why their referencers re-resolve.
+          let names: Vec<u32> = self
+            .block_rows(interner, &block)
+            .iter()
+            .map(|row| row.name_bits)
+            .collect();
+          let import_tag = crate::SymbolKind::Import.tag();
+          let had_imports = block
+            .rows
+            .clone()
+            .any(|row| self.writer.node_kind(row as usize).map(crate::SymbolKind::tag) == Some(import_tag));
+          if had_imports {
+            self.escalate_full();
+          } else {
+            self.escalate_scoped(names, bits);
+          }
+        }
         self.files.remove(path);
         self.store.retract_file(bits);
         self.resolution.remove(&bits);
@@ -134,6 +197,11 @@ impl RetainedIndex {
     self.writer.truncate_edges(self.watermark);
     for ((path, _), part) in batch.iter().zip(parts) {
       let (file_writer, mut references) = part?;
+      let bits = interner.intern(path).to_bits();
+      let old_rows = self
+        .files
+        .get(*path)
+        .map(|block| self.block_rows(interner, &block.clone()));
       let rows_start = self.writer.node_count() as u32;
       let heap_start = self.writer.heap_len();
       let edges_start = self.writer.edges_len() as u32;
@@ -147,12 +215,152 @@ impl RetainedIndex {
         edges: edges_start..self.writer.edges_len() as u32,
       };
       self.watermark = self.writer.edges_len();
+      // Dirty-set reasoning (scoped rederive): diff the definition rows by durable eid.
+      let new_rows = self.block_rows(interner, &block);
+      match old_rows {
+        Some(old_rows) => match self.diff_blocks(&old_rows, &new_rows) {
+          Some(dirty) => self.escalate_scoped(dirty, bits),
+          None => self.escalate_full(),
+        },
+        None => {
+          // A brand-new file: nobody holds edges into it yet, so only names it defines can
+          // change candidate sets — unless it wires imports (aliases affect its own refs,
+          // which are re-resolved anyway; conservative on re-exports: escalate).
+          let import_tag = crate::SymbolKind::Import.tag();
+          if new_rows.iter().any(|row| row.kind_tag == import_tag) {
+            self.escalate_full();
+          } else {
+            let names: Vec<u32> = new_rows.iter().map(|row| row.name_bits).collect();
+            self.escalate_scoped(names, bits);
+          }
+        }
+      }
+      // Reference postings for the dirty expansion; per-file dedup keeps rows bounded.
+      let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+      for reference in &references {
+        if seen.insert(reference.name.to_bits()) {
+          self
+            .postings
+            .entry(reference.name.to_bits())
+            .or_default()
+            .push(bits);
+        }
+      }
       self.files.insert((*path).to_string(), block);
-      let bits = interner.intern(path).to_bits();
       self.resolution.remove(&bits);
       self.store.append_file(bits, references.iter())?;
     }
     Ok(())
+  }
+
+  fn block_rows(
+    &self,
+    interner: &vorpal_resolve::Interner,
+    block: &FileBlock,
+  ) -> Vec<RowSummary> {
+    // Containment is per-block: owners come from this block's own edge range.
+    let mut owner_of: HashMap<u32, u32> = HashMap::new();
+    let log = self.writer.edge_log();
+    for i in block.edges.start as usize..(block.edges.end as usize).min(log.len()) {
+      let (src, dst, _) = log.triple(i);
+      if self.writer.node_kind(src as usize) != Some(crate::SymbolKind::File) {
+        owner_of.insert(dst, src);
+      }
+    }
+    let mut out = Vec::with_capacity(block.rows.len());
+    for row in block.rows.clone() {
+      let Some((_, name, _, kind, exported)) = self.writer.definition(row as usize) else {
+        continue;
+      };
+      let Some(eid) = self.writer.node_eid(row as usize) else {
+        continue;
+      };
+      let owner_eid = owner_of
+        .get(&row)
+        .and_then(|&src| self.writer.node_eid(src as usize));
+      out.push(RowSummary {
+        eid,
+        name_bits: interner.intern(name).to_bits(),
+        kind_tag: kind.tag(),
+        exported,
+        owner_eid,
+        row,
+      });
+    }
+    out
+  }
+
+  fn escalate_full(&mut self) {
+    self.pending = PendingScope::Full;
+  }
+
+  fn escalate_scoped(&mut self, names: impl IntoIterator<Item = u32>, file: u32) {
+    match &mut self.pending {
+      PendingScope::Full => {}
+      PendingScope::Scoped {
+        dirty_names,
+        dirty_files,
+      } => {
+        dirty_names.extend(names);
+        dirty_files.insert(file);
+      }
+      PendingScope::Clean => {
+        self.pending = PendingScope::Scoped {
+          dirty_names: names.into_iter().collect(),
+          dirty_files: [file].into_iter().collect(),
+        };
+      }
+    }
+  }
+
+  /// Diff an edited file's old and new definition rows: record eid-identical successors in
+  /// the repair map, and return the names whose CANDIDATE SET changed (added, removed, or
+  /// kind/export-flipped entities). `None` means scoped reasoning cannot cover this edit
+  /// (import wiring changed) and the caller must escalate to Full.
+  fn diff_blocks(&mut self, old_rows: &[RowSummary], new_rows: &[RowSummary]) -> Option<Vec<u32>> {
+    let import_tag = crate::SymbolKind::Import.tag();
+    let mut dirty = Vec::new();
+    let mut new_by_eid: HashMap<(u64, u64), &RowSummary> = HashMap::with_capacity(new_rows.len());
+    for row in new_rows {
+      // Duplicate eids (re-defined identity in one file) are collapsed by the writer's
+      // per-file dedup; last wins here to stay in lockstep.
+      new_by_eid.insert(row.eid, row);
+    }
+    for old in old_rows {
+      match new_by_eid.remove(&old.eid) {
+        Some(new) => {
+          // An import row surviving with identical shape only shifts ids (repairable);
+          // any other import change moves this file's binding targets out of scoped reach.
+          if (old.kind_tag == import_tag || new.kind_tag == import_tag)
+            && (old.kind_tag != new.kind_tag || old.name_bits != new.name_bits)
+          {
+            return None;
+          }
+          self.repair.insert(old.row, new.row);
+          if old.name_bits != new.name_bits
+            || old.kind_tag != new.kind_tag
+            || old.exported != new.exported
+            || old.owner_eid != new.owner_eid
+          {
+            dirty.push(old.name_bits);
+            dirty.push(new.name_bits);
+          }
+        }
+        None => {
+          if old.kind_tag == import_tag {
+            return None;
+          }
+          dirty.push(old.name_bits); // entity removed: its candidate set shrank
+        }
+      }
+    }
+    for (_, new) in new_by_eid {
+      if new.kind_tag == import_tag {
+        return None; // a NEW import alias changes this file's binding targets
+      }
+      dirty.push(new.name_bits); // entity added: its candidate set grew
+    }
+    Some(dirty)
   }
 
   /// Every apply is absorb-based (a batch of one): the retained writer's own canonical
@@ -210,17 +418,74 @@ impl RetainedIndex {
     let qualified = self.store.qualified_imports(interner, order.iter().copied());
     vorpal_resolve::seed_import_bindings(interner, &mut table, &qualified, resolver);
 
-    // Full re-resolve into per-file buckets (v1: every link recomputes every bucket; the
-    // buckets are the substrate scoped rederive will refresh selectively).
-    self.resolution.clear();
-    let stats = {
+    // Scope decision (SUBSECOND.md dirty-bucket rederive): the applies since the last link
+    // recorded which candidate sets changed; expand through the reference postings to every
+    // file whose resolution could differ, and re-resolve ONLY those buckets. Everything
+    // else keeps its bucket, healed by the eid repair map where the edited file's unchanged
+    // entities shifted ids. Past ~a quarter of the corpus the full streaming feed's
+    // efficiency beats per-file scoping (measured shape, not a tuned constant: scoped pays
+    // a repair scan over every retained edge either way) — and any repair miss (a dirty
+    // set the reasoning under-approximated) falls back to a full re-resolve LOUDLY.
+    let pending = std::mem::replace(&mut self.pending, PendingScope::Clean);
+    let alive: std::collections::HashSet<u32> = order.iter().copied().collect();
+    let mut scope: Option<std::collections::HashSet<u32>> = match pending {
+      PendingScope::Clean => Some(std::collections::HashSet::new()),
+      PendingScope::Full => None,
+      PendingScope::Scoped {
+        dirty_names,
+        dirty_files,
+      } => {
+        let mut files = dirty_files;
+        for name in &dirty_names {
+          if let Some(referencers) = self.postings.get(name) {
+            files.extend(referencers.iter().copied());
+          }
+        }
+        files.retain(|bits| alive.contains(bits));
+        if files.len() > 64 && files.len() * 4 > self.files.len() {
+          None
+        } else {
+          Some(files)
+        }
+      }
+    };
+    if let Some(files) = &scope
+      && !files.is_empty()
+      && self.repair_buckets(&blocks, files).is_err()
+    {
+      // A bucket held an edge into a dead row with no successor outside the dirty set:
+      // the scoped reasoning missed a dependency. Recompute everything — correctness is
+      // never negotiable, scoping only ever an optimization.
+      vorpal_kg::phase_stamp("retained: repair miss — full re-resolve");
+      scope = None;
+    }
+    match &scope {
+      None => {
+        vorpal_kg::phase_stamp("retained: full link");
+        self.resolution.clear();
+      }
+      Some(files) => {
+        vorpal_kg::phase_stamp(&format!("retained: scoped link ({} dirty files)", files.len()));
+        for bits in files {
+          self.resolution.remove(bits);
+        }
+      }
+    }
+    let feed: Vec<u32> = match &scope {
+      None => order.clone(),
+      Some(files) => order.iter().copied().filter(|bits| files.contains(bits)).collect(),
+    };
+    if scope.is_none() {
+      self.repair.clear();
+    }
+    let _pump_stats = {
       let resolution = std::cell::RefCell::new(&mut self.resolution);
       let store = &mut self.store;
       vorpal_resolve::resolve_all_store_into(
         interner,
         &table,
         store,
-        order.iter().copied(),
+        feed.iter().copied(),
         resolver,
         |edge| {
           let mut resolution = resolution.borrow_mut();
@@ -277,7 +542,67 @@ impl RetainedIndex {
       )?
     };
     drop(table);
-    self.assemble(&blocks, &order, stats)
+    self.assemble(&blocks, &order)
+  }
+
+  /// Heal untouched buckets in place after an edit: edges (and evidence targets) pointing
+  /// at rows the edit retired follow the eid repair map to their successors. A dead target
+  /// with no successor is only legal in a bucket the dirty set will re-resolve — anywhere
+  /// else it means the dirty reasoning under-approximated, and the caller must recompute in
+  /// full. `dirty` lists the buckets about to be re-resolved (skipped here).
+  fn repair_buckets(
+    &mut self,
+    blocks: &[FileBlock],
+    dirty: &std::collections::HashSet<u32>,
+  ) -> Result<(), ()> {
+    let mut is_alive = vec![false; self.writer.node_count()];
+    for block in blocks {
+      for row in block.rows.clone() {
+        is_alive[row as usize] = true;
+      }
+    }
+    let chase = |mut row: u32| -> Option<u32> {
+      let mut hops = 0;
+      while !is_alive[row as usize] {
+        row = *self.repair.get(&row)?;
+        hops += 1;
+        if hops > 64 {
+          return None; // structurally impossible chain — treat as a miss, never spin
+        }
+      }
+      Some(row)
+    };
+    for (bits, bucket) in &mut self.resolution {
+      if dirty.contains(bits) {
+        continue;
+      }
+      for (from, to, _) in &mut bucket.edges {
+        debug_assert!(is_alive[*from as usize], "untouched bucket sources stay alive");
+        if !is_alive[*to as usize] {
+          match chase(*to) {
+            Some(next) => *to = next,
+            None => return Err(()),
+          }
+        }
+      }
+      for row in &mut bucket.evidence {
+        if row.to != vorpal_kg::NO_EDGE && !is_alive[row.to as usize] {
+          match chase(row.to) {
+            Some(next) => row.to = next,
+            None => return Err(()),
+          }
+        }
+        for alt in &mut row.alternatives {
+          if !is_alive[*alt as usize] {
+            match chase(*alt) {
+              Some(next) => *alt = next,
+              None => return Err(()),
+            }
+          }
+        }
+      }
+    }
+    Ok(())
   }
 
   /// Assemble the sealed graph from the containment blocks + the resolution buckets chained
@@ -288,8 +613,13 @@ impl RetainedIndex {
     &mut self,
     blocks: &[FileBlock],
     order: &[u32],
-    stats: crate::ResolveStats,
   ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
+    let mut stats = crate::ResolveStats::default();
+    for bits in order {
+      if let Some(bucket) = self.resolution.get(bits) {
+        stats += bucket.stats;
+      }
+    }
     let resolution_edges = order.iter().filter_map(|bits| self.resolution.get(bits)).flat_map(|bucket| bucket.edges.iter().copied());
     let (kg, lut) = self.writer.seal_canonical_with(blocks, resolution_edges);
     let mut evidence: Vec<vorpal_kg::EvidenceRow> =
