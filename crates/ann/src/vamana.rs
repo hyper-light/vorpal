@@ -106,6 +106,15 @@ impl VisitStamps {
     };
   }
 
+  /// Stage `v`'s mark slot into cache ahead of the `seen` probe (a random 2-byte load into
+  /// a multi-MB array — the expansion loop's other unhidden memory dependency).
+  #[inline]
+  pub fn prefetch(&self, v: u32) {
+    if let Some(slot) = self.mark.get(v as usize) {
+      vorpal_mem::prefetch::prefetch_read(slot as *const u16 as *const u8);
+    }
+  }
+
   #[inline]
   fn seen(&mut self, v: u32) -> bool {
     let slot = &mut self.mark[v as usize];
@@ -139,30 +148,80 @@ pub(crate) fn greedy_search(
   stamps.begin();
   stamps.seen(medoid);
   // (distance, id, expanded) — kept sorted ascending by (distance, id).
-  let mut beam: Vec<(f32, u32, bool)> = vec![(dist(medoid), medoid, false)];
-  let mut visited: Vec<Scored> = Vec::new();
+  let mut beam: Vec<(f32, u32, bool)> = Vec::with_capacity(l + 1);
+  beam.push((dist(medoid), medoid, false));
+  let mut visited: Vec<Scored> = Vec::with_capacity(l * 3);
+  // Per-expansion admission buffer (see below) — one allocation per search, reused.
+  let mut cand: Vec<(f32, u32)> = Vec::with_capacity(64);
 
-  // Beam is sorted: the first unexpanded entry is the closest one.
-  while let Some(index) = beam.iter().position(|&(_, _, expanded)| !expanded) {
-    beam[index].2 = true;
-    let (dist_next, next, _) = beam[index];
+  // Frontier cursor: entries before `frontier` are all expanded, so the first unexpanded
+  // entry (the (distance, id) minimum among unexpanded — the array is sorted) is found in
+  // O(1) instead of the previous rescan-from-zero (O(beam) per expansion, ~1.7×10¹⁰ flag
+  // reads per kernel-scale build).
+  let mut frontier = 0usize;
+  while frontier < beam.len() {
+    if beam[frontier].2 {
+      frontier += 1;
+      continue;
+    }
+    beam[frontier].2 = true;
+    let (dist_next, next, _) = beam[frontier];
+    frontier += 1;
     visited.push((next, dist_next));
     // The expansion loop is memory-latency-bound (one random ~256 B row per neighbor):
-    // stage the next neighbor's row while the current dot product runs.
+    // stage the upcoming neighbor's codes AND its visit-mark slot while the current dot
+    // product runs (the mark probe is a random load into a multi-MB array — unprefetched,
+    // it stalled ahead of every distance).
     let row = graph.row(next);
+    cand.clear();
     for (i, &nb) in row.iter().enumerate() {
       if let Some(&ahead) = row.get(i + 1) {
         prefetch(ahead);
+        stamps.prefetch(ahead);
       }
       if stamps.seen(nb) {
         continue;
       }
-      let d = dist(nb);
-      let at = beam.partition_point(|&(bd, bv, _)| (bd, bv) < (d, nb));
-      if at < l {
-        beam.insert(at, (d, nb, false));
-        beam.truncate(l);
+      cand.push((dist(nb), nb));
+    }
+    if cand.is_empty() {
+      continue;
+    }
+    // Batch admission: sort this expansion's candidates once and set_union-merge them into
+    // the sorted beam in one pass — replacing up to R separate binary-search + O(beam)
+    // memmove inserts. The result is the l smallest (distance, id) entries of
+    // old-beam ∪ candidates, exactly what the sequential inserts produced (each sequential
+    // insert kept the running l-minimum; admission or eviction order cannot change the
+    // final set, and ties cannot exist — ids are unique).
+    cand.sort_unstable_by(|a, b| (a.0, a.1).partial_cmp(&(b.0, b.1)).unwrap());
+    let old = std::mem::replace(&mut beam, Vec::with_capacity(l + 1));
+    let mut oi = 0usize;
+    let mut ci = 0usize;
+    let mut first_new: Option<usize> = None;
+    while beam.len() < l && (oi < old.len() || ci < cand.len()) {
+      let take_new = match (old.get(oi), cand.get(ci)) {
+        (Some(&(od, ov, _)), Some(&(cd, cv))) => (cd, cv) < (od, ov),
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (None, None) => unreachable!(),
+      };
+      if take_new {
+        if first_new.is_none() {
+          first_new = Some(beam.len());
+        }
+        let (cd, cv) = cand[ci];
+        beam.push((cd, cv, false));
+        ci += 1;
+      } else {
+        beam.push(old[oi]);
+        oi += 1;
       }
+    }
+    // A new entry landing before the cursor reopens the expanded prefix at its position.
+    if let Some(at) = first_new
+      && at < frontier
+    {
+      frontier = at;
     }
   }
   visited
@@ -223,6 +282,10 @@ impl Vamana {
     // under immediate-decay jemalloc — ~700k minor faults per kernel-scale build.
     let stamp_pool: std::sync::Mutex<Vec<VisitStamps>> = std::sync::Mutex::new(Vec::new());
     for alpha in [params.alpha] {
+      // Round-reused transpose scratch (n-sized; zeroed per round — a memset, not an alloc).
+      let mut counts: Vec<u32> = vec![0; n];
+      let mut offsets: Vec<u32> = vec![0; n + 1];
+      let mut cursors: Vec<u32> = vec![0; n];
       let mut start = 0usize;
       let mut round = 1usize;
       while start < n {
@@ -276,25 +339,46 @@ impl Vamana {
           flat[at..at + pruned.len()].copy_from_slice(pruned);
           lens[*p as usize] = pruned.len() as u8;
         }
-        let mut additions: std::collections::HashMap<u32, Vec<u32>> =
-          std::collections::HashMap::new();
-        for (p, pruned) in &proposals {
+        // Back-edge transpose by counting scatter — no hash map, no per-target Vec, no
+        // sort: count per target, prefix-sum ascending target ids (reproducing the sorted
+        // order the HashMap+sort form produced), then scatter sources in proposal order
+        // (reproducing each target's batch-order incoming list). The previous form pushed
+        // ~n·R entries through a std HashMap single-threaded — the build's measured
+        // serial-merge stall.
+        counts[..].fill(0);
+        for (_, pruned) in &proposals {
           for &b in pruned {
-            additions.entry(b).or_default().push(*p);
+            counts[b as usize] += 1;
           }
         }
-        let mut targets: Vec<(u32, Vec<u32>)> = additions.into_iter().collect();
-        targets.sort_unstable_by_key(|(b, _)| *b);
+        let mut total = 0u32;
+        for b in 0..n {
+          offsets[b] = total;
+          total += counts[b];
+        }
+        offsets[n] = total;
+        let mut incoming_flat: Vec<u32> = vec![0; total as usize];
+        cursors[..n].copy_from_slice(&offsets[..n]);
+        for (p, pruned) in &proposals {
+          for &b in pruned {
+            let slot = cursors[b as usize];
+            incoming_flat[slot as usize] = *p;
+            cursors[b as usize] = slot + 1;
+          }
+        }
+        let touched: Vec<u32> = (0..n as u32).filter(|&b| counts[b as usize] > 0).collect();
         // One prune per target per round: additions append in batch order, then a single
         // robust prune bounds the degree — pruning once over the union keeps the same
         // α-domination guarantee as pruning per addition, at a fraction of the distance
         // work (targets in a big round receive many back-edges).
-        let merged: Vec<(u32, Vec<u32>)> = targets
+        let merged: Vec<(u32, Vec<u32>)> = touched
           .into_par_iter()
-          .map(|(b, incoming)| {
+          .map(|b| {
+            let incoming =
+              &incoming_flat[offsets[b as usize] as usize..offsets[b as usize + 1] as usize];
             let at = b as usize * params.r;
             let mut neighbors: Vec<u32> = flat[at..at + lens[b as usize] as usize].to_vec();
-            for p in incoming {
+            for &p in incoming {
               if !neighbors.contains(&p) {
                 neighbors.push(p);
               }

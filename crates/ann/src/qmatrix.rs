@@ -134,7 +134,16 @@ impl QuantMatrix {
   /// Stage row `i`'s codes into cache (the beam loop's next-neighbor prefetch).
   #[inline]
   pub fn prefetch_row(&self, i: u32) {
-    vorpal_mem::prefetch_read(self.codes[i as usize * self.padded..].as_ptr());
+    // The whole row, not just its first cache line: a 256-byte row spans 2 lines on Apple
+    // Silicon (128 B) and 4 on x86 (64 B); prefetching at a 64 B stride covers both layouts
+    // (a second hint into an already-staged 128 B line is a no-op).
+    let base = self.codes[i as usize * self.padded..].as_ptr();
+    let mut off = 0usize;
+    while off < self.padded {
+      // SAFETY: `base + off` stays inside row `i`'s `padded`-byte allocation.
+      vorpal_mem::prefetch_read(unsafe { base.add(off) });
+      off += 64;
+    }
   }
 
   /// Squared L2 between dequantized rows `a` and `b`.
