@@ -12,6 +12,7 @@ version.workspace = true
 
 [dependencies]
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+rustc-hash = "2.1.2"
 crossbeam-channel.workspace = true
 rayon.workspace = true
 vorpal-kg.workspace = true

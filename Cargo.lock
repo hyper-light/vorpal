@@ -3653,7 +3653,6 @@ dependencies = [
  "vorpal-core",
  "vorpal-dynamic",
  "vorpal-index",
- "vorpal-lang-registry",
  "vorpal-language",
  "vorpal-loader",
  "vorpal-lsp",
@@ -3762,7 +3761,6 @@ dependencies = [
  "rayon",
  "vorpal-core",
  "vorpal-kg",
- "vorpal-lang-registry",
  "vorpal-language",
  "vorpal-mem",
  "vorpal-outline",
@@ -3781,22 +3779,6 @@ dependencies = [
  "vorpal-mem",
  "vorpal-outline",
  "vorpal-segment",
- "xxhash-rust",
-]
-
-[[package]]
-name = "vorpal-lang-registry"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "ignore",
- "serde",
- "serde_yaml",
- "tree-sitter",
- "vorpal-config",
- "vorpal-core",
- "vorpal-dynamic",
- "vorpal-language",
  "xxhash-rust",
 ]
 
@@ -3880,7 +3862,6 @@ dependencies = [
  "vorpal-config",
  "vorpal-core",
  "vorpal-index",
- "vorpal-ingest",
  "vorpal-kg",
  "vorpal-language",
 ]
