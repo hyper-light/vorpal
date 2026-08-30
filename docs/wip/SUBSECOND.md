@@ -339,6 +339,21 @@ size-less → 8B header or usable-size query); (b) per-parse bump arena reset at
 tcache tuning as a zero-code floor probe. Allocation COUNTS are the contention-immune
 gate metric; wall-clock confirmation deferred to a quiet machine.
 
+## CLI one-file incremental — phase attribution 2026-08-30 (kernel, 1.07-1.13s wall)
+
+Honest breakdown of the streamed replay path (VORPAL_PHASE_TRACE, one C file edited):
+manifest stat sweep **153ms** (already 16-way parallel ignore-walker with per-thread
+flush — near the macOS stat floor at 72k files); stream admission+replay **363ms**
+(72,540 pack products through zero-copy view decode+apply at ~5µs/file, 18-way);
+absorb tail **174ms** (sequential single-writer splice — the determinism anchor);
+resolve **174ms** (2.17M references, parallel); seal 43ms; evidence+kg save 82ms
+(concurrent); content-id hash 33ms; commit/pack tail ~100ms. Every bucket is parallel
+and tight; the stateless CLI's floor is ~1s because it must re-APPLY every product and
+re-link the whole graph — the daemon's retained state is the designed escape (135ms
+edit→answer), and patchable sealed columns are the Phase-4 format question below.
+Also fixed the same day: daemon↔CLI alternation used to re-parse the world (path
+spelling split, see "one tree, one spelling" commit) — interop now replays 72,540/72,541.
+
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
 The consensus lesson from Glean/SCIP/stack-graphs/Kythe: identity must be file-local or
