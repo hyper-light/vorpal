@@ -28,6 +28,8 @@ use vorpal_language::SupportLang;
 use vorpal_resolve::{RefForm, RefKind};
 
 type SgNode<'t> = Node<'t, StrDoc<SgLang>>;
+/// The walk's node type, exported for the typefacts capture module (same doc, same lifetime).
+pub(crate) type SgNodeAlias<'t> = SgNode<'t>;
 
 /// One extracted reference, file-locally attributed: `from` indexes the file's local
 /// definition layout (see `local_layout`). Deliberately path-free — the enclosing file's path
@@ -44,6 +46,37 @@ pub(crate) struct RawRef<'t> {
   pub(crate) form: RefForm,
   /// Aliased-import local rebinding (`as z`), when the grammar provides one.
   pub(crate) alias: Option<Cow<'t, str>>,
+  /// The receiver's SIMPLE spelling for method-form calls (`x.helper()` → `x`), captured
+  /// only when the receiver is a bare name a file-local binding could type (G-M1). Complex
+  /// receiver expressions stay `None` — never guessed at.
+  pub(crate) receiver: Option<Cow<'t, str>>,
+  /// Per-argument records at the call site (G-M1, consumed by data-flow in G-M3).
+  pub(crate) args: Vec<RawArg<'t>>,
+}
+
+/// One call-site argument: position, traceability class, keyword name (Python), and — for
+/// traceable classes only — the expression text capped at 64 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawArg<'t> {
+  pub(crate) index: u16,
+  pub(crate) class: ArgClass,
+  pub(crate) kw_name: Option<Cow<'t, str>>,
+  pub(crate) expr: Option<Cow<'t, str>>,
+}
+
+/// Argument shape classification — what a static data-flow pass can and cannot follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgClass {
+  /// A bare variable name: traceable.
+  Var = 0,
+  /// A field/member access chain: traceable as an access path.
+  FieldAccess = 1,
+  /// The result of a nested call: traceable one hop (the producing call).
+  CallResult = 2,
+  /// A literal: a value, not a flow.
+  Literal = 3,
+  /// Anything else (arithmetic, closures, comprehensions …): opaque.
+  Other = 4,
 }
 
 impl<'t> RawRef<'t> {
@@ -51,6 +84,8 @@ impl<'t> RawRef<'t> {
     Self {
       from,
       name,
+      receiver: None,
+      args: Vec::new(),
       kind,
       start,
       end,
@@ -1140,6 +1175,26 @@ pub(crate) fn builtin_specs_for_test() -> Vec<(String, RefSpecData)> {
     .collect()
 }
 
+/// Kind-id-resolved typefact tables, process-wide (G-M1) — beside the ref specs so both
+/// resolve exactly once against the same grammars.
+static RESOLVED_TYPEFACTS: LazyLock<HashMap<SgLang, crate::typefacts::ResolvedTypeFacts>> =
+  LazyLock::new(|| {
+    use SupportLang as L;
+    [L::Rust, L::Python, L::TypeScript, L::Tsx]
+      .into_iter()
+      .filter(|lang| lang.is_enabled())
+      .map(SgLang::from)
+      .filter_map(|lang| {
+        let spec = crate::typefacts::type_spec(lang)?;
+        Some((lang, crate::typefacts::ResolvedTypeFacts::build(lang, spec)))
+      })
+      .collect()
+  });
+
+pub(crate) fn resolved_typefacts(lang: SgLang) -> Option<&'static crate::typefacts::ResolvedTypeFacts> {
+  RESOLVED_TYPEFACTS.get(&lang)
+}
+
 /// The kind-id-resolved extraction spec for `lang`, if it has one.
 pub(crate) fn resolved_ref_spec(lang: SgLang) -> Option<&'static ResolvedRefSpec> {
   RESOLVED_SPECS.get(&lang)
@@ -1194,7 +1249,7 @@ pub(crate) fn ref_spec(lang: SgLang) -> Option<&'static RefSpec> {
 /// repo). The answer is still "minimum-length span containing the offset" — computed over the
 /// (tiny) active set, which by the monotonic contract equals the containing set — so the
 /// semantics match the specification implementation's linear scan for any span shape.
-struct SpanCursor<'a> {
+pub(crate) struct SpanCursor<'a> {
   spans: &'a [(Range<usize>, NodeId)],
   /// Next span (spans are in document order) not yet considered for activation.
   next: usize,
@@ -1203,7 +1258,7 @@ struct SpanCursor<'a> {
 }
 
 impl<'a> SpanCursor<'a> {
-  fn new(spans: &'a [(Range<usize>, NodeId)]) -> Self {
+  pub(crate) fn new(spans: &'a [(Range<usize>, NodeId)]) -> Self {
     Self {
       spans,
       next: 0,
@@ -1213,7 +1268,7 @@ impl<'a> SpanCursor<'a> {
 
   /// The innermost definition containing `offset`. Offsets must be non-decreasing across
   /// calls (the walk's document order guarantees this).
-  fn enclosing(&mut self, offset: usize) -> Option<NodeId> {
+  pub(crate) fn enclosing(&mut self, offset: usize) -> Option<NodeId> {
     while let Some(&top) = self.active.last() {
       if self.spans[top].0.end <= offset {
         self.active.pop();
@@ -1255,12 +1310,28 @@ enum Pending<'t> {
 /// implements / call handling, and type-parameter binder collection rides the same walk
 /// instead of a second full pass. `entities` maps each local definition id in `def_spans` to
 /// its entity path — the source of enclosing-owner names for `self.`/`Self::` attribution.
+#[cfg_attr(not(test), allow(dead_code))] // the thin no-facts wrapper is the test harness's surface
 pub(crate) fn extract_references<'t>(
   root: SgNode<'t>,
   resolved: &ResolvedRefSpec,
   def_spans: &[(Range<usize>, NodeId)],
   entities: &[String],
   out: &mut Vec<RawRef<'t>>,
+) {
+  extract_references_with_facts(root, resolved, None, def_spans, entities, out, &mut Vec::new());
+}
+
+/// [`extract_references`] with type-fact capture riding the SAME dfs (G-M1): binding sites
+/// dispatch through the resolved typefact table exactly like reference sites dispatch through
+/// the chain table — one walk, two outputs.
+pub(crate) fn extract_references_with_facts<'t>(
+  root: SgNode<'t>,
+  resolved: &ResolvedRefSpec,
+  typefacts: Option<&crate::typefacts::ResolvedTypeFacts>,
+  def_spans: &[(Range<usize>, NodeId)],
+  entities: &[String],
+  out: &mut Vec<RawRef<'t>>,
+  bindings: &mut Vec<crate::typefacts::RawBinding<'t>>,
 ) {
   let spec = &*resolved.spec;
   // Generic type-parameter binders: (declaring item's span, binder name). Mentions of a binder
@@ -1282,6 +1353,11 @@ pub(crate) fn extract_references<'t>(
       continue;
     }
     let kind_id = node.kind_id();
+    if let Some(facts) = typefacts {
+      if let Some(bind) = facts.arm(kind_id) {
+        crate::typefacts::capture_at(bind, &node, bindings);
+      }
+    }
     if resolved.declares_type_params(kind_id) {
       collect_binders_in(&node, &mut binders);
     }
@@ -1356,7 +1432,17 @@ pub(crate) fn extract_references<'t>(
           }
           None => {
             if let Some(from) = span_cursor.enclosing(range.start) {
-              let (form, qualifier) = classify_call(&node, cspec, &callee, spec, entities, from);
+              let (form, qualifier, receiver) =
+                classify_call(&node, cspec, &callee, spec, entities, from);
+              // Receiver/arg extras are persisted to feed typed-receiver resolution and
+              // data-flow; languages without capture tables would carry them as dead pack
+              // weight (measured on the kernel's C: +33% pack, +7% cold) — so capture is
+              // exactly as wide as the typefacts launch set.
+              let (receiver, args) = if typefacts.is_some() {
+                (receiver, capture_args(&node))
+              } else {
+                (None, Vec::new())
+              };
               pending.push(Pending::Ready(RawRef {
                 from,
                 name,
@@ -1366,6 +1452,8 @@ pub(crate) fn extract_references<'t>(
                 qualifier,
                 form,
                 alias: None,
+                receiver,
+                args,
               }));
             }
           }
@@ -1416,7 +1504,7 @@ fn classify_call<'t>(
   spec: &RefSpecData,
   entities: &[String],
   from: NodeId,
-) -> (RefForm, Option<Cow<'t, str>>) {
+) -> (RefForm, Option<Cow<'t, str>>, Option<Cow<'t, str>>) {
   let owner = || owner_of_entity(entities, from).map(Cow::Owned);
   let qualifier_of = |node: &SgNode<'t>| -> Option<Cow<'t, str>> {
     let text = callee_name(node).or_else(|| {
@@ -1433,29 +1521,122 @@ fn classify_call<'t>(
   // Call-node-level fields first (Java/PHP/Ruby put receiver/scope beside the callee).
   if let Some(scope_field) = &cspec.scope_field {
     if let Some(scope) = call.field(scope_field.as_str()) {
-      return (RefForm::Static, qualifier_of(&scope));
+      return (RefForm::Static, qualifier_of(&scope), None);
     }
   }
   if let Some(receiver_field) = &cspec.receiver_field {
     if let Some(receiver) = call.field(receiver_field.as_str()) {
-      return classify_receiver(&receiver, spec, owner);
+      let (form, qualifier) = classify_receiver(&receiver, spec, owner);
+      return (form, qualifier, simple_receiver_text(&receiver));
     }
-    return (RefForm::Bare, None);
+    return (RefForm::Bare, None, None);
   }
 
   let callee_kind_cow = callee.kind();
   let callee_kind = callee_kind_cow.as_ref();
   if spec.static_callee_kinds.iter().any(|k| k.as_str() == callee_kind) {
     let scope = callee.field("path").or_else(|| callee.field("scope"));
-    return (RefForm::Static, scope.as_ref().and_then(qualifier_of));
+    return (RefForm::Static, scope.as_ref().and_then(qualifier_of), None);
   }
   if spec.method_callee_kinds.iter().any(|k| k.as_str() == callee_kind) {
     return match RECEIVER_FIELDS.iter().find_map(|f| callee.field(f)) {
-      Some(receiver) => classify_receiver(&receiver, spec, owner),
-      None => (RefForm::Method, None),
+      Some(receiver) => {
+        let (form, qualifier) = classify_receiver(&receiver, spec, owner);
+        let simple = simple_receiver_text(&receiver);
+        (form, qualifier, simple)
+      }
+      None => (RefForm::Method, None, None),
     };
   }
-  (RefForm::Bare, None)
+  (RefForm::Bare, None, None)
+}
+
+/// The receiver's spelling when — and only when — it is a bare simple name a file-local
+/// binding could type (`x` in `x.helper()`); anything structured returns `None`.
+fn simple_receiver_text<'t>(receiver: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  let kind_cow = receiver.kind();
+  if !LEAF_KINDS.contains(&kind_cow.as_ref()) {
+    return None;
+  }
+  let text = receiver.text();
+  (!text.is_empty() && text.len() <= 64 && !text.contains(char::is_whitespace)).then_some(text)
+}
+
+/// Per-argument capture at a call node (G-M1): position, traceability class, keyword name,
+/// and — for traceable classes — the expression text capped at 64 bytes. The container is
+/// found the same way `first_argument` finds it; a call with no discoverable container
+/// yields no records (counted nowhere because there is nothing to count — absence of an
+/// arguments node is a grammar shape, not a skip).
+fn capture_args<'t>(call: &SgNode<'t>) -> Vec<RawArg<'t>> {
+  let container = call.field("arguments").or_else(|| {
+    call.children().find(|c| {
+      matches!(
+        c.kind().as_ref(),
+        "arguments" | "argument_list" | "call_suffix"
+      )
+    })
+  });
+  let Some(container) = container else {
+    return Vec::new();
+  };
+  let mut args = Vec::new();
+  for (index, child) in container.children().filter(|c| c.is_named()).enumerate() {
+    if index > u16::MAX as usize {
+      break;
+    }
+    let (node, kw_name) = keyword_split(&child);
+    let class = classify_arg(&node);
+    let expr = match class {
+      ArgClass::Var | ArgClass::FieldAccess => {
+        let text = node.text();
+        (text.len() <= 64).then(|| text.clone())
+      }
+      // A CallResult's producing call is ITSELF an extracted reference at this same span —
+      // the link stage joins by span; duplicating its text measured as pure pack weight.
+      ArgClass::CallResult | ArgClass::Literal | ArgClass::Other => None,
+    };
+    args.push(RawArg {
+      index: index as u16,
+      class,
+      kw_name,
+      expr,
+    });
+  }
+  args
+}
+
+/// Split a keyword-argument wrapper (`f(x=1)` → name `x`, value node) where the grammar has
+/// one; everything else passes through.
+fn keyword_split<'t>(node: &SgNode<'t>) -> (SgNode<'t>, Option<Cow<'t, str>>) {
+  if matches!(node.kind().as_ref(), "keyword_argument" | "named_argument") {
+    let name = node.field("name").map(|n| n.text());
+    if let Some(value) = node.field("value") {
+      return (value, name);
+    }
+  }
+  (node.clone(), None)
+}
+
+fn classify_arg(node: &SgNode<'_>) -> ArgClass {
+  let kind_cow = node.kind();
+  let kind = kind_cow.as_ref();
+  if LEAF_KINDS.contains(&kind) {
+    return ArgClass::Var;
+  }
+  if DESCEND_KINDS.contains(&kind) || kind.contains("field") || kind.contains("member") {
+    return ArgClass::FieldAccess;
+  }
+  if kind.contains("call") || kind == "application_expression" || kind == "invocation" {
+    return ArgClass::CallResult;
+  }
+  if kind.contains("literal")
+    || kind.contains("string")
+    || kind.contains("number")
+    || matches!(kind, "integer" | "float" | "true" | "false" | "nil" | "none" | "atom")
+  {
+    return ArgClass::Literal;
+  }
+  ArgClass::Other
 }
 
 /// Classify a member-access receiver (Java `obj.m()` / Python `Foo.bar()` / Rust
@@ -1703,6 +1884,8 @@ fn emit_imports<'t>(
         qualifier,
         form,
         alias: import_alias(&target),
+        receiver: None,
+        args: Vec::new(),
       }));
     }
   }
@@ -2244,6 +2427,8 @@ mod tests {
                 end: range.end as u32,
                 qualifier,
                 form,
+                receiver: None,
+                args: Vec::new(),
                 alias: import_alias(&target),
               });
             }
@@ -2391,7 +2576,8 @@ mod tests {
         }
         None => {
           if let Some(from) = enclosing(def_spans, range.start) {
-            let (form, qualifier) = classify_call(&node, cspec, &callee, spec, entities, from);
+            let (form, qualifier, receiver) =
+              classify_call(&node, cspec, &callee, spec, entities, from);
             out.push(RawRef {
               from,
               name,
@@ -2401,6 +2587,8 @@ mod tests {
               qualifier,
               form,
               alias: None,
+              receiver,
+              args: capture_args(&node),
             });
           }
         }

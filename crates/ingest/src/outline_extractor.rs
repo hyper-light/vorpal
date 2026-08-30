@@ -19,7 +19,7 @@ use vorpal_resolve::Reference;
 
 use crate::pipeline::FileExtractor;
 use crate::product::{self, FileProduct, ProductRef};
-use crate::references::{extract_references, ref_spec, resolved_ref_spec};
+use crate::references::{extract_references_with_facts, ref_spec, resolved_ref_spec};
 
 type LangExtractors = HashMap<SgLang, CombinedExtractors<SgLang>>;
 
@@ -359,8 +359,17 @@ impl OutlineExtractor {
     let (entities, spans) = local_layout(&items);
 
     let mut raw = Vec::new();
+    let mut bindings = Vec::new();
     if let Some(spec) = spec {
-      extract_references(grep.root(), spec, &spans, &entities, &mut raw);
+      extract_references_with_facts(
+        grep.root(),
+        spec,
+        crate::references::resolved_typefacts(lang),
+        &spans,
+        &entities,
+        &mut raw,
+        &mut bindings,
+      );
     }
     for sub in &injected {
       let sub_lang = *sub.root().lang();
@@ -369,7 +378,15 @@ impl OutlineExtractor {
         .get(&sub_lang)
         .or_else(|| resolved_ref_spec(sub_lang))
       {
-        extract_references(sub.root(), sub_spec, &spans, &entities, &mut raw);
+        extract_references_with_facts(
+          sub.root(),
+          sub_spec,
+          crate::references::resolved_typefacts(sub_lang),
+          &spans,
+          &entities,
+          &mut raw,
+          &mut bindings,
+        );
       }
     }
     if !injected.is_empty() {
@@ -377,19 +394,84 @@ impl OutlineExtractor {
       // normalize); untouched for injection-free files.
       raw.sort_by_key(|r| (r.start, r.end));
     }
+    // File-local type knowledge (G-M1): fold captured bindings into name → (type, origin),
+    // poisoning any name bound to disagreeing types — conservative by design. Binding order
+    // never matters (a use-before-assign types identically), so the map is order-free.
+    let mut typed: HashMap<&str, Option<(&str, crate::typefacts::BindOrigin)>> = HashMap::new();
+    for binding in &bindings {
+      let Some(ty) = binding.ty.as_deref() else {
+        continue;
+      };
+      typed
+        .entry(binding.name.as_ref())
+        .and_modify(|slot| {
+          if let Some((existing, origin)) = slot {
+            if *existing != ty {
+              *slot = None; // disagreement → no type, ever
+            } else if binding.origin < *origin {
+              *origin = binding.origin; // stronger origin wins the label (Annotated < …)
+            }
+          }
+        })
+        .or_insert(Some((ty, binding.origin)));
+    }
+
+    // Per-entity parameter lists: every Param binding attributed to its innermost enclosing
+    // definition span, in file order (dfs order is file order).
+    let mut entity_params: product::EntityParams = Vec::new();
+    {
+      let mut cursor = crate::references::SpanCursor::new(&spans);
+      let mut by_entity: std::collections::BTreeMap<u32, Vec<(String, Option<String>)>> =
+        std::collections::BTreeMap::new();
+      for binding in &bindings {
+        if binding.origin != crate::typefacts::BindOrigin::Param {
+          continue;
+        }
+        if let Some(from) = cursor.enclosing(binding.start as usize) {
+          by_entity
+            .entry(from.raw() as u32)
+            .or_default()
+            .push((
+              binding.name.to_string(),
+              binding.ty.as_deref().map(str::to_string),
+            ));
+        }
+      }
+      entity_params.extend(by_entity);
+    }
+
     // The single ownership point: names/qualifiers rode through extraction as borrows of
     // `source`; they are copied exactly once, here, into the detachable product.
     let refs = raw
       .into_iter()
-      .map(|r| ProductRef {
-        from_entity_index: r.from.raw() as u32,
-        name: r.name.into_owned(),
-        kind: product::refkind_tag(r.kind),
-        start: r.start,
-        end: r.end,
-        qualifier: r.qualifier.map(Cow::into_owned),
-        form: product::refform_tag(r.form),
-        alias: r.alias.map(Cow::into_owned),
+      .map(|r| {
+        let receiver_typing = r
+          .receiver
+          .as_deref()
+          .and_then(|name| typed.get(name).copied().flatten());
+        ProductRef {
+          from_entity_index: r.from.raw() as u32,
+          name: r.name.into_owned(),
+          kind: product::refkind_tag(r.kind),
+          start: r.start,
+          end: r.end,
+          qualifier: r.qualifier.map(Cow::into_owned),
+          form: product::refform_tag(r.form),
+          alias: r.alias.map(Cow::into_owned),
+          receiver_type: receiver_typing.map(|(ty, _)| ty.to_string()),
+          receiver_type_origin: receiver_typing.map(|(_, o)| o.tag()).unwrap_or(0xFF),
+          receiver: r.receiver.map(Cow::into_owned),
+          args: r
+            .args
+            .into_iter()
+            .map(|arg| product::ProductArg {
+              index: arg.index,
+              class: arg.class as u8,
+              kw_name: arg.kw_name.map(Cow::into_owned),
+              expr: arg.expr.map(Cow::into_owned),
+            })
+            .collect(),
+        }
       })
       .collect();
 
@@ -409,6 +491,7 @@ impl OutlineExtractor {
       error_spans,
       items: items.into_iter().map(product::own_item).collect(),
       refs,
+      entity_params,
     })
   }
 }

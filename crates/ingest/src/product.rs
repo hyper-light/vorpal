@@ -31,7 +31,15 @@ use vorpal_resolve::{RefForm, RefKind};
 /// rebinding (`from x import y as z` → alias `z`), so import bindings can key on the name
 /// bare uses actually say; v13 adds the MethodHinted form — member-access receivers ride as
 /// owner hints (`Foo.bar()` corroborates class Foo) instead of being discarded.
-pub const PRODUCT_FORMAT_VERSION: u32 = 13;
+/// v14 (G-M1): refs carry receiver/receiver-type/args; products carry per-entity params.
+/// The version check itself is this bump's invalidation — v13 bytes never decode, so every
+/// file re-extracts exactly once.
+pub const PRODUCT_FORMAT_VERSION: u32 = 14;
+
+/// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
+pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
+/// Borrowed twin of [`EntityParams`] for the zero-copy view.
+pub type EntityParamsView<'a> = Vec<(u32, Vec<(&'a str, Option<&'a str>)>)>;
 
 /// One file's extraction output, serializable for the on-disk product cache.
 #[derive(Debug, Clone)]
@@ -69,6 +77,9 @@ pub struct FileProduct {
   pub error_spans: Vec<(u32, u32)>,
   pub items: Vec<OutlineItem<'static>>,
   pub refs: Vec<ProductRef>,
+  /// Per-entity parameter lists (G-M1): `(local entity index, [(name, type_text?)])`, sorted
+  /// by entity index; captured for the typefacts launch languages, empty elsewhere.
+  pub entity_params: EntityParams,
 }
 
 /// A reference keyed by its enclosing definition's position in the file's local layout
@@ -89,6 +100,26 @@ pub struct ProductRef {
   pub qualifier: Option<String>,
   /// Syntactic form tag (see [`refform_tag`]).
   pub form: u8,
+  /// Method-call receiver's simple spelling (`x.helper()` → `x`), when it is a bare name.
+  pub receiver: Option<String>,
+  /// The receiver's file-locally bound type text, when exactly one unpoisoned binding names
+  /// it (G-M1 capture; consumed by typed-receiver resolution in G-M2).
+  pub receiver_type: Option<String>,
+  /// [`crate::typefacts::BindOrigin`] tag for `receiver_type`; `0xFF` when absent.
+  pub receiver_type_origin: u8,
+  /// Call-site arguments (G-M1 capture; consumed by data-flow in G-M3).
+  pub args: Vec<ProductArg>,
+}
+
+/// One persisted call-site argument (see `references::RawArg`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductArg {
+  pub index: u16,
+  /// `references::ArgClass` discriminant.
+  pub class: u8,
+  pub kw_name: Option<String>,
+  /// Expression text (≤64 bytes), traceable classes only.
+  pub expr: Option<String>,
 }
 
 pub(crate) fn refkind_tag(kind: RefKind) -> u8 {
@@ -388,6 +419,55 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
       }
       None => buf.push(0),
     }
+    // Extras presence flags: bit0 receiver, bit1 receiver_type (+origin byte), bit2 args
+    // (+u16 count). The overwhelmingly common no-extras ref costs ONE byte, not five.
+    let flags = u8::from(r.receiver.is_some())
+      | (u8::from(r.receiver_type.is_some()) << 1)
+      | (u8::from(!r.args.is_empty()) << 2);
+    buf.push(flags);
+    if let Some(v) = &r.receiver {
+      push_str(buf, v);
+    }
+    if let Some(v) = &r.receiver_type {
+      push_str(buf, v);
+      buf.push(r.receiver_type_origin);
+    }
+    if !r.args.is_empty() {
+      buf.extend_from_slice(&(r.args.len() as u16).to_le_bytes());
+    }
+    for arg in &r.args {
+      buf.extend_from_slice(&arg.index.to_le_bytes());
+      buf.push(arg.class);
+      match &arg.kw_name {
+        Some(v) => {
+          buf.push(1);
+          push_str(buf, v);
+        }
+        None => buf.push(0),
+      }
+      match &arg.expr {
+        Some(v) => {
+          buf.push(1);
+          push_str(buf, v);
+        }
+        None => buf.push(0),
+      }
+    }
+  }
+  push_u32(buf, product.entity_params.len() as u32);
+  for (entity, params) in &product.entity_params {
+    push_u32(buf, *entity);
+    push_u32(buf, params.len() as u32);
+    for (name, ty) in params {
+      push_str(buf, name);
+      match ty {
+        Some(t) => {
+          buf.push(1);
+          push_str(buf, t);
+        }
+        None => buf.push(0),
+      }
+    }
   }
 }
 
@@ -412,6 +492,10 @@ impl<'a> Reader<'a> {
 
   fn u8(&mut self) -> io::Result<u8> {
     Ok(self.take(1)?[0])
+  }
+
+  fn u16(&mut self) -> io::Result<u16> {
+    Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("2B")))
   }
 
   fn u32(&mut self) -> io::Result<u32> {
@@ -506,9 +590,14 @@ pub struct ProductView<'a> {
   pub error_spans: Vec<(u32, u32)>,
   pub items: Vec<OutlineItem<'a>>,
   pub refs: Vec<RefView<'a>>,
+  /// Per-entity parameter lists, borrowed (see `FileProduct::entity_params`).
+  pub entity_params: EntityParamsView<'a>,
 }
 
 /// One reference occurrence as a borrowed view (see [`ProductRef`] for field semantics).
+/// Receiver typing is decoded eagerly (two option-tagged slices — no allocation); the
+/// argument records stay as raw encoded bytes decoded on demand via [`RefView::args`] — the
+/// replay path applies millions of refs and must never pay for records it doesn't read.
 #[derive(Clone, Copy)]
 pub struct RefView<'a> {
   pub from_entity_index: u32,
@@ -519,6 +608,92 @@ pub struct RefView<'a> {
   pub qualifier: Option<&'a str>,
   pub form: u8,
   pub alias: Option<&'a str>,
+  pub receiver: Option<&'a str>,
+  pub receiver_type: Option<&'a str>,
+  pub receiver_type_origin: u8,
+  /// Encoded argument records (count-prefixed region), decoded lazily.
+  args_bytes: &'a [u8],
+  args_count: u16,
+}
+
+/// One decoded argument view.
+#[derive(Clone, Copy)]
+pub struct ArgView<'a> {
+  pub index: u16,
+  pub class: u8,
+  pub kw_name: Option<&'a str>,
+  pub expr: Option<&'a str>,
+}
+
+impl<'a> RefView<'a> {
+  /// Bridge an owned ref into the shared apply path. Argument records are deliberately not
+  /// bridged (the apply stage never reads them; the link stage decodes them from product
+  /// bytes where they live).
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn bridge(
+    from_entity_index: u32,
+    name: &'a str,
+    kind: u8,
+    start: u32,
+    end: u32,
+    qualifier: Option<&'a str>,
+    form: u8,
+    alias: Option<&'a str>,
+    receiver: Option<&'a str>,
+    receiver_type: Option<&'a str>,
+    receiver_type_origin: u8,
+  ) -> Self {
+    Self {
+      from_entity_index,
+      name,
+      kind,
+      start,
+      end,
+      qualifier,
+      form,
+      alias,
+      receiver,
+      receiver_type,
+      receiver_type_origin,
+      args_bytes: &[],
+      args_count: 0,
+    }
+  }
+
+  /// Decode the argument records on demand. Errors surface as an early end (the encoder and
+  /// the eager decoder guarantee well-formed bytes; a torn read yields fewer records, never
+  /// junk).
+  pub fn args(&self) -> impl Iterator<Item = ArgView<'a>> + 'a {
+    let mut r = Reader {
+      bytes: self.args_bytes,
+      off: 0,
+    };
+    let count = self.args_count;
+    (0..count).map_while(move |_| {
+      let index = r.u16().ok()?;
+      let class = r.u8().ok()?;
+      let kw_name = if r.u8().ok()? != 0 {
+        Some(r.str_borrowed().ok()?)
+      } else {
+        None
+      };
+      let expr = if r.u8().ok()? != 0 {
+        Some(r.str_borrowed().ok()?)
+      } else {
+        None
+      };
+      Some(ArgView {
+        index,
+        class,
+        kw_name,
+        expr,
+      })
+    })
+  }
+
+  pub fn args_len(&self) -> usize {
+    self.args_count as usize
+  }
 }
 
 /// The stat stamp of an encoded product, read from its fixed header — magic and format
@@ -706,6 +881,31 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     } else {
       None
     };
+    let flags = r.u8()?;
+    let receiver = if flags & 1 != 0 {
+      Some(r.str_borrowed()?)
+    } else {
+      None
+    };
+    let (receiver_type, receiver_type_origin) = if flags & 2 != 0 {
+      (Some(r.str_borrowed()?), r.u8()?)
+    } else {
+      (None, 0xFF)
+    };
+    // Args stay encoded: remember the region, skip past it.
+    let args_count = if flags & 4 != 0 { r.u16()? } else { 0 };
+    let args_start = r.off;
+    for _ in 0..args_count {
+      r.u16()?;
+      r.u8()?;
+      if r.u8()? != 0 {
+        r.str_borrowed()?;
+      }
+      if r.u8()? != 0 {
+        r.str_borrowed()?;
+      }
+    }
+    let args_bytes = &bytes[args_start..r.off];
     refs.push(RefView {
       from_entity_index,
       name,
@@ -715,7 +915,29 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       qualifier,
       form,
       alias,
+      receiver,
+      receiver_type,
+      receiver_type_origin,
+      args_bytes,
+      args_count,
     });
+  }
+  let entity_param_count = r.count()?;
+  let mut entity_params = Vec::with_capacity(entity_param_count.min(1024));
+  for _ in 0..entity_param_count {
+    let entity = r.u32()?;
+    let param_count = r.count()?;
+    let mut params = Vec::with_capacity(param_count.min(64));
+    for _ in 0..param_count {
+      let name = r.str_borrowed()?;
+      let ty = if r.u8()? != 0 {
+        Some(r.str_borrowed()?)
+      } else {
+        None
+      };
+      params.push((name, ty));
+    }
+    entity_params.push((entity, params));
   }
   Ok(ProductView {
     source_size,
@@ -727,6 +949,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     error_spans,
     items,
     refs,
+    entity_params,
   })
 }
 
@@ -780,6 +1003,27 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     let form = r.u8()?;
     let qualifier = if r.u8()? != 0 { Some(r.str()?) } else { None };
     let alias = if r.u8()? != 0 { Some(r.str()?) } else { None };
+    let flags = r.u8()?;
+    let receiver = if flags & 1 != 0 { Some(r.str()?) } else { None };
+    let (receiver_type, receiver_type_origin) = if flags & 2 != 0 {
+      (Some(r.str()?), r.u8()?)
+    } else {
+      (None, 0xFF)
+    };
+    let arg_count = if flags & 4 != 0 { r.u16()? as usize } else { 0 };
+    let mut args = Vec::with_capacity(arg_count.min(64));
+    for _ in 0..arg_count {
+      let index = r.u16()?;
+      let class = r.u8()?;
+      let kw_name = if r.u8()? != 0 { Some(r.str()?) } else { None };
+      let expr = if r.u8()? != 0 { Some(r.str()?) } else { None };
+      args.push(ProductArg {
+        index,
+        class,
+        kw_name,
+        expr,
+      });
+    }
     refs.push(ProductRef {
       from_entity_index,
       name,
@@ -789,7 +1033,24 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
       qualifier,
       form,
       alias,
+      receiver,
+      receiver_type,
+      receiver_type_origin,
+      args,
     });
+  }
+  let entity_param_count = r.count()?;
+  let mut entity_params = Vec::with_capacity(entity_param_count.min(1024));
+  for _ in 0..entity_param_count {
+    let entity = r.u32()?;
+    let param_count = r.count()?;
+    let mut params = Vec::with_capacity(param_count.min(64));
+    for _ in 0..param_count {
+      let name = r.str()?;
+      let ty = if r.u8()? != 0 { Some(r.str()?) } else { None };
+      params.push((name, ty));
+    }
+    entity_params.push((entity, params));
   }
   if r.off != bytes.len() {
     return Err(corrupt("trailing bytes after product"));
@@ -805,6 +1066,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     error_spans,
     items,
     refs,
+    entity_params,
   })
 }
 
