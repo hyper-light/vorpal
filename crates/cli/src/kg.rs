@@ -307,6 +307,18 @@ pub enum McpAction {
   Deny { name: String },
   /// List enrolled projects.
   Projects,
+  /// Write this machine's MCP client configs to launch vorpal (idempotent; backups taken).
+  Install {
+    /// Which client to configure.
+    #[clap(long, value_enum, default_value = "all")]
+    client: crate::mcp_install::Client,
+    /// Command to write into the config (default: this executable's absolute path).
+    #[clap(long)]
+    command: Option<String>,
+    /// Print what would be written without touching anything.
+    #[clap(long)]
+    dry_run: bool,
+  },
 }
 
 fn index_dir(explicit: Option<PathBuf>) -> PathBuf {
@@ -913,6 +925,13 @@ fn run_mcp_action(action: McpAction) -> Result<ExitCode> {
     McpAction::Deny { name } => {
       let file = vorpal_mcp::registry::remove(&name).map_err(|err| anyhow!(err))?;
       println!("removed '{name}' ({})", file.display());
+    }
+    McpAction::Install {
+      client,
+      command,
+      dry_run,
+    } => {
+      crate::mcp_install::run_install(client, command.as_deref(), dry_run)?;
     }
     McpAction::Projects => {
       let projects = vorpal_mcp::registry::load().map_err(|err| anyhow!(err))?;

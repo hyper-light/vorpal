@@ -5,6 +5,7 @@ mod graph_filter;
 mod kg;
 mod lang;
 mod lsp;
+mod mcp_install;
 mod new;
 mod outline;
 mod print;
@@ -215,6 +216,8 @@ mod test_cli {
       "mcp allow . --name self",
       "mcp deny self",
       "mcp projects",
+      "mcp install --client claude-code --dry-run",
+      "mcp install --command /usr/local/bin/vorpal",
       "graph coverage",
       "graph coverage --format json --limit 10",
       "graph impact --since origin/main --src . --depth 3",
