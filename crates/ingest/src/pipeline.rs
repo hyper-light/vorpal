@@ -478,31 +478,33 @@ fn apply_parts<'a, 'i>(
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
   writer.forget_identity_scope();
-  writer.ingest_file(path, items);
-  // References carry entity *indices* into the file's local layout; resolve them through the
-  // recomputed layout (an out-of-range index — a corrupt product — simply drops the ref).
-  let (entities, _spans) = crate::outline_extractor::local_layout(items);
+  // One traversal defines the nodes AND yields each layout index's node id: `spans[i]` is the
+  // id of layout entity `i` (index 0 = file), the same convention `local_layout` documents —
+  // both derive from `layout_entity_paths`. References carry entity *indices* into that
+  // layout, so attribution is a direct index — this replaced a second `layout_entity_paths`
+  // pass (~38 `format!` strings per file) plus a blake3 `entity_id` lookup PER REFERENCE
+  // (~6.8M hashes + 32-byte-key probes at kernel scale) with an array index. An out-of-range
+  // index — a corrupt product — simply drops the ref, exactly as before.
+  let layout_ids = writer.ingest_file_with_spans(path, items);
   // Intern the file's path once; every reference carries the 4-byte id.
   let path_id = interner.intern(path);
   for r in refs {
-    let Some(entity) = entities.get(r.from_entity_index as usize) else {
+    let Some(&(_, from)) = layout_ids.get(r.from_entity_index as usize) else {
       continue;
     };
-    if let Some(from) = writer.entity_id(path, entity) {
-      references.push(
-        Reference::with_interned_path(
-          interner,
-          from,
-          path_id,
-          r.name,
-          crate::product::tag_refkind(r.kind),
-        )
-        .with_evidence(r.start, r.end)
-        .with_qualifier_ref(interner, r.qualifier)
-        .with_alias_ref(interner, r.alias)
-        .with_form(crate::product::tag_refform(r.form)),
-      );
-    }
+    references.push(
+      Reference::with_interned_path(
+        interner,
+        from,
+        path_id,
+        r.name,
+        crate::product::tag_refkind(r.kind),
+      )
+      .with_evidence(r.start, r.end)
+      .with_qualifier_ref(interner, r.qualifier)
+      .with_alias_ref(interner, r.alias)
+      .with_form(crate::product::tag_refform(r.form)),
+    );
   }
 }
 
