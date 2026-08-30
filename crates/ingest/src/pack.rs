@@ -287,6 +287,13 @@ impl PackReader {
     self.lookup(path).map(|slot| (slot.body_off, slot.body_len))
   }
 
+  /// The `(file offset, length)` of `path`'s product body inside the pack file — the
+  /// positioned-patch handle the stamp-only commit cutoff uses (product stamp bytes sit at
+  /// fixed offsets inside the body).
+  pub fn body_span(&self, path: &str) -> Option<(u64, u32)> {
+    self.entry(path)
+  }
+
   /// Every packed `(path, product bytes)` pair, in unspecified order — whole-bank sweeps
   /// (coverage overviews) sort their own results. Bytes are the raw cached product; decode
   /// and stamp validation stay the caller's job.

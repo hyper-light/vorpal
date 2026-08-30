@@ -313,6 +313,31 @@ pub fn build_index_full(
         });
       }
     }
+    // Product-equality early cutoff (docs/wip/SUBSECOND.md Phase 1a — Bazel-style "change
+    // pruning"): stats changed, but if every changed file re-extracts to a product whose BODY
+    // is byte-equal to the cached one (mtime-only touches, checkout restamps, comment or
+    // whitespace edits that extraction cannot see), then a from-scratch build's graph
+    // artifacts are provably identical to the prior generation's — determinism makes
+    // "inputs byte-equal ⇒ outputs byte-equal" a theorem, not a hope. Stage the new
+    // generation as hardlinks of the five graph artifacts + a stamp-patched pack clone + the
+    // fresh manifest, and commit through the ordinary atomic path. Any doubt bails to the
+    // full pipeline. Gated exactly like the whole-tree fast path (verified mode and
+    // non-Warn health policies re-derive everything; racy files digest-verify).
+    if !verify_all
+      && policy.mode == ParseHealthMode::Warn
+      && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
+      && let Some(report) = try_stamp_only_cutoff(
+        out,
+        &prior,
+        &manifest,
+        &prior_manifest,
+        &extractor,
+        cache_mode.label(),
+        prior_manifest_ns,
+      )?
+    {
+      return Ok(report);
+    }
   }
 
   // Past the fast path, this run will stage a new generation and write bank products —
@@ -636,6 +661,189 @@ const GENERATION_ARTIFACTS: [&str; 8] = [
 /// *new* opens in a collected generation fail, as a clean retryable error. A legacy flat root
 /// that served as the prior is swept the same way: its artifacts are superseded by the
 /// generation just committed from them.
+/// The stamp-only commit cutoff (Phase 1a). Returns `Ok(Some(report))` after committing a
+/// new generation whose graph artifacts are carried forward byte-identically, `Ok(None)` to
+/// fall through to the full pipeline. Never guesses: every changed file's fresh extraction
+/// must match its cached product byte-for-byte outside the stamp window `[8..32)`
+/// (source size, mtime, content digest — magic/version before it and the grammar digest and
+/// entire extraction body after it must be equal), and adds/removes/loose-bank products all
+/// disqualify.
+fn try_stamp_only_cutoff(
+  out: &Path,
+  prior: &Path,
+  manifest: &Manifest,
+  prior_manifest: &Manifest,
+  extractor: &OutlineExtractor,
+  cache_mode_label: &'static str,
+  prior_manifest_ns: u64,
+) -> io::Result<Option<IndexReport>> {
+  /// Above this many changed files the full pipeline is competitive and the cutoff's
+  /// serial re-extraction is not — a policy bound, not a correctness one.
+  const MAX_RESTAMPED: usize = 64;
+  // Path-sorted two-pointer diff: any add or remove disqualifies (the pipeline would change
+  // node ids and the pack's record set).
+  let current = manifest.entries();
+  let previous = prior_manifest.entries();
+  let (mut i, mut j) = (0usize, 0usize);
+  let mut changed: Vec<&vorpal_ingest::FileStat> = Vec::new();
+  while i < current.len() && j < previous.len() {
+    match current[i].path.cmp(&previous[j].path) {
+      std::cmp::Ordering::Less | std::cmp::Ordering::Greater => return Ok(None),
+      std::cmp::Ordering::Equal => {
+        if current[i].size != previous[j].size || current[i].mtime_ns != previous[j].mtime_ns {
+          changed.push(&current[i]);
+          if changed.len() > MAX_RESTAMPED {
+            return Ok(None);
+          }
+        }
+        i += 1;
+        j += 1;
+      }
+    }
+  }
+  if i < current.len() || j < previous.len() || changed.is_empty() {
+    return Ok(None);
+  }
+  // The racy-mtime hazard applies to files this run will TRUST WITHOUT READING — the
+  // stat-unchanged ones. (Changed files are re-extracted and byte-compared below, a
+  // strictly stronger check than the digest probe.) A stat-invisible edit inside the racy
+  // window among the unchanged set disqualifies the cutoff, exactly as it disqualifies the
+  // whole-tree fast path.
+  {
+    let changed_paths: std::collections::HashSet<&str> =
+      changed.iter().map(|e| e.path.as_str()).collect();
+    let racy_unchanged: Vec<&vorpal_ingest::FileStat> = manifest
+      .entries()
+      .iter()
+      .filter(|e| {
+        e.mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000
+          && !changed_paths.contains(e.path.as_str())
+      })
+      .collect();
+    if !racy_unchanged.is_empty() {
+      let Some(pack) = PackReader::open(prior) else {
+        return Ok(None);
+      };
+      let all_match = racy_unchanged.iter().all(|entry| {
+        let stored = pack
+          .get(&entry.path)
+          .and_then(vorpal_ingest::peek_product_digest);
+        match (stored, fs::read(&entry.path)) {
+          (Some(digest), Ok(bytes)) => xxhash_rust::xxh3::xxh3_64(&bytes) == digest,
+          _ => false,
+        }
+      });
+      if !all_match {
+        return Ok(None);
+      }
+    }
+  }
+  // The full pipeline would consolidate loose bank products into the pack — a non-empty bank
+  // means the carried-forward pack would diverge.
+  if let Ok(mut bank) = fs::read_dir(out.join("products"))
+    && bank.next().is_some()
+  {
+    return Ok(None);
+  }
+  const CARRIED: [&str; 6] = [
+    "nodes.vseg",
+    "strings.heap",
+    "graph.bin",
+    "evidence.bin",
+    "names.idx",
+    "products.idx",
+  ];
+  for artifact in CARRIED.iter().chain(&["products.pack", "manifest.bin"]) {
+    if !prior.join(artifact).exists() {
+      return Ok(None);
+    }
+  }
+  let Some(pack) = PackReader::open(prior) else {
+    return Ok(None);
+  };
+  // Re-extract each changed file and compare against its cached product. The stamp window
+  // [8..32) (size u64, mtime u64, source-xxh3 u64 at fixed offsets after magic+version) is
+  // the only region allowed to differ; it is patched into the pack clone below so the pack
+  // equals what the pipeline would have written (fresh stamps, identical body).
+  let mut patches: Vec<(u64, [u8; 24])> = Vec::new();
+  let mut encode_buf: Vec<u8> = Vec::new();
+  for entry in &changed {
+    let Ok(source) = fs::read_to_string(&entry.path) else {
+      return Ok(None);
+    };
+    let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
+      return Ok(None);
+    };
+    product.source_size = entry.size;
+    product.source_mtime_ns = entry.mtime_ns;
+    encode_buf.clear();
+    vorpal_ingest::encode_product_into(&product, &mut encode_buf);
+    let Some(cached) = pack.get(&entry.path) else {
+      return Ok(None);
+    };
+    if encode_buf.len() != cached.len()
+      || encode_buf.len() < 32
+      || encode_buf[0..8] != cached[0..8]
+      || encode_buf[32..] != cached[32..]
+    {
+      return Ok(None);
+    }
+    let Some((body_off, _)) = pack.body_span(&entry.path) else {
+      return Ok(None);
+    };
+    let stamp: [u8; 24] = encode_buf[8..32].try_into().expect("stamp window");
+    patches.push((body_off + 8, stamp));
+  }
+  drop(pack);
+
+  // Stage the generation: hardlink (copy fallback) the byte-identical artifacts, clone the
+  // pack and patch the stamp windows in place (fs::copy clones on reflink-capable
+  // filesystems — APFS/btrfs/XFS — and degrades to a plain copy elsewhere; the patch then
+  // touches only the affected blocks), and write the fresh manifest. commit_generation
+  // provides the same atomic CURRENT swap, dedup guard, GC, and ANN carry-forward as the
+  // full pipeline — and because nodes.vseg is unchanged, the carried ANN tier's stamp still
+  // matches: the vector tier stays warm through the cutoff.
+  let staging = out.join(format!(".staging-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&staging);
+  fs::create_dir_all(&staging)?;
+  for artifact in CARRIED {
+    let (from, to) = (prior.join(artifact), staging.join(artifact));
+    if fs::hard_link(&from, &to).is_err() {
+      fs::copy(&from, &to)?;
+    }
+  }
+  fs::copy(prior.join("products.pack"), staging.join("products.pack"))?;
+  {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut pack_file = fs::OpenOptions::new()
+      .write(true)
+      .open(staging.join("products.pack"))?;
+    for (offset, stamp) in &patches {
+      pack_file.seek(SeekFrom::Start(*offset))?;
+      pack_file.write_all(stamp)?;
+    }
+    pack_file.sync_all()?;
+  }
+  manifest.save(&staging.join("manifest.bin"))?;
+  commit_generation(out, prior, staging)?;
+  let nodes = Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
+  Ok(Some(IndexReport {
+    reused: true,
+    cache_mode: cache_mode_label,
+    error_files: 0,
+    error_nodes: 0,
+    error_bytes: 0,
+    excluded_files: 0,
+    indexed: changed.len() as u64,
+    skipped: manifest.len() as u64 - changed.len() as u64,
+    nodes,
+    resolved: 0,
+    ambiguous: 0,
+    external: 0,
+    masked: 0,
+  }))
+}
+
 fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<()> {
   // Sweep staging scratch that is not part of the named artifact set (spill files, tmp names)
   // so the generation holds exactly its artifacts.

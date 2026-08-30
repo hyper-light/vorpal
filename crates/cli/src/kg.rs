@@ -295,7 +295,16 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
     .map_err(boxed)
     .with_context(|| format!("indexing {}", arg.src.display()))?;
   if report.reused {
-    println!("unchanged — reused existing index ({} nodes)", report.nodes);
+    if report.indexed > 0 {
+      // The stamp-only cutoff: files re-extracted and proven extraction-identical, stamps
+      // refreshed, graph carried forward byte-identically.
+      println!(
+        "content-unchanged — restamped {} file(s), reused graph ({} nodes)",
+        report.indexed, report.nodes
+      );
+    } else {
+      println!("unchanged — reused existing index ({} nodes)", report.nodes);
+    }
   } else {
     println!(
       "parsed {} files ({} replayed from cache) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",

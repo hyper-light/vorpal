@@ -117,7 +117,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       let report =
         vorpal_index::build_index_full(Path::new(src), Path::new(out), mode, policy)?;
       if report.reused {
-        println!("unchanged — reused existing index ({} nodes)", report.nodes);
+        if report.indexed > 0 {
+      // The stamp-only cutoff: files re-extracted and proven extraction-identical, stamps
+      // refreshed, graph carried forward byte-identically.
+      println!(
+        "content-unchanged — restamped {} file(s), reused graph ({} nodes)",
+        report.indexed, report.nodes
+      );
+    } else {
+      println!("unchanged — reused existing index ({} nodes)", report.nodes);
+    }
       } else {
         println!(
           "parsed {} files ({} replayed from cache) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",

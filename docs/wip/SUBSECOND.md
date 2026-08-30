@@ -130,7 +130,13 @@ SHA A/B for 0.D; streamed≡batch; full workspace suite; retrieval_eval; resolut
 
 ## Phase 1 — Early cutoff & O(changed) commit (additive, contract-preserving)
 
-- **1a. Product-equality cutoff** (Bazel change-pruning / salsa backdating): after re-extracting
+- **1a. Product-equality cutoff — LANDED 2026-08-29.** Kernel touch class: 1.05s → **0.21s**
+  ("content-unchanged — restamped"); comment/whitespace edits included (the stamp window
+  [8..32) — size/mtime/xxh3 — is patched into a pack clone; everything else must be
+  byte-equal). Gate: the committed generation's content id equals a from-scratch build's
+  (pinned by crates/index/tests/stamp_cutoff.rs, plus live kernel A/B). Racy-mtime hazard
+  scoped to stat-UNCHANGED files (changed files are re-extracted — strictly stronger).
+  Original design: (Bazel change-pruning / salsa backdating): after re-extracting
   the changed file, if the new product bytes equal the cached ones (comment/whitespace/touch
   edits — a large real-world class), the from-scratch build differs only in `manifest.bin`:
   hardlink the other seven artifacts from the prior generation, rewrite the manifest, fold the
