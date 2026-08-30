@@ -70,7 +70,8 @@ impl Profile {
   fn allows(self, tool: &str) -> bool {
     const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
-      "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
+      "callers", "references", "importers", "implementors", "type_users", "similar", "reachable",
+      "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
       "code_search", "data_flow", "query",
     ];
@@ -562,7 +563,8 @@ impl Server {
         data["totalErrorBytes"] = report.total_error_bytes.into();
         Ok((text, data))
       }
-      "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
+      "node" | "callers" | "references" | "importers" | "implementors" | "type_users"
+      | "similar" => {
         // Pattern listing (node only): regex over names, matches ARE the answer.
         if tool == "node" {
           if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
@@ -1235,6 +1237,15 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
     tool("implementors", "Types implementing/extending a trait, interface, or base type (incoming `implements` edges).", name_only.clone(), &["name"]),
     tool("type_users", "Definitions using a type in fields, params, returns, or annotations (incoming `of_type` edges).", name_only.clone(), &["name"]),
     tool(
+      "similar",
+      "Near-clones of a definition: `similar_to` edges from extraction-time MinHash sketches \
+       over token shingles (≥ 0.7 estimated Jaccard; confidence = similarity × 100; each \
+       definition keeps its 8 most similar partners, a clone family's representative links \
+       to every member). Definitions under 32 tokens are never signed.",
+      name_only.clone(),
+      &["name"],
+    ),
+    tool(
       "reachable",
       "Relation-specific transitive traversal from a symbol, returning each reached node WITH \
        its path back to the seed (per-edge relation names). direction \"in\" = everything \
@@ -1245,7 +1256,7 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
         "name": {"type": "string", "description": "Exact symbol name"},
         "direction": {"type": "string", "enum": ["in", "out", "both"]},
         "relations": {"type": "array", "items": {"type": "string"},
-          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides (default [\"calls\"])"},
+          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides, data_flows, changes_with, similar_to (default [\"calls\"])"},
         "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"},
         "min_grade": {"type": "string", "enum": ["exact", "constrained", "heuristic"],
           "description": "Only traverse edges at this resolution grade or better (absent = include structural edges too)"},

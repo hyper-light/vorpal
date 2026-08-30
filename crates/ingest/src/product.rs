@@ -34,7 +34,7 @@ use vorpal_resolve::{RefForm, RefKind};
 /// v14 (G-M1): refs carry receiver/receiver-type/args; products carry per-entity params.
 /// The version check itself is this bump's invalidation — v13 bytes never decode, so every
 /// file re-extracts exactly once.
-pub const PRODUCT_FORMAT_VERSION: u32 = 15;
+pub const PRODUCT_FORMAT_VERSION: u32 = 16;
 
 /// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
 pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
@@ -81,10 +81,14 @@ pub struct FileProduct {
   /// by entity index; captured for the typefacts launch languages, empty elsewhere.
   pub entity_params: EntityParams,
   /// `(function name, declared return type)` — v15, the chained-call return ledger. Name-
+/// v16: near-clone signatures — per callable definition a 64-byte MinHash sketch + shingle
+/// count (trailing section, absent for definitions under the 32-token floor).
   /// keyed on purpose: link joins it against receiver "types" that are really callee names
   /// (`let x = make(); x.render()`), poisoning same-named functions with disagreeing
   /// returns. Only capture languages with a return annotation produce rows.
   pub returns: Vec<(String, String)>,
+  /// Near-clone sketches per signed callable definition (v16), entity-ordered.
+  pub signatures: Vec<ProductSignature>,
 }
 
 /// A reference keyed by its enclosing definition's position in the file's local layout
@@ -114,6 +118,22 @@ pub struct ProductRef {
   pub receiver_type_origin: u8,
   /// Call-site arguments (G-M1 capture; consumed by data-flow in G-M3).
   pub args: Vec<ProductArg>,
+}
+
+/// One definition's near-clone sketch (see `signature.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductSignature {
+  pub entity_index: u32,
+  pub shingles: u32,
+  pub sketch: [u8; crate::signature::BINS],
+}
+
+/// Borrowed twin of [`ProductSignature`].
+#[derive(Clone, Copy)]
+pub struct SignatureView<'a> {
+  pub entity_index: u32,
+  pub shingles: u32,
+  pub sketch: &'a [u8],
 }
 
 /// One persisted call-site argument (see `references::RawArg`).
@@ -479,6 +499,12 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
     push_str(buf, name);
     push_str(buf, ret);
   }
+  push_u32(buf, product.signatures.len() as u32);
+  for sig in &product.signatures {
+    push_u32(buf, sig.entity_index);
+    push_u32(buf, sig.shingles);
+    buf.extend_from_slice(&sig.sketch);
+  }
 }
 
 struct Reader<'a> {
@@ -604,6 +630,8 @@ pub struct ProductView<'a> {
   pub entity_params: EntityParamsView<'a>,
   /// Borrowed twin of `FileProduct::returns` (v15).
   pub returns: Vec<(&'a str, &'a str)>,
+  /// Borrowed twin of `FileProduct::signatures` (v16).
+  pub signatures: Vec<SignatureView<'a>>,
 }
 
 /// One reference occurrence as a borrowed view (see [`ProductRef`] for field semantics).
@@ -925,6 +953,18 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     let ret = r.str_borrowed()?;
     returns.push((name, ret));
   }
+  let signature_count = r.count()?;
+  let mut signatures = Vec::with_capacity(signature_count.min(1024));
+  for _ in 0..signature_count {
+    let entity_index = r.u32()?;
+    let shingles = r.u32()?;
+    let sketch = r.take(crate::signature::BINS)?;
+    signatures.push(SignatureView {
+      entity_index,
+      shingles,
+      sketch,
+    });
+  }
   if r.off != bytes.len() {
     return Err(corrupt("trailing bytes after product"));
   }
@@ -940,6 +980,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     refs,
     entity_params,
     returns,
+    signatures,
   })
 }
 
@@ -1049,6 +1090,21 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     let ret = r.str()?;
     returns.push((name, ret));
   }
+  let signature_count = r.count()?;
+  let mut signatures = Vec::with_capacity(signature_count.min(1024));
+  for _ in 0..signature_count {
+    let entity_index = r.u32()?;
+    let shingles = r.u32()?;
+    let sketch: [u8; crate::signature::BINS] = r
+      .take(crate::signature::BINS)?
+      .try_into()
+      .map_err(|_| corrupt("signature sketch width"))?;
+    signatures.push(ProductSignature {
+      entity_index,
+      shingles,
+      sketch,
+    });
+  }
   if r.off != bytes.len() {
     return Err(corrupt("trailing bytes after product"));
   }
@@ -1065,6 +1121,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     refs,
     entity_params,
     returns,
+    signatures,
   })
 }
 

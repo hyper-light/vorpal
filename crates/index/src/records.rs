@@ -38,12 +38,16 @@ pub struct NodeRecord {
 }
 
 /// A node related to the query target through one edge, with the edge's resolution grade
-/// (`structural` for containment edges, else exact/constrained/heuristic).
+/// (`structural` for containment edges, else exact/constrained/heuristic). For `similar_to`
+/// edges the confidence IS the estimated similarity, surfaced as a percentage.
 #[derive(Serialize, Debug)]
 pub struct RelatedRecord {
   #[serde(flatten)]
   pub node: NodeRecord,
   pub grade: String,
+  /// Estimated Jaccard similarity x 100 (`similar_to` edges only).
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub similarity: Option<u8>,
 }
 
 /// One step of a relation-restricted traversal: the reached node, its BFS depth, the node it
@@ -906,6 +910,7 @@ pub fn related_records(
     "importers" => vorpal_kg::EdgeType::IMPORTS,
     "implementors" => vorpal_kg::EdgeType::IMPLEMENTS,
     "typeusers" => vorpal_kg::EdgeType::OF_TYPE,
+    "similar" => vorpal_kg::EdgeType::SIMILAR_TO,
     other => return Err(format!("unknown graph verb '{other}'")),
   };
   let matches = resolve_target(kg, target).map_err(|err| err.to_string())?;
@@ -932,6 +937,7 @@ pub fn related_records(
         Some(RelatedRecord {
           node: node_record(kg, id)?,
           grade: crate::confidence_label(confidence).to_string(),
+          similarity: (edge.base() == vorpal_kg::EdgeType::SIMILAR_TO).then_some(confidence),
         })
       })
       .collect(),

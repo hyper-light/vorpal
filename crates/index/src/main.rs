@@ -148,6 +148,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
           Some(note) => println!("note: {note}"),
           None => println!("co-change: {} file pairs from git history", report.cochange_edges),
         }
+        match &report.similar_note {
+          Some(note) => println!("near-clones: {note}"),
+          None => println!("near-clones: {} similar_to pairs from token sketches", report.similar_edges),
+        }
         if report.excluded_files > 0 {
           println!(
             "note: {} unhealthy files excluded from the graph (parse-health policy)",

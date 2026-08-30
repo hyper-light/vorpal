@@ -84,6 +84,12 @@ pub struct IndexReport {
   /// Why the co-change pass produced nothing (not a repository, disabled, no history) —
   /// stated on the report, never a silent zero. `None` when edges were computed.
   pub cochange_note: Option<String>,
+  /// Symmetric `similar_to` near-clone pairs sealed from extraction-time sketches (each pair
+  /// counted once).
+  pub similar_edges: u64,
+  /// Why the similarity pass produced nothing, or what it truncated — stated, never a
+  /// silent zero. `None` when pairs were sealed.
+  pub similar_note: Option<String>,
 }
 
 impl IndexReport {
@@ -343,6 +349,8 @@ pub fn build_index_env(
           unverified_langs: unverified_langs.clone(),
           cochange_edges: 0,
           cochange_note: None,
+          similar_edges: 0,
+          similar_note: None,
         });
       }
     }
@@ -646,7 +654,7 @@ pub fn build_index_env(
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve, evidence, flows) = vorpal_ingest::link_writer_spilled_with_flows(
+  let (kg, resolve, evidence, flows, similar) = vorpal_ingest::link_writer_spilled_with_flows(
     &interner,
     writer,
     spilled_refs,
@@ -691,6 +699,8 @@ pub fn build_index_env(
     unverified_langs,
     cochange_edges,
     cochange_note,
+    similar_edges: similar.edges,
+    similar_note: similar.note,
   })
 }
 
@@ -2515,6 +2525,7 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
     "importers" => Some(vorpal_kg::EdgeType::IMPORTS),
     "implementors" => Some(vorpal_kg::EdgeType::IMPLEMENTS),
     "typeusers" => Some(vorpal_kg::EdgeType::OF_TYPE),
+    "similar" => Some(vorpal_kg::EdgeType::SIMILAR_TO),
     "node" => None,
     other => return Err(format!("unknown graph verb '{other}'").into()),
   };
@@ -2559,6 +2570,19 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
           view.path,
           id.raw(),
           confidence_label(confidence)
+        );
+      }
+    }
+    out
+  } else if edge.base() == vorpal_kg::EdgeType::SIMILAR_TO {
+    // Near-clones: the edge confidence is the estimated similarity — show it.
+    let mut out = String::new();
+    for &(id, confidence) in &hits {
+      if let Some(view) = kg.node(id) {
+        let _ = writeln!(
+          out,
+          "{} [{:?}] {} (~{}% similar)",
+          view.name, view.kind, view.path, confidence
         );
       }
     }

@@ -64,6 +64,23 @@ cache hit costs **14 ms** (the kind-gated File-node scan), so the one-file updat
 0.95 s. Cold rows above were measured before the pass landed; the user-CPU column grows by
 the overlapped git work.
 
+2026-08-30 near-clone edges (`similar_to`, product format 16): every Function/Method/
+Constructor with ≥ 32 tokens carries a 64-byte one-permutation MinHash sketch over its
+3-token shingles (captured inside the existing reference walk — one hash per token, no
+second pass; comments skipped), and link pairs them by LSH banding (16 × 4 bytes) with
+sketch verification at ≥ 0.7 estimated Jaccard, 8 partners per definition, stars for
+clone families above 64 members. Measured on the kernel against the pre-change binary,
+interleaved: cold **+0.03 s / +0.34 s** wall on 8.5 s / 7.0 s base runs (+4% user CPU
+for the token hashing); `products.pack` **595 → 641 MB (+7.7%)** for 629,887 signed
+definitions; `graph.bin` +1.9% for **94,516 pairs**. The pairing itself is **0.18 s** on
+its own thread (630k sketches → 6.76M candidates → 106k accepted → 94,516 kept after the
+partner cap), started at the top of link so it finishes under the symbol-table build — the
+one-file update measured 2.12–2.43 s against 2.17 s base (+1.5 s user CPU: sketch replay,
+spill, pairing). The kernel's pairs are the v4/v6 twins one expects
+(`__cookie_v4_check`/`__cookie_v6_check`, `tcp_v4_rcv`/`tcp_v6_rcv`,
+`bictcp_cong_avoid`/`cubictcp_cong_avoid`); `IGMP_V1_SEEN`/`IGMP_V2_SEEN` show macro
+bodies are signed too. Cold/update rows above predate the format bump.
+
 Index size (linux, one generation): 1.27 GiB before tiers — `products.pack` 595 MB,
 `evidence.bin` 268 MB, `nodes.vseg` 171 MB, `strings.heap` 150 MB, `graph.bin` 122 MB,
 `names.idx` 44 MB, `manifest.bin` 6.8 MB, `products.idx` 6.5 MB, `dataflow.bin` 0.75 MB
@@ -135,6 +152,7 @@ vorpal query '<text>' --index /tmp/bench-lk
 | `query 'MATCH (f:Function {name: "tcp_v4_rcv"}) RETURN f.community'` | < 5 ms |
 | `query 'MATCH (g:Function) WHERE g.community = 1919789 RETURN count(*)'` (2.76M-node scan) | 20 ms |
 | `graph architecture` (modules, hubs, entries, 80k-community cluster pass) | 50 ms |
+| `graph similar tcp_v4_rcv` (near-clones with similarity) | 10 ms |
 | `search "socket buffer alloc" -k 10` (tiers warm) | 30 ms |
 
 `/usr/bin/time -p` resolves 10 ms on this machine; "< 5 ms" rows reported `0.00`.

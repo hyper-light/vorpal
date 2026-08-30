@@ -20,6 +20,9 @@ mod pipeline;
 mod product;
 mod references;
 mod selfcheck;
+pub mod signature;
+pub mod similar;
+pub use similar::SimilarReport;
 pub mod typefacts;
 
 pub use manifest::{FileStat, Manifest};
@@ -88,7 +91,7 @@ pub use pipeline::{
   stream_apply, stream_apply_spilled,
 };
 pub use product::{
-  FileProduct, ProductRef, ProductView, RefView, cache_file_name, decode_product,
+  FileProduct, ProductRef, ProductSignature, ProductView, RefView, SignatureView, cache_file_name, decode_product,
   decode_product_view, encode_product_into, load_product, peek_product_digest,
   peek_product_error_bytes, peek_product_error_nodes, peek_product_grammar_digest,
   peek_product_stamps, save_product,
@@ -153,12 +156,14 @@ pub fn extraction_identity_for_path(path: &str, rules_digest: u64) -> Option<u64
 /// Combine a grammar digest and a rules digest into one product-identity digest (order-fixed
 /// xxh3, so it never accidentally cancels the way a XOR could).
 pub fn extraction_identity(grammar_digest: u64, rules_digest: u64) -> u64 {
-  // Three identity inputs since G-M1: the grammar generation, the rules digest, and the
-  // typefacts table version — editing capture semantics re-keys products with no format bump.
-  let mut buf = [0u8; 24];
+  // Four identity inputs: the grammar generation, the rules digest, the typefacts table
+  // version, and the signature scheme version — editing capture semantics re-keys products
+  // with no format bump.
+  let mut buf = [0u8; 28];
   buf[..8].copy_from_slice(&grammar_digest.to_le_bytes());
   buf[8..16].copy_from_slice(&rules_digest.to_le_bytes());
-  buf[16..].copy_from_slice(&typefacts::TYPEFACTS_VERSION.to_le_bytes());
+  buf[16..24].copy_from_slice(&typefacts::TYPEFACTS_VERSION.to_le_bytes());
+  buf[24..].copy_from_slice(&signature::SIGNATURE_VERSION.to_le_bytes());
   xxhash_rust::xxh3::xxh3_64(&buf)
 }
 

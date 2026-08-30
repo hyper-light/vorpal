@@ -358,10 +358,39 @@ impl OutlineExtractor {
 
     let (entities, spans) = local_layout(&items);
 
+    // Near-clone signatures (v16): every callable definition's leaf tokens stream into a
+    // sketch during the reference walk. The seed is the grammar generation, so tokens of
+    // different grammars never collide by kind id.
+    let mut signer = {
+      let mut kinds: Vec<vorpal_kg::SymbolKind> = Vec::with_capacity(spans.len());
+      kinds.push(vorpal_kg::SymbolKind::File);
+      for item in &items {
+        kinds.push(vorpal_kg::SymbolKind::from_symbol_type(item.entry.symbol_type, item.is_import));
+        for member in &item.members {
+          kinds.push(vorpal_kg::SymbolKind::from_symbol_type(member.entry.symbol_type, false));
+        }
+      }
+      let signable: Vec<(std::ops::Range<usize>, u32)> = spans
+        .iter()
+        .filter(|(_, id)| {
+          matches!(
+            kinds.get(id.raw() as usize),
+            Some(
+              vorpal_kg::SymbolKind::Function
+                | vorpal_kg::SymbolKind::Method
+                | vorpal_kg::SymbolKind::Constructor
+            )
+          )
+        })
+        .map(|(range, id)| (range.clone(), id.raw() as u32))
+        .collect();
+      (!signable.is_empty()).then(|| crate::signature::Signer::new(grammar_generation, signable))
+    };
+
     let mut raw = Vec::new();
     let mut bindings = Vec::new();
-    if let Some(spec) = spec {
-      extract_references_with_facts(
+    match spec {
+      Some(spec) => extract_references_with_facts(
         grep.root(),
         spec,
         crate::references::resolved_typefacts(lang),
@@ -369,10 +398,22 @@ impl OutlineExtractor {
         &entities,
         &mut raw,
         &mut bindings,
-      );
+        signer.as_mut(),
+      ),
+      None => {
+        // No reference spec: the signatures still need the token stream.
+        if let Some(signer) = signer.as_mut() {
+          for node in grep.root().dfs() {
+            signer.visit(&node);
+          }
+        }
+      }
     }
     for sub in &injected {
       let sub_lang = *sub.root().lang();
+      if let Some(signer) = signer.as_mut() {
+        signer.restart(crate::grammar_generation_for(sub_lang).unwrap_or(grammar_generation));
+      }
       if let Some(sub_spec) = self
         .dynamic_specs
         .get(&sub_lang)
@@ -386,9 +427,27 @@ impl OutlineExtractor {
           &entities,
           &mut raw,
           &mut bindings,
+          signer.as_mut(),
         );
+      } else if let Some(signer) = signer.as_mut() {
+        for node in sub.root().dfs() {
+          signer.visit(&node);
+        }
       }
     }
+    let signatures: Vec<product::ProductSignature> = signer
+      .map(|signer| {
+        signer
+          .finish()
+          .into_iter()
+          .map(|(entity_index, sketch)| product::ProductSignature {
+            entity_index,
+            shingles: sketch.shingles,
+            sketch: sketch.bins,
+          })
+          .collect()
+      })
+      .unwrap_or_default();
     if !injected.is_empty() {
       // Same canonicalization for references (attribution reads spans, so order is free to
       // normalize); untouched for injection-free files.
@@ -506,6 +565,7 @@ impl OutlineExtractor {
       refs,
       entity_params,
       returns,
+      signatures,
     })
   }
 }

@@ -184,14 +184,23 @@ pub(crate) struct RetRec {
   pub(crate) ret: Box<str>,
 }
 
-/// Flow-tracing rows a shard hands the absorber beside its references: call-site argument
-/// records and callee parameter ledgers — one struct so the absorb/committer plumbing keeps
-/// a fixed shape as flow data grows.
+/// One signed definition's near-clone sketch (v16), keyed by its entity id — rebased with
+/// its shard like a parameter ledger.
+pub(crate) struct SigRec {
+  pub(crate) entity: NodeId,
+  pub(crate) shingles: u32,
+  pub(crate) sketch: [u8; crate::signature::BINS],
+}
+
+/// Side rows a shard hands the absorber beside its references: call-site argument records,
+/// callee parameter ledgers, return ledgers, and near-clone sketches — one struct so the
+/// absorb/committer plumbing keeps a fixed shape as side data grows.
 #[derive(Default)]
 pub(crate) struct FlowSidecar {
   pub(crate) args: Vec<ArgRec>,
   pub(crate) params: Vec<ParamRec>,
   pub(crate) rets: Vec<RetRec>,
+  pub(crate) sigs: Vec<SigRec>,
 }
 
 /// Append-only arg spill (staging `.args.spill`): written by the absorber in absorb order,
@@ -510,11 +519,81 @@ pub(crate) fn load_param_spill(path: &std::path::Path, expected: u64) -> io::Res
   Ok(ParamTable { rows })
 }
 
+/// Fixed-width sketch spill (`.sigs.spill`): entity u64 · shingles u32 · 64 sketch bytes.
+/// Same lifecycle as the arg spill.
+pub(crate) struct SigSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+const SIG_RECORD_LEN: usize = 8 + 4 + crate::signature::BINS;
+
+impl SigSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &SigRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&rec.entity.raw().to_le_bytes())?;
+    self.file.write_all(&rec.shingles.to_le_bytes())?;
+    self.file.write_all(&rec.sketch)?;
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+pub(crate) fn load_sig_spill(
+  path: &std::path::Path,
+  expected: u64,
+) -> io::Result<Vec<crate::similar::SigRow>> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  if bytes.len() % SIG_RECORD_LEN != 0 || (bytes.len() / SIG_RECORD_LEN) as u64 != expected {
+    return Err(io::Error::other(format!(
+      "sig spill holds {} bytes for {expected} records of {SIG_RECORD_LEN} — torn scratch",
+      bytes.len()
+    )));
+  }
+  Ok(
+    bytes
+      .chunks_exact(SIG_RECORD_LEN)
+      .map(|rec| {
+        let mut sketch = [0u8; crate::signature::BINS];
+        sketch.copy_from_slice(&rec[12..]);
+        crate::similar::SigRow {
+          node: u64::from_le_bytes(rec[..8].try_into().expect("8B")),
+          shingles: u32::from_le_bytes(rec[8..12].try_into().expect("4B")),
+          sketch,
+        }
+      })
+      .collect(),
+  )
+}
+
 enum RefSink<'a, 'i> {
   Ram(&'a mut Vec<Reference<'i>>, &'a mut FlowSidecar),
   Spill(
     &'a mut vorpal_resolve::RefSpillWriter<'i>,
-    Option<(&'a mut ArgSpillWriter, &'a mut ParamSpillWriter, &'a mut RetSpillWriter)>,
+    Option<(
+      &'a mut ArgSpillWriter,
+      &'a mut ParamSpillWriter,
+      &'a mut RetSpillWriter,
+      &'a mut SigSpillWriter,
+    )>,
   ),
 }
 
@@ -537,19 +616,24 @@ impl<'i> RefSink<'_, 'i> {
       rec.entity = NodeId::new(rec.entity.raw() + id_base);
       rec
     });
+    let rebased_sigs = shard_flow.sigs.into_iter().map(|mut rec| {
+      rec.entity = NodeId::new(rec.entity.raw() + id_base);
+      rec
+    });
     match self {
       RefSink::Ram(references, flow) => {
         references.extend(rebased);
         flow.args.extend(rebased_args);
         flow.params.extend(rebased_params);
         flow.rets.extend(shard_flow.rets);
+        flow.sigs.extend(rebased_sigs);
         Ok(())
       }
       RefSink::Spill(writer, flow_writers) => {
         for reference in rebased {
           writer.push(&reference)?;
         }
-        if let Some((arg_writer, param_writer, ret_writer)) = flow_writers {
+        if let Some((arg_writer, param_writer, ret_writer, sig_writer)) = flow_writers {
           for rec in rebased_args {
             arg_writer.push(&rec)?;
           }
@@ -558,6 +642,9 @@ impl<'i> RefSink<'_, 'i> {
           }
           for rec in &shard_flow.rets {
             ret_writer.push(rec)?;
+          }
+          for rec in rebased_sigs {
+            sig_writer.push(&rec)?;
           }
         }
         Ok(())
@@ -670,7 +757,7 @@ pub fn link_writer_spilled<'i>(
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
 ) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
-  let (kg, stats, evidence, _flows) =
+  let (kg, stats, evidence, _flows, _similar) =
     link_writer_spilled_with_flows(interner, writer, spill, resolver, None)?;
   Ok((kg, stats, evidence))
 }
@@ -704,18 +791,75 @@ fn bind_param_index(rec: &ArgRec, callee_params: Option<&[Box<str>]>) -> u16 {
   }
 }
 
+/// What a spilled link yields: the sealed graph, resolution stats, evidence rows, data-flow
+/// rows, and the near-clone pairing report.
+pub type LinkedGraph = (
+  Kg,
+  ResolveStats,
+  Vec<vorpal_kg::EvidenceRow>,
+  Vec<vorpal_kg::DataflowRow>,
+  crate::similar::SimilarReport,
+);
+
 pub fn link_writer_spilled_with_flows<'i>(
   interner: &'i vorpal_resolve::Interner,
   mut writer: KgWriter,
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
   flow_spill: Option<FlowSpill>,
-) -> io::Result<(
-  Kg,
-  ResolveStats,
-  Vec<vorpal_kg::EvidenceRow>,
-  Vec<vorpal_kg::DataflowRow>,
-)> {
+) -> io::Result<LinkedGraph> {
+  // Near-clone sketches (v16): paired on their own thread while the table builds and
+  // resolution runs — they need no writer state, only the spill rows.
+  let sig_rows: Vec<crate::similar::SigRow> = match &flow_spill {
+    Some(spill) if spill.sigs.1 > 0 => load_sig_spill(&spill.sigs.0, spill.sigs.1)?,
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.sigs.0);
+      Vec::new()
+    }
+    None => Vec::new(),
+  };
+  // The pairing needs nothing below — it starts now and overlaps the spill loads, the table
+  // build, and resolution; its result is joined once resolution has finished.
+  let (link, pairing) = std::thread::scope(|scope| {
+    let pairing = scope.spawn(move || crate::similar::similar_pairs(sig_rows));
+    let link = link_resolve(interner, &mut writer, &spill, resolver, flow_spill);
+    (
+      link,
+      pairing
+        .join()
+        .map_err(|_| io::Error::other("similarity pairing panicked")),
+    )
+  });
+  let (stats, evidence, flows) = link?;
+  let (similar_pairs, similar_report) = pairing?;
+  phase_trace("link: resolve done");
+  // Symmetric near-clone edges, sorted pairs — deterministic edge-log order.
+  for &(a, b, confidence) in &similar_pairs {
+    let label = vorpal_kg::EdgeType::SIMILAR_TO.with_confidence(confidence);
+    writer.add_edge(NodeId::new(a), NodeId::new(b), label);
+    writer.add_edge(NodeId::new(b), NodeId::new(a), label);
+  }
+  drop(similar_pairs);
+  let _ = spill.remove();
+  // The link transients (spill chunks + table + arg join) just died — return their pages
+  // before compaction and seal allocate theirs.
+  release_freed_pages();
+  phase_trace("link: seal start");
+  let kg = writer.seal();
+  release_freed_pages();
+  phase_trace("link: seal done");
+  Ok((kg, stats, evidence, flows, similar_report))
+}
+
+/// The resolution half of a spilled link: load the flow spills, build the table, resolve
+/// every reference into the writer's edge log, collect evidence and data-flow rows.
+fn link_resolve<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  writer: &mut KgWriter,
+  spill: &vorpal_resolve::RefSpill<'i>,
+  resolver: &Resolver,
+  flow_spill: Option<FlowSpill>,
+) -> io::Result<(ResolveStats, Vec<vorpal_kg::EvidenceRow>, Vec<vorpal_kg::DataflowRow>)> {
   let arg_join: ArgJoin = match &flow_spill {
     Some(spill) if spill.args.1 > 0 => load_arg_spill(&spill.args.0, spill.args.1)?,
     Some(spill) => {
@@ -747,7 +891,7 @@ pub fn link_writer_spilled_with_flows<'i>(
   let mut flows: Vec<vorpal_kg::DataflowRow> = Vec::new();
   let mut flow_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
   phase_trace("link: table build start");
-  let mut table = build_symbol_table(interner, &writer);
+  let mut table = build_symbol_table(interner, writer);
   release_freed_pages();
   phase_trace("link: resolve start");
   // Import-binding pre-pass (§3.3 scope step): the spill retained the qualifier-carrying
@@ -759,12 +903,11 @@ pub fn link_writer_spilled_with_flows<'i>(
   // makes the sidecar deterministic, so streaming them out is not an option).
   let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::new();
   let stats = {
-    let writer = &mut writer;
     let evidence = std::cell::RefCell::new(&mut evidence);
     vorpal_resolve::resolve_all_spilled_into(
       interner,
       &table,
-      &spill,
+      spill,
       resolver,
       chain.as_ref(),
       |edge| {
@@ -840,21 +983,12 @@ pub fn link_writer_spilled_with_flows<'i>(
       },
     )?
   };
-  phase_trace("link: resolve done");
   drop(table);
   drop(arg_join);
   drop(param_table);
   drop(chain);
   drop(flow_pairs);
-  let _ = spill.remove();
-  // The link transients (spill chunks + table + arg join) just died — return their pages
-  // before compaction and seal allocate theirs.
-  release_freed_pages();
-  phase_trace("link: seal start");
-  let kg = writer.seal();
-  release_freed_pages();
-  phase_trace("link: seal done");
-  Ok((kg, stats, evidence, flows))
+  Ok((stats, evidence, flows))
 }
 
 /// Fewer files than this per shard and the fan-out overhead outweighs the win: small trees
@@ -941,7 +1075,14 @@ pub(crate) fn apply_product_with_args<'i>(
   references: &mut Vec<Reference<'i>>,
   mut flow_out: Option<&mut FlowSidecar>,
 ) {
-  let crate::FileProduct { items, refs, entity_params, returns, .. } = product;
+  let crate::FileProduct {
+    items,
+    refs,
+    entity_params,
+    returns,
+    signatures,
+    ..
+  } = product;
   if let Some(flow_out) = flow_out.as_deref_mut() {
     for (name, ret) in &returns {
       flow_out.rets.push(RetRec {
@@ -975,6 +1116,9 @@ pub(crate) fn apply_product_with_args<'i>(
       )
     }),
     &entity_params,
+    signatures
+      .iter()
+      .map(|sig| (sig.entity_index, sig.shingles, &sig.sketch[..])),
     writer,
     references,
     flow_out,
@@ -1011,6 +1155,10 @@ pub(crate) fn apply_product_view_with_args<'i>(
     &view.items,
     view.refs.iter().copied(),
     &entity_params,
+    view
+      .signatures
+      .iter()
+      .map(|sig| (sig.entity_index, sig.shingles, sig.sketch)),
     writer,
     references,
     flow_out,
@@ -1025,6 +1173,7 @@ fn apply_parts<'a, 'i>(
   items: &[vorpal_outline::model::OutlineItem<'_>],
   refs: impl Iterator<Item = crate::product::RefView<'a>>,
   entity_params: &[(u32, Vec<&str>)],
+  signatures: impl Iterator<Item = (u32, u32, &'a [u8])>,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
   mut flow_out: Option<&mut FlowSidecar>,
@@ -1054,6 +1203,25 @@ fn apply_parts<'a, 'i>(
             });
           }
         }
+      }
+    }
+  }
+  // Near-clone sketches (v16): keyed to the writer's fresh node id, collected only where a
+  // collector exists (the spilled index-build path).
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    for (entity_index, shingles, sketch) in signatures {
+      let Some(entity) = entities.get(entity_index as usize) else {
+        continue;
+      };
+      let Ok(sketch) = <[u8; crate::signature::BINS]>::try_from(sketch) else {
+        continue; // a corrupt width — the decoder guarantees 64, so this never fires
+      };
+      if let Some(id) = writer.entity_id(path, entity) {
+        flow_out.sigs.push(SigRec {
+          entity: id,
+          shingles,
+          sketch,
+        });
       }
     }
   }
@@ -1553,6 +1721,8 @@ where
   let mut param_writer = ParamSpillWriter::create(&params_path)?;
   let rets_path = spill_path.with_extension("rets");
   let mut ret_writer = RetSpillWriter::create(&rets_path)?;
+  let sigs_path = spill_path.with_extension("sigs");
+  let mut sig_writer = SigSpillWriter::create(&sigs_path)?;
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
@@ -1560,7 +1730,7 @@ where
     work,
     RefSink::Spill(
       &mut spill_writer,
-      Some((&mut arg_writer, &mut param_writer, &mut ret_writer)),
+      Some((&mut arg_writer, &mut param_writer, &mut ret_writer, &mut sig_writer)),
     ),
     heap_stream_path,
     pack,
@@ -1569,6 +1739,7 @@ where
     args: arg_writer.finish()?,
     params: param_writer.finish()?,
     rets: ret_writer.finish()?,
+    sigs: sig_writer.finish()?,
   };
   Ok((writer, spill_writer.finish()?, stats, flow_spill))
 }
@@ -1578,6 +1749,7 @@ pub struct FlowSpill {
   pub(crate) args: (std::path::PathBuf, u64),
   pub(crate) params: (std::path::PathBuf, u64),
   pub(crate) rets: (std::path::PathBuf, u64),
+  pub(crate) sigs: (std::path::PathBuf, u64),
 }
 
 fn stream_apply_impl<'i, F>(

@@ -16,12 +16,15 @@ fn one_touched_file_reparses_exactly_one_product() {
   let _ = fs::remove_dir_all(&base);
   fs::create_dir_all(&src).unwrap();
   // Every product shape the validator must understand: references with receivers, typed
-  // receivers, call arguments (kwargs included), entity params, returns, injections.
+  // receivers, call arguments (kwargs included), entity params, returns, injections, and a
+  // near-clone sketch (a body over the 32-token signing floor).
   fs::write(
     src.join("a.rs"),
     "pub struct Widget;\nimpl Widget {\n  pub fn render(&self, n: u32) -> u32 { n }\n}\n\
      pub fn make() -> Widget { Widget }\n\
-     pub fn run(w: &Widget) -> u32 {\n    let m = make();\n    w.render(1) + m.render(2)\n}\n",
+     pub fn run(w: &Widget) -> u32 {\n    let m = make();\n    w.render(1) + m.render(2)\n}\n\
+     pub fn big(a: u32, b: u32) -> u32 {\n    let mut s = a + b;\n    if s > 10 { s = s / 2; } \
+     else { s = s * 3; }\n    while s < 100 { s += a; }\n    s - b\n}\n",
   )
   .unwrap();
   fs::write(

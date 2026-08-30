@@ -1320,12 +1320,22 @@ pub(crate) fn extract_references<'t>(
   entities: &[String],
   out: &mut Vec<RawRef<'t>>,
 ) {
-  extract_references_with_facts(root, resolved, None, def_spans, entities, out, &mut Vec::new());
+  extract_references_with_facts(
+    root,
+    resolved,
+    None,
+    def_spans,
+    entities,
+    out,
+    &mut Vec::new(),
+    None,
+  );
 }
 
 /// [`extract_references`] with type-fact capture riding the SAME dfs (G-M1): binding sites
 /// dispatch through the resolved typefact table exactly like reference sites dispatch through
 /// the chain table — one walk, two outputs.
+#[allow(clippy::too_many_arguments)] // the one fused walk: every output rides the same cursor
 pub(crate) fn extract_references_with_facts<'t>(
   root: SgNode<'t>,
   resolved: &ResolvedRefSpec,
@@ -1334,6 +1344,7 @@ pub(crate) fn extract_references_with_facts<'t>(
   entities: &[String],
   out: &mut Vec<RawRef<'t>>,
   bindings: &mut Vec<crate::typefacts::RawBinding<'t>>,
+  mut signer: Option<&mut crate::signature::Signer>,
 ) {
   let spec = &*resolved.spec;
   // Generic type-parameter binders: (declaring item's span, binder name). Mentions of a binder
@@ -1351,6 +1362,11 @@ pub(crate) fn extract_references_with_facts<'t>(
   // index of this repo); `dfs()` streams the whole file over ONE cursor. Anonymous token
   // leaves still stream past, but a skipped iterator step is free where a cursor was not.
   for node in root.dfs() {
+    // Near-clone signatures (v16) read every leaf token — anonymous ones included — before
+    // the named-only dispatch below.
+    if let Some(signer) = signer.as_deref_mut() {
+      signer.visit(&node);
+    }
     if !node.is_named() {
       continue;
     }

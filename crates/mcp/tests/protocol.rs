@@ -100,6 +100,7 @@ fn initialize_handshake_and_tool_listing() {
       "importers",
       "implementors",
       "type_users",
+      "similar",
       "reachable",
       "structural_search",
       "rule_search",

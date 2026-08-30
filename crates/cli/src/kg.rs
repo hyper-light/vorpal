@@ -119,6 +119,8 @@ enum GraphVerb {
   Architecture,
   /// Outgoing data-flow rows for a definition: which arguments flow into which callees.
   Flows,
+  /// Near-clones of a definition (`similar_to` edges; confidence = estimated similarity).
+  Similar,
 }
 
 impl GraphVerb {
@@ -139,6 +141,7 @@ impl GraphVerb {
       GraphVerb::Diff => "diff",
       GraphVerb::Architecture => "architecture",
       GraphVerb::Flows => "flows",
+      GraphVerb::Similar => "similar",
     }
   }
 }
@@ -224,7 +227,8 @@ pub struct GraphArg {
   #[clap(long, value_name = "in|out|both", default_value = "in")]
   direction: String,
   /// (reachable) Comma-separated edge types to follow (calls, references, imports,
-  /// implements, of_type, defines, has_method, has_field, overrides, data_flows).
+  /// implements, of_type, defines, has_method, has_field, overrides, data_flows,
+  /// changes_with, similar_to).
   /// Default `calls`.
   #[clap(long, value_name = "RELS", default_value = "calls")]
   relations: String,
@@ -583,6 +587,10 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
     match &report.cochange_note {
       Some(note) => println!("note: {note}"),
       None => println!("co-change: {} file pairs from git history", report.cochange_edges),
+    }
+    match &report.similar_note {
+      Some(note) => println!("near-clones: {note}"),
+      None => println!("near-clones: {} similar_to pairs from token sketches", report.similar_edges),
     }
   }
   if !report.unverified_langs.is_empty() {

@@ -39,6 +39,10 @@ impl EdgeType {
   /// indexed repository's recent history (symmetric; confidence encodes the co-change
   /// count, ×20 capped at 100). Derived at seal from `git log`, never from source text.
   pub const CHANGES_WITH: EdgeType = EdgeType(11);
+  /// Near-clone: the two definitions' token shingle sets are estimated ≥ 0.7 Jaccard-similar
+  /// by their MinHash sketches (symmetric; confidence = estimated similarity × 100). Derived
+  /// at link from extraction-time signatures, never from name resolution.
+  pub const SIMILAR_TO: EdgeType = EdgeType(12);
 
   /// The user-facing relation name (the spelling accepted by [`EdgeType::from_name`] and shown
   /// in traversal results). Confidence is ignored — this reports the base type.
@@ -55,6 +59,7 @@ impl EdgeType {
       EdgeType::HAS_FIELD => "has_field",
       EdgeType::DATA_FLOWS => "data_flows",
       EdgeType::CHANGES_WITH => "changes_with",
+      EdgeType::SIMILAR_TO => "similar_to",
       _ => "unknown",
     }
   }
@@ -74,6 +79,7 @@ impl EdgeType {
       "has_field" => Some(EdgeType::HAS_FIELD),
       "data_flows" => Some(EdgeType::DATA_FLOWS),
       "changes_with" => Some(EdgeType::CHANGES_WITH),
+      "similar_to" => Some(EdgeType::SIMILAR_TO),
       _ => None,
     }
   }
