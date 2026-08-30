@@ -518,3 +518,33 @@ mod tests {
     }
   }
 }
+
+#[cfg(test)]
+mod rotation_tests {
+  use super::*;
+
+  /// The rotation is an isometry up to one global power-of-two scale: pairwise squared
+  /// distances scale uniformly, so RELATIVE geometry — all any quantizer or estimator
+  /// consumes — is exactly preserved. Also pins byte-determinism across calls.
+  #[test]
+  fn rotation_preserves_relative_geometry_and_is_deterministic() {
+    let mut a: Vec<f32> = (0..256).map(|i| ((i * 37 + 11) % 97) as f32 / 97.0 - 0.5).collect();
+    let mut b: Vec<f32> = (0..256).map(|i| ((i * 53 + 29) % 89) as f32 / 89.0 - 0.5).collect();
+    let d0: f32 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum();
+    let n0: f32 = a.iter().map(|x| x * x).sum();
+    let mut a2 = a.clone();
+    rotate_row(&mut a);
+    rotate_row(&mut a2);
+    assert_eq!(a, a2, "rotation must be a pure function");
+    rotate_row(&mut b);
+    let d1: f32 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum();
+    let n1: f32 = a.iter().map(|x| x * x).sum();
+    // Same power-of-two scale on distances and norms (3 rounds of 2^-6 on squared values).
+    let scale = n1 / n0;
+    assert!((d1 / d0 - scale).abs() < 1e-3 * scale, "isometry up to uniform scale");
+    // Non-multiple-of-64 rows are identity — deterministic skip.
+    let mut short = vec![1.0f32; 48];
+    rotate_row(&mut short);
+    assert_eq!(short, vec![1.0f32; 48]);
+  }
+}
