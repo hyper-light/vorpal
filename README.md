@@ -29,34 +29,34 @@ $ vorpal mcp          # serve all of the above to agents over MCP (stdio)
 
 ## Install
 
-Vorpal ships two interchangeable binaries: **`vorpal`** and the short alias **`vp`**.
-
 ### Prebuilt binary (recommended)
 
-Every [release](https://github.com/hyper-light/vorpal/releases) attaches a zip per platform,
-`app-<target>.zip`, containing both `vorpal` and `vp`.
+Every [release](https://github.com/hyper-light/vorpal/releases) attaches **one binary per
+platform** — download it, make it executable, done. No archive to unpack.
 
 ```sh
-# macOS (Apple Silicon) — swap the asset name for your platform (table below)
-curl -L -o vorpal.zip https://github.com/hyper-light/vorpal/releases/latest/download/app-aarch64-apple-darwin.zip
-unzip vorpal.zip && chmod +x vorpal vp && sudo mv vorpal vp /usr/local/bin/
+# macOS (Apple Silicon) — pick your asset from the table below
+curl -L -o vorpal https://github.com/hyper-light/vorpal/releases/latest/download/vorpal-macos-arm64
+chmod +x vorpal && sudo mv vorpal /usr/local/bin/
 vorpal --help
 ```
 
 | Platform | Asset |
 |---|---|
-| macOS Apple Silicon | `app-aarch64-apple-darwin.zip` |
-| macOS Intel | `app-x86_64-apple-darwin.zip` |
-| Linux x86-64 (glibc) | `app-x86_64-unknown-linux-gnu.zip` |
-| Linux ARM64 (glibc) | `app-aarch64-unknown-linux-gnu.zip` |
-| Linux x86-64 (musl/static) | `app-x86_64-unknown-linux-musl.zip` |
-| Linux ARM64 (musl/static) | `app-aarch64-unknown-linux-musl.zip` |
-| Windows x64 / ARM64 | `app-x86_64-pc-windows-msvc.zip` · `app-aarch64-pc-windows-msvc.zip` |
+| macOS Apple Silicon | `vorpal-macos-arm64` |
+| macOS Intel | `vorpal-macos-x64` |
+| Linux x64 (glibc) | `vorpal-linux-x64` |
+| Linux ARM64 (glibc) | `vorpal-linux-arm64` |
+| Linux x64 (static/musl) | `vorpal-linux-x64-musl` |
+| Linux ARM64 (static/musl) | `vorpal-linux-arm64-musl` |
+| Windows x64 | `vorpal-windows-x64.exe` |
+| Windows ARM64 | `vorpal-windows-arm64.exe` |
+| Windows x86 (32-bit) | `vorpal-windows-x86.exe` |
 
 ### npm (cross-platform, global CLI)
 
 ```sh
-npm install -g @hyper-light/vorpal-cli   # installs the vorpal + vp binaries for your platform
+npm install -g @hyper-light/vorpal-cli   # installs the vorpal binary for your platform
 ```
 
 ### From source (any platform, Rust 1.85+)
@@ -64,7 +64,7 @@ npm install -g @hyper-light/vorpal-cli   # installs the vorpal + vp binaries for
 ```sh
 git clone https://github.com/hyper-light/vorpal && cd vorpal
 cargo build --release -p vorpal
-sudo mv target/release/vorpal target/release/vp /usr/local/bin/   # or add to PATH
+sudo mv target/release/vorpal /usr/local/bin/   # or add to PATH
 ```
 
 More detail (PATH setup, verifying, troubleshooting): **[docs/getting-started.md](docs/getting-started.md)**.

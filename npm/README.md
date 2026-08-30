@@ -4,9 +4,9 @@
   <img src="https://vorpal.github.io/logo.svg" alt="vorpal"/>
 </p>
 
-## vorpal(vp)
+## vorpal
 
-vorpal(vp) is a CLI tool for code structural search, lint, and rewriting.
+vorpal is a CLI tool for code structural search, lint, and rewriting.
 
 Please see [vorpal's official site](https://vorpal.github.io/) and [repository](https://github.com/hyper-light/vorpal)
 for more information.

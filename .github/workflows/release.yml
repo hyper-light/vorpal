@@ -1,6 +1,8 @@
-# CLI release: build the `vorpal` + `vp` binaries for every supported platform, attach them to
-# a GitHub Release as `app-<target>.zip` (the name cargo-binstall and the @hyper-light/vorpal-cli npm
-# wrapper expect), and publish the @hyper-light/vorpal-cli wrapper + its per-platform binary packages.
+# CLI release: build the `vorpal` binary for every supported platform and attach each one to
+# the GitHub Release DIRECTLY — one raw binary per platform, named `vorpal-<os>-<arch>` (Windows:
+# `vorpal-windows-<arch>.exe`), no archive to unpack. cargo-binstall's per-target overrides in
+# crates/cli/Cargo.toml expect exactly these names. Also publishes the @hyper-light/vorpal-cli
+# wrapper + its per-platform binary packages.
 #
 # Triggers: pushing a tag `v<version>` does the full release; workflow_dispatch runs the build
 # matrix only (a dry run — nothing is released or published without a tag).
@@ -60,14 +62,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest }
-          - { target: aarch64-pc-windows-msvc, os: windows-latest }
-          - { target: i686-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest, asset: vorpal-macos-arm64 }
+          - { target: x86_64-apple-darwin, os: macos-latest, asset: vorpal-macos-x64 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, asset: vorpal-linux-x64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, asset: vorpal-linux-arm64 }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true, asset: vorpal-linux-x64-musl }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, asset: vorpal-linux-arm64-musl }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-x64.exe }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-arm64.exe }
+          - { target: i686-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-x86.exe }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,23 +88,17 @@ jobs:
           # musl-gcc links against shared libgcc_s.so.1 by default, which runners lack.
           RUSTFLAGS: ${{ matrix.musl && '-C target-feature=+crt-static -C link-arg=-static-libgcc' || '' }}
         run: cargo build --release -p vorpal --target ${{ matrix.target }}
-      - name: Package (unix)
+      - name: Stage binary (unix)
         if: runner.os != 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          zip -j "${GITHUB_WORKSPACE}/app-${{ matrix.target }}.zip" vorpal vp
-      - name: Package (windows)
+        run: cp "target/${{ matrix.target }}/release/vorpal" "${{ matrix.asset }}"
+      - name: Stage binary (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          Compress-Archive -Path `
-            "target/${{ matrix.target }}/release/vorpal.exe", `
-            "target/${{ matrix.target }}/release/vp.exe" `
-            -DestinationPath "app-${{ matrix.target }}.zip"
+        run: Copy-Item "target/${{ matrix.target }}/release/vorpal.exe" "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: app-${{ matrix.target }}
-          path: app-${{ matrix.target }}.zip
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
           if-no-files-found: error
 
   # The remote-fleet stage-0 loader + the signed agent (docs/REMOTE.md §2, §6). The agent is the
@@ -185,9 +182,9 @@ jobs:
           path: artifacts
       - uses: softprops/action-gh-release@v2
         with:
-          # The CLI zips, plus the fleet stage-0 loaders, signed agents, and blake3 pins.
+          # The CLI binaries, plus the fleet stage-0 loaders, signed agents, and blake3 pins.
           files: |
-            artifacts/**/app-*.zip
+            artifacts/**/vorpal-*
             artifacts/**/vorpal-loader-*
             artifacts/**/agent-*.json
             artifacts/**/agent-*.vld
@@ -216,20 +213,20 @@ jobs:
         run: |
           set -euo pipefail
           for pair in \
-            aarch64-apple-darwin=darwin-arm64 \
-            x86_64-unknown-linux-gnu=linux-x64-gnu \
-            aarch64-unknown-linux-gnu=linux-arm64-gnu \
-            x86_64-unknown-linux-musl=linux-x64-musl \
-            aarch64-unknown-linux-musl=linux-arm64-musl \
-            x86_64-pc-windows-msvc=win32-x64-msvc \
-            aarch64-pc-windows-msvc=win32-arm64-msvc \
-            i686-pc-windows-msvc=win32-ia32-msvc; do
-            target="${pair%%=*}"
+            vorpal-macos-arm64=darwin-arm64 \
+            vorpal-linux-x64=linux-x64-gnu \
+            vorpal-linux-arm64=linux-arm64-gnu \
+            vorpal-linux-x64-musl=linux-x64-musl \
+            vorpal-linux-arm64-musl=linux-arm64-musl \
+            vorpal-windows-x64.exe=win32-x64-msvc \
+            vorpal-windows-arm64.exe=win32-arm64-msvc \
+            vorpal-windows-x86.exe=win32-ia32-msvc; do
+            asset="${pair%%=*}"
             platform="${pair##*=}"
-            zipfile="artifacts/app-${target}/app-${target}.zip"
+            binary="artifacts/${asset}/${asset}"
             case "$platform" in
-              win32-*) unzip -o "$zipfile" vorpal.exe -d "npm/platforms/${platform}/" ;;
-              *)       unzip -o "$zipfile" vorpal -d "npm/platforms/${platform}/" \
+              win32-*) cp "$binary" "npm/platforms/${platform}/vorpal.exe" ;;
+              *)       cp "$binary" "npm/platforms/${platform}/vorpal" \
                          && chmod +x "npm/platforms/${platform}/vorpal" ;;
             esac
           done
