@@ -167,6 +167,8 @@ pub(crate) fn greedy_search(
   let mut visited: Vec<Scored> = Vec::with_capacity(l * 3);
   // Per-expansion admission buffer (see below) — one allocation per search, reused.
   let mut cand: Vec<(f32, u32)> = Vec::with_capacity(64);
+  // Survivor ids staged between the filter pass and the distance pass, reused.
+  let mut fresh: Vec<u32> = Vec::with_capacity(64);
 
   // Frontier cursor: entries before `frontier` are all expanded, so the first unexpanded
   // entry (the (distance, id) minimum among unexpanded — the array is sorted) is found in
@@ -182,20 +184,26 @@ pub(crate) fn greedy_search(
     let (dist_next, next, _) = beam[frontier];
     frontier += 1;
     visited.push((next, dist_next));
-    // The expansion loop is memory-latency-bound (one random ~256 B row per neighbor):
-    // stage the upcoming neighbor's codes AND its visit-mark slot while the current dot
-    // product runs (the mark probe is a random load into a multi-MB array — unprefetched,
-    // it stalled ahead of every distance).
+    // The expansion is memory-latency-bound (one random ~256 B row per candidate). Two
+    // passes convert a 1-deep prefetch pipeline into full-fan memory-level parallelism:
+    // the FILTER pass runs the visited checks (staging each upcoming mark slot) and issues
+    // the row prefetch for every survivor — putting all of them in flight at once — and
+    // the DISTANCE pass then evaluates rows the memory system has already been fetching.
+    // Same survivors, same distances, same admission set: bit-identical output (sha-pinned).
     let row = graph.row(next);
     cand.clear();
+    fresh.clear();
     for (i, &nb) in row.iter().enumerate() {
       if let Some(&ahead) = row.get(i + 1) {
-        prefetch(ahead);
         stamps.prefetch(ahead);
       }
       if stamps.seen(nb) {
         continue;
       }
+      prefetch(nb);
+      fresh.push(nb);
+    }
+    for &nb in &fresh {
       cand.push((dist(nb), nb));
     }
     if counters_enabled() {
