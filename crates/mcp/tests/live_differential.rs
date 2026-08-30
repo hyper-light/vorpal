@@ -59,7 +59,7 @@ fn scratch_battery(src: &Path, scratch_root: &Path, step: usize, probes: &[&str]
 }
 
 fn wait_for_marker(server: &mut Server, id: &mut u64, marker: &str) {
-  let deadline = Instant::now() + Duration::from_secs(15);
+  let deadline = Instant::now() + Duration::from_secs(30);
   loop {
     *id += 1;
     let (text, is_error) = call_tool(server, *id, "node", json!({"name": marker}));

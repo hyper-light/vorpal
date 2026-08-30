@@ -761,10 +761,11 @@ impl RetainedIndex {
         is_alive[row as usize] = true;
       }
     }
+    let repair = &self.repair;
     let chase = |mut row: u32| -> Option<u32> {
       let mut hops = 0;
       while !is_alive[row as usize] {
-        row = *self.repair.get(&row)?;
+        row = *repair.get(&row)?;
         hops += 1;
         if hops > 64 {
           return None; // structurally impossible chain — treat as a miss, never spin
@@ -772,37 +773,46 @@ impl RetainedIndex {
       }
       Some(row)
     };
-    for (bits, bucket) in &mut self.resolution {
-      if dirty.contains(bits) {
-        continue;
-      }
-      for (from, to, _) in &mut bucket.edges {
-        debug_assert!(is_alive[*from as usize], "untouched bucket sources stay alive");
-        if !is_alive[*to as usize] {
-          match chase(*to) {
-            Some(next) => *to = next,
-            None => return Err(()),
-          }
-        }
-      }
-      for row in &mut bucket.evidence {
-        if row.to != vorpal_kg::NO_EDGE && !is_alive[row.to as usize] {
-          match chase(row.to) {
-            Some(next) => row.to = next,
-            None => return Err(()),
-          }
-        }
-        for alt in &mut row.alternatives {
-          if !is_alive[*alt as usize] {
-            match chase(*alt) {
-              Some(next) => *alt = next,
-              None => return Err(()),
+    // Buckets heal independently — fan the scan out (it walks every retained edge; serial
+    // it was ~10-15ms of the serve path at kernel scale).
+    use rayon::prelude::*;
+    let mut untouched: Vec<&mut FileResolution> = self
+      .resolution
+      .iter_mut()
+      .filter_map(|(bits, bucket)| (!dirty.contains(bits)).then_some(bucket))
+      .collect();
+    let ok = untouched
+      .par_iter_mut()
+      .map(|bucket| {
+        for (from, to, _) in &mut bucket.edges {
+          debug_assert!(is_alive[*from as usize], "untouched bucket sources stay alive");
+          if !is_alive[*to as usize] {
+            match chase(*to) {
+              Some(next) => *to = next,
+              None => return false,
             }
           }
         }
-      }
-    }
-    Ok(())
+        for row in &mut bucket.evidence {
+          if row.to != vorpal_kg::NO_EDGE && !is_alive[row.to as usize] {
+            match chase(row.to) {
+              Some(next) => row.to = next,
+              None => return false,
+            }
+          }
+          for alt in &mut row.alternatives {
+            if !is_alive[*alt as usize] {
+              match chase(*alt) {
+                Some(next) => *alt = next,
+                None => return false,
+              }
+            }
+          }
+        }
+        true
+      })
+      .reduce(|| true, |a, b| a && b);
+    if ok { Ok(()) } else { Err(()) }
   }
 
   /// Assemble the sealed graph from the containment blocks + the resolution buckets chained

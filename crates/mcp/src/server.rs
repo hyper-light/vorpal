@@ -327,12 +327,19 @@ impl Server {
     // changed file) and canonicalize the stamps in a background build. Any doubt falls
     // through to the synchronous rebuild below. A failed or superseded background build
     // re-arms the dirty flag, so the next query retries.
-    if let Some(paths) = &hints
+    // One extraction per changed file serves BOTH fast paths: the serve-immediately
+    // decision (byte-identical to cached products?) and, failing that, the overlay's
+    // absorb — which previously re-extracted the same files.
+    let probe = if let Some(paths) = &hints
       && !paths.is_empty()
       && paths.len() <= 8
       && self.kg.is_some()
-      && vorpal_index::extraction_unchanged(&self.index_dir, paths)
     {
+      vorpal_index::live::probe_extraction(&self.index_dir, paths).ok()
+    } else {
+      None
+    };
+    if probe.as_ref().is_some_and(vorpal_index::live::ExtractionProbe::all_unchanged) {
       if self.canonicalizing.is_some() || self.persisting.is_some() {
         // A background committer is still in flight (stamp canonicalization or a live
         // build's persistence): answers are STILL provably unchanged — the probe verified
@@ -344,7 +351,7 @@ impl Server {
       }
       let src = watch.src().to_path_buf();
       let index_dir = self.index_dir.clone();
-      let paths = paths.clone();
+      let paths = hints.as_ref().expect("a probe implies captured hints").clone();
       self.canonicalizing = Some(std::thread::spawn(move || {
         vorpal_index::build_index_watched(&src, &index_dir, &paths).is_ok()
       }));
@@ -358,9 +365,8 @@ impl Server {
     // spawned here commits the very generation these answers came from; ordering holds
     // because both committers are drained first, exactly like the synchronous path.
     if overlay_enabled()
+      && let Some(probe) = &probe
       && let Some(paths) = &hints
-      && !paths.is_empty()
-      && paths.len() <= 8
       && self.kg.is_some()
       && self.overlay.is_some()
     {
@@ -371,7 +377,7 @@ impl Server {
       let paths = paths.clone();
       let overlay = self.overlay.as_mut().expect("checked above");
       vorpal_kg::phase_stamp("overlay: serving");
-      match overlay.apply_and_link(&paths) {
+      match overlay.apply_and_link_probed(probe) {
         Ok(kg) => {
           let stale = overlay.dead_row_fraction() > 0.5;
           self.kg = Some(Arc::new(kg));

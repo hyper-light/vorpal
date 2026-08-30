@@ -19,6 +19,90 @@ use vorpal_ingest::{
 };
 use vorpal_kg::Kg;
 
+/// One hinted path's probed state: the daemon extracts each changed file ONCE, decides the
+/// serve-immediately question with it, and hands the same bytes to the overlay — the
+/// probe→overlay double extraction was ~10-15ms of every semantic serve.
+pub enum ProbedPath {
+  /// Gone from disk — the overlay retracts it.
+  Vanished,
+  /// Not an extractable source file: inert for the unchanged check, skipped by the overlay
+  /// (unless it was indexed before, which the overlay treats as its own failure signal).
+  Unhandled,
+  /// Fresh extraction, encoded. `matches_cache` = byte-identical to the cached product
+  /// outside the stamp window `[8..32)` — the serve-immediately criterion.
+  Extracted { bytes: Vec<u8>, matches_cache: bool },
+  /// Unreadable or unextractable — callers take the full pipeline.
+  Failed,
+}
+
+pub struct ExtractionProbe {
+  pub per_path: Vec<(PathBuf, ProbedPath)>,
+}
+
+impl ExtractionProbe {
+  /// The serve-immediately criterion, byte-equivalent to `extraction_unchanged`: every
+  /// probed path is either inert (unhandled) or extracted byte-identical to its cached
+  /// product. Vanished and failed paths can change answers, so they refuse.
+  pub fn all_unchanged(&self) -> bool {
+    !self.per_path.is_empty()
+      && self.per_path.iter().all(|(_, probed)| match probed {
+        ProbedPath::Unhandled => true,
+        ProbedPath::Extracted { matches_cache, .. } => *matches_cache,
+        ProbedPath::Vanished | ProbedPath::Failed => false,
+      })
+  }
+}
+
+/// Extract every hinted path once, comparing against the committed generation's cached
+/// products. The decision logic mirrors `vorpal_index::extraction_unchanged`; the extracted
+/// bytes ride along for [`LiveOverlay::apply_and_link_probed`].
+pub fn probe_extraction(
+  index_dir: &Path,
+  paths: &HashSet<PathBuf>,
+) -> Result<ExtractionProbe, String> {
+  let generation = vorpal_kg::resolve_index_dir(index_dir);
+  let pack = PackReader::open(&generation);
+  let extractor =
+    OutlineExtractor::new().map_err(|err| format!("probe: extractor init failed: {err}"))?;
+  let mut ordered: Vec<&PathBuf> = paths.iter().collect();
+  ordered.sort();
+  let mut per_path = Vec::with_capacity(ordered.len());
+  for path in ordered {
+    let key = path.to_string_lossy();
+    let probed = if !path.exists() {
+      ProbedPath::Vanished
+    } else if !extractor.handles(&key) {
+      ProbedPath::Unhandled
+    } else {
+      match fs::read_to_string(path) {
+        Err(_) => ProbedPath::Failed,
+        Ok(source) => match extractor.extract_product(&key, &source) {
+          None => ProbedPath::Failed,
+          Some(product) => {
+            let mut bytes = Vec::new();
+            encode_product_into(&product, &mut bytes);
+            let matches_cache = pack
+              .as_ref()
+              .and_then(|p| p.get(&key))
+              .is_some_and(|cached| {
+                bytes.len() == cached.len()
+                  && bytes.len() >= 32
+                  && bytes[0..8] == cached[0..8]
+                  && bytes[32..] == cached[32..]
+              });
+            ProbedPath::Extracted {
+              bytes,
+              matches_cache,
+            }
+          }
+        },
+      }
+    };
+    per_path.push((path.clone(), probed));
+  }
+  Ok(ExtractionProbe { per_path })
+}
+
 pub struct LiveOverlay {
   interner: vorpal_ingest::Interner,
   index: RetainedIndex,
@@ -165,11 +249,53 @@ impl LiveOverlay {
     Ok(())
   }
 
+  /// [`LiveOverlay::absorb`] from a probe's already-extracted products — the serve path
+  /// never extracts twice. Same outcomes as `absorb` on the same tree state.
+  pub fn absorb_probed(&mut self, probe: &ExtractionProbe) -> Result<(), String> {
+    for (path, probed) in &probe.per_path {
+      let key = path.to_string_lossy();
+      match probed {
+        ProbedPath::Vanished => {
+          self
+            .index
+            .apply_file(&self.interner, &key, None)
+            .map_err(|err| format!("overlay: retract {key} failed: {err}"))?;
+        }
+        ProbedPath::Unhandled => {
+          if self.index.contains(&key) {
+            return Err(format!("overlay: {key} indexed before but unhandled now"));
+          }
+        }
+        ProbedPath::Extracted { bytes, .. } => {
+          self
+            .index
+            .apply_file(&self.interner, &key, Some(bytes))
+            .map_err(|err| format!("overlay: apply {key} failed: {err}"))?;
+        }
+        ProbedPath::Failed => {
+          return Err(format!("overlay: {key} failed extraction"));
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// [`LiveOverlay::apply_and_link`], reusing the probe's extractions.
+  pub fn apply_and_link_probed(&mut self, probe: &ExtractionProbe) -> Result<Kg, String> {
+    vorpal_kg::phase_stamp("overlay: apply start");
+    self.absorb_probed(probe)?;
+    self.link_served()
+  }
+
   /// [`LiveOverlay::absorb`] followed by the re-link: the serve path. Returns the sealed
   /// graph for the updated tree — byte-identical to a from-scratch build of it.
   pub fn apply_and_link(&mut self, changed: &HashSet<PathBuf>) -> Result<Kg, String> {
     vorpal_kg::phase_stamp("overlay: apply start");
     self.absorb(changed)?;
+    self.link_served()
+  }
+
+  fn link_served(&mut self) -> Result<Kg, String> {
     let (kg, _stats) = self
       .index
       .link_for_serving(&self.interner, &Resolver::new())
