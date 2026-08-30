@@ -1,0 +1,25 @@
+id: cmake-function
+language: CMake
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_def
+    - has:
+        stopBy: end
+        kind: argument
+        pattern: $NAME
+name: '$NAME'
+---
+id: cmake-macro
+language: CMake
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: macro_def
+    - has:
+        stopBy: end
+        kind: argument
+        pattern: $NAME
+name: '$NAME'

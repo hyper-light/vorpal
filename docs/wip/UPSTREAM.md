@@ -198,7 +198,14 @@ All under `grammars/<crate>/`, patched into the workspace. `Local patches` is "�
 | tree-sitter-solidity | 1.2.13 | `4e938a46c703` | — |
 | tree-sitter-swift | 0.7.3 | `b8b22bffbb34` | — |
 | tree-sitter-typescript | 0.23.2 | `f975a621f4e7` | — (typescript + tsx parsers) |
+| tree-sitter-cmake | 0.7.4 | `v0.7.4` tag | — |
+| tree-sitter-dockerfile | 0.2.0 | `v0.2.0` tag | bindings modernized to LanguageFn (crate 0.2.0 shipped `fn language()` on tree-sitter 0.20) |
+| tree-sitter-graphql | 0.2.1 | `v0.2.1` tag | — |
+| tree-sitter-ini | 1.4.0 | `v1.4.0` tag | — |
+| tree-sitter-make | 1.1.1 | `v1.1.1` tag | — |
+| tree-sitter-proto | 0.5.0 | `0.5.0` tag | — |
 | tree-sitter-toml-ng | 0.7.0 | `64b56832c2cf` | — |
+| tree-sitter-xml | 0.7.0 | `v0.7.0` tag | — |
 | tree-sitter-yaml | 0.7.2 | `7708026449be` | — |
 
 ## Planned

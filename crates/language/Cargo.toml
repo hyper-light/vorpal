@@ -19,6 +19,13 @@ tree-sitter.workspace = true
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 tree-sitter-bash = { version = "0.25.0", optional = true }
+tree-sitter-cmake = { version = "0.7.4", optional = true }
+tree-sitter-dockerfile = { version = "0.2.0", optional = true }
+tree-sitter-graphql = { version = "0.2.1", optional = true }
+tree-sitter-ini = { version = "1.4.0", optional = true }
+tree-sitter-make = { version = "1.1.1", optional = true }
+tree-sitter-proto = { version = "0.5.0", optional = true }
+tree-sitter-xml = { version = "0.7.0", optional = true }
 tree-sitter-cpp = { version = "0.23.0", optional = true }
 tree-sitter-c-sharp = { version = "0.23.0", optional = true }
 tree-sitter-css = { version = "0.25.0", optional = true }
@@ -51,6 +58,13 @@ tree-sitter-hcl = { version = "1.1.0", optional = true }
 builtin-parser = [
   "tree-sitter-bash",
   "tree-sitter-c",
+  "tree-sitter-cmake",
+  "tree-sitter-dockerfile",
+  "tree-sitter-graphql",
+  "tree-sitter-ini",
+  "tree-sitter-make",
+  "tree-sitter-proto",
+  "tree-sitter-xml",
   "tree-sitter-cpp",
   "tree-sitter-c-sharp",
   "tree-sitter-css",

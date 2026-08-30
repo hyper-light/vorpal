@@ -1,0 +1,39 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "cmake",
+      "camelcase": "Cmake",
+      "scope": "source.cmake",
+      "path": ".",
+      "file-types": [
+        "cmake",
+        "CMakeLists.txt"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.7.4",
+    "license": "MIT",
+    "description": "CMake grammar for tree-sitter",
+    "authors": [
+      {
+        "name": "Uy Ha"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/uyha/tree-sitter-cmake"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": true,
+    "java": false,
+    "node": true,
+    "python": true,
+    "rust": true,
+    "swift": true,
+    "zig": false
+  }
+}

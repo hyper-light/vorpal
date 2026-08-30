@@ -1,0 +1,47 @@
+id: dockerfile-stage
+language: Dockerfile
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: from_instruction
+    - has:
+        kind: image_spec
+        pattern: $NAME
+name: '$NAME'
+---
+id: dockerfile-arg
+language: Dockerfile
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: arg_instruction
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: dockerfile-env
+language: Dockerfile
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: env_pair
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: dockerfile-label
+language: Dockerfile
+role: item
+symbolType: key
+rule:
+  all:
+    - kind: label_pair
+    - has:
+        field: key
+        pattern: $NAME
+name: '$NAME'

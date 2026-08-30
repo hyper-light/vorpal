@@ -69,6 +69,13 @@ rayon = "1.10.0"
 # CPU, so the C runtime (lexer/parser/subtree/stack) is ours to profile and optimize in-tree.
 # See docs/UPSTREAM.md for the sync ledger.
 tree-sitter = { path = "vendor/tree-sitter" }
+tree-sitter-cmake = { path = "grammars/tree-sitter-cmake" }
+tree-sitter-dockerfile = { path = "grammars/tree-sitter-dockerfile" }
+tree-sitter-graphql = { path = "grammars/tree-sitter-graphql" }
+tree-sitter-ini = { path = "grammars/tree-sitter-ini" }
+tree-sitter-make = { path = "grammars/tree-sitter-make" }
+tree-sitter-proto = { path = "grammars/tree-sitter-proto" }
+tree-sitter-xml = { path = "grammars/tree-sitter-xml" }
 tree-sitter-bash = { path = "grammars/tree-sitter-bash" }
 tree-sitter-c = { path = "grammars/tree-sitter-c" }
 tree-sitter-c-sharp = { path = "grammars/tree-sitter-c-sharp" }

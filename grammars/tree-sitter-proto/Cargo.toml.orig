@@ -1,0 +1,27 @@
+[package]
+name = "tree-sitter-proto"
+description = "Parser for proto2 and proto3 files"
+version = "0.5.0"
+authors = ["Mohammad Ashar Khan <ashar786khan@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+keywords = ["incremental", "parsing", "tree-sitter", "proto"]
+categories = ["parsing", "text-editors"]
+repository = "https://github.com/coder3101/tree-sitter-proto"
+edition = "2021"
+autoexamples = false
+
+build = "bindings/rust/build.rs"
+include = ["LICENSE", "bindings/rust/*", "grammar.js", "queries/*", "src/*"]
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.2"
+
+[dev-dependencies]
+tree-sitter = "0.26"

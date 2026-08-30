@@ -248,6 +248,48 @@ fn structural_languages_extract_structure_nodes() {
       &["server", "port"],
     ),
     (
+      "dockerfile",
+      "Dockerfile",
+      "FROM alpine:3\nARG VERSION=1\nENV KEY=value\n",
+      &["alpine:3", "VERSION", "KEY"],
+    ),
+    (
+      "make",
+      "Makefile",
+      "VAR := 1\n\nall: dep\n\techo hi\n",
+      &["VAR", "all"],
+    ),
+    (
+      "cmake",
+      "CMakeLists.txt",
+      "function(canary_fn arg)\nendfunction()\n",
+      &["canary_fn"],
+    ),
+    (
+      "ini",
+      "cfg.ini",
+      "top = 1\n\n[section]\nkey = value\n",
+      &["top", "section", "key"],
+    ),
+    (
+      "xml",
+      "doc.xml",
+      "<root><child attr=\"1\"/></root>\n",
+      &["root", "child"],
+    ),
+    (
+      "proto",
+      "api.proto",
+      "syntax = \"proto3\";\nmessage Canary {\n  string name = 1;\n}\n",
+      &["Canary", "name"],
+    ),
+    (
+      "graphql",
+      "schema.graphql",
+      "type Canary {\n  id: ID\n}\n",
+      &["Canary", "id"],
+    ),
+    (
       "toml",
       "cfg.toml",
       "top = 1\n\n[server]\nport = 8080\n",

@@ -1,0 +1,37 @@
+id: make-rule
+language: Make
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: rule
+    - has:
+        kind: targets
+        has:
+          kind: word
+          pattern: $NAME
+name: '$NAME'
+---
+id: make-variable
+language: Make
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: variable_assignment
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: make-define
+language: Make
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: define_directive
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'

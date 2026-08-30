@@ -229,6 +229,7 @@ macro_rules! langs {
       kind: $kind:tt $(($kchar:literal))?,
       aliases: [$($alias:literal),+ $(,)?],
       extensions: [$($ext:literal),+ $(,)?],
+      $(filenames: [$($fname:literal),+ $(,)?],)?
     }
   )*) => {
     /// One binding per language row; a disabled feature leaves an `unimplemented!()` stub
@@ -294,6 +295,14 @@ macro_rules! langs {
       }
     }
 
+    /// Exact file names that route to a language regardless of extension (`Dockerfile`,
+    /// `Makefile`, `CMakeLists.txt`) — empty for most languages.
+    fn filenames(lang: SupportLang) -> &'static [&'static str] {
+      match lang {
+        $(SupportLang::$variant => &[$($($fname),+)?],)*
+      }
+    }
+
     macro_rules! execute_lang_method {
       ($d me: path, $d method: ident, $d($d pname:tt),*) => {
         match $d me {
@@ -320,6 +329,8 @@ langs! { $
   Bash { parser: language_bash(tree_sitter_bash), feature: "tree-sitter-bash", kind: plain, aliases: ["bash"], extensions: ["bash", "bats", "cgi", "command", "env", "fcgi", "ksh", "sh", "tmux", "tool", "zsh"], }
   // https://en.cppreference.com/w/cpp/language/identifiers
   C { parser: language_c(tree_sitter_c), feature: "tree-sitter-c", kind: expando('𐀀'), aliases: ["c"], extensions: ["c", "h"], }
+  // CMake: `$` only appears in ${var} references, never in raw identifiers/arguments.
+  CMake { parser: language_cmake(tree_sitter_cmake), feature: "tree-sitter-cmake", kind: expando('µ'), aliases: ["cmake"], extensions: ["cmake"], filenames: ["CMakeLists.txt"], }
   Cpp { parser: language_cpp(tree_sitter_cpp), feature: "tree-sitter-cpp", kind: expando('𐀀'), aliases: ["cc", "c++", "cpp", "cxx"], extensions: ["cc", "hpp", "cpp", "c++", "hh", "cxx", "cu", "ino"], }
   // https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/lexical-structure#643-identifiers
   // all letter number is accepted: https://www.compart.com/en/unicode/category/Nl
@@ -327,10 +338,14 @@ langs! { $
   // https://www.w3.org/TR/CSS21/grammar.html#scanner
   Css { parser: language_css(tree_sitter_css), feature: "tree-sitter-css", kind: expando('_'), aliases: ["css"], extensions: ["css", "scss"], }
   Dart { parser: language_dart(tree_sitter_dart), feature: "tree-sitter-dart", kind: plain, aliases: ["dart"], extensions: ["dart"], }
+  // Dockerfile words interpolate $VAR, so `$` cannot survive in patterns.
+  Dockerfile { parser: language_dockerfile(tree_sitter_dockerfile), feature: "tree-sitter-dockerfile", kind: expando('µ'), aliases: ["dockerfile", "docker"], extensions: ["dockerfile"], filenames: ["Dockerfile", "Containerfile"], }
   // https://github.com/elixir-lang/tree-sitter-elixir/blob/a2861e88a730287a60c11ea9299c033c7d076e30/grammar.js#L245
   Elixir { parser: language_elixir(tree_sitter_elixir), feature: "tree-sitter-elixir", kind: expando('µ'), aliases: ["ex", "elixir"], extensions: ["ex", "exs"], }
   // any Unicode code point categorized as "Letter": https://go.dev/ref/spec#letter
   Go { parser: language_go(tree_sitter_go), feature: "tree-sitter-go", kind: expando('µ'), aliases: ["go", "golang"], extensions: ["go"], }
+  // GraphQL names are /[_A-Za-z][_0-9A-Za-z]*/ — `_` is the only safe expando.
+  GraphQL { parser: language_graphql(tree_sitter_graphql), feature: "tree-sitter-graphql", kind: expando('_'), aliases: ["graphql", "gql"], extensions: ["graphql", "gql", "graphqls"], }
   // GHC supports Unicode syntax (https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/unicode_syntax.html)
   // and the tree-sitter-haskell grammar parses it too.
   Haskell { parser: language_haskell(tree_sitter_haskell), feature: "tree-sitter-haskell", kind: expando('µ'), aliases: ["hs", "haskell"], extensions: ["hs"], }
@@ -338,17 +353,23 @@ langs! { $
   Hcl { parser: language_hcl(tree_sitter_hcl), feature: "tree-sitter-hcl", kind: expando('µ'), aliases: ["hcl"], extensions: ["hcl", "nomad", "tf", "tfvars", "workflow"], }
   // Hand-written type: carries the injection machinery (crates/language/src/html.rs).
   Html { parser: language_html(tree_sitter_html), feature: "tree-sitter-html", kind: custom, aliases: ["html"], extensions: ["html", "htm", "xhtml"], }
+  // INI keys are conventionally [A-Za-z0-9._-]; `$` does not lex as part of a key.
+  Ini { parser: language_ini(tree_sitter_ini), feature: "tree-sitter-ini", kind: expando('_'), aliases: ["ini", "properties"], extensions: ["ini", "cfg", "properties"], filenames: [".editorconfig"], }
   Java { parser: language_java(tree_sitter_java), feature: "tree-sitter-java", kind: plain, aliases: ["java"], extensions: ["java"], }
   JavaScript { parser: language_javascript(tree_sitter_javascript), feature: "tree-sitter-javascript", kind: plain, aliases: ["javascript", "js", "jsx"], extensions: ["cjs", "js", "mjs", "jsx"], }
   Json { parser: language_json(tree_sitter_json), feature: "tree-sitter-json", kind: plain, aliases: ["json"], extensions: ["json"], }
   // https://github.com/fwcd/tree-sitter-kotlin/pull/93
   Kotlin { parser: language_kotlin(tree_sitter_kotlin), feature: "tree-sitter-kotlin", kind: expando('µ'), aliases: ["kotlin", "kt"], extensions: ["kt", "ktm", "kts"], }
   Lua { parser: language_lua(tree_sitter_lua), feature: "tree-sitter-lua", kind: plain, aliases: ["lua"], extensions: ["lua"], }
+  // Make: `$` is THE macro character; it can never appear raw in a target/variable name.
+  Make { parser: language_make(tree_sitter_make), feature: "tree-sitter-make", kind: expando('µ'), aliases: ["make", "makefile", "gnumake"], extensions: ["mk", "mak", "make"], filenames: ["Makefile", "makefile", "GNUmakefile"], }
   Markdown { parser: language_markdown(tree_sitter_md), feature: "tree-sitter-md", kind: plain, aliases: ["markdown", "md"], extensions: ["markdown", "md"], }
   // Nix uses $ for string interpolation, e.g. "${pkgs.hello}"
   Nix { parser: language_nix(tree_sitter_nix), feature: "tree-sitter-nix", kind: expando('_'), aliases: ["nix"], extensions: ["nix"], }
   // PHP accepts unicode in some names (not variable names, though)
   Php { parser: language_php(tree_sitter_php, LANGUAGE_PHP_ONLY), feature: "tree-sitter-php", kind: expando('µ'), aliases: ["php"], extensions: ["php"], }
+  // Protobuf identifiers are [A-Za-z0-9_].
+  Proto { parser: language_proto(tree_sitter_proto), feature: "tree-sitter-proto", kind: expando('_'), aliases: ["proto", "protobuf"], extensions: ["proto"], }
   // any char in [:XID_Start:]: https://docs.python.org/3/reference/lexical_analysis.html#identifiers
   // see also PEP 3131 (https://peps.python.org/pep-3131/)
   Python { parser: language_python(tree_sitter_python), feature: "tree-sitter-python", kind: expando('µ'), aliases: ["py", "python"], extensions: ["py", "py3", "pyi", "bzl", "bazel"], }
@@ -364,6 +385,8 @@ langs! { $
   Toml { parser: language_toml(tree_sitter_toml), feature: "tree-sitter-toml", kind: expando('_'), aliases: ["toml"], extensions: ["toml"], }
   Tsx { parser: language_tsx(tree_sitter_typescript, LANGUAGE_TSX), feature: "tree-sitter-typescript", kind: plain, aliases: ["tsx"], extensions: ["tsx"], }
   TypeScript { parser: language_typescript(tree_sitter_typescript, LANGUAGE_TYPESCRIPT), feature: "tree-sitter-typescript", kind: plain, aliases: ["ts", "typescript"], extensions: ["ts", "cts", "mts"], }
+  // XML Names exclude `$` (and µ — NameStartChar begins at U+00C0); `_` is valid.
+  Xml { parser: language_xml(tree_sitter_xml, LANGUAGE_XML), feature: "tree-sitter-xml", kind: expando('_'), aliases: ["xml"], extensions: ["xml", "xsd", "xsl", "xslt", "svg", "rss", "atom", "plist", "xaml", "csproj", "props", "targets"], }
   Yaml { parser: language_yaml(tree_sitter_yaml), feature: "tree-sitter-yaml", kind: plain, aliases: ["yaml", "yml"], extensions: ["yaml", "yml"], }
 }
 
@@ -683,6 +706,17 @@ fn compute_grammar_digest(lang: SupportLang) -> u64 {
 /// Adapt from `<https://github.com/Wilfred/difftastic/blob/master/src/parse/guess_language.rs>`
 /// N.B do not confuse it with `FromStr` trait. This function is to guess language from file extension.
 fn from_extension(path: &Path) -> Option<SupportLang> {
+  // Exact-filename routing first: Dockerfile/Makefile/CMakeLists.txt have no extension (or a
+  // meaningless one), so their languages declare filenames in the langs! table.
+  if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+    if let Some(lang) = SupportLang::all_langs()
+      .iter()
+      .copied()
+      .find(|&l| filenames(l).iter().any(|f| name.eq_ignore_ascii_case(f)))
+    {
+      return Some(lang);
+    }
+  }
   let ext = path.extension()?.to_str()?;
   SupportLang::all_langs()
     .iter()
@@ -709,6 +743,12 @@ fn file_types(lang: SupportLang) -> Types {
   let exts = extensions(lang);
   let lang_name = lang.to_string();
   add_custom_file_type(&mut builder, &lang_name, exts);
+  for fname in filenames(lang) {
+    builder
+      .add(&lang_name, fname)
+      .expect("file name glob must compile");
+    builder.select(&lang_name);
+  }
   builder.build().expect("file type must be valid")
 }
 

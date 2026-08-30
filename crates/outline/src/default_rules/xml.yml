@@ -1,0 +1,48 @@
+id: xml-element
+language: Xml
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: STag
+            has:
+              kind: Name
+              pattern:
+                context: <$NAME></$NAME>
+                selector: Name
+        - has:
+            kind: EmptyElemTag
+            has:
+              kind: Name
+              pattern:
+                context: <$NAME></$NAME>
+                selector: Name
+name: '$NAME'
+---
+id: xml-child-element
+language: Xml
+role: member
+parentRuleIds: [xml-element]
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: STag
+            has:
+              kind: Name
+              pattern:
+                context: <$NAME></$NAME>
+                selector: Name
+        - has:
+            kind: EmptyElemTag
+            has:
+              kind: Name
+              pattern:
+                context: <$NAME></$NAME>
+                selector: Name
+name: '$NAME'
