@@ -112,7 +112,7 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
 |---|---|---|
 | pool recall (l=200, 32 probes) | 0.9125 | **0.9937** (refine×2, saturated: ×3 identical) |
 | structurally unreachable nodes | 66,257 silently invisible | **0** (repair pass) |
-| vamana build (kernel, 16 cores) | ~8.6s | ~21-26s load-dependent; phase telemetry: insertion ~8.4-9.9s, refine-1 ~7.2-7.9s, refine-2 ~7.3-7.6s |
+| vamana build (kernel, 16 cores) | ~8.6s | ~21-23s; phase telemetry: insertion ~8.1-8.4s, refine ~6.5-7.0s each (x4 kernel −8-10% on search phases) |
 | determinism | sha-stable | sha-stable + dist-eval/expansion counters as the noise-immune A/B instrument |
 
 CORRECTION (phase telemetry, supersedes the fa9ef31 commit message): refine pass 2 costs
@@ -148,6 +148,11 @@ is load-bearing, the third independent confirmation of that law.
   Mechanism: partial refinement redistributes edges toward the refined half; merge prunes
   on their targets evict back-edges the UNREFINED half depended on, orphaning it. Full
   refinement re-balances symmetrically — the 19.5s build is the honest price of 0.9812.
+
+- Interleaved x4 SDOT kernel: **ADOPTED, sha-pinned** — four candidates' misses overlap;
+  refine phases 7.2-7.9 → 6.5-7.0s. Remaining kernel headroom (query-in-registers full
+  unroll at dim 256) judged diminishing; the structural time lever remains the FastScan
+  package below.
 
 Next up: FastScan-packed SymphonyQG layout as a dedicated branch-scale effort (design
 above), and Tier-3 incremental daemon tier (unblocked, independent of Tier-2).
