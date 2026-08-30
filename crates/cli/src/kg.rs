@@ -142,6 +142,58 @@ impl GraphVerb {
   }
 }
 
+/// `vorpal query '<text>'` (G-M4): the Cypher-shaped read-only query language.
+#[derive(Args)]
+pub struct QueryArg {
+  /// Query text, e.g.
+  /// 'MATCH (f:Function)-[:calls*1..3]->(g {name: "resolve_target"}) RETURN f.name LIMIT 20'
+  text: String,
+  /// Index directory (default .vorpal/index).
+  #[clap(long, value_name = "DIR")]
+  index: Option<PathBuf>,
+  /// Output: text table or the QueryResult JSON document.
+  #[clap(long, value_enum, default_value_t = OutputFormat::Text)]
+  format: OutputFormat,
+}
+
+pub fn run_query(arg: QueryArg) -> Result<ExitCode> {
+  if !matches!(arg.format, OutputFormat::Text | OutputFormat::Json) {
+    return Err(anyhow!("`query` renders --format text or json"));
+  }
+  let dir = index_dir(arg.index);
+  let kg = vorpal_index::Kg::load(&dir)
+    .map_err(|err| anyhow!(err.to_string()))
+    .with_context(|| missing_index_hint(&dir))?;
+  let result = match vorpal_query::run(&kg, &arg.text) {
+    Ok(result) => result,
+    Err(err) => {
+      // Query mistakes are user-facing teaching errors, not stack noise: print the typed
+      // message (it names the byte offset / boundary / ceiling) and exit nonzero.
+      eprintln!("{err}");
+      return Ok(ExitCode::FAILURE);
+    }
+  };
+  match arg.format {
+    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+    _ => {
+      println!("{}", result.columns.join(" | "));
+      for row in &result.rows {
+        println!(
+          "{}",
+          row.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ")
+        );
+      }
+      let shown = result.rows.len() as u64;
+      if shown != result.total_rows {
+        println!("({shown} of {} rows)", result.total_rows);
+      } else {
+        println!("({shown} row{})", if shown == 1 { "" } else { "s" });
+      }
+    }
+  }
+  Ok(ExitCode::SUCCESS)
+}
+
 #[derive(Args)]
 pub struct GraphArg {
   /// Which relation to query.

@@ -249,6 +249,14 @@ impl Kg {
     self.graph.edge_count() as u64
   }
 
+  /// The underlying CSR/CSC graph — read-only access for traversal engines that need
+  /// allocation-free adjacency walks with their own budgets (vorpal-query's bounded BFS),
+  /// which `out_neighbors`/`in_neighbors` (allocating) and the fixed-shape `reachable_*`
+  /// wrappers don't serve.
+  pub fn graph(&self) -> &vorpal_graph::Graph {
+    &self.graph
+  }
+
   /// Incoming-edge count for one node — two mapped offset reads, no allocation (unlike
   /// [`Kg::in_neighbors`], which materializes the row).
   pub fn in_degree(&self, id: NodeId) -> usize {

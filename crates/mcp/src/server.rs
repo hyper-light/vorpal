@@ -72,7 +72,7 @@ impl Profile {
     const ANALYSIS_EXTRA: &[&str] = &[
       "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
-      "code_search", "data_flow",
+      "code_search", "data_flow", "query",
     ];
     match self {
       Profile::Full => true,
@@ -827,6 +827,54 @@ impl Server {
           json!({"records": records, "sidecarPresent": sidecar_present}),
         ))
       }
+      "query" => {
+        // Cypher-shaped read-only queries (G-M4): `text` in the query language, or `ir`
+        // carrying the typed IR document. Ceilings (text bytes, depth, edge visits, rows)
+        // are typed refusals naming the ceiling — never a silently truncated answer.
+        let parsed = if let Some(text) = args.get("text").and_then(Value::as_str) {
+          vorpal_query::parse(text)
+        } else if let Some(ir) = args.get("ir") {
+          vorpal_query::parse_ir_json(&ir.to_string())
+        } else {
+          return Err(ToolError::coded(
+            "bad-argument",
+            "pass `text` (the query language) or `ir` (a typed IR document)",
+          ));
+        }
+        .map_err(|err| ToolError::coded("bad-query", err.to_string()))?;
+        self.kg()?;
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded(
+            "index-unavailable",
+            "no graph is loaded — run the 'index' tool first",
+          ));
+        };
+        let result = vorpal_query::execute(kg, &parsed)
+          .map_err(|err| ToolError::coded("bad-query", err.to_string()))?;
+        const TEXT_ROWS: usize = 200;
+        let mut lines = vec![result.columns.join(" | ")];
+        for row in result.rows.iter().take(TEXT_ROWS) {
+          lines.push(row.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | "));
+        }
+        if result.rows.len() > TEXT_ROWS {
+          lines.push(format!(
+            "… {} more rows in structuredContent",
+            result.rows.len() - TEXT_ROWS
+          ));
+        }
+        if result.rows.is_empty() {
+          lines.push("(no rows)".to_string());
+        }
+        lines.push(format!(
+          "{} row{} (of {} before SKIP/LIMIT)",
+          result.rows.len(),
+          if result.rows.len() == 1 { "" } else { "s" },
+          result.total_rows
+        ));
+        let structured = serde_json::to_value(&result)
+          .map_err(|err| ToolError::coded("internal", err.to_string()))?;
+        Ok((lines.join("\n") + "\n", structured))
+      }
       "snippet" => {
         // The selector-driven sibling of `fetch_span`: name/path/kind/id/eid resolution with
         // the shared ambiguity contract, whole-line context, and the same digest refusal.
@@ -1265,6 +1313,23 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
         "eid": {"type": "string", "description": "Refine: durable external id (32 hex chars)"}
       }),
       &["name"],
+    ),
+    tool(
+      "query",
+      "Cypher-shaped READ-ONLY graph query. One MATCH with a single linear pattern — \
+       (var:Kind {name: \"x\", path: \"suffix\"}) optionally joined through \
+       -[:calls|data_flows*1..5 {grade: constrained}]-> to a second node — then WHERE \
+       (AND-combined =, <>, STARTS/ENDS WITH, CONTAINS over name/path/kind/exported/id/eid), \
+       RETURN projections or COUNT(*) / COUNT(DISTINCT var.prop) with one grouping key, \
+       ORDER BY / SKIP / LIMIT. Runs under explicit work ceilings (16KiB text, depth 10, \
+       5M edge visits, 100k rows) and refuses with the ceiling's name rather than truncate. \
+       Example: MATCH (f:Function)-[:calls*1..3]->(g {name: \"resolve_target\"}) \
+       RETURN f.name, f.path LIMIT 20",
+      json!({
+        "text": {"type": "string", "description": "The query text"},
+        "ir": {"type": "object", "description": "Alternative: a typed IR document (the parsed form; see the vorpal-query crate docs)"}
+      }),
+      &[],
     ),
     tool(
       "snippet",

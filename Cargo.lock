@@ -3867,6 +3867,7 @@ dependencies = [
  "vorpal-lsp",
  "vorpal-mcp",
  "vorpal-outline",
+ "vorpal-query",
  "vorpal-transport",
  "vorpal-wire",
 ]
@@ -4118,6 +4119,7 @@ dependencies = [
  "vorpal-ingest",
  "vorpal-kg",
  "vorpal-language",
+ "vorpal-query",
 ]
 
 [[package]]
@@ -4179,6 +4181,17 @@ dependencies = [
  "vorpal-index",
  "vorpal-kg",
  "vorpal-language",
+]
+
+[[package]]
+name = "vorpal-query"
+version = "0.2.0"
+dependencies = [
+ "rayon",
+ "serde",
+ "serde_json",
+ "vorpal-graph",
+ "vorpal-kg",
 ]
 
 [[package]]

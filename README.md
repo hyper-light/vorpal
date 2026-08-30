@@ -119,8 +119,8 @@ it from `.cursor/mcp.json`).
 
 Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
 `compare_generations`, `impact`, `dead_code`, `node`, `callers`, `references`, `importers`,
-`implementors`, `type_users`, `reachable`, `data_flow`, `structural_search`, `rule_search`,
-`ast_dump`, `fetch_span`, `snippet`, `why`, `search`. Record-bearing tools page with cursors and accept
+`implementors`, `type_users`, `reachable`, `data_flow`, `query`, `structural_search`,
+`rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. Record-bearing tools page with cursors and accept
 `format: "toon" | "lean" | "ids"` for token-lean output; `--profile scout|analysis|full`
 serves a smaller surface to read-only agents. Full descriptions and setup notes:
 **[docs/mcp.md](docs/mcp.md)**.
@@ -144,6 +144,7 @@ npm install @hyper-light/vorpal-wasm     # browser / portable
 | `vorpal index [src] [--out DIR] [--verify]` | Build/refresh the knowledge-graph index |
 | `vorpal search <query> [-k N] [--index DIR]` | Hybrid (name + semantic + graph) search |
 | `vorpal graph <verb> [name] [--index DIR]` | `callers` `refs` `importers` `implementors` `typeusers` `node` `reachable` `flows` `snippet` `schema` `dead` `coverage` `impact` `diff` `architecture` |
+| `vorpal query '<cypher>' [--index DIR]` | Cypher-shaped read-only graph queries (`MATCH … WHERE … RETURN … LIMIT`) |
 | `vorpal run -p <pattern> [-l lang] [-r fix]` | One-off structural search/rewrite (default command) |
 | `vorpal scan [-r rule.yml] [--format github]` | Run configured YAML rules across a project |
 | `vorpal outline [paths] [--view signatures]` | File structure: symbols, members, imports/exports |

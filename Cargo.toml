@@ -37,6 +37,7 @@ vorpal-lsp = { path = "crates/lsp", version = "0.2.0" }
 vorpal-mcp = { path = "crates/mcp", version = "0.2.0" }
 vorpal-mem = { path = "crates/mem", version = "0.2.0" }
 vorpal-outline = { path = "crates/outline", version = "0.2.0" }
+vorpal-query = { path = "crates/query", version = "0.2.0" }
 vorpal-resolve = { path = "crates/resolve", version = "0.2.0" }
 vorpal-segment = { path = "crates/segment", version = "0.2.0" }
 vorpal-transport = { path = "crates/transport", version = "0.2.0" }
