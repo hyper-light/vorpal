@@ -32,7 +32,8 @@ fn main() {
     .par_iter()
     .map(|path| {
       let Ok(source) = std::fs::read_to_string(path) else { return 0 };
-      let lang = if path.extension().is_some_and(|e| e == "c") { SupportLang::C } else { SupportLang::C };
+      // The probe walks .c/.h trees only (see `walk`), so the grammar is always C.
+      let lang = SupportLang::C;
       let Ok(doc) = vorpal_core::tree_sitter::StrDoc::try_new(&source, lang) else { return 0 };
       let n = doc.tree.root_node().descendant_count() as u64;
       drop(doc);
