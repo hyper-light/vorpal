@@ -435,6 +435,50 @@ impl Vamana {
         n
       ));
     }
+    // In-coverage repair: a node no other node points at is unreachable by graph traversal
+    // (only the medoid is legitimately entered from outside), so its whole neighborhood can
+    // never surface in any beam's visited pool. For each such node v (ascending id —
+    // deterministic), splice v into the out-list of its nearest own out-neighbor u via the
+    // same α-prune every other edge decision uses: u's list re-prunes over {existing ∪ v},
+    // so v displaces an edge only when α-domination says it should. In-degree 0 is a
+    // structural condition, not a tuned threshold.
+    {
+      let mut indegree: Vec<u32> = vec![0; n];
+      for u in 0..n {
+        let at = u * params.r;
+        for &nb in &flat[at..at + lens[u] as usize] {
+          indegree[nb as usize] += 1;
+        }
+      }
+      let starved: Vec<u32> = (0..n as u32)
+        .filter(|&v| indegree[v as usize] == 0 && v != medoid && lens[v as usize] > 0)
+        .collect();
+      if counters_enabled() {
+        crate::trace(&format!("vamana: {} unreachable nodes repaired", starved.len()));
+      }
+      for v in starved {
+        let vat = v as usize * params.r;
+        // Nearest own out-neighbor: v's list is (re)built by robust_prune, whose first
+        // entry is its closest survivor — but recompute to be explicit and order-proof.
+        let mut best: Option<(f32, u32)> = None;
+        for &u in &flat[vat..vat + lens[v as usize] as usize] {
+          let key = (matrix.dist_sq(u, v), u);
+          if best.is_none() || key < best.expect("checked") {
+            best = Some(key);
+          }
+        }
+        let Some((_, u)) = best else { continue };
+        let uat = u as usize * params.r;
+        let mut pool: Vec<Scored> = flat[uat..uat + lens[u as usize] as usize]
+          .iter()
+          .map(|&w| (w, matrix.dist_sq(u, w)))
+          .collect();
+        pool.push((v, matrix.dist_sq(u, v)));
+        let pruned = robust_prune(matrix, u, pool, params.alpha, params.r, params.l_build);
+        flat[uat..uat + pruned.len()].copy_from_slice(&pruned);
+        lens[u as usize] = pruned.len() as u8;
+      }
+    }
     Self {
       flat,
       lens,
