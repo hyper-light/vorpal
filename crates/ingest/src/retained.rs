@@ -396,10 +396,32 @@ impl RetainedIndex {
   /// resolution over alive references, canonical-order seal. Returns the sealed graph
   /// (byte-identical to a scratch build of the live tree), resolution stats, and evidence
   /// rows already remapped into sealed-id space.
+  /// [`RetainedIndex::link`] without materializing the evidence sidecar — the daemon's
+  /// serve path drops evidence on the floor (generation-bound tools read the committed
+  /// sidecar), and cloning + remapping ~7M rows costs ~100ms at kernel scale. The buckets
+  /// keep their rows, so nothing is lost for a later persist.
+  pub fn link_for_serving(
+    &mut self,
+    interner: &vorpal_resolve::Interner,
+    resolver: &Resolver,
+  ) -> io::Result<(Kg, crate::ResolveStats)> {
+    let (kg, stats, _) = self.link_inner(interner, resolver, false)?;
+    Ok((kg, stats))
+  }
+
   pub fn link(
     &mut self,
     interner: &vorpal_resolve::Interner,
     resolver: &Resolver,
+  ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
+    self.link_inner(interner, resolver, true)
+  }
+
+  fn link_inner(
+    &mut self,
+    interner: &vorpal_resolve::Interner,
+    resolver: &Resolver,
+    want_evidence: bool,
   ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
     self.writer.truncate_edges(self.watermark);
     let blocks: Vec<FileBlock> = self.files.values().cloned().collect();
@@ -542,7 +564,7 @@ impl RetainedIndex {
       )?
     };
     drop(table);
-    self.assemble(&blocks, &order)
+    self.assemble(&blocks, &order, want_evidence)
   }
 
   /// Heal untouched buckets in place after an edit: edges (and evidence targets) pointing
@@ -613,6 +635,7 @@ impl RetainedIndex {
     &mut self,
     blocks: &[FileBlock],
     order: &[u32],
+    want_evidence: bool,
   ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
     let mut stats = crate::ResolveStats::default();
     for bits in order {
@@ -622,6 +645,9 @@ impl RetainedIndex {
     }
     let resolution_edges = order.iter().filter_map(|bits| self.resolution.get(bits)).flat_map(|bucket| bucket.edges.iter().copied());
     let (kg, lut) = self.writer.seal_canonical_with(blocks, resolution_edges);
+    if !want_evidence {
+      return Ok((kg, stats, Vec::new()));
+    }
     let mut evidence: Vec<vorpal_kg::EvidenceRow> =
       Vec::with_capacity(order.iter().filter_map(|bits| self.resolution.get(bits)).map(|b| b.evidence.len()).sum());
     for bits in order {
