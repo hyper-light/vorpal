@@ -555,6 +555,21 @@ impl KgWriter {
     blocks: &[FileBlock],
     resolution_edges_from: usize,
   ) -> (Kg, Vec<u32>) {
+    let tail: Vec<(u32, u32, EdgeType)> = (resolution_edges_from..self.edges.len())
+      .map(|i| self.edges.triple(i))
+      .collect();
+    self.seal_canonical_with(blocks, tail.into_iter())
+  }
+
+  /// The core canonical seal: containment edges gathered per block, this link's resolution
+  /// edges supplied by the caller — already in the emission order a from-scratch resolve
+  /// produces (the retained daemon keeps them in per-file buckets and chains them in
+  /// canonical file order, which IS that order).
+  pub fn seal_canonical_with(
+    &self,
+    blocks: &[FileBlock],
+    resolution: impl Iterator<Item = (u32, u32, EdgeType)>,
+  ) -> (Kg, Vec<u32>) {
     crate::phase_stamp("seal-canonical: gather");
 
     let total_rows: usize = blocks.iter().map(|b| b.rows.len()).sum();
@@ -671,8 +686,7 @@ impl KgWriter {
     // is an upstream logic error — checked in debug, dropped defensively in release.
     let mut new_edges = EdgeLog::new();
     for block in blocks {
-      let (start, end) = (block.edges.start as usize, block.edges.end.min(resolution_edges_from as u32) as usize);
-      for i in start..end {
+      for i in block.edges.start as usize..block.edges.end as usize {
         let (src, dst, etype) = self.edges.triple(i);
         let (s, d) = (lut[src as usize], lut[dst as usize]);
         debug_assert!(s != u32::MAX && d != u32::MAX, "containment edge touches a dead row");
@@ -681,8 +695,7 @@ impl KgWriter {
         }
       }
     }
-    for i in resolution_edges_from..self.edges.len() {
-      let (src, dst, etype) = self.edges.triple(i);
+    for (src, dst, etype) in resolution {
       let (s, d) = (lut[src as usize], lut[dst as usize]);
       debug_assert!(s != u32::MAX && d != u32::MAX, "resolution edge touches a dead row");
       if s != u32::MAX && d != u32::MAX {

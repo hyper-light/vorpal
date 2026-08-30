@@ -17,14 +17,25 @@
 //! Everything here is lifetime-free: the interner is BORROWED per call, never stored, so a
 //! daemon owns `(Interner, RetainedIndex)` side by side without self-reference.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
 
-use vorpal_kg::{FileBlock, Kg, KgWriter};
-use vorpal_resolve::{RefStore, Resolver};
+use vorpal_kg::{EdgeType, FileBlock, Kg, KgWriter};
+use vorpal_resolve::{Confidence, RefStore, Resolver};
 
 use crate::pipeline::{apply_product_view, build_symbol_table_over};
+
+/// One file's resolution outcome, in retained-writer id space: its emitted edges (in
+/// emission order — the canonical-order feed makes that the from-scratch order), its
+/// evidence rows, and its share of the stats. Bucketing by source file is what makes
+/// scoped rederive possible: an edit re-resolves only the dirty buckets.
+#[derive(Default)]
+struct FileResolution {
+  edges: Vec<(u32, u32, EdgeType)>,
+  evidence: Vec<vorpal_kg::EvidenceRow>,
+  stats: crate::ResolveStats,
+}
 
 /// Retained pipeline state: everything an incremental re-link needs, minus the interner.
 pub struct RetainedIndex {
@@ -32,9 +43,11 @@ pub struct RetainedIndex {
   store: RefStore,
   /// Path → footprint, iterated in path order — the canonical block order every link uses.
   files: BTreeMap<String, FileBlock>,
-  /// Containment watermark: the edge-log length with NO resolution edges appended. Every
-  /// apply and every link first truncates back to it, so block edge ranges stay valid and
-  /// resolution edges never leak between links.
+  /// Path bits → that file's resolution bucket (see [`FileResolution`]).
+  resolution: HashMap<u32, FileResolution>,
+  /// Containment watermark: the edge-log length with NO resolution edges appended. The edge
+  /// log holds containment ONLY between links (resolution lives in the buckets), so this
+  /// tracks the log length after the latest apply.
   watermark: usize,
 }
 
@@ -51,6 +64,7 @@ impl RetainedIndex {
       writer: KgWriter::new(),
       store: RefStore::create(store_path)?,
       files: BTreeMap::new(),
+      resolution: HashMap::new(),
       watermark: 0,
     };
     for (path, bytes) in products {
@@ -66,6 +80,7 @@ impl RetainedIndex {
       writer: KgWriter::new(),
       store: RefStore::create(store_path)?,
       files: BTreeMap::new(),
+      resolution: HashMap::new(),
       watermark: 0,
     })
   }
@@ -86,8 +101,10 @@ impl RetainedIndex {
     match product_bytes {
       Some(bytes) => self.apply_product_bytes(interner, path, bytes),
       None => {
+        let bits = interner.intern(path).to_bits();
         self.files.remove(path);
-        self.store.retract_file(interner.intern(path).to_bits());
+        self.store.retract_file(bits);
+        self.resolution.remove(&bits);
         Ok(())
       }
     }
@@ -131,9 +148,9 @@ impl RetainedIndex {
       };
       self.watermark = self.writer.edges_len();
       self.files.insert((*path).to_string(), block);
-      self
-        .store
-        .append_file(interner.intern(path).to_bits(), references.iter())?;
+      let bits = interner.intern(path).to_bits();
+      self.resolution.remove(&bits);
+      self.store.append_file(bits, references.iter())?;
     }
     Ok(())
   }
@@ -193,12 +210,12 @@ impl RetainedIndex {
     let qualified = self.store.qualified_imports(interner, order.iter().copied());
     vorpal_resolve::seed_import_bindings(interner, &mut table, &qualified, resolver);
 
-    let mut evidence: Vec<vorpal_kg::EvidenceRow> =
-      Vec::with_capacity(self.store.count() as usize);
+    // Full re-resolve into per-file buckets (v1: every link recomputes every bucket; the
+    // buckets are the substrate scoped rederive will refresh selectively).
+    self.resolution.clear();
     let stats = {
-      let writer = &mut self.writer;
+      let resolution = std::cell::RefCell::new(&mut self.resolution);
       let store = &mut self.store;
-      let evidence = std::cell::RefCell::new(&mut evidence);
       vorpal_resolve::resolve_all_store_into(
         interner,
         &table,
@@ -206,9 +223,18 @@ impl RetainedIndex {
         order.iter().copied(),
         resolver,
         |edge| {
-          writer.add_edge(edge.from, edge.to, edge.edge.with_confidence(edge.confidence));
+          let mut resolution = resolution.borrow_mut();
+          let bucket = resolution.entry(edge.from_path_bits).or_default();
+          bucket
+            .edges
+            .push((edge.from.raw() as u32, edge.to.raw() as u32, edge.edge.with_confidence(edge.confidence)));
+          if Confidence(edge.confidence) <= Confidence::AMBIGUOUS {
+            bucket.stats.ambiguous += 1;
+          } else {
+            bucket.stats.resolved += 1;
+          }
           let (alt_ids, alt_count) = edge.alternatives;
-          evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
+          bucket.evidence.push(vorpal_kg::EvidenceRow {
             from: edge.from.raw() as u32,
             to: edge.to.raw() as u32,
             name_hash: edge.name_hash,
@@ -223,7 +249,14 @@ impl RetainedIndex {
           });
         },
         |unresolved| {
-          evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
+          let mut resolution = resolution.borrow_mut();
+          let bucket = resolution.entry(unresolved.from_path_bits).or_default();
+          if unresolved.external {
+            bucket.stats.external += 1;
+          } else {
+            bucket.stats.masked += 1;
+          }
+          bucket.evidence.push(vorpal_kg::EvidenceRow {
             from: unresolved.from.raw() as u32,
             to: vorpal_kg::NO_EDGE,
             name_hash: unresolved.name_hash,
@@ -244,24 +277,42 @@ impl RetainedIndex {
       )?
     };
     drop(table);
+    self.assemble(&blocks, &order, stats)
+  }
 
-    let (kg, lut) = self.writer.seal_canonical(&blocks, self.watermark);
-    // Evidence carries retained-writer ids; the sealed graph carries canonical ids. One
-    // remap through the seal's own LUT keeps them in lockstep (NO_EDGE stays sentinel).
-    for row in &mut evidence {
-      debug_assert_ne!(lut[row.from as usize], u32::MAX, "evidence from a dead row");
-      row.from = lut[row.from as usize];
-      if row.to != vorpal_kg::NO_EDGE {
-        debug_assert_ne!(lut[row.to as usize], u32::MAX, "evidence to a dead row");
-        row.to = lut[row.to as usize];
-      }
-      for alt in &mut row.alternatives {
-        debug_assert_ne!(lut[*alt as usize], u32::MAX, "alternative is a dead row");
-        *alt = lut[*alt as usize];
+  /// Assemble the sealed graph from the containment blocks + the resolution buckets chained
+  /// in canonical file order — the exact emission order a from-scratch resolve produces —
+  /// and remap evidence copies through the seal's id LUT. Buckets stay in writer-id space
+  /// (they outlive this link once scoped rederive lands).
+  fn assemble(
+    &mut self,
+    blocks: &[FileBlock],
+    order: &[u32],
+    stats: crate::ResolveStats,
+  ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
+    let resolution_edges = order.iter().filter_map(|bits| self.resolution.get(bits)).flat_map(|bucket| bucket.edges.iter().copied());
+    let (kg, lut) = self.writer.seal_canonical_with(blocks, resolution_edges);
+    let mut evidence: Vec<vorpal_kg::EvidenceRow> =
+      Vec::with_capacity(order.iter().filter_map(|bits| self.resolution.get(bits)).map(|b| b.evidence.len()).sum());
+    for bits in order {
+      let Some(bucket) = self.resolution.get(bits) else {
+        continue;
+      };
+      for row in &bucket.evidence {
+        let mut row = row.clone();
+        debug_assert_ne!(lut[row.from as usize], u32::MAX, "evidence from a dead row");
+        row.from = lut[row.from as usize];
+        if row.to != vorpal_kg::NO_EDGE {
+          debug_assert_ne!(lut[row.to as usize], u32::MAX, "evidence to a dead row");
+          row.to = lut[row.to as usize];
+        }
+        for alt in &mut row.alternatives {
+          debug_assert_ne!(lut[*alt as usize], u32::MAX, "alternative is a dead row");
+          *alt = lut[*alt as usize];
+        }
+        evidence.push(row);
       }
     }
-    // Hygiene: drop this link's resolution edges so the next apply sees containment only.
-    self.writer.truncate_edges(self.watermark);
     Ok((kg, stats, evidence))
   }
 }

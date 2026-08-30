@@ -166,6 +166,11 @@ pub struct ResolvedEdge {
   pub name_hash: u32,
   /// Retained final-set alternatives (tie picks), `(ids, count)` — see [`Resolution`].
   pub alternatives: ([u32; MAX_RETAINED_ALTERNATIVES], u8),
+  /// Interned bits of the referencing file's path — the retained daemon's bucketing key
+  /// (per-file resolution buckets; scoped rederive). Process-private, like every NameId.
+  pub from_path_bits: u32,
+  /// Interned bits of the referenced name — the scoped-rederive postings key.
+  pub name_bits: u32,
 }
 
 /// A reference that produced **no** edge, retained as evidence (IMPROVEMENTS 07-29 §4): the
@@ -183,6 +188,10 @@ pub struct UnresolvedEvidence {
   /// `true` = external (no definition anywhere in the tree); `false` = masked (definitions
   /// exist but none is safely attributable).
   pub external: bool,
+  /// Interned bits of the referencing file's path (see [`ResolvedEdge::from_path_bits`]).
+  pub from_path_bits: u32,
+  /// Interned bits of the referenced name (see [`ResolvedEdge::name_bits`]).
+  pub name_bits: u32,
 }
 
 /// Counts from a resolution batch. `external + masked` is the total left without an edge.
@@ -906,6 +915,8 @@ fn resolve_chunk<'i>(
           candidates: resolution.candidates.min(u32::MAX as usize) as u32,
           name_hash,
           alternatives: resolution.alternatives,
+          from_path_bits: reference.from_path.to_bits(),
+          name_bits: reference.name.to_bits(),
         });
       }
       None => {
@@ -922,6 +933,8 @@ fn resolve_chunk<'i>(
           span: reference.evidence,
           candidates: resolution.candidates.min(u32::MAX as usize) as u32,
           external,
+          from_path_bits: reference.from_path.to_bits(),
+          name_bits: reference.name.to_bits(),
         });
       }
     }
@@ -1288,6 +1301,8 @@ mod tests {
             name_hash: xxhash_rust::xxh3::xxh3_64(itn().text_of(reference.name).as_bytes())
               as u32,
             alternatives: resolution.alternatives,
+            from_path_bits: reference.from_path.to_bits(),
+            name_bits: reference.name.to_bits(),
           });
         }
         None => {
