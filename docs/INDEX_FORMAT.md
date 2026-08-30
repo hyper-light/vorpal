@@ -42,6 +42,7 @@ by its first rebuild (pinned by `legacy_flat_index_migrates_on_rebuild`).
 | product pack (`products.pack`/`products.idx`) | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
 | evidence sidecar (`evidence.bin`) | `VERSION` (crates/kg/src/evidence.rs) | 2 | sidecar treated as absent → `why` reports no evidence |
+| data-flow sidecar (`dataflow.bin`) | `VERSION` (crates/kg/src/dataflow.rs) | 1 | load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows) |
 | lexical posting tier (`postings.bin`) | `VERSION` (crates/index/src/postings.rs) | 1 | scan fallback → warm rebuilds |
 | embedding semantics (`ann.model.json`) | `LEXICAL_EMBED_VERSION` (crates/ann/src/embed.rs) | 1 | ANN tier distrusted → exact fallback → warm rebuilds |
 <!-- END GENERATED VERSION TABLE -->

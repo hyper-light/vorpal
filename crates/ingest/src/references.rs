@@ -1623,7 +1623,13 @@ fn classify_arg(node: &SgNode<'_>) -> ArgClass {
   if LEAF_KINDS.contains(&kind) {
     return ArgClass::Var;
   }
-  if DESCEND_KINDS.contains(&kind) || kind.contains("field") || kind.contains("member") {
+  if DESCEND_KINDS.contains(&kind)
+    || kind.contains("field")
+    || kind.contains("member")
+    // Python/Ruby spell member access `attribute`; Rust field access is `field_expression`
+    // (caught above); OCaml uses `field_get_expression`.
+    || kind == "attribute"
+  {
     return ArgClass::FieldAccess;
   }
   if kind.contains("call") || kind == "application_expression" || kind == "invocation" {

@@ -153,25 +153,183 @@ impl<'i, E: FileExtractor> Ingestor<'i, E> {
 /// Where the (rebased) reference stream goes during a streamed apply: RAM for callers that
 /// want the vector, or the disk spill for bulk builds — at kernel scale the in-RAM vector
 /// was ~220 MB of peak footprint that resolution only ever reads once, sequentially.
+/// One traceable call-site argument riding beside its reference through the apply→link
+/// hand-off (G-M3). `from` is the caller entity (rebased with its reference); the (from,
+/// span) pair keys the join against resolved call edges at link time.
+pub(crate) struct ArgRec {
+  pub(crate) from: NodeId,
+  pub(crate) span: (u32, u32),
+  pub(crate) index: u16,
+  pub(crate) class: u8,
+  pub(crate) expr: Option<Box<str>>,
+}
+
+/// Append-only arg spill (staging `.args.spill`): written by the absorber in absorb order,
+/// loaded once at link into the join map. Process-private scratch — no versioning.
+pub(crate) struct ArgSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+impl ArgSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &ArgRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&rec.from.raw().to_le_bytes())?;
+    self.file.write_all(&rec.span.0.to_le_bytes())?;
+    self.file.write_all(&rec.span.1.to_le_bytes())?;
+    self.file.write_all(&rec.index.to_le_bytes())?;
+    self.file.write_all(&[rec.class])?;
+    let expr = rec.expr.as_deref().unwrap_or("");
+    self.file.write_all(&(expr.len() as u16).to_le_bytes())?;
+    self.file.write_all(expr.as_bytes())?;
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+/// The link-time argument join: one flat record vector sorted by (from, span), looked up by
+/// binary search — measured against a HashMap<(from,span), Vec<..>> shape, the per-key
+/// vectors and hashing dominated the join's cost at ~500k records. Holds launch-language
+/// traceable args only; freed with the link phase; the spill file is deleted after load.
+pub(crate) struct ArgJoin {
+  records: Vec<ArgRec>,
+  /// `(from << 64) | (span.0 << 32) | span.1` per record, sorted — the probe compares one
+  /// u128 instead of extracting a 3-tuple, which halved the join's share of link resolve.
+  keys: Vec<u128>,
+}
+
+#[inline]
+fn arg_key(from: u64, span: (u32, u32)) -> u128 {
+  ((from as u128) << 64) | ((span.0 as u128) << 32) | span.1 as u128
+}
+
+impl ArgJoin {
+  pub(crate) fn empty() -> Self {
+    Self {
+      records: Vec::new(),
+      keys: Vec::new(),
+    }
+  }
+
+  pub(crate) fn is_empty(&self) -> bool {
+    self.records.is_empty()
+  }
+
+  #[inline]
+  pub(crate) fn get(&self, from: u64, span: (u32, u32)) -> &[ArgRec] {
+    let key = arg_key(from, span);
+    let start = self.keys.partition_point(|&k| k < key);
+    let end = start + self.keys[start..].iter().take_while(|&&k| k == key).count();
+    &self.records[start..end]
+  }
+}
+
+pub(crate) fn load_arg_spill(path: &std::path::Path, expected: u64) -> io::Result<ArgJoin> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  let mut records: Vec<ArgRec> = Vec::with_capacity(expected as usize);
+  let mut off = 0usize;
+  let mut seen = 0u64;
+  while off < bytes.len() {
+    let take = |o: usize, n: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(o..o + n)
+        .ok_or_else(|| io::Error::other("arg spill truncated"))
+    };
+    let from = u64::from_le_bytes(take(off, 8)?.try_into().expect("8B"));
+    let s0 = u32::from_le_bytes(take(off + 8, 4)?.try_into().expect("4B"));
+    let s1 = u32::from_le_bytes(take(off + 12, 4)?.try_into().expect("4B"));
+    let index = u16::from_le_bytes(take(off + 16, 2)?.try_into().expect("2B"));
+    let class = take(off + 18, 1)?[0];
+    let expr_len = u16::from_le_bytes(take(off + 19, 2)?.try_into().expect("2B")) as usize;
+    let expr_bytes = take(off + 21, expr_len)?;
+    let expr = if expr_len == 0 {
+      None
+    } else {
+      Some(
+        std::str::from_utf8(expr_bytes)
+          .map_err(|_| io::Error::other("arg spill: non-utf8 expression"))?
+          .into(),
+      )
+    };
+    off += 21 + expr_len;
+    seen += 1;
+    records.push(ArgRec {
+      from: NodeId::new(from),
+      span: (s0, s1),
+      index,
+      class,
+      expr,
+    });
+  }
+  if seen != expected {
+    return Err(io::Error::other(format!(
+      "arg spill holds {seen} records, absorber wrote {expected} — torn scratch"
+    )));
+  }
+  let keys = {
+    use rayon::prelude::*;
+    // Stable by (key, index): records per call site keep their capture order.
+    records.par_sort_by_key(|r| (r.from.raw(), r.span.0, r.span.1, r.index));
+    records
+      .par_iter()
+      .map(|r| arg_key(r.from.raw(), r.span))
+      .collect()
+  };
+  Ok(ArgJoin { records, keys })
+}
+
 enum RefSink<'a, 'i> {
-  Ram(&'a mut Vec<Reference<'i>>),
-  Spill(&'a mut vorpal_resolve::RefSpillWriter<'i>),
+  Ram(&'a mut Vec<Reference<'i>>, &'a mut Vec<ArgRec>),
+  Spill(&'a mut vorpal_resolve::RefSpillWriter<'i>, Option<&'a mut ArgSpillWriter>),
 }
 
 impl<'i> RefSink<'_, 'i> {
-  fn consume(&mut self, shard_references: Vec<Reference<'i>>, id_base: u64) -> io::Result<()> {
+  fn consume(
+    &mut self,
+    shard_references: Vec<Reference<'i>>,
+    shard_args: Vec<ArgRec>,
+    id_base: u64,
+  ) -> io::Result<()> {
     let rebased = shard_references.into_iter().map(|mut reference| {
       reference.from = NodeId::new(reference.from.raw() + id_base);
       reference
     });
+    let rebased_args = shard_args.into_iter().map(|mut rec| {
+      rec.from = NodeId::new(rec.from.raw() + id_base);
+      rec
+    });
     match self {
-      RefSink::Ram(references) => {
+      RefSink::Ram(references, args) => {
         references.extend(rebased);
+        args.extend(rebased_args);
         Ok(())
       }
-      RefSink::Spill(writer) => {
+      RefSink::Spill(writer, arg_writer) => {
         for reference in rebased {
           writer.push(&reference)?;
+        }
+        if let Some(arg_writer) = arg_writer {
+          for rec in rebased_args {
+            arg_writer.push(&rec)?;
+          }
         }
         Ok(())
       }
@@ -187,9 +345,10 @@ fn absorb_shard<'i>(
   sink: &mut RefSink<'_, 'i>,
   shard_writer: KgWriter,
   shard_references: Vec<Reference<'i>>,
+  shard_args: Vec<ArgRec>,
 ) -> io::Result<()> {
   let id_base = writer.absorb(shard_writer);
-  sink.consume(shard_references, id_base)
+  sink.consume(shard_references, shard_args, id_base)
 }
 
 /// Emit a phase stamp to stderr when `VORPAL_PHASE_TRACE` is set — for correlating RSS
@@ -269,10 +428,41 @@ pub fn link_writer<'i>(
 /// every persisted relation can answer "why does this exist?".
 pub fn link_writer_spilled<'i>(
   interner: &'i vorpal_resolve::Interner,
-  mut writer: KgWriter,
+  writer: KgWriter,
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
 ) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
+  let (kg, stats, evidence, _flows) =
+    link_writer_spilled_with_flows(interner, writer, spill, resolver, None)?;
+  Ok((kg, stats, evidence))
+}
+
+/// [`link_writer_spilled`] plus the data-flow join (G-M3): the arg spill written beside the
+/// reference spill joins resolved CALLS edges by (from, span) — every traceable argument at
+/// a resolved call becomes a `dataflow.bin` row, and each (caller, callee) pair with at
+/// least one traceable argument gains one `DATA_FLOWS` edge carrying the call's confidence.
+pub fn link_writer_spilled_with_flows<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  mut writer: KgWriter,
+  spill: vorpal_resolve::RefSpill<'i>,
+  resolver: &Resolver,
+  arg_spill: Option<(std::path::PathBuf, u64)>,
+) -> io::Result<(
+  Kg,
+  ResolveStats,
+  Vec<vorpal_kg::EvidenceRow>,
+  Vec<vorpal_kg::DataflowRow>,
+)> {
+  let arg_join: ArgJoin = match &arg_spill {
+    Some((path, count)) if *count > 0 => load_arg_spill(path, *count)?,
+    Some((path, _)) => {
+      let _ = std::fs::remove_file(path);
+      ArgJoin::empty()
+    }
+    None => ArgJoin::empty(),
+  };
+  let mut flows: Vec<vorpal_kg::DataflowRow> = Vec::new();
+  let mut flow_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
   phase_trace("link: table build start");
   let mut table = build_symbol_table(interner, &writer);
   release_freed_pages();
@@ -299,6 +489,31 @@ pub fn link_writer_spilled<'i>(
           edge.to,
           edge.edge.with_confidence(edge.confidence),
         );
+        if edge.edge.base() == vorpal_kg::EdgeType::CALLS && !arg_join.is_empty() {
+          let records = arg_join.get(edge.from.raw(), edge.span);
+          if !records.is_empty() {
+            // One DATA_FLOWS edge per (caller, callee) pair; one row per traceable arg.
+            if flow_pairs.insert((edge.from.raw(), edge.to.raw())) {
+              writer.add_edge(
+                edge.from,
+                edge.to,
+                vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(edge.confidence),
+              );
+            }
+            for rec in records {
+              flows.push(vorpal_kg::DataflowRow {
+                from: edge.from.raw() as u32,
+                to: edge.to.raw() as u32,
+                span: edge.span,
+                arg_index: rec.index,
+                // Positional binding v1 (kwarg matching is the G-M5 refinement).
+                param_index: rec.index,
+                class: rec.class,
+                expr: rec.expr.as_deref().map(str::to_string),
+              });
+            }
+          }
+        }
         let (alt_ids, alt_count) = edge.alternatives;
         evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
           from: edge.from.raw() as u32,
@@ -339,15 +554,17 @@ pub fn link_writer_spilled<'i>(
   };
   phase_trace("link: resolve done");
   drop(table);
+  drop(arg_join);
+  drop(flow_pairs);
   let _ = spill.remove();
-  // The link transients (spill chunks + table) just died — return their pages before
-  // compaction and seal allocate theirs.
+  // The link transients (spill chunks + table + arg join) just died — return their pages
+  // before compaction and seal allocate theirs.
   release_freed_pages();
   phase_trace("link: seal start");
   let kg = writer.seal();
   release_freed_pages();
   phase_trace("link: seal done");
-  Ok((kg, stats, evidence))
+  Ok((kg, stats, evidence, flows))
 }
 
 /// Fewer files than this per shard and the fan-out overhead outweighs the win: small trees
@@ -423,6 +640,17 @@ pub(crate) fn apply_product<'i>(
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
 ) {
+  apply_product_with_args(interner, path, product, writer, references, None);
+}
+
+pub(crate) fn apply_product_with_args<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  path: &str,
+  product: crate::FileProduct,
+  writer: &mut KgWriter,
+  references: &mut Vec<Reference<'i>>,
+  args_out: Option<&mut Vec<ArgRec>>,
+) {
   let crate::FileProduct { items, refs, .. } = product;
   apply_parts(
     interner,
@@ -441,22 +669,25 @@ pub(crate) fn apply_product<'i>(
         r.receiver.as_deref(),
         r.receiver_type.as_deref(),
         r.receiver_type_origin,
+        &r.args,
       )
     }),
     writer,
     references,
+    args_out,
   );
 }
 
 /// Apply a pack-replayed product straight from its mapped bytes: decode to views, apply —
 /// no owned strings anywhere on the path (the replay profile showed decode's per-string
 /// allocations as a top cost).
-pub(crate) fn apply_product_view<'i>(
+pub(crate) fn apply_product_view_with_args<'i>(
   interner: &'i vorpal_resolve::Interner,
   path: &str,
   view: &crate::ProductView<'_>,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
+  args_out: Option<&mut Vec<ArgRec>>,
 ) {
   apply_parts(
     interner,
@@ -465,6 +696,7 @@ pub(crate) fn apply_product_view<'i>(
     view.refs.iter().copied(),
     writer,
     references,
+    args_out,
   );
 }
 
@@ -476,6 +708,7 @@ fn apply_parts<'a, 'i>(
   refs: impl Iterator<Item = crate::product::RefView<'a>>,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
+  mut args_out: Option<&mut Vec<ArgRec>>,
 ) {
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
@@ -491,6 +724,25 @@ fn apply_parts<'a, 'i>(
       continue;
     };
     if let Some(from) = writer.entity_id(path, entity) {
+      // Traceable call-site arguments ride beside the reference (G-M3): lazily decoded off
+      // the view, captured only where a collector exists (the spilled index-build path).
+      if let Some(args_out) = args_out.as_deref_mut() {
+        if crate::product::tag_refkind(r.kind) == vorpal_resolve::RefKind::Call
+          && r.args_len() > 0
+        {
+          for arg in r.args() {
+            if arg.class <= 2 {
+              args_out.push(ArgRec {
+                from,
+                span: (r.start, r.end),
+                index: arg.index,
+                class: arg.class,
+                expr: arg.expr.map(Box::from),
+              });
+            }
+          }
+        }
+      }
       references.push(
         Reference::with_interned_path(
           interner,
@@ -916,12 +1168,15 @@ where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
   let mut references = Vec::new();
+  // The in-RAM path has no data-flow consumer yet (flows are a spilled-build product; see
+  // the G-M3 plan note) — args are collected for order parity and dropped here, stated.
+  let mut args = Vec::new();
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
     budget_bytes,
     work,
-    RefSink::Ram(&mut references),
+    RefSink::Ram(&mut references, &mut args),
     None,
     None,
   )?;
@@ -940,21 +1195,30 @@ pub fn stream_apply_spilled<'i, F>(
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
   work: F,
-) -> io::Result<(KgWriter, vorpal_resolve::RefSpill<'i>, StreamStats)>
+) -> io::Result<(
+  KgWriter,
+  vorpal_resolve::RefSpill<'i>,
+  StreamStats,
+  (std::path::PathBuf, u64),
+)>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
   let mut spill_writer = vorpal_resolve::RefSpillWriter::create(interner, spill_path)?;
+  // The arg spill rides beside the reference spill (G-M3), same absorber, same order.
+  let args_path = spill_path.with_extension("args");
+  let mut arg_writer = ArgSpillWriter::create(&args_path)?;
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
     budget_bytes,
     work,
-    RefSink::Spill(&mut spill_writer),
+    RefSink::Spill(&mut spill_writer, Some(&mut arg_writer)),
     heap_stream_path,
     pack,
   )?;
-  Ok((writer, spill_writer.finish()?, stats))
+  let arg_spill = arg_writer.finish()?;
+  Ok((writer, spill_writer.finish()?, stats, arg_spill))
 }
 
 fn stream_apply_impl<'i, F>(
@@ -997,30 +1261,31 @@ where
     let mut scratch = ExtractScratch::default();
     let mut writer = KgWriter::new();
     let mut references = Vec::new();
+    let mut args = Vec::new();
     let (mut parsed, mut replayed) = (0u64, 0u64);
     for entry in entries {
       match work(entry, &mut scratch)? {
         StreamWork::Parsed(path, product) => {
           parsed += 1;
-          apply_product(interner, &path, product, &mut writer, &mut references);
+          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut args));
         }
         StreamWork::Replayed(path, product) => {
           replayed += 1;
-          apply_product(interner, &path, product, &mut writer, &mut references);
+          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut args));
         }
         StreamWork::ReplayedPacked(path) => {
           if let Some(view) = pack
             .and_then(|p| p.get(&path))
             .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
           {
-            apply_product_view(interner, &path, &view, &mut writer, &mut references);
+            apply_product_view_with_args(interner, &path, &view, &mut writer, &mut references, Some(&mut args));
             replayed += 1;
           }
         }
         StreamWork::Skipped => {}
       }
     }
-    sink.consume(references, 0)?;
+    sink.consume(references, args, 0)?;
     return Ok((
       writer,
       StreamStats {
@@ -1066,7 +1331,7 @@ where
   }
   // Committers → absorber: completed shards, for rolling prefix absorption. Unbounded so a
   // committer never blocks handing off a finished shard.
-  let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>)>();
+  let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>, Vec<ArgRec>)>();
 
   let outputs = std::thread::scope(|scope| {
     // Committers: each owns its assigned shards' writers outright (single writer per shard)
@@ -1082,9 +1347,9 @@ where
         scope.spawn(move || {
           let owned_shards: Vec<usize> =
             (committer_index..num_shards).step_by(committers).collect();
-          let mut writers: HashMap<usize, (KgWriter, Vec<Reference>)> = owned_shards
+          let mut writers: HashMap<usize, (KgWriter, Vec<Reference>, Vec<ArgRec>)> = owned_shards
             .iter()
-            .map(|&shard| (shard, (KgWriter::new(), Vec::new())))
+            .map(|&shard| (shard, (KgWriter::new(), Vec::new(), Vec::new())))
             .collect();
           let mut pending: HashMap<usize, std::collections::BTreeMap<usize, Slot>> = owned_shards
             .iter()
@@ -1112,8 +1377,8 @@ where
                   parsed: was_parsed,
                   reserved,
                 } => {
-                  let (writer, references) = writers.get_mut(&shard).expect("owned shard");
-                  apply_product(interner, &path, product, writer, references);
+                  let (writer, references, args) = writers.get_mut(&shard).expect("owned shard");
+                  apply_product_with_args(interner, &path, product, writer, references, Some(args));
                   budget.release(reserved);
                   if was_parsed {
                     parsed += 1;
@@ -1129,8 +1394,8 @@ where
                     .and_then(|p| p.get(&path))
                     .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
                   {
-                    let (writer, references) = writers.get_mut(&shard).expect("owned shard");
-                    apply_product_view(interner, &path, &view, writer, references);
+                    let (writer, references, args) = writers.get_mut(&shard).expect("owned shard");
+                    apply_product_view_with_args(interner, &path, &view, writer, references, Some(args));
                     replayed += 1;
                   }
                   budget.release(reserved);
@@ -1143,9 +1408,9 @@ where
             // with its merged copy in one final doubling spike.
             let shard_end = ((shard + 1) * shard_size).min(total_sequences);
             if *expected == shard_end
-              && let Some((shard_writer, shard_references)) = writers.remove(&shard)
+              && let Some((shard_writer, shard_references, shard_args)) = writers.remove(&shard)
             {
-              let _ = done_tx.send((shard, shard_writer, shard_references));
+              let _ = done_tx.send((shard, shard_writer, shard_references, shard_args));
             }
           }
           (writers, parsed, replayed)
@@ -1216,15 +1481,19 @@ where
     let absorber = scope.spawn(move || {
       let mut writer = writer;
       let mut sink = sink;
-      let mut holdback: std::collections::BTreeMap<usize, (KgWriter, Vec<Reference<'i>>)> =
-        std::collections::BTreeMap::new();
+      let mut holdback: std::collections::BTreeMap<
+        usize,
+        (KgWriter, Vec<Reference<'i>>, Vec<ArgRec>),
+      > = std::collections::BTreeMap::new();
       let mut next_absorb = 0usize;
       // First sink (spill IO) error: aborts absorption, surfaced after the scope joins.
       let mut sink_error: Option<io::Error> = None;
-      while let Ok((shard, shard_writer, shard_references)) = done_rx.recv() {
-        holdback.insert(shard, (shard_writer, shard_references));
-        while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
-          if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
+      while let Ok((shard, shard_writer, shard_references, shard_args)) = done_rx.recv() {
+        holdback.insert(shard, (shard_writer, shard_references, shard_args));
+        while let Some((shard_writer, shard_references, shard_args)) = holdback.remove(&next_absorb)
+        {
+          if let Err(err) =
+            absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_args)
             && sink_error.is_none()
           {
             sink_error = Some(err);
@@ -1289,8 +1558,9 @@ where
     }
   }
   phase_trace("stream: absorb tail");
-  while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
-    if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
+  while let Some((shard_writer, shard_references, shard_args)) = holdback.remove(&next_absorb) {
+    if let Err(err) =
+      absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_args)
       && sink_error.is_none()
     {
       sink_error = Some(err);

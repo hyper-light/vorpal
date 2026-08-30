@@ -71,7 +71,8 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 | `importers` | Files importing a symbol (incoming `imports` edges). |
 | `implementors` | Types implementing/extending a trait, interface, or base type. |
 | `type_users` | Definitions using a type in fields, params, returns, or annotations. |
-| `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`). |
+| `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`; add `"data_flows"` to follow argument flow). |
+| `data_flow` | Where a symbol's arguments flow: per-argument rows (`arg#i` → callee `param#j`, with the argument expression when traceable) joined from the `dataflow.bin` sidecar. Captured for Rust/Python/TypeScript/TSX call sites; older generations without the sidecar answer empty. |
 
 **Search**
 | Tool | What it does |

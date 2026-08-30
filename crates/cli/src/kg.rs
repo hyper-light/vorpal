@@ -116,6 +116,8 @@ enum GraphVerb {
   Diff,
   /// Orientation summary: module mass, hubs by in-degree, entry-point candidates.
   Architecture,
+  /// Outgoing data-flow rows for a definition: which arguments flow into which callees.
+  Flows,
 }
 
 impl GraphVerb {
@@ -135,6 +137,7 @@ impl GraphVerb {
       GraphVerb::Impact => "impact",
       GraphVerb::Diff => "diff",
       GraphVerb::Architecture => "architecture",
+      GraphVerb::Flows => "flows",
     }
   }
 }
@@ -168,7 +171,8 @@ pub struct GraphArg {
   #[clap(long, value_name = "in|out|both", default_value = "in")]
   direction: String,
   /// (reachable) Comma-separated edge types to follow (calls, references, imports,
-  /// implements, of_type, defines, has_method, has_field, overrides). Default `calls`.
+  /// implements, of_type, defines, has_method, has_field, overrides, data_flows).
+  /// Default `calls`.
   #[clap(long, value_name = "RELS", default_value = "calls")]
   relations: String,
   /// (reachable) Maximum hops (0 = unbounded).
@@ -465,6 +469,69 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
       OutputFormat::Toon | OutputFormat::Lean | OutputFormat::Ids => {
         anyhow::bail!("schema is a single report — use --format text or json")
+      }
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Flows) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let name = arg
+      .name
+      .clone()
+      .ok_or_else(|| anyhow!("`graph flows` needs a symbol name"))?;
+    let eid = match arg.eid.as_deref() {
+      Some(hex) => Some(
+        u128::from_str_radix(hex, 16)
+          .map_err(|_| anyhow::anyhow!("malformed external id '{hex}' (expect 32 hex chars)"))?,
+      ),
+      None => None,
+    };
+    let target = vorpal_index::GraphTarget {
+      name,
+      id: arg.id,
+      external_id: eid,
+      path_suffix: arg.path.clone(),
+      kind: arg.kind.clone(),
+      merge_all: arg.all,
+      show_ids: arg.ids,
+    };
+    let (records, sidecar_present) =
+      vorpal_index::records::flow_records(&kg, &gen_dir, &target).map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => {
+        if !sidecar_present {
+          println!(
+            "no data-flow sidecar in this generation (built before flows existed) — rebuild              the index to record flows"
+          );
+        } else if records.is_empty() {
+          println!("no outgoing data flows recorded for this selection");
+        }
+        for r in &records {
+          println!(
+            "{} --arg#{}({}{})--> {} param#{} [{}]",
+            r.from_name,
+            r.arg_index,
+            r.class,
+            r.expr.as_deref().map(|e| format!(" {e}")).unwrap_or_default(),
+            r.to_name,
+            r.param_index,
+            r.to_path
+          );
+        }
+      }
+      _ => {
+        let value = serde_json::json!({
+          "sidecarPresent": sidecar_present,
+          "records": records,
+        });
+        match arg.format {
+          OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+          _ => print!("{}", emit_machine(arg.format, &value)?),
+        }
       }
     }
     return Ok(ExitCode::SUCCESS);

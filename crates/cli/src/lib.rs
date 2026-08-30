@@ -219,6 +219,7 @@ mod test_cli {
       "mcp install --client claude-code --dry-run",
       "mcp install --command /usr/local/bin/vorpal",
       "graph coverage",
+      "graph flows source --path a.py",
       "graph coverage --format json --limit 10",
       "graph impact --since origin/main --src . --depth 3",
       "graph impact --relations calls,references --min-grade constrained --format json",

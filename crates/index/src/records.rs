@@ -93,6 +93,74 @@ pub struct ChannelRank {
 
 /// One definition's source text, sliced from its persisted byte span and digest-verified
 /// against the generation that recorded it — the selector-driven twin of `fetch_span`.
+/// One data-flow row answered to queries (G-M3): a traceable argument at a resolved call
+/// from `from_name` into `to_name`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowRecord {
+  pub from_id: u64,
+  pub from_name: String,
+  pub to_id: u64,
+  pub to_name: String,
+  pub to_path: String,
+  pub arg_index: u16,
+  pub param_index: u16,
+  /// var | field-access | call-result.
+  pub class: &'static str,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub expr: Option<String>,
+  pub span: (u32, u32),
+}
+
+fn flow_class_name(class: u8) -> &'static str {
+  match class {
+    0 => "var",
+    1 => "field-access",
+    2 => "call-result",
+    _ => "other",
+  }
+}
+
+/// Outgoing data-flow rows for one selected definition, from the `dataflow.bin` sidecar.
+/// Absent sidecar (an older generation) answers empty with `sidecar_present = false` — the
+/// caller says so instead of implying "no flows exist".
+pub fn flow_records(
+  kg: &vorpal_kg::Kg,
+  kg_dir: &std::path::Path,
+  target: &crate::GraphTarget,
+) -> Result<(Vec<FlowRecord>, bool), String> {
+  let matches = crate::resolve_target(kg, target).map_err(|err| err.to_string())?;
+  let store = vorpal_kg::DataflowStore::load(kg_dir).map_err(|err| err.to_string())?;
+  let present = !store.is_empty();
+  let mut records = Vec::new();
+  for &id in &matches {
+    for flow in store.flows_from(id.raw() as u32) {
+      let to = vorpal_kg::NodeId::new(flow.to as u64);
+      let (to_name, to_path) = kg
+        .node(to)
+        .map(|v| (v.name.to_string(), v.path.to_string()))
+        .unwrap_or_default();
+      let from_name = kg
+        .node(id)
+        .map(|v| v.name.to_string())
+        .unwrap_or_default();
+      records.push(FlowRecord {
+        from_id: id.raw(),
+        from_name,
+        to_id: flow.to as u64,
+        to_name,
+        to_path,
+        arg_index: flow.arg_index,
+        param_index: flow.param_index,
+        class: flow_class_name(flow.class),
+        expr: flow.expr.map(str::to_string),
+        span: flow.span,
+      });
+    }
+  }
+  Ok((records, present))
+}
+
 #[derive(Serialize, Debug)]
 pub struct SnippetRecord {
   #[serde(flatten)]

@@ -72,7 +72,7 @@ impl Profile {
     const ANALYSIS_EXTRA: &[&str] = &[
       "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
-      "code_search",
+      "code_search", "data_flow",
     ];
     match self {
       Profile::Full => true,
@@ -784,6 +784,49 @@ impl Server {
         }
         Ok((text, data))
       }
+      "data_flow" => {
+        // Outgoing data-flow rows (G-M3): which arguments flow from this definition into
+        // which callees, from the dataflow.bin sidecar. Absence of rows is NOT proof of no
+        // flows — the sidecar covers the typefacts launch languages, and older generations
+        // have no sidecar at all (said explicitly in the response).
+        let target = graph_target(args, str_arg("name")?);
+        self.kg()?;
+        let dir = self
+          .kg_dir
+          .clone()
+          .ok_or_else(|| ToolError::coded("index-unavailable", "no generation dir pinned"))?;
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
+        let (records, sidecar_present) =
+          vorpal_index::records::flow_records(kg, &dir, &target).map_err(ToolError::from)?;
+        let mut lines = Vec::new();
+        if !sidecar_present {
+          lines.push(
+            "no data-flow sidecar in this generation (built before flows existed) — rebuild \
+             the index to record flows"
+              .to_string(),
+          );
+        } else if records.is_empty() {
+          lines.push("no outgoing data flows recorded for this selection".to_string());
+        }
+        for r in &records {
+          lines.push(format!(
+            "{} --arg#{}({}{})--> {} param#{} [{}]",
+            r.from_name,
+            r.arg_index,
+            r.class,
+            r.expr.as_deref().map(|e| format!(" {e}")).unwrap_or_default(),
+            r.to_name,
+            r.param_index,
+            r.to_path
+          ));
+        }
+        Ok((
+          lines.join("\n") + "\n",
+          json!({"records": records, "sidecarPresent": sidecar_present}),
+        ))
+      }
       "snippet" => {
         // The selector-driven sibling of `fetch_span`: name/path/kind/id/eid resolution with
         // the shared ambiguity contract, whole-line context, and the same digest refusal.
@@ -1205,6 +1248,23 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
         "max_bytes": {"type": "integer", "description": "Clamp returned source (default 16384)"}
       }),
       &["id"],
+    ),
+    tool(
+      "data_flow",
+      "Outgoing data flows for a definition: which call-site arguments (by position, with \
+       the expression for variables and field accesses) flow into which callees, from the \
+       dataflow sidecar. Coverage note: flows are recorded for the typed-capture languages \
+       (Rust, Python, TypeScript, TSX) at resolved calls with traceable arguments — absence \
+       of rows is NOT proof no data flows; generations built before flows existed say so \
+       explicitly.",
+      json!({
+        "name": {"type": "string", "description": "Exact symbol name (or eid:<hex>)"},
+        "path": {"type": "string", "description": "Refine: definition file path ends with this suffix"},
+        "kind": {"type": "string", "description": "Refine: symbol kind"},
+        "id": {"type": "integer", "description": "Refine: exactly this node id"},
+        "eid": {"type": "string", "description": "Refine: durable external id (32 hex chars)"}
+      }),
+      &["name"],
     ),
     tool(
       "snippet",

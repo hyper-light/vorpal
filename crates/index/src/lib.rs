@@ -32,7 +32,7 @@ use std::time::UNIX_EPOCH;
 use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, ModelProvenance, tokenize};
 use vorpal_ingest::{
   ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
-  StreamWork, cache_file_name, decode_product, encode_product_into, link_writer_spilled,
+  StreamWork, cache_file_name, decode_product, encode_product_into,
   load_product, peek_product_stamps, save_product, stream_apply_spilled,
   validate_product,
 };
@@ -536,7 +536,7 @@ pub fn build_index_env(
   );
   drop(pack_sink);
   let pack_result = pack_thread.join().expect("pack writer panicked");
-  let (writer, spilled_refs, stream) = stream_result?;
+  let (writer, spilled_refs, stream, arg_spill) = stream_result?;
   pack_result?;
   // Fail policy judges here — before sealing, before the generation commits: nothing is
   // published, and the message lists the worst offenders with their damage ratios.
@@ -596,22 +596,30 @@ pub fn build_index_env(
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve, evidence) =
-    link_writer_spilled(&interner, writer, spilled_refs, &Resolver::new())?;
+  let (kg, resolve, evidence, flows) = vorpal_ingest::link_writer_spilled_with_flows(
+    &interner,
+    writer,
+    spilled_refs,
+    &Resolver::new(),
+    Some(arg_spill),
+  )?;
   // Persist the evidence sidecar (§5) and the graph segments CONCURRENTLY: they are
   // independent artifacts in the same staged generation, and running them serially left
   // 17 cores idle for the longer of the two. Evidence is canonically sorted (total order)
   // inside its saver, so it still joins the content identity deterministically. The
   // manifest stays strictly last — it is the commit point.
-  let (evidence_result, kg_result) = std::thread::scope(|scope| {
+  let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
     let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+    let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
     let kg_result = kg.save(&staging);
     (
-      evidence_task.join().expect("evidence saver panicked"),
+      evidence_task.join().map_err(|_| io::Error::other("evidence saver panicked")),
+      dataflow_task.join().map_err(|_| io::Error::other("dataflow saver panicked")),
       kg_result,
     )
   });
-  evidence_result?;
+  evidence_result??;
+  dataflow_result??;
   kg_result?;
   manifest.save(&staging.join("manifest.bin"))?;
   // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
@@ -638,7 +646,8 @@ pub fn build_index_env(
 /// (sorted) order. Lazy sidecars added after commit (the ANN tier) are deliberately excluded:
 /// they are stamp-validated against the node segment, deterministic given the generation, and
 /// must not change its identity.
-pub(crate) const GENERATION_ARTIFACTS: [&str; 8] = [
+pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
+  "dataflow.bin",
   "evidence.bin",
   "graph.bin",
   "manifest.bin",

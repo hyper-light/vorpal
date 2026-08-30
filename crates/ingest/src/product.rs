@@ -611,9 +611,15 @@ pub struct RefView<'a> {
   pub receiver: Option<&'a str>,
   pub receiver_type: Option<&'a str>,
   pub receiver_type_origin: u8,
-  /// Encoded argument records (count-prefixed region), decoded lazily.
-  args_bytes: &'a [u8],
-  args_count: u16,
+  /// Argument records: encoded bytes (the replay path, decoded lazily) or a borrow of the
+  /// owned records (the just-parsed bridge) — one accessor serves both.
+  args: ArgsSrc<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ArgsSrc<'a> {
+  Encoded { bytes: &'a [u8], count: u16 },
+  Owned(&'a [ProductArg]),
 }
 
 /// One decoded argument view.
@@ -626,9 +632,7 @@ pub struct ArgView<'a> {
 }
 
 impl<'a> RefView<'a> {
-  /// Bridge an owned ref into the shared apply path. Argument records are deliberately not
-  /// bridged (the apply stage never reads them; the link stage decodes them from product
-  /// bytes where they live).
+  /// Bridge an owned ref into the shared apply path, argument records included (borrowed).
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn bridge(
     from_entity_index: u32,
@@ -642,6 +646,7 @@ impl<'a> RefView<'a> {
     receiver: Option<&'a str>,
     receiver_type: Option<&'a str>,
     receiver_type_origin: u8,
+    args: &'a [ProductArg],
   ) -> Self {
     Self {
       from_entity_index,
@@ -655,8 +660,7 @@ impl<'a> RefView<'a> {
       receiver,
       receiver_type,
       receiver_type_origin,
-      args_bytes: &[],
-      args_count: 0,
+      args: ArgsSrc::Owned(args),
     }
   }
 
@@ -664,12 +668,12 @@ impl<'a> RefView<'a> {
   /// the eager decoder guarantee well-formed bytes; a torn read yields fewer records, never
   /// junk).
   pub fn args(&self) -> impl Iterator<Item = ArgView<'a>> + 'a {
-    let mut r = Reader {
-      bytes: self.args_bytes,
-      off: 0,
+    let (bytes, count, owned): (&'a [u8], u16, &'a [ProductArg]) = match self.args {
+      ArgsSrc::Encoded { bytes, count } => (bytes, count, &[]),
+      ArgsSrc::Owned(records) => (&[], 0, records),
     };
-    let count = self.args_count;
-    (0..count).map_while(move |_| {
+    let mut r = Reader { bytes, off: 0 };
+    let encoded = (0..count).map_while(move |_| {
       let index = r.u16().ok()?;
       let class = r.u8().ok()?;
       let kw_name = if r.u8().ok()? != 0 {
@@ -688,11 +692,20 @@ impl<'a> RefView<'a> {
         kw_name,
         expr,
       })
-    })
+    });
+    encoded.chain(owned.iter().map(|arg| ArgView {
+      index: arg.index,
+      class: arg.class,
+      kw_name: arg.kw_name.as_deref(),
+      expr: arg.expr.as_deref(),
+    }))
   }
 
   pub fn args_len(&self) -> usize {
-    self.args_count as usize
+    match self.args {
+      ArgsSrc::Encoded { count, .. } => count as usize,
+      ArgsSrc::Owned(records) => records.len(),
+    }
   }
 }
 
@@ -918,8 +931,10 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       receiver,
       receiver_type,
       receiver_type_origin,
-      args_bytes,
-      args_count,
+      args: ArgsSrc::Encoded {
+        bytes: args_bytes,
+        count: args_count,
+      },
     });
   }
   let entity_param_count = r.count()?;

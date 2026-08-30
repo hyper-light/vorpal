@@ -105,6 +105,7 @@ fn initialize_handshake_and_tool_listing() {
       "rule_search",
       "ast_dump",
       "fetch_span",
+      "data_flow",
       "snippet",
       "why",
       "search"
