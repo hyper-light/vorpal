@@ -84,6 +84,15 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
   quality on this corpus, so the cap only added work. Counters (deterministic dist-eval /
   expansion totals) landed and are the standing A/B instrument.
 
+- Progressive α (1.0→1.2, DiskANN occlude_list semantics) + saturate-to-R (Tier-1 items
+  5-6): **BOTH REJECTED by gate.** Progressive alone: pool recall 0.9125 → 0.9062; with
+  saturate: → 0.8562 (and +20% evals). Geometry explanation: lexical-hash vectors form
+  near-duplicate clusters (similar identifiers), and the pool metric rewards retrieving
+  those twins — strict-RNG-first selection evicts exactly them, and saturate back-fills
+  dominated edges that displace nothing useful. Production-DiskANN defaults do not
+  transfer to this embedding geometry; single-α=1.2 stands. (Lazy memoized single-α prune
+  kept — sha-identical, structural win.)
+
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
 - kNN-first wholesale (NN-descent/RNN-descent/HCNNG): 10-16× more distance evals; honest
