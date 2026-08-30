@@ -278,6 +278,28 @@ struct BoundPredicate {
   value: PropValue,
 }
 
+/// The WHERE tree with every leaf's variable resolved to a side.
+enum BoundPred {
+  Cmp(BoundPredicate),
+  And(Vec<BoundPred>),
+  Or(Vec<BoundPred>),
+  Not(Box<BoundPred>),
+}
+
+impl BoundPred {
+  fn eval(&self, kg: &Kg, l: u32, r: u32) -> bool {
+    match self {
+      BoundPred::Cmp(leaf) => {
+        let id = if leaf.side == 0 { l } else { r };
+        id != u32::MAX && leaf.eval(kg, id)
+      }
+      BoundPred::And(terms) => terms.iter().all(|t| t.eval(kg, l, r)),
+      BoundPred::Or(terms) => terms.iter().any(|t| t.eval(kg, l, r)),
+      BoundPred::Not(inner) => !inner.eval(kg, l, r),
+    }
+  }
+}
+
 impl BoundPredicate {
   fn eval(&self, kg: &Kg, id: u32) -> bool {
     let cell = prop_cell(kg, id, &self.prop);
@@ -381,17 +403,32 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
   };
 
   // ---- Plan: predicates, projections, order, aggregation. ----
-  let mut predicates = Vec::new();
-  for pred in &query.predicates {
-    check_prop(&pred.target.prop)?;
-    check_predicate_types(&pred.target.prop, pred.op, &pred.value)?;
-    predicates.push(BoundPredicate {
-      side: side_of(&pred.target.var)?,
-      prop: pred.target.prop.clone(),
-      op: pred.op,
-      value: pred.value.clone(),
-    });
+  fn bind_pred(
+    expr: &PredExpr,
+    side_of: &impl Fn(&str) -> Result<usize, QueryError>,
+  ) -> Result<BoundPred, QueryError> {
+    Ok(match expr {
+      PredExpr::Cmp(pred) => {
+        check_prop(&pred.target.prop)?;
+        check_predicate_types(&pred.target.prop, pred.op, &pred.value)?;
+        BoundPred::Cmp(BoundPredicate {
+          side: side_of(&pred.target.var)?,
+          prop: pred.target.prop.clone(),
+          op: pred.op,
+          value: pred.value.clone(),
+        })
+      }
+      PredExpr::And(terms) => BoundPred::And(
+        terms.iter().map(|t| bind_pred(t, side_of)).collect::<Result<_, _>>()?,
+      ),
+      PredExpr::Or(terms) => BoundPred::Or(
+        terms.iter().map(|t| bind_pred(t, side_of)).collect::<Result<_, _>>()?,
+      ),
+      PredExpr::Not(inner) => BoundPred::Not(Box::new(bind_pred(inner, side_of)?)),
+    })
   }
+  let predicate: Option<BoundPred> =
+    query.predicate.as_ref().map(|p| bind_pred(p, &side_of)).transpose()?;
 
   let expand_projection =
     |proj: &Projection, out: &mut Vec<BoundColumn>| -> Result<(), QueryError> {
@@ -497,10 +534,7 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
     Ok(())
   }
   let passes_where = |kg: &Kg, l: u32, r: u32| -> bool {
-    predicates.iter().all(|p| {
-      let id = if p.side == 0 { l } else { r };
-      id != NO_NODE && p.eval(kg, id)
-    })
+    predicate.as_ref().is_none_or(|p| p.eval(kg, l, r))
   };
 
   match (&rel, &right) {
@@ -509,7 +543,7 @@ pub(crate) fn execute(kg: &Kg, query: &Query) -> Result<QueryResult, QueryError>
       // `in_degree >= 500` touches every node's view — serial, that was ~1s at kernel
       // scale; the rayon filter preserves encounter order, so rows stay deterministic).
       let candidates = left.candidates(kg);
-      let survivors: Vec<u32> = if predicates.is_empty() {
+      let survivors: Vec<u32> = if predicate.is_none() {
         candidates
       } else {
         use rayon::prelude::*;

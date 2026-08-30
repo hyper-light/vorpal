@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Query {
   pub pattern: Pattern,
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub predicates: Vec<Predicate>,
+  /// The WHERE clause as a boolean expression tree (v1.1 — v1 was AND-only).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub predicate: Option<PredExpr>,
   pub returns: Returns,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub order_by: Vec<Ordering>,
@@ -88,7 +89,18 @@ pub struct PropRef {
   pub prop: String,
 }
 
-/// One WHERE conjunct (`AND`-combined; v1 has no OR/NOT).
+/// A WHERE expression: comparisons combined with AND / OR / NOT (parentheses group).
+/// Precedence NOT > AND > OR, exactly as parsed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredExpr {
+  Cmp(Predicate),
+  And(Vec<PredExpr>),
+  Or(Vec<PredExpr>),
+  Not(Box<PredExpr>),
+}
+
+/// One comparison leaf.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Predicate {
   pub target: PropRef,

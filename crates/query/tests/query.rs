@@ -212,7 +212,6 @@ fn typed_errors_name_the_boundary() {
     Err(QueryError::Parse { message, .. }) => message,
     other => panic!("expected a parse error for {text}, got {other:?}"),
   };
-  assert!(parse_err("MATCH (f) WHERE f.name = 'x' OR f.name = 'y' RETURN f.name").contains("OR"));
   assert!(parse_err("MATCH (a)-[:calls]->(b)-[:calls]->(c) RETURN a.name").contains("multi-segment"));
   assert!(parse_err("MATCH (f) WHERE f.name IN ['a'] RETURN f.name").contains("IN lists"));
 }
@@ -248,6 +247,7 @@ fn parser_fuzz_never_panics() {
   };
   let vocab = [
     "MATCH", "WHERE", "RETURN", "ORDER", "BY", "SKIP", "LIMIT", "COUNT", "DISTINCT", "AND",
+    "OR", "NOT",
     "AS", "STARTS", "ENDS", "WITH", "CONTAINS", "(", ")", "[", "]", "{", "}", ":", ",", ".",
     "..", "|", "*", "<", ">", "-", "->", "<-", "=", "<>", "!=", "'x'", "\"y\"", "42", "f",
     "calls", "name", "grade", "true", "false", "\\", "\u{1F980}", "\0",
@@ -350,4 +350,53 @@ fn scc_size_property_finds_recursion_knots() {
   );
   let r = run(&kg, r#"MATCH (f {name: "gamma"}) RETURN f.scc_size"#).unwrap();
   assert_eq!(r.rows, vec![vec![Cell::Int(1)]]);
+}
+
+#[test]
+fn boolean_predicate_trees() {
+  let kg = fixture();
+
+  // OR at the bottom of precedence: (exported AND path-p) OR name=deserialize.
+  let r = run(
+    &kg,
+    r#"MATCH (f:Function) WHERE f.exported = true AND f.path STARTS WITH "src/p" OR f.name = "deserialize" RETURN f.name ORDER BY f.name"#,
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["deserialize", "parse"]);
+
+  // Parentheses regroup: exported AND (path-p OR deserialize).
+  let r = run(
+    &kg,
+    r#"MATCH (f:Function) WHERE f.exported = true AND (f.path STARTS WITH "src/p" OR f.name = "deserialize") RETURN f.name ORDER BY f.name"#,
+  )
+  .unwrap();
+  assert_eq!(texts(&r.rows, 0), ["deserialize", "parse"]);
+
+  // NOT binds tighter than AND; De Morgan sanity against the equivalent positive form.
+  let negative = run(
+    &kg,
+    r#"MATCH (f:Function) WHERE NOT f.name = "main" AND NOT f.name = "parse" RETURN f.name ORDER BY f.name"#,
+  )
+  .unwrap();
+  let positive = run(
+    &kg,
+    r#"MATCH (f:Function) WHERE NOT (f.name = "main" OR f.name = "parse") RETURN f.name ORDER BY f.name"#,
+  )
+  .unwrap();
+  assert_eq!(negative.rows, positive.rows);
+  assert_eq!(texts(&negative.rows, 0), ["deserialize", "validate"]);
+
+  // NOT over a substring operator.
+  let r = run(
+    &kg,
+    r#"MATCH (f) WHERE NOT f.path CONTAINS "src/" RETURN COUNT(*)"#,
+  )
+  .unwrap();
+  assert_eq!(r.rows, vec![vec![Cell::Int(0)]]);
+
+  // Plan errors surface from inside the tree.
+  match run(&kg, r#"MATCH (f) WHERE f.name = "x" OR g.name = "y" RETURN f.name"#) {
+    Err(QueryError::Plan(message)) => assert!(message.contains("not bound"), "{message}"),
+    other => panic!("expected plan error, got {other:?}"),
+  }
 }

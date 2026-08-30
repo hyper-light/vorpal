@@ -114,22 +114,14 @@ impl Parser {
   fn query(&mut self) -> Result<Query, QueryError> {
     self.expect_kw("MATCH")?;
     let pattern = self.pattern()?;
-    let mut predicates = Vec::new();
-    if self.eat_kw("WHERE") {
-      loop {
-        predicates.push(self.predicate()?);
-        if self.eat_kw("AND") {
-          continue;
-        }
-        if self.at_kw("OR") || self.at_kw("NOT") || self.at_kw("XOR") {
-          return Err(QueryError::parse(
-            self.offset(),
-            "only AND-combined predicates are supported in v1 (no OR/NOT)",
-          ));
-        }
-        break;
+    let predicate = if self.eat_kw("WHERE") {
+      if self.at_kw("XOR") {
+        return Err(QueryError::parse(self.offset(), "XOR is not supported (use AND/OR/NOT)"));
       }
-    }
+      Some(self.pred_or()?)
+    } else {
+      None
+    };
     if self.at_kw("WITH") || self.at_kw("OPTIONAL") {
       return Err(QueryError::parse(
         self.offset(),
@@ -162,7 +154,7 @@ impl Parser {
     };
     Ok(Query {
       pattern,
-      predicates,
+      predicate,
       returns,
       order_by,
       skip,
@@ -352,6 +344,52 @@ impl Parser {
     }
     self.expect(&Tok::RBracket, "']' closing the relationship")?;
     Ok((types, range, grade))
+  }
+
+  /// `or := and (OR and)*` — lowest precedence.
+  fn pred_or(&mut self) -> Result<PredExpr, QueryError> {
+    let mut terms = vec![self.pred_and()?];
+    while self.eat_kw("OR") {
+      terms.push(self.pred_and()?);
+    }
+    Ok(if terms.len() == 1 {
+      match terms.pop() {
+        Some(only) => only,
+        None => return Err(QueryError::parse(self.offset(), "empty predicate")),
+      }
+    } else {
+      PredExpr::Or(terms)
+    })
+  }
+
+  /// `and := unary (AND unary)*`.
+  fn pred_and(&mut self) -> Result<PredExpr, QueryError> {
+    let mut terms = vec![self.pred_unary()?];
+    while self.eat_kw("AND") {
+      terms.push(self.pred_unary()?);
+    }
+    Ok(if terms.len() == 1 {
+      match terms.pop() {
+        Some(only) => only,
+        None => return Err(QueryError::parse(self.offset(), "empty predicate")),
+      }
+    } else {
+      PredExpr::And(terms)
+    })
+  }
+
+  /// `unary := NOT unary | '(' or ')' | comparison`.
+  fn pred_unary(&mut self) -> Result<PredExpr, QueryError> {
+    if self.eat_kw("NOT") {
+      return Ok(PredExpr::Not(Box::new(self.pred_unary()?)));
+    }
+    if self.peek() == Some(&Tok::LParen) {
+      self.at += 1;
+      let inner = self.pred_or()?;
+      self.expect(&Tok::RParen, "')' closing the predicate group")?;
+      return Ok(inner);
+    }
+    Ok(PredExpr::Cmp(self.predicate()?))
   }
 
   fn predicate(&mut self) -> Result<Predicate, QueryError> {
