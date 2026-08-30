@@ -20,7 +20,11 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 tree-sitter-bash = { version = "0.25.0", optional = true }
 tree-sitter-cmake = { version = "0.7.4", optional = true }
+tree-sitter-astro = { version = "0.1.1", optional = true, package = "tree-sitter-astro-next" }
 tree-sitter-erlang = { version = "0.20.0", optional = true }
+tree-sitter-jsdoc = { version = "0.25.0", optional = true }
+tree-sitter-svelte = { version = "1.0.2", optional = true, package = "tree-sitter-svelte-ng" }
+tree-sitter-vue = { version = "0.0.3", optional = true }
 tree-sitter-julia = { version = "0.23.1", optional = true }
 tree-sitter-objc = { version = "3.0.2", optional = true }
 tree-sitter-ocaml = { version = "0.25.0", optional = true }
@@ -69,7 +73,9 @@ builtin-parser = [
   "tree-sitter-c",
   "tree-sitter-cmake",
   "tree-sitter-dockerfile",
+  "tree-sitter-astro",
   "tree-sitter-erlang",
+  "tree-sitter-jsdoc",
   "tree-sitter-julia",
   "tree-sitter-objc",
   "tree-sitter-ocaml",
@@ -105,9 +111,11 @@ builtin-parser = [
   "tree-sitter-rust",
   "tree-sitter-scala",
   "tree-sitter-solidity",
+  "tree-sitter-svelte",
   "tree-sitter-swift",
   "tree-sitter-toml",
   "tree-sitter-typescript",
+  "tree-sitter-vue",
   "tree-sitter-yaml",
 ]
 napi-lang = [

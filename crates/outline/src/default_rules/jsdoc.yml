@@ -1,0 +1,11 @@
+id: jsdoc-tag
+language: JsDoc
+role: item
+symbolType: key
+rule:
+  all:
+    - kind: tag
+    - has:
+        kind: tag_name
+        pattern: $NAME
+name: '$NAME'

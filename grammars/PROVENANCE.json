@@ -1,4 +1,13 @@
 {
+  "tree-sitter-astro-next": {
+    "abi": 14,
+    "commit": "15a3b95bf444",
+    "license": "MIT or Apache-2.0",
+    "patches": [],
+    "repository": "https://github.com/PRRPCHT/tree-sitter-astro-next",
+    "source_digest": "xxh3:c0c4b6c2cd7fc6c9",
+    "version": "0.1.1"
+  },
   "tree-sitter-bash": {
     "abi": 15,
     "commit": "a06c2e4415e9",
@@ -187,6 +196,15 @@
     ],
     "repository": "https://github.com/tree-sitter/tree-sitter-javascript",
     "source_digest": "xxh3:920237063fe7966d",
+    "version": "0.25.0"
+  },
+  "tree-sitter-jsdoc": {
+    "abi": 15,
+    "commit": "658d18dcdddb",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter/tree-sitter-jsdoc",
+    "source_digest": "xxh3:77e67efc94181d18",
     "version": "0.25.0"
   },
   "tree-sitter-json": {
@@ -386,6 +404,15 @@
     "source_digest": "xxh3:26f79f55aee5b8d4",
     "version": "1.2.13"
   },
+  "tree-sitter-svelte-ng": {
+    "abi": 14,
+    "commit": "774a65aea563",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-svelte",
+    "source_digest": "xxh3:0a1b77b6cefe3b36",
+    "version": "1.0.2"
+  },
   "tree-sitter-swift": {
     "abi": 15,
     "commit": "b8b22bffbb34",
@@ -415,6 +442,17 @@
     "repository": "https://github.com/tree-sitter/tree-sitter-typescript",
     "source_digest": "xxh3:019c30f748c9184b",
     "version": "0.23.2"
+  },
+  "tree-sitter-vue": {
+    "abi": 14,
+    "commit": "8bbcd4cbd59c",
+    "license": "MIT",
+    "patches": [
+      "embedded tree-sitter-html scanner copy no longer exports the five tree_sitter_html_external_scanner_* C symbols (duplicate definitions across static libraries let the linker silently replace the real HTML grammar's scanner — corpus-wide HTML breakage); bindings/rust modernized to LanguageFn (crate 0.0.3 shipped fn language() on tree-sitter 0.19)"
+    ],
+    "repository": "https://github.com/xiaoxin-sky/tree-sitter-vue",
+    "source_digest": "xxh3:01c59ff4e1ed9755",
+    "version": "0.0.3"
   },
   "tree-sitter-xml": {
     "abi": 14,

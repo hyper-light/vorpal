@@ -166,6 +166,21 @@ const CALL_ROWS: &[(&str, &str, &str)] = &[
     "<html><script>\nfunction helper() { return 1 }\nfunction run() { return helper() }\n</script></html>\n",
   ),
   (
+    "vue-script",
+    "a.vue",
+    "<template><div/></template>\n<script>\nfunction helper() { return 1 }\nfunction run() { return helper() }\n</script>\n",
+  ),
+  (
+    "svelte-script",
+    "a.svelte",
+    "<script>\nfunction helper() { return 1 }\nfunction run() { return helper() }\n</script>\n<div/>\n",
+  ),
+  (
+    "astro-frontmatter",
+    "a.astro",
+    "---\nfunction helper() { return 1 }\nfunction run() { return helper() }\n---\n<div/>\n",
+  ),
+  (
     "powershell",
     "a.ps1",
     "function helper {\n  1\n}\n\nfunction run {\n  helper\n}\n",

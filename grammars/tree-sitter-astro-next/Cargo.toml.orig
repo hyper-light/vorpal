@@ -1,0 +1,31 @@
+[package]
+name = "tree-sitter-astro-next"
+version = "0.1.1"
+edition = "2024"
+license = "MIT or Apache-2.0"
+description = "Astro grammar for tree-sitter, compatible with tree-sitter 0.25+"
+keywords = ["tree-sitter", "astro", "parsing", "syntax", "grammar"]
+categories = ["parsing", "text-editors"]
+include = ["src/**/*", "queries/*", "build.rs", "LICENSE*", "README.md"]
+repository = "https://github.com/PRRPCHT/tree-sitter-astro-next"
+homepage = "https://github.com/PRRPCHT/tree-sitter-astro-next"
+documentation = "https://docs.rs/tree-sitter-astro-next"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+# Features to enable when building on docs.rs
+all-features = true
+# Target to build for on docs.rs (defaults to x86_64-unknown-linux-gnu)
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1.7"
+
+[build-dependencies]
+cc = "1.2.55"
+
+[dev-dependencies]
+tree-sitter = "0.26.5"

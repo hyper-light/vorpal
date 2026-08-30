@@ -1,0 +1,40 @@
+id: astro-element
+language: Astro
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'
+---
+id: astro-child-element
+language: Astro
+role: member
+parentRuleIds: [astro-element]
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'

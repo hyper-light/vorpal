@@ -1,0 +1,40 @@
+id: vue-element
+language: Vue
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'
+---
+id: vue-child-element
+language: Vue
+role: member
+parentRuleIds: [vue-element]
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'

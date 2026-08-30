@@ -353,6 +353,35 @@ const CANARIES: &[Canary] = &[
     min_refs: 1,
   },
   Canary {
+    lang: SupportLang::Vue,
+    path: "vorpal-selfcheck/canary.vue",
+    source: "<template><div/></template>\n<script>\nfunction canary() { helper() }\n</script>\n",
+    min_items: 2,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::Svelte,
+    path: "vorpal-selfcheck/canary.svelte",
+    source: "<script>\nfunction canary() { helper() }\n</script>\n<div/>\n",
+    min_items: 2,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::Astro,
+    path: "vorpal-selfcheck/canary.astro",
+    source: "---\nfunction canary() { helper() }\n---\n<div/>\n",
+    min_items: 1,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::JsDoc,
+    path: "vorpal-selfcheck/canary.jsdoc",
+    // The jsdoc grammar parses comment CONTENT (injection ranges exclude the /** */ fence).
+    source: "@param {number} x\n",
+    min_items: 1,
+    min_refs: 0,
+  },
+  Canary {
     lang: SupportLang::Toml,
     path: "vorpal-selfcheck/canary.toml",
     source: "top = 1\n\n[package]\nname = \"canary\"\n",

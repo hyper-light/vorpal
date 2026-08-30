@@ -92,6 +92,14 @@ pub const DEFAULT_OUTLINE_RULES: &str = concat!(
   include_str!("default_rules/css.yml"),
   "\n---\n",
   include_str!("default_rules/html.yml"),
+  "\n---\n",
+  include_str!("default_rules/vue.yml"),
+  "\n---\n",
+  include_str!("default_rules/svelte.yml"),
+  "\n---\n",
+  include_str!("default_rules/astro.yml"),
+  "\n---\n",
+  include_str!("default_rules/jsdoc.yml"),
 );
 
 #[cfg(test)]

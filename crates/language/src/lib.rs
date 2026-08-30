@@ -27,7 +27,11 @@ mod elixir;
 mod go;
 mod haskell;
 mod hcl;
+mod astro;
 mod html;
+mod html_injection;
+mod svelte;
+mod vue;
 mod json;
 mod kotlin;
 mod lua;
@@ -42,7 +46,10 @@ mod solidity;
 mod swift;
 mod yaml;
 
+pub use astro::Astro;
 pub use html::Html;
+pub use svelte::Svelte;
+pub use vue::Vue;
 use vorpal_core::matcher::{Pattern, PatternBuilder, PatternError};
 
 use ignore::types::{Types, TypesBuilder};
@@ -361,6 +368,8 @@ langs! { $
   JavaScript { parser: language_javascript(tree_sitter_javascript), feature: "tree-sitter-javascript", kind: plain, aliases: ["javascript", "js", "jsx"], extensions: ["cjs", "js", "mjs", "jsx"], }
   // Julia identifiers admit unicode letters (µ), never `$` (interpolation sigil).
   Julia { parser: language_julia(tree_sitter_julia), feature: "tree-sitter-julia", kind: expando('µ'), aliases: ["julia", "jl"], extensions: ["jl"], }
+  // JSDoc: an injection-target grammar (JS comment blocks via languageInjections config).
+  JsDoc { parser: language_jsdoc(tree_sitter_jsdoc), feature: "tree-sitter-jsdoc", kind: plain, aliases: ["jsdoc"], extensions: ["jsdoc"], }
   Json { parser: language_json(tree_sitter_json), feature: "tree-sitter-json", kind: plain, aliases: ["json"], extensions: ["json"], }
   // https://github.com/fwcd/tree-sitter-kotlin/pull/93
   Kotlin { parser: language_kotlin(tree_sitter_kotlin), feature: "tree-sitter-kotlin", kind: expando('µ'), aliases: ["kotlin", "kt"], extensions: ["kt", "ktm", "kts"], }
@@ -368,6 +377,8 @@ langs! { $
   // Make: `$` is THE macro character; it can never appear raw in a target/variable name.
   Make { parser: language_make(tree_sitter_make), feature: "tree-sitter-make", kind: expando('µ'), aliases: ["make", "makefile", "gnumake"], extensions: ["mk", "mak", "make"], filenames: ["Makefile", "makefile", "GNUmakefile"], }
   Markdown { parser: language_markdown(tree_sitter_md), feature: "tree-sitter-md", kind: plain, aliases: ["markdown", "md"], extensions: ["markdown", "md"], }
+  // Astro host: frontmatter is TypeScript; script/style blocks inject (hand-written type).
+  Astro { parser: language_astro(tree_sitter_astro), feature: "tree-sitter-astro", kind: custom, aliases: ["astro"], extensions: ["astro"], }
   // Objective-C rides the C identifier rules.
   ObjectiveC { parser: language_objc(tree_sitter_objc), feature: "tree-sitter-objc", kind: expando('𐀀'), aliases: ["objc", "objective-c", "objectivec"], extensions: ["m"], }
   // OCaml identifiers are [A-Za-z0-9_'].
@@ -392,6 +403,8 @@ langs! { $
   // any char in [:XID_Start:]: https://doc.rust-lang.org/reference/identifiers.html
   Rust { parser: language_rust(tree_sitter_rust), feature: "tree-sitter-rust", kind: expando('µ'), aliases: ["rs", "rust"], extensions: ["rs"], }
   Scala { parser: language_scala(tree_sitter_scala), feature: "tree-sitter-scala", kind: plain, aliases: ["scala"], extensions: ["scala", "sc", "sbt"], }
+  // Svelte host: script/style blocks inject (hand-written type).
+  Svelte { parser: language_svelte(tree_sitter_svelte), feature: "tree-sitter-svelte", kind: custom, aliases: ["svelte"], extensions: ["svelte"], }
   // SQL identifiers: `$` only appears in dialect-specific dollar quoting.
   Sql { parser: language_sql(tree_sitter_sequel), feature: "tree-sitter-sequel", kind: expando('_'), aliases: ["sql"], extensions: ["sql"], }
   Solidity { parser: language_solidity(tree_sitter_solidity), feature: "tree-sitter-solidity", kind: plain, aliases: ["sol", "solidity"], extensions: ["sol"], }
@@ -405,6 +418,8 @@ langs! { $
   Xml { parser: language_xml(tree_sitter_xml, LANGUAGE_XML), feature: "tree-sitter-xml", kind: expando('_'), aliases: ["xml"], extensions: ["xml", "xsd", "xsl", "xslt", "svg", "rss", "atom", "plist", "xaml", "csproj", "props", "targets"], }
   // Zig identifiers are [A-Za-z0-9_]; `$` never lexes.
   Zig { parser: language_zig(tree_sitter_zig), feature: "tree-sitter-zig", kind: expando('_'), aliases: ["zig"], extensions: ["zig"], }
+  // Vue SFC host: script/style blocks inject (hand-written type).
+  Vue { parser: language_vue(tree_sitter_vue), feature: "tree-sitter-vue", kind: custom, aliases: ["vue"], extensions: ["vue"], }
   Yaml { parser: language_yaml(tree_sitter_yaml), feature: "tree-sitter-yaml", kind: plain, aliases: ["yaml", "yml"], extensions: ["yaml", "yml"], }
 }
 
@@ -549,7 +564,10 @@ impl LanguageExt for SupportLang {
     root: Node<StrDoc<L>>,
   ) -> Vec<(String, Vec<TSRange>)> {
     match self {
+      SupportLang::Astro => Astro.extract_injections(root),
       SupportLang::Html => Html.extract_injections(root),
+      SupportLang::Svelte => Svelte.extract_injections(root),
+      SupportLang::Vue => Vue.extract_injections(root),
       _ => Vec::new(),
     }
   }
