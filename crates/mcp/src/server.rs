@@ -104,6 +104,17 @@ pub struct Server {
   /// absorb exactly drops it (rebuilt later) — stale overlays never serve.
   overlay: Option<vorpal_index::live::LiveOverlay>,
   overlay_building: Option<std::thread::JoinHandle<Result<vorpal_index::live::LiveOverlay, String>>>,
+  /// The live vector tier (ANN_FRONTIER.md Tier 3): per-edit tombstone+insert instead of
+  /// the full per-generation warm. `live_ann_task` covers both adoption (from a fresh
+  /// committed tier) and per-edit updates — the tier travels INTO the task and back, so
+  /// the serve path never blocks on O(n) id refreshes.
+  live_ann: Option<vorpal_index::live_ann::LiveAnnTier>,
+  live_ann_task: Option<std::thread::JoinHandle<Option<vorpal_index::live_ann::LiveAnnTier>>>,
+  /// Edit churn that arrived while a tier task was in flight — applied at reap.
+  pending_churn: Vec<(Vec<u64>, Vec<u64>)>,
+  /// The generation an adopt already failed against — never retry the same one (the next
+  /// commit changes the generation and clears the latch).
+  live_ann_failed_gen: Option<PathBuf>,
 }
 
 /// The live overlay is on by default; `VORPAL_NO_LIVE_OVERLAY=1` (or `true`/`yes`) keeps the
@@ -160,13 +171,17 @@ impl Server {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
     // start building it now instead of on the first semantic search. The generation must be
-    // resolved first — artifacts live in `gen/<id>/`, never at the index root.
+    // resolved first — artifacts live in `gen/<id>/`, never at the index root. When the
+    // persisted tier looks RECONCILABLE (identity sidecar present, built by the active
+    // model), the rebuild yields to live-tier adoption on the first refresh — ~200 ms of
+    // reconciliation instead of a full build; if adoption declines after all (torn pair,
+    // churn past the overlay ceiling), its reap requests this very warm.
+    let generation = vorpal_kg::resolve_index_dir(&index_dir);
+    let tier_reconcilable = generation.join("ann.files").exists()
+      && vorpal_index::persisted_model_provenance(&generation).as_ref()
+        == Some(&vorpal_index::model_provenance());
     let mut warm = None;
-    if autowarm_enabled()
-      && vorpal_kg::resolve_index_dir(&index_dir)
-        .join("nodes.vseg")
-        .exists()
-    {
+    if autowarm_enabled() && generation.join("nodes.vseg").exists() && !tier_reconcilable {
       let warm_dir = index_dir.clone();
       warm = Some(std::thread::spawn(move || {
         let _ = vorpal_index::warm_ann(&warm_dir);
@@ -184,8 +199,99 @@ impl Server {
       persisting: None,
       overlay: None,
       overlay_building: None,
+      live_ann: None,
+      live_ann_task: None,
+      pending_churn: Vec::new(),
+      live_ann_failed_gen: None,
       watch,
     }
+  }
+
+  /// Reap a finished live-ANN task (adopt or update); queued churn drains through a fresh
+  /// update task so the serve path stays free of O(n) work.
+  fn reap_live_ann(&mut self) {
+    if !self.live_ann_task.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
+    }
+    if let Some(handle) = self.live_ann_task.take() {
+      self.live_ann = handle.join().ok().flatten();
+      if self.live_ann.is_some() {
+        vorpal_kg::phase_stamp("live-ann: tier ready");
+        self.live_ann_failed_gen = None;
+      } else {
+        vorpal_kg::phase_stamp("live-ann: adoption failed for this generation");
+        self.live_ann_failed_gen = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
+        // The tier is gone (failed adopt, or an update task died) and its presence was
+        // suppressing warms: hand the generation to the classic warm now. The failed-gen
+        // latch keeps this bounded to one rebuild per generation.
+        self.request_warm();
+      }
+    }
+    if self.live_ann.is_some() && !self.pending_churn.is_empty() {
+      let churn = std::mem::take(&mut self.pending_churn);
+      self.spawn_live_ann_update(churn);
+    }
+  }
+
+  /// Try to adopt the committed generation's tier (background). Preconditions mirror the
+  /// overlay builder's: never while a committer is writing.
+  fn spawn_live_ann_adopt(&mut self) {
+    if self.live_ann.is_some()
+      || self.live_ann_task.is_some()
+      || self.canonicalizing.is_some()
+      || self.persisting.is_some()
+      // A running warm is about to REPLACE these artifacts (compaction, failed-adopt
+      // recovery): adopting mid-warm re-loads the tier the warm is retiring. `reap_warm`
+      // clears the latch when it lands, so adoption follows the fresh tier instead.
+      || self.warm.is_some()
+    {
+      return;
+    }
+    // One attempt per generation: a failed adopt (no tier, foreign model, churn ceiling)
+    // waits for the next commit — or the next warm — instead of spinning.
+    if self
+      .live_ann_failed_gen
+      .as_ref()
+      .is_some_and(|failed| *failed == vorpal_kg::resolve_index_dir(&self.index_dir))
+    {
+      return;
+    }
+    let Some(kg) = self.kg.clone() else { return };
+    let index_dir = self.index_dir.clone();
+    vorpal_kg::phase_stamp("live-ann: adopt spawned");
+    self.live_ann_task = Some(std::thread::spawn(move || {
+      let generation = vorpal_kg::resolve_index_dir(&index_dir);
+      vorpal_index::live_ann::LiveAnnTier::adopt(&generation, &kg)
+    }));
+  }
+
+  /// Apply edit churn to the tier on a background task: refresh the eid→id translation
+  /// against the newly served graph, tombstone removed eids, insert added ones (~ms each).
+  fn spawn_live_ann_update(&mut self, churn: Vec<(Vec<u64>, Vec<u64>)>) {
+    let Some(mut tier) = self.live_ann.take() else {
+      self.pending_churn.extend(churn);
+      return;
+    };
+    let Some(kg) = self.kg.clone() else {
+      self.live_ann = Some(tier);
+      return;
+    };
+    vorpal_kg::phase_stamp(&format!("live-ann: update spawned ({} batches)", churn.len()));
+    self.live_ann_task = Some(std::thread::spawn(move || {
+      let start = std::time::Instant::now();
+      tier.refresh_ids(&kg);
+      let (mut removed_total, mut added_total) = (0usize, 0usize);
+      for (removed, added) in &churn {
+        removed_total += removed.len();
+        added_total += added.len();
+        tier.apply_edit(&kg, removed, added);
+      }
+      vorpal_kg::phase_stamp(&format!(
+        "live-ann: update done (-{removed_total} +{added_total} rows, {} ms)",
+        start.elapsed().as_millis(),
+      ));
+      Some(tier)
+    }));
   }
 
   /// Start building the live overlay from the committed generation, unless one is already
@@ -256,6 +362,11 @@ impl Server {
     match handle.join() {
       Ok(Ok(dir)) => {
         self.kg_dir = Some(dir);
+        // Adoption first, warm second: with an adopt task in flight the warm request
+        // defers (its gate treats the task as tier-present), and a failed adopt requests
+        // the warm itself — so the ~full-build rebuild only runs when reconciliation
+        // genuinely cannot bridge the committed tier to the served graph.
+        self.spawn_live_ann_adopt();
         self.request_warm();
         self.spawn_overlay_build();
       }
@@ -267,6 +378,16 @@ impl Server {
     }
   }
 
+  /// Reap a finished warm (non-blocking). A completed warm rewrote this generation's ANN
+  /// artifacts IN PLACE, so the per-generation adoption latch must not outlive the
+  /// artifacts it judged — clearing it lets the next pass adopt the rebuilt tier.
+  fn reap_warm(&mut self) {
+    if self.warm.as_ref().is_some_and(|h| h.is_finished()) {
+      let _ = self.warm.take().map(std::thread::JoinHandle::join);
+      self.live_ann_failed_gen = None;
+    }
+  }
+
   /// Request an eager background ANN warm of the current generation. Single-flight: while a
   /// warm is running this only marks the request, and the reap below (called from the same
   /// places) spawns the trailing warm once the runner finishes. `warm_ann` re-resolves
@@ -275,9 +396,18 @@ impl Server {
     if !autowarm_enabled() {
       return;
     }
-    if self.warm.as_ref().is_some_and(|h| h.is_finished()) {
-      let _ = self.warm.take().map(std::thread::JoinHandle::join);
+    // A healthy live tier IS the warm tier: per-edit maintenance replaces the ~full-build
+    // background rebuild. The compaction trigger clears `live_ann` first when a real
+    // rebuild is wanted, so this gate never blocks compaction. A live-ANN task in flight
+    // counts as present: an update task briefly OWNS the tier (it travels into the
+    // thread), and treating that window as tier-less fired a full rebuild on every edit —
+    // the reap reinstalls the tier, or requests this warm itself when the task fails.
+    if self.live_ann.as_ref().is_some_and(|t| t.dead_fraction() <= 0.05)
+      || self.live_ann_task.is_some()
+    {
+      return;
     }
+    self.reap_warm();
     if self.warm.is_some() {
       self.warm_pending = true;
       return;
@@ -300,10 +430,21 @@ impl Server {
     if self.warm_pending && self.warm.as_ref().is_none_or(|h| h.is_finished()) {
       self.request_warm();
     }
+    self.reap_warm();
     // Reap a finished background persist (non-blocking) so `kg_dir` pins the committed
     // generation as soon as it exists.
     self.reap_persist(false);
     self.reap_overlay_build();
+    self.reap_live_ann();
+    // Compaction trigger: past the tombstone-debt threshold the incremental tier retires
+    // and the classic full warm rebuilds a dense one (re-adopted on the next pass).
+    if self.live_ann.as_ref().is_some_and(|t| t.dead_fraction() > 0.05) {
+      self.live_ann = None;
+      self.request_warm();
+    }
+    if self.live_ann.is_none() && self.live_ann_task.is_none() {
+      self.spawn_live_ann_adopt();
+    }
     // Reap a finished background canonicalization (non-blocking): a failure re-arms the
     // dirty flag; a success is the overlay builder's green light (spawn_overlay_build
     // itself re-checks every committer, so this can never read a mid-write generation).
@@ -403,9 +544,13 @@ impl Server {
         match overlay.apply_and_link_probed_persisting(probe, prior, self.index_dir.clone()) {
           Ok((kg, pending)) => {
             let stale = overlay.dead_row_fraction() > 0.5;
+            let churn = overlay.take_eid_churn();
             self.kg = Some(kg);
             self.kg_dir = None;
             self.persisting = Some(std::thread::spawn(move || pending.persist()));
+            if !(churn.0.is_empty() && churn.1.is_empty()) {
+              self.spawn_live_ann_update(vec![churn]);
+            }
             if stale {
               vorpal_kg::phase_stamp("overlay: retired (tombstone debt)");
               self.overlay = None;
@@ -481,6 +626,8 @@ impl Server {
             self.persisting = Some(std::thread::spawn(move || pending.persist()));
           } else {
             self.kg_dir = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
+            // Adoption before warm at every kg-servable site — see `reap_persist`.
+            self.spawn_live_ann_adopt();
             self.request_warm();
           }
           self.spawn_overlay_build();
@@ -489,6 +636,7 @@ impl Server {
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         if build.report.reused && self.kg.is_some() {
           self.kg_dir = Some(dir);
+          self.spawn_live_ann_adopt();
           self.request_warm();
           self.spawn_overlay_build();
           return Ok(());
@@ -497,6 +645,7 @@ impl Server {
           Ok(kg) => {
             self.kg = Some(Arc::new(kg));
             self.kg_dir = Some(dir);
+            self.spawn_live_ann_adopt();
             self.request_warm();
             self.spawn_overlay_build();
             Ok(())
@@ -938,8 +1087,13 @@ impl Server {
         // rendered from the same records (byte-compatible with `search_index_explained`) —
         // agents get ranking provenance by default (§11's "expose which rankers
         // contributed").
-        let records = vorpal_index::search_records_filtered(&self.index_dir, &query, k, &filter)
-          .map_err(|err| err.to_string())?;
+        let records = if let Some(tier) = &self.live_ann {
+          vorpal_kg::phase_stamp("live-ann: semantic pool served by live tier");
+          vorpal_index::search_records_filtered_live(&self.index_dir, &query, k, &filter, tier)
+        } else {
+          vorpal_index::search_records_filtered(&self.index_dir, &query, k, &filter)
+        }
+        .map_err(|err| err.to_string())?;
         let mut text = String::new();
         for hit in &records {
           let mut provenance = format!("id {}", hit.node.id);

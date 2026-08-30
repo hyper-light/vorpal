@@ -230,6 +230,11 @@ impl LiveOverlay {
       })?;
     }
     vorpal_kg::phase_stamp("overlay: build done");
+    // The replay above ran every file through the same apply path live edits use, so the
+    // eid-churn ledger now lists the ENTIRE graph as "added". Churn is defined as change
+    // SINCE the built state — drain the replay's noise so the first live edit hands the
+    // vector tier its own delta, not a 2.3M-row rebuild disguised as an update.
+    let _ = index.take_eid_churn();
     Ok(Self {
       interner,
       index,
@@ -425,6 +430,12 @@ impl LiveOverlay {
       new_products,
     };
     Ok((kg, persist))
+  }
+
+  /// Drain the vector-tier eid churn (removed, added) accumulated by absorbs since the
+  /// last drain — the live ANN tier's per-edit feed.
+  pub fn take_eid_churn(&mut self) -> (Vec<u64>, Vec<u64>) {
+    self.index.take_eid_churn()
   }
 
   /// Tombstoned share of the retained rows — the caller's rebuild-the-overlay trigger

@@ -83,6 +83,11 @@ pub struct RetainedIndex {
   /// referencing file to re-resolve. Values may themselves die later — lookups chase.
   repair: HashMap<u32, u32>,
   pending: PendingScope,
+  /// Vector-tier churn since the last drain: (removed eid-lo halves, added eid-lo halves)
+  /// in apply order — the daemon's live ANN tier consumes these per edit. Import rows are
+  /// excluded from `added` (the tier never embeds wiring), included in `removed` (deleting
+  /// an id the tier never held is a no-op).
+  eid_churn: (Vec<u64>, Vec<u64>),
   /// The persistent symbol table (SUBSECOND.md Phase 3 — the ~69ms-per-link full rebuild
   /// becomes per-name maintenance). Interner brand erased for storage; rebound per link.
   table: Option<vorpal_resolve::RetainedSymbolTable>,
@@ -121,6 +126,7 @@ impl RetainedIndex {
       postings: HashMap::new(),
       repair: HashMap::new(),
       pending: PendingScope::Full,
+      eid_churn: (Vec::new(), Vec::new()),
       table: None,
       table_dirty_names: std::collections::HashSet::new(),
       table_dirty_files: std::collections::HashSet::new(),
@@ -146,6 +152,7 @@ impl RetainedIndex {
       postings: HashMap::new(),
       repair: HashMap::new(),
       pending: PendingScope::Full,
+      eid_churn: (Vec::new(), Vec::new()),
       table: None,
       table_dirty_names: std::collections::HashSet::new(),
       table_dirty_files: std::collections::HashSet::new(),
@@ -188,6 +195,10 @@ impl RetainedIndex {
             .any(|row| self.writer.node_kind(row as usize).map(crate::SymbolKind::tag) == Some(import_tag));
           self.table_dirty_names.extend(names.iter().copied());
           self.table_dirty_files.insert(bits);
+          self
+            .eid_churn
+            .0
+            .extend(self.block_rows(interner, &block).iter().map(|row| row.eid.0));
           if had_imports {
             self.escalate_full();
             self.table_full = true;
@@ -258,6 +269,18 @@ impl RetainedIndex {
         for row in old_rows {
           self.table_dirty_names.insert(row.name_bits);
         }
+      }
+      {
+        let import_tag = crate::SymbolKind::Import.tag();
+        if let Some(old_rows) = &old_rows {
+          self.eid_churn.0.extend(old_rows.iter().map(|row| row.eid.0));
+        }
+        self.eid_churn.1.extend(
+          new_rows
+            .iter()
+            .filter(|row| row.kind_tag != import_tag)
+            .map(|row| row.eid.0),
+        );
       }
       match old_rows {
         Some(old_rows) => match self.diff_blocks(&old_rows, &new_rows) {
@@ -420,6 +443,11 @@ impl RetainedIndex {
     bytes: &[u8],
   ) -> io::Result<()> {
     self.apply_files_parallel(interner, &[(path, bytes)])
+  }
+
+  /// Drain the vector-tier churn accumulated by applies since the last drain.
+  pub fn take_eid_churn(&mut self) -> (Vec<u64>, Vec<u64>) {
+    std::mem::take(&mut self.eid_churn)
   }
 
   /// Alive files currently retained.

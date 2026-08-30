@@ -22,6 +22,8 @@ type Scored = (u32, f32);
 
 pub struct AnnOverlay {
   base: AnnIndex,
+  /// Stable id per base row (overrides `base.ids` — the daemon keys rows by durable eid).
+  base_ids: Vec<u64>,
   padded: usize,
   base_n: usize,
   r: usize,
@@ -45,15 +47,27 @@ impl AnnOverlay {
   /// Adopt a built (or loaded) Vamana-tier index. Returns `None` for flat tiers — at flat
   /// scale the full rebuild is milliseconds and an overlay is pure overhead.
   pub fn adopt(base: AnnIndex) -> Option<Self> {
+    let ids: Vec<u64> = (0..base.len()).map(|row| base.ids[row]).collect();
+    Self::adopt_with_ids(base, ids)
+  }
+
+  /// [`AnnOverlay::adopt`] with the base rows re-keyed by caller-supplied stable ids —
+  /// the daemon's form: the persisted tier's ids are GENERATION-LOCAL node ids, but an
+  /// overlay that outlives edits must key rows by the durable identity (the node eid),
+  /// which survives dense-id renumbering across generations. `ids[row]` replaces
+  /// `base.ids[row]` everywhere: dedup, deletes, and returned pools.
+  pub fn adopt_with_ids(base: AnnIndex, ids: Vec<u64>) -> Option<Self> {
     base.quant.as_ref()?;
     let base_n = base.len();
+    debug_assert_eq!(ids.len(), base_n);
     let padded = base.quant.as_ref().expect("checked").padded();
     let mut id_to_row = std::collections::HashMap::new();
     id_to_row.reserve(base_n);
-    for row in 0..base_n {
-      id_to_row.insert(base.ids[row], row as u32);
+    for (row, &id) in ids.iter().enumerate() {
+      id_to_row.insert(id, row as u32);
     }
     Some(Self {
+      base_ids: ids,
       padded,
       base_n,
       r: VAMANA_R,
@@ -73,6 +87,10 @@ impl AnnOverlay {
 
   pub fn live_len(&self) -> usize {
     self.base_n + self.new_ids.len() - self.dead_count
+  }
+
+  pub fn dead_len(&self) -> usize {
+    self.dead_count
   }
 
   /// Tombstoned fraction of all rows ever present — the caller's compaction trigger.
@@ -123,7 +141,7 @@ impl AnnOverlay {
   #[inline]
   fn id_of(&self, row: u32) -> u64 {
     if (row as usize) < self.base_n {
-      self.base.ids[row as usize]
+      self.base_ids[row as usize]
     } else {
       self.new_ids[row as usize - self.base_n]
     }

@@ -12,6 +12,7 @@
 
 pub mod annfiles;
 pub mod live;
+pub mod live_ann;
 pub mod gendiff;
 pub mod impact;
 pub mod autowarm;
@@ -1218,9 +1219,12 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // would pay the exhaustive fallback until a full re-warm. Hardlinks are safe because ANN
   // artifacts are only ever *replaced* (tmp + rename), never mutated in place: a re-warm in
   // this generation unlinks its name without touching the prior generation's inode. Never
-  // overwrites — a generation that already warmed its own tier keeps it.
+  // overwrites — a generation that already warmed its own tier keeps it. The model
+  // provenance travels with the tier it describes: without it the carried bin reads as
+  // "unverifiable model" and every provenance-gated consumer (freshness, live-tier
+  // adoption) rejects a tier that is in fact reconcilable.
   if *prior != final_dir {
-    for ann_file in ["ann.bin", "ann.files", "ann.stamp"] {
+    for ann_file in ["ann.bin", "ann.files", "ann.model.json", "ann.stamp"] {
       let from = prior.join(ann_file);
       let to = final_dir.join(ann_file);
       if from.exists() && !to.exists() && fs::hard_link(&from, &to).is_err() {
@@ -1298,14 +1302,14 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
 /// necessary-condition semantics, same as every other cache in the pipeline. Hashing the
 /// loaded mapping (never re-reading `nodes.vseg`) pins every freshness decision to the
 /// generation actually in hand.
-fn stamp_of(kg: &Kg) -> u64 {
+pub(crate) fn stamp_of(kg: &Kg) -> u64 {
   xxhash_rust::xxh3::xxh3_64(kg.node_segment_bytes())
 }
 
 /// The vector tier's row set: every non-Import node id, ascending. Import nodes are wiring,
 /// not semantic targets (they stay reachable through the exact-name channel); build and
 /// fallback must agree on this filter or cold results would resurface import noise.
-fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
+pub(crate) fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
   (0..kg.node_count() as u64)
     .filter(|&i| {
       kg.node(NodeId::new(i))
@@ -1316,7 +1320,7 @@ fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
 
 /// Embed node `id`'s parts into `row` — the one embedding recipe (name double-weighted,
 /// signature, file basename) shared by the index build, the cold fallback, and the rerank.
-fn embed_node_into(kg: &Kg, embedder: &LexicalEmbedder, id: u64, row: &mut [f32]) {
+pub(crate) fn embed_node_into(kg: &Kg, embedder: &LexicalEmbedder, id: u64, row: &mut [f32]) {
   if let Some(view) = kg.node(NodeId::new(id)) {
     let basename = view.path.rsplit('/').next().unwrap_or(view.path);
     let parts = [view.name, view.name, view.signature, basename];
@@ -1337,7 +1341,7 @@ pub fn peek_ann_header(index_dir: &Path) -> Option<(usize, u64)> {
 /// deterministic lexical hasher is the offline default; a learned adapter would be selected
 /// here and carry `learned: true` in its persisted provenance — labeled honestly, never
 /// silently swapped (the provenance gate below invalidates the tier on ANY model change).
-fn active_embedder() -> LexicalEmbedder {
+pub(crate) fn active_embedder() -> LexicalEmbedder {
   LexicalEmbedder::default()
 }
 
@@ -1380,7 +1384,7 @@ fn write_model_provenance(index_dir: &Path, provenance: &ModelProvenance) -> io:
 
 /// Whether the persisted vector tier matches `current_stamp` (and this build's format and
 /// embedder shape). Read-only — never blocks on, or triggers, a build.
-fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
+pub(crate) fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
   fs::read(index_dir.join("ann.stamp"))
     .ok()
     .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
@@ -1866,6 +1870,50 @@ pub fn search_records(
   search_records_filtered(index_dir, query, k, &SearchFilter::default())
 }
 
+/// [`search_records_filtered`] with the semantic candidate pool supplied by the daemon's
+/// live ANN tier. Filters, the full-precision rerank, and fusion are the shared path — the
+/// live tier only replaces WHERE the approximate pool came from.
+pub fn search_records_filtered_live(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+  filter: &SearchFilter,
+  tier: &live_ann::LiveAnnTier,
+) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
+  let searcher = cached_searcher(index_dir)?;
+  let pool = (k * 4).max(50);
+  let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
+  let query_vec = active_embedder().embed(query);
+  let semantic_pool = tier.search_ids(&query_vec, take);
+  let ranked = searcher.run_with_semantic_pool(query, k, filter, semantic_pool)?;
+  Ok(hit_records(&searcher.kg, ranked))
+}
+
+/// Map a ranked `(row, score, per-channel ranks)` list into hit records — shared by every
+/// search-records surface.
+fn hit_records(kg: &Kg, ranked: Vec<(u64, f32, Vec<Option<usize>>)>) -> Vec<records::SearchHitRecord> {
+  const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
+  ranked
+    .into_iter()
+    .filter_map(|(row, score, ranks)| {
+      Some(records::SearchHitRecord {
+        node: records::node_record(kg, NodeId::new(row))?,
+        score,
+        channels: CHANNELS
+          .iter()
+          .zip(&ranks)
+          .filter_map(|(&channel, rank)| {
+            rank.map(|rank| records::ChannelRank {
+              channel,
+              rank: rank + 1,
+            })
+          })
+          .collect(),
+      })
+    })
+    .collect()
+}
+
 /// [`search_records`] with structured pre-ranking filters.
 pub fn search_records_filtered(
   index_dir: &Path,
@@ -1875,29 +1923,7 @@ pub fn search_records_filtered(
 ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
   let searcher = cached_searcher(index_dir)?;
   let ranked = searcher.run(query, k, filter)?;
-  let kg = &searcher.kg;
-  const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
-  Ok(
-    ranked
-      .into_iter()
-      .filter_map(|(row, score, ranks)| {
-        Some(records::SearchHitRecord {
-          node: records::node_record(kg, NodeId::new(row))?,
-          score,
-          channels: CHANNELS
-            .iter()
-            .zip(&ranks)
-            .filter_map(|(&channel, rank)| {
-              rank.map(|rank| records::ChannelRank {
-                channel,
-                rank: rank + 1,
-              })
-            })
-            .collect(),
-        })
-      })
-      .collect(),
-  )
+  Ok(hit_records(&searcher.kg, ranked))
 }
 
 fn search_index_impl(
@@ -1959,6 +1985,33 @@ impl Searcher {
     k: usize,
     filter: &SearchFilter,
   ) -> Result<Vec<(u64, f32, Vec<Option<usize>>)>, Box<dyn Error>> {
+    self.run_inner(query, k, filter, None)
+  }
+
+  /// [`Searcher::run`] with the semantic candidate pool SUPPLIED by the caller (the
+  /// daemon's live ANN tier) instead of chosen by the tier dispatch below. Everything
+  /// downstream — filters, the full-precision re-embedding rerank, RRF fusion — is the
+  /// shared path, so a live-tier answer differs from a persisted-tier answer only in
+  /// which approximate pool fed the exact rerank.
+  #[allow(clippy::type_complexity)]
+  pub fn run_with_semantic_pool(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+    semantic_pool: Vec<u64>,
+  ) -> Result<Vec<(u64, f32, Vec<Option<usize>>)>, Box<dyn Error>> {
+    self.run_inner(query, k, filter, Some(semantic_pool))
+  }
+
+  #[allow(clippy::type_complexity)]
+  fn run_inner(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+    supplied_pool: Option<Vec<u64>>,
+  ) -> Result<Vec<(u64, f32, Vec<Option<usize>>)>, Box<dyn Error>> {
     let kg = &self.kg;
     let index_dir = self.generation_dir.as_path();
     let compiled_filter = CompiledSearchFilter::compile(filter)?;
@@ -1979,7 +2032,9 @@ impl Searcher {
   // filtered query overfetches to keep its post-filter pool honest; the exhaustive fallback
   // filters BEFORE scoring and needs no slack.
   let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
-  let candidates: Vec<u64> = if let Some(ann) = &self.ann {
+  let candidates: Vec<u64> = if let Some(supplied) = supplied_pool {
+    supplied
+  } else if let Some(ann) = &self.ann {
     ann
       .search(&query_vec, take)
       .into_iter()

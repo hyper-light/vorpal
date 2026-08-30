@@ -386,6 +386,12 @@ impl AnnIndex {
     }
   }
 
+  /// The stable id stored for `row` — generation-local node ids for tiers built by
+  /// `build_ann`, whatever the caller supplied otherwise.
+  pub fn row_id(&self, row: usize) -> u64 {
+    self.ids[row]
+  }
+
   pub fn len(&self) -> usize {
     self.ids.len()
   }
