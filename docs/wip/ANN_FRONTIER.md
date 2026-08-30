@@ -161,14 +161,38 @@ is load-bearing, the third independent confirmation of that law.
   return tombstones; deterministic replay pinned by test. Kernel-scale probe (2.34M rows):
   insert 184µs, delete 88ns, search(l=80) 140µs, adopt 52ms per generation. A 100-del +
   100-ins edit ≈ **18.5ms CPU vs ~330 CPU-s full rebuild (~18,000×)**. Churn test: 10
-  cycles × 5% delete+insert holds pool recall within ε of start. T3b (daemon wiring:
-  symbol-diff → vector ops in LiveOverlay, serve from AnnOverlay, consolidation triggers +
-  probe cadence + compactor reconciliation) is the next arc; integration points:
-  `crates/index/src/live.rs` absorb/retract paths already carry the per-file node-id
-  diffs, `warm_ann` becomes the compactor, `ann.files` OverlayView retires.
+  cycles × 5% delete+insert holds pool recall within ε of start.
+
+- Tier-3 daemon wiring, T3b — **LANDED** (2f08282, `crates/index/src/live_ann.rs` +
+  mcp/server lifecycle). `LiveAnnTier` re-keys the committed tier by durable eids
+  (node-identity lo-64) so it survives per-generation dense renumbering; per commit the
+  daemon tombstones removed eids and re-embeds added ones from the current graph (the
+  eid-churn ledger in `ingest/retained.rs`; the overlay BUILD's replay churn is drained —
+  it once handed the first edit a 2.3M-row "update"). Serving proposes candidates only
+  (eid → current id, unknown drops); rerank/filters/fusion identical to every tier.
+  Hard-won lifecycle laws, each from a measured failure:
+  * **Stale-tolerant adoption**: on an edited tree a classic warm can never land fresh
+    (bootstrap race, 4 rebuilds/51s observed) — adoption reconciles ANY persisted tier
+    through `ann.files` (remap / sentinel-tombstone / insert), 2.34M rows in ~200ms.
+  * **Provenance travels with the tier**: generation carry-forward must include
+    `ann.model.json` — daemon-committed generations lost it and every provenance-gated
+    consumer rejected reconcilable tiers forever (the "adoption failed every generation"
+    failure).
+  * **A live-ANN task in flight counts as tier-present** for warm suppression: updates
+    OWN the tier while running; treating the window as tier-less fired a full rebuild
+    per edit (527 CPU-s/6 edits observed).
+  * **Adopt-first at every kg-servable site**, warm as fallback: reap-failure requests
+    the warm, a per-generation latch (cleared by reap_warm — warms rewrite in place)
+    bounds attempts; boot warm yields when the tier looks reconcilable.
+  Kernel-scale daemon validation: tier ready 3.2s after first query, ZERO full builds
+  across boot + 6 edit cycles (was 4-6), daemon 19.9 CPU-s/6 cycles (was 496.6 — 25×),
+  per-edit update −145/+115 rows in 130-150ms off the serve path, live-tier semantic
+  search 52ms finding a just-added symbol. Compaction: dead_fraction > 5% retires the
+  tier, the classic warm rebuilds densely, adoption re-keys the fresh tier.
 
 Next up: FastScan-packed SymphonyQG layout as a dedicated branch-scale effort (design
-above), and Tier-3 incremental daemon tier (unblocked, independent of Tier-2).
+above). T3 follow-ups: quality-probe cadence on the live tier (probe machinery exists),
+persistence policy for long-lived overlays (warm-as-compactor already wired).
 
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
