@@ -50,10 +50,15 @@ pub(crate) struct QuantQuery {
 /// natural navigation signposts, and at 8 bits the fidelity gain cannot repay that; see
 /// docs/wip/ANN_FRONTIER.md). Retained as the foundation the 1-bit RaBitQ tier requires:
 /// sign-bit codes are only unbiased estimators AFTER this rotation.
-const ROTATION_SEED: u64 = 0x0517_AC1E_D0_7A7E5;
+// Dead-code allowances: consumed by the 1-bit RaBitQ tier (in progress) and pinned by the
+// rotation_tests module meanwhile; release builds see no callers yet.
+#[allow(dead_code)]
+const ROTATION_SEED: u64 = 0x0051_7AC1_ED07_A7E5;
+#[allow(dead_code)]
 const ROTATION_ROUNDS: usize = 3;
 
 #[inline]
+#[allow(dead_code)]
 fn splitmix64(state: &mut u64) -> u64 {
   *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
   let mut z = *state;
@@ -62,6 +67,7 @@ fn splitmix64(state: &mut u64) -> u64 {
   z ^ (z >> 31)
 }
 
+#[allow(dead_code)]
 fn fht64(block: &mut [f32]) {
   debug_assert_eq!(block.len(), 64);
   let mut h = 1;
@@ -85,6 +91,7 @@ fn fht64(block: &mut [f32]) {
   }
 }
 
+#[allow(dead_code)]
 pub(crate) fn rotate_row(row: &mut [f32]) {
   let d = row.len();
   if d == 0 || d % 64 != 0 {
