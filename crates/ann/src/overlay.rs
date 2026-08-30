@@ -14,7 +14,10 @@
 //! Determinism: no RNG anywhere; fixed iteration orders; ties broken by (distance, id).
 //! Replaying the same op sequence on the same base reproduces the overlay exactly.
 
-use crate::index::{AnnGraphStore, AnnIndex, VAMANA_ALPHA, VAMANA_L_BUILD, VAMANA_R};
+use crate::index::{
+  AnnGraphStore, AnnIndex, BUILD_SEED, CALIBRATION_K, CALIBRATION_PROBES, CALIBRATION_SEARCH_L,
+  VAMANA_ALPHA, VAMANA_L_BUILD, VAMANA_R,
+};
 use crate::qmatrix::{dot_i8, quantize_row};
 
 /// One merged-row candidate: `(row, exact squared distance)`.
@@ -331,6 +334,95 @@ impl AnnOverlay {
     }
   }
 
+  /// Draw a fresh probe set for [`AnnOverlay::pool_recall_probe_with`], or top up an
+  /// existing one: alive `prior` rows are KEPT (recall probes must re-measure the same
+  /// rows over a tier's life — 32 correlated probes carry ±points of set-to-set sampling
+  /// spread, so redrawing per probe would swamp the degradation bar), dead ones are
+  /// replaced from a deterministic seeded stream. Same overlay state + same `prior` →
+  /// same result. Rows are opaque cookies: hold them and pass them back.
+  pub fn refresh_probe_rows(&self, prior: &[u32]) -> Vec<u32> {
+    let total = self.total_rows();
+    let probe_count = CALIBRATION_PROBES.min(self.live_len());
+    let mut probes: Vec<u32> = prior
+      .iter()
+      .copied()
+      .filter(|&row| (row as usize) < total && !self.dead[row as usize])
+      .collect();
+    probes.truncate(probe_count);
+    let mut chosen: std::collections::HashSet<u32> = probes.iter().copied().collect();
+    // The build calibration's selection recipe, distinct salt (independent stream);
+    // bounded attempts keep degenerate states (nearly-all-dead) from spinning.
+    let mut rng = crate::Rng::new(BUILD_SEED ^ 0x5EED_CA11_0B5E_7B02);
+    let mut attempts = 0usize;
+    while probes.len() < probe_count && attempts < total * 4 {
+      attempts += 1;
+      let candidate = rng.below(total) as u32;
+      if !self.dead[candidate as usize] && chosen.insert(candidate) {
+        probes.push(candidate);
+      }
+    }
+    probes
+  }
+
+  /// Measured pool recall of the CURRENT overlay against a pinned probe set — the build
+  /// calibration's exact recipe (exact quantized-domain oracle over the live set, then
+  /// visited-set membership at the production beam shape), so the number is directly
+  /// comparable to the build's `pool_recall` and to earlier probes of the SAME rows.
+  /// Deterministic for a given overlay state and probe set. `None` when nothing is
+  /// measurable (no live probes, or a degenerate live set).
+  ///
+  /// Cost: probes × live-rows exact distances (rayon-parallel over probes) + probes
+  /// beams — background-thread work, never the serve path.
+  pub fn pool_recall_probe_with(&self, probes: &[u32]) -> Option<f64> {
+    let total = self.total_rows();
+    if self.live_len() < 2 {
+      return None;
+    }
+    use rayon::prelude::*;
+    let (hits, want) = probes
+      .par_iter()
+      .filter(|&&probe| (probe as usize) < total && !self.dead[probe as usize])
+      .map(|&probe| {
+        // Exact quantized top-K over the live set (probe excluded, ties by row — the
+        // build oracle's ordering), then the production-shaped beam.
+        let mut best: Vec<(f32, u32)> = Vec::with_capacity(CALIBRATION_K + 1);
+        for row in 0..total as u32 {
+          if row == probe || self.dead[row as usize] {
+            continue;
+          }
+          let key = (self.dist_pair(probe, row), row);
+          if best.len() < CALIBRATION_K {
+            let at = best.partition_point(|entry| *entry < key);
+            best.insert(at, key);
+          } else if key < *best.last().expect("k > 0") {
+            let at = best.partition_point(|entry| *entry < key);
+            best.insert(at, key);
+            best.pop();
+          }
+        }
+        let visited = self.beam(
+          self.codes_of(probe),
+          self.scale_of(probe),
+          self.snorm_of(probe),
+          CALIBRATION_SEARCH_L.min(total),
+        );
+        let pool: std::collections::HashSet<u32> = visited.iter().map(|&(v, _)| v).collect();
+        let hit = best.iter().filter(|(_, row)| pool.contains(row)).count();
+        (hit, best.len())
+      })
+      .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    if want == 0 {
+      return None;
+    }
+    Some(hits as f64 / want as f64)
+  }
+
+  /// [`AnnOverlay::pool_recall_probe_with`] over a freshly drawn set — the one-shot form
+  /// for tools and tests; long-lived tiers pin the set and refresh it instead.
+  pub fn pool_recall_probe(&self) -> Option<f64> {
+    self.pool_recall_probe_with(&self.refresh_probe_rows(&[]))
+  }
+
   /// The live visited pool for `query`, exact distances, sorted (distance, id-row) — the
   /// caller reranks/fuses exactly as with the base tier. Tombstoned rows never appear.
   pub fn search_pool(&self, query: &[f32], l: usize) -> Vec<(u64, f32)> {
@@ -465,6 +557,70 @@ mod tests {
       overlay.search_pool(&probe, 64)
     };
     assert_eq!(run(), run(), "same ops on same base must reproduce exactly");
+  }
+
+  #[test]
+  fn recall_probe_is_deterministic_and_survives_churn() {
+    let (base, _) = build_base(3000);
+    let mut overlay = AnnOverlay::adopt(base).expect("vamana tier");
+    let baseline = overlay.pool_recall_probe().expect("measurable");
+    assert_eq!(
+      overlay.pool_recall_probe(),
+      Some(baseline),
+      "same state must probe to the same value"
+    );
+    assert!(baseline > 0.85, "adopted-base probe sanity: {baseline}");
+
+    // The churn pattern of `churn_preserves_pool_recall_and_hides_tombstones`, judged by
+    // the runtime probe instead of the f32 test oracle — the two metrics must agree that
+    // recall holds (same 0.05 test-stability bound).
+    let mut live: Vec<u64> = (0..3000).collect();
+    let mut next_id = 3000u64;
+    for cycle in 0..10u64 {
+      for k in 0..150u64 {
+        let victim = live[((cycle * 977 + k * 131) as usize * 7919) % live.len()];
+        overlay.delete(victim);
+        live.retain(|id| *id != victim);
+      }
+      for _ in 0..150 {
+        overlay.insert(next_id, &vector_for(next_id, DIM));
+        live.push(next_id);
+        next_id += 1;
+      }
+    }
+    let end = overlay.pool_recall_probe().expect("still measurable");
+    assert!(
+      end >= baseline - 0.05,
+      "probe says recall decayed under churn: {baseline} -> {end}"
+    );
+  }
+
+  #[test]
+  fn probe_set_pins_alive_rows_and_replaces_dead_deterministically() {
+    let (base, _) = build_base(3000);
+    let mut overlay = AnnOverlay::adopt(base).expect("vamana tier");
+    let pinned = overlay.refresh_probe_rows(&[]);
+    assert_eq!(pinned.len(), 32);
+    assert_eq!(pinned, overlay.refresh_probe_rows(&pinned), "no churn -> identical set");
+
+    // Kill two probe rows: refresh must keep every survivor (order too) and top up with
+    // deterministic replacements.
+    overlay.delete(pinned[3] as u64); // base rows: id == row for this fixture
+    overlay.delete(pinned[17] as u64);
+    let refreshed = overlay.refresh_probe_rows(&pinned);
+    assert_eq!(refreshed.len(), 32);
+    let survivors: Vec<u32> =
+      pinned.iter().copied().filter(|r| *r != pinned[3] && *r != pinned[17]).collect();
+    assert_eq!(&refreshed[..30], survivors.as_slice(), "alive rows keep their order");
+    assert!(!refreshed.contains(&pinned[3]) && !refreshed.contains(&pinned[17]));
+    assert_eq!(
+      refreshed,
+      overlay.refresh_probe_rows(&pinned),
+      "replacement draw is deterministic"
+    );
+    // Pinned measurement stays available and sane after the replacement.
+    let measured = overlay.pool_recall_probe_with(&refreshed).expect("measurable");
+    assert!(measured > 0.85, "pinned-set probe sanity: {measured}");
   }
 
   #[test]

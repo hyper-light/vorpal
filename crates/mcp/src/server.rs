@@ -115,6 +115,9 @@ pub struct Server {
   /// The generation an adopt already failed against — never retry the same one (the next
   /// commit changes the generation and clears the latch).
   live_ann_failed_gen: Option<PathBuf>,
+  /// Set when the served graph advances past an in-flight live-ANN task: the reap
+  /// drops that task's result instead of installing a tier keyed to a retired graph.
+  live_ann_discard_task: bool,
 }
 
 /// The live overlay is on by default; `VORPAL_NO_LIVE_OVERLAY=1` (or `true`/`yes`) keeps the
@@ -203,7 +206,25 @@ impl Server {
       live_ann_task: None,
       pending_churn: Vec::new(),
       live_ann_failed_gen: None,
+      live_ann_discard_task: false,
       watch,
+    }
+  }
+
+  /// Retire the live tier because the served graph advanced WITHOUT an eid-churn ledger
+  /// (replay-pipeline commits): its id translations and edited-symbol vectors are stale
+  /// against the new graph, and no later signal would ever resync them. An in-flight
+  /// live-ANN task computed against the old graph, so its result is discarded on reap;
+  /// queued churn is superseded by the fresh adoption's reconciliation.
+  fn retire_live_ann_for_resync(&mut self) {
+    if self.live_ann.is_none() && self.live_ann_task.is_none() {
+      return;
+    }
+    vorpal_kg::phase_stamp("live-ann: retiring tier (graph advanced without churn ledger)");
+    self.live_ann = None;
+    self.pending_churn.clear();
+    if self.live_ann_task.is_some() {
+      self.live_ann_discard_task = true;
     }
   }
 
@@ -214,7 +235,14 @@ impl Server {
       return;
     }
     if let Some(handle) = self.live_ann_task.take() {
-      self.live_ann = handle.join().ok().flatten();
+      let joined = handle.join().ok().flatten();
+      if std::mem::take(&mut self.live_ann_discard_task) {
+        // The graph this task computed against is no longer the served one — drop the
+        // result; the commit that retired the tier already queued a fresh adoption.
+        vorpal_kg::phase_stamp("live-ann: discarded stale task result");
+        return;
+      }
+      self.live_ann = joined;
       if self.live_ann.is_some() {
         vorpal_kg::phase_stamp("live-ann: tier ready");
         self.live_ann_failed_gen = None;
@@ -290,6 +318,9 @@ impl Server {
         "live-ann: update done (-{removed_total} +{added_total} rows, {} ms)",
         start.elapsed().as_millis(),
       ));
+      // Quality is measured, not assumed: anchor the baseline on the first update, then
+      // re-probe per churn step; a degraded probe latches the compaction trigger.
+      tier.probe_if_due();
       Some(tier)
     }));
   }
@@ -402,7 +433,7 @@ impl Server {
     // counts as present: an update task briefly OWNS the tier (it travels into the
     // thread), and treating that window as tier-less fired a full rebuild on every edit —
     // the reap reinstalls the tier, or requests this warm itself when the task fails.
-    if self.live_ann.as_ref().is_some_and(|t| t.dead_fraction() <= 0.05)
+    if self.live_ann.as_ref().is_some_and(|t| !t.needs_compaction())
       || self.live_ann_task.is_some()
     {
       return;
@@ -436,9 +467,11 @@ impl Server {
     self.reap_persist(false);
     self.reap_overlay_build();
     self.reap_live_ann();
-    // Compaction trigger: past the tombstone-debt threshold the incremental tier retires
-    // and the classic full warm rebuilds a dense one (re-adopted on the next pass).
-    if self.live_ann.as_ref().is_some_and(|t| t.dead_fraction() > 0.05) {
+    // Compaction trigger: tombstone debt past the ceiling OR measured recall through the
+    // degradation bar — either way the incremental tier retires and the classic full warm
+    // rebuilds a dense one (re-adopted on the next pass).
+    if self.live_ann.as_ref().is_some_and(vorpal_index::live_ann::LiveAnnTier::needs_compaction) {
+      vorpal_kg::phase_stamp("live-ann: retiring tier to compactor");
       self.live_ann = None;
       self.request_warm();
     }
@@ -617,6 +650,12 @@ impl Server {
           // COMPLETE capture absorbs even on the every-64th reconciliation sweep — the
           // sweep insures manifest patching, not capture exactness.
           self.overlay_absorb_or_drop(hints.as_ref());
+          // The replay pipeline produced a NEW sealed graph with no eid-churn ledger:
+          // the live tier's translations and edited-symbol vectors are stale against it,
+          // and nothing downstream would ever resync them. Retire the tier; the
+          // stale-tolerant adopt reconciles a fresh one from the committed generation
+          // (the same primitive that bridges any persisted-tier drift).
+          self.retire_live_ann_for_resync();
           self.kg = Some(kg);
           if let Some(pending) = build.pending {
             // No committed generation for this graph yet: leave `kg_dir` unpinned;
@@ -635,6 +674,8 @@ impl Server {
         }
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
         if build.report.reused && self.kg.is_some() {
+          // Whole-tree reuse: the SAME graph keeps serving — the live tier's
+          // translations are still exact, keep it.
           self.kg_dir = Some(dir);
           self.spawn_live_ann_adopt();
           self.request_warm();
@@ -643,6 +684,9 @@ impl Server {
         }
         match Kg::load(&dir) {
           Ok(kg) => {
+            // A synchronously committed generation replaces the served graph — same
+            // staleness argument as the live-build branch above.
+            self.retire_live_ann_for_resync();
             self.kg = Some(Arc::new(kg));
             self.kg_dir = Some(dir);
             self.spawn_live_ann_adopt();

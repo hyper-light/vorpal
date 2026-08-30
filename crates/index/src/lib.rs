@@ -1245,7 +1245,13 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // "unverifiable model" and every provenance-gated consumer (freshness, live-tier
   // adoption) rejects a tier that is in fact reconcilable.
   if *prior != final_dir {
-    for ann_file in ["ann.bin", "ann.files", "ann.model.json", "ann.stamp"] {
+    for ann_file in [
+      "ann.bin",
+      "ann.files",
+      "ann.model.json",
+      "ann.calibration.json",
+      "ann.stamp",
+    ] {
       let from = prior.join(ann_file);
       let to = final_dir.join(ann_file);
       if from.exists() && !to.exists() && fs::hard_link(&from, &to).is_err() {

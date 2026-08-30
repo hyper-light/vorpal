@@ -29,10 +29,31 @@ fn eid_lo_of(kg: &Kg, id: u64) -> Option<u64> {
   external_id.map(|eid| eid as u64)
 }
 
+/// Probe cadence: re-measure after this fraction of live rows has churned since the last
+/// measurement — 1/100 gives five probe points across the 5% tombstone-debt compaction
+/// window (monitoring resolution tied to the existing trigger, not a tuned constant).
+const PROBE_CHURN_DENOMINATOR: usize = 100;
+/// Degradation bar under the self-anchored baseline: ~3× the probe's own quantization
+/// step (32 probes × k=10 → 1/320 per oracle entry), so a trip is beyond probe-set drift.
+/// Recall at or below `baseline − PROBE_DEGRADATION` retires the tier to the compactor.
+const PROBE_DEGRADATION: f64 = 0.01;
+
 pub struct LiveAnnTier {
   overlay: AnnOverlay,
   /// eid_lo → node id in the generation `refresh_ids` last saw — the pool translation.
   eid_to_id: HashMap<u64, u64>,
+  /// First probe of this adopted tier — the self-anchored recall reference (same probe
+  /// machinery, same quantized domain, so later probes are directly comparable).
+  baseline_recall: Option<f64>,
+  /// The PINNED probe rows: recall is re-measured on the same rows across the tier's
+  /// life (dead ones replaced deterministically), because 32 correlated probes carry
+  /// ±points of set-to-set sampling spread — redrawing per probe would swamp the bar.
+  probe_rows: Vec<u32>,
+  /// Rows churned (tombstoned + inserted) since the last probe.
+  rows_since_probe: usize,
+  /// Latched by a probe at or below the degradation bar; the daemon's compaction trigger
+  /// reads it through [`LiveAnnTier::needs_compaction`].
+  degraded: bool,
 }
 
 impl LiveAnnTier {
@@ -81,6 +102,10 @@ impl LiveAnnTier {
     let mut tier = Self {
       overlay,
       eid_to_id: HashMap::new(),
+      baseline_recall: None,
+      probe_rows: Vec::new(),
+      rows_since_probe: 0,
+      degraded: false,
     };
     for sentinel in dead_sentinels {
       tier.overlay.delete(sentinel);
@@ -131,6 +156,46 @@ impl LiveAnnTier {
       embed_node_into(kg, &embedder, id, &mut row);
       self.overlay.insert(eid, &row);
     }
+    self.rows_since_probe += removed_eids.len() + added_eids.len();
+  }
+
+  /// Run the recall probe when due — after adoption (anchoring the baseline) and then per
+  /// [`PROBE_CHURN_DENOMINATOR`] of live-row churn. Background-thread work (the daemon
+  /// calls this from the same task that applied the churn); a probe at or below
+  /// `baseline − PROBE_DEGRADATION` latches [`LiveAnnTier::needs_compaction`]. Stamps the
+  /// measurement either way — the tier's quality is a number, not a hope.
+  pub fn probe_if_due(&mut self) {
+    let due = self.baseline_recall.is_none()
+      || self.rows_since_probe * PROBE_CHURN_DENOMINATOR >= self.overlay.live_len().max(1);
+    if self.degraded || !due {
+      return;
+    }
+    let start = std::time::Instant::now();
+    // Pinned probe set: keep alive rows, deterministically replace dead ones — the same
+    // rows are re-measured across the tier's life so probes compare like with like.
+    let refreshed = self.overlay.refresh_probe_rows(&self.probe_rows);
+    let Some(measured) = self.overlay.pool_recall_probe_with(&refreshed) else {
+      return; // too small to measure — flat-scale tiers never reach here in practice
+    };
+    self.probe_rows = refreshed;
+    self.rows_since_probe = 0;
+    let baseline = *self.baseline_recall.get_or_insert(measured);
+    if measured <= baseline - PROBE_DEGRADATION {
+      self.degraded = true;
+    }
+    vorpal_kg::phase_stamp(&format!(
+      "live-ann: recall probe {measured:.4} (baseline {baseline:.4}, {} live, {:.2}% dead, {} ms){}",
+      self.overlay.live_len(),
+      self.overlay.dead_fraction() * 100.0,
+      start.elapsed().as_millis(),
+      if self.degraded { " — DEGRADED, retiring to compactor" } else { "" },
+    ));
+  }
+
+  /// The daemon's compaction trigger: tombstone debt past the 5% ceiling, or measured
+  /// recall through the degradation bar — either retires this tier to the classic warm.
+  pub fn needs_compaction(&self) -> bool {
+    self.degraded || self.overlay.dead_fraction() > 0.05
   }
 
   /// The semantic candidate pool for `query_vec`, translated to CURRENT-generation node

@@ -40,7 +40,7 @@ impl AnnConfig {
 
 pub(crate) const VAMANA_R: usize = 32;
 pub(crate) const VAMANA_ALPHA: f32 = 1.2;
-const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+pub(crate) const BUILD_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 pub(crate) const VAMANA_L_BUILD: usize = 48;
 
@@ -57,15 +57,15 @@ pub(crate) const VAMANA_L_BUILD: usize = 48;
 // and a per-corpus honesty stamp today.
 //
 /// Seeded probe count (distinct rows whose own vectors serve as queries).
-const CALIBRATION_PROBES: usize = 32;
+pub(crate) const CALIBRATION_PROBES: usize = 32;
 /// Oracle depth — matches the default user k.
-const CALIBRATION_K: usize = 10;
+pub(crate) const CALIBRATION_K: usize = 10;
 /// The beam the *production* search runs for k = 10 with no filter: the rerank pool is
 /// (k·4).max(50) = 50, the tier fetch is pool·2 = 100, and the search beam is
 /// (take · default beam multiplier 2).clamp(64, n) = 200. Calibration measures at that
 /// contract with the DEFAULT multiplier regardless of the VORPAL_ANN_BEAM override, so the
 /// chosen rung never depends on the environment.
-const CALIBRATION_SEARCH_L: usize = 200;
+pub(crate) const CALIBRATION_SEARCH_L: usize = 200;
 /// "ANN5" — v2 moved the Vamana tier's vectors to per-row-scaled i8 codes (4× smaller,
 /// integer-exact distances; flat tiers still store f32); v3 dropped Import nodes from the
 /// row set (wiring, not semantic targets); v4 lays the Vamana tier out as aligned sections
