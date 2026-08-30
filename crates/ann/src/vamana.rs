@@ -246,6 +246,126 @@ pub(crate) fn greedy_search(
   visited
 }
 
+/// One bulk-synchronous insertion round: every point in `batch` searches the FROZEN graph
+/// and proposes its pruned out-neighborhood; forward edges swap in; back-edges transpose by
+/// counting scatter; each touched target merge-prunes once. Proposals are a pure function
+/// of the graph state at round start, so thread count cannot change the outcome. With
+/// `include_existing`, a point's current out-edges join its candidate pool — the refinement
+/// pass's guarantee that re-pruning never silently drops an edge the fresh search missed.
+#[allow(clippy::too_many_arguments)]
+fn run_round(
+  matrix: &QuantMatrix,
+  params: &BuildParams,
+  alpha: f32,
+  medoid: u32,
+  flat: &mut Vec<u32>,
+  lens: &mut Vec<u8>,
+  counts: &mut [u32],
+  offsets: &mut [u32],
+  cursors: &mut [u32],
+  stamp_pool: &std::sync::Mutex<Vec<VisitStamps>>,
+  batch: &[u32],
+  include_existing: bool,
+) {
+  let n = lens.len();
+  let threads = rayon::current_num_threads().max(1);
+  let chunk = batch.len().div_ceil(threads * 4).max(1);
+  let proposals: Vec<(u32, Vec<u32>)> = batch
+    .par_chunks(chunk)
+    .flat_map_iter(|points| {
+      let mut stamps = stamp_pool
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop()
+        .unwrap_or_else(|| VisitStamps::new(n));
+      let mut out = Vec::with_capacity(points.len());
+      for &p in points {
+        let visited = greedy_search(
+          &Adjacency::FlatCap {
+            flat,
+            lens,
+            cap: params.r,
+          },
+          medoid,
+          params.l_build,
+          &mut stamps,
+          |x| matrix.dist_sq(x, p),
+          |x| matrix.prefetch_row(x),
+        );
+        let mut candidates: Vec<Scored> = visited.into_iter().filter(|&(v, _)| v != p).collect();
+        if include_existing {
+          let at = p as usize * params.r;
+          for &v in &flat[at..at + lens[p as usize] as usize] {
+            candidates.push((v, matrix.dist_sq(v, p)));
+          }
+        }
+        out.push((
+          p,
+          robust_prune(matrix, p, candidates, alpha, params.r, params.l_build),
+        ));
+      }
+      stamp_pool
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(stamps);
+      out
+    })
+    .collect();
+  for (p, pruned) in &proposals {
+    let at = *p as usize * params.r;
+    flat[at..at + pruned.len()].copy_from_slice(pruned);
+    lens[*p as usize] = pruned.len() as u8;
+  }
+  counts[..].fill(0);
+  for (_, pruned) in &proposals {
+    for &b in pruned {
+      counts[b as usize] += 1;
+    }
+  }
+  let mut total = 0u32;
+  for b in 0..n {
+    offsets[b] = total;
+    total += counts[b];
+  }
+  offsets[n] = total;
+  let mut incoming_flat: Vec<u32> = vec![0; total as usize];
+  cursors[..n].copy_from_slice(&offsets[..n]);
+  for (p, pruned) in &proposals {
+    for &b in pruned {
+      let slot = cursors[b as usize];
+      incoming_flat[slot as usize] = *p;
+      cursors[b as usize] = slot + 1;
+    }
+  }
+  let touched: Vec<u32> = (0..n as u32).filter(|&b| counts[b as usize] > 0).collect();
+  let merged: Vec<(u32, Vec<u32>)> = touched
+    .into_par_iter()
+    .map(|b| {
+      let incoming = &incoming_flat[offsets[b as usize] as usize..offsets[b as usize + 1] as usize];
+      let at = b as usize * params.r;
+      let mut neighbors: Vec<u32> = flat[at..at + lens[b as usize] as usize].to_vec();
+      for &p in incoming {
+        if !neighbors.contains(&p) {
+          neighbors.push(p);
+        }
+      }
+      if neighbors.len() > params.r {
+        let scored: Vec<Scored> = neighbors
+          .iter()
+          .map(|&v| (v, matrix.dist_sq(b, v)))
+          .collect();
+        neighbors = robust_prune(matrix, b, scored, alpha, params.r, params.l_build);
+      }
+      (b, neighbors)
+    })
+    .collect();
+  for (b, neighbors) in merged {
+    let at = b as usize * params.r;
+    flat[at..at + neighbors.len()].copy_from_slice(&neighbors);
+    lens[b as usize] = neighbors.len() as u8;
+  }
+}
+
 impl Vamana {
   pub fn build(matrix: &QuantMatrix, params: &BuildParams) -> Self {
     let n = matrix.len();
@@ -300,12 +420,11 @@ impl Vamana {
       BUILD_DIST_EVALS.store(0, Ordering::Relaxed);
       BUILD_EXPANSIONS.store(0, Ordering::Relaxed);
     }
-    let threads = rayon::current_num_threads().max(1);
     // Reused stamp arrays, bounded by in-flight task count; dropped with the build. A fresh
     // zero-filled ~9 MB array per task per round re-faulted its pages on every allocation
     // under immediate-decay jemalloc — ~700k minor faults per kernel-scale build.
     let stamp_pool: std::sync::Mutex<Vec<VisitStamps>> = std::sync::Mutex::new(Vec::new());
-    for alpha in [params.alpha] {
+    {
       // Round-reused transpose scratch (n-sized; zeroed per round — a memset, not an alloc).
       let mut counts: Vec<u32> = vec![0; n];
       let mut offsets: Vec<u32> = vec![0; n + 1];
@@ -313,127 +432,44 @@ impl Vamana {
       let mut start = 0usize;
       let mut round = 1usize;
       while start < n {
-        let batch = &order[start..(start + round).min(n)];
-        // Parallel phase: every point in the round searches the frozen graph and proposes its
-        // pruned out-neighborhood. Nothing mutates, so the proposals are a pure function of
-        // the graph state at round start — thread count cannot change them. Chunking bounds
-        // the per-task stamp scratch to one allocation per in-flight task.
-        let chunk = batch.len().div_ceil(threads * 4).max(1);
-        let proposals: Vec<(u32, Vec<u32>)> = batch
-          .par_chunks(chunk)
-          .flat_map_iter(|points| {
-            let mut stamps = stamp_pool
-              .lock()
-              .unwrap_or_else(|poisoned| poisoned.into_inner())
-              .pop()
-              .unwrap_or_else(|| VisitStamps::new(n));
-            let mut out = Vec::with_capacity(points.len());
-            for &p in points {
-              let visited = greedy_search(
-                &Adjacency::FlatCap {
-                  flat: &flat,
-                  lens: &lens,
-                  cap: params.r,
-                },
-                medoid,
-                params.l_build,
-                &mut stamps,
-                |x| matrix.dist_sq(x, p),
-                |x| matrix.prefetch_row(x),
-              );
-              let candidates: Vec<Scored> = visited.into_iter().filter(|&(v, _)| v != p).collect();
-              out.push((
-                p,
-                robust_prune(matrix, p, candidates, alpha, params.r, params.l_build),
-              ));
-            }
-            stamp_pool
-              .lock()
-              .unwrap_or_else(|poisoned| poisoned.into_inner())
-              .push(stamps);
-            out
-          })
-          .collect();
-        // Merge, still in deterministic batch order but no longer serial: forward edges swap
-        // in first; back-edge additions are grouped per target (preserving batch order within
-        // each target), and then every target runs the exact per-addition push-and-prune loop
-        // the serial build ran — independently, in parallel — before its final list swaps in.
-        for (p, pruned) in &proposals {
-          let at = *p as usize * params.r;
-          flat[at..at + pruned.len()].copy_from_slice(pruned);
-          lens[*p as usize] = pruned.len() as u8;
-        }
-        // Back-edge transpose by counting scatter — no hash map, no per-target Vec, no
-        // sort: count per target, prefix-sum ascending target ids (reproducing the sorted
-        // order the HashMap+sort form produced), then scatter sources in proposal order
-        // (reproducing each target's batch-order incoming list). The previous form pushed
-        // ~n·R entries through a std HashMap single-threaded — the build's measured
-        // serial-merge stall.
-        counts[..].fill(0);
-        for (_, pruned) in &proposals {
-          for &b in pruned {
-            counts[b as usize] += 1;
-          }
-        }
-        let mut total = 0u32;
-        for b in 0..n {
-          offsets[b] = total;
-          total += counts[b];
-        }
-        offsets[n] = total;
-        let mut incoming_flat: Vec<u32> = vec![0; total as usize];
-        cursors[..n].copy_from_slice(&offsets[..n]);
-        for (p, pruned) in &proposals {
-          for &b in pruned {
-            let slot = cursors[b as usize];
-            incoming_flat[slot as usize] = *p;
-            cursors[b as usize] = slot + 1;
-          }
-        }
-        let touched: Vec<u32> = (0..n as u32).filter(|&b| counts[b as usize] > 0).collect();
-        // One prune per target per round: additions append in batch order, then a single
-        // robust prune bounds the degree — pruning once over the union keeps the same
-        // α-domination guarantee as pruning per addition, at a fraction of the distance
-        // work (targets in a big round receive many back-edges).
-        let merged: Vec<(u32, Vec<u32>)> = touched
-          .into_par_iter()
-          .map(|b| {
-            let incoming =
-              &incoming_flat[offsets[b as usize] as usize..offsets[b as usize + 1] as usize];
-            let at = b as usize * params.r;
-            let mut neighbors: Vec<u32> = flat[at..at + lens[b as usize] as usize].to_vec();
-            for &p in incoming {
-              if !neighbors.contains(&p) {
-                neighbors.push(p);
-              }
-            }
-            if neighbors.len() > params.r {
-              let scored: Vec<Scored> = neighbors
-                .iter()
-                .map(|&v| (v, matrix.dist_sq(b, v)))
-                .collect();
-              neighbors = robust_prune(matrix, b, scored, alpha, params.r, params.l_build);
-            }
-            (b, neighbors)
-          })
-          .collect();
-        for (b, neighbors) in merged {
-          let at = b as usize * params.r;
-          flat[at..at + neighbors.len()].copy_from_slice(&neighbors);
-          lens[b as usize] = neighbors.len() as u8;
-        }
+        let batch: Vec<u32> = order[start..(start + round).min(n)].to_vec();
+        run_round(
+          matrix,
+          params,
+          params.alpha,
+          medoid,
+          &mut flat,
+          &mut lens,
+          &mut counts,
+          &mut offsets,
+          &mut cursors,
+          &stamp_pool,
+          &batch,
+          false,
+        );
         start += round;
         round *= 2;
       }
-    }
-    if counters_enabled() {
-      use std::sync::atomic::Ordering;
-      crate::trace(&format!(
-        "vamana: {} dist evals, {} expansions ({} points)",
-        BUILD_DIST_EVALS.load(Ordering::Relaxed),
-        BUILD_EXPANSIONS.load(Ordering::Relaxed),
-        n
-      ));
+      // Refinement round (two-pass Vamana; FastKCNA's k-CNA result): every node re-acquires
+      // its candidate pool by searching the FINISHED graph — early-round nodes chose their
+      // edges against a graph that barely existed, and this is the pass that repairs them.
+      // One bulk-synchronous round over ascending ids (deterministic), existing out-edges
+      // included in each pool so re-pruning can only refine, never regress reach.
+      let refine: Vec<u32> = (0..n as u32).collect();
+      run_round(
+        matrix,
+        params,
+        params.alpha,
+        medoid,
+        &mut flat,
+        &mut lens,
+        &mut counts,
+        &mut offsets,
+        &mut cursors,
+        &stamp_pool,
+        &refine,
+        true,
+      );
     }
     // In-coverage repair: a node no other node points at is unreachable by graph traversal
     // (only the medoid is legitimately entered from outside), so its whole neighborhood can
