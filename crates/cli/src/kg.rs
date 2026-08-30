@@ -337,6 +337,16 @@ fn extraction_env_from_project(
       });
     }
   }
+  // languageInjections shape index extraction (C3a) — fold the exact config bytes into the
+  // rules digest so editing an injection rule re-keys products like an outline-rule edit.
+  if !project.language_injections.is_empty() {
+    let yaml = serde_yaml::to_string(&project.language_injections)
+      .context("serializing languageInjections for the extraction identity")?;
+    env.injection_config = Some(vorpal_index::RuleSource {
+      origin: "vorpalconfig.yml#languageInjections".into(),
+      yaml,
+    });
+  }
   if !pattern_only.is_empty() {
     pattern_only.sort_unstable();
     println!(

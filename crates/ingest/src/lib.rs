@@ -39,6 +39,10 @@ pub struct ExtractionEnv {
   /// from the compiled-in canary table. A dynamic language extracting without one is reported
   /// as unverified on every build, never silently trusted.
   pub canaries: Vec<DynamicCanary>,
+  /// The project's `languageInjections` configuration, serialized (C3a): it shapes what the
+  /// index extracts from host files, so its exact bytes fold into the rules digest — editing
+  /// an injection rule re-keys products like editing an outline rule does.
+  pub injection_config: Option<RuleSource>,
 }
 
 /// One dynamic language's extraction canary: `source` is extracted as `path` and must yield at
@@ -56,7 +60,11 @@ impl ExtractionEnv {
   /// The extractor this environment describes. Languages named by the sources must already be
   /// registered — dlopen is the caller's job (a one-shot at startup), never extraction's.
   pub fn extractor(&self) -> Result<OutlineExtractor, String> {
-    OutlineExtractor::with_env(&self.outline_sources, &self.ref_spec_sources)
+    OutlineExtractor::with_env(
+      &self.outline_sources,
+      &self.ref_spec_sources,
+      self.injection_config.as_ref(),
+    )
   }
 
   /// Dynamic languages this environment extracts but does not canary-verify — computed against
@@ -96,8 +104,41 @@ pub use vorpal_resolve::Interner;
 /// supported language. The product-cache replay gate compares this against the digest a cached
 /// product was stamped with, so editing a grammar invalidates exactly its language's products.
 pub fn grammar_digest_for_path(path: &str) -> Option<u64> {
-  vorpal_lang_registry::from_path(std::path::Path::new(path))
-    .and_then(vorpal_lang_registry::grammar_digest)
+  vorpal_lang_registry::from_path(std::path::Path::new(path)).and_then(grammar_generation_for)
+}
+
+/// The grammar-generation identity of `lang` as an extraction HOST (C3a): its own digest,
+/// folded with the digests of every language it can inject (sorted by name — registration
+/// order can never perturb it). A language with no injections keeps its bare digest, so the
+/// 40+ non-host languages' identities are untouched by the injection machinery. The injectable
+/// set is the runtime one (builtin + any registered `languageInjections`); the custom half of
+/// that configuration is additionally folded into the rules digest by the extraction
+/// environment, so editing it re-keys products even though this per-language fold cannot see
+/// which rule changed.
+pub fn grammar_generation_for(lang: SgLang) -> Option<u64> {
+  use vorpal_language::LanguageExt;
+  let base = vorpal_lang_registry::grammar_digest(lang)?;
+  let Some(injectables) = lang.injectable_languages() else {
+    return Some(base);
+  };
+  let mut entries: Vec<(String, u64)> = injectables
+    .iter()
+    .filter_map(|name| name.parse::<SgLang>().ok())
+    .filter_map(|sub| vorpal_lang_registry::grammar_digest(sub).map(|d| (sub.to_string(), d)))
+    .collect();
+  if entries.is_empty() {
+    return Some(base);
+  }
+  entries.sort_unstable();
+  entries.dedup();
+  let mut h = xxhash_rust::xxh3::Xxh3::new();
+  h.update(&base.to_le_bytes());
+  for (name, digest) in &entries {
+    h.update(name.as_bytes());
+    h.update(&[0]);
+    h.update(&digest.to_le_bytes());
+  }
+  Some(h.digest())
 }
 
 /// The full extraction-identity a product is keyed on: its language's grammar generation folded
@@ -123,7 +164,32 @@ pub fn extraction_identity(grammar_digest: u64, rules_digest: u64) -> u64 {
 /// [`grammar_digest_for_path`], only the files whose language actually changed). Sorted-fold
 /// formula (v2): registration order can never perturb it.
 pub fn global_grammar_stamp() -> u64 {
-  vorpal_lang_registry::global_grammar_stamp()
+  let base = vorpal_lang_registry::global_grammar_stamp();
+  // Injection hosts (C3a): a host language's extraction identity folds the grammars it can
+  // inject, so the whole-tree stamp must see that fold too — otherwise turning injections on
+  // (or changing an injected grammar) would leave the fast path serving pre-injection
+  // products until an unrelated edit. Only hosts whose folded identity differs from their
+  // bare digest contribute; for everything else this is exactly the registry stamp.
+  let mut hosts: Vec<(String, u64)> = SgLang::all_langs()
+    .into_iter()
+    .filter_map(|lang| {
+      let bare = vorpal_lang_registry::grammar_digest(lang)?;
+      let generation = grammar_generation_for(lang)?;
+      (generation != bare).then(|| (lang.to_string(), generation))
+    })
+    .collect();
+  if hosts.is_empty() {
+    return base;
+  }
+  hosts.sort_unstable();
+  let mut h = xxhash_rust::xxh3::Xxh3::new();
+  h.update(&base.to_le_bytes());
+  for (name, generation) in &hosts {
+    h.update(name.as_bytes());
+    h.update(&[0]);
+    h.update(&generation.to_le_bytes());
+  }
+  h.digest()
 }
 
 /// Whether `lang` has reference-extraction semantics (calls/imports/types) — pure-structural

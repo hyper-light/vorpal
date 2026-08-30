@@ -161,6 +161,11 @@ const CALL_ROWS: &[(&str, &str, &str)] = &[
     "function helper(x)\n    x\nend\n\nfunction run(x)\n    helper(x)\nend\n",
   ),
   (
+    "html-script",
+    "a.html",
+    "<html><script>\nfunction helper() { return 1 }\nfunction run() { return helper() }\n</script></html>\n",
+  ),
+  (
     "powershell",
     "a.ps1",
     "function helper {\n  1\n}\n\nfunction run {\n  helper\n}\n",

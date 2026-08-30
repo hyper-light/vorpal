@@ -99,6 +99,7 @@ fn dynamic_language_indexes_end_to_end() {
       yaml: jsonx_spec.into(),
     }],
     canaries: vec![],
+    ..Default::default()
   };
 
   // Build 1: both files extract — the dynamic language next to the builtin one.

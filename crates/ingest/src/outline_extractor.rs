@@ -79,7 +79,7 @@ impl OutlineExtractor {
   /// replay-or-parse pass), exactly like editing the bundled rules. Per-language isolation
   /// comes from the grammar half of the identity, not the rules half.
   pub fn with_sources(sources: &[RuleSource]) -> Result<Self, String> {
-    Self::with_env(sources, &[])
+    Self::with_env(sources, &[], None)
   }
 
   /// Extra outline rules AND serialized ref specs (F-M4). The canonical digest stream extends
@@ -91,8 +91,9 @@ impl OutlineExtractor {
   pub fn with_env(
     outline_sources: &[RuleSource],
     ref_spec_sources: &[RuleSource],
+    injection_config: Option<&RuleSource>,
   ) -> Result<Self, String> {
-    if outline_sources.is_empty() && ref_spec_sources.is_empty() {
+    if outline_sources.is_empty() && ref_spec_sources.is_empty() && injection_config.is_none() {
       return Self::new();
     }
     let canonical = |sources: &[RuleSource]| -> Result<Vec<RuleSource>, String> {
@@ -123,6 +124,13 @@ impl OutlineExtractor {
     }
     for source in &ref_specs {
       h.update(b"\x00refspec\x00");
+      h.update(source.origin.as_bytes());
+      h.update(&[0]);
+      h.update(&(source.yaml.len() as u64).to_le_bytes());
+      h.update(source.yaml.as_bytes());
+    }
+    if let Some(source) = injection_config {
+      h.update(b"\x00injections\x00");
       h.update(source.origin.as_bytes());
       h.update(&[0]);
       h.update(&(source.yaml.len() as u64).to_le_bytes());
@@ -269,11 +277,20 @@ impl OutlineExtractor {
     // A language with rules or a spec always has a linked grammar (rule compilation and spec
     // resolution are enablement-gated), so this is total here; `None` would mean a language we
     // cannot stamp an identity for, whose products could never validate — not extractable.
-    let grammar_generation = vorpal_lang_registry::grammar_digest(lang)?;
+    // Host identity folds injectable grammars (C3a) — the same value the replay gate computes.
+    let grammar_generation = crate::grammar_generation_for(lang)?;
     // The parse tree (`grep`) is owned locally; everything extracted is copied into the owned
     // product before it drops. Reference extraction runs even without outline rules (the file
     // node is the only definition span).
     let grep = lang.grep(source);
+    // Injections (C3a): embedded languages parse with tree-sitter included ranges, so every
+    // span below is a host-file byte offset. Hosts without injections pay nothing (the
+    // injectable set is a static `None` for almost every language).
+    let injected = if vorpal_language::LanguageExt::injectable_languages(&lang).is_some() {
+      grep.get_injections(|name| name.parse::<SgLang>().ok())
+    } else {
+      Vec::new()
+    };
     let root = grep.root();
     // Graceful-degradation telemetry (all languages): count the tree-sitter ERROR nodes this
     // parse produced (0 = clean) AND measure the damage — merged error ranges give an honest
@@ -285,7 +302,9 @@ impl OutlineExtractor {
     // overwhelming majority of files) has provably zero ERROR nodes, so we skip the full-tree
     // DFS entirely. When the flag is set we walk exactly as before — a MISSING-only tree (flag
     // set, no ERROR node) still yields `(0, 0, [])`, byte-identical to the ungated result.
-    let (error_nodes, error_bytes, error_spans) = if root.has_error() {
+    let (error_nodes, error_bytes, error_spans) = if root.has_error()
+      || injected.iter().any(|sub| sub.root().has_error())
+    {
       let mut error_ranges: Vec<(u32, u32)> = root
         .dfs()
         .filter(|node| node.is_error())
@@ -294,6 +313,13 @@ impl OutlineExtractor {
           (range.start as u32, range.end as u32)
         })
         .collect();
+      for sub in &injected {
+        let sub_root = sub.root();
+        error_ranges.extend(sub_root.dfs().filter(|node| node.is_error()).map(|node| {
+          let range = node.range();
+          (range.start as u32, range.end as u32)
+        }));
+      }
       let error_nodes = error_ranges.len() as u32;
       error_ranges.sort_unstable();
       let mut merged: Vec<(u32, u32)> = Vec::new();
@@ -309,15 +335,47 @@ impl OutlineExtractor {
     } else {
       (0u32, 0u64, Vec::new())
     };
-    let items: Vec<OutlineItem<'_>> = combined
+    let mut items: Vec<OutlineItem<'_>> = combined
       .map(|c| c.extract(grep.root()).collect())
       .unwrap_or_default();
+    for sub in &injected {
+      let sub_lang = *sub.root().lang();
+      if let Some(sub_combined) = self.by_lang.get(&sub_lang) {
+        items.extend(sub_combined.extract(sub.root()));
+      }
+    }
+    if !injected.is_empty() {
+      // Canonical layout across trees: document order by span. Stable, so equal-start items
+      // keep host-then-injection order. Injection-free files never take this branch — their
+      // product bytes are exactly the single-tree extraction's.
+      items.sort_by_key(|item| {
+        (
+          item.entry.range.byte_offset.start,
+          item.entry.range.byte_offset.end,
+        )
+      });
+    }
 
     let (entities, spans) = local_layout(&items);
 
     let mut raw = Vec::new();
     if let Some(spec) = spec {
       extract_references(grep.root(), spec, &spans, &entities, &mut raw);
+    }
+    for sub in &injected {
+      let sub_lang = *sub.root().lang();
+      if let Some(sub_spec) = self
+        .dynamic_specs
+        .get(&sub_lang)
+        .or_else(|| resolved_ref_spec(sub_lang))
+      {
+        extract_references(sub.root(), sub_spec, &spans, &entities, &mut raw);
+      }
+    }
+    if !injected.is_empty() {
+      // Same canonicalization for references (attribution reads spans, so order is free to
+      // normalize); untouched for injection-free files.
+      raw.sort_by_key(|r| (r.start, r.end));
     }
     // The single ownership point: names/qualifiers rode through extraction as borrows of
     // `source`; they are copied exactly once, here, into the detachable product.
