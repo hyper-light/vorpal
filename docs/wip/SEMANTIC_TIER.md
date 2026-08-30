@@ -1,8 +1,10 @@
 # The high-tier embedding option — evidence-based design
 
-Status: DESIGN, researched (2026-08-30). Nothing here is implemented. Trade-offs are ranked
-on correctness/robustness/performance/efficiency/speed only — implementation complexity is
-explicitly unweighted (owner directive). Owner decision points at the end.
+Status: DESIGNED AND DETERMINED (2026-08-30). Nothing here is implemented yet. Trade-offs
+are ranked on correctness/robustness/performance/efficiency/speed only — implementation
+complexity is explicitly unweighted (owner directive); it is absorbed by the staged plan's
+checks (§4). Determinations in §3; the only remaining owner calls are the Stage-6 trigger
+waiver and the go-ahead to start Stage 0.
 
 The ask: a semantic-quality tier above the deterministic lexical hasher, **owned end to
 end** — our tokenizer, our math, our optimization — and **never an independent download**.
