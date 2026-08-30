@@ -107,6 +107,19 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
   deterministic) as the 1-bit tier's required foundation — sign-bit estimators are only
   unbiased AFTER rotation.
 
+### Scoreboard after the first implementation day (2026-08-30)
+| metric | session start | now |
+|---|---|---|
+| pool recall (l=200, 32 probes) | 0.9125 | **0.9812** |
+| structurally unreachable nodes | 66,257 silently invisible | **0** (repair pass) |
+| vamana build (kernel, 16 cores) | ~8.6s | ~19.5s (refinement round; Tier-2 1-bit tier is the designated claw-back) |
+| determinism | sha-stable | sha-stable + dist-eval/expansion counters as the noise-immune A/B instrument |
+
+Next up (in order): 1-bit RaBitQ traversal tier (build beams + search steering, exact-i8
+admission/prune/rerank; the build claw-back AND the search head-room that converts to more
+pool at iso-latency), then FastScan packing if profiling demands, then Tier-3 incremental
+tier for the daemon.
+
 ### Rejected with cause (recorded so we do not re-litigate)
 - l_build 48→32: pool recall 0.9125→0.7781 measured — quality bar violation.
 - kNN-first wholesale (NN-descent/RNN-descent/HCNNG): 10-16× more distance evals; honest
