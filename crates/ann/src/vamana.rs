@@ -444,6 +444,7 @@ impl Vamana {
       // were gated and REJECTED — the insertion pass's fidelity is load-bearing; see
       // docs/wip/ANN_FRONTIER.md. Insertion and refinement both run at full l_build.
       let l_substrate = params.l_build;
+      let phase_t0 = std::time::Instant::now();
       while start < n {
         let batch: Vec<u32> = order[start..(start + round).min(n)].to_vec();
         run_round(
@@ -464,6 +465,9 @@ impl Vamana {
         start += round;
         round *= 2;
       }
+      if counters_enabled() {
+        crate::trace(&format!("vamana: insertion rounds {:?}", phase_t0.elapsed()));
+      }
       // Refinement round (two-pass Vamana; FastKCNA's k-CNA result): every node re-acquires
       // its candidate pool by searching the FINISHED graph — early-round nodes chose their
       // edges against a graph that barely existed, and this is the pass that repairs them.
@@ -475,7 +479,13 @@ impl Vamana {
       // converges in far fewer expansions.
       const REFINEMENT_PASSES: usize = 2;
       let refine: Vec<u32> = (0..n as u32).collect();
-      for _pass in 0..REFINEMENT_PASSES {
+      // Each pass is ONE frozen bulk-synchronous round over all n. Chunked variants were
+      // gated and rejected (docs/wip/ANN_FRONTIER.md): splitting the pass makes early
+      // chunks' merges see fewer competitors and later chunks see a different graph —
+      // pass-2 cost tripled and recall fell. The frozen-round symmetry (every node
+      // re-evaluated against the SAME complete graph) is load-bearing.
+      for pass in 0..REFINEMENT_PASSES {
+        let pass_t0 = std::time::Instant::now();
         run_round(
           matrix,
           params,
@@ -491,6 +501,9 @@ impl Vamana {
           &refine,
           true,
         );
+        if counters_enabled() {
+          crate::trace(&format!("vamana: refine pass {} {:?}", pass + 1, pass_t0.elapsed()));
+        }
       }
     }
     // In-coverage repair: a node no other node points at is unreachable by graph traversal

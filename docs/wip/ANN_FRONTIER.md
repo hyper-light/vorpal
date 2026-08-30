@@ -112,14 +112,23 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
 |---|---|---|
 | pool recall (l=200, 32 probes) | 0.9125 | **0.9937** (refine×2, saturated: ×3 identical) |
 | structurally unreachable nodes | 66,257 silently invisible | **0** (repair pass) |
-| vamana build (kernel, 16 cores) | ~8.6s | ~21s (second refine pass costs only ~2.4s — the refined graph re-searches itself cheaply) |
+| vamana build (kernel, 16 cores) | ~8.6s | ~21-26s load-dependent; phase telemetry: insertion ~8.4-9.9s, refine-1 ~7.2-7.9s, refine-2 ~7.3-7.6s |
 | determinism | sha-stable | sha-stable + dist-eval/expansion counters as the noise-immune A/B instrument |
+
+CORRECTION (phase telemetry, supersedes the fa9ef31 commit message): refine pass 2 costs
+the SAME as pass 1 (~7.5s), not ~2.4s — the earlier figure was wall-clock variance read as
+mechanism. The +1.25pt from pass 2 is real and saturating (×3 identical), but paid at full
+price. Refinement passes do not get cheaper on refined graphs.
 
 Refinement-cost negatives (all gated, all reverted): warm-start seeding (own out-edges +
 medoid) → 0.9344 AND slower — the medoid APPROACH PATH is the refinement's candidate-
 diversity source, and local seeds evict the medoid from the beam before it expands;
 substrate 2/3·l_build with refine×1 → 0.9281 @13.7s; with refine×2 → 0.9438 @19.1s —
-the insertion pass's fidelity is load-bearing, refinement polishes but does not replace it.
+the insertion pass's fidelity is load-bearing, refinement polishes but does not replace it;
+chunked refine passes (8 sequential frozen chunks) → pass-1 cheaper (7.6s) but recall
+0.9844 and pass-2 stayed expensive — smaller merges see fewer competitors and keep
+different edges: the frozen-round symmetry (every node against the SAME complete graph)
+is load-bearing, the third independent confirmation of that law.
 
 - 1-bit steering, FLAT-SCALAR variant (Tier-2 item 10, first cut): **REJECTED by gate on
   both axes** — build 19.5 → 31-37s AND pool recall 0.9812 → 0.9469 (deterministic, sha
