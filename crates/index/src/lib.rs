@@ -374,6 +374,27 @@ fn build_index_inner(
   hints: Option<&std::collections::HashSet<PathBuf>>,
   live: Option<&mut LiveSlots>,
 ) -> Result<IndexReport, Box<dyn Error>> {
+  // One tree, ONE spelling: canonicalize the root so every producer — CLI argv, daemon
+  // watch root, bindings — keys manifests, pack entries, and node identities (eids hash
+  // the path) identically. Without this a daemon-committed generation (canonical watch
+  // root, e.g. /private/tmp on macOS) and a CLI run of the same tree (verbatim argv,
+  // /tmp) miss every cache lookup and silently re-parse the world on each alternation.
+  // Hints rebase onto the canonical root by prefix swap (pure string op — works for
+  // deleted files, which canonicalize() cannot touch); an unreadable root keeps its
+  // verbatim spelling and the scan below reports the real error.
+  let canonical_src = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+  let rebased_hints: Option<std::collections::HashSet<PathBuf>> =
+    hints.filter(|_| canonical_src != src).map(|set| {
+      set
+        .iter()
+        .map(|hint| match hint.strip_prefix(src) {
+          Ok(rel) => canonical_src.join(rel),
+          Err(_) => hint.clone(),
+        })
+        .collect()
+    });
+  let hints = rebased_hints.as_ref().or(hints);
+  let src = canonical_src.as_path();
   // The build session's string interner (scoped-interner contract, docs/EMBEDDING.md):
   // created here, dropped when this function returns — reclaim is `Drop`, and the `NameId`
   // lifetime brand makes anything holding a session id un-returnable at compile time.
@@ -1792,7 +1813,10 @@ pub fn path_class(path: &str) -> PathClass {
 
 /// The filter compiled for the hot path: kind/lang parsed once, applied per node view.
 struct CompiledSearchFilter<'f> {
-  path_prefix: Option<&'f str>,
+  /// `Cow` because an existing prefix path re-spells to the graph's canonical form at
+  /// compile time (the build canonicalizes its root, so `/tmp/...` filters must meet
+  /// `/private/tmp/...` node paths); a prefix that names nothing stays verbatim.
+  path_prefix: Option<std::borrow::Cow<'f, str>>,
   path_suffix: Option<&'f str>,
   kind: Option<vorpal_kg::SymbolKind>,
   lang: Option<String>,
@@ -1816,8 +1840,26 @@ impl<'f> CompiledSearchFilter<'f> {
       ),
       None => None,
     };
+    let path_prefix = filter.path_prefix.as_deref().map(|prefix| {
+      // Canonicalize a prefix that names a real path (preserving an intentional trailing
+      // slash); partial prefixes cannot resolve and keep their verbatim spelling.
+      match Path::new(prefix).canonicalize() {
+        Ok(canonical) => {
+          let mut spelled = canonical.to_string_lossy().into_owned();
+          if prefix.ends_with('/') && !spelled.ends_with('/') {
+            spelled.push('/');
+          }
+          if spelled == prefix {
+            std::borrow::Cow::Borrowed(prefix)
+          } else {
+            std::borrow::Cow::Owned(spelled)
+          }
+        }
+        Err(_) => std::borrow::Cow::Borrowed(prefix),
+      }
+    });
     Ok(Self {
-      path_prefix: filter.path_prefix.as_deref(),
+      path_prefix,
       path_suffix: filter.path_suffix.as_deref(),
       kind,
       lang,
@@ -1830,8 +1872,8 @@ impl<'f> CompiledSearchFilter<'f> {
     let Some(view) = kg.node(NodeId::new(id)) else {
       return false;
     };
-    if let Some(prefix) = self.path_prefix {
-      if !view.path.starts_with(prefix) {
+    if let Some(prefix) = &self.path_prefix {
+      if !view.path.starts_with(prefix.as_ref()) {
         return false;
       }
     }
