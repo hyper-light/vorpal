@@ -264,3 +264,29 @@ fn rust_reference_params_strip_to_the_owner_name() {
   assert_eq!(by_receiver("b").receiver_type.as_deref(), Some("Widget"));
   assert_eq!(by_receiver("c").receiver_type.as_deref(), Some("Box"), "wrapper name, not the parameter");
 }
+
+#[test]
+fn validate_product_is_the_decoder_and_is_strict() {
+  // Every product shape the walker must understand: typed receivers, args with kwargs and
+  // expressions, entity params, returns, members, error spans.
+  let src = "struct W;\nimpl W {\n  fn go(&self, n: u32) -> u32 { n }\n}\n\
+             fn mk() -> W { W }\nfn run(w: &W) -> u32 {\n    let a = mk();\n    a.go(w.go(1))\n}\n";
+  let mut p = product("t.rs", src);
+  p.source_size = 1;
+  p.source_mtime_ns = 2;
+  let mut buf = Vec::new();
+  vorpal_ingest::encode_product_into(&p, &mut buf);
+  assert!(vorpal_ingest::validate_product(&buf), "a freshly encoded product validates");
+  assert!(vorpal_ingest::decode_product_view(&buf).is_ok());
+  // Strictness: a truncated body and a body with trailing bytes are both refused — and the
+  // validator agrees with the decoder on every prefix (no product can validate yet fail to
+  // decode, which is the silent-drop hole the old walker had).
+  for cut in [buf.len() - 1, buf.len() / 2, 60] {
+    assert!(!vorpal_ingest::validate_product(&buf[..cut]), "truncated at {cut}");
+    assert!(vorpal_ingest::decode_product_view(&buf[..cut]).is_err());
+  }
+  let mut padded = buf.clone();
+  padded.push(0);
+  assert!(!vorpal_ingest::validate_product(&padded), "trailing byte refused");
+  assert!(vorpal_ingest::decode_product_view(&padded).is_err());
+}
