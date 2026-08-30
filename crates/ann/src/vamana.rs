@@ -264,6 +264,7 @@ pub(crate) fn greedy_search(
 fn run_round(
   matrix: &QuantMatrix,
   params: &BuildParams,
+  l_search: usize,
   alpha: f32,
   medoid: u32,
   flat: &mut Vec<u32>,
@@ -295,7 +296,7 @@ fn run_round(
             cap: params.r,
           },
           medoid,
-          params.l_build,
+          l_search,
           &mut stamps,
           |x| matrix.dist_sq(x, p),
           |x| matrix.prefetch_row(x),
@@ -439,11 +440,16 @@ impl Vamana {
       let mut cursors: Vec<u32> = vec![0; n];
       let mut start = 0usize;
       let mut round = 1usize;
+      // Substrate width experiments (2/3·l_build, with one and two refinement passes)
+      // were gated and REJECTED — the insertion pass's fidelity is load-bearing; see
+      // docs/wip/ANN_FRONTIER.md. Insertion and refinement both run at full l_build.
+      let l_substrate = params.l_build;
       while start < n {
         let batch: Vec<u32> = order[start..(start + round).min(n)].to_vec();
         run_round(
           matrix,
           params,
+          l_substrate,
           params.alpha,
           medoid,
           &mut flat,
@@ -463,21 +469,29 @@ impl Vamana {
       // edges against a graph that barely existed, and this is the pass that repairs them.
       // One bulk-synchronous round over ascending ids (deterministic), existing out-edges
       // included in each pool so re-pruning can only refine, never regress reach.
+      // Two passes, measured to saturation on-corpus (0.9812 → 0.9937 → 0.9937; FastKCNA
+      // reports the same ~2-iteration saturation): the SECOND pass costs a fraction of the
+      // first — the once-refined graph navigates so much better that its own re-search
+      // converges in far fewer expansions.
+      const REFINEMENT_PASSES: usize = 2;
       let refine: Vec<u32> = (0..n as u32).collect();
-      run_round(
-        matrix,
-        params,
-        params.alpha,
-        medoid,
-        &mut flat,
-        &mut lens,
-        &mut counts,
-        &mut offsets,
-        &mut cursors,
-        &stamp_pool,
-        &refine,
-        true,
-      );
+      for _pass in 0..REFINEMENT_PASSES {
+        run_round(
+          matrix,
+          params,
+          params.l_build,
+          params.alpha,
+          medoid,
+          &mut flat,
+          &mut lens,
+          &mut counts,
+          &mut offsets,
+          &mut cursors,
+          &stamp_pool,
+          &refine,
+          true,
+        );
+      }
     }
     // In-coverage repair: a node no other node points at is unreachable by graph traversal
     // (only the medoid is legitimately entered from outside), so its whole neighborhood can

@@ -110,10 +110,16 @@ Quality is the bar: pool recall must go UP, never traded away. Byte-deterministi
 ### Scoreboard after the first implementation day (2026-08-30)
 | metric | session start | now |
 |---|---|---|
-| pool recall (l=200, 32 probes) | 0.9125 | **0.9812** |
+| pool recall (l=200, 32 probes) | 0.9125 | **0.9937** (refine×2, saturated: ×3 identical) |
 | structurally unreachable nodes | 66,257 silently invisible | **0** (repair pass) |
-| vamana build (kernel, 16 cores) | ~8.6s | ~19.5s (refinement round; Tier-2 1-bit tier is the designated claw-back) |
+| vamana build (kernel, 16 cores) | ~8.6s | ~21s (second refine pass costs only ~2.4s — the refined graph re-searches itself cheaply) |
 | determinism | sha-stable | sha-stable + dist-eval/expansion counters as the noise-immune A/B instrument |
+
+Refinement-cost negatives (all gated, all reverted): warm-start seeding (own out-edges +
+medoid) → 0.9344 AND slower — the medoid APPROACH PATH is the refinement's candidate-
+diversity source, and local seeds evict the medoid from the beam before it expands;
+substrate 2/3·l_build with refine×1 → 0.9281 @13.7s; with refine×2 → 0.9438 @19.1s —
+the insertion pass's fidelity is load-bearing, refinement polishes but does not replace it.
 
 - 1-bit steering, FLAT-SCALAR variant (Tier-2 item 10, first cut): **REJECTED by gate on
   both axes** — build 19.5 → 31-37s AND pool recall 0.9812 → 0.9469 (deterministic, sha
