@@ -282,11 +282,14 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   three tracks under rayon::join — segment build, in-memory name index straight off the
   gathered name column, edge remap + compaction — critical path = longest track. Kernel
   scoreboard, semantic edit→answer: … → 251 (evidence skip) → 185-207 (table splice) →
-  **157-170ms warm** (parallel tail). Remaining floor ≈ pre-link ~55 (extract/apply ~15,
-  repair scan ~10-15, qualified seed ~10, scope/splice ~5) + longest seal track ~50 +
-  gather 3 + probe/glue ~20. Next levers: Phase-4 file-local ids (kills the full remap +
-  renumber), retained persist (kills the canonicalizer's ~1s background CPU per edit),
-  probe↔overlay shared extraction.
+  **157-170ms warm** (parallel tail), then shared extraction probe (one extraction serves
+  the serve-immediately check AND the overlay absorb) + parallel repair scan →
+  **127-137ms warm, 135ms median on a CLEAN machine** (every earlier number ran under 2-3
+  cores of fseventsd/syspolicyd churn from the disk cleanup; the churn also explained a
+  15s-convergence flake — FSEvents delivery starvation, deadline now 30s). Session arc:
+  1074 → 135ms (8×). Remaining floor ≈ apply/diff ~15 + seed ~10 + longest seal track ~50
+  + probe ~10 + glue. Next levers: Phase-4 file-local ids (kills the remap + renumber),
+  retained persist (kills the canonicalizer's ~1s background CPU per edit).
   Superseded design note (kept for the record): store name/path/
   owner as u32 bits (no interner lifetime), maintain per-name candidate lists through the
   def-postings (rebuild only names defined by edited files, in canonical file order),
