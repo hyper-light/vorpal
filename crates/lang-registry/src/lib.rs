@@ -369,7 +369,7 @@ mod test {
     // Same universe, different construction order: identical after the canonical sort.
     assert_eq!(stamp_of(&a), stamp_of(&b));
     // Any difference in membership, name, or digest moves the stamp.
-    assert_ne!(stamp_of(&a), stamp_of(&a[..1].to_vec()));
+    assert_ne!(stamp_of(&a), stamp_of(&a[..1]));
     let renamed = vec![("go".to_string(), 7u64), ("ruby".to_string(), 9u64)];
     assert_ne!(stamp_of(&a), stamp_of(&renamed));
     let redigested = vec![("go".to_string(), 7u64), ("rust".to_string(), 10u64)];
