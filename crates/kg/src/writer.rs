@@ -576,16 +576,15 @@ impl KgWriter {
       out
     }
 
-    // Heap: block-concat in canonical order. Offsets rebase per block by the delta between
-    // the block's old heap base and its new one — within a block every offset is
-    // block-relative-stable (absorb rebased them uniformly when the block landed).
+    // Heap deltas first (serial prefix sums), then every gather — 13 columns and the heap
+    // bytes — fans out in parallel: each is an independent pure copy, and the serial form
+    // left this ~memcpy phase on one core (~45ms at kernel scale).
     let heap_total: usize = blocks.iter().map(|b| (b.heap.end - b.heap.start) as usize).sum();
-    let mut new_heap = Vec::with_capacity(heap_total);
     let mut heap_delta = Vec::with_capacity(blocks.len());
+    let mut heap_cursor = 0i64;
     for block in blocks {
-      heap_delta.push(new_heap.len() as i64 - block.heap.start as i64);
-      new_heap
-        .extend_from_slice(&self.heap.bytes()[block.heap.start as usize..block.heap.end as usize]);
+      heap_delta.push(heap_cursor - block.heap.start as i64);
+      heap_cursor += (block.heap.end - block.heap.start) as i64;
     }
     let gather_off = |col: &[u32]| -> Vec<u32> {
       let mut out = Vec::with_capacity(total_rows);
@@ -598,20 +597,53 @@ impl KgWriter {
       }
       out
     };
+    let gather_heap = || {
+      let mut out = Vec::with_capacity(heap_total);
+      for block in blocks {
+        out.extend_from_slice(
+          &self.heap.bytes()[block.heap.start as usize..block.heap.end as usize],
+        );
+      }
+      out
+    };
 
-    let kind = gather(&self.kind, blocks, total_rows);
-    let name_off = gather_off(&self.name_off);
-    let name_len = gather(&self.name_len, blocks, total_rows);
-    let path_off = gather_off(&self.path_off);
-    let path_len = gather(&self.path_len, blocks, total_rows);
-    let sig_off = gather_off(&self.sig_off);
-    let sig_len = gather(&self.sig_len, blocks, total_rows);
-    let content_hash = gather(&self.content_hash, blocks, total_rows);
-    let eid_lo = gather(&self.eid_lo, blocks, total_rows);
-    let eid_hi = gather(&self.eid_hi, blocks, total_rows);
-    let flags = gather(&self.flags, blocks, total_rows);
-    let span_start = gather(&self.span_start, blocks, total_rows);
-    let span_end = gather(&self.span_end, blocks, total_rows);
+    let (
+      (((kind, name_off), (name_len, path_off)), ((path_len, sig_off), (sig_len, content_hash))),
+      (((eid_lo, eid_hi), (flags, span_start)), (span_end, new_heap)),
+    ) = rayon::join(
+      || {
+        rayon::join(
+          || {
+            rayon::join(
+              || rayon::join(|| gather(&self.kind, blocks, total_rows), || gather_off(&self.name_off)),
+              || rayon::join(|| gather(&self.name_len, blocks, total_rows), || gather_off(&self.path_off)),
+            )
+          },
+          || {
+            rayon::join(
+              || rayon::join(|| gather(&self.path_len, blocks, total_rows), || gather_off(&self.sig_off)),
+              || {
+                rayon::join(
+                  || gather(&self.sig_len, blocks, total_rows),
+                  || gather(&self.content_hash, blocks, total_rows),
+                )
+              },
+            )
+          },
+        )
+      },
+      || {
+        rayon::join(
+          || {
+            rayon::join(
+              || rayon::join(|| gather(&self.eid_lo, blocks, total_rows), || gather(&self.eid_hi, blocks, total_rows)),
+              || rayon::join(|| gather(&self.flags, blocks, total_rows), || gather(&self.span_start, blocks, total_rows)),
+            )
+          },
+          || rayon::join(|| gather(&self.span_end, blocks, total_rows), gather_heap),
+        )
+      },
+    );
 
     let n = total_rows as u32;
     let nodes = {

@@ -141,10 +141,21 @@ impl RefStore {
     order: impl IntoIterator<Item = u32>,
   ) -> io::Result<StoreRawChunks> {
     self.out.flush()?;
-    let ranges: Vec<Range<u64>> = order
-      .into_iter()
-      .filter_map(|bits| self.files.get(&bits).map(|f| f.records.clone()))
-      .collect();
+    // Coalesce adjacent ranges: files fed in the order they were appended have contiguous
+    // records (the common case — canonical order IS append order for never-edited files),
+    // and per-chunk overhead is per RANGE run, not per file. Without this a 72k-file corpus
+    // feeds ~72k tiny chunks (one per file) instead of ~200 full ones, and the pump's
+    // per-chunk costs dominate resolution.
+    let mut ranges: Vec<Range<u64>> = Vec::new();
+    for bits in order {
+      let Some(file) = self.files.get(&bits) else {
+        continue;
+      };
+      match ranges.last_mut() {
+        Some(last) if last.end == file.records.start => last.end = file.records.end,
+        _ => ranges.push(file.records.clone()),
+      }
+    }
     Ok(StoreRawChunks {
       file: File::open(&self.path)?,
       ranges,
