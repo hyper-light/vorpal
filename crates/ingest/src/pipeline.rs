@@ -2335,6 +2335,7 @@ where
   }
   // The writer has absorbed its last shard: return growth slack before link stacks the
   // table and edge transients on top, and reopen a streamed heap for the link pass's reads.
+  phase_trace("stream: consolidate (shrink + heap finalize)");
   writer.shrink_to_fit();
   writer.finalize_streamed_heap()?;
   Ok((

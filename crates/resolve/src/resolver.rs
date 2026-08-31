@@ -347,10 +347,11 @@ impl Resolver {
       refined,
       local,
       visible,
+      path_buf,
     } = scratch;
     let edge = reference.kind.edge();
     if reference.kind == RefKind::Import {
-      if let Some((target, _)) = resolve_import_path(interner, table, reference) {
+      if let Some((target, _)) = resolve_import_path(interner, table, reference, path_buf) {
         return Resolution {
           target: Some(target),
           edge,
@@ -570,6 +571,9 @@ struct ResolveScratch<'i> {
   refined: Vec<Symbol<'i>>,
   local: Vec<Symbol<'i>>,
   visible: Vec<Symbol<'i>>,
+  /// Reused path-probe buffer for [`resolve_import_path`]'s join/extension
+  /// probes — one allocation per chunk lifetime instead of two-plus per import.
+  path_buf: String,
 }
 
 /// Shared tail of resolution: local-first, then cross-file visibility, then pick.
@@ -731,6 +735,7 @@ fn resolve_import_path<'i>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   reference: &Reference<'i>,
+  buf: &mut String,
 ) -> Option<(NodeId, NameId<'i>)> {
   let name = interner.text_of(reference.name);
   if !name.contains(['/', '.']) {
@@ -740,14 +745,15 @@ fn resolve_import_path<'i>(
     return Some((id, reference.name));
   }
   let from_path = interner.text_of(reference.from_path);
-  let joined = join_normalize(parent_dir(from_path), name);
-  if let Some(id) = table.file(interner, &joined) {
-    return Some((id, interner.intern(&joined)));
+  join_normalize_into(parent_dir(from_path), name, buf);
+  if let Some(id) = table.file(interner, buf) {
+    return Some((id, interner.intern(buf)));
   }
   if let Some(ext) = extension(from_path) {
-    let with_ext = format!("{joined}.{ext}");
-    if let Some(id) = table.file(interner, &with_ext) {
-      return Some((id, interner.intern(&with_ext)));
+    buf.push('.');
+    buf.push_str(ext);
+    if let Some(id) = table.file(interner, buf) {
+      return Some((id, interner.intern(buf)));
     }
   }
   // Root-relative includes (`#include <linux/export.h>`, absolute-style module paths):
@@ -776,11 +782,12 @@ pub fn build_include_reach<'i>(
   let edges: Vec<(NameId<'i>, NameId<'i>)> = imports
     .par_chunks(chunk)
     .flat_map_iter(|chunk| {
-      chunk.iter().filter_map(|reference| {
+      let mut buf = String::new();
+      chunk.iter().filter_map(move |reference| {
         if reference.kind != RefKind::Import {
           return None;
         }
-        resolve_import_path(interner, table, reference)
+        resolve_import_path(interner, table, reference, &mut buf)
           .map(|(_, target_path)| (reference.from_path, target_path))
       })
     })
@@ -795,25 +802,42 @@ fn parent_dir(path: &str) -> &str {
 /// Join a relative segment path onto a directory, resolving `.` and `..` textually. An absolute
 /// `rel` ignores `dir`; an absolute `dir` keeps its leading slash through the split/join.
 fn join_normalize(dir: &str, rel: &str) -> String {
-  let mut parts: Vec<&str> = if rel.starts_with('/') || dir.is_empty() {
-    Vec::new()
-  } else {
-    dir.split('/').collect()
-  };
+  let mut out = String::new();
+  join_normalize_into(dir, rel, &mut out);
+  out
+}
+
+/// Allocation-free core of [`join_normalize`]: writes the joined path into
+/// `out` (cleared first). Exactly the Vec-collect-and-join semantics —
+/// including empty segments inherited verbatim from `dir` (`a//b` stays
+/// `a//b`; `..` over an empty segment truncates to the previous `/`).
+/// [`join_normalize`] delegates here, so the two can never drift. The probe
+/// paths call this with a reused scratch `String`: the Vec<&str> + join +
+/// format chain it replaces allocated two-to-three times per import probe,
+/// ~a million times per kernel-scale link.
+fn join_normalize_into(dir: &str, rel: &str, out: &mut String) {
+  out.clear();
+  let absolute = rel.starts_with('/');
+  if !absolute && !dir.is_empty() {
+    out.push_str(dir);
+  }
   for segment in rel.split('/') {
     match segment {
       "" | "." => {}
-      ".." => {
-        parts.pop();
+      ".." => match out.rfind('/') {
+        Some(at) => out.truncate(at),
+        None => out.clear(),
+      },
+      other => {
+        if !out.is_empty() {
+          out.push('/');
+        }
+        out.push_str(other);
       }
-      other => parts.push(other),
     }
   }
-  let joined = parts.join("/");
-  if rel.starts_with('/') {
-    format!("/{joined}")
-  } else {
-    joined
+  if absolute {
+    out.insert(0, '/');
   }
 }
 

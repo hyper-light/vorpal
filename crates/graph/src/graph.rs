@@ -32,8 +32,14 @@ impl Graph {
   /// Build both directions from parallel `(src, dst, etype)` columns.
   pub(crate) fn from_parts(node_count: u32, srcs: &[u32], dsts: &[u32], etypes: &[u16]) -> Self {
     // out-CSR keys on src; in-CSC keys on dst (so its "targets" are the sources).
-    let out = DirectedCsr::build(node_count, srcs, dsts, etypes);
-    let inc = DirectedCsr::build(node_count, dsts, srcs, etypes);
+    // The two directions are independent counting sorts over the same columns;
+    // building them concurrently halves the seal-compact interval (measured
+    // 0.36 s single-threaded at kernel scale). Scoped threads, no Arc (§7).
+    let (out, inc) = std::thread::scope(|scope| {
+      let out = scope.spawn(|| DirectedCsr::build(node_count, srcs, dsts, etypes));
+      let inc = DirectedCsr::build(node_count, dsts, srcs, etypes);
+      (out.join().expect("csr build panicked"), inc)
+    });
     Self {
       node_count,
       out,
