@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use vorpal_language::{SupportLang, global_grammar_stamp, grammar_info};
+use vorpal_language::{SupportLang, grammar_info};
 
 #[derive(clap::Args)]
 pub struct GrammarsArg {
@@ -37,12 +37,35 @@ pub fn run_grammars(arg: GrammarsArg) -> Result<ExitCode> {
     );
     shown += 1;
   }
+  // Dynamic grammars (registered custom languages), with the digests their products key on —
+  // the same identity surface `vorpal grammars` shows for builtins.
+  for lang in vorpal_lang_registry::SgLang::all_langs() {
+    let vorpal_lang_registry::SgLang::Custom(_) = lang else {
+      continue;
+    };
+    let name = lang.to_string();
+    if let Some(f) = &filter {
+      if name.to_ascii_lowercase() != *f {
+        continue;
+      }
+    }
+    match vorpal_lang_registry::grammar_digest(lang) {
+      Some(digest) => println!("{name:<12} (dynamic, dlopen'd at startup)  {digest:016x}"),
+      None => println!("{name:<12} (dynamic, no digest — grammar not loaded)"),
+    }
+    shown += 1;
+  }
   if let Some(f) = &filter {
     if shown == 0 {
-      return Err(anyhow::anyhow!("no compiled-in grammar named '{f}'"));
+      return Err(anyhow::anyhow!("no compiled-in or registered grammar named '{f}'"));
     }
   } else {
-    println!("\nglobal grammar stamp: {:016x}", global_grammar_stamp());
+    // The registry stamp — the value index manifests actually record — so what this command
+    // prints always matches what the whole-tree fast path compares (dynamic langs included).
+    println!(
+      "\nglobal grammar stamp: {:016x}",
+      vorpal_lang_registry::global_grammar_stamp()
+    );
     println!("provenance (vendored / upstream commit / local patches): docs/UPSTREAM.md");
   }
   Ok(ExitCode::SUCCESS)

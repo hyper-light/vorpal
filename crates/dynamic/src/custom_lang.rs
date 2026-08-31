@@ -22,6 +22,27 @@ pub struct CustomLang {
   pub extensions: Vec<String>,
   /// YAML file containing outline rules for this custom language.
   pub outline_rules: Option<PathBuf>,
+  /// YAML file containing the serialized reference-extraction spec for this custom language
+  /// (calls/imports/types — see vorpal-ingest's `refspec_config`).
+  #[serde(default)]
+  pub ref_spec: Option<PathBuf>,
+  /// Extraction canary: proof this language actually extracts before any index build trusts
+  /// it. Without one the language indexes as best-effort and is reported unverified.
+  #[serde(default)]
+  pub canary: Option<CustomLangCanary>,
+}
+
+/// The canary fixture for a custom language: `source` is extracted as `path` and must yield at
+/// least `minItems` outline items and `minRefs` references.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomLangCanary {
+  pub path: String,
+  pub source: String,
+  #[serde(default)]
+  pub min_items: usize,
+  #[serde(default)]
+  pub min_refs: usize,
 }
 
 impl CustomLang {

@@ -36,6 +36,11 @@ impl From<CustomPyLang> for CustomLang {
       expando_char: c.expando_char,
       extensions: c.extensions,
       outline_rules: None,
+      // The Python registration surface carries no spec or canary yet: the language
+      // registers pattern-only and best-effort — every index build reports it unverified
+      // rather than silently trusting it (see CustomLang::canary).
+      ref_spec: None,
+      canary: None,
     }
   }
 }

@@ -24,7 +24,12 @@ use std::path::Path;
 use vorpal_kg::{EdgeType, FileBlock, Kg, KgWriter};
 use vorpal_resolve::{Confidence, RefStore, Resolver};
 
-use crate::pipeline::{apply_product_view, build_symbol_table_over};
+use crate::pipeline::{
+  ArgJoin, FlowSidecar, ParamTable, apply_product_view_with_args, build_symbol_table_over,
+  join_call_edge,
+};
+
+use crate::pipeline::PairingHandle;
 
 /// One file's resolution outcome, in retained-writer id space: its emitted edges (in
 /// emission order — the canonical-order feed makes that the from-scratch order), its
@@ -103,6 +108,16 @@ pub struct RetainedIndex {
   table_garbage: usize,
   /// Path bits → path string, for canonical ordering and file-node repoints.
   bits_to_path: HashMap<u32, String>,
+  /// Path bits → the file's Route/Channel definition rows `(retained row, name)` — the
+  /// request/route join consumes these per link; a full 2.8M-row definition scan per serve
+  /// was ~70ms at kernel scale for what absorption already knows. Maintained beside the
+  /// flow sidecars: replaced on absorb, dropped on delete.
+  routes: HashMap<u32, Vec<(u32, String)>>,
+  /// Path bits → the file's flow sidecar (G-M3/G-M5/v16/v17) in retained-writer id space:
+  /// call-site args, parameter ledgers, return facts (name-keyed, never rebased), near-clone
+  /// sketches, and request sites. Replaced wholesale on every absorb, dropped on delete —
+  /// the link assembles the same joins the bulk pipeline builds from its spills.
+  flows: HashMap<u32, FlowSidecar>,
   /// Containment watermark: the edge-log length with NO resolution edges appended. The edge
   /// log holds containment ONLY between links (resolution lives in the buckets), so this
   /// tracks the log length after the latest apply.
@@ -133,6 +148,8 @@ impl RetainedIndex {
       table_full: false,
       table_garbage: 0,
       bits_to_path: HashMap::new(),
+      routes: HashMap::new(),
+      flows: HashMap::new(),
       watermark: 0,
     };
     for (path, bytes) in products {
@@ -159,6 +176,8 @@ impl RetainedIndex {
       table_full: false,
       table_garbage: 0,
       bits_to_path: HashMap::new(),
+      routes: HashMap::new(),
+      flows: HashMap::new(),
       watermark: 0,
     })
   }
@@ -206,6 +225,20 @@ impl RetainedIndex {
             self.escalate_scoped(names, bits);
           }
         }
+        // Chain-dependency dirtiness (G-M5): the deleted file's return facts leave the
+        // ledger, re-typing chained calls in OTHER files — dirty those function names so
+        // the postings expansion re-resolves every file referencing them.
+        self.routes.remove(&bits);
+        if let Some(flow) = self.flows.remove(&bits) {
+          let ret_names: Vec<u32> = flow
+            .rets
+            .iter()
+            .map(|rec| interner.intern(&rec.name).to_bits())
+            .collect();
+          if !ret_names.is_empty() {
+            self.escalate_scoped(ret_names, bits);
+          }
+        }
         self.files.remove(path);
         self.store.retract_file(bits);
         self.resolution.remove(&bits);
@@ -225,19 +258,28 @@ impl RetainedIndex {
     batch: &[(&str, &[u8])],
   ) -> io::Result<()> {
     use rayon::prelude::*;
-    let parts: Vec<io::Result<(KgWriter, Vec<vorpal_resolve::Reference<'_>>)>> = batch
+    let parts: Vec<io::Result<(KgWriter, Vec<vorpal_resolve::Reference<'_>>, FlowSidecar)>> =
+      batch
       .par_iter()
       .map(|(path, bytes)| {
         let view = crate::product::decode_product_view(bytes)?;
         let mut writer = KgWriter::new();
         let mut references = Vec::with_capacity(view.refs.len());
-        apply_product_view(interner, path, &view, &mut writer, &mut references);
-        Ok((writer, references))
+        let mut flow = FlowSidecar::default();
+        apply_product_view_with_args(
+          interner,
+          path,
+          &view,
+          &mut writer,
+          &mut references,
+          Some(&mut flow),
+        );
+        Ok((writer, references, flow))
       })
       .collect();
     self.writer.truncate_edges(self.watermark);
     for ((path, _), part) in batch.iter().zip(parts) {
-      let (file_writer, mut references) = part?;
+      let (file_writer, mut references, mut flow) = part?;
       let bits = interner.intern(path).to_bits();
       let old_rows = self
         .files
@@ -249,6 +291,62 @@ impl RetainedIndex {
       let id_base = self.writer.absorb(file_writer);
       for reference in &mut references {
         reference.from = vorpal_kg::NodeId::new(reference.from.raw() + id_base);
+      }
+      // Flow rows rebase by the same base, exactly like the bulk committer's absorb arm;
+      // rets are name-keyed and never rebase.
+      for rec in &mut flow.args {
+        rec.from = vorpal_kg::NodeId::new(rec.from.raw() + id_base);
+      }
+      for rec in &mut flow.params {
+        rec.entity = vorpal_kg::NodeId::new(rec.entity.raw() + id_base);
+      }
+      for rec in &mut flow.sigs {
+        rec.entity = vorpal_kg::NodeId::new(rec.entity.raw() + id_base);
+      }
+      for rec in &mut flow.requests {
+        rec.from = vorpal_kg::NodeId::new(rec.from.raw() + id_base);
+      }
+      // Chain-dependency dirtiness (G-M5): a changed return-type fact re-types chained
+      // calls in OTHER files, and candidate-set diffing cannot see it (the definition row
+      // itself is unchanged). Any rets delta dirties the affected function names; the
+      // postings expansion then re-resolves every file that references them.
+      {
+        let old_rets = self.flows.get(&bits).map(|f| f.rets.as_slice()).unwrap_or(&[]);
+        let mut old_fp: Vec<(&str, &str)> = old_rets
+          .iter()
+          .map(|r| (r.name.as_ref(), r.ret.as_ref()))
+          .collect();
+        let mut new_fp: Vec<(&str, &str)> = flow
+          .rets
+          .iter()
+          .map(|r| (r.name.as_ref(), r.ret.as_ref()))
+          .collect();
+        old_fp.sort_unstable();
+        new_fp.sort_unstable();
+        if old_fp != new_fp {
+          let ret_names: Vec<u32> = old_fp
+            .iter()
+            .chain(new_fp.iter())
+            .map(|(name, _)| interner.intern(name).to_bits())
+            .collect();
+          drop((old_fp, new_fp));
+          self.escalate_scoped(ret_names, bits);
+        }
+      }
+      self.flows.insert(bits, flow);
+      // Route/Channel rows for the request join — collected here where the block is hot.
+      let mut file_routes: Vec<(u32, String)> = Vec::new();
+      for row in rows_start..self.writer.node_count() as u32 {
+        if let Some((_, name, _, kind, _)) = self.writer.definition(row as usize)
+          && matches!(kind, crate::SymbolKind::Route | crate::SymbolKind::Channel)
+        {
+          file_routes.push((row, name.to_string()));
+        }
+      }
+      if file_routes.is_empty() {
+        self.routes.remove(&bits);
+      } else {
+        self.routes.insert(bits, file_routes);
       }
       let block = FileBlock {
         rows: rows_start..self.writer.node_count() as u32,
@@ -450,6 +548,21 @@ impl RetainedIndex {
     std::mem::take(&mut self.eid_churn)
   }
 
+  /// Whether a change set of `changed` files sits inside the scoped-absorb envelope — the
+  /// measured escalation shape the link itself uses (past 64 files AND a quarter of the
+  /// corpus, the streaming pipeline's parallel replay beats per-file absorption; the shape
+  /// is a measured crossover, not a tuned constant — see `link_inner`'s scope decision).
+  /// The daemon's overlay-vs-pipeline routing consults the SAME predicate, so the two
+  /// deciders can never disagree.
+  pub fn within_absorb_budget(&self, changed: usize) -> bool {
+    !(changed > 64 && changed * 4 > self.files.len())
+  }
+
+  /// The file node's retained row for `path` — a block's first row is its file node.
+  pub fn file_node(&self, path: &str) -> Option<u32> {
+    self.files.get(path).map(|block| block.rows.start)
+  }
+
   /// Alive files currently retained.
   pub fn file_count(&self) -> usize {
     self.files.len()
@@ -474,12 +587,16 @@ impl RetainedIndex {
   /// serve path drops evidence on the floor (generation-bound tools read the committed
   /// sidecar), and cloning + remapping ~7M rows costs ~100ms at kernel scale. The buckets
   /// keep their rows, so nothing is lost for a later persist.
+  /// `pre_edges` are the caller-derived edges the bulk pipeline adds BEFORE its link
+  /// (today: co-change `changes_with` pairs, which need the git checkout only the caller
+  /// knows) — in retained-writer id space, in the bulk pipeline's emission order.
   pub fn link_for_serving(
     &mut self,
     interner: &vorpal_resolve::Interner,
     resolver: &Resolver,
+    pre_edges: &[(u32, u32, EdgeType)],
   ) -> io::Result<(Kg, crate::ResolveStats)> {
-    let (kg, stats, _) = self.link_inner(interner, resolver, false)?;
+    let (kg, stats, _, _) = self.link_inner(interner, resolver, false, pre_edges)?;
     Ok((kg, stats))
   }
 
@@ -487,8 +604,14 @@ impl RetainedIndex {
     &mut self,
     interner: &vorpal_resolve::Interner,
     resolver: &Resolver,
-  ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
-    self.link_inner(interner, resolver, true)
+    pre_edges: &[(u32, u32, EdgeType)],
+  ) -> io::Result<(
+    Kg,
+    crate::ResolveStats,
+    Vec<vorpal_kg::EvidenceRow>,
+    Vec<vorpal_kg::DataflowRow>,
+  )> {
+    self.link_inner(interner, resolver, true, pre_edges)
   }
 
   fn link_inner(
@@ -496,7 +619,13 @@ impl RetainedIndex {
     interner: &vorpal_resolve::Interner,
     resolver: &Resolver,
     want_evidence: bool,
-  ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
+    pre_edges: &[(u32, u32, EdgeType)],
+  ) -> io::Result<(
+    Kg,
+    crate::ResolveStats,
+    Vec<vorpal_kg::EvidenceRow>,
+    Vec<vorpal_kg::DataflowRow>,
+  )> {
     self.writer.truncate_edges(self.watermark);
     let blocks: Vec<FileBlock> = self.files.values().cloned().collect();
     // Canonical file order for every order-sensitive consumer below: the same path-sorted
@@ -530,10 +659,10 @@ impl RetainedIndex {
           }
         }
         files.retain(|bits| alive.contains(bits));
-        if files.len() > 64 && files.len() * 4 > self.files.len() {
-          None
-        } else {
+        if self.within_absorb_budget(files.len()) {
           Some(files)
+        } else {
+          None
         }
       }
     };
@@ -700,6 +829,50 @@ impl RetainedIndex {
     } else {
       vorpal_kg::phase_stamp("retained: table maintained");
     }
+    // Chain-return ledger (G-M5), folded from the per-file sidecars in canonical order —
+    // the same fold the bulk link performs over its rets spill. The fold is order-free
+    // (identical facts dedup, disagreements poison symmetrically); canonical order is kept
+    // for legibility.
+    // Near-clone pairing overlaps resolution exactly as the bulk link overlaps it: the
+    // canonical-mapped sketch rows are snapshotted here and the pairing thread runs while
+    // the table maintenance and resolve below proceed; `assemble` joins it. The canonical
+    // LUT is the same block walk the seal performs (and `assemble` asserts they agree).
+    let total_rows: usize = blocks.iter().map(|b| b.rows.len()).sum();
+    let mut pre_lut = vec![u32::MAX; self.writer.node_count()];
+    let mut inverse = Vec::with_capacity(total_rows);
+    let mut next = 0u32;
+    for block in &blocks {
+      for old in block.rows.clone() {
+        pre_lut[old as usize] = next;
+        inverse.push(old);
+        next += 1;
+      }
+    }
+    let pairing = {
+      let mut sig_rows: Vec<crate::similar::SigRow> = Vec::new();
+      for bits in &order {
+        let Some(flow) = self.flows.get(bits) else {
+          continue;
+        };
+        sig_rows.extend(flow.sigs.iter().map(|rec| crate::similar::SigRow {
+          node: pre_lut[rec.entity.raw() as usize] as u64,
+          shingles: rec.shingles,
+          sketch: rec.sketch,
+        }));
+      }
+      (sig_rows.len() > 1).then(|| std::thread::spawn(move || crate::similar::similar_pairs(sig_rows)))
+    };
+    vorpal_kg::phase_stamp("retained: chain build start");
+    let chain = {
+      let mut rows: Vec<(&str, &str)> = Vec::new();
+      for bits in &order {
+        if let Some(flow) = self.flows.get(bits) {
+          rows.extend(flow.rets.iter().map(|rec| (rec.name.as_ref(), rec.ret.as_ref())));
+        }
+      }
+      (!rows.is_empty()).then(|| vorpal_resolve::ChainReturns::build(interner, rows))
+    };
+    vorpal_kg::phase_stamp("retained: chain build done");
     let table = self
       .table
       .as_mut()
@@ -716,6 +889,7 @@ impl RetainedIndex {
         store,
         feed.iter().copied(),
         resolver,
+        chain.as_ref(),
         |edge| {
           let mut resolution = resolution.borrow_mut();
           let bucket = resolution.entry(edge.from_path_bits).or_default();
@@ -770,7 +944,7 @@ impl RetainedIndex {
         },
       )?
     };
-    self.assemble(&blocks, &order, want_evidence)
+    self.assemble(&blocks, &order, want_evidence, pre_edges, pre_lut, inverse, pairing)
   }
 
   /// Heal untouched buckets in place after an edit: edges (and evidence targets) pointing
@@ -847,22 +1021,152 @@ impl RetainedIndex {
   /// in canonical file order — the exact emission order a from-scratch resolve produces —
   /// and remap evidence copies through the seal's id LUT. Buckets stay in writer-id space
   /// (they outlive this link once scoped rederive lands).
+  #[allow(clippy::too_many_arguments)] // the single seal assembly: every input is load-bearing
   fn assemble(
     &mut self,
     blocks: &[FileBlock],
     order: &[u32],
     want_evidence: bool,
-  ) -> io::Result<(Kg, crate::ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
+    pre_edges: &[(u32, u32, EdgeType)],
+    pre_lut: Vec<u32>,
+    inverse: Vec<u32>,
+    pairing: Option<PairingHandle>,
+  ) -> io::Result<(
+    Kg,
+    crate::ResolveStats,
+    Vec<vorpal_kg::EvidenceRow>,
+    Vec<vorpal_kg::DataflowRow>,
+  )> {
     let mut stats = crate::ResolveStats::default();
     for bits in order {
       if let Some(bucket) = self.resolution.get(bits) {
         stats += bucket.stats;
       }
     }
-    let resolution_edges = order.iter().filter_map(|bits| self.resolution.get(bits)).flat_map(|bucket| bucket.edges.iter().copied());
-    let (kg, lut) = self.writer.seal_canonical_with(blocks, resolution_edges);
+    // The remaining flow joins, assembled from the per-file sidecars in canonical order —
+    // the same structures the bulk link loads from its spills; each is a pure function of
+    // its row set (the joins sort internally). The near-clone pairing was spawned before
+    // resolution (canonical-mapped through the same LUT) and is joined below.
+    let mut arg_records = Vec::new();
+    let mut param_rows: Vec<(u64, Box<[Box<str>]>)> = Vec::new();
+    let mut req_rows: Vec<crate::requests::ReqRow> = Vec::new();
+    for bits in order {
+      let Some(flow) = self.flows.get(bits) else {
+        continue;
+      };
+      arg_records.extend(flow.args.iter().map(|rec| crate::pipeline::ArgRec {
+        from: rec.from,
+        span: rec.span,
+        index: rec.index,
+        class: rec.class,
+        has_receiver: rec.has_receiver,
+        expr: rec.expr.clone(),
+        kw: rec.kw.clone(),
+      }));
+      param_rows.extend(
+        flow
+          .params
+          .iter()
+          .map(|rec| (rec.entity.raw(), rec.names.clone())),
+      );
+      req_rows.extend(flow.requests.iter().map(|rec| crate::requests::ReqRow {
+        from: rec.from.raw(),
+        method: rec.method.clone(),
+        path: rec.path.clone(),
+        span: rec.span,
+      }));
+    }
+    vorpal_kg::phase_stamp("retained: ledger gather done");
+    let arg_join = ArgJoin::from_records(arg_records);
+    let param_table = ParamTable::from_rows(param_rows);
+    let (similar_pairs, _similar_report) = match pairing {
+      Some(handle) => handle
+        .join()
+        .map_err(|_| io::Error::other("near-clone pairing thread panicked"))?,
+      None => (Vec::new(), crate::similar::SimilarReport::default()),
+    };
+    vorpal_kg::phase_stamp("retained: similar pairing joined");
+    // Routes from the per-file ledger in canonical order: block-major, row-ascending —
+    // after the LUT this is exactly the ascending-canonical-id sequence the bulk scan yields.
+    let (matched, _request_report) = if req_rows.is_empty() {
+      (crate::requests::MatchedEdges::default(), crate::requests::RequestReport::default())
+    } else {
+      let mut routes: Vec<(u64, String)> = Vec::new();
+      for bits in order {
+        if let Some(file_routes) = self.routes.get(bits) {
+          routes.extend(file_routes.iter().map(|(row, name)| (*row as u64, name.clone())));
+        }
+      }
+      crate::requests::match_requests(&routes, &req_rows)
+    };
+    vorpal_kg::phase_stamp("retained: requests matched");
+    // The resolution stream in the bulk pipeline's exact edge-log order: [pre-link edges
+    // (co-change)] [per-bucket resolution with DATA_FLOWS interleaved at first-pair
+    // occurrence] [near-clone pairs] [request/notify matches]. Log order is part of the
+    // sealed bytes — the CSR build is an insertion-stable counting scatter.
+    let mut stream: Vec<(u32, u32, EdgeType)> =
+      Vec::with_capacity(pre_edges.len() + order.len() * 8);
+    stream.extend_from_slice(pre_edges);
+    let mut flow_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut flows: Vec<vorpal_kg::DataflowRow> = Vec::new();
+    for bits in order {
+      let Some(bucket) = self.resolution.get(bits) else {
+        continue;
+      };
+      // Resolved-outcome evidence rows sit 1:1 with bucket edges in push order — the span
+      // source for the argument join (edges deliberately do not carry spans).
+      let mut spans = bucket
+        .evidence
+        .iter()
+        .filter(|row| matches!(row.outcome, vorpal_kg::EvidenceOutcome::Edge));
+      for &(from, to, etype) in &bucket.edges {
+        stream.push((from, to, etype));
+        let Some(evidence) = spans.next() else {
+          debug_assert!(false, "bucket edge without its evidence row");
+          continue;
+        };
+        debug_assert_eq!(
+          (evidence.from, evidence.to),
+          (from, to),
+          "bucket evidence misaligned with its edge"
+        );
+        if etype.base() == EdgeType::CALLS {
+          join_call_edge(
+            from as u64,
+            to as u64,
+            (evidence.span_start, evidence.span_end),
+            etype.confidence(),
+            &arg_join,
+            &param_table,
+            &mut flow_pairs,
+            &mut flows,
+            |flow_etype| stream.push((from, to, flow_etype)),
+          );
+        }
+      }
+    }
+    for &(a, b, confidence) in &similar_pairs {
+      let label = EdgeType::SIMILAR_TO.with_confidence(confidence);
+      let (ra, rb) = (inverse[a as usize], inverse[b as usize]);
+      stream.push((ra, rb, label));
+      stream.push((rb, ra, label));
+    }
+    for &(from, to, confidence) in &matched.requests {
+      stream.push((from as u32, to as u32, EdgeType::REQUESTS.with_confidence(confidence)));
+    }
+    for &(from, to, confidence) in &matched.notifies {
+      stream.push((from as u32, to as u32, EdgeType::NOTIFIES.with_confidence(confidence)));
+    }
+    drop((arg_join, param_table, flow_pairs));
+    let (kg, lut) = self.writer.seal_canonical_with(blocks, stream.iter().copied());
+    debug_assert_eq!(lut, pre_lut, "assembly LUT must mirror the seal's");
+    // Data-flow rows leave in sealed-id space — dataflow.bin is a committed artifact.
+    for row in &mut flows {
+      row.from = lut[row.from as usize];
+      row.to = lut[row.to as usize];
+    }
     if !want_evidence {
-      return Ok((kg, stats, Vec::new()));
+      return Ok((kg, stats, Vec::new(), flows));
     }
     // Materialize sealed-id evidence copies in parallel per bucket (the saver's canonical
     // total-order sort makes concatenation order irrelevant): ~7M row clones were ~100ms
@@ -898,6 +1202,6 @@ impl RetainedIndex {
     for mut bucket in per_bucket {
       evidence.append(&mut bucket);
     }
-    Ok((kg, stats, evidence))
+    Ok((kg, stats, evidence, flows))
   }
 }

@@ -1,0 +1,78 @@
+id: graphql-type
+language: GraphQL
+role: item
+symbolType: class
+rule:
+  all:
+    - any:
+        - kind: object_type_definition
+        - kind: input_object_type_definition
+    - has:
+        kind: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: graphql-interface
+language: GraphQL
+role: item
+symbolType: interface
+rule:
+  all:
+    - any:
+        - kind: interface_type_definition
+        - kind: union_type_definition
+        - kind: scalar_type_definition
+    - has:
+        kind: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: graphql-enum
+language: GraphQL
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: enum_type_definition
+    - has:
+        kind: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: graphql-field
+language: GraphQL
+role: member
+parentRuleIds: [graphql-type, graphql-interface]
+symbolType: field
+rule:
+  all:
+    - kind: field_definition
+    - has:
+        kind: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: graphql-fragment
+language: GraphQL
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: fragment_definition
+    - has:
+        stopBy: end
+        kind: fragment_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: graphql-operation
+language: GraphQL
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: operation_definition
+    - has:
+        kind: name
+        pattern: $NAME
+name: '$NAME'

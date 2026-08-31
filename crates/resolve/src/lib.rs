@@ -25,7 +25,7 @@ mod table;
 pub use intern::{Interner, NameId};
 pub use reference::{RefForm, RefKind, Reference};
 pub use resolver::{
-  Confidence, MAX_RETAINED_ALTERNATIVES, Resolution, ResolutionGrade, ResolveReason, ResolveStats,
+  ChainReturns, Confidence, MAX_RETAINED_ALTERNATIVES, Resolution, ResolutionGrade, ResolveReason, ResolveStats,
   ResolvedEdge, Resolver, UnresolvedEvidence,
   resolve_all, resolve_all_spilled, resolve_all_spilled_into, resolve_all_store_into, seed_import_bindings,
 };

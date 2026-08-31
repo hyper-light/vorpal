@@ -1,0 +1,151 @@
+=================================================
+simple here-doc
+=================================================
+
+print <<EOF;
+hello
+EOF
+
+---
+
+(source_file
+      (call_expression_with_spaced_args
+        (call_expression_with_bareword
+          (identifier))
+        (arguments
+          (heredoc_initializer
+            (heredoc_start_identifier))))
+      (heredoc_body_statement
+        (heredoc_end_identifier)))
+
+=================================================
+here-doc with interpolation
+=================================================
+
+print <<EOF;
+hello $name
+EOF
+
+---
+
+(source_file
+      (call_expression_with_spaced_args
+        (call_expression_with_bareword
+          (identifier))
+        (arguments
+          (heredoc_initializer
+            (heredoc_start_identifier))))
+      (heredoc_body_statement
+        (interpolation
+          (scalar_variable))
+        (heredoc_end_identifier)))
+
+=================================================
+here-doc with escape sequence
+=================================================
+
+print <<EOF;
+hello $name \n how are you?
+EOF
+
+---
+
+(source_file
+      (call_expression_with_spaced_args
+        (call_expression_with_bareword
+          (identifier))
+        (arguments
+          (heredoc_initializer
+            (heredoc_start_identifier))))
+      (heredoc_body_statement
+        (interpolation
+          (scalar_variable))
+        (escape_sequence)
+        (heredoc_end_identifier)))
+
+=================================================
+here-doc with escaped variables
+=================================================
+
+print <<EOF;
+hello this is a string not a variable \$name
+EOF
+
+---
+
+(source_file
+      (call_expression_with_spaced_args
+        (call_expression_with_bareword
+          (identifier))
+        (arguments
+          (heredoc_initializer
+            (heredoc_start_identifier))))
+      (heredoc_body_statement
+        (heredoc_end_identifier)))
+
+=================================================
+multiple here-doc queued
+=================================================
+
+print(<<EOF, <<MEOW);
+hello
+EOF
+this is the cat
+MEOW
+
+---
+
+(source_file
+      (call_expression_with_args_with_brackets
+        (call_expression_with_bareword
+          (identifier))
+        (array
+          (heredoc_initializer
+            (heredoc_start_identifier))
+          (normal_comma)
+          (heredoc_initializer
+            (heredoc_start_identifier))))
+      (heredoc_body_statement
+        (heredoc_end_identifier))
+      (heredoc_body_statement
+        (heredoc_end_identifier)))
+
+=================================================
+here-doc indented
+=================================================
+
+print <<~EOF;
+hello
+EOF
+
+---
+
+(source_file
+      (call_expression_with_spaced_args
+        (call_expression_with_bareword
+          (identifier))
+        (arguments
+          (heredoc_initializer
+            (heredoc_start_identifier))))
+      (heredoc_body_statement
+        (heredoc_end_identifier)))
+
+=================================================
+here-doc with \ in identifier
+=================================================
+
+print <<\EOF;
+hello
+EOF
+
+---
+
+(source_file
+      (call_expression_with_spaced_args
+        (call_expression_with_bareword
+          (identifier))
+        (arguments
+          (heredoc_initializer
+            (heredoc_start_identifier))))
+      (heredoc_body_statement
+        (heredoc_end_identifier)))

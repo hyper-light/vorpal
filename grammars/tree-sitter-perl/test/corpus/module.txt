@@ -1,0 +1,44 @@
+=================================================
+method invocation 1
+=================================================
+
+my $output = BaseModule::YeaThis->hello('first', {
+  hello => 'beautiful'
+});
+
+---
+
+(source_file
+      (binary_expression
+        (variable_declaration
+          (scope)
+          (scalar_variable))
+        (method_invocation
+          (package_name
+            (identifier)
+            (identifier))
+          (arrow_operator)
+          (identifier)
+          (parenthesized_argument
+            (arguments
+              (string_single_quoted)
+              (normal_comma)
+              (hash_ref
+                (call_expression_with_bareword
+                  (identifier))
+                (fat_comma)
+                (string_single_quoted)))))))
+
+
+=================================================
+method invocation 2
+=================================================
+
+my $output = BaseModule->new();
+
+---
+
+(source_file
+  (binary_expression (variable_declaration (scope) (scalar_variable))
+  (method_invocation (identifier) (arrow_operator) (identifier) (parenthesized_argument))) 
+)

@@ -1,0 +1,64 @@
+{
+  "description": "Self-index graded set (index this repo into target/eval-index first), graded 2026-08-30.",
+  "queries": [
+    {
+      "class": "exact",
+      "query": "rrf_fuse_explained",
+      "relevant": [{ "name": "rrf_fuse_explained", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "commit_generation",
+      "relevant": [{ "name": "commit_generation", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "warm ann",
+      "relevant": [
+        { "name": "warm_ann", "grade": 3 },
+        { "name": "ensure_ann", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "resolve index dir",
+      "relevant": [{ "name": "resolve_index_dir", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "postings",
+      "relevant": [{ "name": "Postings", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "bounded bfs edge budget",
+      "relevant": [{ "name": "bounded_bfs", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "ingest folded stacks",
+      "relevant": [{ "name": "ingest_traces", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "near duplicate code detection",
+      "relevant": [
+        { "name": "similar_pairs", "grade": 3 },
+        { "name": "Sketch", "grade": 1 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "who called what at runtime",
+      "relevant": [
+        { "name": "ObservedStore", "grade": 2 },
+        { "name": "ingest_traces", "grade": 2 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "louvain community size cap",
+      "relevant": [{ "name": "cut", "grade": 3 }]
+    }
+  ]
+}

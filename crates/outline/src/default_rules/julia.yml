@@ -1,0 +1,41 @@
+id: julia-module
+language: Julia
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: module_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: julia-function
+language: Julia
+role: item
+symbolType: function
+rule:
+  all:
+    - any:
+        - kind: function_definition
+        - kind: macro_definition
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+---
+id: julia-struct
+language: Julia
+role: item
+symbolType: struct
+rule:
+  all:
+    - any:
+        - kind: struct_definition
+        - kind: abstract_definition
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'

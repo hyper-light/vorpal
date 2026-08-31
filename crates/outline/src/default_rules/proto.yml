@@ -1,0 +1,65 @@
+id: proto-message
+language: Proto
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: message
+    - has:
+        kind: message_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: proto-enum
+language: Proto
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: enum
+    - has:
+        kind: enum_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: proto-service
+language: Proto
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: service
+    - has:
+        kind: service_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: proto-rpc
+language: Proto
+role: member
+parentRuleIds: [proto-service]
+symbolType: method
+rule:
+  all:
+    - kind: rpc
+    - has:
+        kind: rpc_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: proto-field
+language: Proto
+role: member
+parentRuleIds: [proto-message]
+symbolType: field
+rule:
+  all:
+    - any:
+        - kind: field
+        - kind: map_field
+        - kind: oneof_field
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'

@@ -15,6 +15,9 @@ impl Confidence {
   pub const NONE: Confidence = Confidence(0);
   /// Multiple candidates; the edge is approximate (labeled, not faked).
   pub const AMBIGUOUS: Confidence = Confidence(40);
+  /// Typed-receiver resolution (G-M2): the candidate set was narrowed by the receiver's
+  /// inferred type — stronger than a bare-name pick, weaker than an explicit local binding.
+  pub const TYPE_BOUND: Confidence = Confidence(85);
   /// A single visible exported definition in another file.
   pub const CROSS_FILE: Confidence = Confidence(90);
   /// A single definition in the same file — the strongest binding.
@@ -48,7 +51,9 @@ impl ResolutionGrade {
   pub fn from_confidence(c: Confidence) -> Self {
     if c >= Confidence::LOCAL {
       Self::Exact
-    } else if c >= Confidence::CROSS_FILE {
+    } else if c >= Confidence::TYPE_BOUND {
+      // The constrained floor moved 90 → 85 when TYPE_BOUND landed (G-M0). No existing edge
+      // lives in (40, 90), so no historical label shifts.
       Self::Constrained
     } else if c > Confidence::NONE {
       Self::Heuristic
@@ -94,6 +99,19 @@ pub enum ResolveReason {
   /// of this name resolved to a single corroborated target, and no local definition shadows
   /// it. The strongest cross-file evidence a bare use can carry.
   ImportBound = 8,
+  /// Typed-receiver resolution (G-M2): the receiver's type came from an explicit annotation.
+  ReceiverAnnotated = 9,
+  /// The receiver's type came from a constructor-shaped initializer.
+  ReceiverConstructed = 10,
+  /// The receiver's type came from a typed parameter binding.
+  ReceiverParamTyped = 11,
+  /// The receiver's type came from a typed field on the enclosing type.
+  ReceiverFieldTyped = 12,
+  /// Type narrowing left several candidates; deterministic tie pick (approximate).
+  ReceiverTypedTie = 13,
+  /// Chained-call typing (G-M5): the receiver was bound from a call whose callee's declared
+  /// return type uniquely narrowed the candidates (`let x = make(); x.render()`).
+  ReceiverChained = 14,
 }
 
 impl ResolveReason {
@@ -107,6 +125,12 @@ impl ResolveReason {
       6 => Self::VisibleExport,
       7 => Self::VisibleTie,
       8 => Self::ImportBound,
+      9 => Self::ReceiverAnnotated,
+      10 => Self::ReceiverConstructed,
+      11 => Self::ReceiverParamTyped,
+      12 => Self::ReceiverFieldTyped,
+      13 => Self::ReceiverTypedTie,
+      14 => Self::ReceiverChained,
       _ => Self::None,
     }
   }
@@ -123,7 +147,52 @@ impl ResolveReason {
       Self::VisibleExport => "visible-export",
       Self::VisibleTie => "visible-tie",
       Self::ImportBound => "import-bound",
+      Self::ReceiverAnnotated => "receiver-annotated",
+      Self::ReceiverConstructed => "receiver-constructed",
+      Self::ReceiverParamTyped => "receiver-param-typed",
+      Self::ReceiverFieldTyped => "receiver-field-typed",
+      Self::ReceiverTypedTie => "receiver-typed-tie",
+      Self::ReceiverChained => "receiver-chained",
     }
+  }
+}
+
+/// The chained-call return ledger (G-M5): function name → declared return type, both as
+/// interned ids. Built once at link from the per-file capture rows; a name bound to
+/// DISAGREEING return types across the corpus is poisoned out (absent) — conservative by
+/// design, exactly the receiver-typing discipline.
+pub struct ChainReturns<'i> {
+  map: std::collections::HashMap<NameId<'i>, Option<NameId<'i>>>,
+}
+
+impl<'i> ChainReturns<'i> {
+  pub fn build(
+    interner: &'i Interner,
+    rows: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+  ) -> Self {
+    let mut map: std::collections::HashMap<NameId<'i>, Option<NameId<'i>>> =
+      std::collections::HashMap::new();
+    for (name, ret) in rows {
+      let name = interner.intern(name.as_ref());
+      let ret = interner.intern(ret.as_ref());
+      map
+        .entry(name)
+        .and_modify(|slot| {
+          if *slot != Some(ret) {
+            *slot = None; // disagreement → poisoned, forever
+          }
+        })
+        .or_insert(Some(ret));
+    }
+    Self { map }
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.map.is_empty()
+  }
+
+  pub fn get(&self, name: NameId<'i>) -> Option<NameId<'i>> {
+    *self.map.get(&name)?
   }
 }
 
@@ -216,6 +285,13 @@ impl ResolveStats {
   }
 }
 
+impl ResolveStats {
+  /// Every reference this stats block accounts for, across all four outcomes.
+  pub fn total(&self) -> u64 {
+    self.resolved + self.ambiguous + self.external + self.masked
+  }
+}
+
 impl std::ops::AddAssign for ResolveStats {
   fn add_assign(&mut self, other: ResolveStats) {
     self.resolved += other.resolved;
@@ -251,7 +327,7 @@ impl Resolver {
     table: &SymbolTable<'i>,
     reference: &Reference<'i>,
   ) -> Resolution {
-    self.resolve_with(interner, table, reference, &mut ResolveScratch::default())
+    self.resolve_with(interner, table, reference, &mut ResolveScratch::default(), None)
   }
 
   /// [`Resolver::resolve`] with caller-owned scratch buffers — batch resolution reuses one
@@ -263,6 +339,7 @@ impl Resolver {
     table: &SymbolTable<'i>,
     reference: &Reference<'i>,
     scratch: &mut ResolveScratch<'i>,
+    chain: Option<&ChainReturns<'i>>,
   ) -> Resolution {
     let edge = reference.kind.edge();
     if reference.kind == RefKind::Import {
@@ -352,6 +429,84 @@ impl Resolver {
       }
     }
 
+    // Typed-receiver narrowing (G-M2): the receiver's file-locally bound type refines the
+    // candidate set by OWNER. A hint that upgrades, never vetoes: a type that matches no
+    // in-tree owner (external type, spelling drift) falls through to untyped semantics.
+    if matches!(reference.form, RefForm::Method | RefForm::MethodHinted) {
+      if let Some(receiver_type) = reference.receiver_type {
+        scratch.refined.clear();
+        scratch.refined.extend(
+          candidates
+            .iter()
+            .filter(|s| s.owner == Some(receiver_type))
+            .copied(),
+        );
+        match scratch.refined.len() {
+          0 => {
+            // Chained-call fallback (G-M5): the "type" may really be a CALLEE NAME
+            // (`let x = make()` records `make`). If the corpus-wide return ledger maps it
+            // to exactly one return type that uniquely narrows, that is the edge; any
+            // ambiguity refuses (inference on inference earns no tie picks).
+            if let Some(ret) = chain.and_then(|c| c.get(receiver_type)) {
+              scratch.refined.extend(
+                candidates.iter().filter(|s| s.owner == Some(ret)).copied(),
+              );
+              if scratch.refined.len() == 1 {
+                let target = scratch.refined[0];
+                return Resolution {
+                  target: Some(target.id),
+                  edge,
+                  confidence: Confidence::TYPE_BOUND,
+                  candidates: candidates.len(),
+                  reason: ResolveReason::ReceiverChained,
+                  alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
+                };
+              }
+              scratch.refined.clear();
+            }
+          }
+          1 => {
+            let target = scratch.refined[0];
+            return Resolution {
+              target: Some(target.id),
+              edge,
+              confidence: typed_receiver_confidence(
+                interner,
+                reference,
+                target.path == reference.from_path,
+              ),
+              candidates: candidates.len(),
+              reason: typed_receiver_reason(reference.receiver_type_origin),
+              alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
+            };
+          }
+          _ => {
+            // Several methods on the SAME type (e.g. duplicate impl blocks): genuinely
+            // ambiguous, but the type narrowed the field — a labeled deterministic pick
+            // with the beaten set retained, exactly the QualifiedTie discipline.
+            let target = scratch.refined.first().map(|s| s.id);
+            let mut alts = [0u32; MAX_RETAINED_ALTERNATIVES];
+            let mut alt_count = 0u8;
+            for symbol in scratch.refined.iter() {
+              if Some(symbol.id) == target || (alt_count as usize) >= MAX_RETAINED_ALTERNATIVES {
+                continue;
+              }
+              alts[alt_count as usize] = symbol.id.raw() as u32;
+              alt_count += 1;
+            }
+            return Resolution {
+              target,
+              edge,
+              confidence: Confidence::AMBIGUOUS,
+              candidates: candidates.len(),
+              reason: ResolveReason::ReceiverTypedTie,
+              alternatives: (alts, alt_count),
+            };
+          }
+        }
+      }
+    }
+
     // Bare names may take a labeled approximate pick on a tie; member accesses on untyped
     // values (hinted or not) carry no proof beyond the name, so only a unique match binds.
     let guess_on_tie = !matches!(reference.form, RefForm::Method | RefForm::MethodHinted);
@@ -436,6 +591,36 @@ fn finish<'i>(
 /// that name, or — for static paths only — it is a top-level definition in a module file named
 /// `q` (`util::helper` → `…/util.rs`). Method receivers never module-match: a variable that
 /// happens to share a file's name is coincidence, not namespace evidence.
+/// The confidence a typed-receiver unique match earns. An explicit annotation in a
+/// statically-checked language is compiler-grade evidence — local/cross-file strength; a
+/// constructor-inferred, param-typed, or field-typed binding — and ANY binding in Python,
+/// whose annotations are unenforced hints — caps at `TYPE_BOUND`.
+fn typed_receiver_confidence<'i>(
+  interner: &'i Interner,
+  reference: &Reference<'i>,
+  local: bool,
+) -> Confidence {
+  let annotated = reference.receiver_type_origin == 0; // typefacts BindOrigin::Annotated
+  let path = interner.text_of(reference.from_path);
+  let python = path.ends_with(".py") || path.ends_with(".pyi");
+  if annotated && !python {
+    if local { Confidence::LOCAL } else { Confidence::CROSS_FILE }
+  } else {
+    Confidence::TYPE_BOUND
+  }
+}
+
+/// The reason tag for a typed-receiver unique match, by binding origin.
+fn typed_receiver_reason(origin: u8) -> ResolveReason {
+  match origin {
+    0 => ResolveReason::ReceiverAnnotated,
+    1 => ResolveReason::ReceiverConstructed,
+    2 => ResolveReason::ReceiverParamTyped,
+    3 => ResolveReason::ReceiverFieldTyped,
+    _ => ResolveReason::ReceiverAnnotated,
+  }
+}
+
 fn qualifier_matches<'i>(
   interner: &'i Interner,
   symbol: &Symbol<'i>,
@@ -563,8 +748,18 @@ fn extension(path: &str) -> Option<&str> {
 /// Choose a target from a visible set: unique → the given confidence; a tie takes a
 /// deterministic min-id target at `AMBIGUOUS` when the reference's form tolerates it, and no
 /// edge at all when it does not.
-fn pick(
-  set: &[Symbol],
+/// The deterministic ambiguous pick is the FIRST tied candidate in RUN order. Run order is
+/// the canonical BUILD SEQUENCE: the bulk and retained table builders insert path-major in
+/// the same canonical walk, the retained splice maintenance preserves it ("runs are
+/// path-major by invariant"), and post-build import-binding seeds append in the same
+/// canonical seeding sequence on every linker — so run order is identical in every id
+/// space, where raw ids are not (the retained writer re-appends an edited file's rows at
+/// its tail; a lowest-raw-id pick flipped between spaces — kernel repro:
+/// slab_is_available, 41 flipped evidence rows). Filtered sets built by iterating the run
+/// keep its order, so `first()` IS the canonical pick, at zero comparisons — this also
+/// removed a measured ~1.3s of hub-name tie-break comparisons per kernel link.
+fn pick<'i>(
+  set: &[Symbol<'i>],
   edge: EdgeType,
   unique: Confidence,
   candidates: usize,
@@ -597,7 +792,7 @@ fn pick(
     } else {
       ResolveReason::VisibleTie
     };
-    let target = set.iter().min_by_key(|s| s.id.raw()).map(|s| s.id);
+    let target = set.first().map(|s| s.id);
     // Retain the tie set the pick beat — the alternatives a "why this target?" answer names.
     let mut alts = [0u32; MAX_RETAINED_ALTERNATIVES];
     let mut alt_count = 0u8;
@@ -649,7 +844,7 @@ pub fn seed_import_bindings<'i>(
     rustc_hash::FxHashMap::default();
   let mut scratch = ResolveScratch::default();
   for reference in qualified_imports {
-    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch);
+    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, None);
     let Some(target) = resolution.target else {
       continue;
     };
@@ -689,7 +884,7 @@ pub fn resolve_all<'i>(
   resolver: &Resolver,
 ) -> (Vec<ResolvedEdge>, ResolveStats) {
   if references.len() <= MIN_REFS_PER_SHARD {
-    let (edges, _unresolved, stats) = resolve_chunk(interner, table, references, resolver);
+    let (edges, _unresolved, stats) = resolve_chunk(interner, table, references, resolver, None);
     return (edges, stats);
   }
   use rayon::prelude::*;
@@ -700,7 +895,7 @@ pub fn resolve_all<'i>(
     .max(MIN_REFS_PER_SHARD);
   let shards: Vec<(Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats)> = references
     .par_chunks(chunk_size)
-    .map(|chunk| resolve_chunk(interner, table, chunk, resolver))
+    .map(|chunk| resolve_chunk(interner, table, chunk, resolver, None))
     .collect();
   // Reserve what actually resolved, not one slot per reference — at kernel scale roughly
   // half of all references yield edges, and the difference is ~80 MB of dead reservation.
@@ -731,6 +926,7 @@ pub fn resolve_all_spilled<'i>(
     table,
     spill,
     resolver,
+    None,
     |edge| edges.push(*edge),
     |_| {},
   )?;
@@ -747,6 +943,7 @@ pub fn resolve_all_spilled_into<'i>(
   table: &SymbolTable<'i>,
   spill: &crate::RefSpill<'i>,
   resolver: &Resolver,
+  chain: Option<&ChainReturns<'i>>,
   sink: impl FnMut(&ResolvedEdge),
   unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
@@ -757,6 +954,7 @@ pub fn resolve_all_spilled_into<'i>(
     resolver,
     raw_chunks,
     |bytes| spill.decode_chunk(bytes),
+    chain,
     sink,
     unresolved_sink,
   )
@@ -765,12 +963,14 @@ pub fn resolve_all_spilled_into<'i>(
 /// [`resolve_all_spilled_into`] over a retained [`crate::RefStore`] — the memory-primary
 /// daemon's link path. Identical pump; only the chunk source differs (alive ranges instead
 /// of the whole file).
+#[allow(clippy::too_many_arguments)] // the retained-path resolve entry: chain ledger rides with the sinks
 pub fn resolve_all_store_into<'i>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   store: &mut crate::RefStore,
   order: impl IntoIterator<Item = u32>,
   resolver: &Resolver,
+  chain: Option<&ChainReturns<'i>>,
   sink: impl FnMut(&ResolvedEdge),
   unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
@@ -782,6 +982,7 @@ pub fn resolve_all_store_into<'i>(
     resolver,
     raw_chunks,
     |bytes| store.decode_chunk(interner, bytes),
+    chain,
     sink,
     unresolved_sink,
   )
@@ -791,12 +992,15 @@ pub fn resolve_all_store_into<'i>(
 /// paths. Chunk provenance is invisible to resolution (a pure per-reference read of the
 /// immutable table), so both sources produce output identical to an in-RAM `resolve_all`
 /// over the same reference sequence.
+#[allow(clippy::too_many_arguments)] // the shared chunk pump: decode hook + chain ledger + both sinks are load-bearing
 fn resolve_chunks_into<'i>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   resolver: &Resolver,
   raw_chunks: impl Iterator<Item = std::io::Result<Vec<u8>>> + Send,
   decode: impl Fn(&[u8]) -> Vec<Reference<'i>> + Sync,
+  chain: Option<&ChainReturns<'i>>,
+
   mut sink: impl FnMut(&ResolvedEdge),
   mut unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
@@ -832,7 +1036,8 @@ fn resolve_chunks_into<'i>(
           while let Ok((index, bytes)) = work_rx.recv() {
             let chunk = decode(&bytes);
             drop(bytes);
-            let (edges, unresolved, stats) = resolve_chunk(interner, table, &chunk, resolver);
+            let (edges, unresolved, stats) =
+              resolve_chunk(interner, table, &chunk, resolver, chain);
             if out_tx.send((index, edges, unresolved, stats)).is_err() {
               break;
             }
@@ -862,6 +1067,10 @@ fn resolve_chunks_into<'i>(
       type Held = (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats);
       let mut holdback: std::collections::BTreeMap<usize, Held> = std::collections::BTreeMap::new();
       let mut next_out = 0usize;
+      // Superlinearity probe over drained references (D7): chunk granularity, one tick
+      // per drained chunk — far off the per-reference hot path.
+      let mut scaling = vorpal_kg::ScalingProbe::new("link");
+      let mut refs_done: u64 = 0;
       while let Ok((index, chunk_edges, chunk_unresolved, chunk_stats)) = out_rx.recv() {
         holdback.insert(index, (chunk_edges, chunk_unresolved, chunk_stats));
         while let Some((chunk_edges, chunk_unresolved, chunk_stats)) = holdback.remove(&next_out) {
@@ -871,10 +1080,13 @@ fn resolve_chunks_into<'i>(
           for row in &chunk_unresolved {
             unresolved_sink(row);
           }
+          refs_done += chunk_stats.total();
+          scaling.tick(refs_done);
           *stats += chunk_stats;
           next_out += 1;
         }
       }
+      scaling.finish(refs_done);
     });
   }
   if let Some(err) = feed_error {
@@ -889,13 +1101,14 @@ fn resolve_chunk<'i>(
   table: &SymbolTable<'i>,
   references: &[Reference<'i>],
   resolver: &Resolver,
+  chain: Option<&ChainReturns<'i>>,
 ) -> (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats) {
   let mut edges = Vec::new();
   let mut unresolved = Vec::new();
   let mut stats = ResolveStats::default();
   let mut scratch = ResolveScratch::default();
   for reference in references {
-    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch);
+    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, chain);
     let name_hash =
       xxhash_rust::xxh3::xxh3_64(interner.text_of(reference.name).as_bytes()) as u32;
     match resolution.target {

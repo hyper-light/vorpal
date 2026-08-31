@@ -89,8 +89,13 @@ fn local_definition_wins_over_exported_elsewhere() {
 #[test]
 fn ambiguous_exported_is_labeled_and_deterministic() {
   let mut table = SymbolTable::new();
-  table.insert(itn(), "amb", sym(9, SymbolKind::Function, "c.rs", true));
+  // Candidate runs keep insertion order, and every production builder inserts in the
+  // canonical (path-major) sequence — so the resolver's tie-break, "first tied candidate
+  // in run order", is the canonical pick in EVERY id space. (Raw ids are space-relative:
+  // the retained writer re-appends an edited file's rows at its tail, which is why the
+  // old lowest-raw-id pick flipped between the bulk and retained linkers.)
   table.insert(itn(), "amb", sym(4, SymbolKind::Function, "b.rs", true));
+  table.insert(itn(), "amb", sym(9, SymbolKind::Function, "c.rs", true));
   let reference = Reference::new(itn(), NodeId::new(0), "a.rs", "amb", RefKind::Call);
 
   table.finalize();
@@ -98,7 +103,7 @@ fn ambiguous_exported_is_labeled_and_deterministic() {
   assert_eq!(
     res.target,
     Some(NodeId::new(4)),
-    "deterministic min-id target"
+    "first tied candidate in canonical run order"
   );
   assert_eq!(res.confidence, Confidence::AMBIGUOUS);
   assert_eq!(res.candidates, 2);

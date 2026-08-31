@@ -149,11 +149,11 @@ func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
   - Field private trees
   - Field private maxParams
   - Field public Config
+  - Method public Use
 - Interface item exported RoutesInfo
   - Method public Last
   - Method public ByName
 - Function item exported New
-- Method item exported Use
 "#,
   );
 }
@@ -193,11 +193,38 @@ func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
 - TypeParameter item exported HandlerFunc | type HandlerFunc func(*Context)
 - Struct item exported Engine | type Engine struct {
   - Field private maxParams | maxParams uint16
+  - Method public Use | func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
 - Interface item exported RoutesInfo | type RoutesInfo interface {
   - Method public Last | Last() RouteInfo
   - Method private byName | byName(string) (RouteInfo, bool)
 - Function item exported New | func New() *Engine {
-- Method item exported Use | func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
+"#,
+  );
+}
+
+#[test]
+fn go_method_adoption_is_order_free_and_file_local() {
+  // A method ABOVE its type still nests (adoption is a two-phase pass, not positional);
+  // a method whose receiver type lives in another file stays a top-level item.
+  common::assert_outline_snapshot(
+    SupportLang::Go,
+    GO_RULES,
+    r#"
+package gin
+
+func (e Engine) Pre() {}
+
+type Engine struct {
+    maxParams uint16
+}
+
+func (c Context) Do() {}
+"#,
+    r#"
+- Struct item exported Engine
+  - Field private maxParams
+  - Method public Pre
+- Method item exported Do
 "#,
   );
 }

@@ -11,6 +11,9 @@
 //! as deterministic as the serial loop was.
 
 pub mod annfiles;
+pub mod artifact;
+pub mod cochange;
+pub mod traces;
 pub mod live;
 pub mod live_ann;
 pub mod gendiff;
@@ -33,20 +36,27 @@ use std::time::UNIX_EPOCH;
 use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, ModelProvenance, tokenize};
 use vorpal_ingest::{
   ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
-  StreamWork, cache_file_name, decode_product, encode_product_into, link_writer_spilled,
+  StreamWork, cache_file_name, decode_product, encode_product_into,
   load_product, peek_product_stamps, save_product, stream_apply_spilled,
   validate_product,
 };
 // `Kg` is imported once and re-exported for downstream surfaces (CLI) that route all graph
 // access through this crate.
+pub use vorpal_ingest::{DynamicCanary, ExtractionEnv, RuleSource};
 pub use vorpal_kg::{Direction, EdgeType, Kg};
 use vorpal_kg::NodeId;
 
 /// Summary of an indexing run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReport {
   /// The tree was unchanged since the last index — reused without re-parsing (§3.4).
   pub reused: bool,
+  /// The committed generation's GRAPH artifacts are byte-identical carries of the prior
+  /// generation's (whole-tree reuse, and the stamp-only cutoff — which re-extracts changed
+  /// files but proves their extraction unchanged). A serving daemon may keep its loaded
+  /// graph, ANN tier, and overlay: they remain exact for the new generation. Distinct from
+  /// `reused`, which additionally claims no file was re-parsed at all.
+  pub graph_reused: bool,
   /// Files re-parsed this run (changed, new, or cache-missing).
   pub indexed: u64,
   /// Files whose cached extraction product was replayed without a parse.
@@ -74,6 +84,28 @@ pub struct IndexReport {
   pub masked: u64,
   /// The cache-validity mode this run used (`fast-stat` / `verified`).
   pub cache_mode: &'static str,
+  /// Dynamic languages extracted this build WITHOUT a canary (F-M4): best-effort tier, named
+  /// on every report so an unverified grammar can never pass as a verified one. Empty for the
+  /// default environment and whenever every dynamic language has a canary.
+  pub unverified_langs: Vec<String>,
+  /// Symmetric `changes_with` pairs sealed from git history (each pair counted once).
+  pub cochange_edges: u64,
+  /// Why the co-change pass produced nothing (not a repository, disabled, no history) —
+  /// stated on the report, never a silent zero. `None` when edges were computed.
+  pub cochange_note: Option<String>,
+  /// Symmetric `similar_to` near-clone pairs sealed from extraction-time sketches (each pair
+  /// counted once).
+  pub similar_edges: u64,
+  /// Why the similarity pass produced nothing, or what it truncated — stated, never a
+  /// silent zero. `None` when pairs were sealed.
+  pub similar_note: Option<String>,
+  /// HTTP client call sites with a literal URL seen this build.
+  pub request_sites: u64,
+  /// Directional `requests` edges sealed (unique client URL → route template matches).
+  pub request_edges: u64,
+  /// Stated when request sites existed but nothing linked — external services are normal,
+  /// silence is not.
+  pub request_note: Option<String>,
 }
 
 impl IndexReport {
@@ -124,7 +156,7 @@ pub enum CacheMode {
 
 impl CacheMode {
   /// The mode the environment requests when a caller passes none.
-  fn from_env() -> CacheMode {
+  pub fn from_env() -> CacheMode {
     if std::env::var_os("VORPAL_VERIFY_CACHE").is_some_and(|v| v == "1") {
       CacheMode::Verified
     } else {
@@ -207,13 +239,16 @@ pub fn build_index_watched(
   src: &Path,
   out: &Path,
   hints: &std::collections::HashSet<PathBuf>,
+  env: &vorpal_ingest::ExtractionEnv,
 ) -> Result<IndexReport, Box<dyn Error>> {
-  build_index_full(
+  build_index_inner(
     src,
     out,
     CacheMode::from_env(),
     ParseHealthPolicy::default(),
     Some(hints),
+    None,
+    env,
   )
 }
 
@@ -273,7 +308,30 @@ pub fn build_index_full(
   policy: ParseHealthPolicy,
   hints: Option<&std::collections::HashSet<PathBuf>>,
 ) -> Result<IndexReport, Box<dyn Error>> {
-  build_index_inner(src, out, cache_mode, policy, hints, None)
+  build_index_inner(
+    src,
+    out,
+    cache_mode,
+    policy,
+    hints,
+    None,
+    &vorpal_ingest::ExtractionEnv::default(),
+  )
+}
+
+/// [`build_index_full`] under an explicit [`ExtractionEnv`] (F-M3): extra outline-rule sources
+/// extend extraction to registered custom/dynamic languages. The default environment is
+/// byte-identical to the bundled behavior. Registration (any dlopen) is the caller's one-shot
+/// startup act — this function never loads code, so serving surfaces (MCP tools) can never
+/// trigger a dlopen through it.
+pub fn build_index_env(
+  src: &Path,
+  out: &Path,
+  cache_mode: CacheMode,
+  policy: ParseHealthPolicy,
+  env: &vorpal_ingest::ExtractionEnv,
+) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_inner(src, out, cache_mode, policy, None, None, env)
 }
 
 /// A full-pipeline build whose persistence tail was deferred (SUBSECOND.md Phase 3, live
@@ -287,8 +345,13 @@ pub struct PendingPersist {
   prior: PathBuf,
   staging: PathBuf,
   evidence: Vec<vorpal_kg::EvidenceRow>,
+  flows: Vec<vorpal_kg::DataflowRow>,
   manifest: Manifest,
   kg: Arc<Kg>,
+  /// The still-running pack consolidation from the build that deferred here — joined
+  /// before the manifest/commit, so the deferred tail overlaps it exactly like the
+  /// synchronous tail does.
+  pack: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 
 impl PendingPersist {
@@ -301,24 +364,36 @@ impl PendingPersist {
       prior,
       staging,
       evidence,
+      flows,
       manifest,
       kg,
+      pack,
     } = self;
-    let (evidence_result, kg_result) = std::thread::scope(|scope| {
+    let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
       let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+      let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
       let kg_result = kg.save(&staging);
       (
         evidence_task.join().expect("evidence saver panicked"),
+        dataflow_task.join().expect("dataflow saver panicked"),
         kg_result,
       )
     });
     evidence_result.map_err(|err| format!("evidence save failed: {err}"))?;
+    dataflow_result.map_err(|err| format!("dataflow save failed: {err}"))?;
     kg_result.map_err(|err| format!("graph save failed: {err}"))?;
+    if let Some(pack) = pack {
+      pack
+        .join()
+        .map_err(|_| "pack writer panicked".to_string())?
+        .map_err(|err| format!("pack write failed: {err}"))?;
+    }
     manifest
       .save(&staging.join("manifest.bin"))
       .map_err(|err| format!("manifest save failed: {err}"))?;
-    commit_generation(&out, &prior, staging)
-      .map_err(|err| format!("generation commit failed: {err}"))
+    let id = commit_generation(&out, &prior, staging)
+      .map_err(|err| format!("generation commit failed: {err}"))?;
+    Ok(out.join("gen").join(id))
   }
 }
 
@@ -349,6 +424,7 @@ pub fn build_index_live(
   src: &Path,
   out: &Path,
   hints: Option<&std::collections::HashSet<PathBuf>>,
+  env: &vorpal_ingest::ExtractionEnv,
 ) -> Result<LiveBuild, Box<dyn Error>> {
   let mut slots = LiveSlots::default();
   let report = build_index_inner(
@@ -358,6 +434,7 @@ pub fn build_index_live(
     ParseHealthPolicy::default(),
     hints,
     Some(&mut slots),
+    env,
   )?;
   Ok(LiveBuild {
     report,
@@ -373,6 +450,7 @@ fn build_index_inner(
   policy: ParseHealthPolicy,
   hints: Option<&std::collections::HashSet<PathBuf>>,
   live: Option<&mut LiveSlots>,
+  env: &vorpal_ingest::ExtractionEnv,
 ) -> Result<IndexReport, Box<dyn Error>> {
   // One tree, ONE spelling: canonicalize the root so every producer — CLI argv, daemon
   // watch root, bindings — keys manifests, pack entries, and node identities (eids hash
@@ -401,7 +479,10 @@ fn build_index_inner(
   // Embedded hosts get bounded memory with no reclaim call at all.
   let interner = vorpal_ingest::Interner::default();
   vorpal_kg::phase_stamp("build: enter");
-  let extractor = OutlineExtractor::new()?;
+  let extractor = env.extractor()?;
+  // Computed once, up front: reported on every exit path (fast-path reuse included) so an
+  // unverified dynamic language is never silently trusted.
+  let unverified_langs = env.unverified_langs(&extractor);
   vorpal_kg::phase_stamp("build: rules compiled");
   // Extraction identity for this run: the whole grammar set folded with the outline-rule digest.
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
@@ -500,6 +581,7 @@ fn build_index_inner(
       if let Ok(nodes) = Kg::peek_node_count(&prior) {
         return Ok(IndexReport {
           reused: true,
+          graph_reused: true,
           cache_mode: cache_mode.label(),
           error_files: 0,
           error_nodes: 0,
@@ -512,6 +594,14 @@ fn build_index_inner(
           ambiguous: 0,
           external: 0,
           masked: 0,
+          unverified_langs: unverified_langs.clone(),
+          cochange_edges: 0,
+          cochange_note: None,
+          similar_edges: 0,
+          similar_note: None,
+          request_sites: 0,
+          request_edges: 0,
+          request_note: None,
         });
       }
     }
@@ -525,10 +615,16 @@ fn build_index_inner(
     // fresh manifest, and commit through the ordinary atomic path. Any doubt bails to the
     // full pipeline. Gated exactly like the whole-tree fast path (verified mode and
     // non-Warn health policies re-derive everything; racy files digest-verify).
+    // Trust gates BEFORE the stamp-only cutoff: the cutoff re-extracts changed files and
+    // rewrites stamp windows — extraction it trusts must pass the same selfcheck and
+    // environment canaries the pipeline demands. (The whole-tree reuse path above stays
+    // ungated: a reused build writes nothing, so there is nothing to trust anew.)
+    vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
+    vorpal_ingest::verify_env_extraction(&extractor, &env.canaries).map_err(io::Error::other)?;
     if !verify_all
       && policy.mode == ParseHealthMode::Warn
       && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
-      && let Some(report) = try_stamp_only_cutoff(
+      && let Some(mut report) = try_stamp_only_cutoff(
         out,
         &prior,
         &manifest,
@@ -538,6 +634,9 @@ fn build_index_inner(
         prior_manifest_ns,
       )?
     {
+      // The cutoff re-extracts changed files with this environment's extractor — the
+      // best-effort tier disclosure travels with every report, fast paths included.
+      report.unverified_langs = unverified_langs.clone();
       return Ok(report);
     }
   }
@@ -547,6 +646,9 @@ fn build_index_inner(
   // internally inconsistent build otherwise seals a silently gutted graph with exit 0).
   // Once per process; the unchanged-tree fast path above returns before this line.
   vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
+  // Dynamic-language canaries (F-M4): environment-scoped, so not memoized — the same refusal
+  // gate builtin languages get, extended to grammars that arrived via dlopen.
+  vorpal_ingest::verify_env_extraction(&extractor, &env.canaries).map_err(io::Error::other)?;
 
   // Incremental path, streamed (§7.5): replay cached products for stat-unchanged files,
   // re-parse the rest — admission is byte-budget-gated, extraction fans out over scoped
@@ -558,6 +660,10 @@ fn build_index_inner(
   // per-shard application keeps the output bit-identical to the batch path.
   // The loose bank lives at the *root* (outside any generation): concurrent searches feed it
   // and every build consumes it, whichever generation is live.
+  // Co-change pass in flight (ADOPTION #27): a HEAD-keyed cache hit costs two `git
+  // rev-parse` calls; otherwise `git log` runs as a child beside the extraction stream and
+  // is joined before link — its serial cost (1.1 s at kernel scale) hides under parsing.
+  let cochange_pending = cochange::start(src, &out.join("cochange.cache"));
   let products_dir = out.join("products");
   fs::create_dir_all(&products_dir)?;
   // Stage the new generation in a scratch dir under `gen/`; it becomes `gen/<content-id>` at
@@ -738,13 +844,33 @@ fn build_index_inner(
     },
   );
   drop(pack_sink);
-  let pack_result = pack_thread.join().expect("pack writer panicked");
-  let (writer, spilled_refs, stream) = stream_result?;
-  pack_result?;
+  // The pack writer's tail (consolidation + flush of a ~0.5 GB pack at kernel scale) is
+  // pure I/O nothing before the commit reads — it keeps running while cochange, the table,
+  // resolution, and the seal proceed; every exit below joins it (the staged directory must
+  // never outlive an abandoned build with a writer still in it).
+  let (mut writer, spilled_refs, stream, mut arg_spill) = match stream_result {
+    Ok(parts) => parts,
+    Err(err) => {
+      let _ = pack_thread.join();
+      return Err(err.into());
+    }
+  };
+  // Near-clone pairing starts HERE — its input (the sig spill) closed with the stream, and
+  // it needs nothing else, so it overlaps the pack tail, cochange, the table build, AND
+  // resolution instead of only the link (it was the link's critical path by ~110ms at
+  // kernel scale).
+  let pairing = match vorpal_ingest::spawn_sig_pairing(&mut arg_spill) {
+    Ok(handle) => handle,
+    Err(err) => {
+      let _ = pack_thread.join();
+      return Err(err.into());
+    }
+  };
   // Fail policy judges here — before sealing, before the generation commits: nothing is
   // published, and the message lists the worst offenders with their damage ratios.
   let offenders = unhealthy_files.into_inner().unwrap();
   if !offenders.is_empty() {
+    let _ = pack_thread.join();
     let mut sorted = offenders;
     sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let shown: Vec<String> = sorted
@@ -769,6 +895,7 @@ fn build_index_inner(
   // so a single check on its final size proves no intermediate offset wrapped.
   const U32_CEIL: usize = u32::MAX as usize;
   if writer.node_count() > U32_CEIL {
+    let _ = pack_thread.join();
     return Err(format!(
       "index exceeds the supported node limit: {} definitions (max {U32_CEIL}); node ids are \
        32-bit — split the corpus into multiple indexes",
@@ -777,6 +904,7 @@ fn build_index_inner(
     .into());
   }
   if writer.heap_len() > U32_CEIL as u64 {
+    let _ = pack_thread.join();
     return Err(format!(
       "index string heap exceeds the 4 GiB addressable limit: {} bytes (max {U32_CEIL}); \
        names/paths/signatures use 32-bit offsets — split the corpus into multiple indexes",
@@ -789,6 +917,44 @@ fn build_index_inner(
   vorpal_ingest::release_freed_pages();
   let (reparsed, replayed) = (stream.parsed, stream.replayed);
 
+  // Temporal coupling (ADOPTION #27): files that changed together in recent git history
+  // gain symmetric `changes_with` edges between their File nodes — derived from `git log`,
+  // bounded, and stated on the report when nothing could be computed.
+  vorpal_kg::phase_stamp("cochange: start");
+  let cochange = cochange::finish(
+    cochange_pending,
+    src,
+    manifest.entries().iter().map(|e| e.path.as_str()),
+  );
+  let mut cochange_edges = 0u64;
+  if !cochange.edges.is_empty() {
+    // File-node lookup by an on-demand scan of the writer's rows — per-file identity keys
+    // are shed as files land (`forget_identity_scope`), and a resident path map would sit
+    // in memory through the whole stream phase to answer this once. Only the paths the
+    // pass actually relates are collected.
+    let wanted: HashSet<&str> = cochange
+      .edges
+      .iter()
+      .flat_map(|e| [e.a.as_str(), e.b.as_str()])
+      .collect();
+    let mut file_ids: HashMap<&str, NodeId> = HashMap::with_capacity(wanted.len());
+    writer.for_each_file(|id, path| {
+      if let Some(&key) = wanted.get(path) {
+        file_ids.insert(key, id);
+      }
+    });
+    for edge in &cochange.edges {
+      if let (Some(&a), Some(&b)) = (file_ids.get(edge.a.as_str()), file_ids.get(edge.b.as_str())) {
+        let label = vorpal_kg::EdgeType::CHANGES_WITH.with_confidence(edge.confidence);
+        writer.add_edge(a, b, label);
+        writer.add_edge(b, a, label);
+        cochange_edges += 1;
+      }
+    }
+  }
+  let cochange_note = cochange.note;
+  vorpal_kg::phase_stamp("cochange: done");
+
   // Loose-file hygiene: everything snapshotted above is now consolidated in the pack (or
   // superseded by a re-parse, or stale) — delete it. Files banked by searches *during* this
   // run are not in the snapshot and survive untouched.
@@ -799,10 +965,24 @@ fn build_index_inner(
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve, evidence) =
-    link_writer_spilled(&interner, writer, spilled_refs, &Resolver::new())?;
+  let linked = vorpal_ingest::link_writer_spilled_with_flows(
+    &interner,
+    writer,
+    spilled_refs,
+    &Resolver::new(),
+    Some(arg_spill),
+    pairing,
+  );
+  let (kg, resolve, evidence, flows, similar, request_report) = match linked {
+    Ok(parts) => parts,
+    Err(err) => {
+      let _ = pack_thread.join();
+      return Err(err.into());
+    }
+  };
   let report = IndexReport {
     reused: false,
+    graph_reused: false,
     cache_mode: cache_mode.label(),
     indexed: reparsed,
     skipped: replayed,
@@ -815,6 +995,14 @@ fn build_index_inner(
     ambiguous: resolve.ambiguous,
     external: resolve.external,
     masked: resolve.masked,
+    unverified_langs,
+    cochange_edges,
+    cochange_note,
+    similar_edges: similar.edges,
+    similar_note: similar.note,
+    request_sites: request_report.sites,
+    request_edges: request_report.edges,
+    request_note: request_report.note,
   };
   if let Some(slots) = live {
     // Deferred persistence: the sealed graph is answer-complete NOW — hand it to the daemon
@@ -832,25 +1020,35 @@ fn build_index_inner(
       prior,
       staging,
       evidence,
+      flows,
       manifest,
       kg,
+      pack: Some(pack_thread),
     });
     return Ok(report);
   }
+  // Synchronous tail: the pack must be complete before the manifest (the commit point) and
+  // the content hash — join it here, after everything it overlapped.
+  pack_thread
+    .join()
+    .expect("pack writer panicked")?;
   // Persist the evidence sidecar (§5) and the graph segments CONCURRENTLY: they are
   // independent artifacts in the same staged generation, and running them serially left
   // 17 cores idle for the longer of the two. Evidence is canonically sorted (total order)
   // inside its saver, so it still joins the content identity deterministically. The
   // manifest stays strictly last — it is the commit point.
-  let (evidence_result, kg_result) = std::thread::scope(|scope| {
+  let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
     let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+    let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
     let kg_result = kg.save(&staging);
     (
-      evidence_task.join().expect("evidence saver panicked"),
+      evidence_task.join().map_err(|_| io::Error::other("evidence saver panicked")),
+      dataflow_task.join().map_err(|_| io::Error::other("dataflow saver panicked")),
       kg_result,
     )
   });
-  evidence_result?;
+  evidence_result??;
+  dataflow_result??;
   kg_result?;
   manifest.save(&staging.join("manifest.bin"))?;
   // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
@@ -862,7 +1060,8 @@ fn build_index_inner(
 /// (sorted) order. Lazy sidecars added after commit (the ANN tier) are deliberately excluded:
 /// they are stamp-validated against the node segment, deterministic given the generation, and
 /// must not change its identity.
-const GENERATION_ARTIFACTS: [&str; 8] = [
+pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
+  "dataflow.bin",
   "evidence.bin",
   "graph.bin",
   "manifest.bin",
@@ -889,63 +1088,57 @@ const GENERATION_ARTIFACTS: [&str; 8] = [
 /// *new* opens in a collected generation fail, as a clean retryable error. A legacy flat root
 /// that served as the prior is swept the same way: its artifacts are superseded by the
 /// generation just committed from them.
-/// Whether `path`'s CURRENT extraction is byte-identical to its cached product outside the
-/// stamp window `[8..32)` — the "answers cannot have changed" predicate shared by the
-/// stamp-only commit cutoff and the daemon's serve-immediately probe.
-fn extraction_matches_cache(
-  pack: &PackReader,
-  extractor: &OutlineExtractor,
-  path: &str,
-  encode_buf: &mut Vec<u8>,
-) -> bool {
-  let Ok(source) = fs::read_to_string(path) else {
-    return false;
-  };
-  let Some(product) = extractor.extract_product(path, &source) else {
-    return false;
-  };
-  encode_buf.clear();
-  vorpal_ingest::encode_product_into(&product, encode_buf);
-  let Some(cached) = pack.get(path) else {
-    return false;
-  };
-  encode_buf.len() == cached.len()
-    && encode_buf.len() >= 32
-    && encode_buf[0..8] == cached[0..8]
-    && encode_buf[32..] == cached[32..]
-}
-
-/// Serve-immediately probe for the watched daemon: `true` iff EVERY hinted path's current
-/// extraction is byte-identical to its cached product — in which case no query answer can
-/// differ from the loaded graph's, and the caller may keep serving it while a background
-/// build canonicalizes the stamps. Conservative: any doubt (unreadable file, uncached path,
-/// unhandled extension change, missing pack, any body difference) returns `false`. Cost is
-/// one re-extraction per hinted file (single-digit milliseconds each).
-pub fn extraction_unchanged(
-  index_dir: &Path,
-  paths: &std::collections::HashSet<PathBuf>,
-) -> bool {
-  if paths.is_empty() {
-    return false;
-  }
-  let prior = vorpal_kg::resolve_index_dir(index_dir);
-  let Some(pack) = PackReader::open(&prior) else {
-    return false;
-  };
-  let Ok(extractor) = OutlineExtractor::new() else {
-    return false;
-  };
-  let mut encode_buf = Vec::new();
-  paths.iter().all(|path| {
-    let path_str = path.to_string_lossy();
-    if !extractor.handles(&path_str) {
-      // An unhandled path cannot change answers UNLESS it newly became relevant — which
-      // `handles` alone cannot prove. Files the index never carried are rejected by the
-      // pack lookup below; unhandled-but-hinted paths (editor lockfiles, .txt) are inert.
-      return true;
+/// The content id of a generation directory: the deterministic fold over every artifact (in
+/// fixed order) that names `gen/<id>` dirs. Pure function of the artifact bytes; the folding
+/// shape is an internal detail of this binary version (ids are content addresses, not a
+/// cross-version interchange format — see docs on the shareable-artifact import for how that
+/// is handled honestly).
+pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
+  const HASH_CHUNK: u64 = 8 << 20;
+  let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+  for artifact in GENERATION_ARTIFACTS {
+    let path = dir.join(artifact);
+    let Ok(file) = fs::File::open(&path) else {
+      continue; // an artifact a smaller index legitimately lacks still yields a stable id
+    };
+    let len = file.metadata()?.len();
+    hasher.update(artifact.as_bytes());
+    hasher.update(&len.to_le_bytes());
+    let chunk_count = len.div_ceil(HASH_CHUNK);
+    let chunk_digests: io::Result<Vec<u128>> = {
+      use rayon::prelude::*;
+      // Positional reads per chunk: threads never share a cursor, and in-flight memory
+      // stays at (pool width × 8 MiB) — the whole-artifact read would have re-materialized
+      // a ~gigabyte pack this build just spent effort never holding at once. Unix pread's
+      // Windows sibling moves the handle's file pointer, so non-unix opens a fresh handle
+      // per chunk instead (identical bytes, no shared-cursor races).
+      #[cfg(unix)]
+      let read_chunk = |buf: &mut [u8], offset: u64| -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+      };
+      #[cfg(not(unix))]
+      let read_chunk = |buf: &mut [u8], offset: u64| -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut chunk_file = fs::File::open(&path)?;
+        chunk_file.seek(SeekFrom::Start(offset))?;
+        chunk_file.read_exact(buf)
+      };
+      (0..chunk_count)
+        .into_par_iter()
+        .map(|index| {
+          let offset = index * HASH_CHUNK;
+          let mut buf = vec![0u8; HASH_CHUNK.min(len - offset) as usize];
+          read_chunk(&mut buf, offset)?;
+          Ok(xxhash_rust::xxh3::xxh3_128(&buf))
+        })
+        .collect()
+    };
+    for digest in chunk_digests? {
+      hasher.update(&digest.to_le_bytes());
     }
-    extraction_matches_cache(&pack, &extractor, &path_str, &mut encode_buf)
-  })
+  }
+  Ok(format!("{:032x}", hasher.digest128()))
 }
 
 /// The stamp-only commit cutoff (Phase 1a). Returns `Ok(Some(report))` after committing a
@@ -1032,11 +1225,12 @@ fn try_stamp_only_cutoff(
   {
     return Ok(None);
   }
-  const CARRIED: [&str; 6] = [
+  const CARRIED: [&str; 7] = [
     "nodes.vseg",
     "strings.heap",
     "graph.bin",
     "evidence.bin",
+    "dataflow.bin",
     "names.idx",
     "products.idx",
   ];
@@ -1121,7 +1315,11 @@ fn try_stamp_only_cutoff(
   commit_generation(out, prior, staging)?;
   let nodes = Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
   Ok(Some(IndexReport {
-    reused: true,
+    // A stamp-only commit re-extracted the changed files and committed a NEW generation —
+    // `reused` ("unchanged, nothing re-parsed") would misreport both. The GRAPH, however,
+    // is a proven byte-identical carry.
+    reused: false,
+    graph_reused: true,
     cache_mode: cache_mode_label,
     error_files: 0,
     error_nodes: 0,
@@ -1134,8 +1332,24 @@ fn try_stamp_only_cutoff(
     ambiguous: 0,
     external: 0,
     masked: 0,
+    // The stamp-only commit carries every graph artifact forward byte-identically —
+    // cochange/similarity/request edges from the prior generation persist unchanged; the
+    // passes themselves did not run this build. Stated, never a silent zero.
+    unverified_langs: Vec::new(),
+    cochange_edges: 0,
+    cochange_note: Some(STAMP_ONLY_CARRY_NOTE.to_string()),
+    similar_edges: 0,
+    similar_note: Some(STAMP_ONLY_CARRY_NOTE.to_string()),
+    request_sites: 0,
+    request_edges: 0,
+    request_note: Some(STAMP_ONLY_CARRY_NOTE.to_string()),
   }))
 }
+
+/// Report note for edge passes on the stamp-only path: the edges live in the carried
+/// artifacts; this build did not recompute them.
+const STAMP_ONLY_CARRY_NOTE: &str =
+  "carried forward from prior generation (stamp-only commit)";
 
 /// Process-unique staging suffix: concurrent builds in ONE process (the daemon's background
 /// canonicalizer racing a synchronous rebuild) must never share a staging directory.
@@ -1144,7 +1358,7 @@ pub(crate) fn staging_nonce() -> u64 {
   NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<PathBuf> {
+pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<String> {
   // Sweep staging scratch that is not part of the named artifact set (spill files, tmp names)
   // so the generation holds exactly its artifacts.
   for entry in fs::read_dir(&staging)?.flatten() {
@@ -1169,51 +1383,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // folding shape is an internal detail of this binary version (ids are content addresses,
   // not a cross-version interchange format; see docs/INDEX_FORMAT.md).
   vorpal_kg::phase_stamp("commit: content-id hash start");
-  const HASH_CHUNK: u64 = 8 << 20;
-  let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-  for artifact in GENERATION_ARTIFACTS {
-    let path = staging.join(artifact);
-    let Ok(file) = fs::File::open(&path) else {
-      continue; // an artifact a smaller index legitimately lacks still yields a stable id
-    };
-    let len = file.metadata()?.len();
-    hasher.update(artifact.as_bytes());
-    hasher.update(&len.to_le_bytes());
-    let chunk_count = len.div_ceil(HASH_CHUNK);
-    let chunk_digests: io::Result<Vec<u128>> = {
-      use rayon::prelude::*;
-      // Positional reads per chunk: threads never share a cursor, and in-flight memory
-      // stays at (pool width × 8 MiB) — the whole-artifact read would have re-materialized
-      // a ~gigabyte pack this build just spent effort never holding at once. Unix pread's
-      // Windows sibling moves the handle's file pointer, so non-unix opens a fresh handle
-      // per chunk instead (identical bytes, no shared-cursor races).
-      #[cfg(unix)]
-      let read_chunk = |buf: &mut [u8], offset: u64| -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        file.read_exact_at(buf, offset)
-      };
-      #[cfg(not(unix))]
-      let read_chunk = |buf: &mut [u8], offset: u64| -> io::Result<()> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut chunk_file = fs::File::open(&path)?;
-        chunk_file.seek(SeekFrom::Start(offset))?;
-        chunk_file.read_exact(buf)
-      };
-      (0..chunk_count)
-        .into_par_iter()
-        .map(|index| {
-          let offset = index * HASH_CHUNK;
-          let mut buf = vec![0u8; HASH_CHUNK.min(len - offset) as usize];
-          read_chunk(&mut buf, offset)?;
-          Ok(xxhash_rust::xxh3::xxh3_128(&buf))
-        })
-        .collect()
-    };
-    for digest in chunk_digests? {
-      hasher.update(&digest.to_le_bytes());
-    }
-  }
-  let id = format!("{:032x}", hasher.digest128());
+  let id = generation_content_id(&staging)?;
   vorpal_kg::phase_stamp("commit: content-id hash done");
   let final_dir = root.join("gen").join(&id);
   // Dedup guard: an existing same-id generation is byte-identical *by construction*, but only
@@ -1315,7 +1485,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       let _ = fs::remove_file(root.join(scratch));
     }
   }
-  Ok(final_dir)
+  Ok(id)
 }
 
 /// Build the semantic tier over every KG node: each definition embeds its name (double-weighted),
@@ -1485,6 +1655,7 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
     if !postings::postings_are_fresh(index_dir, current) {
       postings::build_postings(&kg, index_dir, current)?;
     }
+    ensure_communities(&kg, index_dir, current)?;
     return Ok(());
   }
   build_ann(&kg, index_dir, current).map_err(|err| err as Box<dyn Error>)?;
@@ -1503,6 +1674,37 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   if !postings::postings_are_fresh(index_dir, current) {
     postings::build_postings(&kg, index_dir, current)?;
   }
+  ensure_communities(&kg, index_dir, current)?;
+  Ok(())
+}
+
+/// The community sidecar warms beside the search tiers: same stamp discipline, same
+/// absent-tolerant read (queries answer `null` for `community` until it exists).
+/// Member cap for the community dendrogram cut: `VORPAL_COMMUNITY_CAP` (default
+/// [`vorpal_kg::communities::DEFAULT_CAP`]; 0 reports the top Louvain level). A value that
+/// is not a non-negative integer is an error, never a silent default.
+fn community_cap() -> Result<u32, Box<dyn Error>> {
+  match std::env::var_os("VORPAL_COMMUNITY_CAP") {
+    None => Ok(vorpal_kg::communities::DEFAULT_CAP),
+    Some(raw) => {
+      let text = raw.to_string_lossy();
+      text.trim().parse::<u32>().map_err(|e| {
+        format!("VORPAL_COMMUNITY_CAP must be a non-negative integer (0 disables the cap), got {text:?}: {e}")
+          .into()
+      })
+    }
+  }
+}
+
+fn ensure_communities(kg: &Kg, index_dir: &Path, current: u64) -> Result<(), Box<dyn Error>> {
+  let cap = community_cap()?;
+  if vorpal_kg::communities::is_fresh(index_dir, current, cap) {
+    return Ok(());
+  }
+  vorpal_kg::phase_stamp("communities: build start");
+  let membership = vorpal_kg::communities::compute(kg, cap);
+  vorpal_kg::communities::save(index_dir, current, cap, &membership)?;
+  vorpal_kg::phase_stamp("communities: saved");
   Ok(())
 }
 
@@ -1969,9 +2171,7 @@ pub fn search_records_filtered(
   k: usize,
   filter: &SearchFilter,
 ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
-  let searcher = cached_searcher(index_dir)?;
-  let ranked = searcher.run(query, k, filter)?;
-  Ok(hit_records(&searcher.kg, ranked))
+  cached_searcher(index_dir)?.records(query, k, filter)
 }
 
 fn search_index_impl(
@@ -1998,6 +2198,10 @@ pub struct Searcher {
   ann: Option<AnnIndex>,
   /// The persisted lexical posting tier — present only when its stamp matches this generation.
   postings: Option<postings::Postings>,
+  /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
+  /// effect (autowarm) so queries take the exact reference paths only. Set by
+  /// [`Searcher::open_exact`]; never used in serving.
+  exact_only: bool,
 }
 
 impl Searcher {
@@ -2020,7 +2224,66 @@ impl Searcher {
       kg,
       ann,
       postings,
+      exact_only: false,
     })
+  }
+
+  /// [`Searcher::open`] with every approximate tier deliberately refused: queries take the
+  /// exact reference paths (exhaustive semantic scan + full name scan) no matter what
+  /// sidecars exist on disk, and nothing is mutated (no autowarm). This is the measurement
+  /// seam — `cargo xtask searcheval --overlap` compares tier answers against it — never a
+  /// serving path.
+  pub fn open_exact(index_dir: &Path) -> Result<Searcher, Box<dyn Error>> {
+    let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
+    let kg = Kg::load(&generation_dir)?;
+    Ok(Searcher {
+      generation_dir,
+      kg,
+      ann: None,
+      postings: None,
+      exact_only: true,
+    })
+  }
+
+  /// Which warm tiers this handle holds, as `(ann, postings)` — fresh-and-open vs
+  /// absent/stale. Lets measurement tools state which path served their numbers.
+  pub fn tiers(&self) -> (bool, bool) {
+    (self.ann.is_some(), self.postings.is_some())
+  }
+
+  /// The typed-record surface over [`Searcher::run`]: one record per hit with the fused
+  /// score and per-channel provenance ranks. Shared by [`search_records_filtered`] and bulk
+  /// callers holding a persistent handle.
+  pub fn records(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
+    let ranked = self.run(query, k, filter)?;
+    let kg = &self.kg;
+    const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
+    Ok(
+      ranked
+        .into_iter()
+        .filter_map(|(row, score, ranks)| {
+          Some(records::SearchHitRecord {
+            node: records::node_record(kg, NodeId::new(row))?,
+            score,
+            channels: CHANNELS
+              .iter()
+              .zip(&ranks)
+              .filter_map(|(&channel, rank)| {
+                rank.map(|rank| records::ChannelRank {
+                  channel,
+                  rank: rank + 1,
+                })
+              })
+              .collect(),
+          })
+        })
+        .collect(),
+    )
   }
 
   /// The pinned-generation hybrid ranking shared by the rendered and typed search surfaces:
@@ -2088,7 +2351,10 @@ impl Searcher {
       .into_iter()
       .map(|(id, _)| id)
       .collect()
-  } else if let Some(overlay) = annfiles::OverlayView::assemble(index_dir, kg, embedder.dim()) {
+  } else if let Some(overlay) = (!self.exact_only)
+    .then(|| annfiles::OverlayView::assemble(index_dir, kg, embedder.dim()))
+    .flatten()
+  {
     autowarm::maybe_spawn(index_dir);
     // Overfetch by the dead-row count (bounded) so tombstoning cannot starve the pool.
     let bump = (overlay.tombstoned_nodes as usize).min(take);
@@ -2110,8 +2376,11 @@ impl Searcher {
     ids
   } else {
     // Kick a detached warm so the *next* search takes the fast tier — gated (registered
-    // binaries only, opt-out, once per process) and best-effort; see `autowarm`.
-    autowarm::maybe_spawn(index_dir);
+    // binaries only, opt-out, once per process) and best-effort; see `autowarm`. The
+    // exact-only seam measures the index as-is and must not mutate it.
+    if !self.exact_only {
+      autowarm::maybe_spawn(index_dir);
+    }
     let mut ids = semantic_row_ids(kg);
     // The exhaustive path filters BEFORE scoring: exact recall over exactly the admitted
     // population, no overfetch slack needed.
@@ -2226,7 +2495,11 @@ impl Searcher {
   let mut by_degree: Vec<u64> = named.clone();
   by_degree.sort_by_key(|&id| {
     (
-      std::cmp::Reverse(kg.in_neighbors(NodeId::new(id)).len()),
+      // Referential degree only: the flow-era edge families (similar_to, changes_with,
+      // data_flows, …) are topology, not usage — counting them silently redefined this
+      // disambiguator when they landed (an 8-partner clone family gains 16 raw in-edges
+      // that say nothing about how called the symbol is).
+      std::cmp::Reverse(kg.in_degree_referential(NodeId::new(id))),
       id,
     )
   });
@@ -2732,7 +3005,8 @@ pub fn min_confidence_for_grade(grade: Option<&str>) -> Result<u8, Box<dyn Error
   Ok(match grade.map(str::to_ascii_lowercase).as_deref() {
     None | Some("") => 0,
     Some("heuristic") => 1,
-    Some("constrained") => 90,
+    // 90 -> 85 with TYPE_BOUND (G-M0): the constrained floor now admits typed-receiver edges.
+    Some("constrained") => 85,
     Some("exact") => 100,
     Some(other) => {
       return Err(format!("unknown grade '{other}' (exact | constrained | heuristic)").into());
@@ -2818,8 +3092,54 @@ pub fn snippet_query_on(
   }
 }
 
+/// Open the data-flow sidecar when a traversal will render `data_flows` hops. Absent or
+/// unreadable sidecars degrade to no annotations — the hop itself still renders.
+pub(crate) fn flow_store_for(
+  dir: Option<&std::path::Path>,
+  relations: &[vorpal_kg::EdgeType],
+) -> Option<vorpal_kg::DataflowStore> {
+  let dir = dir?;
+  if !relations.iter().any(|e| e.base() == vorpal_kg::EdgeType::DATA_FLOWS) {
+    return None;
+  }
+  vorpal_kg::DataflowStore::load(dir).ok().filter(|s| !s.is_empty())
+}
+
+/// The `expr→param#k` annotations for one traversal hop with sidecar rows on its
+/// (from, to) pair. Deliberately NOT gated on the hop's winning edge type: a call edge and
+/// its derived DATA_FLOWS edge share endpoints, and BFS crowns whichever the CSR lists
+/// first — the rows describe the call either way. `parent`/`node` orient by `inbound`
+/// (the stored edge always points from → to).
+pub(crate) fn flow_exprs_for_hop(
+  store: Option<&vorpal_kg::DataflowStore>,
+  parent: u32,
+  node: u32,
+  inbound: bool,
+) -> Vec<String> {
+  let Some(store) = store else {
+    return Vec::new();
+  };
+  let (from, to) = if inbound { (node, parent) } else { (parent, node) };
+  store
+    .flows_between(from, to)
+    .iter()
+    .map(|flow| {
+      let expr = flow.expr.unwrap_or(match flow.class {
+        2 => "(call-result)",
+        _ => "(arg)",
+      });
+      if flow.param_index == u16::MAX {
+        format!("{expr}→#?")
+      } else {
+        format!("{expr}→#{}", flow.param_index)
+      }
+    })
+    .collect()
+}
+
 pub fn reachable_query_on(
   kg: &Kg,
+  flows_dir: Option<&std::path::Path>,
   target: &GraphTarget,
   dir: vorpal_kg::Direction,
   relations: &[vorpal_kg::EdgeType],
@@ -2845,6 +3165,7 @@ pub fn reachable_query_on(
     return Ok(out);
   }
 
+  let flow_store = flow_store_for(flows_dir, relations);
   let mut out = String::new();
   for &seed in &matches {
     // Parent-edge map for path reconstruction; steps arrive in BFS order (deterministic).
@@ -2872,10 +3193,18 @@ pub fn reachable_query_on(
         };
         // Pure In/Out keeps the historical arrow; Both labels each hop's real orientation
         // (`←rel-` = the stored edge points from this node toward its parent).
+        let flow_note = {
+          let exprs = flow_exprs_for_hop(flow_store.as_ref(), up, at, inbound);
+          if exprs.is_empty() {
+            String::new()
+          } else {
+            format!("[{}]", exprs.join(", "))
+          }
+        };
         if matches!(dir, vorpal_kg::Direction::Both) && inbound {
-          chain.push(format!("←{}- {}", edge.name(), name_of(at)));
+          chain.push(format!("←{}{}- {}", edge.name(), flow_note, name_of(at)));
         } else {
-          chain.push(format!("-{}→ {}", edge.name(), name_of(at)));
+          chain.push(format!("-{}{}→ {}", edge.name(), flow_note, name_of(at)));
         }
         at = up;
       }
@@ -2926,6 +3255,7 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
     "importers" => Some(vorpal_kg::EdgeType::IMPORTS),
     "implementors" => Some(vorpal_kg::EdgeType::IMPLEMENTS),
     "typeusers" => Some(vorpal_kg::EdgeType::OF_TYPE),
+    "similar" => Some(vorpal_kg::EdgeType::SIMILAR_TO),
     "node" => None,
     other => return Err(format!("unknown graph verb '{other}'").into()),
   };
@@ -2970,6 +3300,19 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
           view.path,
           id.raw(),
           confidence_label(confidence)
+        );
+      }
+    }
+    out
+  } else if edge.base() == vorpal_kg::EdgeType::SIMILAR_TO {
+    // Near-clones: the edge confidence is the estimated similarity — show it.
+    let mut out = String::new();
+    for &(id, confidence) in &hits {
+      if let Some(view) = kg.node(id) {
+        let _ = writeln!(
+          out,
+          "{} [{:?}] {} (~{}% similar)",
+          view.name, view.kind, view.path, confidence
         );
       }
     }

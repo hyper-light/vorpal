@@ -34,7 +34,7 @@ fn call_tool(server: &mut Server, id: u64, tool: &str, args: Value) -> (String, 
 fn battery(server: &mut Server, id: &mut u64, probes: &[&str]) -> String {
   let mut out = String::new();
   for name in probes {
-    for tool in ["node", "callers", "references", "importers"] {
+    for tool in ["node", "callers", "references", "importers", "similar"] {
       *id += 1;
       let (text, _) = call_tool(server, *id, tool, json!({"name": name}));
       out.push_str(&format!("== {tool} {name}\n{text}\n"));
@@ -78,7 +78,8 @@ fn wait_for_marker(server: &mut Server, id: &mut u64, marker: &str) {
 
 const PROBES: &[&str] = &[
   "alpha", "beta", "beta2", "gamma", "probe_1", "probe_2", "probe_6", "probe_7", "probe_8a",
-  "probe_8b", "probe_10", "broken_fn",
+  "probe_8b", "probe_10", "broken_fn", "chain_probe", "maker", "render", "sim_probe_a",
+  "sim_probe_b", "probe_11", "probe_12",
 ];
 
 #[test]
@@ -107,6 +108,26 @@ fn watched_daemon_answers_equal_scratch_after_every_edit_class() {
   fs::write(
     src.join("c.py"),
     "from b import beta\n\ndef gamma():\n    return beta()\n",
+  )
+  .unwrap();
+  // Flow-era corpus (G-M3/G-M5/v16): traceable call arguments with a keyword binding, a
+  // declared-return-type chain (`maker().render()` resolves through the rets ledger), and
+  // a near-clone pair past the 32-token signing floor — so the daemon's retained tier must
+  // reproduce the bulk pipeline's data-flow, chain, and similar_to derivations to pass the
+  // answer battery AND the generation-convergence pin below.
+  fs::write(
+    src.join("flow_chain.py"),
+    "class Widget:\n    def render(self):\n        return 1\n\nclass Gadget:\n    def render(self):\n        return 2\n\ndef maker() -> Widget:\n    return Widget()\n\ndef chain_probe():\n    return maker().render()\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("flow_args.py"),
+    "def sink(value, other=None):\n    return value\n\ndef feeder(k):\n    return sink(k, other=k)\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("flow_clones.py"),
+    "def sim_probe_a(items, floor, ceiling):\n    total = 0\n    for item in items:\n        if item < floor:\n            total += floor\n        elif item > ceiling:\n            total += ceiling\n        else:\n            total += item\n    return total\n\ndef sim_probe_b(items, floor, ceiling):\n    total = 0\n    for item in items:\n        if item < floor:\n            total += floor\n        elif item > ceiling:\n            total += ceiling\n        else:\n            total += item + 1\n    return total\n",
   )
   .unwrap();
   let index: PathBuf = src.join(".vorpal").join("index");
@@ -229,6 +250,25 @@ fn watched_daemon_answers_equal_scratch_after_every_edit_class() {
   )
   .unwrap();
   converge_and_compare(&mut daemon, &mut id, &mut step, Some("probe_10"));
+
+  // 11: return-annotation retarget — the definition row is UNCHANGED (same name, kind,
+  // export, owner), so candidate-set diffing sees nothing; only the retained rets-ledger
+  // diff can dirty the chain, and `callers(render)`'s answer moves between classes.
+  fs::write(
+    src.join("flow_chain.py"),
+    "class Widget:\n    def render(self):\n        return 1\n\nclass Gadget:\n    def render(self):\n        return 2\n\ndef maker() -> Gadget:\n    return Gadget()\n\ndef chain_probe():\n    return maker().render()\n\ndef probe_11():\n    return chain_probe()\n",
+  )
+  .unwrap();
+  converge_and_compare(&mut daemon, &mut id, &mut step, Some("probe_11"));
+
+  // 12: near-clone edit — the pair must survive re-sketching, and the retained tier's
+  // pairing must keep matching the bulk pipeline's (id-value tie-breaks and all).
+  fs::write(
+    src.join("flow_clones.py"),
+    "def sim_probe_a(items, floor, ceiling):\n    total = 0\n    for item in items:\n        if item < floor:\n            total += floor\n        elif item > ceiling:\n            total += ceiling\n        else:\n            total += item\n    return total\n\ndef sim_probe_b(items, floor, ceiling):\n    total = 0\n    for item in items:\n        if item < floor:\n            total += floor\n        elif item > ceiling:\n            total += ceiling\n        else:\n            total += item + 2\n    return total\n\ndef probe_12():\n    return sim_probe_a([], 0, 1)\n",
+  )
+  .unwrap();
+  converge_and_compare(&mut daemon, &mut id, &mut step, Some("probe_12"));
 
   // Generation convergence (the retained-persist pin): once the daemon's background
   // committers land, its CURRENT must name the SAME content-addressed generation a

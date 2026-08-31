@@ -8,6 +8,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 
+use crate::config::ProjectConfig;
+use crate::lang::CustomLang;
+
 
 /// Default index location relative to the indexed tree / working directory. Hidden, so the
 /// ignore-respecting walker never indexes the index itself.
@@ -114,6 +117,12 @@ enum GraphVerb {
   Diff,
   /// Orientation summary: module mass, hubs by in-degree, entry-point candidates.
   Architecture,
+  /// Outgoing data-flow rows for a definition: which arguments flow into which callees.
+  Flows,
+  /// Near-clones of a definition (`similar_to` edges; confidence = estimated similarity).
+  Similar,
+  /// Runtime-observed calls for a definition (from ingested traces), both directions.
+  Observed,
 }
 
 impl GraphVerb {
@@ -133,8 +142,63 @@ impl GraphVerb {
       GraphVerb::Impact => "impact",
       GraphVerb::Diff => "diff",
       GraphVerb::Architecture => "architecture",
+      GraphVerb::Flows => "flows",
+      GraphVerb::Similar => "similar",
+      GraphVerb::Observed => "observed",
     }
   }
+}
+
+/// `vorpal query '<text>'` (G-M4): the Cypher-shaped read-only query language.
+#[derive(Args)]
+pub struct QueryArg {
+  /// Query text, e.g.
+  /// 'MATCH (f:Function)-[:calls*1..3]->(g {name: "resolve_target"}) RETURN f.name LIMIT 20'
+  text: String,
+  /// Index directory (default .vorpal/index).
+  #[clap(long, value_name = "DIR")]
+  index: Option<PathBuf>,
+  /// Output: text table or the QueryResult JSON document.
+  #[clap(long, value_enum, default_value_t = OutputFormat::Text)]
+  format: OutputFormat,
+}
+
+pub fn run_query(arg: QueryArg) -> Result<ExitCode> {
+  if !matches!(arg.format, OutputFormat::Text | OutputFormat::Json) {
+    return Err(anyhow!("`query` renders --format text or json"));
+  }
+  let dir = index_dir(arg.index);
+  let kg = vorpal_index::Kg::load(&dir)
+    .map_err(|err| anyhow!(err.to_string()))
+    .with_context(|| missing_index_hint(&dir))?;
+  let result = match vorpal_query::run(&kg, &arg.text) {
+    Ok(result) => result,
+    Err(err) => {
+      // Query mistakes are user-facing teaching errors, not stack noise: print the typed
+      // message (it names the byte offset / boundary / ceiling) and exit nonzero.
+      eprintln!("{err}");
+      return Ok(ExitCode::FAILURE);
+    }
+  };
+  match arg.format {
+    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+    _ => {
+      println!("{}", result.columns.join(" | "));
+      for row in &result.rows {
+        println!(
+          "{}",
+          row.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ")
+        );
+      }
+      let shown = result.rows.len() as u64;
+      if shown != result.total_rows {
+        println!("({shown} of {} rows)", result.total_rows);
+      } else {
+        println!("({shown} row{})", if shown == 1 { "" } else { "s" });
+      }
+    }
+  }
+  Ok(ExitCode::SUCCESS)
 }
 
 #[derive(Args)]
@@ -166,7 +230,9 @@ pub struct GraphArg {
   #[clap(long, value_name = "in|out|both", default_value = "in")]
   direction: String,
   /// (reachable) Comma-separated edge types to follow (calls, references, imports,
-  /// implements, of_type, defines, has_method, has_field, overrides). Default `calls`.
+  /// implements, of_type, defines, has_method, has_field, overrides, data_flows,
+  /// changes_with, similar_to, requests, notifies).
+  /// Default `calls`.
   #[clap(long, value_name = "RELS", default_value = "calls")]
   relations: String,
   /// (reachable) Maximum hops (0 = unbounded).
@@ -274,6 +340,49 @@ pub struct McpArg {
   /// `full` (everything).
   #[clap(long, default_value = "full")]
   profile: String,
+  /// Disable the proactive background rebuild (D1): the index then refreshes lazily on the
+  /// first query after a change instead of as soon as the tree goes quiet.
+  #[clap(long)]
+  no_watch_rebuild: bool,
+  /// Serve every enrolled project from this one daemon (registry: `vorpal mcp allow`).
+  #[clap(long)]
+  projects: bool,
+  #[clap(subcommand)]
+  action: Option<McpAction>,
+}
+
+/// Registry management — the HUMAN-ONLY enrollment surface. These commands exist exactly so
+/// that the MCP protocol never has to (and never can) touch the registry: a confirmation
+/// delivered through MCP would be answered by the same agent that may have been influenced.
+#[derive(clap::Subcommand)]
+pub enum McpAction {
+  /// Enroll a source root so `vorpal mcp --projects` may serve it.
+  Allow {
+    /// Source directory to enroll.
+    path: PathBuf,
+    /// Project name (default: the directory name).
+    #[clap(long)]
+    name: Option<String>,
+    /// Index root (default: `<path>/.vorpal/index`).
+    #[clap(long)]
+    index: Option<PathBuf>,
+  },
+  /// Remove an enrolled project by name.
+  Deny { name: String },
+  /// List enrolled projects.
+  Projects,
+  /// Write this machine's MCP client configs to launch vorpal (idempotent; backups taken).
+  Install {
+    /// Which client to configure.
+    #[clap(long, value_enum, default_value = "all")]
+    client: crate::mcp_install::Client,
+    /// Command to write into the config (default: this executable's absolute path).
+    #[clap(long)]
+    command: Option<String>,
+    /// Print what would be written without touching anything.
+    #[clap(long)]
+    dry_run: bool,
+  },
 }
 
 fn index_dir(explicit: Option<PathBuf>) -> PathBuf {
@@ -284,16 +393,180 @@ fn boxed(err: Box<dyn std::error::Error>) -> anyhow::Error {
   anyhow!(err.to_string())
 }
 
-pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
+/// The extraction environment a project configures (F-M3): each custom language's declared
+/// `outlineRules` file becomes a rule source whose origin is the path exactly as written in
+/// the config — relative, so the rules digest is machine-independent. An unreadable rules
+/// file is a hard error naming it; a custom language declaring none is reported (pattern-only,
+/// not indexed), never silently skipped.
+/// Union every enrolled project's custom-language declarations into ONE registration map
+/// (D4 v2): library paths absolutize per project; an extension may have one owner; an
+/// extension routing to a builtin grammar refuses (shadowing cannot be consented to
+/// per-project); one language name must mean one definition. Every refusal names the
+/// projects involved.
+fn union_custom_languages(
+  declared: Vec<(String, PathBuf, std::collections::HashMap<String, CustomLang>)>,
+) -> Result<std::collections::HashMap<String, CustomLang>> {
+  let mut union: std::collections::HashMap<String, (CustomLang, String)> = Default::default();
+  let mut claimed_ext: std::collections::HashMap<String, (String, String)> = Default::default();
+  for (project, project_dir, customs) in declared {
+    let mut customs: Vec<(String, CustomLang)> = customs.into_iter().collect();
+    customs.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic refusal order
+    for (lang_name, custom) in customs {
+      let custom = absolutized_custom(custom, &project_dir);
+      for ext in &custom.extensions {
+        let probe = format!("probe.{ext}");
+        // Customs are not yet registered, so the registry router answers builtins only.
+        if matches!(
+          vorpal_lang_registry::from_path(std::path::Path::new(&probe)),
+          Some(vorpal_lang_registry::SgLang::Builtin(_))
+        ) {
+          return Err(anyhow!(
+            "project '{project}': custom language '{lang_name}' claims extension '.{ext}', \
+             which routes to a builtin grammar — shadowing a builtin cannot be consented \
+             to per-project; multi-project serving refuses it"
+          ));
+        }
+        if let Some((other_lang, other_project)) =
+          claimed_ext.insert(ext.clone(), (lang_name.clone(), project.clone()))
+        {
+          if other_lang != lang_name {
+            return Err(anyhow!(
+              "extension '.{ext}' is claimed by custom language '{lang_name}' \
+               (project '{project}') and '{other_lang}' (project '{other_project}') — \
+               multi-project serving needs one owner per extension"
+            ));
+          }
+        }
+      }
+      match union.entry(lang_name.clone()) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+          slot.insert((custom, project.clone()));
+        }
+        std::collections::hash_map::Entry::Occupied(existing) => {
+          let (registered, first_project) = existing.get();
+          if !same_custom(registered, &custom) {
+            return Err(anyhow!(
+              "custom language '{lang_name}' is declared differently by projects \
+               '{first_project}' and '{project}' (library/symbol/extensions differ) — \
+               multi-project serving needs one definition per language name"
+            ));
+          }
+        }
+      }
+    }
+  }
+  Ok(union.into_iter().map(|(lang, (custom, _))| (lang, custom)).collect())
+}
+
+/// Resolve a custom language's library paths against its project dir, so the union
+/// registration's shared base is inert (Path::join with an absolute path yields it).
+fn absolutized_custom(mut custom: CustomLang, project_dir: &Path) -> CustomLang {
+  use vorpal_dynamic::LibraryPath;
+  custom.library_path = match custom.library_path {
+    LibraryPath::Single(path) => LibraryPath::Single(project_dir.join(path)),
+    LibraryPath::Platform(map) => LibraryPath::Platform(
+      map.into_iter().map(|(target, path)| (target, project_dir.join(path))).collect(),
+    ),
+  };
+  custom
+}
+
+/// Two declarations describe the same registration (name-collision check).
+fn same_custom(a: &CustomLang, b: &CustomLang) -> bool {
+  use vorpal_dynamic::LibraryPath;
+  let libs_equal = match (&a.library_path, &b.library_path) {
+    (LibraryPath::Single(x), LibraryPath::Single(y)) => x == y,
+    (LibraryPath::Platform(x), LibraryPath::Platform(y)) => x == y,
+    _ => false,
+  };
+  libs_equal
+    && a.language_symbol == b.language_symbol
+    && a.extensions == b.extensions
+    && a.expando_char == b.expando_char
+    && a.meta_var_char == b.meta_var_char
+}
+
+fn extraction_env_from_project(
+  project: Option<&ProjectConfig>,
+) -> Result<vorpal_index::ExtractionEnv> {
+  let mut env = vorpal_index::ExtractionEnv::default();
+  let Some(project) = project else {
+    return Ok(env);
+  };
+  let Some(customs) = project.custom_languages.as_ref() else {
+    return Ok(env);
+  };
+  let mut pattern_only: Vec<&str> = Vec::new();
+  for (name, lang) in customs {
+    if lang.outline_rules.is_none() && lang.ref_spec.is_none() {
+      pattern_only.push(name);
+      continue;
+    }
+    if let Some(declared) = lang.outline_rules.as_ref() {
+      let path = project.project_dir.join(declared);
+      let yaml = std::fs::read_to_string(&path).with_context(|| {
+        format!("reading outline rules for custom language '{name}': {}", path.display())
+      })?;
+      env.outline_sources.push(vorpal_index::RuleSource {
+        origin: declared.to_string_lossy().into_owned(),
+        yaml,
+      });
+    }
+    if let Some(declared) = lang.ref_spec.as_ref() {
+      let path = project.project_dir.join(declared);
+      let yaml = std::fs::read_to_string(&path).with_context(|| {
+        format!("reading ref spec for custom language '{name}': {}", path.display())
+      })?;
+      env.ref_spec_sources.push(vorpal_index::RuleSource {
+        origin: declared.to_string_lossy().into_owned(),
+        yaml,
+      });
+    }
+    if let Some(canary) = lang.canary.as_ref() {
+      env.canaries.push(vorpal_index::DynamicCanary {
+        lang: name.clone(),
+        path: canary.path.clone(),
+        source: canary.source.clone(),
+        min_items: canary.min_items,
+        min_refs: canary.min_refs,
+      });
+    }
+  }
+  // languageInjections shape index extraction (C3a) — fold the exact config bytes into the
+  // rules digest so editing an injection rule re-keys products like an outline-rule edit.
+  if !project.language_injections.is_empty() {
+    let yaml = serde_yaml::to_string(&project.language_injections)
+      .context("serializing languageInjections for the extraction identity")?;
+    env.injection_config = Some(vorpal_index::RuleSource {
+      origin: "vorpalconfig.yml#languageInjections".into(),
+      yaml,
+    });
+  }
+  if !pattern_only.is_empty() {
+    pattern_only.sort_unstable();
+    println!(
+      "note: {} custom language(s) declare no outlineRules and are pattern-only, not indexed: {}",
+      pattern_only.len(),
+      pattern_only.join(", ")
+    );
+  }
+  Ok(env)
+}
+
+pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
   let out = arg.out.unwrap_or_else(|| arg.src.join(DEFAULT_INDEX_DIR));
   let mode = if arg.verify {
     vorpal_index::CacheMode::Verified
   } else {
     vorpal_index::CacheMode::default()
   };
-  let report = vorpal_index::build_index_with(&arg.src, &out, mode)
-    .map_err(boxed)
-    .with_context(|| format!("indexing {}", arg.src.display()))?;
+  // Custom/dynamic languages were registered at CLI setup (the one-shot dlopen); here their
+  // configured outline rules extend extraction (F-M3). No project config = bundled behavior.
+  let env = extraction_env_from_project(project.ok().as_ref())?;
+  let report =
+    vorpal_index::build_index_env(&arg.src, &out, mode, Default::default(), &env)
+      .map_err(boxed)
+      .with_context(|| format!("indexing {}", arg.src.display()))?;
   if report.reused {
     if report.indexed > 0 {
       // The stamp-only cutoff: files re-extracted and proven extraction-identical, stamps
@@ -323,6 +596,30 @@ pub fn run_index(arg: IndexArg) -> Result<ExitCode> {
         report.error_files, report.error_nodes
       );
     }
+    match &report.cochange_note {
+      Some(note) => println!("note: {note}"),
+      None => println!("co-change: {} file pairs from git history", report.cochange_edges),
+    }
+    match &report.similar_note {
+      Some(note) => println!("near-clones: {note}"),
+      None => println!("near-clones: {} similar_to pairs from token sketches", report.similar_edges),
+    }
+    if report.request_sites > 0 {
+      println!(
+        "requests: {} of {} request/emit sites linked to routes/channels",
+        report.request_edges, report.request_sites
+      );
+    }
+    if let Some(note) = &report.request_note {
+      println!("requests: {note}");
+    }
+  }
+  if !report.unverified_langs.is_empty() {
+    println!(
+      "note: {} dynamic language(s) indexed without a canary (best-effort, unverified): {} —        add `canary:` to their custom language config",
+      report.unverified_langs.len(),
+      report.unverified_langs.join(", ")
+    );
   }
   if report.cache_mode != "fast-stat" {
     println!("cache mode: {}", report.cache_mode);
@@ -346,6 +643,131 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
       OutputFormat::Toon | OutputFormat::Lean | OutputFormat::Ids => {
         anyhow::bail!("schema is a single report — use --format text or json")
+      }
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Flows) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let name = arg
+      .name
+      .clone()
+      .ok_or_else(|| anyhow!("`graph flows` needs a symbol name"))?;
+    let eid = match arg.eid.as_deref() {
+      Some(hex) => Some(
+        u128::from_str_radix(hex, 16)
+          .map_err(|_| anyhow::anyhow!("malformed external id '{hex}' (expect 32 hex chars)"))?,
+      ),
+      None => None,
+    };
+    let target = vorpal_index::GraphTarget {
+      name,
+      id: arg.id,
+      external_id: eid,
+      path_suffix: arg.path.clone(),
+      kind: arg.kind.clone(),
+      merge_all: arg.all,
+      show_ids: arg.ids,
+    };
+    let (records, sidecar_present) =
+      vorpal_index::records::flow_records(&kg, &gen_dir, &target).map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => {
+        if !sidecar_present {
+          println!(
+            "no data-flow sidecar in this generation (built before flows existed) — rebuild              the index to record flows"
+          );
+        } else if records.is_empty() {
+          println!("no outgoing data flows recorded for this selection");
+        }
+        for r in &records {
+          println!(
+            "{} --arg#{}({}{})--> {} param#{} [{}]",
+            r.from_name,
+            r.arg_index,
+            r.class,
+            r.expr.as_deref().map(|e| format!(" {e}")).unwrap_or_default(),
+            r.to_name,
+            if r.param_index == u16::MAX { "?".to_string() } else { r.param_index.to_string() },
+            r.to_path
+          );
+        }
+      }
+      _ => {
+        let value = serde_json::json!({
+          "sidecarPresent": sidecar_present,
+          "records": records,
+        });
+        match arg.format {
+          OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+          _ => print!("{}", emit_machine(arg.format, &value)?),
+        }
+      }
+    }
+    return Ok(ExitCode::SUCCESS);
+  }
+
+  if matches!(arg.verb, GraphVerb::Observed) {
+    let kg = vorpal_index::Kg::load(&dir)
+      .map_err(|err| anyhow::anyhow!(err.to_string()))
+      .with_context(|| missing_index_hint(&dir))?;
+    let gen_dir = vorpal_index::resolve_index_dir(&dir);
+    let name = arg
+      .name
+      .clone()
+      .ok_or_else(|| anyhow!("`graph observed` needs a symbol name"))?;
+    let eid = match arg.eid.as_deref() {
+      Some(hex) => Some(
+        u128::from_str_radix(hex, 16)
+          .map_err(|_| anyhow::anyhow!("malformed external id '{hex}' (expect 32 hex chars)"))?,
+      ),
+      None => None,
+    };
+    let target = vorpal_index::GraphTarget {
+      name,
+      id: arg.id,
+      external_id: eid,
+      path_suffix: arg.path.clone(),
+      kind: arg.kind.clone(),
+      merge_all: arg.all,
+      show_ids: arg.ids,
+    };
+    let (records, sidecar_present) =
+      vorpal_index::records::observed_records(&kg, &gen_dir, &target).map_err(anyhow::Error::msg)?;
+    match arg.format {
+      OutputFormat::Text => {
+        if !sidecar_present {
+          println!(
+            "no observed-calls sidecar for this generation — ingest runtime traces with \
+             `vorpal-index ingest-traces <index> <folded-stacks>` (a rebuild invalidates it)"
+          );
+        } else if records.is_empty() {
+          println!("no observed calls recorded for this selection");
+        }
+        for r in &records {
+          println!(
+            "{} {} x{} {}{}",
+            if r.direction == "in" { "<-observed-" } else { "-observed->" },
+            r.counterpart_name,
+            r.count,
+            r.counterpart_path,
+            if r.in_static_graph { "" } else { "  (not in the static graph)" }
+          );
+        }
+      }
+      _ => {
+        let value = serde_json::json!({
+          "sidecarPresent": sidecar_present,
+          "records": records,
+        });
+        match arg.format {
+          OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&value)?),
+          _ => print!("{}", emit_machine(arg.format, &value)?),
+        }
       }
     }
     return Ok(ExitCode::SUCCESS);
@@ -641,7 +1063,8 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       let kg = vorpal_index::Kg::load(&dir)
         .map_err(|err| anyhow::anyhow!(err.to_string()))
         .with_context(|| missing_index_hint(&dir))?;
-      vorpal_index::reachable_query_on(&kg, &target, *direction, relations, *max_depth, *min_confidence)
+      let gen_dir = vorpal_index::resolve_index_dir(&dir);
+      vorpal_index::reachable_query_on(&kg, Some(&gen_dir), &target, *direction, relations, *max_depth, *min_confidence)
         .map_err(boxed)?
     }
     (OutputFormat::Text, None) => vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
@@ -657,6 +1080,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
           vorpal_index::records::selected_page_value(
             vorpal_index::records::reach_records_page(
               &kg,
+              Some(vorpal_index::resolve_index_dir(&dir)).as_deref(),
               &target,
               *direction,
               relations,
@@ -772,10 +1196,92 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
   Ok(ExitCode::SUCCESS)
 }
 
-pub fn run_mcp(arg: McpArg) -> Result<ExitCode> {
+pub fn run_mcp(arg: McpArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
+  if let Some(action) = arg.action {
+    return run_mcp_action(action);
+  }
   let profile = vorpal_mcp::Profile::parse(&arg.profile)
     .ok_or_else(|| anyhow!("--profile must be full, analysis, or scout"))?;
-  vorpal_mcp::serve_stdio_profiled(index_dir(arg.index), profile)?;
+  if arg.projects {
+    // Per-project custom languages (D4 v2): union-register every enrolled project's
+    // dynamic grammars in THIS process, at launch — the serving loop still can never
+    // dlopen — and hand each project its own extraction environment.
+    let mut envs = std::collections::BTreeMap::new();
+    let mut declared: Vec<(String, PathBuf, std::collections::HashMap<String, CustomLang>)> =
+      Vec::new();
+    for (name, src, _index) in vorpal_mcp::enrolled_projects()? {
+      let Some(config) = ProjectConfig::load_unregistered(&src)
+        .with_context(|| format!("loading project '{name}' config at {}", src.display()))?
+      else {
+        continue; // no config file: builtin grammars, default env
+      };
+      if config.language_globs.is_some() {
+        return Err(anyhow!(
+          "project '{name}' declares languageGlobs, which rebind builtin file routing \
+           process-wide — multi-project serving refuses them (run that project as a \
+           single-project daemon: `vorpal mcp --index …`)"
+        ));
+      }
+      declared.push((
+        name.clone(),
+        config.project_dir.clone(),
+        config.custom_languages.clone().unwrap_or_default(),
+      ));
+      envs.insert(name.clone(), extraction_env_from_project(Some(&config))?);
+      // Injectable registrations are per-env on the index path (C3a); the global
+      // injectable set only affects run/scan, which this daemon never serves.
+    }
+    let merged = union_custom_languages(declared)?;
+    if !merged.is_empty() {
+      // Library paths were absolutized per project inside the union; the base is inert.
+      vorpal_lang_registry::SgLang::register_custom_language(std::path::Path::new("/"), merged)
+        .map_err(|err| anyhow!("union custom-language registration failed: {err}"))?;
+    }
+    vorpal_mcp::serve_stdio_projects_with_envs(profile, envs)?;
+    return Ok(ExitCode::SUCCESS);
+  }
+  // Custom languages were registered (the one-shot dlopen) at CLI setup, before serving
+  // begins; the daemon itself can never load code. Its rebuilds run under the same
+  // extraction environment `vorpal index` uses.
+  let env = extraction_env_from_project(project.ok().as_ref())?;
+  vorpal_mcp::serve_stdio_opts(index_dir(arg.index), profile, env, !arg.no_watch_rebuild)?;
+  Ok(ExitCode::SUCCESS)
+}
+
+fn run_mcp_action(action: McpAction) -> Result<ExitCode> {
+  match action {
+    McpAction::Allow { path, name, index } => {
+      let (name, entry, file) =
+        vorpal_mcp::registry::enroll(&path, name.as_deref(), index.as_deref())
+          .map_err(|err| anyhow!(err))?;
+      println!(
+        "enrolled '{name}': src={} index={} ({})",
+        entry.src.display(),
+        entry.index.display(),
+        file.display()
+      );
+    }
+    McpAction::Deny { name } => {
+      let file = vorpal_mcp::registry::remove(&name).map_err(|err| anyhow!(err))?;
+      println!("removed '{name}' ({})", file.display());
+    }
+    McpAction::Install {
+      client,
+      command,
+      dry_run,
+    } => {
+      crate::mcp_install::run_install(client, command.as_deref(), dry_run)?;
+    }
+    McpAction::Projects => {
+      let projects = vorpal_mcp::registry::load().map_err(|err| anyhow!(err))?;
+      if projects.is_empty() {
+        println!("no projects enrolled (enroll one: `vorpal mcp allow <path>`)");
+      }
+      for (name, entry) in projects {
+        println!("{name}  src={}  index={}", entry.src.display(), entry.index.display());
+      }
+    }
+  }
   Ok(ExitCode::SUCCESS)
 }
 
@@ -790,5 +1296,98 @@ fn snippet_error(err: vorpal_index::records::SnippetError) -> anyhow::Error {
   match err {
     vorpal_index::records::SnippetError::Stale(message)
     | vorpal_index::records::SnippetError::Other(message) => anyhow!(message),
+  }
+}
+
+#[cfg(test)]
+mod union_tests {
+  use super::*;
+  use std::collections::HashMap;
+  use vorpal_dynamic::LibraryPath;
+
+  fn custom(lib: &str, exts: &[&str]) -> CustomLang {
+    CustomLang {
+      library_path: LibraryPath::Single(PathBuf::from(lib)),
+      language_symbol: None,
+      meta_var_char: None,
+      expando_char: None,
+      extensions: exts.iter().map(|e| e.to_string()).collect(),
+      outline_rules: None,
+      ref_spec: None,
+      canary: None,
+    }
+  }
+
+  #[test]
+  fn union_absolutizes_and_shares_identical_declarations() {
+    let merged = union_custom_languages(vec![
+      (
+        "a".into(),
+        PathBuf::from("/proj/a"),
+        HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+      ),
+      (
+        // The SAME declaration from another project dir differs after absolutization —
+        // identical only when the resolved paths agree.
+        "b".into(),
+        PathBuf::from("/proj/a"),
+        HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+      ),
+    ])
+    .expect("identical declarations merge");
+    assert_eq!(merged.len(), 1);
+    match &merged["zed"].library_path {
+      LibraryPath::Single(path) => assert_eq!(path, &PathBuf::from("/proj/a/libs/zed.so")),
+      LibraryPath::Platform(_) => panic!("single-path declaration must stay single"),
+    }
+  }
+
+  #[test]
+  fn union_refuses_conflicts_by_name() {
+    let refusals = [
+      // Same name, different libraries (different project dirs absolutize apart).
+      union_custom_languages(vec![
+        (
+          "a".into(),
+          PathBuf::from("/proj/a"),
+          HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+        ),
+        (
+          "b".into(),
+          PathBuf::from("/proj/b"),
+          HashMap::from([("zed".to_string(), custom("libs/zed.so", &["zed"]))]),
+        ),
+      ]),
+      // Same extension, two owners.
+      union_custom_languages(vec![
+        (
+          "a".into(),
+          PathBuf::from("/proj/a"),
+          HashMap::from([("zed".to_string(), custom("z.so", &["zz"]))]),
+        ),
+        (
+          "b".into(),
+          PathBuf::from("/proj/b"),
+          HashMap::from([("qux".to_string(), custom("q.so", &["zz"]))]),
+        ),
+      ]),
+      // Shadowing a builtin extension.
+      union_custom_languages(vec![(
+        "a".into(),
+        PathBuf::from("/proj/a"),
+        HashMap::from([("pyx".to_string(), custom("p.so", &["py"]))]),
+      )]),
+    ];
+    let messages: Vec<String> = refusals
+      .into_iter()
+      .map(|r| match r {
+        Err(err) => err.to_string(),
+        Ok(_) => panic!("must refuse"),
+      })
+      .collect();
+    assert!(messages[0].contains("declared differently"), "{}", messages[0]);
+    assert!(messages[0].contains("'a'") && messages[0].contains("'b'"), "{}", messages[0]);
+    assert!(messages[1].contains("one owner per extension"), "{}", messages[1]);
+    assert!(messages[2].contains("routes to a builtin"), "{}", messages[2]);
   }
 }

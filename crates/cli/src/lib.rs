@@ -5,6 +5,7 @@ mod graph_filter;
 mod kg;
 mod lang;
 mod lsp;
+mod mcp_install;
 mod new;
 mod outline;
 mod print;
@@ -23,7 +24,7 @@ use std::{path::PathBuf, process::ExitCode};
 use completions::{CompletionsArg, run_shell_completion};
 use config::ProjectConfig;
 use grammars::{GrammarsArg, run_grammars};
-use kg::{GraphArg, IndexArg, McpArg, SearchArg, run_graph, run_index, run_mcp, run_search};
+use kg::{GraphArg, IndexArg, McpArg, QueryArg, SearchArg, run_graph, run_index, run_mcp, run_query, run_search};
 use lsp::{LspArg, run_language_server};
 use new::{NewArg, run_create_new};
 use outline::{OutlineArg, run_outline};
@@ -74,6 +75,8 @@ enum Commands {
   Index(IndexArg),
   /// Query the knowledge graph (callers, refs, importers, implementors, typeusers, node).
   Graph(GraphArg),
+  /// Cypher-shaped read-only queries over the knowledge graph.
+  Query(QueryArg),
   /// Semantic search over indexed definitions.
   Search(SearchArg),
   /// List the tree-sitter grammars compiled into this binary (versions, generation digests).
@@ -173,11 +176,12 @@ pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
     Commands::New(arg) => run_create_new(arg, project),
     Commands::Lsp(arg) => run_language_server(arg, project).map(|_| ExitCode::SUCCESS),
     Commands::Outline(arg) => run_outline(arg, project),
-    Commands::Index(arg) => run_index(arg),
+    Commands::Index(arg) => run_index(arg, project),
     Commands::Graph(arg) => run_graph(arg),
+    Commands::Query(arg) => run_query(arg),
     Commands::Search(arg) => run_search(arg),
     Commands::Grammars(arg) => run_grammars(arg),
-    Commands::Mcp(arg) => run_mcp(arg),
+    Commands::Mcp(arg) => run_mcp(arg, project),
     Commands::Completions(arg) => run_shell_completion::<App>(arg),
     #[cfg(debug_assertions)]
     Commands::Docs => todo!("todo, generate rule docs based on current config"),
@@ -210,7 +214,15 @@ mod test_cli {
       "search kfree($X) --code --lang c -k 30",
       "mcp --index /tmp/idx",
       "mcp --profile scout",
+      "mcp --no-watch-rebuild",
+      "mcp --projects --profile analysis",
+      "mcp allow . --name self",
+      "mcp deny self",
+      "mcp projects",
+      "mcp install --client claude-code --dry-run",
+      "mcp install --command /usr/local/bin/vorpal",
       "graph coverage",
+      "graph flows source --path a.py",
       "graph coverage --format json --limit 10",
       "graph impact --since origin/main --src . --depth 3",
       "graph impact --relations calls,references --min-grade constrained --format json",
@@ -221,6 +233,10 @@ mod test_cli {
       "graph callers seal --format toon",
       "graph callers seal --format lean",
       "graph node Kg --format ids --limit 500",
+      // The query text is a single positional (spaces live inside the shell-quoted arg;
+      // this table splits on spaces, so the row uses a space-free query).
+      "query MATCH(f:Function)RETURN(f.name)",
+      "query q --index /tmp/idx --format json",
     ] {
       sg(args).unwrap_or_else(|e| panic!("`vorpal {args}` should parse: {e}"));
     }

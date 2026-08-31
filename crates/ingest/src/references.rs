@@ -23,10 +23,13 @@ use std::sync::LazyLock;
 use vorpal_core::tree_sitter::{PreWithDepth, StrDoc};
 use vorpal_core::{Language, Node};
 use vorpal_kg::NodeId;
+use vorpal_lang_registry::SgLang;
 use vorpal_language::SupportLang;
 use vorpal_resolve::{RefForm, RefKind};
 
-type SgNode<'t> = Node<'t, StrDoc<SupportLang>>;
+type SgNode<'t> = Node<'t, StrDoc<SgLang>>;
+/// The walk's node type, exported for the typefacts capture module (same doc, same lifetime).
+pub(crate) type SgNodeAlias<'t> = SgNode<'t>;
 
 /// One extracted reference, file-locally attributed: `from` indexes the file's local
 /// definition layout (see `local_layout`). Deliberately path-free — the enclosing file's path
@@ -43,6 +46,37 @@ pub(crate) struct RawRef<'t> {
   pub(crate) form: RefForm,
   /// Aliased-import local rebinding (`as z`), when the grammar provides one.
   pub(crate) alias: Option<Cow<'t, str>>,
+  /// The receiver's SIMPLE spelling for method-form calls (`x.helper()` → `x`), captured
+  /// only when the receiver is a bare name a file-local binding could type (G-M1). Complex
+  /// receiver expressions stay `None` — never guessed at.
+  pub(crate) receiver: Option<Cow<'t, str>>,
+  /// Per-argument records at the call site (G-M1, consumed by data-flow in G-M3).
+  pub(crate) args: Vec<RawArg<'t>>,
+}
+
+/// One call-site argument: position, traceability class, keyword name (Python), and — for
+/// traceable classes only — the expression text capped at 64 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawArg<'t> {
+  pub(crate) index: u16,
+  pub(crate) class: ArgClass,
+  pub(crate) kw_name: Option<Cow<'t, str>>,
+  pub(crate) expr: Option<Cow<'t, str>>,
+}
+
+/// Argument shape classification — what a static data-flow pass can and cannot follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgClass {
+  /// A bare variable name: traceable.
+  Var = 0,
+  /// A field/member access chain: traceable as an access path.
+  FieldAccess = 1,
+  /// The result of a nested call: traceable one hop (the producing call).
+  CallResult = 2,
+  /// A literal: a value, not a flow.
+  Literal = 3,
+  /// Anything else (arithmetic, closures, comprehensions …): opaque.
+  Other = 4,
 }
 
 impl<'t> RawRef<'t> {
@@ -50,6 +84,8 @@ impl<'t> RawRef<'t> {
     Self {
       from,
       name,
+      receiver: None,
+      args: Vec::new(),
       kind,
       start,
       end,
@@ -121,12 +157,76 @@ struct ImportSpec {
 }
 
 /// Classification of a call by its extracted callee text.
-enum TextAction {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TextAction {
   /// A definition form (`def`, `defmodule`, …): emit nothing and suppress the definition-head
   /// call (`def foo(x)` parses `foo(x)` as a call — it is a definition, not a call site).
   SkipDefinition,
   /// The call imports its first argument (`require 'x'`, `source ./x`, `alias Foo.Bar`).
   ImportFirstArg,
+}
+
+/// Where a route construct's handler name lives.
+#[derive(Clone, Copy)]
+enum HandlerAt {
+  /// The last argument that names something (Express `app.get("/x", auth, handler)`, Go
+  /// `HandleFunc("/x", h)`, Django `path("x", views.detail, name=…)`); closures, objects,
+  /// literals, and keyword arguments name nothing and are skipped.
+  LastArgument,
+  /// The argument at `index` (0-based, named children), unwrapped once when it is itself a
+  /// call — axum's `route("/x", get(handler))` names the handler inside `get(…)`.
+  UnwrappedArgument(u8),
+  /// The declaration the construct decorates: the nearest ancestor of one of `ancestors`
+  /// (optionally through its `via` field), whose `name` field is the handler.
+  DecoratedDefinition {
+    ancestors: &'static [&'static str],
+    via: Option<&'static str>,
+  },
+  /// The next named sibling of one of `kinds` — its `name` field is the handler (Rust
+  /// attribute items, TypeScript method decorators).
+  NextSibling(&'static [&'static str]),
+}
+
+/// An HTTP route registration construct. The outline rule with the same predicate creates
+/// the `Route` item spanning the construct; the walk emits a `calls` reference from that
+/// item to the handler, so a route "calls" its handler like any other caller and every
+/// caller/reachability/impact surface sees endpoints without special cases.
+struct RouteSpec {
+  kind: &'static str,
+  /// Navigation from the construct to the node whose name is the verb or registrar (`get`,
+  /// `HandleFunc`, `GetMapping`), checked against `names`.
+  name: &'static [Sel],
+  names: &'static [&'static str],
+  /// Navigation to the argument list holding the path literal.
+  args: &'static [Sel],
+  /// Accept any string literal as the path. Otherwise the literal must start with `/` or be
+  /// a `VERB /path` pattern — the shape that separates `app.get("/x", h)` from `map.get(k)`.
+  path_any: bool,
+  handler: HandlerAt,
+}
+
+/// An HTTP client call site (`fetch("/api/users")`, `requests.get(url)`): matching nodes
+/// record a request (method + literal URL) for link-time matching against `Route` nodes.
+/// Literal URLs only — a URL built from variables records nothing.
+struct RequestSpec {
+  kind: &'static str,
+  /// Navigation to the callee node.
+  name: &'static [Sel],
+  /// Callee names that ARE the HTTP verb (`get`, `Post`).
+  verb_names: &'static [&'static str],
+  /// Callee names implying GET (`fetch` without an options argument is a GET).
+  get_names: &'static [&'static str],
+  /// Callee names that EMIT an event (`emit`, `publish`): the record's method is `EVENT`
+  /// and the first string literal (any shape) is the topic — matched against `Channel`
+  /// registrations, where fan-out is expected and every match links.
+  event_names: &'static [&'static str],
+  /// Receiver spellings that mark an HTTP client (`axios`, `requests`, `http`); empty
+  /// means the callee name alone suffices (`fetch`).
+  receivers: &'static [&'static str],
+  args: &'static [Sel],
+  /// The argument (0-based, named children) carrying the method as a string literal
+  /// (`http.NewRequest("GET", url, …)`); the verb from the name is ignored then.
+  method_from_arg: Option<u8>,
 }
 
 /// An implements/extends construct: matching nodes emit `implements` references for their type
@@ -161,6 +261,10 @@ pub(crate) struct RefSpec {
   method_callee_kinds: &'static [&'static str],
   /// Receiver spellings that denote the enclosing type (`self`, `this`, `$this`).
   self_receivers: &'static [&'static str],
+  /// HTTP route registration constructs (see [`RouteSpec`]).
+  routes: &'static [RouteSpec],
+  /// HTTP client call constructs (see [`RequestSpec`]).
+  requests: &'static [RequestSpec],
   /// Body-less type WRAPPER kinds: in `struct X y;` the wrapper's `name` field IS the
   /// type being used, so the generic definition-name skip must not eat it. A wrapper
   /// WITH a body is the definition itself and stays skipped. Measured before this
@@ -187,8 +291,227 @@ const SPEC_DEFAULTS: RefSpec = RefSpec {
   static_callee_kinds: NO_KINDS,
   method_callee_kinds: NO_KINDS,
   self_receivers: NO_KINDS,
+  routes: &[],
+  requests: &[],
   type_ref_wrappers: NO_KINDS,
 };
+
+// ---- Owned spec data (F-M4) ---------------------------------------------------------------
+//
+// The walk consumes these owned twins so specs can come from *data* (serialized YAML for
+// dynamic languages) as well as from the `&'static` authoring consts above. The consts remain
+// the builtin authoring format; `From<&RefSpec>` lifts them into data once, at dispatch-table
+// build. Field names mirror the static structs 1:1 so the walk reads identically.
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SelData {
+  Field(String),
+  FieldLast(String),
+  FirstNamedChild,
+  ChildOfKind(Vec<String>),
+}
+
+impl From<&Sel> for SelData {
+  fn from(sel: &Sel) -> Self {
+    match sel {
+      Sel::Field(name) => SelData::Field((*name).into()),
+      Sel::FieldLast(name) => SelData::FieldLast((*name).into()),
+      Sel::FirstNamedChild => SelData::FirstNamedChild,
+      Sel::ChildOfKind(kinds) => {
+        SelData::ChildOfKind(kinds.iter().map(|k| (*k).into()).collect())
+      }
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum QualSourceData {
+  None,
+  NodeField(String),
+  TargetPath,
+}
+
+impl From<QualSource> for QualSourceData {
+  fn from(source: QualSource) -> Self {
+    match source {
+      QualSource::None => QualSourceData::None,
+      QualSource::NodeField(field) => QualSourceData::NodeField(field.into()),
+      QualSource::TargetPath => QualSourceData::TargetPath,
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CallSpecData {
+  pub(crate) kind: String,
+  pub(crate) callee: SelData,
+  pub(crate) receiver_field: Option<String>,
+  pub(crate) scope_field: Option<String>,
+}
+
+impl From<&CallSpec> for CallSpecData {
+  fn from(spec: &CallSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      callee: SelData::from(&spec.callee),
+      receiver_field: spec.receiver_field.map(Into::into),
+      scope_field: spec.scope_field.map(Into::into),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImportSpecData {
+  pub(crate) kind: String,
+  pub(crate) target: SelData,
+  pub(crate) string_target: bool,
+  pub(crate) qualifier: QualSourceData,
+}
+
+impl From<&ImportSpec> for ImportSpecData {
+  fn from(spec: &ImportSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      target: SelData::from(&spec.target),
+      string_target: spec.string_target,
+      qualifier: spec.qualifier.into(),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ImplSpecData {
+  pub(crate) kind: String,
+  pub(crate) target: Option<SelData>,
+}
+
+impl From<&ImplSpec> for ImplSpecData {
+  fn from(spec: &ImplSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      target: spec.target.as_ref().map(SelData::from),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum HandlerAtData {
+  LastArgument,
+  UnwrappedArgument(u8),
+  DecoratedDefinition {
+    ancestors: Vec<String>,
+    via: Option<String>,
+  },
+  NextSibling(Vec<String>),
+}
+
+impl From<&HandlerAt> for HandlerAtData {
+  fn from(at: &HandlerAt) -> Self {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).into()).collect() };
+    match at {
+      HandlerAt::LastArgument => HandlerAtData::LastArgument,
+      HandlerAt::UnwrappedArgument(index) => HandlerAtData::UnwrappedArgument(*index),
+      HandlerAt::DecoratedDefinition { ancestors, via } => HandlerAtData::DecoratedDefinition {
+        ancestors: owned(ancestors),
+        via: via.map(Into::into),
+      },
+      HandlerAt::NextSibling(kinds) => HandlerAtData::NextSibling(owned(kinds)),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RouteSpecData {
+  pub(crate) kind: String,
+  pub(crate) name: Vec<SelData>,
+  pub(crate) names: Vec<String>,
+  pub(crate) args: Vec<SelData>,
+  pub(crate) path_any: bool,
+  pub(crate) handler: HandlerAtData,
+}
+
+impl From<&RouteSpec> for RouteSpecData {
+  fn from(spec: &RouteSpec) -> Self {
+    Self {
+      kind: spec.kind.into(),
+      name: spec.name.iter().map(SelData::from).collect(),
+      names: spec.names.iter().map(|s| (*s).into()).collect(),
+      args: spec.args.iter().map(SelData::from).collect(),
+      path_any: spec.path_any,
+      handler: HandlerAtData::from(&spec.handler),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RequestSpecData {
+  pub(crate) kind: String,
+  pub(crate) name: Vec<SelData>,
+  pub(crate) verb_names: Vec<String>,
+  pub(crate) get_names: Vec<String>,
+  pub(crate) event_names: Vec<String>,
+  pub(crate) receivers: Vec<String>,
+  pub(crate) args: Vec<SelData>,
+  pub(crate) method_from_arg: Option<u8>,
+}
+
+impl From<&RequestSpec> for RequestSpecData {
+  fn from(spec: &RequestSpec) -> Self {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).into()).collect() };
+    Self {
+      kind: spec.kind.into(),
+      name: spec.name.iter().map(SelData::from).collect(),
+      verb_names: owned(spec.verb_names),
+      get_names: owned(spec.get_names),
+      event_names: owned(spec.event_names),
+      receivers: owned(spec.receivers),
+      args: spec.args.iter().map(SelData::from).collect(),
+      method_from_arg: spec.method_from_arg,
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RefSpecData {
+  pub(crate) calls: Vec<CallSpecData>,
+  pub(crate) imports: Vec<ImportSpecData>,
+  pub(crate) text_rules: Vec<(String, TextAction)>,
+  pub(crate) types: Vec<String>,
+  pub(crate) implements: Vec<ImplSpecData>,
+  pub(crate) type_params: Vec<String>,
+  pub(crate) type_placeholders: Vec<String>,
+  pub(crate) static_callee_kinds: Vec<String>,
+  pub(crate) method_callee_kinds: Vec<String>,
+  pub(crate) self_receivers: Vec<String>,
+  pub(crate) routes: Vec<RouteSpecData>,
+  pub(crate) requests: Vec<RequestSpecData>,
+  pub(crate) type_ref_wrappers: Vec<String>,
+}
+
+impl From<&RefSpec> for RefSpecData {
+  fn from(spec: &RefSpec) -> Self {
+    let owned = |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).into()).collect() };
+    Self {
+      calls: spec.calls.iter().map(CallSpecData::from).collect(),
+      imports: spec.imports.iter().map(ImportSpecData::from).collect(),
+      text_rules: spec
+        .text_rules
+        .iter()
+        .map(|(text, action)| ((*text).into(), *action))
+        .collect(),
+      types: owned(spec.types),
+      implements: spec.implements.iter().map(ImplSpecData::from).collect(),
+      type_params: owned(spec.type_params),
+      type_placeholders: owned(spec.type_placeholders),
+      static_callee_kinds: owned(spec.static_callee_kinds),
+      method_callee_kinds: owned(spec.method_callee_kinds),
+      self_receivers: owned(spec.self_receivers),
+      routes: spec.routes.iter().map(RouteSpecData::from).collect(),
+      requests: spec.requests.iter().map(RequestSpecData::from).collect(),
+      type_ref_wrappers: owned(spec.type_ref_wrappers),
+    }
+  }
+}
 
 const RUST: RefSpec = RefSpec {
   calls: &[CallSpec {
@@ -213,6 +536,40 @@ const RUST: RefSpec = RefSpec {
   static_callee_kinds: &["scoped_identifier"],
   method_callee_kinds: &["field_expression"],
   self_receivers: &["self"],
+  routes: &[
+    // axum: `.route("/x", get(handler))` — the handler sits inside the method call.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["route"],
+      args: &[Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::UnwrappedArgument(1),
+    },
+    // actix-web / rocket: `#[get("/x")]` decorates the next function item.
+    RouteSpec {
+      kind: "attribute_item",
+      name: &[
+        Sel::ChildOfKind(&["attribute"]),
+        Sel::ChildOfKind(&["identifier", "scoped_identifier"]),
+      ],
+      names: &["get", "post", "put", "delete", "patch", "head", "options", "route"],
+      args: &[Sel::ChildOfKind(&["attribute"]), Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::NextSibling(&["function_item"]),
+    },
+  ],
+  requests: &[RequestSpec {
+    // reqwest: client.get("http://…"), reqwest::get(…).
+    kind: "call_expression",
+    name: &[Sel::Field("function")],
+    verb_names: &["get", "post", "put", "delete", "patch", "head"],
+    get_names: &[],
+    event_names: &[],
+    receivers: &["client", "reqwest", "http_client"],
+    args: &[Sel::Field("arguments")],
+    method_from_arg: None,
+  }],
   ..SPEC_DEFAULTS
 };
 
@@ -242,6 +599,65 @@ const PYTHON: RefSpec = RefSpec {
   }],
   method_callee_kinds: &["attribute"],
   self_receivers: &["self", "cls"],
+  routes: &[
+    // Flask / FastAPI: `@app.get("/items/{id}")` decorates the definition below it.
+    RouteSpec {
+      kind: "decorator",
+      name: &[Sel::ChildOfKind(&["call"]), Sel::Field("function")],
+      names: &[
+        "get", "post", "put", "delete", "patch", "head", "options", "route", "api_route",
+        "websocket",
+      ],
+      args: &[Sel::ChildOfKind(&["call"]), Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::DecoratedDefinition {
+        ancestors: &["decorated_definition"],
+        via: Some("definition"),
+      },
+    },
+    // Django: `path("users/<int:id>/", views.detail)` inside `urlpatterns`.
+    RouteSpec {
+      kind: "call",
+      name: &[Sel::Field("function")],
+      names: &["path"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
+    // Event listeners: `bus.subscribe("user.created", handler)`.
+    RouteSpec {
+      kind: "call",
+      name: &[Sel::Field("function")],
+      names: &["subscribe", "on"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
+  ],
+  requests: &[
+    RequestSpec {
+      // requests.get("http://svc/x"), httpx.post(...), session/client verbs.
+      kind: "call",
+      name: &[Sel::Field("function")],
+      verb_names: &["get", "post", "put", "delete", "patch", "head", "options", "request"],
+      get_names: &[],
+      event_names: &[],
+      receivers: &["requests", "httpx", "client", "session", "http", "api"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    RequestSpec {
+      // bus.emit("user.created") / broker.publish("topic", …).
+      kind: "call",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &[],
+      event_names: &["emit", "publish", "dispatch"],
+      receivers: &[],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -260,6 +676,65 @@ const GO: RefSpec = RefSpec {
   types: TYPE_ID,
   type_params: &["type_parameter_list"],
   method_callee_kinds: &["selector_expression"],
+  routes: &[
+    // nc.Subscribe("subject", handler) — NATS-style listeners (Channel items).
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["Subscribe"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
+    // net/http, gorilla, gin, echo, chi, fiber: `HandleFunc("/x", h)` / `r.GET("/x", h)` /
+    // Go 1.22 `mux.HandleFunc("GET /x", h)` patterns.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &[
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "Get", "Post", "Put",
+        "Delete", "Patch", "Head", "Options", "Any", "HandleFunc", "Handle",
+      ],
+      args: &[Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::LastArgument,
+    },
+  ],
+  requests: &[
+    // nc.Publish("subject", data) — NATS-style emitters.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &[],
+      event_names: &["Publish"],
+      receivers: &[],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    // http.Get(url) / http.Head / http.PostForm — package-level client calls.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &["Get", "Post", "Head", "PostForm"],
+      get_names: &[],
+      event_names: &[],
+      receivers: &["http", "client", "resty"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    // http.NewRequest("GET", url, …) — the method is the first argument.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &["NewRequest", "NewRequestWithContext"],
+      get_names: &[],
+      event_names: &[],
+      receivers: &["http"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: Some(0),
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -287,6 +762,72 @@ const JS_LIKE: RefSpec = RefSpec {
   type_params: &["type_parameters"],
   method_callee_kinds: &["member_expression"],
   self_receivers: &["this"],
+  routes: &[
+    // Express / Koa / Fastify / Hono: `app.get("/x", …, handler)`.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["get", "post", "put", "delete", "patch", "head", "options", "all"],
+      args: &[Sel::Field("arguments")],
+      path_any: false,
+      handler: HandlerAt::LastArgument,
+    },
+    // NestJS: `@Get("cats/:id")` decorates the next method definition.
+    RouteSpec {
+      kind: "decorator",
+      name: &[Sel::ChildOfKind(&["call_expression"]), Sel::Field("function")],
+      names: &["Get", "Post", "Put", "Delete", "Patch", "Head", "Options", "All"],
+      args: &[Sel::ChildOfKind(&["call_expression"]), Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::NextSibling(&["method_definition"]),
+    },
+    // Event listeners: `bus.on("user.created", handler)` — the registration is a Channel
+    // item (outline rule) and calls its handler like a route does.
+    RouteSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      names: &["on", "once", "addListener", "subscribe"],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::LastArgument,
+    },
+  ],
+  requests: &[
+    // fetch("/api/users") — GET unless options say otherwise (v1 records GET).
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &["fetch"],
+      event_names: &[],
+      receivers: &[],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    // axios.get("/x") and friends — verb-named member calls on known client receivers.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &["get", "post", "put", "delete", "patch", "head", "options"],
+      get_names: &[],
+      event_names: &[],
+      receivers: &["axios", "http", "https", "client", "api", "ky", "got", "superagent", "agent"],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+    // bus.emit("user.created", …) — event emitters, any receiver; the topic must still
+    // match a registered Channel to link, so the match is the precision gate.
+    RequestSpec {
+      kind: "call_expression",
+      name: &[Sel::Field("function")],
+      verb_names: &[],
+      get_names: &[],
+      event_names: &["emit", "publish", "dispatch", "trigger", "broadcast"],
+      receivers: &[],
+      args: &[Sel::Field("arguments")],
+      method_from_arg: None,
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -344,6 +885,23 @@ const JAVA: RefSpec = RefSpec {
   // definable type) — the grammar surfaces it as a `type_identifier` leaf (verified by probe).
   type_placeholders: &["var"],
   self_receivers: &["this"],
+  routes: &[
+    // Spring: `@GetMapping("/users")` / `@RequestMapping(value = "/x", …)` on a method.
+    RouteSpec {
+      kind: "annotation",
+      name: &[Sel::Field("name")],
+      names: &[
+        "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
+        "RequestMapping",
+      ],
+      args: &[Sel::Field("arguments")],
+      path_any: true,
+      handler: HandlerAt::DecoratedDefinition {
+        ancestors: &["method_declaration"],
+        via: None,
+      },
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -366,6 +924,20 @@ const CSHARP: RefSpec = RefSpec {
   type_params: &["type_parameter_list"],
   method_callee_kinds: &["member_access_expression"],
   self_receivers: &["this"],
+  routes: &[
+    // ASP.NET: `[HttpGet("users/{id}")]` on a method or local function.
+    RouteSpec {
+      kind: "attribute",
+      name: &[Sel::Field("name")],
+      names: &["HttpGet", "HttpPost", "HttpPut", "HttpDelete", "HttpPatch", "HttpHead", "HttpOptions"],
+      args: &[Sel::ChildOfKind(&["attribute_argument_list"])],
+      path_any: true,
+      handler: HandlerAt::DecoratedDefinition {
+        ancestors: &["method_declaration", "local_function_statement"],
+        via: None,
+      },
+    },
+  ],
   ..SPEC_DEFAULTS
 };
 
@@ -610,6 +1182,202 @@ const HCL: RefSpec = RefSpec {
   ..SPEC_DEFAULTS
 };
 
+/// SQL (dialect-tolerant): function invocations are the one reliable reference class.
+const SQL: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "invocation",
+    callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
+  }],
+  ..SPEC_DEFAULTS
+};
+
+/// Objective-C rides the C surface (call_expression/preproc_include/type_identifier) and adds
+/// message sends and @interface superclasses.
+const OBJC: RefSpec = RefSpec {
+  calls: &[
+    CallSpec {
+      kind: "call_expression",
+      callee: Sel::Field("function"),
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "message_expression",
+      callee: Sel::Field("method"),
+      receiver_field: Some("receiver"),
+      ..CALL_DEFAULTS
+    },
+  ],
+  imports: &[ImportSpec {
+    kind: "preproc_include",
+    target: Sel::Field("path"),
+    string_target: true,
+    qualifier: QualSource::None,
+  }],
+  implements: &[
+    ImplSpec {
+      kind: "class_interface",
+      target: Some(Sel::Field("superclass")),
+    },
+    ImplSpec {
+      kind: "class_implementation",
+      target: Some(Sel::Field("superclass")),
+    },
+  ],
+  types: TYPE_ID,
+  self_receivers: &["self"],
+  ..SPEC_DEFAULTS
+};
+
+const PERL: RefSpec = RefSpec {
+  calls: &[
+    CallSpec {
+      kind: "call_expression_with_bareword",
+      callee: Sel::FirstNamedChild,
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "call_expression_with_args_with_brackets",
+      callee: Sel::FirstNamedChild,
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "call_expression_with_spaced_args",
+      callee: Sel::FirstNamedChild,
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "method_invocation",
+      callee: Sel::Field("function_name"),
+      receiver_field: Some("object"),
+      ..CALL_DEFAULTS
+    },
+  ],
+  imports: &[
+    ImportSpec {
+      kind: "use_no_statement",
+      target: Sel::Field("package_name"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+    ImportSpec {
+      kind: "require_statement",
+      target: Sel::Field("package_name"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+  ],
+  ..SPEC_DEFAULTS
+};
+
+/// Zig: `@import("x")` is a builtin call whose first argument names the module.
+const ZIG: RefSpec = RefSpec {
+  calls: &[
+    CallSpec {
+      kind: "call_expression",
+      callee: Sel::Field("function"),
+      ..CALL_DEFAULTS
+    },
+    CallSpec {
+      kind: "builtin_function",
+      callee: Sel::ChildOfKind(&["builtin_identifier"]),
+      ..CALL_DEFAULTS
+    },
+  ],
+  text_rules: &[("@import", TextAction::ImportFirstArg)],
+  ..SPEC_DEFAULTS
+};
+
+const ERLANG: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "call",
+    callee: Sel::Field("expr"),
+    ..CALL_DEFAULTS
+  }],
+  imports: &[ImportSpec {
+    kind: "import_attribute",
+    target: Sel::Field("module"),
+    string_target: false,
+    qualifier: QualSource::None,
+  }],
+  implements: &[ImplSpec {
+    kind: "behaviour_attribute",
+    target: Some(Sel::Field("name")),
+  }],
+  ..SPEC_DEFAULTS
+};
+
+const OCAML: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "application_expression",
+    callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
+  }],
+  imports: &[
+    ImportSpec {
+      kind: "open_module",
+      target: Sel::Field("module"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+    ImportSpec {
+      kind: "include_module",
+      target: Sel::Field("module"),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+  ],
+  ..SPEC_DEFAULTS
+};
+
+/// R: `library(x)` / `require(x)` are ordinary calls importing their first argument.
+const R_SPEC: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "call",
+    callee: Sel::Field("function"),
+    ..CALL_DEFAULTS
+  }],
+  text_rules: &[
+    ("library", TextAction::ImportFirstArg),
+    ("require", TextAction::ImportFirstArg),
+    ("requireNamespace", TextAction::ImportFirstArg),
+  ],
+  ..SPEC_DEFAULTS
+};
+
+const JULIA: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "call_expression",
+    callee: Sel::FirstNamedChild,
+    ..CALL_DEFAULTS
+  }],
+  imports: &[
+    ImportSpec {
+      kind: "import_statement",
+      target: Sel::ChildOfKind(&["identifier", "scoped_identifier", "import_path"]),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+    ImportSpec {
+      kind: "using_statement",
+      target: Sel::ChildOfKind(&["identifier", "scoped_identifier", "import_path"]),
+      string_target: false,
+      qualifier: QualSource::None,
+    },
+  ],
+  ..SPEC_DEFAULTS
+};
+
+/// PowerShell: cmdlet/function calls are `command` nodes named by their command_name.
+const POWERSHELL: RefSpec = RefSpec {
+  calls: &[CallSpec {
+    kind: "command",
+    callee: Sel::Field("command_name"),
+    ..CALL_DEFAULTS
+  }],
+  ..SPEC_DEFAULTS
+};
+
 /// One node's dispatch outcome in the fused walk — mirrors the priority of the original
 /// if-chain (imports > types > implements > calls); a kind belongs to exactly one chain arm.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -626,17 +1394,22 @@ enum Chain {
 /// build-once dispatch): the walk indexes one dense table per node instead of comparing the
 /// kind string against every spec entry.
 pub(crate) struct ResolvedRefSpec {
-  pub(crate) spec: &'static RefSpec,
+  pub(crate) spec: std::sync::Arc<RefSpecData>,
   /// `kind_id → chain arm`, dense over the ids the spec mentions.
   chain: Vec<Chain>,
   /// `kind_id → declares type parameters` (checked independently of the chain).
   type_params: Vec<bool>,
   /// Resolved kind id per `spec.imports` entry (multiple import specs may share a kind).
   import_kind_ids: Vec<u16>,
+  /// Resolved kind id per `spec.routes` entry (routes share kinds with calls, so they
+  /// dispatch beside the chain, never through it).
+  route_kind_ids: Vec<u16>,
+  /// Resolved kind id per `spec.requests` entry — same beside-the-chain dispatch.
+  request_kind_ids: Vec<u16>,
 }
 
 impl ResolvedRefSpec {
-  fn build(lang: SupportLang, spec: &'static RefSpec) -> Self {
+  pub(crate) fn build(lang: SgLang, spec: std::sync::Arc<RefSpecData>) -> Self {
     let id_of = |kind: &str| -> Option<u16> {
       // `kind_to_id` returns 0 for kinds absent from the pinned grammar; such entries could
       // never have matched by string either, so they simply don't dispatch.
@@ -648,17 +1421,27 @@ impl ResolvedRefSpec {
     let import_kind_ids: Vec<u16> = spec
       .imports
       .iter()
-      .map(|i| id_of(i.kind).unwrap_or(0))
+      .map(|i| id_of(&i.kind).unwrap_or(0))
+      .collect();
+    let route_kind_ids: Vec<u16> = spec
+      .routes
+      .iter()
+      .map(|r| id_of(&r.kind).unwrap_or(0))
+      .collect();
+    let request_kind_ids: Vec<u16> = spec
+      .requests
+      .iter()
+      .map(|r| id_of(&r.kind).unwrap_or(0))
       .collect();
 
     let max_id = spec
       .calls
       .iter()
-      .map(|c| c.kind)
-      .chain(spec.imports.iter().map(|i| i.kind))
-      .chain(spec.implements.iter().map(|i| i.kind))
-      .chain(spec.types.iter().copied())
-      .chain(spec.type_params.iter().copied())
+      .map(|c| c.kind.as_str())
+      .chain(spec.imports.iter().map(|i| i.kind.as_str()))
+      .chain(spec.implements.iter().map(|i| i.kind.as_str()))
+      .chain(spec.types.iter().map(String::as_str))
+      .chain(spec.type_params.iter().map(String::as_str))
       .filter_map(id_of)
       .max()
       .unwrap_or(0) as usize;
@@ -669,26 +1452,26 @@ impl ResolvedRefSpec {
     // within calls/implements, reverse entry order so the FIRST spec entry sharing a kind wins
     // — the same tie-break the sequential `find()` dispatch had.
     for (idx, call) in spec.calls.iter().enumerate().rev() {
-      if let Some(id) = id_of(call.kind) {
+      if let Some(id) = id_of(&call.kind) {
         chain[id as usize] = Chain::Call(idx as u16);
       }
     }
     for (idx, imp) in spec.implements.iter().enumerate().rev() {
-      if let Some(id) = id_of(imp.kind) {
+      if let Some(id) = id_of(&imp.kind) {
         chain[id as usize] = Chain::Implements(idx as u16);
       }
     }
-    for kind in spec.types {
+    for kind in &spec.types {
       if let Some(id) = id_of(kind) {
         chain[id as usize] = Chain::Type;
       }
     }
-    for imp in spec.imports {
-      if let Some(id) = id_of(imp.kind) {
+    for imp in &spec.imports {
+      if let Some(id) = id_of(&imp.kind) {
         chain[id as usize] = Chain::Import;
       }
     }
-    for kind in spec.type_params {
+    for kind in &spec.type_params {
       if let Some(id) = id_of(kind) {
         type_params[id as usize] = true;
       }
@@ -698,6 +1481,8 @@ impl ResolvedRefSpec {
       chain,
       type_params,
       import_kind_ids,
+      route_kind_ids,
+      request_kind_ids,
     }
   }
 
@@ -721,7 +1506,7 @@ impl ResolvedRefSpec {
 }
 
 /// Kind ids resolved once per language, process-wide.
-static RESOLVED_SPECS: LazyLock<HashMap<SupportLang, ResolvedRefSpec>> = LazyLock::new(|| {
+static RESOLVED_SPECS: LazyLock<HashMap<SgLang, ResolvedRefSpec>> = LazyLock::new(|| {
   use SupportLang as L;
   let all = [
     L::Rust,
@@ -747,25 +1532,110 @@ static RESOLVED_SPECS: LazyLock<HashMap<SupportLang, ResolvedRefSpec>> = LazyLoc
     L::Solidity,
     L::Nix,
     L::Hcl,
+    L::Sql,
+    L::ObjectiveC,
+    L::Perl,
+    L::Zig,
+    L::Erlang,
+    L::OCaml,
+    L::R,
+    L::Julia,
+    L::PowerShell,
   ];
   all
     .into_iter()
     // Slim builds: a disabled grammar's kind_to_id is an unimplemented!() stub — specs
     // resolve only for compiled-in languages (their files are never walked anyway).
     .filter(|lang| lang.is_enabled())
-    .filter_map(|lang| Some((lang, ResolvedRefSpec::build(lang, ref_spec(lang)?))))
+    .map(SgLang::from)
+    .filter_map(|lang| {
+      let data = std::sync::Arc::new(RefSpecData::from(ref_spec(lang)?));
+      Some((lang, ResolvedRefSpec::build(lang, data)))
+    })
     .collect()
 });
 
+/// Every builtin (language name, walk data) pair — the round-trip expressiveness test's
+/// ground truth. Test-only: production dispatch reads `RESOLVED_SPECS`.
+#[cfg(test)]
+pub(crate) fn builtin_specs_for_test() -> Vec<(String, RefSpecData)> {
+  use SupportLang as L;
+  let all = [
+    L::Rust,
+    L::Python,
+    L::Go,
+    L::JavaScript,
+    L::TypeScript,
+    L::Tsx,
+    L::C,
+    L::Cpp,
+    L::Java,
+    L::CSharp,
+    L::Kotlin,
+    L::Swift,
+    L::Ruby,
+    L::Php,
+    L::Dart,
+    L::Scala,
+    L::Lua,
+    L::Bash,
+    L::Elixir,
+    L::Haskell,
+    L::Solidity,
+    L::Nix,
+    L::Hcl,
+    L::Sql,
+    L::ObjectiveC,
+    L::Perl,
+    L::Zig,
+    L::Erlang,
+    L::OCaml,
+    L::R,
+    L::Julia,
+    L::PowerShell,
+  ];
+  all
+    .into_iter()
+    .map(SgLang::from)
+    .filter_map(|lang| Some((lang.to_string(), RefSpecData::from(ref_spec(lang)?))))
+    .collect()
+}
+
+/// Kind-id-resolved typefact tables, process-wide (G-M1) — beside the ref specs so both
+/// resolve exactly once against the same grammars.
+static RESOLVED_TYPEFACTS: LazyLock<HashMap<SgLang, crate::typefacts::ResolvedTypeFacts>> =
+  LazyLock::new(|| {
+    // `type_spec` is the single authority on which languages capture — enumerating every
+    // enabled builtin here means a new capture table can never be silently dropped by a
+    // stale second list (the RESOLVED_SPECS hazard, relearned once with Go/Java).
+    SupportLang::all_langs()
+      .iter()
+      .filter(|lang| lang.is_enabled())
+      .map(|lang| SgLang::from(*lang))
+      .filter_map(|lang| {
+        let spec = crate::typefacts::type_spec(lang)?;
+        Some((lang, crate::typefacts::ResolvedTypeFacts::build(lang, spec)))
+      })
+      .collect()
+  });
+
+pub(crate) fn resolved_typefacts(lang: SgLang) -> Option<&'static crate::typefacts::ResolvedTypeFacts> {
+  RESOLVED_TYPEFACTS.get(&lang)
+}
+
 /// The kind-id-resolved extraction spec for `lang`, if it has one.
-pub(crate) fn resolved_ref_spec(lang: SupportLang) -> Option<&'static ResolvedRefSpec> {
+pub(crate) fn resolved_ref_spec(lang: SgLang) -> Option<&'static ResolvedRefSpec> {
   RESOLVED_SPECS.get(&lang)
 }
 
 /// Reference-extraction spec for a language. Pure-structural languages (CSS, HTML, JSON,
 /// Markdown, YAML) have no call/import semantics and return `None`.
-pub(crate) fn ref_spec(lang: SupportLang) -> Option<&'static RefSpec> {
+pub(crate) fn ref_spec(lang: SgLang) -> Option<&'static RefSpec> {
   use SupportLang as L;
+  // Dynamic languages gain serialized specs in F-M4; until then they are structural-only.
+  let SgLang::Builtin(lang) = lang else {
+    return None;
+  };
   match lang {
     L::Rust => Some(&RUST),
     L::Python => Some(&PYTHON),
@@ -785,6 +1655,15 @@ pub(crate) fn ref_spec(lang: SupportLang) -> Option<&'static RefSpec> {
     L::Elixir => Some(&ELIXIR),
     L::Haskell => Some(&HASKELL),
     L::Solidity => Some(&SOLIDITY),
+    L::Sql => Some(&SQL),
+    L::ObjectiveC => Some(&OBJC),
+    L::Perl => Some(&PERL),
+    L::Zig => Some(&ZIG),
+    L::Erlang => Some(&ERLANG),
+    L::OCaml => Some(&OCAML),
+    L::R => Some(&R_SPEC),
+    L::Julia => Some(&JULIA),
+    L::PowerShell => Some(&POWERSHELL),
     L::Nix => Some(&NIX),
     L::Hcl => Some(&HCL),
     _ => None,
@@ -798,7 +1677,7 @@ pub(crate) fn ref_spec(lang: SupportLang) -> Option<&'static RefSpec> {
 /// repo). The answer is still "minimum-length span containing the offset" — computed over the
 /// (tiny) active set, which by the monotonic contract equals the containing set — so the
 /// semantics match the specification implementation's linear scan for any span shape.
-struct SpanCursor<'a> {
+pub(crate) struct SpanCursor<'a> {
   spans: &'a [(Range<usize>, NodeId)],
   /// Next span (spans are in document order) not yet considered for activation.
   next: usize,
@@ -807,7 +1686,7 @@ struct SpanCursor<'a> {
 }
 
 impl<'a> SpanCursor<'a> {
-  fn new(spans: &'a [(Range<usize>, NodeId)]) -> Self {
+  pub(crate) fn new(spans: &'a [(Range<usize>, NodeId)]) -> Self {
     Self {
       spans,
       next: 0,
@@ -817,7 +1696,7 @@ impl<'a> SpanCursor<'a> {
 
   /// The innermost definition containing `offset`. Offsets must be non-decreasing across
   /// calls (the walk's document order guarantees this).
-  fn enclosing(&mut self, offset: usize) -> Option<NodeId> {
+  pub(crate) fn enclosing(&mut self, offset: usize) -> Option<NodeId> {
     while let Some(&top) = self.active.last() {
       if self.spans[top].0.end <= offset {
         self.active.pop();
@@ -841,6 +1720,16 @@ impl<'a> SpanCursor<'a> {
   }
 }
 
+/// One recorded HTTP client call site: the enclosing definition, the method, and the
+/// literal URL — matched against `Route` templates at link time.
+pub(crate) struct RawRequest<'t> {
+  pub(crate) from: NodeId,
+  pub(crate) method: String,
+  pub(crate) path: Cow<'t, str>,
+  pub(crate) start: u32,
+  pub(crate) end: u32,
+}
+
 /// A walk emission awaiting the post-pass: definite references pass through in visit order;
 /// type-use candidates wait for the complete binder set (a `type_parameters` declaration may
 /// be visited after uses of its binder, so the shadow filter can only run once the walk ends).
@@ -859,6 +1748,7 @@ enum Pending<'t> {
 /// implements / call handling, and type-parameter binder collection rides the same walk
 /// instead of a second full pass. `entities` maps each local definition id in `def_spans` to
 /// its entity path — the source of enclosing-owner names for `self.`/`Self::` attribution.
+#[cfg_attr(not(test), allow(dead_code))] // the thin no-facts wrapper is the test harness's surface
 pub(crate) fn extract_references<'t>(
   root: SgNode<'t>,
   resolved: &ResolvedRefSpec,
@@ -866,7 +1756,35 @@ pub(crate) fn extract_references<'t>(
   entities: &[String],
   out: &mut Vec<RawRef<'t>>,
 ) {
-  let spec = resolved.spec;
+  extract_references_with_facts(
+    root,
+    resolved,
+    None,
+    def_spans,
+    entities,
+    out,
+    &mut Vec::new(),
+    &mut Vec::new(),
+    None,
+  );
+}
+
+/// [`extract_references`] with type-fact capture riding the SAME dfs (G-M1): binding sites
+/// dispatch through the resolved typefact table exactly like reference sites dispatch through
+/// the chain table — one walk, two outputs.
+#[allow(clippy::too_many_arguments)] // the one fused walk: every output rides the same cursor
+pub(crate) fn extract_references_with_facts<'t>(
+  root: SgNode<'t>,
+  resolved: &ResolvedRefSpec,
+  typefacts: Option<&crate::typefacts::ResolvedTypeFacts>,
+  def_spans: &[(Range<usize>, NodeId)],
+  entities: &[String],
+  out: &mut Vec<RawRef<'t>>,
+  bindings: &mut Vec<crate::typefacts::RawBinding<'t>>,
+  requests_out: &mut Vec<RawRequest<'t>>,
+  mut signer: Option<&mut crate::signature::Signer>,
+) {
+  let spec = &*resolved.spec;
   // Generic type-parameter binders: (declaring item's span, binder name). Mentions of a binder
   // inside its declaring span are local bindings, not type uses.
   let mut binders: Vec<(Range<usize>, Cow<'t, str>)> = Vec::new();
@@ -877,10 +1795,6 @@ pub(crate) fn extract_references<'t>(
   let mut seen_impls: HashSet<(u64, Cow<'t, str>)> = HashSet::new();
   let mut pending: Vec<Pending<'t>> = Vec::new();
   let mut span_cursor = SpanCursor::new(def_spans);
-  // Single-cursor pre-order (document order): `children()` allocates a fresh tree cursor per
-  // call, so the previous stack walk paid one C-side cursor malloc per visited node (~350k per
-  // index of this repo); `dfs()` streams the whole file over ONE cursor. Anonymous token
-  // leaves still stream past, but a skipped iterator step is free where a cursor was not.
   // Explicit ancestor stack, driven by the walk's own depth (a truncate + push per node):
   // every parent the handlers consult reads from this stack instead of `Node::parent`,
   // which has no parent pointer and re-walks from the tree ROOT (one
@@ -889,13 +1803,36 @@ pub(crate) fn extract_references<'t>(
   let mut ancestors: Vec<SgNode<'t>> = Vec::new();
   for (node, depth) in PreWithDepth::new(&root) {
     ancestors.truncate(depth);
+    // Near-clone signatures (v16) read every leaf token — anonymous ones included —
+    // before the named-only dispatch below.
+    if let Some(signer) = signer.as_deref_mut() {
+      signer.visit(&node);
+    }
     'dispatch: {
       if !node.is_named() {
         break 'dispatch;
       }
       let kind_id = node.kind_id();
+      if let Some(facts) = typefacts {
+        if let Some(bind) = facts.arm(kind_id) {
+          crate::typefacts::capture_at(bind, &node, bindings);
+        }
+      }
       if resolved.declares_type_params(kind_id) {
         collect_binders_in(&node, ancestors.last(), &mut binders);
+      }
+      // Route registrations dispatch beside the chain: their kinds are usually also call
+      // kinds, and the same node legitimately yields both the framework call and the
+      // route → handler reference.
+      for (idx, &id) in resolved.route_kind_ids.iter().enumerate() {
+        if id != 0 && id == kind_id {
+          emit_route_handler(&node, &spec.routes[idx], spec, &mut span_cursor, &mut pending);
+        }
+      }
+      for (idx, &id) in resolved.request_kind_ids.iter().enumerate() {
+        if id != 0 && id == kind_id {
+          emit_request(&node, &spec.requests[idx], &mut span_cursor, requests_out);
+        }
       }
       match resolved.chain_at(kind_id) {
         Chain::None => {}
@@ -917,72 +1854,86 @@ pub(crate) fn extract_references<'t>(
         ),
         Chain::Call(idx) => {
           let cspec = &spec.calls[idx as usize];
-          if suppressed.remove(&node.node_id()) || is_chain_link(&node, ancestors.last(), spec) {
+          if suppressed.remove(&node.node_id())
+            || is_chain_link(&node, ancestors.last(), spec)
+          {
             break 'dispatch;
           }
           let Some(mut callee) = select(&node, &cspec.callee) else {
             break 'dispatch;
           };
-        // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
-        // chain yields one reference, attributed at the outermost node.
-        while let Some(inner) = spec
-          .calls
-          .iter()
-          .find(|c| c.kind == callee.kind().as_ref())
-          .and_then(|c| select(&callee, &c.callee))
-        {
-          callee = inner;
-        }
+          // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
+          // chain yields one reference, attributed at the outermost node.
+          while let Some(inner) = spec
+            .calls
+            .iter()
+            .find(|c| c.kind == callee.kind().as_ref())
+            .and_then(|c| select(&callee, &c.callee))
+          {
+            callee = inner;
+          }
           let Some(name) = callee_name(&callee) else {
             break 'dispatch;
           };
-        let range = node.range();
-        match spec
-          .text_rules
-          .iter()
-          .find(|(text, _)| name.as_ref() == *text)
-        {
-          Some((_, TextAction::SkipDefinition)) => {
-            if let Some(args) = node.children().find(|c| c.kind().as_ref() == "arguments") {
-              if let Some(head) = args.children().find(|c| c.is_named()) {
-                if spec.calls.iter().any(|c| c.kind == head.kind().as_ref()) {
-                  suppressed.insert(head.node_id());
+          let range = node.range();
+          match spec
+            .text_rules
+            .iter()
+            .find(|(text, _)| name.as_ref() == *text)
+          {
+            Some((_, TextAction::SkipDefinition)) => {
+              if let Some(args) = node.children().find(|c| c.kind().as_ref() == "arguments") {
+                if let Some(head) = args.children().find(|c| c.is_named()) {
+                  if spec.calls.iter().any(|c| c.kind == head.kind().as_ref()) {
+                    suppressed.insert(head.node_id());
+                  }
                 }
               }
             }
-          }
-          Some((_, TextAction::ImportFirstArg)) => {
-            if let (Some(arg), Some(from)) =
-              (first_argument(&node), outermost(def_spans, range.start))
-            {
-              if let Some(import) = import_arg_name(&arg) {
-                pending.push(Pending::Ready(RawRef::plain(
+            Some((_, TextAction::ImportFirstArg)) => {
+              if let (Some(arg), Some(from)) =
+                (first_argument(&node), outermost(def_spans, range.start))
+              {
+                if let Some(import) = import_arg_name(&arg) {
+                  pending.push(Pending::Ready(RawRef::plain(
+                    from,
+                    import,
+                    RefKind::Import,
+                    range.start as u32,
+                    range.end as u32,
+                  )));
+                }
+              }
+            }
+            None => {
+              if let Some(from) = span_cursor.enclosing(range.start) {
+                let (form, qualifier, receiver) =
+                  classify_call(&node, cspec, &callee, spec, entities, from);
+                // Receiver/arg extras are persisted to feed typed-receiver resolution and
+                // data-flow; languages without capture tables would carry them as dead pack
+                // weight (measured on the kernel's C: +33% pack, +7% cold) — so capture is
+                // exactly as wide as the typefacts launch set.
+                let (receiver, args) = if typefacts.is_some() {
+                  (receiver, capture_args(&node))
+                } else {
+                  (None, Vec::new())
+                };
+                pending.push(Pending::Ready(RawRef {
                   from,
-                  import,
-                  RefKind::Import,
-                  range.start as u32,
-                  range.end as u32,
-                )));
+                  name,
+                  kind: RefKind::Call,
+                  start: range.start as u32,
+                  end: range.end as u32,
+                  qualifier,
+                  form,
+                  alias: None,
+                  receiver,
+                  args,
+                }));
               }
             }
           }
-          None => {
-            if let Some(from) = span_cursor.enclosing(range.start) {
-              let (form, qualifier) = classify_call(&node, cspec, &callee, spec, entities, from);
-              pending.push(Pending::Ready(RawRef {
-                from,
-                name,
-                kind: RefKind::Call,
-                start: range.start as u32,
-                end: range.end as u32,
-                qualifier,
-                form,
-                alias: None,
-              }));
-            }
-          }
         }
-      }
       }
     }
     ancestors.push(node);
@@ -1025,19 +1976,19 @@ const RECEIVER_FIELDS: &[&str] = &["value", "object", "operand", "argument", "ex
 ///   namespace evidence, and resolution must not treat it as such.
 fn classify_call<'t>(
   call: &SgNode<'t>,
-  cspec: &CallSpec,
+  cspec: &CallSpecData,
   callee: &SgNode<'t>,
-  spec: &RefSpec,
+  spec: &RefSpecData,
   entities: &[String],
   from: NodeId,
-) -> (RefForm, Option<Cow<'t, str>>) {
+) -> (RefForm, Option<Cow<'t, str>>, Option<Cow<'t, str>>) {
   let owner = || owner_of_entity(entities, from).map(Cow::Owned);
   let qualifier_of = |node: &SgNode<'t>| -> Option<Cow<'t, str>> {
     let text = callee_name(node).or_else(|| {
       let trimmed = trim_cow(node.text(), str::trim);
       (!trimmed.is_empty() && !trimmed.contains(char::is_whitespace)).then_some(trimmed)
     })?;
-    if text.as_ref() == "Self" || spec.self_receivers.contains(&text.as_ref()) {
+    if text.as_ref() == "Self" || spec.self_receivers.iter().any(|s| s.as_str() == text.as_ref()) {
       return owner();
     }
     // Module-relative path heads (`crate::`, `super::`) name no owner we can check.
@@ -1045,31 +1996,130 @@ fn classify_call<'t>(
   };
 
   // Call-node-level fields first (Java/PHP/Ruby put receiver/scope beside the callee).
-  if let Some(scope_field) = cspec.scope_field {
-    if let Some(scope) = call.field(scope_field) {
-      return (RefForm::Static, qualifier_of(&scope));
+  if let Some(scope_field) = &cspec.scope_field {
+    if let Some(scope) = call.field(scope_field.as_str()) {
+      return (RefForm::Static, qualifier_of(&scope), None);
     }
   }
-  if let Some(receiver_field) = cspec.receiver_field {
-    if let Some(receiver) = call.field(receiver_field) {
-      return classify_receiver(&receiver, spec, owner);
+  if let Some(receiver_field) = &cspec.receiver_field {
+    if let Some(receiver) = call.field(receiver_field.as_str()) {
+      let (form, qualifier) = classify_receiver(&receiver, spec, owner);
+      return (form, qualifier, simple_receiver_text(&receiver));
     }
-    return (RefForm::Bare, None);
+    return (RefForm::Bare, None, None);
   }
 
   let callee_kind_cow = callee.kind();
   let callee_kind = callee_kind_cow.as_ref();
-  if spec.static_callee_kinds.contains(&callee_kind) {
+  if spec.static_callee_kinds.iter().any(|k| k.as_str() == callee_kind) {
     let scope = callee.field("path").or_else(|| callee.field("scope"));
-    return (RefForm::Static, scope.as_ref().and_then(qualifier_of));
+    return (RefForm::Static, scope.as_ref().and_then(qualifier_of), None);
   }
-  if spec.method_callee_kinds.contains(&callee_kind) {
+  if spec.method_callee_kinds.iter().any(|k| k.as_str() == callee_kind) {
     return match RECEIVER_FIELDS.iter().find_map(|f| callee.field(f)) {
-      Some(receiver) => classify_receiver(&receiver, spec, owner),
-      None => (RefForm::Method, None),
+      Some(receiver) => {
+        let (form, qualifier) = classify_receiver(&receiver, spec, owner);
+        let simple = simple_receiver_text(&receiver);
+        (form, qualifier, simple)
+      }
+      None => (RefForm::Method, None, None),
     };
   }
-  (RefForm::Bare, None)
+  (RefForm::Bare, None, None)
+}
+
+/// The receiver's spelling when — and only when — it is a bare simple name a file-local
+/// binding could type (`x` in `x.helper()`); anything structured returns `None`.
+fn simple_receiver_text<'t>(receiver: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  let kind_cow = receiver.kind();
+  if !LEAF_KINDS.contains(&kind_cow.as_ref()) {
+    return None;
+  }
+  let text = receiver.text();
+  (!text.is_empty() && text.len() <= 64 && !text.contains(char::is_whitespace)).then_some(text)
+}
+
+/// Per-argument capture at a call node (G-M1): position, traceability class, keyword name,
+/// and — for traceable classes — the expression text capped at 64 bytes. The container is
+/// found the same way `first_argument` finds it; a call with no discoverable container
+/// yields no records (counted nowhere because there is nothing to count — absence of an
+/// arguments node is a grammar shape, not a skip).
+fn capture_args<'t>(call: &SgNode<'t>) -> Vec<RawArg<'t>> {
+  let container = call.field("arguments").or_else(|| {
+    call.children().find(|c| {
+      matches!(
+        c.kind().as_ref(),
+        "arguments" | "argument_list" | "call_suffix"
+      )
+    })
+  });
+  let Some(container) = container else {
+    return Vec::new();
+  };
+  let mut args = Vec::new();
+  for (index, child) in container.children().filter(|c| c.is_named()).enumerate() {
+    if index > u16::MAX as usize {
+      break;
+    }
+    let (node, kw_name) = keyword_split(&child);
+    let class = classify_arg(&node);
+    let expr = match class {
+      ArgClass::Var | ArgClass::FieldAccess => {
+        let text = node.text();
+        (text.len() <= 64).then(|| text.clone())
+      }
+      // A CallResult's producing call is ITSELF an extracted reference at this same span —
+      // the link stage joins by span; duplicating its text measured as pure pack weight.
+      ArgClass::CallResult | ArgClass::Literal | ArgClass::Other => None,
+    };
+    args.push(RawArg {
+      index: index as u16,
+      class,
+      kw_name,
+      expr,
+    });
+  }
+  args
+}
+
+/// Split a keyword-argument wrapper (`f(x=1)` → name `x`, value node) where the grammar has
+/// one; everything else passes through.
+fn keyword_split<'t>(node: &SgNode<'t>) -> (SgNode<'t>, Option<Cow<'t, str>>) {
+  if matches!(node.kind().as_ref(), "keyword_argument" | "named_argument") {
+    let name = node.field("name").map(|n| n.text());
+    if let Some(value) = node.field("value") {
+      return (value, name);
+    }
+  }
+  (node.clone(), None)
+}
+
+fn classify_arg(node: &SgNode<'_>) -> ArgClass {
+  let kind_cow = node.kind();
+  let kind = kind_cow.as_ref();
+  if LEAF_KINDS.contains(&kind) {
+    return ArgClass::Var;
+  }
+  if DESCEND_KINDS.contains(&kind)
+    || kind.contains("field")
+    || kind.contains("member")
+    // Python/Ruby spell member access `attribute`; Rust field access is `field_expression`
+    // (caught above); OCaml uses `field_get_expression`.
+    || kind == "attribute"
+  {
+    return ArgClass::FieldAccess;
+  }
+  if kind.contains("call") || kind == "application_expression" || kind == "invocation" {
+    return ArgClass::CallResult;
+  }
+  if kind.contains("literal")
+    || kind.contains("string")
+    || kind.contains("number")
+    || matches!(kind, "integer" | "float" | "true" | "false" | "nil" | "none" | "atom")
+  {
+    return ArgClass::Literal;
+  }
+  ArgClass::Other
 }
 
 /// Classify a member-access receiver (Java `obj.m()` / Python `Foo.bar()` / Rust
@@ -1084,11 +2134,11 @@ fn classify_call<'t>(
 /// - anything else (call results, chained accesses) is opaque: plain Method, no hint.
 fn classify_receiver<'t>(
   receiver: &SgNode<'t>,
-  spec: &RefSpec,
+  spec: &RefSpecData,
   owner: impl FnOnce() -> Option<Cow<'t, str>>,
 ) -> (RefForm, Option<Cow<'t, str>>) {
   let text = trim_cow(receiver.text(), str::trim);
-  if spec.self_receivers.contains(&text.as_ref()) || text.as_ref() == "Self" {
+  if spec.self_receivers.iter().any(|s| s.as_str() == text.as_ref()) || text.as_ref() == "Self" {
     return (RefForm::Method, owner());
   }
   let plain_name = !text.is_empty()
@@ -1151,7 +2201,7 @@ const IMPL_TARGET_KINDS: &[&str] = &["type_identifier", "identifier", "constant"
 fn stage_type_use<'t>(
   node: &SgNode<'t>,
   ancestors: &[SgNode<'t>],
-  spec: &RefSpec,
+  spec: &RefSpecData,
   span_cursor: &mut SpanCursor<'_>,
   pending: &mut Vec<Pending<'t>>,
 ) {
@@ -1168,7 +2218,7 @@ fn stage_type_use<'t>(
     let bodyless_wrapper = spec
       .type_ref_wrappers
       .iter()
-      .any(|k| *k == parent.kind().as_ref())
+      .any(|k| k.as_str() == parent.kind().as_ref())
       && parent.field("body").is_none();
     if !bodyless_wrapper {
       return;
@@ -1185,7 +2235,7 @@ fn stage_type_use<'t>(
   let (Some(name), Some(from)) = (callee_name(node), span_cursor.enclosing(range.start)) else {
     return;
   };
-  if spec.type_placeholders.contains(&name.as_ref()) {
+  if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
     return;
   }
   pending.push(Pending::TypeUse {
@@ -1200,8 +2250,8 @@ fn stage_type_use<'t>(
 /// node itself) is reduced to a name directly when possible, else to its type leaves.
 fn emit_implements<'t>(
   node: &SgNode<'t>,
-  ispec: &ImplSpec,
-  spec: &RefSpec,
+  ispec: &ImplSpecData,
+  spec: &RefSpecData,
   span_cursor: &mut SpanCursor<'_>,
   seen: &mut HashSet<(u64, Cow<'t, str>)>,
   pending: &mut Vec<Pending<'t>>,
@@ -1224,7 +2274,7 @@ fn emit_implements<'t>(
         .collect()
     };
     for name in names {
-      if spec.type_placeholders.contains(&name.as_ref()) {
+      if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
         continue;
       }
       if seen.insert((from.raw(), name.clone())) {
@@ -1241,7 +2291,7 @@ fn emit_implements<'t>(
 }
 
 /// A call node that is its same-kind parent's selected callee is a chain link, not a call site.
-fn is_chain_link(node: &SgNode<'_>, parent: Option<&SgNode<'_>>, spec: &RefSpec) -> bool {
+fn is_chain_link(node: &SgNode<'_>, parent: Option<&SgNode<'_>>, spec: &RefSpecData) -> bool {
   let Some(parent) = parent else {
     return false;
   };
@@ -1257,42 +2307,300 @@ fn is_chain_link(node: &SgNode<'_>, parent: Option<&SgNode<'_>>, spec: &RefSpec)
     .is_some_and(|callee| callee.node_id() == node.node_id())
 }
 
-fn select<'t>(node: &SgNode<'t>, sel: &Sel) -> Option<SgNode<'t>> {
+fn select<'t>(node: &SgNode<'t>, sel: &SelData) -> Option<SgNode<'t>> {
   match sel {
-    Sel::Field(name) => node.field(name),
-    Sel::FieldLast(name) => node.field_children(name).last(),
-    Sel::FirstNamedChild => node.children().find(|c| c.is_named()),
-    Sel::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds).into_iter().next(),
+    SelData::Field(name) => node.field(name.as_str()),
+    SelData::FieldLast(name) => node.field_children(name.as_str()).last(),
+    SelData::FirstNamedChild => node.children().find(|c| c.is_named()),
+    SelData::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds).into_iter().next(),
   }
 }
 
+/// Apply a navigation path of selectors, hop by hop.
+fn select_path<'t>(node: &SgNode<'t>, path: &[SelData]) -> Option<SgNode<'t>> {
+  let mut current = node.clone();
+  for sel in path {
+    current = select(&current, sel)?;
+  }
+  Some(current)
+}
+
+/// Is `text` a Go 1.22 style `VERB /path` pattern?
+fn verb_pattern(text: &str) -> bool {
+  matches!(
+    text.split_once(' '),
+    Some((verb, rest))
+      if !verb.is_empty() && rest.starts_with('/') && verb.bytes().all(|b| b.is_ascii_uppercase())
+  )
+}
+
+/// The first string literal under `args` (pre-order) as its quote-stripped text — `None`
+/// when absent or (unless `any`) it neither starts with `/` nor is a `VERB /path` pattern.
+fn route_path_literal<'t>(args: &SgNode<'t>, any: bool) -> Option<Cow<'t, str>> {
+  let literal = args.dfs().skip(1).find(|n| {
+    let kind = n.kind();
+    kind.as_ref() == "string" || kind.as_ref().ends_with("string_literal")
+  })?;
+  let trimmed = trim_cow(literal.text(), |t| {
+    t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+  });
+  if trimmed.is_empty() {
+    return None;
+  }
+  (any || trimmed.starts_with('/') || verb_pattern(trimmed.as_ref())).then_some(trimmed)
+}
+
+/// A node that *refers* to something by name: an identifier leaf, or the language's
+/// member/static access shapes (`views.detail`, `pkg.Handler`, `Ctrl::show`). Keyword
+/// arguments, literals, and closures are none of these — they can never be a handler.
+fn reference_shaped(node: &SgNode<'_>, spec: &RefSpecData) -> bool {
+  let kind_cow = node.kind();
+  let kind = kind_cow.as_ref();
+  LEAF_KINDS.contains(&kind)
+    || spec.method_callee_kinds.iter().any(|k| k == kind)
+    || spec.static_callee_kinds.iter().any(|k| k == kind)
+}
+
+/// The handler node for a route construct, per its spec.
+fn route_handler_node<'t>(
+  construct: &SgNode<'t>,
+  args: &SgNode<'t>,
+  at: &HandlerAtData,
+  spec: &RefSpecData,
+) -> Option<SgNode<'t>> {
+  match at {
+    // The last reference-shaped argument is the handler — middleware-tolerant, and immune
+    // to trailing `name="…"` keyword arguments or option objects.
+    HandlerAtData::LastArgument => args
+      .children()
+      .filter(|c| c.is_named() && reference_shaped(c, spec))
+      .last(),
+    HandlerAtData::UnwrappedArgument(index) => {
+      let arg = args.children().filter(|c| c.is_named()).nth(*index as usize)?;
+      if arg.kind().as_ref().ends_with("call_expression") {
+        let inner = arg.field("arguments")?;
+        inner.children().find(|c| c.is_named())
+      } else {
+        Some(arg)
+      }
+    }
+    HandlerAtData::DecoratedDefinition { ancestors, via } => {
+      let holder = construct
+        .ancestors()
+        .find(|a| ancestors.iter().any(|k| a.kind().as_ref() == k.as_str()))?;
+      let target = match via {
+        Some(field) => holder.field(field.as_str())?,
+        None => holder,
+      };
+      target.field("name")
+    }
+    HandlerAtData::NextSibling(kinds) => {
+      let sibling = construct
+        .next_all()
+        .find(|s| s.is_named() && kinds.iter().any(|k| s.kind().as_ref() == k.as_str()))?;
+      sibling.field("name")
+    }
+  }
+}
+
+/// Emit the route → handler `calls` reference for a matched route construct (see
+/// [`RouteSpec`]). The predicate mirrors the outline rule that creates the `Route` item —
+/// fixtures pin the two in sync per framework.
+fn emit_route_handler<'t>(
+  node: &SgNode<'t>,
+  route: &RouteSpecData,
+  spec: &RefSpecData,
+  span_cursor: &mut SpanCursor<'_>,
+  pending: &mut Vec<Pending<'t>>,
+) {
+  let Some(name_node) = select_path(node, &route.name) else {
+    return;
+  };
+  let Some(verb) = callee_name(&name_node) else {
+    return;
+  };
+  if !route.names.iter().any(|n| n == verb.as_ref()) {
+    return;
+  }
+  let Some(args) = select_path(node, &route.args) else {
+    return;
+  };
+  if route_path_literal(&args, route.path_any).is_none() {
+    return;
+  }
+  let Some(handler) = route_handler_node(node, &args, &route.handler, spec) else {
+    return;
+  };
+  let Some(name) = callee_name(&handler) else {
+    return;
+  };
+  if name.is_empty() {
+    return;
+  }
+  let Some(from) = span_cursor.enclosing(node.range().start) else {
+    return;
+  };
+  // A member-shaped handler (`views.detail`, `handlers.Show`) carries its container as a
+  // MethodHinted qualifier: corroborated exactly like any receiver hint (`import views` in
+  // the registering file proves the module), and a hint can upgrade but never mask.
+  let qualifier = ["object", "operand", "value", "scope", "path"]
+    .iter()
+    .find_map(|field| handler.field(field))
+    .map(|container| trim_cow(container.text(), str::trim))
+    .filter(|text| !text.is_empty() && !text.contains(char::is_whitespace));
+  let range = handler.range();
+  let mut raw = RawRef::plain(from, name, RefKind::Call, range.start as u32, range.end as u32);
+  if qualifier.is_some() {
+    raw.qualifier = qualifier;
+    raw.form = RefForm::MethodHinted;
+  }
+  pending.push(Pending::Ready(raw));
+}
+
+/// The container (receiver/module) text of a callee node, when it is a single word:
+/// `axios.get` → `axios`, `reqwest::get` → `reqwest`, `http.Get` → `http`.
+fn container_text<'t>(callee: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  ["object", "operand", "value", "scope", "path"]
+    .iter()
+    .find_map(|field| callee.field(field))
+    .map(|container| trim_cow(container.text(), str::trim))
+    .filter(|text| !text.is_empty() && !text.contains(char::is_whitespace))
+}
+
+/// The first URL-shaped string literal under `args`: content starting `/`, `http://`, or
+/// `https://`. Quote-stripped; `None` when every argument is dynamic.
+fn request_url_literal<'t>(args: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  args
+    .dfs()
+    .skip(1)
+    .filter(|n| {
+      let kind = n.kind();
+      kind.as_ref() == "string" || kind.as_ref().ends_with("string_literal")
+    })
+    .map(|literal| {
+      trim_cow(literal.text(), |t| {
+        t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+      })
+    })
+    .find(|text| {
+      text.starts_with('/') || text.starts_with("http://") || text.starts_with("https://")
+    })
+}
+
+/// The first non-empty string literal under `args` — an event topic (any shape, but never
+/// whitespace: `emit(f"...")` and message bodies stay out).
+fn event_topic_literal<'t>(args: &SgNode<'t>) -> Option<Cow<'t, str>> {
+  args
+    .dfs()
+    .skip(1)
+    .filter(|n| {
+      let kind = n.kind();
+      kind.as_ref() == "string" || kind.as_ref().ends_with("string_literal")
+    })
+    .map(|literal| {
+      trim_cow(literal.text(), |t| {
+        t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+      })
+    })
+    .find(|text| !text.is_empty() && !text.contains(char::is_whitespace) && text.len() <= 256)
+}
+
+/// Record an HTTP client call site (see [`RequestSpec`]) for link-time route matching.
+fn emit_request<'t>(
+  node: &SgNode<'t>,
+  request: &RequestSpecData,
+  span_cursor: &mut SpanCursor<'_>,
+  out: &mut Vec<RawRequest<'t>>,
+) {
+  let Some(callee) = select_path(node, &request.name) else {
+    return;
+  };
+  let Some(name) = callee_name(&callee) else {
+    return;
+  };
+  let event = request.event_names.iter().any(|n| n == name.as_ref());
+  let method = if request.verb_names.iter().any(|n| n == name.as_ref()) {
+    name.to_ascii_uppercase()
+  } else if request.get_names.iter().any(|n| n == name.as_ref()) {
+    "GET".to_string()
+  } else if event {
+    "EVENT".to_string()
+  } else {
+    return;
+  };
+  if !request.receivers.is_empty() {
+    let Some(receiver) = container_text(&callee) else {
+      return;
+    };
+    if !request.receivers.iter().any(|r| r == receiver.as_ref()) {
+      return;
+    }
+  }
+  let Some(args) = select_path(node, &request.args) else {
+    return;
+  };
+  let method = match request.method_from_arg {
+    None => method,
+    Some(index) => {
+      // The method rides as a string argument (`http.NewRequest("GET", …)`).
+      let Some(arg) = args.children().filter(|c| c.is_named()).nth(index as usize) else {
+        return;
+      };
+      let text = trim_cow(arg.text(), |t| t.trim_matches(|c| c == '"' || c == '\'' || c == '`'));
+      if text.is_empty() || !text.bytes().all(|b| b.is_ascii_uppercase()) {
+        return;
+      }
+      text.to_string()
+    }
+  };
+  let literal = if event {
+    event_topic_literal(&args)
+  } else {
+    request_url_literal(&args)
+  };
+  let Some(path) = literal else {
+    return;
+  };
+  let range = node.range();
+  let Some(from) = span_cursor.enclosing(range.start) else {
+    return;
+  };
+  out.push(RawRequest {
+    from,
+    method,
+    path,
+    start: range.start as u32,
+    end: range.end as u32,
+  });
+}
+
 /// All matching targets for an import node (repeated fields / multiple names per statement).
-fn select_all<'t>(node: &SgNode<'t>, sel: &Sel) -> Vec<SgNode<'t>> {
+fn select_all<'t>(node: &SgNode<'t>, sel: &SelData) -> Vec<SgNode<'t>> {
   match sel {
-    Sel::Field(name) => {
-      let all: Vec<_> = node.field_children(name).collect();
+    SelData::Field(name) => {
+      let all: Vec<_> = node.field_children(name.as_str()).collect();
       if all.is_empty() {
-        node.field(name).into_iter().collect()
+        node.field(name.as_str()).into_iter().collect()
       } else {
         all
       }
     }
-    Sel::FieldLast(name) => node.field_children(name).last().into_iter().collect(),
-    Sel::FirstNamedChild => node.children().find(|c| c.is_named()).into_iter().collect(),
-    Sel::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds),
+    SelData::FieldLast(name) => node.field_children(name.as_str()).last().into_iter().collect(),
+    SelData::FirstNamedChild => node.children().find(|c| c.is_named()).into_iter().collect(),
+    SelData::ChildOfKind(kinds) => first_descendants_of_kinds(node, kinds),
   }
 }
 
 /// Pre-order descendants whose kind is listed, without descending into matches (so an
 /// `aliased_import` match does not also yield its inner `dotted_name`).
-fn first_descendants_of_kinds<'t>(node: &SgNode<'t>, kinds: &[&str]) -> Vec<SgNode<'t>> {
+fn first_descendants_of_kinds<'t, K: AsRef<str>>(node: &SgNode<'t>, kinds: &[K]) -> Vec<SgNode<'t>> {
   let mut found = Vec::new();
   let mut queue: Vec<SgNode<'t>> = node.children().collect();
   let mut index = 0;
   while index < queue.len() {
     let current = queue[index].clone();
     index += 1;
-    if kinds.contains(&current.kind().as_ref()) {
+    if kinds.iter().any(|k| k.as_ref() == current.kind().as_ref()) {
       found.push(current);
     } else {
       queue.extend(current.children());
@@ -1303,7 +2611,7 @@ fn first_descendants_of_kinds<'t>(node: &SgNode<'t>, kinds: &[&str]) -> Vec<SgNo
 
 fn emit_imports<'t>(
   node: &SgNode<'t>,
-  ispec: &ImportSpec,
+  ispec: &ImportSpecData,
   def_spans: &[(Range<usize>, NodeId)],
   pending: &mut Vec<Pending<'t>>,
 ) {
@@ -1318,7 +2626,7 @@ fn emit_imports<'t>(
       callee_name(&target)
     };
     if let Some(name) = name {
-      let (form, qualifier) = match import_qualifier(node, &target, ispec.qualifier) {
+      let (form, qualifier) = match import_qualifier(node, &target, &ispec.qualifier) {
         Some(q) => (RefForm::Static, Some(q)),
         None => (RefForm::Bare, None),
       };
@@ -1331,6 +2639,8 @@ fn emit_imports<'t>(
         qualifier,
         form,
         alias: import_alias(&target),
+        receiver: None,
+        args: Vec::new(),
       }));
     }
   }
@@ -1353,18 +2663,18 @@ fn import_alias<'t>(target: &SgNode<'t>) -> Option<Cow<'t, str>> {
 fn import_qualifier<'t>(
   node: &SgNode<'t>,
   target: &SgNode<'t>,
-  source: QualSource,
+  source: &QualSourceData,
 ) -> Option<Cow<'t, str>> {
   match source {
-    QualSource::None => None,
-    QualSource::NodeField(field) => {
-      let module = node.field(field)?;
+    QualSourceData::None => None,
+    QualSourceData::NodeField(field) => {
+      let module = node.field(field.as_str())?;
       let seg = trim_cow(module.text(), |s| {
         s.trim().rsplit('.').next().unwrap_or("").trim()
       });
       (!seg.is_empty() && !seg.contains(char::is_whitespace)).then_some(seg)
     }
-    QualSource::TargetPath => {
+    QualSourceData::TargetPath => {
       // A scoped path carries its own `name`; a fieldless wrapper (`use_as_clause`) holds the
       // real path in its `path` field instead — unwrap once, then take that path's prefix.
       let path_node = if target.field("name").is_some() {
@@ -1453,6 +2763,13 @@ const LEAF_KINDS: &[&str] = &[
   "constant",
   "module_id",
   "attr_identifier",
+  // Erlang: unquoted atoms name functions/modules in call and import position.
+  "atom",
+  // Zig: `@import` and friends.
+  "builtin_identifier",
+  // OCaml: the leaves of value/module paths.
+  "value_name",
+  "module_name",
 ];
 
 /// Fieldless wrapper kinds: recurse into the last named child (the rightmost simple name,
@@ -1477,6 +2794,11 @@ const DESCEND_KINDS: &[&str] = &[
   "aliased_import",
   // Solidity wraps callees in a generic `expression` node.
   "expression",
+  // OCaml paths (`Mod.value`) and Erlang remote calls (`mod:fun`) end in their rightmost name.
+  "value_path",
+  "module_path",
+  "constructor_path",
+  "remote",
 ];
 
 /// The rightmost identifier of a callee/import expression — one universal navigator; unmatched
@@ -1546,6 +2868,7 @@ mod tests {
   }
 
   fn full_refs_for(lang: SupportLang, src: &str) -> Vec<OwnedRef> {
+    let lang = SgLang::from(lang);
     let spec = resolved_ref_spec(lang).expect("language has a ref spec");
     let grep = lang.grep(src);
     let spans = vec![(0..usize::MAX, NodeId::new(0))];
@@ -1694,8 +3017,8 @@ mod tests {
   #[test]
   fn rust_static_and_self_calls_carry_qualifier_evidence() {
     let src = "impl Kg {\n  fn a(&self) {\n    self.helper();\n    Self::assoc();\n    Manifest::scan();\n    Vec::new();\n    plain();\n    value.method();\n  }\n}\n";
-    let spec = resolved_ref_spec(SupportLang::Rust).unwrap();
-    let grep = SupportLang::Rust.grep(src);
+    let spec = resolved_ref_spec(SgLang::from(SupportLang::Rust)).unwrap();
+    let grep = SgLang::from(SupportLang::Rust).grep(src);
     // Mimic extract_product's local layout: file + the `Kg` impl item spanning the source.
     let spans = vec![
       (0..usize::MAX, NodeId::new(0)),
@@ -1841,12 +3164,12 @@ mod tests {
     entities: &[String],
     out: &mut Vec<RawRef<'t>>,
   ) {
-    let spec = resolved.spec;
+    let spec = &*resolved.spec;
     let mut binders: Vec<(Range<usize>, Cow<'t, str>)> = Vec::new();
     let mut stack = vec![root.clone()];
     while let Some(node) = stack.pop() {
       push_children(&mut stack, &node);
-      if spec.type_params.contains(&node.kind().as_ref()) {
+      if spec.type_params.iter().any(|t| t.as_str() == node.kind().as_ref()) {
         collect_binders_in(&node, node.parent().as_ref(), &mut binders);
       }
     }
@@ -1871,7 +3194,7 @@ mod tests {
               callee_name(&target)
             };
             if let Some(name) = name {
-              let (form, qualifier) = match import_qualifier(&node, &target, ispec.qualifier) {
+              let (form, qualifier) = match import_qualifier(&node, &target, &ispec.qualifier) {
                 Some(q) => (RefForm::Static, Some(q)),
                 None => (RefForm::Bare, None),
               };
@@ -1883,6 +3206,8 @@ mod tests {
                 end: range.end as u32,
                 qualifier,
                 form,
+                receiver: None,
+                args: Vec::new(),
                 alias: import_alias(&target),
               });
             }
@@ -1893,7 +3218,7 @@ mod tests {
         continue;
       }
 
-      if spec.types.contains(&kind) {
+      if spec.types.iter().any(|t| t.as_str() == kind) {
         let Some(parent) = node.parent() else {
           continue;
         };
@@ -1904,7 +3229,7 @@ mod tests {
           let bodyless_wrapper = spec
             .type_ref_wrappers
             .iter()
-            .any(|k| *k == parent.kind().as_ref())
+            .any(|k| k.as_str() == parent.kind().as_ref())
             && parent.field("body").is_none();
           if !bodyless_wrapper {
             continue;
@@ -1928,7 +3253,7 @@ mod tests {
         else {
           continue;
         };
-        if spec.type_placeholders.contains(&name.as_ref()) {
+        if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
           continue;
         }
         if binders
@@ -1968,7 +3293,7 @@ mod tests {
               .collect()
           };
           for name in names {
-            if spec.type_placeholders.contains(&name.as_ref()) {
+            if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
               continue;
             }
             if seen.insert((from.raw(), name.clone(), 1)) {
@@ -2038,7 +3363,11 @@ mod tests {
         }
         None => {
           if let Some(from) = enclosing(def_spans, range.start) {
-            let (form, qualifier) = classify_call(&node, cspec, &callee, spec, entities, from);
+            let (form, qualifier, _receiver) =
+              classify_call(&node, cspec, &callee, spec, entities, from);
+            // The twin mirrors the fused walk's no-typefacts configuration (the only one the
+            // differential harness runs): extras are gated off there, so they are here.
+            // Extras semantics have their own pinning suite (typefacts_capture.rs).
             out.push(RawRef {
               from,
               name,
@@ -2048,6 +3377,8 @@ mod tests {
               qualifier,
               form,
               alias: None,
+              receiver: None,
+              args: Vec::new(),
             });
           }
         }
@@ -2062,6 +3393,7 @@ mod tests {
     entities: &[String],
     context: &str,
   ) {
+    let lang = SgLang::from(lang);
     let Some(resolved) = resolved_ref_spec(lang) else {
       return;
     };
@@ -2144,7 +3476,7 @@ mod tests {
       let Some(lang) = SupportLang::from_path(&path) else {
         continue;
       };
-      if resolved_ref_spec(lang).is_none() {
+      if resolved_ref_spec(SgLang::from(lang)).is_none() {
         continue;
       }
       let Ok(source) = std::fs::read_to_string(entry.path()) else {
@@ -2284,7 +3616,7 @@ mod tests {
       SupportLang::Markdown,
       SupportLang::Yaml,
     ] {
-      assert!(ref_spec(lang).is_none(), "{lang:?}");
+      assert!(ref_spec(SgLang::from(lang)).is_none(), "{lang:?}");
     }
   }
 }

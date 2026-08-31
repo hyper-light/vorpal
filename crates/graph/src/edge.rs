@@ -31,6 +31,28 @@ impl EdgeType {
   pub const OVERRIDES: EdgeType = EdgeType(6);
   pub const HAS_METHOD: EdgeType = EdgeType(7);
   pub const HAS_FIELD: EdgeType = EdgeType(8);
+  /// Static argument→parameter flow recorded at extraction (G-M3). Reserved here first
+  /// (G-M0) so every surface speaks the name before any edge exists; id 9 stays free for a
+  /// future structural relation to keep the semantic block contiguous from 10.
+  pub const DATA_FLOWS: EdgeType = EdgeType(10);
+  /// Temporal coupling from version control: the two files changed together in the
+  /// indexed repository's recent history (symmetric; confidence encodes the co-change
+  /// count, ×20 capped at 100). Derived at seal from `git log`, never from source text.
+  pub const CHANGES_WITH: EdgeType = EdgeType(11);
+  /// Near-clone: the two definitions' token shingle sets are estimated ≥ 0.7 Jaccard-similar
+  /// by their MinHash sketches (symmetric; confidence = estimated similarity × 100). Derived
+  /// at link from extraction-time signatures, never from name resolution.
+  pub const SIMILAR_TO: EdgeType = EdgeType(12);
+  /// An HTTP client call site whose literal URL uniquely matches a `Route` node's template
+  /// (`fetch("/api/users")` → `GET /api/users`): caller → route, directional. Confidence 95
+  /// for a literal-exact path, 85 when template parameters absorbed segments. Derived at
+  /// link from extraction-time request records; ambiguity refuses, never guesses.
+  pub const REQUESTS: EdgeType = EdgeType(13);
+  /// An event/message emitter whose literal topic matches a `Channel` node's registration
+  /// (`emit("user.created")` → `EVENT user.created`): emitter → channel, directional, one
+  /// edge per matching listener registration (pub/sub is one-to-many by design; the
+  /// fan-out is capped and counted, never silently truncated). Confidence 90.
+  pub const NOTIFIES: EdgeType = EdgeType(14);
 
   /// The user-facing relation name (the spelling accepted by [`EdgeType::from_name`] and shown
   /// in traversal results). Confidence is ignored — this reports the base type.
@@ -45,6 +67,11 @@ impl EdgeType {
       EdgeType::OVERRIDES => "overrides",
       EdgeType::HAS_METHOD => "has_method",
       EdgeType::HAS_FIELD => "has_field",
+      EdgeType::DATA_FLOWS => "data_flows",
+      EdgeType::CHANGES_WITH => "changes_with",
+      EdgeType::SIMILAR_TO => "similar_to",
+      EdgeType::REQUESTS => "requests",
+      EdgeType::NOTIFIES => "notifies",
       _ => "unknown",
     }
   }
@@ -62,6 +89,11 @@ impl EdgeType {
       "overrides" => Some(EdgeType::OVERRIDES),
       "has_method" => Some(EdgeType::HAS_METHOD),
       "has_field" => Some(EdgeType::HAS_FIELD),
+      "data_flows" => Some(EdgeType::DATA_FLOWS),
+      "changes_with" => Some(EdgeType::CHANGES_WITH),
+      "similar_to" => Some(EdgeType::SIMILAR_TO),
+      "requests" => Some(EdgeType::REQUESTS),
+      "notifies" => Some(EdgeType::NOTIFIES),
       _ => None,
     }
   }

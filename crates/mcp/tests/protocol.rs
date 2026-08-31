@@ -100,11 +100,15 @@ fn initialize_handshake_and_tool_listing() {
       "importers",
       "implementors",
       "type_users",
+      "similar",
       "reachable",
       "structural_search",
       "rule_search",
       "ast_dump",
       "fetch_span",
+      "data_flow",
+      "observed",
+      "query",
       "snippet",
       "why",
       "search"
@@ -631,4 +635,67 @@ fn protocol_and_tool_errors_are_explicit() {
   );
   assert!(is_err);
   assert!(text.contains("direction"), "{text}");
+}
+
+#[test]
+fn query_tool_answers_text_and_ir_and_refuses_typed() {
+  let (src, idx) = temp_tree("query");
+  let mut server = Server::new(idx);
+  let (text, is_err) = call_tool(
+    &mut server,
+    1,
+    "index",
+    json!({"src": src.to_string_lossy()}),
+  );
+  assert!(!is_err, "{text}");
+
+  let response = request(
+    &mut server,
+    2,
+    "tools/call",
+    json!({"name": "query", "arguments": {"text":
+      "MATCH (f)-[:calls]->(g {name: \"target\"}) RETURN f.name, f.path"}}),
+  );
+  let data = &response["result"]["structuredContent"];
+  assert_eq!(data["columns"][0], "f.name");
+  assert_eq!(data["rows"][0][0], "caller");
+  assert_eq!(data["total_rows"], 1);
+
+  // The IR document form executes the same plan.
+  let ir = json!({
+    "pattern": {
+      "left": {"var": "f"},
+      "segments": [{
+        "rel": {"types": ["calls"], "direction": "out"},
+        "node": {"var": "g", "props": [["name", "target"]]}
+      }]
+    },
+    "returns": {"items": [{"expr": {"prop": {"var": "f", "prop": "name"}}}]}
+  });
+  let response = request(
+    &mut server,
+    3,
+    "tools/call",
+    json!({"name": "query", "arguments": {"ir": ir}}),
+  );
+  assert_eq!(
+    response["result"]["structuredContent"]["rows"][0][0],
+    "caller"
+  );
+
+  // Typed refusals: unknown relation names the problem; ceilings name the ceiling.
+  let (text, is_err) = call_tool(
+    &mut server,
+    4,
+    "query",
+    json!({"text": "MATCH (f)-[:frobnicates]->(g) RETURN f.name"}),
+  );
+  assert!(is_err && text.contains("unknown relation"), "{text}");
+  let (text, is_err) = call_tool(
+    &mut server,
+    5,
+    "query",
+    json!({"text": "MATCH (f)-[:calls*1..99]->(g) RETURN f.name"}),
+  );
+  assert!(is_err && text.contains("ceiling"), "{text}");
 }

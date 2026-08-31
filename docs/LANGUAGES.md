@@ -13,31 +13,52 @@ precision and recall must both be 1.0.
 |---|---|---|---|---|
 | Bash | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | C | ✓ corpus-gated | ✓ | ✓ | labelled-gated (precision = recall = 1.0) |
+| CMake | ✓ corpus-gated | ✓ | — (structural only) | — |
+| Erlang | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Cpp | ✓ corpus-gated | ✓ | ✓ | labelled-gated (precision = recall = 1.0) |
 | CSharp | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Css | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Dart | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| Dockerfile | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Elixir | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Go | ✓ corpus-gated | ✓ | ✓ | labelled-gated (precision = recall = 1.0) |
+| GraphQL | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Haskell | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Hcl | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Html | ✓ corpus-gated | ✓ | — (structural only) | — |
+| Ini | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Java | ✓ corpus-gated | ✓ | ✓ | labelled-gated (precision = recall = 1.0) |
 | JavaScript | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| Julia | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| JsDoc | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Json | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Kotlin | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Lua | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| Make | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Markdown | ✓ corpus-gated | ✓ | — (structural only) | — |
+| Astro | ✓ corpus-gated | ✓ | — (structural only) | — |
+| ObjectiveC | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| OCaml | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Nix | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Php | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| Proto | ✓ corpus-gated | ✓ | — (structural only) | — |
+| Perl | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| PowerShell | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Python | ✓ corpus-gated | ✓ | ✓ | labelled-gated (precision = recall = 1.0) |
+| R | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Ruby | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Rust | ✓ corpus-gated | ✓ | ✓ | labelled-gated (precision = recall = 1.0) |
 | Scala | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| Svelte | ✓ corpus-gated | ✓ | — (structural only) | — |
+| Sql | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Solidity | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | Swift | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| Toml | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Tsx | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
 | TypeScript | ✓ corpus-gated | ✓ | ✓ | labelled-gated (precision = recall = 1.0) |
+| Xml | ✓ corpus-gated | ✓ | — (structural only) | — |
+| Zig | ✓ corpus-gated | ✓ | ✓ | extracted; not fixture-gated |
+| Vue | ✓ corpus-gated | ✓ | — (structural only) | — |
 | Yaml | ✓ corpus-gated | ✓ | — (structural only) | — |
 
 **Parser**: vendored at a pinned, digest-verified commit (`grammars/PROVENANCE.json`)

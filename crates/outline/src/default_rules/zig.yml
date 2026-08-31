@@ -1,0 +1,27 @@
+id: zig-function
+language: Zig
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: zig-const
+language: Zig
+role: item
+symbolType: constant
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: function_declaration
+          stopBy: end
+    - has:
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'

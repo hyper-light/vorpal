@@ -31,7 +31,15 @@ use vorpal_resolve::{RefForm, RefKind};
 /// rebinding (`from x import y as z` → alias `z`), so import bindings can key on the name
 /// bare uses actually say; v13 adds the MethodHinted form — member-access receivers ride as
 /// owner hints (`Foo.bar()` corroborates class Foo) instead of being discarded.
-pub const PRODUCT_FORMAT_VERSION: u32 = 13;
+/// v14 (G-M1): refs carry receiver/receiver-type/args; products carry per-entity params.
+/// The version check itself is this bump's invalidation — v13 bytes never decode, so every
+/// file re-extracts exactly once.
+pub const PRODUCT_FORMAT_VERSION: u32 = 17;
+
+/// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
+pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
+/// Borrowed twin of [`EntityParams`] for the zero-copy view.
+pub type EntityParamsView<'a> = Vec<(u32, Vec<(&'a str, Option<&'a str>)>)>;
 
 /// One file's extraction output, serializable for the on-disk product cache.
 #[derive(Debug, Clone)]
@@ -69,6 +77,22 @@ pub struct FileProduct {
   pub error_spans: Vec<(u32, u32)>,
   pub items: Vec<OutlineItem<'static>>,
   pub refs: Vec<ProductRef>,
+  /// Per-entity parameter lists (G-M1): `(local entity index, [(name, type_text?)])`, sorted
+  /// by entity index; captured for the typefacts launch languages, empty elsewhere.
+  pub entity_params: EntityParams,
+  /// `(function name, declared return type)` — v15, the chained-call return ledger. Name-
+/// v16: near-clone signatures — per callable definition a 64-byte MinHash sketch + shingle
+/// count (trailing section, absent for definitions under the 32-token floor).
+/// v17: HTTP request records — per client call site the method + literal URL (trailing
+/// section), matched against `Route` templates at link.
+  /// keyed on purpose: link joins it against receiver "types" that are really callee names
+  /// (`let x = make(); x.render()`), poisoning same-named functions with disagreeing
+  /// returns. Only capture languages with a return annotation produce rows.
+  pub returns: Vec<(String, String)>,
+  /// Near-clone sketches per signed callable definition (v16), entity-ordered.
+  pub signatures: Vec<ProductSignature>,
+  /// HTTP client call sites with literal URLs (v17), in walk order.
+  pub requests: Vec<ProductRequest>,
 }
 
 /// A reference keyed by its enclosing definition's position in the file's local layout
@@ -89,6 +113,62 @@ pub struct ProductRef {
   pub qualifier: Option<String>,
   /// Syntactic form tag (see [`refform_tag`]).
   pub form: u8,
+  /// Method-call receiver's simple spelling (`x.helper()` → `x`), when it is a bare name.
+  pub receiver: Option<String>,
+  /// The receiver's file-locally bound type text, when exactly one unpoisoned binding names
+  /// it (G-M1 capture; consumed by typed-receiver resolution in G-M2).
+  pub receiver_type: Option<String>,
+  /// [`crate::typefacts::BindOrigin`] tag for `receiver_type`; `0xFF` when absent.
+  pub receiver_type_origin: u8,
+  /// Call-site arguments (G-M1 capture; consumed by data-flow in G-M3).
+  pub args: Vec<ProductArg>,
+}
+
+/// One definition's near-clone sketch (see `signature.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductSignature {
+  pub entity_index: u32,
+  pub shingles: u32,
+  pub sketch: [u8; crate::signature::BINS],
+}
+
+/// Borrowed twin of [`ProductSignature`].
+#[derive(Clone, Copy)]
+pub struct SignatureView<'a> {
+  pub entity_index: u32,
+  pub shingles: u32,
+  pub sketch: &'a [u8],
+}
+
+/// One HTTP client call site (v17): the enclosing entity, method, literal URL, span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductRequest {
+  pub from_entity_index: u32,
+  pub method: String,
+  pub path: String,
+  pub start: u32,
+  pub end: u32,
+}
+
+/// Borrowed twin of [`ProductRequest`].
+#[derive(Clone, Copy)]
+pub struct RequestView<'a> {
+  pub from_entity_index: u32,
+  pub method: &'a str,
+  pub path: &'a str,
+  pub start: u32,
+  pub end: u32,
+}
+
+/// One persisted call-site argument (see `references::RawArg`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductArg {
+  pub index: u16,
+  /// `references::ArgClass` discriminant.
+  pub class: u8,
+  pub kw_name: Option<String>,
+  /// Expression text (≤64 bytes), traceable classes only.
+  pub expr: Option<String>,
 }
 
 pub(crate) fn refkind_tag(kind: RefKind) -> u8 {
@@ -239,6 +319,8 @@ fn symbol_type_tag(sym: SymbolType) -> u8 {
     SymbolType::Event => 23,
     SymbolType::Operator => 24,
     SymbolType::TypeParameter => 25,
+    SymbolType::Route => 26,
+    SymbolType::Channel => 27,
   }
 }
 
@@ -270,6 +352,8 @@ fn tag_symbol_type(tag: u8) -> io::Result<SymbolType> {
     23 => SymbolType::Event,
     24 => SymbolType::Operator,
     25 => SymbolType::TypeParameter,
+    26 => SymbolType::Route,
+    27 => SymbolType::Channel,
     other => return Err(corrupt(format!("unknown symbol type tag {other}"))),
   })
 }
@@ -388,6 +472,74 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
       }
       None => buf.push(0),
     }
+    // Extras presence flags: bit0 receiver, bit1 receiver_type (+origin byte), bit2 args
+    // (+u16 count). The overwhelmingly common no-extras ref costs ONE byte, not five.
+    let flags = u8::from(r.receiver.is_some())
+      | (u8::from(r.receiver_type.is_some()) << 1)
+      | (u8::from(!r.args.is_empty()) << 2);
+    buf.push(flags);
+    if let Some(v) = &r.receiver {
+      push_str(buf, v);
+    }
+    if let Some(v) = &r.receiver_type {
+      push_str(buf, v);
+      buf.push(r.receiver_type_origin);
+    }
+    if !r.args.is_empty() {
+      buf.extend_from_slice(&(r.args.len() as u16).to_le_bytes());
+    }
+    for arg in &r.args {
+      buf.extend_from_slice(&arg.index.to_le_bytes());
+      buf.push(arg.class);
+      match &arg.kw_name {
+        Some(v) => {
+          buf.push(1);
+          push_str(buf, v);
+        }
+        None => buf.push(0),
+      }
+      match &arg.expr {
+        Some(v) => {
+          buf.push(1);
+          push_str(buf, v);
+        }
+        None => buf.push(0),
+      }
+    }
+  }
+  push_u32(buf, product.entity_params.len() as u32);
+  for (entity, params) in &product.entity_params {
+    push_u32(buf, *entity);
+    push_u32(buf, params.len() as u32);
+    for (name, ty) in params {
+      push_str(buf, name);
+      match ty {
+        Some(t) => {
+          buf.push(1);
+          push_str(buf, t);
+        }
+        None => buf.push(0),
+      }
+    }
+  }
+  push_u32(buf, product.returns.len() as u32);
+  for (name, ret) in &product.returns {
+    push_str(buf, name);
+    push_str(buf, ret);
+  }
+  push_u32(buf, product.signatures.len() as u32);
+  for sig in &product.signatures {
+    push_u32(buf, sig.entity_index);
+    push_u32(buf, sig.shingles);
+    buf.extend_from_slice(&sig.sketch);
+  }
+  push_u32(buf, product.requests.len() as u32);
+  for req in &product.requests {
+    push_u32(buf, req.from_entity_index);
+    push_u32(buf, req.start);
+    push_u32(buf, req.end);
+    push_str(buf, &req.method);
+    push_str(buf, &req.path);
   }
 }
 
@@ -412,6 +564,10 @@ impl<'a> Reader<'a> {
 
   fn u8(&mut self) -> io::Result<u8> {
     Ok(self.take(1)?[0])
+  }
+
+  fn u16(&mut self) -> io::Result<u16> {
+    Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("2B")))
   }
 
   fn u32(&mut self) -> io::Result<u32> {
@@ -506,9 +662,20 @@ pub struct ProductView<'a> {
   pub error_spans: Vec<(u32, u32)>,
   pub items: Vec<OutlineItem<'a>>,
   pub refs: Vec<RefView<'a>>,
+  /// Per-entity parameter lists, borrowed (see `FileProduct::entity_params`).
+  pub entity_params: EntityParamsView<'a>,
+  /// Borrowed twin of `FileProduct::returns` (v15).
+  pub returns: Vec<(&'a str, &'a str)>,
+  /// Borrowed twin of `FileProduct::signatures` (v16).
+  pub signatures: Vec<SignatureView<'a>>,
+  /// Borrowed twin of `FileProduct::requests` (v17).
+  pub requests: Vec<RequestView<'a>>,
 }
 
 /// One reference occurrence as a borrowed view (see [`ProductRef`] for field semantics).
+/// Receiver typing is decoded eagerly (two option-tagged slices — no allocation); the
+/// argument records stay as raw encoded bytes decoded on demand via [`RefView::args`] — the
+/// replay path applies millions of refs and must never pay for records it doesn't read.
 #[derive(Clone, Copy)]
 pub struct RefView<'a> {
   pub from_entity_index: u32,
@@ -519,6 +686,105 @@ pub struct RefView<'a> {
   pub qualifier: Option<&'a str>,
   pub form: u8,
   pub alias: Option<&'a str>,
+  pub receiver: Option<&'a str>,
+  pub receiver_type: Option<&'a str>,
+  pub receiver_type_origin: u8,
+  /// Argument records: encoded bytes (the replay path, decoded lazily) or a borrow of the
+  /// owned records (the just-parsed bridge) — one accessor serves both.
+  args: ArgsSrc<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ArgsSrc<'a> {
+  Encoded { bytes: &'a [u8], count: u16 },
+  Owned(&'a [ProductArg]),
+}
+
+/// One decoded argument view.
+#[derive(Clone, Copy)]
+pub struct ArgView<'a> {
+  pub index: u16,
+  pub class: u8,
+  pub kw_name: Option<&'a str>,
+  pub expr: Option<&'a str>,
+}
+
+impl<'a> RefView<'a> {
+  /// Bridge an owned ref into the shared apply path, argument records included (borrowed).
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn bridge(
+    from_entity_index: u32,
+    name: &'a str,
+    kind: u8,
+    start: u32,
+    end: u32,
+    qualifier: Option<&'a str>,
+    form: u8,
+    alias: Option<&'a str>,
+    receiver: Option<&'a str>,
+    receiver_type: Option<&'a str>,
+    receiver_type_origin: u8,
+    args: &'a [ProductArg],
+  ) -> Self {
+    Self {
+      from_entity_index,
+      name,
+      kind,
+      start,
+      end,
+      qualifier,
+      form,
+      alias,
+      receiver,
+      receiver_type,
+      receiver_type_origin,
+      args: ArgsSrc::Owned(args),
+    }
+  }
+
+  /// Decode the argument records on demand. Errors surface as an early end (the encoder and
+  /// the eager decoder guarantee well-formed bytes; a torn read yields fewer records, never
+  /// junk).
+  pub fn args(&self) -> impl Iterator<Item = ArgView<'a>> + 'a {
+    let (bytes, count, owned): (&'a [u8], u16, &'a [ProductArg]) = match self.args {
+      ArgsSrc::Encoded { bytes, count } => (bytes, count, &[]),
+      ArgsSrc::Owned(records) => (&[], 0, records),
+    };
+    let mut r = Reader { bytes, off: 0 };
+    let encoded = (0..count).map_while(move |_| {
+      let index = r.u16().ok()?;
+      let class = r.u8().ok()?;
+      let kw_name = if r.u8().ok()? != 0 {
+        Some(r.str_borrowed().ok()?)
+      } else {
+        None
+      };
+      let expr = if r.u8().ok()? != 0 {
+        Some(r.str_borrowed().ok()?)
+      } else {
+        None
+      };
+      Some(ArgView {
+        index,
+        class,
+        kw_name,
+        expr,
+      })
+    });
+    encoded.chain(owned.iter().map(|arg| ArgView {
+      index: arg.index,
+      class: arg.class,
+      kw_name: arg.kw_name.as_deref(),
+      expr: arg.expr.as_deref(),
+    }))
+  }
+
+  pub fn args_len(&self) -> usize {
+    match self.args {
+      ArgsSrc::Encoded { count, .. } => count as usize,
+      ArgsSrc::Owned(records) => records.len(),
+    }
+  }
 }
 
 /// The stat stamp of an encoded product, read from its fixed header — magic and format
@@ -590,60 +856,12 @@ pub fn peek_product_error_bytes(bytes: &[u8]) -> Option<u64> {
 }
 
 pub fn validate_product(bytes: &[u8]) -> bool {
-  fn walk_entry(r: &mut Reader<'_>) -> io::Result<()> {
-    tag_role(r.u8()?)?;
-    tag_symbol_type(r.u8()?)?;
-    r.str_borrowed()?;
-    for _ in 0..6 {
-      r.u32()?;
-    }
-    r.str_borrowed()?;
-    r.str_borrowed()?;
-    Ok(())
-  }
-  fn walk(bytes: &[u8]) -> io::Result<()> {
-    let mut r = Reader { bytes, off: 0 };
-    if r.take(4)? != PRODUCT_MAGIC {
-      return Err(corrupt("bad product magic"));
-    }
-    if r.u32()? != PRODUCT_FORMAT_VERSION {
-      return Err(corrupt("product from a different format generation"));
-    }
-    r.u64()?; // source_size
-    r.u64()?; // source_mtime_ns
-    r.u64()?; // source_xxh3
-    r.u64()?; // grammar_digest
-    r.u32()?; // error_nodes
-    r.u64()?; // error_bytes
-    for _ in 0..r.count()? {
-      r.u32()?; // error span start
-      r.u32()?; // error span end
-    }
-    for _ in 0..r.count()? {
-      walk_entry(&mut r)?;
-      r.u8()?;
-      for _ in 0..r.count()? {
-        walk_entry(&mut r)?;
-        r.u8()?;
-      }
-    }
-    for _ in 0..r.count()? {
-      r.u32()?;
-      r.str_borrowed()?;
-      r.u8()?;
-      r.u32()?;
-      r.u32()?;
-      r.u8()?;
-      if r.u8()? != 0 {
-        r.str_borrowed()?;
-      }
-      if r.u8()? != 0 {
-        r.str_borrowed()?;
-      }
-    }
-    Ok(())
-  }
-  walk(bytes).is_ok()
+  // ONE decoder. This used to be a hand-rolled byte walker mirroring the layout — and it
+  // silently fell behind the v14/v15 reference extras (flags byte, args, entity params,
+  // returns): every product with references failed validation and re-parsed, so incremental
+  // builds re-extracted ~80% of the tree for weeks while cold builds looked fine. The view
+  // decoder is exact by construction and allocates only the item/ref vectors.
+  decode_product_view(bytes).is_ok()
 }
 
 /// Decode a product as views over `bytes` (see [`ProductView`]). Same validation as
@@ -706,6 +924,31 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     } else {
       None
     };
+    let flags = r.u8()?;
+    let receiver = if flags & 1 != 0 {
+      Some(r.str_borrowed()?)
+    } else {
+      None
+    };
+    let (receiver_type, receiver_type_origin) = if flags & 2 != 0 {
+      (Some(r.str_borrowed()?), r.u8()?)
+    } else {
+      (None, 0xFF)
+    };
+    // Args stay encoded: remember the region, skip past it.
+    let args_count = if flags & 4 != 0 { r.u16()? } else { 0 };
+    let args_start = r.off;
+    for _ in 0..args_count {
+      r.u16()?;
+      r.u8()?;
+      if r.u8()? != 0 {
+        r.str_borrowed()?;
+      }
+      if r.u8()? != 0 {
+        r.str_borrowed()?;
+      }
+    }
+    let args_bytes = &bytes[args_start..r.off];
     refs.push(RefView {
       from_entity_index,
       name,
@@ -715,7 +958,69 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       qualifier,
       form,
       alias,
+      receiver,
+      receiver_type,
+      receiver_type_origin,
+      args: ArgsSrc::Encoded {
+        bytes: args_bytes,
+        count: args_count,
+      },
     });
+  }
+  let entity_param_count = r.count()?;
+  let mut entity_params = Vec::with_capacity(entity_param_count.min(1024));
+  for _ in 0..entity_param_count {
+    let entity = r.u32()?;
+    let param_count = r.count()?;
+    let mut params = Vec::with_capacity(param_count.min(64));
+    for _ in 0..param_count {
+      let name = r.str_borrowed()?;
+      let ty = if r.u8()? != 0 {
+        Some(r.str_borrowed()?)
+      } else {
+        None
+      };
+      params.push((name, ty));
+    }
+    entity_params.push((entity, params));
+  }
+  let return_count = r.count()?;
+  let mut returns = Vec::with_capacity(return_count.min(1024));
+  for _ in 0..return_count {
+    let name = r.str_borrowed()?;
+    let ret = r.str_borrowed()?;
+    returns.push((name, ret));
+  }
+  let signature_count = r.count()?;
+  let mut signatures = Vec::with_capacity(signature_count.min(1024));
+  for _ in 0..signature_count {
+    let entity_index = r.u32()?;
+    let shingles = r.u32()?;
+    let sketch = r.take(crate::signature::BINS)?;
+    signatures.push(SignatureView {
+      entity_index,
+      shingles,
+      sketch,
+    });
+  }
+  let request_count = r.count()?;
+  let mut requests = Vec::with_capacity(request_count.min(1024));
+  for _ in 0..request_count {
+    let from_entity_index = r.u32()?;
+    let start = r.u32()?;
+    let end = r.u32()?;
+    let method = r.str_borrowed()?;
+    let path = r.str_borrowed()?;
+    requests.push(RequestView {
+      from_entity_index,
+      method,
+      path,
+      start,
+      end,
+    });
+  }
+  if r.off != bytes.len() {
+    return Err(corrupt("trailing bytes after product"));
   }
   Ok(ProductView {
     source_size,
@@ -727,6 +1032,10 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     error_spans,
     items,
     refs,
+    entity_params,
+    returns,
+    signatures,
+    requests,
   })
 }
 
@@ -780,6 +1089,27 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     let form = r.u8()?;
     let qualifier = if r.u8()? != 0 { Some(r.str()?) } else { None };
     let alias = if r.u8()? != 0 { Some(r.str()?) } else { None };
+    let flags = r.u8()?;
+    let receiver = if flags & 1 != 0 { Some(r.str()?) } else { None };
+    let (receiver_type, receiver_type_origin) = if flags & 2 != 0 {
+      (Some(r.str()?), r.u8()?)
+    } else {
+      (None, 0xFF)
+    };
+    let arg_count = if flags & 4 != 0 { r.u16()? as usize } else { 0 };
+    let mut args = Vec::with_capacity(arg_count.min(64));
+    for _ in 0..arg_count {
+      let index = r.u16()?;
+      let class = r.u8()?;
+      let kw_name = if r.u8()? != 0 { Some(r.str()?) } else { None };
+      let expr = if r.u8()? != 0 { Some(r.str()?) } else { None };
+      args.push(ProductArg {
+        index,
+        class,
+        kw_name,
+        expr,
+      });
+    }
     refs.push(ProductRef {
       from_entity_index,
       name,
@@ -789,6 +1119,61 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
       qualifier,
       form,
       alias,
+      receiver,
+      receiver_type,
+      receiver_type_origin,
+      args,
+    });
+  }
+  let entity_param_count = r.count()?;
+  let mut entity_params = Vec::with_capacity(entity_param_count.min(1024));
+  for _ in 0..entity_param_count {
+    let entity = r.u32()?;
+    let param_count = r.count()?;
+    let mut params = Vec::with_capacity(param_count.min(64));
+    for _ in 0..param_count {
+      let name = r.str()?;
+      let ty = if r.u8()? != 0 { Some(r.str()?) } else { None };
+      params.push((name, ty));
+    }
+    entity_params.push((entity, params));
+  }
+  let return_count = r.count()?;
+  let mut returns = Vec::with_capacity(return_count.min(1024));
+  for _ in 0..return_count {
+    let name = r.str()?;
+    let ret = r.str()?;
+    returns.push((name, ret));
+  }
+  let signature_count = r.count()?;
+  let mut signatures = Vec::with_capacity(signature_count.min(1024));
+  for _ in 0..signature_count {
+    let entity_index = r.u32()?;
+    let shingles = r.u32()?;
+    let sketch: [u8; crate::signature::BINS] = r
+      .take(crate::signature::BINS)?
+      .try_into()
+      .map_err(|_| corrupt("signature sketch width"))?;
+    signatures.push(ProductSignature {
+      entity_index,
+      shingles,
+      sketch,
+    });
+  }
+  let request_count = r.count()?;
+  let mut requests = Vec::with_capacity(request_count.min(1024));
+  for _ in 0..request_count {
+    let from_entity_index = r.u32()?;
+    let start = r.u32()?;
+    let end = r.u32()?;
+    let method = r.str()?;
+    let path = r.str()?;
+    requests.push(ProductRequest {
+      from_entity_index,
+      method,
+      path,
+      start,
+      end,
     });
   }
   if r.off != bytes.len() {
@@ -805,6 +1190,10 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     error_spans,
     items,
     refs,
+    entity_params,
+    returns,
+    signatures,
+    requests,
   })
 }
 

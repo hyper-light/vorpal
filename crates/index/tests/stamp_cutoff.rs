@@ -32,7 +32,8 @@ fn restamp_class_commits_the_from_scratch_generation() {
   fs::write(src.join("a.c"), a).unwrap();
 
   let report = build(&src, &out);
-  assert!(report.reused, "restamp class must reuse the graph");
+  assert!(report.graph_reused, "restamp class must reuse the graph");
+  assert!(!report.reused, "files re-extracted and a new generation committed — not 'unchanged'");
   assert_eq!(report.indexed, 1, "exactly the edited file re-extracts");
   let cutoff_gen = gen_id(&out);
 

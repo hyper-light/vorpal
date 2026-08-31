@@ -1,0 +1,42 @@
+id: ini-section
+language: Ini
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: section
+    - has:
+        kind: section_name
+        has:
+          kind: text
+          pattern: $NAME
+name: '$NAME'
+---
+id: ini-top-setting
+language: Ini
+role: item
+symbolType: key
+rule:
+  all:
+    - kind: setting
+    - not:
+        inside:
+          kind: section
+          stopBy: end
+    - has:
+        kind: setting_name
+        pattern: $NAME
+name: '$NAME'
+---
+id: ini-section-setting
+language: Ini
+role: member
+parentRuleIds: [ini-section]
+symbolType: key
+rule:
+  all:
+    - kind: setting
+    - has:
+        kind: setting_name
+        pattern: $NAME
+name: '$NAME'

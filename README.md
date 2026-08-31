@@ -119,8 +119,8 @@ it from `.cursor/mcp.json`).
 
 Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
 `compare_generations`, `impact`, `dead_code`, `node`, `callers`, `references`, `importers`,
-`implementors`, `type_users`, `reachable`, `structural_search`, `rule_search`, `ast_dump`,
-`fetch_span`, `snippet`, `why`, `search`. Record-bearing tools page with cursors and accept
+`implementors`, `type_users`, `similar`, `reachable`, `data_flow`, `observed`, `query`, `structural_search`,
+`rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. Record-bearing tools page with cursors and accept
 `format: "toon" | "lean" | "ids"` for token-lean output; `--profile scout|analysis|full`
 serves a smaller surface to read-only agents. Full descriptions and setup notes:
 **[docs/mcp.md](docs/mcp.md)**.
@@ -143,7 +143,8 @@ npm install @hyper-light/vorpal-wasm     # browser / portable
 |---|---|
 | `vorpal index [src] [--out DIR] [--verify]` | Build/refresh the knowledge-graph index |
 | `vorpal search <query> [-k N] [--index DIR]` | Hybrid (name + semantic + graph) search |
-| `vorpal graph <verb> [name] [--index DIR]` | `callers` `refs` `importers` `implementors` `typeusers` `node` `reachable` `snippet` `schema` `dead` `coverage` `impact` `diff` `architecture` |
+| `vorpal graph <verb> [name] [--index DIR]` | `callers` `refs` `importers` `implementors` `typeusers` `similar` `observed` `node` `reachable` `flows` `snippet` `schema` `dead` `coverage` `impact` `diff` `architecture` |
+| `vorpal query '<cypher>' [--index DIR]` | Cypher-shaped read-only graph queries (`MATCH … WHERE … RETURN … LIMIT`) |
 | `vorpal run -p <pattern> [-l lang] [-r fix]` | One-off structural search/rewrite (default command) |
 | `vorpal scan [-r rule.yml] [--format github]` | Run configured YAML rules across a project |
 | `vorpal outline [paths] [--view signatures]` | File structure: symbols, members, imports/exports |
@@ -155,9 +156,12 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 ## Performance
 
 All numbers below are release builds on an Apple M5 Max (18 cores, 128 GB, macOS 26.4.1,
-rustc 1.98.0), measured 2026-08-30, wall-clock for the whole CLI invocation including
+rustc 1.98.0), measured 2026-08-31, wall-clock for the whole CLI invocation including
 process start. Datasets are pinned so you can re-run them: Linux kernel @ `1590cf032971`
-(72,541 indexable files), CPython @ `b86a41cbf63` (3,592 files). Cold times are best of 3.
+(75,954 indexable files), CPython @ `b86a41cbf63` (3,841 files). Cold times are best of 3.
+Indexing derives the full relation set — calls, imports, types, data flow, near-clone
+pairs, request→route links, co-change history — so every number below buys the whole
+graph, not a bare symbol table.
 
 ### Indexing
 
@@ -167,17 +171,17 @@ vorpal index <source-tree> --out <index-dir>
 
 | Tree | Cold index | Edit one file, re-index | `touch` one file | Nothing changed |
 |---|---|---|---|---|
-| **Linux kernel** (72,541 files, ~30 M LOC → 2.75 M nodes, 6.8 M references) | **6.3 s** | **0.98 s** | 0.20 s | 0.10 s |
-| **CPython** (3,592 files → 143k nodes) | 0.67 s | — | — | — |
-| **This repository** (856 files → 44k nodes, incl. vendored tree-sitter runtime + grammars) | 3.8 s¹ | 0.04 s | — | 0.02 s |
+| **Linux kernel** (75,954 files, ~30 M LOC → 2.85 M nodes, 8.9 M references) | **7.6 s** | **1.7 s** | 0.23 s | 0.13 s |
+| **CPython** (3,841 files → 151k nodes) | 0.94 s | — | — | — |
+| **This repository** (1,311 files → 64k nodes, incl. vendored tree-sitter runtime + 49 grammars) | 6.2 s¹ | 0.06 s | — | 0.06 s |
 
-¹ Dominated by a single 33 MB generated `parser.c`; the other 855 files parse in parallel
+¹ Dominated by a single 33 MB generated `parser.c`; the other files parse in parallel
 underneath it.
 
-Peak memory for the kernel cold index stays under 1 GB. The index on disk for the kernel
-is a 2.0 GB generation (that includes the 811 MB semantic-search index and a 581 MB cache
-of parsed files that makes the 0.98 s re-index possible); the previous generation is kept
-until the next commit, then swept.
+Peak memory for the kernel cold index is 1.9 GB. The index on disk for the kernel is a
+1.5 GB generation (the parsed-file cache inside it is what makes the 3.1 s re-index
+possible), plus an 840 MB semantic-search index once that is built; the previous
+generation is kept until the next commit, then swept.
 
 ### Search (Linux kernel index, k = 10)
 
@@ -205,9 +209,11 @@ stdio — you never re-index by hand. Round-trip times measured from the client 
 |---|---|
 | Graph query (callers, references, …) | **< 1 ms** |
 | Hybrid search | **27 ms** |
-| Save a file → queries reflect the change | ~0.5 s |
+| Save a file → queries reflect the change (full relation set, kernel tree) | ~0.57 s |
+| Comment-only / metadata-only saves | ~10 ms |
 | Keeping the semantic index current after an edit | ~140 ms, in the background |
-| Server start → fully warm on an existing index | 2–4 s |
+| Server start → answering queries on an existing index | immediate |
+| Server start → in-memory serving tier rebuilt (background) | ~15 s |
 
 Editing never triggers index rebuilds — changes are applied incrementally, including to
 the semantic-search index.
@@ -246,14 +252,17 @@ re-verifies this.
   graph in-degree (reciprocal rank fusion), with per-channel provenance on every hit.
 - **Incremental by construction** — per-file extraction is cached; re-indexing re-parses only what
   changed and always re-links the whole graph, so renames and deletions never leave stale nodes.
-- **28 languages** — one pipeline, tree-sitter grammars compiled in. No plugins to install.
+- **49 languages** — one pipeline, tree-sitter grammars compiled in. No plugins to install.
 
 ## Supported languages
 
-All **28** grammars are compiled into the binary: Bash, C, C++, C#, CSS, Dart, Elixir, Go,
-Haskell, HCL/Terraform, HTML, Java, JavaScript, JSON, Kotlin, Lua, Markdown, Nix, PHP, Python,
-Ruby, Rust, Scala, Solidity, Swift, TSX, TypeScript, YAML. The relation edges each supports are in
-the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simply absent — never guessed.
+All **49** grammars are compiled into the binary: Astro, Bash, C, C++, C#, CMake, CSS, Dart,
+Dockerfile, Elixir, Erlang, Go, GraphQL, Haskell, HCL/Terraform, HTML, INI, Java, JavaScript,
+JSDoc, JSON, Julia, Kotlin, Lua, Make, Markdown, Nix, Objective-C, OCaml, Perl, PHP,
+PowerShell, Protobuf, Python, R, Ruby, Rust, Scala, Solidity, SQL, Svelte, Swift, TOML, TSX,
+TypeScript, Vue, XML, YAML, Zig. Vue/Svelte/Astro single-file components extract their
+script/style/frontmatter content through real embedded parses (C3a injections). The relation edges each supports are in
+the **[language matrix](docs/LANGUAGES.md)**. Anything not extracted is simply absent — never guessed.
 
 ## Documentation
 
@@ -262,14 +271,14 @@ the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simp
 | [Getting started](docs/getting-started.md) | Install, first index, every CLI command with examples |
 | [MCP setup](docs/mcp.md) | Wire vorpal into Claude / Codex / any MCP client; the tool reference |
 | [Python](docs/python.md) · [TypeScript/JS](docs/typescript.md) | Library quickstarts (patterns + index API) |
-| [Supported languages](docs/wip/LANGUAGES.md) | The full matrix of what each of the 28 grammars extracts |
+| [Supported languages](docs/LANGUAGES.md) | The full matrix of what each of the 49 grammars extracts |
 | [Architecture](docs/wip/ARCHITECTURE.md) | Storage format, memory model, concurrency, scaling roadmap |
-| [Index format](docs/wip/INDEX_FORMAT.md) | On-disk compatibility & migration policy |
+| [Index format](docs/INDEX_FORMAT.md) | On-disk compatibility & migration policy |
 
 ## How it works
 
 ```
-parse (tree-sitter, 28 grammars)
+parse (tree-sitter, 49 grammars)
   → extract   definitions (YAML outline rules) + references (AST walk: calls/imports/types/impl)
   → intern    blake3 path-qualified identity → dense node ids (dedup, incremental skip)
   → store     columnar node segment (mmap, checksummed) + string heap + edge lists

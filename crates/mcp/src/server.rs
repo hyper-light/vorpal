@@ -5,6 +5,20 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use vorpal_index::{CacheMode, ExtractionEnv, ParseHealthPolicy, build_index_env};
+
+use crate::supervised::{BuildOutcome, Supervisor};
+
+/// Serializes IN-PROCESS builds within this daemon: staging dirs are per-PID, so two
+/// same-process builds (the D1 worker's fallback racing a query-path rebuild) would share —
+/// and clobber — one staging directory. Child-process builds need no lock (their PIDs differ).
+static IN_PROCESS_BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn in_process_build_guard() -> std::sync::MutexGuard<'static, ()> {
+  IN_PROCESS_BUILD
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 use vorpal_kg::Kg;
 
 use crate::watch::SourceWatch;
@@ -57,9 +71,10 @@ impl Profile {
   fn allows(self, tool: &str) -> bool {
     const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
-      "callers", "references", "importers", "implementors", "type_users", "reachable", "why",
+      "callers", "references", "importers", "implementors", "type_users", "similar", "reachable",
+      "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
-      "code_search",
+      "code_search", "data_flow", "observed", "query",
     ];
     match self {
       Profile::Full => true,
@@ -72,6 +87,16 @@ impl Profile {
 pub struct Server {
   index_dir: PathBuf,
   profile: Profile,
+  /// The extraction environment every rebuild runs under (F-M6): custom/dynamic language
+  /// rules, ref specs, canaries, and injection config. Fixed at construction — REGISTRATION
+  /// (any dlopen of a grammar .so) is the launching process's one-shot startup act; nothing
+  /// reachable through the MCP surface can ever trigger a dlopen.
+  env: ExtractionEnv,
+  /// Crash isolation for builds (D3): rebuilds run in a child indexer process when one can be
+  /// discovered, so a pathological input costs one build attempt, never the daemon.
+  supervisor: Supervisor,
+  /// `Arc` because the live-rebuild path serves the sealed graph from RAM while the deferred
+  /// persistence tail still holds a reference on its background thread.
   kg: Option<Arc<Kg>>,
   /// The resolved generation directory the cached graph was loaded from — the artifacts a
   /// `why` snippet is digest-verified against, so a concurrent `CURRENT` swap can never split
@@ -85,6 +110,18 @@ pub struct Server {
   /// probe). The synchronous rebuild path drains this first so an older stamp-only commit
   /// can never land after — and regress — a newer semantic one.
   canonicalizing: Option<std::thread::JoinHandle<bool>>,
+  /// The in-flight PROACTIVE full rebuild (`tick`'s heavy tier): a supervised child indexer
+  /// — or an in-process background thread when none is discoverable — committing a
+  /// generation while the daemon keeps serving. One more drain-ordered committer: every
+  /// other commit path reaps or drains it first, so commits can never invert.
+  rebuilding: Option<std::thread::JoinHandle<bool>>,
+  /// Watch-quiet debounce for `tick`: set when the watch first reports dirt, cleared when
+  /// the proactive build starts — an editor's save burst builds once, after it settles.
+  dirty_since: Option<std::time::Instant>,
+  /// Whether `tick` may START builds (the D1 toggle, re-homed): `--no-watch-rebuild` /
+  /// `VORPAL_WATCH_REBUILD=0` turn proactive building off; query-path freshness is lazy
+  /// and unaffected.
+  proactive: bool,
   /// The in-flight background ANN warm, if any. Warms are **single-flight and coalescing**:
   /// a rebuild that lands while one is running sets `warm_pending` instead of stacking a
   /// second core-saturating build, and the trailing warm re-resolves `CURRENT` when it
@@ -171,6 +208,20 @@ impl Server {
   }
 
   pub fn with_profile(index_dir: PathBuf, profile: Profile) -> Self {
+    Self::with_profile_env(index_dir, profile, ExtractionEnv::default())
+  }
+
+  pub fn with_profile_env(index_dir: PathBuf, profile: Profile, env: ExtractionEnv) -> Self {
+    Self::with_profile_env_rebuild(index_dir, profile, env, true)
+  }
+
+  /// Full-control constructor: `watch_rebuild` gates the proactive background rebuild (D1).
+  pub fn with_profile_env_rebuild(
+    index_dir: PathBuf,
+    profile: Profile,
+    env: ExtractionEnv,
+    watch_rebuild: bool,
+  ) -> Self {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
     // start building it now instead of on the first semantic search. The generation must be
@@ -190,13 +241,27 @@ impl Server {
         let _ = vorpal_index::warm_ann(&warm_dir);
       }));
     }
-    Self {
+    let supervisor = Supervisor::discover();
+    // Proactive freshness (D1) is a serve-loop concern now: the protocol loop calls
+    // [`Server::tick`] between requests, which drives the SAME retained freshness path
+    // queries use. The original stateless worker thread was a second committer — its
+    // child-process builds could land between this daemon's own drain-ordered commits
+    // and regress `CURRENT` — so the worker's debounce and supervised build live inside
+    // `tick`/`refresh` instead, where commit ordering is provable.
+    let proactive =
+      watch_rebuild && !std::env::var("VORPAL_WATCH_REBUILD").is_ok_and(|v| v == "0");
+    let mut server = Self {
       index_dir,
       profile,
+      env,
+      supervisor,
       kg: None,
       kg_dir: None,
       hinted_rebuilds: 0,
       canonicalizing: None,
+      rebuilding: None,
+      dirty_since: None,
+      proactive,
       warm,
       warm_pending: false,
       persisting: None,
@@ -208,7 +273,12 @@ impl Server {
       live_ann_failed_gen: None,
       live_ann_discard_task: false,
       watch,
-    }
+    };
+    // The overlay is the serving architecture, not an optimization to warm lazily: start
+    // building it the moment the daemon exists (its own gates decline when there is no
+    // generation yet, a committer is mid-write, or the environment is custom).
+    server.spawn_overlay_build();
+    server
   }
 
   /// Retire the live tier because the served graph advanced WITHOUT an eid-churn ledger
@@ -331,16 +401,28 @@ impl Server {
     if !overlay_enabled() || self.overlay.is_some() || self.overlay_building.is_some() {
       return;
     }
+    // Retained fast paths re-extract with the BUNDLED extractor: under a custom extraction
+    // environment they would absorb edits with the wrong rules — decline, and every change
+    // takes the full env-aware pipeline instead (see ExtractionEnv::is_default).
+    if !self.env.is_default() {
+      return;
+    }
     // NEVER build from a generation a committer is still writing: reading stale CURRENT
     // resurrects rows the daemon already retired (a deleted file's symbols would reappear).
     // The committer reaps retrigger this the moment the commit lands.
-    if self.canonicalizing.is_some() || self.persisting.is_some() {
+    if self.canonicalizing.is_some() || self.persisting.is_some() || self.rebuilding.is_some()
+    {
       return;
     }
+    // The overlay serves WATCHED trees (its serve path consumes captured hints), and its
+    // per-link co-change pass needs the source root — no watch, no overlay.
+    let Some(src) = self.watch.as_ref().map(|watch| watch.src().to_path_buf()) else {
+      return;
+    };
     let index_dir = self.index_dir.clone();
     vorpal_kg::phase_stamp("overlay: builder spawned");
     self.overlay_building = Some(std::thread::spawn(move || {
-      vorpal_index::live::LiveOverlay::build(&index_dir)
+      vorpal_index::live::LiveOverlay::build(&index_dir, &src)
     }));
   }
 
@@ -455,7 +537,63 @@ impl Server {
   /// (no reload of bytes we just wrote); fast paths keep the already-mapped graph, whose
   /// artifacts the new generation hardlinks. Any failure re-arms the dirty flag so the next
   /// query retries rather than serving stale data as fresh.
-  fn ensure_fresh(&mut self) -> Result<(), String> {
+  /// Adopt whatever generation `CURRENT` names as the served graph. Shared by every
+  /// commit that arrives WITHOUT a change-set capture or eid-churn ledger (the proactive
+  /// child rebuild, first-contact builds): the overlay retires (rebuilt in the background
+  /// from the new generation) and the live ANN tier retires for resync (lifecycle law 5 —
+  /// the stale-tolerant adopt reconciles a fresh tier from the committed artifacts).
+  fn adopt_committed_generation(&mut self) -> Result<(), String> {
+    let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+    match Kg::load(&dir) {
+      Ok(kg) => {
+        self.overlay = None;
+        self.retire_live_ann_for_resync();
+        self.kg = Some(Arc::new(kg));
+        self.kg_dir = Some(dir);
+        self.spawn_live_ann_adopt();
+        self.request_warm();
+        self.spawn_overlay_build();
+        Ok(())
+      }
+      Err(err) => {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+        Err(format!("loading committed generation failed: {err}"))
+      }
+    }
+  }
+
+  /// Reap (or drain) the proactive rebuild. Success adopts the committed generation;
+  /// failure re-arms the watch — queries surface the error — and holds the debounce for
+  /// the worker's original 5-second retry cadence so a persistently failing build never
+  /// thrashes the CPU.
+  fn reap_rebuilding(&mut self, block: bool) {
+    if !block && !self.rebuilding.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
+    }
+    let Some(handle) = self.rebuilding.take() else {
+      return;
+    };
+    let ok = handle.join().unwrap_or(false);
+    if !ok {
+      if let Some(watch) = &self.watch {
+        watch.mark_dirty();
+      }
+      self.dirty_since =
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(4500));
+      return;
+    }
+    if let Err(err) = self.adopt_committed_generation() {
+      eprintln!("vorpal-mcp: proactive rebuild committed but adoption failed: {err}");
+    }
+  }
+
+  /// Advance every background lifecycle without doing freshness work: reap finished
+  /// committers, warms, overlay builds, and live-ANN tasks; run compaction policy; and
+  /// green-light follow-on stages. Shared by the query path ([`Self::ensure_fresh`]) and
+  /// the between-requests pulse ([`Self::tick`]).
+  fn advance_background(&mut self) {
     // Trailing coalesced warm: if a warm finished while a newer request was pending, spawn
     // the follow-up now (it warms whatever CURRENT is today).
     if self.warm_pending && self.warm.as_ref().is_none_or(|h| h.is_finished()) {
@@ -494,6 +632,70 @@ impl Server {
         watch.mark_dirty();
       }
     }
+    self.reap_rebuilding(false);
+  }
+
+  /// Between-requests freshness pulse (D1, re-homed): reap background work, debounce the
+  /// watch, and START — never run — anything heavy, so the protocol loop stays responsive.
+  /// Small change sets absorb inline through the retained tiers (milliseconds); one that
+  /// needs the full pipeline builds through [`Self::refresh`]'s background tier as the
+  /// single in-flight committer, and the daemon keeps serving the current graph meanwhile.
+  pub fn tick(&mut self) {
+    self.advance_background();
+    if !self.proactive {
+      return;
+    }
+    let Some(watch) = &self.watch else {
+      return;
+    };
+    if watch.take_dirty() {
+      self.dirty_since = Some(std::time::Instant::now());
+    } else if self.kg.is_none() && self.dirty_since.is_none() && self.rebuilding.is_none() {
+      // Boot on a possibly-stale tree: changes since the last index produced no watch
+      // events, so treat startup itself as dirt — the first pass brings the index current
+      // before the first query needs it (the worker's old "starts dirty" behavior).
+      self.dirty_since = Some(std::time::Instant::now());
+    }
+    let Some(since) = self.dirty_since else {
+      return;
+    };
+    // Editor-burst debounce (the worker's half-second quiet rule): build once per burst.
+    if since.elapsed() < std::time::Duration::from_millis(500) {
+      return;
+    }
+    // Single committer: never stack a proactive build on an in-flight commit path. The
+    // debounce timestamp survives, so the next quiet tick retries.
+    if self.rebuilding.is_some() || self.canonicalizing.is_some() || self.persisting.is_some()
+    {
+      return;
+    }
+    self.dirty_since = None;
+    // Hand the consumed dirt back to the shared flag — `refresh` keys off it, and a fresh
+    // edit landing meanwhile simply re-arms the debounce on the next tick.
+    watch.mark_dirty();
+    if let Err(err) = self.refresh(true) {
+      // stderr is free under stdio MCP (the protocol owns stdout). The failure path
+      // re-armed the dirty flag, so queries retry and surface the error themselves.
+      eprintln!("vorpal-mcp: proactive refresh failed: {err}");
+    }
+  }
+
+  fn ensure_fresh(&mut self) -> Result<(), String> {
+    self.advance_background();
+    self.refresh(false)
+  }
+
+  /// The freshness path proper. `background: false` is the query path — any full pipeline
+  /// run happens synchronously because the caller needs its answer. `background: true` is
+  /// the proactive pulse — the full pipeline commits through a supervised child indexer
+  /// (crash isolation, D3; in-process thread fallback) parked in `self.rebuilding`, and
+  /// serving continues from the current graph until [`Self::reap_rebuilding`] adopts.
+  fn refresh(&mut self, background: bool) -> Result<(), String> {
+    // A proactive rebuild in flight means the tree moved and its commit is pending: the
+    // clean-fast-path below must not serve pre-edit state, so drain and adopt FIRST (a
+    // no-op when nothing is in flight). Draining costs at most what building here
+    // ourselves would have — the child is building the very freshness a query wants.
+    self.reap_rebuilding(true);
     let Some(watch) = &self.watch else {
       return Ok(());
     };
@@ -505,6 +707,46 @@ impl Server {
     // hinted rebuild (belt-and-braces reconciliation) take the full sweep; the committed
     // generation is identical either way (pinned by crates/index/tests/hinted_scan.rs).
     let hints = watch.take_changes();
+    // Decision telemetry (VORPAL_PHASE_TRACE): which freshness tier a dirty pass takes is
+    // the first question every daemon-latency investigation asks — stamp the input.
+    match &hints {
+      Some(paths) => vorpal_kg::phase_stamp(&format!("refresh: captured {} path(s)", paths.len())),
+      None => vorpal_kg::phase_stamp("refresh: capture lost"),
+    }
+    let src = watch.src().to_path_buf();
+    // The absorbable change set: capture-certain hints, or — when the watcher lost
+    // certainty — the overlay's own stat sweep against its retained manifest. The retained
+    // tier is THE path for absorbable edits; the streaming pipeline is reserved for change
+    // sets past the absorb budget, a missing/retired overlay, a custom extraction
+    // environment, or boot — each stated in the trace, never a silent fall-through.
+    let change_set: Option<std::collections::HashSet<PathBuf>> = match &hints {
+      Some(paths) => Some(paths.clone()),
+      None => {
+        if overlay_enabled() && self.kg.is_some() && self.env.is_default() {
+          match self.overlay.as_ref().map(|overlay| overlay.stat_changes(&src)) {
+            Some(Ok(paths)) => {
+              vorpal_kg::phase_stamp(&format!(
+                "refresh: stat sweep recovered {} path(s)",
+                paths.len()
+              ));
+              if paths.is_empty() {
+                // Spurious wake: the tree stat-matches the retained manifest exactly —
+                // nothing to rebuild, nothing to serve differently.
+                return Ok(());
+              }
+              Some(paths)
+            }
+            Some(Err(err)) => {
+              vorpal_kg::phase_stamp(&format!("refresh: stat sweep failed ({err})"));
+              None
+            }
+            None => None,
+          }
+        } else {
+          None
+        }
+      }
+    };
     // Serve-immediately probe (SUBSECOND.md Phase 3): when the capture is complete, small,
     // and every changed file re-extracts byte-identical to its cached product, NO answer can
     // differ from the loaded graph's — so answer now (single-digit ms: one re-extraction per
@@ -514,17 +756,22 @@ impl Server {
     // One extraction per changed file serves BOTH fast paths: the serve-immediately
     // decision (byte-identical to cached products?) and, failing that, the overlay's
     // absorb — which previously re-extracted the same files.
-    let mut probe = if let Some(paths) = &hints
+    let mut probe = if let Some(paths) = &change_set
       && !paths.is_empty()
-      && paths.len() <= 8
       && self.kg.is_some()
+      // The probe re-extracts with the bundled extractor — custom environments fall
+      // through to the full env-aware pipeline (ExtractionEnv::is_default). No size cap:
+      // the extraction is the same per-file work the absorb pays, done once and shared;
+      // the absorb budget below is the routing bound.
+      && self.env.is_default()
     {
       vorpal_index::live::probe_extraction(&self.index_dir, paths).ok()
     } else {
       None
     };
     if probe.as_ref().is_some_and(vorpal_index::live::ExtractionProbe::all_unchanged) {
-      if self.canonicalizing.is_some() || self.persisting.is_some() {
+      if self.canonicalizing.is_some() || self.persisting.is_some() || self.rebuilding.is_some()
+      {
         // A background committer is still in flight (stamp canonicalization or a live
         // build's persistence): answers are STILL provably unchanged — the probe verified
         // the touched files against the cached products, and the pending generation was
@@ -535,7 +782,8 @@ impl Server {
       }
       let src = watch.src().to_path_buf();
       let index_dir = self.index_dir.clone();
-      let paths = hints.as_ref().expect("a probe implies captured hints").clone();
+      let env = self.env.clone();
+      let paths = change_set.as_ref().expect("a probe implies a change set").clone();
       // The overlay saw no graph change here, but its retained manifest must track the
       // moved stamps or a LATER served persistence would commit stale ones and fork the
       // generation id from what a scratch build produces.
@@ -543,11 +791,10 @@ impl Server {
         overlay.note_stamps(probe);
       }
       self.canonicalizing = Some(std::thread::spawn(move || {
-        vorpal_index::build_index_watched(&src, &index_dir, &paths).is_ok()
+        vorpal_index::build_index_watched(&src, &index_dir, &paths, &env).is_ok()
       }));
       return Ok(());
     }
-    let src = watch.src().to_path_buf();
     // Live-overlay semantic serve (SUBSECOND.md Phase 3): a COMPLETE, small change set with
     // a ready overlay skips the replay pipeline — extract the changed files, re-link the
     // retained state, seal in canonical order, and serve. The sealed bytes are pinned
@@ -556,9 +803,20 @@ impl Server {
     // because both committers are drained first, exactly like the synchronous path.
     if overlay_enabled()
       && self.kg.is_some()
-      && self.overlay.is_some()
+      && self
+        .overlay
+        .as_ref()
+        .is_some_and(|overlay| {
+          let within = change_set
+            .as_ref()
+            .is_some_and(|paths| overlay.within_absorb_budget(paths.len()));
+          if !within && change_set.is_some() {
+            vorpal_kg::phase_stamp("refresh: change set past absorb budget — pipeline");
+          }
+          within
+        })
       && let Some(probe) = probe.take()
-      && let Some(paths) = &hints
+      && let Some(paths) = &change_set
     {
       if let Some(handle) = self.canonicalizing.take() {
         let _ = handle.join();
@@ -604,8 +862,9 @@ impl Server {
             self.kg_dir = None;
             let index_dir = self.index_dir.clone();
             let canon_src = src.clone();
+            let env = self.env.clone();
             self.canonicalizing = Some(std::thread::spawn(move || {
-              vorpal_index::build_index_watched(&canon_src, &index_dir, &paths).is_ok()
+              vorpal_index::build_index_watched(&canon_src, &index_dir, &paths, &env).is_ok()
             }));
             if stale {
               // Tombstone debt crossed the line: retire this overlay and rebuild it from
@@ -633,7 +892,9 @@ impl Server {
     }
     self.reap_persist(true);
     self.hinted_rebuilds = self.hinted_rebuilds.wrapping_add(1);
-    let use_hints = hints.as_ref().is_some_and(|set| !set.is_empty())
+    // Both sources are COMPLETE change sets (watcher certainty, or the stat sweep that IS
+    // a full-scan diff), so either satisfies the hinted-manifest-patch contract.
+    let use_hints = change_set.as_ref().is_some_and(|set| !set.is_empty())
       && self.hinted_rebuilds % 64 != 0
       && self.kg.is_some();
     // Live adoption (SUBSECOND.md Phase 3, live rebuild v1): a full pipeline run returns
@@ -641,15 +902,82 @@ impl Server {
     // addressed commit continue on a background thread. Fast paths (whole-tree reuse, the
     // stamp-only cutoff) commit synchronously and hardlink the very artifacts the loaded
     // graph has mapped, so the graph is kept and only `kg_dir` repoints.
-    let hint_set = use_hints.then(|| hints.as_ref().expect("checked above"));
-    match vorpal_index::build_index_live(&src, &self.index_dir, hint_set) {
+    if background {
+      // Proactive heavy tier: commit through a supervised child indexer (crash isolation,
+      // D3) — or an in-process background thread when no indexer binary is discoverable —
+      // while the daemon keeps serving the current graph. Hints are deliberately NOT
+      // forwarded: the child runs the plain incremental pipeline (stat sweep + product
+      // replay), and the serving thread's capture state stays intact for the query path.
+      let supervisor = self.supervisor.clone();
+      let index_dir = self.index_dir.clone();
+      let env = self.env.clone();
+      self.rebuilding = Some(std::thread::spawn(move || {
+        match supervisor.build(&src, &index_dir) {
+          Ok(BuildOutcome::Supervised(_)) => true,
+          Ok(BuildOutcome::Unavailable) => {
+            let _guard = in_process_build_guard();
+            // `from_env` (not `default`) for parity with both the child indexer and the
+            // synchronous path — all three honor the same cache-mode override.
+            build_index_env(
+              &src,
+              &index_dir,
+              CacheMode::from_env(),
+              ParseHealthPolicy::default(),
+              &env,
+            )
+            .is_ok()
+          }
+          Err(err) => {
+            eprintln!("vorpal-mcp: supervised rebuild failed: {err}");
+            false
+          }
+        }
+      }));
+      return Ok(());
+    }
+    if self.kg.is_none()
+      && !vorpal_kg::resolve_index_dir(&self.index_dir)
+        .join("nodes.vseg")
+        .exists()
+    {
+      // First contact with a never-indexed tree: the likeliest place for a pathological
+      // input, and no retained state exists to protect — crash-isolate the build (D3).
+      // Steady-state watched rebuilds stay in-process below: retained serving re-extracts
+      // in-process by design (probe/overlay), so the isolation boundary is first contact
+      // and the explicit `index` tool, stated.
+      let built = match self.supervisor.build(&src, &self.index_dir) {
+        Ok(BuildOutcome::Supervised(_)) => Ok(()),
+        Ok(BuildOutcome::Unavailable) => {
+          let _guard = in_process_build_guard();
+          build_index_env(
+            &src,
+            &self.index_dir,
+            CacheMode::from_env(),
+            ParseHealthPolicy::default(),
+            &self.env,
+          )
+          .map(|_| ())
+          .map_err(|err| err.to_string())
+        }
+        Err(err) => Err(err),
+      };
+      if let Err(err) = built {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+        return Err(format!("revalidating watched index failed: {err}"));
+      }
+      return self.adopt_committed_generation();
+    }
+    let hint_set = use_hints.then(|| change_set.as_ref().expect("checked above"));
+    match vorpal_index::build_index_live(&src, &self.index_dir, hint_set, &self.env) {
       Ok(build) => {
         if let Some(kg) = build.kg {
           // The committed tree moved without the overlay: absorb the exact change set or
           // retire the overlay (rebuilt in the background from the new generation). A
           // COMPLETE capture absorbs even on the every-64th reconciliation sweep — the
           // sweep insures manifest patching, not capture exactness.
-          self.overlay_absorb_or_drop(hints.as_ref());
+          self.overlay_absorb_or_drop(change_set.as_ref());
           // The replay pipeline produced a NEW sealed graph with no eid-churn ledger:
           // the live tier's translations and edited-symbol vectors are stale against it,
           // and nothing downstream would ever resync them. Retire the tier; the
@@ -673,9 +1001,9 @@ impl Server {
           return Ok(());
         }
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
-        if build.report.reused && self.kg.is_some() {
-          // Whole-tree reuse: the SAME graph keeps serving — the live tier's
-          // translations are still exact, keep it.
+        if build.report.graph_reused && self.kg.is_some() {
+          // Byte-identical graph carry (whole-tree reuse or the stamp-only cutoff): the
+          // SAME graph keeps serving — the live tier's translations are still exact.
           self.kg_dir = Some(dir);
           self.spawn_live_ann_adopt();
           self.request_warm();
@@ -740,7 +1068,7 @@ impl Server {
   /// **generation** content id the answer came from (`null` before any graph is loaded, e.g.
   /// pure-parse tools like `ast_dump`), so ids and spans are attributable to exactly one
   /// index state; failures state a **stable machine-readable code** alongside the message.
-  fn tools_call(&mut self, params: &Value) -> Value {
+  pub(crate) fn tools_call(&mut self, params: &Value) -> Value {
     let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params
       .get("arguments")
@@ -887,9 +1215,37 @@ impl Server {
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
         };
-        let report =
-          vorpal_index::build_index_full(Path::new(&src), &self.index_dir, mode, policy, None)
-            .map_err(|err| err.to_string())?;
+        // An explicit rebuild is a commit: drain the proactive rebuild first so commits
+        // stay single-file (its generation lands, then this one supersedes it).
+        self.reap_rebuilding(true);
+        // Supervised when a child indexer exists (D3): a crashing input costs this call,
+        // never the daemon. NOTE: the child runs the default cache/health policy; explicit
+        // policy args force the in-process path so they are honored exactly.
+        let wants_default_policy =
+          mode == CacheMode::default() && policy == ParseHealthPolicy::default();
+        let mut supervised_note: Option<String> = None;
+        let report = if wants_default_policy {
+          match self.supervisor.build(Path::new(&src), &self.index_dir) {
+            Err(err) => return Err(err.into()),
+            Ok(BuildOutcome::Supervised(child_text)) => {
+              supervised_note = Some(child_text);
+              None
+            }
+            Ok(BuildOutcome::Unavailable) => {
+              let _guard = in_process_build_guard();
+              Some(
+                build_index_env(Path::new(&src), &self.index_dir, mode, policy, &self.env)
+                  .map_err(|err| err.to_string())?,
+              )
+            }
+          }
+        } else {
+          let _guard = in_process_build_guard();
+          Some(
+            build_index_env(Path::new(&src), &self.index_dir, mode, policy, &self.env)
+              .map_err(|err| err.to_string())?,
+          )
+        };
         // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
         // new generation directory alongside it.
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
@@ -897,12 +1253,19 @@ impl Server {
         self.kg_dir = Some(dir);
         // An explicit rebuild moved the committed tree with no change-set capture: the
         // overlay cannot be trusted to match — retire it and rebuild from the new generation.
+        // The live ANN tier goes with it (lifecycle law 5): this commit carried no eid-churn
+        // ledger, so the tier's id translations are stale against the reloaded graph; the
+        // stale-tolerant adopt reconciles a fresh tier from the committed generation.
         self.overlay = None;
+        self.retire_live_ann_for_resync();
         self.spawn_overlay_build();
-        let text = if report.reused {
-          format!("unchanged — reused existing index ({} nodes)", report.nodes)
-        } else {
-          format!(
+        let mut text = match (&report, supervised_note) {
+          // Child ran: its stdout tail IS the report (counts, damage note, unverified note).
+          (None, Some(child_text)) => format!("(supervised) {child_text}"),
+          (Some(report), _) if report.reused => {
+            format!("unchanged — reused existing index ({} nodes)", report.nodes)
+          }
+          (Some(report), _) => format!(
             "indexed {} files ({} skipped) → {} nodes; refs: {} resolved, {} ambiguous, {} external, {} masked",
             report.indexed,
             report.skipped,
@@ -911,8 +1274,19 @@ impl Server {
             report.ambiguous,
             report.external,
             report.masked
-          )
+          ),
+          (None, None) => unreachable_report()?,
         };
+        if let Some(report) = &report {
+          if !report.unverified_langs.is_empty() {
+            text.push_str(&format!(
+              "\nnote: {} dynamic language(s) extracted without a canary (best-effort, \
+               unverified): {}",
+              report.unverified_langs.len(),
+              report.unverified_langs.join(", ")
+            ));
+          }
+        }
         Ok((text, json!({})))
       }
       "code_search" => {
@@ -1072,7 +1446,8 @@ impl Server {
         data["totalErrorBytes"] = report.total_error_bytes.into();
         Ok((text, data))
       }
-      "node" | "callers" | "references" | "importers" | "implementors" | "type_users" => {
+      "node" | "callers" | "references" | "importers" | "implementors" | "type_users"
+      | "similar" => {
         // Pattern listing (node only): regex over names, matches ARE the answer.
         if tool == "node" {
           if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
@@ -1219,10 +1594,10 @@ impl Server {
               std::fs::read_to_string(path).map_err(|err| format!("read {path}: {err}"))?;
             let lang = match args.get("lang").and_then(Value::as_str) {
               Some(lang) => lang.to_string(),
-              None => <vorpal_language::SupportLang as vorpal_core::Language>::from_path(
+              None => <vorpal_ingest::SgLang as vorpal_core::Language>::from_path(
                 std::path::Path::new(path),
               )
-              .map(|l: vorpal_language::SupportLang| l.to_string())
+              .map(|l: vorpal_ingest::SgLang| l.to_string())
               .ok_or_else(|| format!("cannot infer language from {path}; pass lang"))?,
             };
             (source, lang)
@@ -1298,6 +1673,139 @@ impl Server {
           data["nextCursor"] = json!(format!("o:{}", report.end));
         }
         Ok((text, data))
+      }
+      "data_flow" => {
+        // Outgoing data-flow rows (G-M3): which arguments flow from this definition into
+        // which callees, from the dataflow.bin sidecar. Absence of rows is NOT proof of no
+        // flows — the sidecar covers the typefacts launch languages, and older generations
+        // have no sidecar at all (said explicitly in the response).
+        let target = graph_target(args, str_arg("name")?);
+        self.kg()?;
+        let dir = self
+          .kg_dir
+          .clone()
+          .ok_or_else(|| ToolError::coded("index-unavailable", "no generation dir pinned"))?;
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
+        let (records, sidecar_present) =
+          vorpal_index::records::flow_records(kg, &dir, &target).map_err(ToolError::from)?;
+        let mut lines = Vec::new();
+        if !sidecar_present {
+          lines.push(
+            "no data-flow sidecar in this generation (built before flows existed) — rebuild \
+             the index to record flows"
+              .to_string(),
+          );
+        } else if records.is_empty() {
+          lines.push("no outgoing data flows recorded for this selection".to_string());
+        }
+        for r in &records {
+          lines.push(format!(
+            "{} --arg#{}({}{})--> {} param#{} [{}]",
+            r.from_name,
+            r.arg_index,
+            r.class,
+            r.expr.as_deref().map(|e| format!(" {e}")).unwrap_or_default(),
+            r.to_name,
+            if r.param_index == u16::MAX { "?".to_string() } else { r.param_index.to_string() },
+            r.to_path
+          ));
+        }
+        Ok((
+          lines.join("\n") + "\n",
+          json!({"records": records, "sidecarPresent": sidecar_present}),
+        ))
+      }
+      "observed" => {
+        // Runtime-observed calls (ADOPTION #26): rows from ingested traces, each flagged
+        // with whether the static graph already carries the edge — `false` is dynamic
+        // dispatch or a function pointer no static resolver can prove. Absence of the
+        // sidecar (never ingested, or invalidated by a rebuild) is stated.
+        let target = graph_target(args, str_arg("name")?);
+        self.kg()?;
+        let dir = self
+          .kg_dir
+          .clone()
+          .ok_or_else(|| ToolError::coded("index-unavailable", "no generation dir pinned"))?;
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
+        let (records, sidecar_present) =
+          vorpal_index::records::observed_records(kg, &dir, &target).map_err(ToolError::from)?;
+        let mut lines = Vec::new();
+        if !sidecar_present {
+          lines.push(
+            "no observed-calls sidecar for this generation — ingest runtime traces with \
+             `vorpal-index ingest-traces <index> <folded-stacks>` (a rebuild invalidates \
+             it until traces are re-ingested)"
+              .to_string(),
+          );
+        } else if records.is_empty() {
+          lines.push("no observed calls recorded for this selection".to_string());
+        }
+        for r in &records {
+          lines.push(format!(
+            "{} {} x{} {}{}",
+            if r.direction == "in" { "<-observed-" } else { "-observed->" },
+            r.counterpart_name,
+            r.count,
+            r.counterpart_path,
+            if r.in_static_graph { "" } else { "  (not in the static graph)" }
+          ));
+        }
+        Ok((
+          lines.join("\n") + "\n",
+          json!({"records": records, "sidecarPresent": sidecar_present}),
+        ))
+      }
+      "query" => {
+        // Cypher-shaped read-only queries (G-M4): `text` in the query language, or `ir`
+        // carrying the typed IR document. Ceilings (text bytes, depth, edge visits, rows)
+        // are typed refusals naming the ceiling — never a silently truncated answer.
+        let parsed = if let Some(text) = args.get("text").and_then(Value::as_str) {
+          vorpal_query::parse(text)
+        } else if let Some(ir) = args.get("ir") {
+          vorpal_query::parse_ir_json(&ir.to_string())
+        } else {
+          return Err(ToolError::coded(
+            "bad-argument",
+            "pass `text` (the query language) or `ir` (a typed IR document)",
+          ));
+        }
+        .map_err(|err| ToolError::coded("bad-query", err.to_string()))?;
+        self.kg()?;
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded(
+            "index-unavailable",
+            "no graph is loaded — run the 'index' tool first",
+          ));
+        };
+        let result = vorpal_query::execute(kg, &parsed)
+          .map_err(|err| ToolError::coded("bad-query", err.to_string()))?;
+        const TEXT_ROWS: usize = 200;
+        let mut lines = vec![result.columns.join(" | ")];
+        for row in result.rows.iter().take(TEXT_ROWS) {
+          lines.push(row.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | "));
+        }
+        if result.rows.len() > TEXT_ROWS {
+          lines.push(format!(
+            "… {} more rows in structuredContent",
+            result.rows.len() - TEXT_ROWS
+          ));
+        }
+        if result.rows.is_empty() {
+          lines.push("(no rows)".to_string());
+        }
+        lines.push(format!(
+          "{} row{} (of {} before SKIP/LIMIT)",
+          result.rows.len(),
+          if result.rows.len() == 1 { "" } else { "s" },
+          result.total_rows
+        ));
+        let structured = serde_json::to_value(&result)
+          .map_err(|err| ToolError::coded("internal", err.to_string()))?;
+        Ok((lines.join("\n") + "\n", structured))
       }
       "snippet" => {
         // The selector-driven sibling of `fetch_span`: name/path/kind/id/eid resolution with
@@ -1419,12 +1927,22 @@ impl Server {
           args.get("min_grade").and_then(Value::as_str),
         )
         .map_err(|err| err.to_string())?;
-        let kg = self.kg()?;
+        self.kg()?;
+        // Freshness first: kg() pins the generation and its dir together, so the sidecar
+        // read can never come from a different generation than the ids it annotates.
+        let flows_dir = self.kg_dir.clone();
+        let Some(kg) = self.kg.as_ref() else {
+          return Err(ToolError::coded(
+            "index-unavailable",
+            "no graph is loaded — run the 'index' tool first",
+          ));
+        };
         // Page-materialized: the BFS runs whole (that IS the deterministic vector), but
         // record construction is paid per page — an undirected kernel walk reaches 200K+
         // nodes and building all their records to serve one page dominated this tool.
         let selected = vorpal_index::records::reach_records_page(
           kg,
+          flows_dir.as_deref(),
           &target,
           dir,
           &relations,
@@ -1443,7 +1961,7 @@ impl Server {
         )
         .map_err(|message| ToolError::coded("bad-argument", message))?;
         // Text stays human-shaped but capped: a full undirected closure renders tens of MB.
-        let text = vorpal_index::reachable_query_on(kg, &target, dir, &relations, max_depth, min_confidence)
+        let text = vorpal_index::reachable_query_on(kg, flows_dir.as_deref(), &target, dir, &relations, max_depth, min_confidence)
           .map_err(|err| err.to_string())
           .map_err(ToolError::from)?;
         const TEXT_CAP: usize = 200;
@@ -1480,7 +1998,7 @@ impl Server {
   }
 }
 
-fn initialize(params: &Value) -> Value {
+pub(crate) fn initialize(params: &Value) -> Value {
   let requested = params
     .get("protocolVersion")
     .and_then(Value::as_str)
@@ -1497,7 +2015,7 @@ fn initialize(params: &Value) -> Value {
   })
 }
 
-fn tools_list(profile: Profile) -> Value {
+pub(crate) fn tools_list(profile: Profile) -> Value {
   let name_only = json!({
     "name": {"type": "string", "description": "Exact symbol name"},
     "path": {"type": "string", "description": "Refine: definition file path must end with this suffix"},
@@ -1572,8 +2090,10 @@ fn tools_list(profile: Profile) -> Value {
     tool(
       "architecture",
       "Orientation summary: modules by definition mass with cross-module import margins, \
-       hub definitions by semantic in-degree, and entry-point candidates (exported, \
-       semantically unreached). The first call to make in an unfamiliar codebase.",
+       hub definitions by semantic in-degree, entry-point candidates (exported, \
+       semantically unreached), and calls-graph clusters (Louvain communities from the \
+       warm-time sidecar: size, representative, dominant module; stated as not built when \
+       the sidecar is absent). The first call to make in an unfamiliar codebase.",
       json!({
         "top": {"type": "integer", "description": "Rows per section (default 20, max 500)"}
       }),
@@ -1647,6 +2167,15 @@ fn tools_list(profile: Profile) -> Value {
     tool("implementors", "Types implementing/extending a trait, interface, or base type (incoming `implements` edges).", name_only.clone(), &["name"]),
     tool("type_users", "Definitions using a type in fields, params, returns, or annotations (incoming `of_type` edges).", name_only.clone(), &["name"]),
     tool(
+      "similar",
+      "Near-clones of a definition: `similar_to` edges from extraction-time MinHash sketches \
+       over token shingles (≥ 0.7 estimated Jaccard; confidence = similarity × 100; each \
+       definition keeps its 8 most similar partners, a clone family's representative links \
+       to every member). Definitions under 32 tokens are never signed.",
+      name_only.clone(),
+      &["name"],
+    ),
+    tool(
       "reachable",
       "Relation-specific transitive traversal from a symbol, returning each reached node WITH \
        its path back to the seed (per-edge relation names). direction \"in\" = everything \
@@ -1657,7 +2186,7 @@ fn tools_list(profile: Profile) -> Value {
         "name": {"type": "string", "description": "Exact symbol name"},
         "direction": {"type": "string", "enum": ["in", "out", "both"]},
         "relations": {"type": "array", "items": {"type": "string"},
-          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides (default [\"calls\"])"},
+          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides, data_flows, changes_with, similar_to, requests, notifies (default [\"calls\"])"},
         "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"},
         "min_grade": {"type": "string", "enum": ["exact", "constrained", "heuristic"],
           "description": "Only traverse edges at this resolution grade or better (absent = include structural edges too)"},
@@ -1720,6 +2249,58 @@ fn tools_list(profile: Profile) -> Value {
         "max_bytes": {"type": "integer", "description": "Clamp returned source (default 16384)"}
       }),
       &["id"],
+    ),
+    tool(
+      "data_flow",
+      "Outgoing data flows for a definition: which call-site arguments (bound positionally \
+       or by Python keyword name — param#? marks a keyword no parameter matched, with \
+       the expression for variables and field accesses) flow into which callees, from the \
+       dataflow sidecar. Coverage note: flows are recorded for the typed-capture languages \
+       (Rust, Python, TypeScript, TSX) at resolved calls with traceable arguments — absence \
+       of rows is NOT proof no data flows; generations built before flows existed say so \
+       explicitly.",
+      json!({
+        "name": {"type": "string", "description": "Exact symbol name (or eid:<hex>)"},
+        "path": {"type": "string", "description": "Refine: definition file path ends with this suffix"},
+        "kind": {"type": "string", "description": "Refine: symbol kind"},
+        "id": {"type": "integer", "description": "Refine: exactly this node id"},
+        "eid": {"type": "string", "description": "Refine: durable external id (32 hex chars)"}
+      }),
+      &["name"],
+    ),
+    tool(
+      "observed",
+      "Runtime-observed calls for a symbol, both directions, from traces ingested with \
+       `vorpal-index ingest-traces` (folded stacks: perf, py-spy, inferno). Each row \
+       carries its sample count and whether the static graph already has the edge — \
+       `false` means dynamic dispatch or a function pointer that static resolution can \
+       never prove. A rebuild invalidates the sidecar until traces are re-ingested; \
+       absence is stated, never silent.",
+      name_only.clone(),
+      &["name"],
+    ),
+    tool(
+      "query",
+      "Cypher-shaped READ-ONLY graph query (openCypher read subset). MATCH a linear \
+       pattern — (var:Kind|Kind2 {name: \"x\", path: \"suffix\"}) chained through up to 8 \
+       segments like -[:calls|data_flows*1..5 {grade: constrained}]-> — then WHERE with \
+       AND/OR/NOT over =, <>, <, <=, >, >=, =~ (bounded regex), STARTS/ENDS WITH, CONTAINS, \
+       IN [..], IS [NOT] NULL, n:Label, and EXISTS { (n)-[:calls]->() }; WITH / UNWIND \
+       pipeline stages; RETURN [DISTINCT] any expression: properties (name, path, kind, \
+       exported, id, eid, signature, in_degree, out_degree, scc_size, community), \
+       arithmetic, string \
+       and list functions (toLower, toUpper, size, trim, replace, substring, split, \
+       coalesce, …), CASE, and count/sum/avg/min/max/collect with implicit grouping; \
+       ORDER BY / SKIP / LIMIT; UNION [ALL]. Runs under explicit work ceilings (16KiB text, \
+       depth 10, 5M edge visits, 100k rows) and refuses with the ceiling's name rather \
+       than truncate. Example: MATCH (f:Function)-[:calls]->(g) WITH g, count(*) AS n \
+       WHERE n >= 20 AND NOT EXISTS { (g)-[:calls]->() } RETURN g.name, n ORDER BY n DESC \
+       LIMIT 20",
+      json!({
+        "text": {"type": "string", "description": "The query text"},
+        "ir": {"type": "object", "description": "Alternative: a typed IR document (the parsed form; see the vorpal-query crate docs)"}
+      }),
+      &[],
     ),
     tool(
       "snippet",
@@ -1873,6 +2454,13 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
   })
 }
 
+/// Coded error for a state the match above makes impossible (report and note both absent);
+/// returning an error keeps the no-panic contract even if a refactor breaks the invariant.
+fn unreachable_report() -> Result<String, String> {
+  Err("internal: index build produced neither a report nor a supervised note".to_string())
+}
+
+
 /// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`), if
 /// that root exists — the precondition for watching.
 fn watch_root(index_dir: &Path) -> Option<PathBuf> {
@@ -1892,6 +2480,6 @@ fn watch_root(index_dir: &Path) -> Option<PathBuf> {
 }
 
 
-fn error_response(id: Value, code: i64, message: &str) -> String {
+pub(crate) fn error_response(id: Value, code: i64, message: &str) -> String {
   json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
 }

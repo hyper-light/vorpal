@@ -1,0 +1,47 @@
+{
+  "description": "cpython graded set, graded 2026-08-30 against cpython main (labels are tree-dependent; the existence gate re-verifies every run).",
+  "queries": [
+    {
+      "class": "short-keyword",
+      "query": "garbage collect run",
+      "relevant": [
+        { "name": "gc_collect_main", "grade": 3 },
+        { "name": "PyGC_Collect", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "bytecode evaluation loop",
+      "relevant": [{ "name": "_PyEval_EvalFrameDefault", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "parse function arguments tuple",
+      "relevant": [
+        { "name": "PyArg_ParseTuple", "grade": 3 },
+        { "name": "vgetargs1", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "append item to list",
+      "relevant": [
+        { "name": "PyList_Append", "grade": 3 },
+        { "name": "list_append", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "dictionary insert entry",
+      "relevant": [{ "name": "insertdict", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "import find spec",
+      "relevant": [
+        { "name": "_find_spec", "grade": 3 },
+        { "name": "find_spec", "grade": 2 }
+      ]
+    }
+  ]
+}

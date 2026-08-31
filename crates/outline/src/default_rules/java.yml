@@ -133,3 +133,64 @@ isPublic:
     kind: modifiers
     has:
       pattern: public
+---
+id: java-http-route-mapping
+language: Java
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: annotation
+  inside:
+    kind: modifiers
+    inside:
+      kind: method_declaration
+  all:
+    - has:
+        field: name
+        regex: '^(Get|Post|Put|Delete|Patch)Mapping$'
+        pattern: $ANN
+    - has:
+        field: arguments
+        has:
+          stopBy: end
+          kind: string_literal
+          has:
+            kind: string_fragment
+            pattern: $ROUTE
+transform:
+  VERB0:
+    replace:
+      source: $ANN
+      replace: 'Mapping$'
+      by: ''
+  VERB:
+    convert:
+      source: $VERB0
+      toCase: upperCase
+name: $VERB $ROUTE
+---
+id: java-http-route-request-mapping
+language: Java
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: annotation
+  inside:
+    kind: modifiers
+    inside:
+      kind: method_declaration
+  all:
+    - has:
+        field: name
+        regex: '^RequestMapping$'
+    - has:
+        field: arguments
+        has:
+          stopBy: end
+          kind: string_literal
+          has:
+            kind: string_fragment
+            pattern: $ROUTE
+name: ROUTE $ROUTE

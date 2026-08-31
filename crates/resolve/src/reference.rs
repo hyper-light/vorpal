@@ -78,6 +78,12 @@ pub struct Reference<'i> {
   pub qualifier: Option<NameId<'i>>,
   /// The syntactic shape (see [`RefForm`]).
   pub form: RefForm,
+  /// The receiver's file-locally bound type (G-M2), interned — capture's conservative
+  /// verdict, never a resolver guess. `None` for untyped/complex/poisoned receivers.
+  pub receiver_type: Option<NameId<'i>>,
+  /// `vorpal-ingest` typefacts `BindOrigin` tag for `receiver_type` (`0xFF` = none): the
+  /// resolver's confidence cap keys on how the type was learned.
+  pub receiver_type_origin: u8,
   /// The local rebinding an aliased import introduces (`from x import y as z` → `z`;
   /// `use a::b as c` → `c`), interned. The reference's `name` stays the ORIGINAL (the edge
   /// targets the real definition); the alias is what the importing file's bare uses say, so
@@ -102,6 +108,8 @@ impl<'i> Reference<'i> {
       qualifier: None,
       form: RefForm::Bare,
       alias: None,
+      receiver_type: None,
+      receiver_type_origin: 0xFF,
     }
   }
 
@@ -123,6 +131,8 @@ impl<'i> Reference<'i> {
       qualifier: None,
       form: RefForm::Bare,
       alias: None,
+      receiver_type: None,
+      receiver_type_origin: 0xFF,
     }
   }
 
@@ -139,6 +149,18 @@ impl<'i> Reference<'i> {
   /// interns straight from mapped bytes without an owned intermediate.
   pub fn with_qualifier_ref(mut self, interner: &'i Interner, qualifier: Option<&str>) -> Self {
     self.qualifier = qualifier.map(|q| interner.intern(q));
+    self
+  }
+
+  /// Attach the captured receiver type (view-replay path: borrowed text, interned here).
+  pub fn with_receiver_type_ref(
+    mut self,
+    interner: &'i Interner,
+    ty: Option<&str>,
+    origin: u8,
+  ) -> Self {
+    self.receiver_type = ty.map(|t| interner.intern(t));
+    self.receiver_type_origin = if self.receiver_type.is_some() { origin } else { 0xFF };
     self
   }
 

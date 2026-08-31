@@ -153,25 +153,613 @@ impl<'i, E: FileExtractor> Ingestor<'i, E> {
 /// Where the (rebased) reference stream goes during a streamed apply: RAM for callers that
 /// want the vector, or the disk spill for bulk builds — at kernel scale the in-RAM vector
 /// was ~220 MB of peak footprint that resolution only ever reads once, sequentially.
+/// One traceable call-site argument riding beside its reference through the apply→link
+/// hand-off (G-M3). `from` is the caller entity (rebased with its reference); the (from,
+/// span) pair keys the join against resolved call edges at link time.
+pub(crate) struct ArgRec {
+  pub(crate) from: NodeId,
+  pub(crate) span: (u32, u32),
+  pub(crate) index: u16,
+  pub(crate) class: u8,
+  /// The call had a receiver (`x.foo(...)`) — drives the Python self/cls offset when the
+  /// callee's parameter ledger starts with one.
+  pub(crate) has_receiver: bool,
+  pub(crate) expr: Option<Box<str>>,
+  /// Keyword name at the call site (`f(x=1)`), bound to the callee's parameter position at
+  /// link time (G-M5).
+  pub(crate) kw: Option<Box<str>>,
+}
+
+/// One callee's ordered parameter names (Python only — the kwarg/self binding ledger).
+/// Splat entries keep their sigils (`*args`, `**kwargs`) so they can never match a keyword.
+pub(crate) struct ParamRec {
+  pub(crate) entity: NodeId,
+  pub(crate) names: Box<[Box<str>]>,
+}
+
+/// One `function name → declared return type` row (G-M5 chained-call typing). Name-keyed —
+/// no id to rebase — and deduplicated/poisoned when the link-time ledger builds.
+pub(crate) struct RetRec {
+  pub(crate) name: Box<str>,
+  pub(crate) ret: Box<str>,
+}
+
+/// One signed definition's near-clone sketch (v16), keyed by its entity id — rebased with
+/// its shard like a parameter ledger.
+pub(crate) struct SigRec {
+  pub(crate) entity: NodeId,
+  pub(crate) shingles: u32,
+  pub(crate) sketch: [u8; crate::signature::BINS],
+}
+
+/// One HTTP client call site riding beside its file's references (v17), keyed by the
+/// calling entity — rebased with its shard.
+pub(crate) struct ReqRec {
+  pub(crate) from: NodeId,
+  pub(crate) method: Box<str>,
+  pub(crate) path: Box<str>,
+  pub(crate) span: (u32, u32),
+}
+
+/// Side rows a shard hands the absorber beside its references: call-site argument records,
+/// callee parameter ledgers, return ledgers, near-clone sketches, and request records —
+/// one struct so the absorb/committer plumbing keeps a fixed shape as side data grows.
+#[derive(Default)]
+pub(crate) struct FlowSidecar {
+  pub(crate) args: Vec<ArgRec>,
+  pub(crate) params: Vec<ParamRec>,
+  pub(crate) rets: Vec<RetRec>,
+  pub(crate) sigs: Vec<SigRec>,
+  pub(crate) requests: Vec<ReqRec>,
+}
+
+/// Append-only arg spill (staging `.args.spill`): written by the absorber in absorb order,
+/// loaded once at link into the join map. Process-private scratch — no versioning.
+pub(crate) struct ArgSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+impl ArgSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &ArgRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&rec.from.raw().to_le_bytes())?;
+    self.file.write_all(&rec.span.0.to_le_bytes())?;
+    self.file.write_all(&rec.span.1.to_le_bytes())?;
+    self.file.write_all(&rec.index.to_le_bytes())?;
+    self.file.write_all(&[rec.class, rec.has_receiver as u8])?;
+    let expr = rec.expr.as_deref().unwrap_or("");
+    self.file.write_all(&(expr.len() as u16).to_le_bytes())?;
+    self.file.write_all(expr.as_bytes())?;
+    let kw = rec.kw.as_deref().unwrap_or("");
+    self.file.write_all(&[kw.len() as u8])?;
+    self.file.write_all(kw.as_bytes())?;
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+/// The link-time argument join: one flat record vector sorted by (from, span), looked up by
+/// binary search — measured against a HashMap<(from,span), Vec<..>> shape, the per-key
+/// vectors and hashing dominated the join's cost at ~500k records. Holds launch-language
+/// traceable args only; freed with the link phase; the spill file is deleted after load.
+pub(crate) struct ArgJoin {
+  records: Vec<ArgRec>,
+  /// `(from << 64) | (span.0 << 32) | span.1` per record, sorted — the probe compares one
+  /// u128 instead of extracting a 3-tuple, which halved the join's share of link resolve.
+  keys: Vec<u128>,
+}
+
+#[inline]
+fn arg_key(from: u64, span: (u32, u32)) -> u128 {
+  ((from as u128) << 64) | ((span.0 as u128) << 32) | span.1 as u128
+}
+
+impl ArgJoin {
+  pub(crate) fn empty() -> Self {
+    Self {
+      records: Vec::new(),
+      keys: Vec::new(),
+    }
+  }
+
+  /// Build the join from in-RAM records — the retained store's path (the bulk build loads
+  /// the same shape from its spill). One sort, any input order: the join is a pure function
+  /// of the record SET.
+  pub(crate) fn from_records(mut records: Vec<ArgRec>) -> Self {
+    use rayon::prelude::*;
+    // Stable by (key, index): records per call site keep their capture order.
+    records.par_sort_by_key(|r| (r.from.raw(), r.span.0, r.span.1, r.index));
+    let keys = records
+      .par_iter()
+      .map(|r| arg_key(r.from.raw(), r.span))
+      .collect();
+    Self { records, keys }
+  }
+
+  pub(crate) fn is_empty(&self) -> bool {
+    self.records.is_empty()
+  }
+
+  #[inline]
+  pub(crate) fn get(&self, from: u64, span: (u32, u32)) -> &[ArgRec] {
+    let key = arg_key(from, span);
+    let start = self.keys.partition_point(|&k| k < key);
+    let end = start + self.keys[start..].iter().take_while(|&&k| k == key).count();
+    &self.records[start..end]
+  }
+}
+
+pub(crate) fn load_arg_spill(path: &std::path::Path, expected: u64) -> io::Result<ArgJoin> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  let mut records: Vec<ArgRec> = Vec::with_capacity(expected as usize);
+  let mut off = 0usize;
+  let mut seen = 0u64;
+  while off < bytes.len() {
+    let take = |o: usize, n: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(o..o + n)
+        .ok_or_else(|| io::Error::other("arg spill truncated"))
+    };
+    let from = u64::from_le_bytes(take(off, 8)?.try_into().expect("8B"));
+    let s0 = u32::from_le_bytes(take(off + 8, 4)?.try_into().expect("4B"));
+    let s1 = u32::from_le_bytes(take(off + 12, 4)?.try_into().expect("4B"));
+    let index = u16::from_le_bytes(take(off + 16, 2)?.try_into().expect("2B"));
+    let class = take(off + 18, 1)?[0];
+    let has_receiver = take(off + 19, 1)?[0] != 0;
+    let expr_len = u16::from_le_bytes(take(off + 20, 2)?.try_into().expect("2B")) as usize;
+    let expr_bytes = take(off + 22, expr_len)?;
+    let expr = if expr_len == 0 {
+      None
+    } else {
+      Some(
+        std::str::from_utf8(expr_bytes)
+          .map_err(|_| io::Error::other("arg spill: non-utf8 expression"))?
+          .into(),
+      )
+    };
+    off += 22 + expr_len;
+    let kw_len = take(off, 1)?[0] as usize;
+    let kw_bytes = take(off + 1, kw_len)?;
+    let kw = if kw_len == 0 {
+      None
+    } else {
+      Some(
+        std::str::from_utf8(kw_bytes)
+          .map_err(|_| io::Error::other("arg spill: non-utf8 keyword"))?
+          .into(),
+      )
+    };
+    off += 1 + kw_len;
+    seen += 1;
+    records.push(ArgRec {
+      from: NodeId::new(from),
+      span: (s0, s1),
+      index,
+      class,
+      has_receiver,
+      expr,
+      kw,
+    });
+  }
+  if seen != expected {
+    return Err(io::Error::other(format!(
+      "arg spill holds {seen} records, absorber wrote {expected} — torn scratch"
+    )));
+  }
+  Ok(ArgJoin::from_records(records))
+}
+
+/// Append-only parameter-ledger spill (`.params.spill`), one record per Python entity with
+/// parameters: entity u64 · count u16 · (len u8 · bytes)*. Same lifecycle as the arg spill.
+pub(crate) struct ParamSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+impl ParamSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &ParamRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&rec.entity.raw().to_le_bytes())?;
+    self.file.write_all(&(rec.names.len() as u16).to_le_bytes())?;
+    for name in rec.names.iter() {
+      self.file.write_all(&[name.len() as u8])?;
+      self.file.write_all(name.as_bytes())?;
+    }
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+/// Append-only return-ledger spill (`.rets.spill`): (len u8 · name)(len u8 · ret) rows.
+/// Name-keyed, so the absorber never rebases them; the link pass folds them into the
+/// resolver's `ChainReturns` (dedup + disagreement poison there).
+pub(crate) struct RetSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+impl RetSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &RetRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&[rec.name.len() as u8])?;
+    self.file.write_all(rec.name.as_bytes())?;
+    self.file.write_all(&[rec.ret.len() as u8])?;
+    self.file.write_all(rec.ret.as_bytes())?;
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+pub(crate) fn load_ret_spill(
+  path: &std::path::Path,
+  expected: u64,
+) -> io::Result<Vec<(Box<str>, Box<str>)>> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  let mut rows = Vec::with_capacity(expected as usize);
+  let mut off = 0usize;
+  let mut seen = 0u64;
+  while off < bytes.len() {
+    let take = |o: usize, n: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(o..o + n)
+        .ok_or_else(|| io::Error::other("ret spill truncated"))
+    };
+    let name_len = take(off, 1)?[0] as usize;
+    let name = std::str::from_utf8(take(off + 1, name_len)?)
+      .map_err(|_| io::Error::other("ret spill: non-utf8 name"))?;
+    off += 1 + name_len;
+    let ret_len = take(off, 1)?[0] as usize;
+    let ret = std::str::from_utf8(take(off + 1, ret_len)?)
+      .map_err(|_| io::Error::other("ret spill: non-utf8 type"))?;
+    off += 1 + ret_len;
+    rows.push((Box::from(name), Box::from(ret)));
+    seen += 1;
+  }
+  if seen != expected {
+    return Err(io::Error::other(format!(
+      "ret spill holds {seen} records, absorber wrote {expected} — torn scratch"
+    )));
+  }
+  Ok(rows)
+}
+
+/// entity id → ordered parameter names, binary-searched (sorted by entity; one row per
+/// entity — later duplicates for the same id cannot exist because each entity's defining
+/// file lands exactly once per build).
+pub(crate) struct ParamTable {
+  rows: Vec<(u64, Box<[Box<str>]>)>,
+}
+
+impl ParamTable {
+  pub(crate) fn empty() -> Self {
+    Self { rows: Vec::new() }
+  }
+
+  /// Build the ledger from in-RAM rows — the retained store's path. Sorted by entity id;
+  /// a pure function of the row set.
+  pub(crate) fn from_rows(mut rows: Vec<(u64, Box<[Box<str>]>)>) -> Self {
+    rows.sort_unstable_by_key(|(id, _)| *id);
+    Self { rows }
+  }
+
+  pub(crate) fn is_empty(&self) -> bool {
+    self.rows.is_empty()
+  }
+
+  pub(crate) fn get(&self, entity: u64) -> Option<&[Box<str>]> {
+    let at = self.rows.binary_search_by_key(&entity, |(id, _)| *id).ok()?;
+    Some(&self.rows[at].1)
+  }
+}
+
+pub(crate) fn load_param_spill(path: &std::path::Path, expected: u64) -> io::Result<ParamTable> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  let mut rows: Vec<(u64, Box<[Box<str>]>)> = Vec::with_capacity(expected as usize);
+  let mut off = 0usize;
+  let mut seen = 0u64;
+  while off < bytes.len() {
+    let take = |o: usize, n: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(o..o + n)
+        .ok_or_else(|| io::Error::other("param spill truncated"))
+    };
+    let entity = u64::from_le_bytes(take(off, 8)?.try_into().expect("8B"));
+    let count = u16::from_le_bytes(take(off + 8, 2)?.try_into().expect("2B")) as usize;
+    off += 10;
+    let mut names = Vec::with_capacity(count);
+    for _ in 0..count {
+      let len = take(off, 1)?[0] as usize;
+      let name = std::str::from_utf8(take(off + 1, len)?)
+        .map_err(|_| io::Error::other("param spill: non-utf8 name"))?;
+      names.push(Box::from(name));
+      off += 1 + len;
+    }
+    rows.push((entity, names.into_boxed_slice()));
+    seen += 1;
+  }
+  if seen != expected {
+    return Err(io::Error::other(format!(
+      "param spill holds {seen} records, absorber wrote {expected} — torn scratch"
+    )));
+  }
+  Ok(ParamTable::from_rows(rows))
+}
+
+/// Fixed-width sketch spill (`.sigs.spill`): entity u64 · shingles u32 · 64 sketch bytes.
+/// Same lifecycle as the arg spill.
+pub(crate) struct SigSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+const SIG_RECORD_LEN: usize = 8 + 4 + crate::signature::BINS;
+
+impl SigSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &SigRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&rec.entity.raw().to_le_bytes())?;
+    self.file.write_all(&rec.shingles.to_le_bytes())?;
+    self.file.write_all(&rec.sketch)?;
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+pub(crate) fn load_sig_spill(
+  path: &std::path::Path,
+  expected: u64,
+) -> io::Result<Vec<crate::similar::SigRow>> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  if bytes.len() % SIG_RECORD_LEN != 0 || (bytes.len() / SIG_RECORD_LEN) as u64 != expected {
+    return Err(io::Error::other(format!(
+      "sig spill holds {} bytes for {expected} records of {SIG_RECORD_LEN} — torn scratch",
+      bytes.len()
+    )));
+  }
+  Ok(
+    bytes
+      .chunks_exact(SIG_RECORD_LEN)
+      .map(|rec| {
+        let mut sketch = [0u8; crate::signature::BINS];
+        sketch.copy_from_slice(&rec[12..]);
+        crate::similar::SigRow {
+          node: u64::from_le_bytes(rec[..8].try_into().expect("8B")),
+          shingles: u32::from_le_bytes(rec[8..12].try_into().expect("4B")),
+          sketch,
+        }
+      })
+      .collect(),
+  )
+}
+
+/// Request spill (`.reqs.spill`): from u64 · span u32×2 · method len u8 + bytes ·
+/// path len u16 + bytes. Same lifecycle as the arg spill.
+pub(crate) struct ReqSpillWriter {
+  file: std::io::BufWriter<std::fs::File>,
+  path: std::path::PathBuf,
+  count: u64,
+}
+
+impl ReqSpillWriter {
+  fn create(path: &std::path::Path) -> io::Result<Self> {
+    Ok(Self {
+      file: std::io::BufWriter::new(std::fs::File::create(path)?),
+      path: path.to_path_buf(),
+      count: 0,
+    })
+  }
+
+  fn push(&mut self, rec: &ReqRec) -> io::Result<()> {
+    use std::io::Write;
+    self.file.write_all(&rec.from.raw().to_le_bytes())?;
+    self.file.write_all(&rec.span.0.to_le_bytes())?;
+    self.file.write_all(&rec.span.1.to_le_bytes())?;
+    self.file.write_all(&[rec.method.len() as u8])?;
+    self.file.write_all(rec.method.as_bytes())?;
+    self.file.write_all(&(rec.path.len() as u16).to_le_bytes())?;
+    self.file.write_all(rec.path.as_bytes())?;
+    self.count += 1;
+    Ok(())
+  }
+
+  fn finish(mut self) -> io::Result<(std::path::PathBuf, u64)> {
+    use std::io::Write;
+    self.file.flush()?;
+    Ok((self.path, self.count))
+  }
+}
+
+pub(crate) fn load_req_spill(
+  path: &std::path::Path,
+  expected: u64,
+) -> io::Result<Vec<crate::requests::ReqRow>> {
+  use std::io::Read;
+  let mut bytes = Vec::new();
+  std::fs::File::open(path)?.read_to_end(&mut bytes)?;
+  let _ = std::fs::remove_file(path);
+  let mut rows = Vec::with_capacity(expected as usize);
+  let mut off = 0usize;
+  let mut seen = 0u64;
+  while off < bytes.len() {
+    let take = |o: usize, n: usize| -> io::Result<&[u8]> {
+      bytes
+        .get(o..o + n)
+        .ok_or_else(|| io::Error::other("request spill truncated"))
+    };
+    let from = u64::from_le_bytes(take(off, 8)?.try_into().expect("8B"));
+    let s0 = u32::from_le_bytes(take(off + 8, 4)?.try_into().expect("4B"));
+    let s1 = u32::from_le_bytes(take(off + 12, 4)?.try_into().expect("4B"));
+    let method_len = take(off + 16, 1)?[0] as usize;
+    let method = std::str::from_utf8(take(off + 17, method_len)?)
+      .map_err(|_| io::Error::other("request spill: non-utf8 method"))?;
+    off += 17 + method_len;
+    let path_len = u16::from_le_bytes(take(off, 2)?.try_into().expect("2B")) as usize;
+    let url = std::str::from_utf8(take(off + 2, path_len)?)
+      .map_err(|_| io::Error::other("request spill: non-utf8 path"))?;
+    off += 2 + path_len;
+    rows.push(crate::requests::ReqRow {
+      from,
+      method: Box::from(method),
+      path: Box::from(url),
+      span: (s0, s1),
+    });
+    seen += 1;
+  }
+  if seen != expected {
+    return Err(io::Error::other(format!(
+      "request spill holds {seen} records, absorber wrote {expected} — torn scratch"
+    )));
+  }
+  Ok(rows)
+}
+
 enum RefSink<'a, 'i> {
-  Ram(&'a mut Vec<Reference<'i>>),
-  Spill(&'a mut vorpal_resolve::RefSpillWriter<'i>),
+  Ram(&'a mut Vec<Reference<'i>>, &'a mut FlowSidecar),
+  Spill(
+    &'a mut vorpal_resolve::RefSpillWriter<'i>,
+    Option<FlowSpillWriters<'a>>,
+  ),
+}
+
+/// The five flow spill writers a bulk build streams side rows into.
+pub(crate) struct FlowSpillWriters<'a> {
+  args: &'a mut ArgSpillWriter,
+  params: &'a mut ParamSpillWriter,
+  rets: &'a mut RetSpillWriter,
+  sigs: &'a mut SigSpillWriter,
+  requests: &'a mut ReqSpillWriter,
 }
 
 impl<'i> RefSink<'_, 'i> {
-  fn consume(&mut self, shard_references: Vec<Reference<'i>>, id_base: u64) -> io::Result<()> {
+  fn consume(
+    &mut self,
+    shard_references: Vec<Reference<'i>>,
+    shard_flow: FlowSidecar,
+    id_base: u64,
+  ) -> io::Result<()> {
     let rebased = shard_references.into_iter().map(|mut reference| {
       reference.from = NodeId::new(reference.from.raw() + id_base);
       reference
     });
+    let rebased_args = shard_flow.args.into_iter().map(|mut rec| {
+      rec.from = NodeId::new(rec.from.raw() + id_base);
+      rec
+    });
+    let rebased_params = shard_flow.params.into_iter().map(|mut rec| {
+      rec.entity = NodeId::new(rec.entity.raw() + id_base);
+      rec
+    });
+    let rebased_sigs = shard_flow.sigs.into_iter().map(|mut rec| {
+      rec.entity = NodeId::new(rec.entity.raw() + id_base);
+      rec
+    });
+    let rebased_requests = shard_flow.requests.into_iter().map(|mut rec| {
+      rec.from = NodeId::new(rec.from.raw() + id_base);
+      rec
+    });
     match self {
-      RefSink::Ram(references) => {
+      RefSink::Ram(references, flow) => {
         references.extend(rebased);
+        flow.args.extend(rebased_args);
+        flow.params.extend(rebased_params);
+        flow.rets.extend(shard_flow.rets);
+        flow.sigs.extend(rebased_sigs);
+        flow.requests.extend(rebased_requests);
         Ok(())
       }
-      RefSink::Spill(writer) => {
+      RefSink::Spill(writer, flow_writers) => {
         for reference in rebased {
           writer.push(&reference)?;
+        }
+        if let Some(writers) = flow_writers {
+          for rec in rebased_args {
+            writers.args.push(&rec)?;
+          }
+          for rec in rebased_params {
+            writers.params.push(&rec)?;
+          }
+          for rec in &shard_flow.rets {
+            writers.rets.push(rec)?;
+          }
+          for rec in rebased_sigs {
+            writers.sigs.push(&rec)?;
+          }
+          for rec in rebased_requests {
+            writers.requests.push(&rec)?;
+          }
         }
         Ok(())
       }
@@ -187,9 +775,19 @@ fn absorb_shard<'i>(
   sink: &mut RefSink<'_, 'i>,
   shard_writer: KgWriter,
   shard_references: Vec<Reference<'i>>,
+  shard_flow: FlowSidecar,
 ) -> io::Result<()> {
   let id_base = writer.absorb(shard_writer);
-  sink.consume(shard_references, id_base)
+  sink.consume(shard_references, shard_flow, id_base)
+}
+
+/// Routes exactly like extraction: the parameter ledger is collected for files the registry
+/// hands to the Python grammar (kwarg call-site binding is a Python-shaped semantic).
+fn is_python_path(path: &str) -> bool {
+  matches!(
+    vorpal_lang_registry::from_path(std::path::Path::new(path)),
+    Some(vorpal_lang_registry::SgLang::Builtin(vorpal_language::SupportLang::Python))
+  )
 }
 
 /// Emit a phase stamp to stderr when `VORPAL_PHASE_TRACE` is set — for correlating RSS
@@ -269,12 +867,253 @@ pub fn link_writer<'i>(
 /// every persisted relation can answer "why does this exist?".
 pub fn link_writer_spilled<'i>(
   interner: &'i vorpal_resolve::Interner,
-  mut writer: KgWriter,
+  writer: KgWriter,
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
 ) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
+  let (kg, stats, evidence, _flows, _similar, _requests) =
+    link_writer_spilled_with_flows(interner, writer, spill, resolver, None, None)?;
+  Ok((kg, stats, evidence))
+}
+
+/// [`link_writer_spilled`] plus the data-flow join (G-M3): the arg spill written beside the
+/// reference spill joins resolved CALLS edges by (from, span) — every traceable argument at
+/// a resolved call becomes a `dataflow.bin` row, and each (caller, callee) pair with at
+/// least one traceable argument gains one `DATA_FLOWS` edge carrying the call's confidence.
+/// Bind one call-site argument to a callee parameter position (G-M5). Keyword arguments
+/// bind by exact name against the callee's parameter ledger — a miss (typo, **kwargs
+/// absorption, no ledger) is the honest sentinel, never a guessed position. Positional
+/// arguments keep their index, shifted past an explicit self/cls when the call had a
+/// receiver and the ledger proves the parameter is there.
+fn bind_param_index(rec: &ArgRec, callee_params: Option<&[Box<str>]>) -> u16 {
+  const NO_PARAM: u16 = u16::MAX;
+  match (rec.kw.as_deref(), callee_params) {
+    (Some(kw), Some(params)) => params
+      .iter()
+      .position(|p| p.as_ref() == kw)
+      .map(|at| at as u16)
+      .unwrap_or(NO_PARAM),
+    (Some(_), None) => NO_PARAM,
+    (None, Some(params)) => {
+      let offset = (rec.has_receiver
+        && matches!(params.first().map(|p| p.as_ref()), Some("self") | Some("cls")))
+        as u16;
+      rec.index + offset
+    }
+    // No ledger (non-Python callee, or an external): positional v1 semantics.
+    (None, None) => rec.index,
+  }
+}
+
+/// The CALLS→data-flow join, shared verbatim by the bulk link sink and the retained
+/// assembly so the two paths cannot drift: the first (caller, callee) occurrence emits one
+/// `DATA_FLOWS` edge (through `push_edge`, at the caller's position in the edge stream —
+/// stream order is part of the sealed bytes), and every traceable argument emits one
+/// data-flow sidecar row. Ids are whatever space the caller resolves in; rows are remapped
+/// by the caller when its space is not the sealed one.
+#[allow(clippy::too_many_arguments)] // one join, both linkers: every input is load-bearing
+pub(crate) fn join_call_edge(
+  from: u64,
+  to: u64,
+  span: (u32, u32),
+  confidence: u8,
+  arg_join: &ArgJoin,
+  param_table: &ParamTable,
+  flow_pairs: &mut std::collections::HashSet<(u64, u64)>,
+  flows: &mut Vec<vorpal_kg::DataflowRow>,
+  mut push_edge: impl FnMut(vorpal_kg::EdgeType),
+) {
+  if arg_join.is_empty() {
+    return;
+  }
+  let records = arg_join.get(from, span);
+  if records.is_empty() {
+    return;
+  }
+  // One DATA_FLOWS edge per (caller, callee) pair; one row per traceable arg.
+  if flow_pairs.insert((from, to)) {
+    push_edge(vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(confidence));
+  }
+  let callee_params = if param_table.is_empty() {
+    None
+  } else {
+    param_table.get(to)
+  };
+  for rec in records {
+    flows.push(vorpal_kg::DataflowRow {
+      from: from as u32,
+      to: to as u32,
+      span,
+      arg_index: rec.index,
+      param_index: bind_param_index(rec, callee_params),
+      class: rec.class,
+      expr: rec.expr.as_deref().map(str::to_string),
+    });
+  }
+}
+
+/// What a spilled link yields: the sealed graph, resolution stats, evidence rows, data-flow
+/// rows, and the near-clone pairing report.
+pub type LinkedGraph = (
+  Kg,
+  ResolveStats,
+  Vec<vorpal_kg::EvidenceRow>,
+  Vec<vorpal_kg::DataflowRow>,
+  crate::similar::SimilarReport,
+  crate::requests::RequestReport,
+);
+
+/// The near-clone pairing thread's yield: sorted canonical-id pairs plus the pass report.
+pub type PairingHandle =
+  std::thread::JoinHandle<(Vec<(u64, u64, u8)>, crate::similar::SimilarReport)>;
+
+/// Start the near-clone pairing as early as its input exists — the sig spill closes with
+/// the stream phase, and the pairing needs nothing else, so a caller that spawns here
+/// overlaps it with the pack tail, the table build, AND resolution instead of only the
+/// link. Consumes the spill's sig entry (the file is deleted; the count zeroes so the
+/// link's own loader knows). `None` when there is nothing to pair — the link then derives
+/// the honest empty report inline.
+pub fn spawn_sig_pairing(flow_spill: &mut FlowSpill) -> io::Result<Option<PairingHandle>> {
+  if flow_spill.sigs.1 == 0 {
+    let _ = std::fs::remove_file(&flow_spill.sigs.0);
+    return Ok(None);
+  }
+  let rows = load_sig_spill(&flow_spill.sigs.0, flow_spill.sigs.1)?;
+  flow_spill.sigs.1 = 0;
+  // Tiny row sets still go through the thread: `similar_pairs` produces the stated
+  // too-few-to-pair notes, and the report text must not depend on WHERE pairing started.
+  Ok(Some(std::thread::spawn(move || crate::similar::similar_pairs(rows))))
+}
+
+pub fn link_writer_spilled_with_flows<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  mut writer: KgWriter,
+  spill: vorpal_resolve::RefSpill<'i>,
+  resolver: &Resolver,
+  flow_spill: Option<FlowSpill>,
+  pairing: Option<PairingHandle>,
+) -> io::Result<LinkedGraph> {
+  // Near-clone sketches (v16): paired on their own thread while the table builds and
+  // resolution runs. A pre-spawned handle (see `spawn_sig_pairing`) started even earlier —
+  // at the stream tail — and the spill's sig count is zero then; otherwise spawn here.
+  let pairing = match pairing {
+    Some(handle) => Some(handle),
+    None => {
+      let sig_rows: Vec<crate::similar::SigRow> = match &flow_spill {
+        Some(spill) if spill.sigs.1 > 0 => load_sig_spill(&spill.sigs.0, spill.sigs.1)?,
+        Some(spill) => {
+          let _ = std::fs::remove_file(&spill.sigs.0);
+          Vec::new()
+        }
+        None => Vec::new(),
+      };
+      Some(std::thread::spawn(move || crate::similar::similar_pairs(sig_rows)))
+    }
+  };
+  let req_rows: Vec<crate::requests::ReqRow> = match &flow_spill {
+    Some(spill) if spill.requests.1 > 0 => load_req_spill(&spill.requests.0, spill.requests.1)?,
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.requests.0);
+      Vec::new()
+    }
+    None => Vec::new(),
+  };
+  let link = link_resolve(interner, &mut writer, &spill, resolver, flow_spill);
+  let pairing = pairing
+    .expect("set above")
+    .join()
+    .map_err(|_| io::Error::other("similarity pairing panicked"));
+  let (stats, evidence, flows) = link?;
+  let (similar_pairs, similar_report) = pairing?;
+  phase_trace("link: resolve done");
+  // Symmetric near-clone edges, sorted pairs — deterministic edge-log order.
+  for &(a, b, confidence) in &similar_pairs {
+    let label = vorpal_kg::EdgeType::SIMILAR_TO.with_confidence(confidence);
+    writer.add_edge(NodeId::new(a), NodeId::new(b), label);
+    writer.add_edge(NodeId::new(b), NodeId::new(a), label);
+  }
+  drop(similar_pairs);
+  // Request → route edges (ADOPTION #25 slice 2): literal client URLs against Route
+  // templates; unique matches only, everything else counted on the report.
+  let request_report = if req_rows.is_empty() {
+    crate::requests::RequestReport::default()
+  } else {
+    let mut routes: Vec<(u64, String)> = Vec::new();
+    writer.for_each_definition(|id, name, _path, kind, _exported| {
+      if matches!(kind, vorpal_kg::SymbolKind::Route | vorpal_kg::SymbolKind::Channel) {
+        routes.push((id.raw(), name.to_string()));
+      }
+    });
+    let (matched, report) = crate::requests::match_requests(&routes, &req_rows);
+    for &(from, to, confidence) in &matched.requests {
+      writer.add_edge(
+        NodeId::new(from),
+        NodeId::new(to),
+        vorpal_kg::EdgeType::REQUESTS.with_confidence(confidence),
+      );
+    }
+    for &(from, to, confidence) in &matched.notifies {
+      writer.add_edge(
+        NodeId::new(from),
+        NodeId::new(to),
+        vorpal_kg::EdgeType::NOTIFIES.with_confidence(confidence),
+      );
+    }
+    report
+  };
+  drop(req_rows);
+  let _ = spill.remove();
+  // The link transients (spill chunks + table + arg join) just died — return their pages
+  // before compaction and seal allocate theirs.
+  release_freed_pages();
+  phase_trace("link: seal start");
+  let kg = writer.seal();
+  release_freed_pages();
+  phase_trace("link: seal done");
+  Ok((kg, stats, evidence, flows, similar_report, request_report))
+}
+
+/// The resolution half of a spilled link: load the flow spills, build the table, resolve
+/// every reference into the writer's edge log, collect evidence and data-flow rows.
+fn link_resolve<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  writer: &mut KgWriter,
+  spill: &vorpal_resolve::RefSpill<'i>,
+  resolver: &Resolver,
+  flow_spill: Option<FlowSpill>,
+) -> io::Result<(ResolveStats, Vec<vorpal_kg::EvidenceRow>, Vec<vorpal_kg::DataflowRow>)> {
+  let arg_join: ArgJoin = match &flow_spill {
+    Some(spill) if spill.args.1 > 0 => load_arg_spill(&spill.args.0, spill.args.1)?,
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.args.0);
+      ArgJoin::empty()
+    }
+    None => ArgJoin::empty(),
+  };
+  let param_table: ParamTable = match &flow_spill {
+    Some(spill) if spill.params.1 > 0 => load_param_spill(&spill.params.0, spill.params.1)?,
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.params.0);
+      ParamTable::empty()
+    }
+    None => ParamTable::empty(),
+  };
+  // The chained-call return ledger (G-M5): name-keyed, disagreements poisoned at build.
+  let chain: Option<vorpal_resolve::ChainReturns<'i>> = match &flow_spill {
+    Some(spill) if spill.rets.1 > 0 => {
+      let rows = load_ret_spill(&spill.rets.0, spill.rets.1)?;
+      Some(vorpal_resolve::ChainReturns::build(interner, rows))
+    }
+    Some(spill) => {
+      let _ = std::fs::remove_file(&spill.rets.0);
+      None
+    }
+    None => None,
+  };
+  let mut flows: Vec<vorpal_kg::DataflowRow> = Vec::new();
+  let mut flow_pairs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
   phase_trace("link: table build start");
-  let mut table = build_symbol_table(interner, &writer);
+  let mut table = build_symbol_table(interner, writer);
   release_freed_pages();
   phase_trace("link: resolve start");
   // Import-binding pre-pass (§3.3 scope step): the spill retained the qualifier-carrying
@@ -289,19 +1128,32 @@ pub fn link_writer_spilled<'i>(
   // reallocations — the last a full-vector memcpy — on the ordered-sink thread.
   let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::with_capacity(spill.count() as usize);
   let stats = {
-    let writer = &mut writer;
     let evidence = std::cell::RefCell::new(&mut evidence);
     vorpal_resolve::resolve_all_spilled_into(
       interner,
       &table,
-      &spill,
+      spill,
       resolver,
+      chain.as_ref(),
       |edge| {
         writer.add_edge(
           edge.from,
           edge.to,
           edge.edge.with_confidence(edge.confidence),
         );
+        if edge.edge.base() == vorpal_kg::EdgeType::CALLS {
+          join_call_edge(
+            edge.from.raw(),
+            edge.to.raw(),
+            edge.span,
+            edge.confidence,
+            &arg_join,
+            &param_table,
+            &mut flow_pairs,
+            &mut flows,
+            |etype| writer.add_edge(edge.from, edge.to, etype),
+          );
+        }
         let (alt_ids, alt_count) = edge.alternatives;
         evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
           from: edge.from.raw() as u32,
@@ -340,17 +1192,12 @@ pub fn link_writer_spilled<'i>(
       },
     )?
   };
-  phase_trace("link: resolve done");
   drop(table);
-  let _ = spill.remove();
-  // The link transients (spill chunks + table) just died — return their pages before
-  // compaction and seal allocate theirs.
-  release_freed_pages();
-  phase_trace("link: seal start");
-  let kg = writer.seal();
-  release_freed_pages();
-  phase_trace("link: seal done");
-  Ok((kg, stats, evidence))
+  drop(arg_join);
+  drop(param_table);
+  drop(chain);
+  drop(flow_pairs);
+  Ok((stats, evidence, flows))
 }
 
 /// Fewer files than this per shard and the fan-out overhead outweighs the win: small trees
@@ -426,54 +1273,128 @@ pub(crate) fn apply_product<'i>(
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
 ) {
-  let crate::FileProduct { items, refs, .. } = product;
+  apply_product_with_args(interner, path, product, writer, references, None);
+}
+
+pub(crate) fn apply_product_with_args<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  path: &str,
+  product: crate::FileProduct,
+  writer: &mut KgWriter,
+  references: &mut Vec<Reference<'i>>,
+  mut flow_out: Option<&mut FlowSidecar>,
+) {
+  let crate::FileProduct {
+    items,
+    refs,
+    entity_params,
+    returns,
+    signatures,
+    requests,
+    ..
+  } = product;
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    for (name, ret) in &returns {
+      flow_out.rets.push(RetRec {
+        name: Box::from(name.as_str()),
+        ret: Box::from(ret.as_str()),
+      });
+    }
+  }
+  let entity_params: Vec<(u32, Vec<&str>)> = entity_params
+    .iter()
+    .map(|(entity, params)| (*entity, params.iter().map(|(name, _)| name.as_str()).collect()))
+    .collect();
   apply_parts(
     interner,
     path,
     &items,
-    refs.iter().map(|r| crate::product::RefView {
-      from_entity_index: r.from_entity_index,
-      name: &r.name,
-      kind: r.kind,
-      start: r.start,
-      end: r.end,
-      qualifier: r.qualifier.as_deref(),
-      form: r.form,
-      alias: r.alias.as_deref(),
+    refs.iter().map(|r| {
+      crate::product::RefView::bridge(
+        r.from_entity_index,
+        &r.name,
+        r.kind,
+        r.start,
+        r.end,
+        r.qualifier.as_deref(),
+        r.form,
+        r.alias.as_deref(),
+        r.receiver.as_deref(),
+        r.receiver_type.as_deref(),
+        r.receiver_type_origin,
+        &r.args,
+      )
     }),
+    &entity_params,
+    signatures
+      .iter()
+      .map(|sig| (sig.entity_index, sig.shingles, &sig.sketch[..])),
+    requests
+      .iter()
+      .map(|r| (r.from_entity_index, r.method.as_str(), r.path.as_str(), (r.start, r.end))),
     writer,
     references,
+    flow_out,
   );
 }
 
 /// Apply a pack-replayed product straight from its mapped bytes: decode to views, apply —
 /// no owned strings anywhere on the path (the replay profile showed decode's per-string
 /// allocations as a top cost).
-pub(crate) fn apply_product_view<'i>(
+pub(crate) fn apply_product_view_with_args<'i>(
   interner: &'i vorpal_resolve::Interner,
   path: &str,
   view: &crate::ProductView<'_>,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
+  mut flow_out: Option<&mut FlowSidecar>,
 ) {
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    for (name, ret) in &view.returns {
+      flow_out.rets.push(RetRec {
+        name: Box::from(*name),
+        ret: Box::from(*ret),
+      });
+    }
+  }
+  let entity_params: Vec<(u32, Vec<&str>)> = view
+    .entity_params
+    .iter()
+    .map(|(entity, params)| (*entity, params.iter().map(|(name, _)| *name).collect()))
+    .collect();
   apply_parts(
     interner,
     path,
     &view.items,
     view.refs.iter().copied(),
+    &entity_params,
+    view
+      .signatures
+      .iter()
+      .map(|sig| (sig.entity_index, sig.shingles, sig.sketch)),
+    view
+      .requests
+      .iter()
+      .map(|r| (r.from_entity_index, r.method, r.path, (r.start, r.end))),
     writer,
     references,
+    flow_out,
   );
 }
 
 /// The single application kernel both product forms share.
+#[allow(clippy::too_many_arguments)] // the single shared application kernel: every input is load-bearing
 fn apply_parts<'a, 'i>(
   interner: &'i vorpal_resolve::Interner,
   path: &str,
   items: &[vorpal_outline::model::OutlineItem<'_>],
   refs: impl Iterator<Item = crate::product::RefView<'a>>,
+  entity_params: &[(u32, Vec<&str>)],
+  signatures: impl Iterator<Item = (u32, u32, &'a [u8])>,
+  requests: impl Iterator<Item = (u32, &'a str, &'a str, (u32, u32))>,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
+  mut flow_out: Option<&mut FlowSidecar>,
 ) {
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
@@ -488,10 +1409,84 @@ fn apply_parts<'a, 'i>(
   let layout_ids = writer.ingest_file_with_spans(path, items);
   // Intern the file's path once; every reference carries the 4-byte id.
   let path_id = interner.intern(path);
+  // Callee parameter ledgers (G-M5): Python entities only — the one language whose call
+  // sites bind by keyword and whose methods carry an explicit self/cls first parameter.
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    if !entity_params.is_empty() && is_python_path(path) {
+      for (entity_index, names) in entity_params {
+        // Layout index -> node id directly (A2): no path-string round trip, same id.
+        let Some(&(_, id)) = layout_ids.get(*entity_index as usize) else {
+          continue;
+        };
+        {
+          if !names.is_empty() {
+            flow_out.params.push(ParamRec {
+              entity: id,
+              names: names.iter().map(|n| Box::from(*n)).collect(),
+            });
+          }
+        }
+      }
+    }
+  }
+  // Near-clone sketches (v16): keyed to the writer's fresh node id, collected only where a
+  // collector exists (the spilled index-build path).
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    for (entity_index, shingles, sketch) in signatures {
+      let Some(&(_, id)) = layout_ids.get(entity_index as usize) else {
+        continue;
+      };
+      let Ok(sketch) = <[u8; crate::signature::BINS]>::try_from(sketch) else {
+        continue; // a corrupt width — the decoder guarantees 64, so this never fires
+      };
+      flow_out.sigs.push(SigRec {
+        entity: id,
+        shingles,
+        sketch,
+      });
+    }
+  }
+  // Request records (v17): keyed to the writer's fresh node id, collected only where a
+  // collector exists (the spilled index-build path).
+  if let Some(flow_out) = flow_out.as_deref_mut() {
+    for (entity_index, method, url, span) in requests {
+      let Some(&(_, from)) = layout_ids.get(entity_index as usize) else {
+        continue;
+      };
+      flow_out.requests.push(ReqRec {
+        from,
+        method: Box::from(method),
+        path: Box::from(url),
+        span,
+      });
+    }
+  }
   for r in refs {
     let Some(&(_, from)) = layout_ids.get(r.from_entity_index as usize) else {
       continue;
     };
+    // Traceable call-site arguments ride beside the reference (G-M3): lazily decoded off
+    // the view, captured only where a collector exists (the spilled index-build path).
+    // `from` is already bound by the layout index above (A2) — no per-reference re-hash.
+    if let Some(flow_out) = flow_out.as_deref_mut() {
+      if crate::product::tag_refkind(r.kind) == vorpal_resolve::RefKind::Call && r.args_len() > 0
+      {
+        let has_receiver = r.receiver.is_some();
+        for arg in r.args() {
+          if arg.class <= 2 {
+            flow_out.args.push(ArgRec {
+              from,
+              span: (r.start, r.end),
+              index: arg.index,
+              class: arg.class,
+              has_receiver,
+              expr: arg.expr.map(Box::from),
+              kw: arg.kw_name.map(Box::from),
+            });
+          }
+        }
+      }
+    }
     references.push(
       Reference::with_interned_path(
         interner,
@@ -503,7 +1498,8 @@ fn apply_parts<'a, 'i>(
       .with_evidence(r.start, r.end)
       .with_qualifier_ref(interner, r.qualifier)
       .with_alias_ref(interner, r.alias)
-      .with_form(crate::product::tag_refform(r.form)),
+      .with_form(crate::product::tag_refform(r.form))
+      .with_receiver_type_ref(interner, r.receiver_type, r.receiver_type_origin),
     );
   }
 }
@@ -931,10 +1927,14 @@ pub struct StreamStats {
 /// either a fully-applied per-file writer or a skip marker (skips still advance the in-shard
 /// order). Application (decode, intern, define, reference building) happens on the extraction
 /// workers — the wide side of the pipeline; the committer's whole job is a sequence-ordered
-/// `absorb` + reference rebase, which is what keeps 18 workers busy instead of 9 committers.
+/// `absorb` + reference/flow rebase, which is what keeps 18 workers busy instead of 9
+/// committers.
 struct AppliedFile<'i> {
   writer: KgWriter,
   references: Vec<Reference<'i>>,
+  /// Data-flow side rows (G-M3) collected during the worker-side apply, file-local ids;
+  /// the committer rebases them by the same absorb offset the references get.
+  flow: FlowSidecar,
   parsed: bool,
   reserved: u64,
 }
@@ -973,12 +1973,15 @@ where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
   let mut references = Vec::new();
+  // The in-RAM path has no data-flow consumer yet (flows are a spilled-build product; see
+  // the G-M3 plan note) — flow rows are collected for order parity and dropped here, stated.
+  let mut flow = FlowSidecar::default();
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
     budget_bytes,
     work,
-    RefSink::Ram(&mut references),
+    RefSink::Ram(&mut references, &mut flow),
     None,
     None,
   )?;
@@ -997,21 +2000,62 @@ pub fn stream_apply_spilled<'i, F>(
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
   work: F,
-) -> io::Result<(KgWriter, vorpal_resolve::RefSpill<'i>, StreamStats)>
+) -> io::Result<(
+  KgWriter,
+  vorpal_resolve::RefSpill<'i>,
+  StreamStats,
+  FlowSpill,
+)>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
   let mut spill_writer = vorpal_resolve::RefSpillWriter::create(interner, spill_path)?;
+  // The flow spills ride beside the reference spill (G-M3/G-M5), same absorber, same order.
+  let args_path = spill_path.with_extension("args");
+  let mut arg_writer = ArgSpillWriter::create(&args_path)?;
+  let params_path = spill_path.with_extension("params");
+  let mut param_writer = ParamSpillWriter::create(&params_path)?;
+  let rets_path = spill_path.with_extension("rets");
+  let mut ret_writer = RetSpillWriter::create(&rets_path)?;
+  let sigs_path = spill_path.with_extension("sigs");
+  let mut sig_writer = SigSpillWriter::create(&sigs_path)?;
+  let reqs_path = spill_path.with_extension("reqs");
+  let mut req_writer = ReqSpillWriter::create(&reqs_path)?;
   let (writer, stats) = stream_apply_impl(
     interner,
     entries,
     budget_bytes,
     work,
-    RefSink::Spill(&mut spill_writer),
+    RefSink::Spill(
+      &mut spill_writer,
+      Some(FlowSpillWriters {
+        args: &mut arg_writer,
+        params: &mut param_writer,
+        rets: &mut ret_writer,
+        sigs: &mut sig_writer,
+        requests: &mut req_writer,
+      }),
+    ),
     heap_stream_path,
     pack,
   )?;
-  Ok((writer, spill_writer.finish()?, stats))
+  let flow_spill = FlowSpill {
+    args: arg_writer.finish()?,
+    params: param_writer.finish()?,
+    rets: ret_writer.finish()?,
+    sigs: sig_writer.finish()?,
+    requests: req_writer.finish()?,
+  };
+  Ok((writer, spill_writer.finish()?, stats, flow_spill))
+}
+
+/// The two flow scratch files a spilled build hands to link: (path, record count) each.
+pub struct FlowSpill {
+  pub(crate) args: (std::path::PathBuf, u64),
+  pub(crate) params: (std::path::PathBuf, u64),
+  pub(crate) rets: (std::path::PathBuf, u64),
+  pub(crate) sigs: (std::path::PathBuf, u64),
+  pub(crate) requests: (std::path::PathBuf, u64),
 }
 
 fn stream_apply_impl<'i, F>(
@@ -1054,30 +2098,31 @@ where
     let mut scratch = ExtractScratch::default();
     let mut writer = KgWriter::new();
     let mut references = Vec::new();
+    let mut flow = FlowSidecar::default();
     let (mut parsed, mut replayed) = (0u64, 0u64);
     for entry in entries {
       match work(entry, &mut scratch)? {
         StreamWork::Parsed(path, product) => {
           parsed += 1;
-          apply_product(interner, &path, product, &mut writer, &mut references);
+          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut flow));
         }
         StreamWork::Replayed(path, product) => {
           replayed += 1;
-          apply_product(interner, &path, product, &mut writer, &mut references);
+          apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut flow));
         }
         StreamWork::ReplayedPacked(path) => {
           if let Some(view) = pack
             .and_then(|p| p.get(&path))
             .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
           {
-            apply_product_view(interner, &path, &view, &mut writer, &mut references);
+            apply_product_view_with_args(interner, &path, &view, &mut writer, &mut references, Some(&mut flow));
             replayed += 1;
           }
         }
         StreamWork::Skipped => {}
       }
     }
-    sink.consume(references, 0)?;
+    sink.consume(references, flow, 0)?;
     return Ok((
       writer,
       StreamStats {
@@ -1123,7 +2168,7 @@ where
   }
   // Committers → absorber: completed shards, for rolling prefix absorption. Unbounded so a
   // committer never blocks handing off a finished shard.
-  let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>)>();
+  let (done_tx, done_rx) = crossbeam_channel::unbounded::<(usize, KgWriter, Vec<Reference>, FlowSidecar)>();
 
   let outputs = std::thread::scope(|scope| {
     // Committers: each owns its assigned shards' writers outright (single writer per shard)
@@ -1139,9 +2184,9 @@ where
         scope.spawn(move || {
           let owned_shards: Vec<usize> =
             (committer_index..num_shards).step_by(committers).collect();
-          let mut writers: HashMap<usize, (KgWriter, Vec<Reference>)> = owned_shards
+          let mut writers: HashMap<usize, (KgWriter, Vec<Reference>, FlowSidecar)> = owned_shards
             .iter()
-            .map(|&shard| (shard, (KgWriter::new(), Vec::new())))
+            .map(|&shard| (shard, (KgWriter::new(), Vec::new(), FlowSidecar::default())))
             .collect();
           let mut pending: HashMap<usize, std::collections::BTreeMap<usize, Slot>> = owned_shards
             .iter()
@@ -1167,18 +2212,37 @@ where
                   let AppliedFile {
                     writer: file_writer,
                     references: file_references,
+                    flow: file_flow,
                     parsed: was_parsed,
                     reserved,
                   } = *applied;
                   // File-granularity absorb: identical to applying the product directly at
                   // this position (absorb is a pure additive-offset splice — the same
                   // associativity the shard→merged absorb rests on, one level down), so the
-                  // shard writer's bytes are unchanged. References rebase by the same base.
-                  let (writer, references) = writers.get_mut(&shard).expect("owned shard");
+                  // shard writer's bytes are unchanged. References AND flow side rows (G-M3)
+                  // rebase by the same base; `rets` are entity-path keyed and never rebase.
+                  let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
                   let id_base = writer.absorb(file_writer);
                   references.extend(file_references.into_iter().map(|mut reference| {
                     reference.from = NodeId::new(reference.from.raw() + id_base);
                     reference
+                  }));
+                  flow.args.extend(file_flow.args.into_iter().map(|mut rec| {
+                    rec.from = NodeId::new(rec.from.raw() + id_base);
+                    rec
+                  }));
+                  flow.params.extend(file_flow.params.into_iter().map(|mut rec| {
+                    rec.entity = NodeId::new(rec.entity.raw() + id_base);
+                    rec
+                  }));
+                  flow.rets.extend(file_flow.rets);
+                  flow.sigs.extend(file_flow.sigs.into_iter().map(|mut rec| {
+                    rec.entity = NodeId::new(rec.entity.raw() + id_base);
+                    rec
+                  }));
+                  flow.requests.extend(file_flow.requests.into_iter().map(|mut rec| {
+                    rec.from = NodeId::new(rec.from.raw() + id_base);
+                    rec
                   }));
                   budget.release(reserved);
                   if was_parsed {
@@ -1195,9 +2259,9 @@ where
             // with its merged copy in one final doubling spike.
             let shard_end = ((shard + 1) * shard_size).min(total_sequences);
             if *expected == shard_end
-              && let Some((shard_writer, shard_references)) = writers.remove(&shard)
+              && let Some((shard_writer, shard_references, shard_flow)) = writers.remove(&shard)
             {
-              let _ = done_tx.send((shard, shard_writer, shard_references));
+              let _ = done_tx.send((shard, shard_writer, shard_references, shard_flow));
             }
           }
           (writers, parsed, replayed)
@@ -1228,13 +2292,16 @@ where
             // Apply HERE, on the worker: decode (for packed replays), intern, define, and
             // reference building all run on the wide 18-way side into a private per-file
             // writer; the committer only splices it in sequence order.
-            let apply_one = |go: &mut dyn FnMut(&mut KgWriter, &mut Vec<Reference<'i>>), parsed_flag: bool| {
+            let apply_one = |go: &mut dyn FnMut(&mut KgWriter, &mut Vec<Reference<'i>>, &mut FlowSidecar),
+                             parsed_flag: bool| {
               let mut file_writer = KgWriter::new();
               let mut file_references: Vec<Reference<'i>> = Vec::new();
-              go(&mut file_writer, &mut file_references);
+              let mut file_flow = FlowSidecar::default();
+              go(&mut file_writer, &mut file_references, &mut file_flow);
               Slot::Applied(Box::new(AppliedFile {
                 writer: file_writer,
                 references: file_references,
+                flow: file_flow,
                 parsed: parsed_flag,
                 reserved,
               }))
@@ -1242,14 +2309,28 @@ where
             let slot = match work(entry, &mut scratch) {
               Ok(StreamWork::Parsed(path, product)) => {
                 let mut product = Some(product);
-                apply_one(&mut |w, r| {
-                  apply_product(interner, &path, product.take().expect("applied once"), w, r)
+                apply_one(&mut |w, r, f| {
+                  apply_product_with_args(
+                    interner,
+                    &path,
+                    product.take().expect("applied once"),
+                    w,
+                    r,
+                    Some(f),
+                  )
                 }, true)
               }
               Ok(StreamWork::Replayed(path, product)) => {
                 let mut product = Some(product);
-                apply_one(&mut |w, r| {
-                  apply_product(interner, &path, product.take().expect("applied once"), w, r)
+                apply_one(&mut |w, r, f| {
+                  apply_product_with_args(
+                    interner,
+                    &path,
+                    product.take().expect("applied once"),
+                    w,
+                    r,
+                    Some(f),
+                  )
                 }, false)
               }
               Ok(StreamWork::ReplayedPacked(path)) => {
@@ -1260,8 +2341,8 @@ where
                   .and_then(|p| p.get(&path))
                   .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
                 {
-                  Some(view) => apply_one(&mut |w, r| {
-                    apply_product_view(interner, &path, &view, w, r)
+                  Some(view) => apply_one(&mut |w, r, f| {
+                    apply_product_view_with_args(interner, &path, &view, w, r, Some(f))
                   }, false),
                   None => {
                     budget.release(reserved);
@@ -1298,15 +2379,19 @@ where
     let absorber = scope.spawn(move || {
       let mut writer = writer;
       let mut sink = sink;
-      let mut holdback: std::collections::BTreeMap<usize, (KgWriter, Vec<Reference<'i>>)> =
-        std::collections::BTreeMap::new();
+      let mut holdback: std::collections::BTreeMap<
+        usize,
+        (KgWriter, Vec<Reference<'i>>, FlowSidecar),
+      > = std::collections::BTreeMap::new();
       let mut next_absorb = 0usize;
       // First sink (spill IO) error: aborts absorption, surfaced after the scope joins.
       let mut sink_error: Option<io::Error> = None;
-      while let Ok((shard, shard_writer, shard_references)) = done_rx.recv() {
-        holdback.insert(shard, (shard_writer, shard_references));
-        while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
-          if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
+      while let Ok((shard, shard_writer, shard_references, shard_flow)) = done_rx.recv() {
+        holdback.insert(shard, (shard_writer, shard_references, shard_flow));
+        while let Some((shard_writer, shard_references, shard_flow)) = holdback.remove(&next_absorb)
+        {
+          if let Err(err) =
+            absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_flow)
             && sink_error.is_none()
           {
             sink_error = Some(err);
@@ -1318,6 +2403,13 @@ where
     });
 
     // Admission, on the calling thread: manifest order, budget-gated — and nothing else.
+    // The scaling probe rides admission: the byte budget ties admission rate to completion
+    // rate, so a growing per-unit cost shows up here as a superlinear exponent (D7). The
+    // unit is BYTES, not files — parse work scales with bytes, and real trees order their
+    // paths with heavy byte skew (the kernel's midsection carries most of its bytes), which
+    // a per-file fit would misread as a fake quadratic.
+    let mut scaling = vorpal_kg::ScalingProbe::new("stream");
+    let mut bytes_admitted: u64 = 0;
     for (sequence, entry) in entries.iter().enumerate() {
       if abort.load(std::sync::atomic::Ordering::Acquire) {
         break;
@@ -1326,7 +2418,10 @@ where
       if work_tx.send((sequence, entry)).is_err() {
         break;
       }
+      bytes_admitted += entry.size.max(1);
+      scaling.tick(bytes_admitted);
     }
+    scaling.finish(bytes_admitted);
     drop(work_tx);
     // Drop the caller's sender so the absorber's drain ends when the committers exit.
     drop(done_tx);
@@ -1361,8 +2456,9 @@ where
     }
   }
   phase_trace("stream: absorb tail");
-  while let Some((shard_writer, shard_references)) = holdback.remove(&next_absorb) {
-    if let Err(err) = absorb_shard(&mut writer, &mut sink, shard_writer, shard_references)
+  while let Some((shard_writer, shard_references, shard_flow)) = holdback.remove(&next_absorb) {
+    if let Err(err) =
+      absorb_shard(&mut writer, &mut sink, shard_writer, shard_references, shard_flow)
       && sink_error.is_none()
     {
       sink_error = Some(err);

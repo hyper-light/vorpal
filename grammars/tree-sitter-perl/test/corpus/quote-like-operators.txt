@@ -1,0 +1,221 @@
+=================================================
+Interpolate only $ and @ variable and not %hash or object reference TODO: fix this
+=================================================
+
+qq {hello $meow print("dsfsdf) %hash};
+
+---
+
+(source_file
+  (string_qq_quoted
+    (start_delimiter)
+      (interpolation (scalar_variable))
+    (end_delimiter))
+  
+)
+
+=================================================
+qq //
+=================================================
+
+qq /im inside another delimiter/;
+
+---
+
+(source_file
+  (string_qq_quoted (start_delimiter) (end_delimiter)) 
+)
+
+=================================================
+qq '' interpolate
+=================================================
+
+qq 'this should $interpolate, yes';
+
+---
+
+(source_file
+  (string_qq_quoted (start_delimiter) (interpolation (scalar_variable)) (end_delimiter)) 
+)
+
+=================================================
+q{} string
+=================================================
+
+my $string = q{im a non interpolated string};
+
+---
+
+(source_file
+  (binary_expression (variable_declaration (scope) (scalar_variable))
+    (string_q_quoted
+          (start_delimiter)
+          (end_delimiter))) 
+)
+
+=================================================
+qx command
+=================================================
+
+my $string = qx{im a non interpolated string};
+
+---
+
+(source_file
+  (binary_expression (variable_declaration (scope) (scalar_variable)) (command_qx_quoted (start_delimiter) (end_delimiter))) 
+)
+
+=================================================
+backtick_quoted
+=================================================
+
+`ls -a`;
+
+---
+
+(source_file
+  (backtick_quoted) 
+)
+
+=================================================
+qw command
+=================================================
+
+my @array = qw /
+  PUBG
+  EVENING
+  BIO_SHOCK_INFINITY
+/;
+
+---
+
+(source_file
+  (binary_expression (variable_declaration
+    (scope) (array_variable)) (word_list_qw (start_delimiter_qw) (list_item) (list_item) (list_item) (end_delimiter_qw))
+  ) 
+)
+
+=================================================
+implicit regex matcher - all the flags are allowed, and the regex can have whitespace
+=================================================
+
+$string =~ /a b c/msixpodualng;
+
+---
+
+(source_file
+  (binary_expression
+    (scalar_variable) (pattern_matcher (regex_pattern_content) (regex_option))
+  ) 
+)
+
+=================================================
+m matcher operator
+=================================================
+
+$string =~ m/Simple/is;
+
+---
+
+(source_file
+  (binary_expression
+    (scalar_variable) (pattern_matcher_m (start_delimiter) (end_delimiter) (regex_option))
+  ) 
+)
+
+=================================================
+m matcher operator - global flag is allowed for searches
+=================================================
+
+$string =~ m/abc/g;
+
+---
+
+(source_file
+  (binary_expression
+    (scalar_variable) (pattern_matcher_m (start_delimiter) (end_delimiter) (regex_option))
+  ) 
+)
+
+
+=================================================
+m matcher operator - $ at the end shouldn't interpolate
+=================================================
+
+my $x = 'shru';
+if ($x =~ m/u$/) {
+}
+
+---
+
+(source_file
+      (binary_expression
+        (variable_declaration
+          (scope)
+          (scalar_variable))
+        (string_single_quoted))
+      (if_statement
+        (array
+          (binary_expression
+            (scalar_variable)
+            (pattern_matcher_m
+              (start_delimiter)
+              (end_delimiter))))
+        (block)))
+
+
+=================================================
+qr regex operator
+=================================================
+
+my $rex = qr/my.STRING/is;
+
+---
+
+(source_file
+  (binary_expression (variable_declaration
+    (scope) (scalar_variable)) (regex_pattern_qr (start_delimiter) (end_delimiter) (regex_option))
+    ) 
+)
+
+=================================================
+s regex substitution
+=================================================
+
+$subs =~ s/my.STRING/foo/is;
+
+---
+
+(source_file
+  (binary_expression
+    (scalar_variable)
+    (substitution_pattern_s (start_delimiter) (separator_delimiter) (end_delimiter) (regex_option_for_substitution))) 
+)
+
+=================================================
+s regex substitution - no replace content
+=================================================
+
+$subs =~ s/search//is;
+
+---
+
+(source_file
+  (binary_expression
+    (scalar_variable)
+    (substitution_pattern_s (start_delimiter) (separator_delimiter) (end_delimiter) (regex_option_for_substitution))) 
+)
+
+=================================================
+tr// or y// transliteration
+=================================================
+
+my $subs =~ tr{bar}{foo}cs;
+
+---
+
+(source_file
+  (binary_expression
+    (variable_declaration (scope) (scalar_variable))
+    (transliteration_tr_or_y (start_delimiter) (separator_delimiter) (end_delimiter) (regex_option_for_transliteration)))
+    )

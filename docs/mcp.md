@@ -63,6 +63,22 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 | `health` | Per-file parse damage: ERROR-node counts, affected-byte ratios, and which definitions overlap damaged regions — the difference between "no edge" and "unknowable here." |
 
 **Graph navigation** (all take a symbol `name`; ambiguous names list candidates)
+
+> **Route nodes.** HTTP route registrations are first-class `Route` nodes named
+> `VERB /path` (`GET /users/:id`, `ROUTE /x` when the verb isn't in the source), extracted
+> for Express/Koa/Fastify, NestJS decorators, Flask/FastAPI, Django `urlpatterns`,
+> Go `net/http`/gin/echo/chi (Go 1.22 `"GET /x"` patterns included), axum,
+> actix-web/Rocket attributes, Spring, ASP.NET attributes, and Rails/Sinatra. A route
+> `calls` its handler, so `callers <handler>` names the endpoint, `reachable` from a route
+> walks its implementation, and `dead_code` never flags handlers. HTTP client call sites
+> with literal URLs (`fetch("/api/users")`, `requests.get(url)`, `http.NewRequest`)
+> gain a directional `requests` edge to the route their path uniquely matches — template
+> parameters absorb segments, cross-language (a TS frontend into a Go backend is one
+> graph), ambiguity refuses and is counted. Event listeners (`bus.on("user.created", h)`,
+> `Subscribe`) are `Channel` nodes (`EVENT user.created`) that `call` their handlers, and
+> emitters (`emit`, `publish`) gain `notifies` edges to EVERY matching registration —
+> pub/sub fan-out is the semantics, capped and counted. Literal strings only; a URL,
+> route, or topic built from variables is not extracted (nothing is guessed).
 | Tool | What it does |
 |---|---|
 | `node` | Nodes matching an exact symbol name. |
@@ -71,7 +87,11 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 | `importers` | Files importing a symbol (incoming `imports` edges). |
 | `implementors` | Types implementing/extending a trait, interface, or base type. |
 | `type_users` | Definitions using a type in fields, params, returns, or annotations. |
-| `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`). |
+| `similar` | Near-clones of a definition (`similar_to` edges): extraction-time MinHash sketches over token shingles, paired at link when the estimated Jaccard similarity is ≥ 0.7 — confidence is that similarity × 100. Each definition keeps its 8 most similar partners (a clone family's representative links to every member); definitions under 32 tokens are never signed. |
+| `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`; add `"data_flows"` to follow argument flow, `"changes_with"` for git co-change, `"similar_to"` for near-clones). |
+| `data_flow` | Where a symbol's arguments flow: per-argument rows (`arg#i` → callee `param#j`, with the argument expression when traceable) joined from the `dataflow.bin` sidecar. Captured for Rust/Python/TypeScript/TSX call sites; older generations without the sidecar answer empty. |
+| `observed` | Runtime-observed calls for a symbol (both directions), from traces ingested with `vorpal-index ingest-traces <index> <folded-stacks>` (perf/py-spy/inferno collapsed format). Each row carries its sample count and whether the static graph already has the edge — `false` means dynamic dispatch or a function pointer static resolution can never prove. A rebuild renumbers nodes and invalidates the sidecar until traces are re-ingested; absence is always stated. |
+| `query` | Cypher-shaped read-only queries (openCypher read subset): `MATCH (f:Function)-[:calls]->(g) WITH g, count(*) AS n WHERE n >= 20 AND NOT EXISTS { (g)-[:calls]->() } RETURN g.name, n ORDER BY n DESC LIMIT 20`. Linear patterns up to 8 segments with var-length paths and grade floors; `WHERE` trees with `=~`, `IN`, `IS NULL`, `n:Label`, `EXISTS {…}`; `WITH`/`UNWIND` stages; `RETURN [DISTINCT]` of expressions — properties, arithmetic, string/list functions, `CASE`, `count/sum/avg/min/max/collect` with implicit grouping; `ORDER BY`/`SKIP`/`LIMIT`; `UNION [ALL]`. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, 100k rows) and refuses by naming the ceiling instead of truncating. Not supported, by name: `OPTIONAL MATCH`, a second `MATCH`, `XOR`, map literals, path/relationship variables. |
 
 **Search**
 | Tool | What it does |
@@ -107,3 +127,39 @@ The agent picks the right tool, and every claim is grounded in your actual index
   `<project>/.vorpal/index` layout for auto-indexing.
 - **Server doesn't start** — confirm `vorpal mcp --index <abs path>` runs in your terminal; if it
   does, the issue is the client's `command`/`PATH`. Use an absolute path to the binary.
+
+## Custom languages and the daemon
+
+Custom/dynamic languages (grammar `.so` files) are registered by the **launching process at
+startup** — `vorpal mcp` performs the one-shot registration (the only `dlopen`) while reading
+`vorpalconfig.yml`, before the first request is served. Nothing reachable through the MCP
+surface can load code: the serving loop and every tool run against the fixed set of grammars
+registered at launch, and the daemon's rebuilds use the same extraction environment (outline
+rules, ref specs, canaries, injection config) that `vorpal index` builds from the project
+config. A dynamic language without a `canary` is extracted best-effort and named in every
+`index` tool response as unverified — never silently trusted.
+
+Multi-project mode (`vorpal mcp --projects`) supports custom languages too: at launch the
+CLI union-registers every enrolled project's dynamic grammars (still one startup-only
+registration) and hands each project its own extraction environment, so a language declared
+by one project is never *walked* in another. Conflicts refuse loudly at launch — one
+definition per language name, one owner per extension, and no shadowing of builtin
+extensions; a project declaring `languageGlobs` (which rebind builtin routing process-wide)
+must run as a single-project daemon.
+
+## Freshness and crash isolation
+
+The daemon watches the source tree (FSEvents/inotify) and rebuilds **proactively**: after a
+save, once the tree is quiet for half a second, a background worker rebuilds the index so the
+first query after an edit is already warm (it pays a fast-path check plus an mmap reload, not
+the build). Disable with `--no-watch-rebuild` (or `VORPAL_WATCH_REBUILD=0`); queries then
+refresh lazily, exactly as before.
+
+Builds run **supervised** whenever an indexer binary can be found (`VORPAL_INDEX_BIN`
+override; the daemon's own executable when it is `vorpal`/`vorpal-index`; else a
+`vorpal-index` beside it): the indexer runs as a child process, so a pathological input — a
+grammar crash, a runaway allocation — costs one build attempt and an error string, never the
+server. The served graph keeps answering from the committed generation throughout; only the
+atomic `CURRENT` swap publishes new work, and `index` responses are prefixed `(supervised)`
+when a child ran. Without a discoverable binary the build runs in-process and says so.
+Child builds are killed after `VORPAL_MCP_BUILD_TIMEOUT_S` (default 1800).

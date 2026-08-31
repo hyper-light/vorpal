@@ -1,0 +1,166 @@
+syntax = "proto3";
+//^ keyword.directive
+//       ^ string.special.symbol
+
+package foo.bar;
+//      ^ module
+//          ^ module
+
+import "google/protobuf/any.proto";
+//^ keyword.import
+//     ^ string.special.path
+
+/** A block comment */
+//^ comment
+
+// A line comment
+//^ comment
+
+enum Status {
+//^ keyword.type
+//   ^ type
+  STATUS_UNKNOWN = 0;
+//^ constant
+  reserved 1 to max;
+//^ keyword
+//           ^ keyword
+//              ^ keyword
+}
+
+message TypeTest {
+//^ keyword.type
+//      ^ type
+  int32 count = 1;
+//^ type.builtin
+  MyMessage msg = 2;
+//^ type
+}
+
+extend Foo {
+//     ^ type
+}
+
+option my_option = MY_ENUM_VALUE;
+//                 ^ constant
+
+service Greeter {
+//^ keyword.type
+//      ^ type
+  rpc SayHello(HelloRequest) returns (HelloResponse);
+//^ keyword.function
+//    ^ function.method
+//                           ^ keyword.return
+}
+
+// map_field: the field name identifier should be @property
+message MapFieldTest {
+  map<string, int32> labels = 1;
+//                   ^ property
+}
+
+// oneof: the container name should be @type,
+// and each oneof_field name should be @property
+message OneofTest {
+  oneof contact {
+//      ^ type
+    string name = 1;
+//         ^ property
+    SubMessage sub = 9;
+//             ^ property
+  }
+}
+
+// keyword.modifier: repeated, optional, etc.
+message MundaneTest {
+  repeated string tags = 1;
+//^ keyword.modifier
+
+  bool flag = 2;
+//     ^ property
+
+  float ratio = 3;
+//^ type.builtin
+}
+
+// operator: =, -, +
+enum Polarity {
+  POSITIVE = 1;
+//         ^ operator
+//           ^ number
+  NEGATIVE = -1;
+//           ^ operator
+//            ^ number
+}
+
+// string.escape, punctuation.bracket, punctuation.delimiter
+message EscapeTest {
+  string val = 1;
+//           ^ operator
+//             ^ number
+//^ type.builtin
+//       ^ property
+}
+
+// boolean in field options; enum_value_option property
+enum FlagEnum {
+  FLAG_A = 0 [deprecated = false];
+//             ^ property
+//                          ^ boolean
+
+  // enum_value_option: parenthesized extension name should be
+  // @variable / @variable.member, same as field_option and top-level option
+  FLAG_B = 1 [(validate.rules) = true];
+//             ^ variable
+//                      ^ variable.member
+}
+
+// block_lit property; extension option name variable/variable.member
+option (my.opt) = {key: "val"};
+//      ^ variable
+//         ^ variable.member
+//                 ^ property
+
+// boolean in field options
+message BoolTest {
+  string name = 1 [deprecated = true];
+//                              ^ boolean
+}
+
+// number.float
+option (my.threshold) = 3.14;
+//      ^ variable
+//         ^ variable.member
+//                      ^ number.float
+
+option optimize_for = SPEED;
+//^ keyword.directive
+//     ^ property
+
+// string and string.escape
+option java_package = "com\nexample";
+//     ^ property
+//                    ^ string
+//                        ^ string.escape
+
+// field_option / enum_value_option: parenthesized extension names should be
+// @variable / @variable.member, same as top-level option; trailing path
+// segments after the parens stay @property
+message ParenFieldOptionTest {
+  string id = 1 [(validate.rules).string.min_len = 1];
+//                ^ variable
+//                         ^ variable.member
+//                                ^ property
+//                                       ^ property
+}
+
+// punctuation.bracket and punctuation.delimiter
+message PunctuationTest {
+//                      ^ punctuation.bracket
+  map<string, int32> labels = 1;
+//   ^ punctuation.bracket
+//          ^ punctuation.delimiter
+//                 ^ punctuation.bracket
+//                          ^ operator
+//                            ^ number
+//                             ^ punctuation.delimiter
+}

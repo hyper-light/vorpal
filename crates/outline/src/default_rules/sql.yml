@@ -1,0 +1,27 @@
+id: sql-create-table
+language: Sql
+role: item
+symbolType: class
+rule:
+  all:
+    - any:
+        - kind: create_table
+        - kind: create_view
+    - has:
+        stopBy: end
+        kind: object_reference
+        pattern: $NAME
+name: '$NAME'
+---
+id: sql-create-function
+language: Sql
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: create_function
+    - has:
+        stopBy: end
+        kind: object_reference
+        pattern: $NAME
+name: '$NAME'

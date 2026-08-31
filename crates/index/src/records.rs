@@ -38,18 +38,26 @@ pub struct NodeRecord {
 }
 
 /// A node related to the query target through one edge, with the edge's resolution grade
-/// (`structural` for containment edges, else exact/constrained/heuristic).
+/// (`structural` for containment edges, else exact/constrained/heuristic). For `similar_to`
+/// edges the confidence IS the estimated similarity, surfaced as a percentage.
 #[derive(Serialize, Debug)]
 pub struct RelatedRecord {
   #[serde(flatten)]
   pub node: NodeRecord,
   pub grade: String,
+  /// Estimated Jaccard similarity x 100 (`similar_to` edges only).
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub similarity: Option<u8>,
 }
 
 /// One step of a relation-restricted traversal: the reached node, its BFS depth, the node it
 /// was first reached from, and the edge that reached it.
 #[derive(Serialize, Debug)]
 pub struct ReachRecord {
+  /// For `data_flows` hops with a sidecar: the arguments flowing along this hop, rendered
+  /// `expr→param#k` (empty otherwise — absence of a sidecar is stated by the tool text).
+  #[serde(skip_serializing_if = "Vec::is_empty", default)]
+  pub flow_exprs: Vec<String>,
   #[serde(flatten)]
   pub node: NodeRecord,
   pub depth: u32,
@@ -93,6 +101,138 @@ pub struct ChannelRank {
 
 /// One definition's source text, sliced from its persisted byte span and digest-verified
 /// against the generation that recorded it — the selector-driven twin of `fetch_span`.
+/// One data-flow row answered to queries (G-M3): a traceable argument at a resolved call
+/// from `from_name` into `to_name`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowRecord {
+  pub from_id: u64,
+  pub from_name: String,
+  pub to_id: u64,
+  pub to_name: String,
+  pub to_path: String,
+  pub arg_index: u16,
+  pub param_index: u16,
+  /// var | field-access | call-result.
+  pub class: &'static str,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub expr: Option<String>,
+  pub span: (u32, u32),
+}
+
+fn flow_class_name(class: u8) -> &'static str {
+  match class {
+    0 => "var",
+    1 => "field-access",
+    2 => "call-result",
+    _ => "other",
+  }
+}
+
+/// Outgoing data-flow rows for one selected definition, from the `dataflow.bin` sidecar.
+/// Absent sidecar (an older generation) answers empty with `sidecar_present = false` — the
+/// caller says so instead of implying "no flows exist".
+pub fn flow_records(
+  kg: &vorpal_kg::Kg,
+  kg_dir: &std::path::Path,
+  target: &crate::GraphTarget,
+) -> Result<(Vec<FlowRecord>, bool), String> {
+  let matches = crate::resolve_target(kg, target).map_err(|err| err.to_string())?;
+  let store = vorpal_kg::DataflowStore::load(kg_dir).map_err(|err| err.to_string())?;
+  let present = !store.is_empty();
+  let mut records = Vec::new();
+  for &id in &matches {
+    for flow in store.flows_from(id.raw() as u32) {
+      let to = vorpal_kg::NodeId::new(flow.to as u64);
+      let (to_name, to_path) = kg
+        .node(to)
+        .map(|v| (v.name.to_string(), v.path.to_string()))
+        .unwrap_or_default();
+      let from_name = kg
+        .node(id)
+        .map(|v| v.name.to_string())
+        .unwrap_or_default();
+      records.push(FlowRecord {
+        from_id: id.raw(),
+        from_name,
+        to_id: flow.to as u64,
+        to_name,
+        to_path,
+        arg_index: flow.arg_index,
+        param_index: flow.param_index,
+        class: flow_class_name(flow.class),
+        expr: flow.expr.map(str::to_string),
+        span: flow.span,
+      });
+    }
+  }
+  Ok((records, present))
+}
+
+/// One runtime-observed call for a selected definition (from the `observed.bin` sidecar,
+/// ingested with `vorpal-index ingest-traces`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedRecord {
+  /// `out` = the selection was seen calling the counterpart; `in` = the reverse.
+  pub direction: &'static str,
+  pub counterpart_id: u64,
+  pub counterpart_name: String,
+  pub counterpart_path: String,
+  /// Summed sample/occurrence count across the ingested stacks.
+  pub count: u64,
+  /// Whether the static graph already carries a `calls` edge for this pair — `false` is
+  /// the interesting case: dynamic dispatch or a function pointer static resolution can
+  /// never prove.
+  pub in_static_graph: bool,
+}
+
+fn static_calls(kg: &vorpal_kg::Kg, from: vorpal_kg::NodeId, to: u32) -> bool {
+  kg.out_neighbors(from)
+    .into_iter()
+    .any(|(t, e)| t.raw() as u32 == to && e.base() == vorpal_kg::EdgeType::CALLS)
+}
+
+/// Observed calls touching one selected definition, both directions. Absent or stale
+/// sidecar (a rebuild renumbers nodes) answers empty with `sidecar_present = false` — the
+/// caller says "not ingested for this generation" instead of implying "never ran".
+pub fn observed_records(
+  kg: &vorpal_kg::Kg,
+  kg_dir: &std::path::Path,
+  target: &crate::GraphTarget,
+) -> Result<(Vec<ObservedRecord>, bool), String> {
+  let matches = crate::resolve_target(kg, target).map_err(|err| err.to_string())?;
+  let store = vorpal_kg::observed::ObservedStore::load(kg_dir, kg.node_segment_stamp())
+    .map_err(|err| err.to_string())?;
+  let present = !store.is_empty();
+  let mut records = Vec::new();
+  let mut describe = |direction: &'static str, counterpart: u32, count: u64, statically: bool| {
+    let id = vorpal_kg::NodeId::new(counterpart as u64);
+    let (name, path) = kg
+      .node(id)
+      .map(|v| (v.name.to_string(), v.path.to_string()))
+      .unwrap_or_default();
+    records.push(ObservedRecord {
+      direction,
+      counterpart_id: counterpart as u64,
+      counterpart_name: name,
+      counterpart_path: path,
+      count,
+      in_static_graph: statically,
+    });
+  };
+  for &id in &matches {
+    for (to, count) in store.observed_from(id.raw() as u32) {
+      describe("out", to, count, static_calls(kg, id, to));
+    }
+    for (from, count) in store.observed_into(id.raw() as u32) {
+      let statically = static_calls(kg, vorpal_kg::NodeId::new(from as u64), id.raw() as u32);
+      describe("in", from, count, statically);
+    }
+  }
+  Ok((records, present))
+}
+
 #[derive(Serialize, Debug)]
 pub struct SnippetRecord {
   #[serde(flatten)]
@@ -834,6 +974,7 @@ pub fn related_records(
     "importers" => vorpal_kg::EdgeType::IMPORTS,
     "implementors" => vorpal_kg::EdgeType::IMPLEMENTS,
     "typeusers" => vorpal_kg::EdgeType::OF_TYPE,
+    "similar" => vorpal_kg::EdgeType::SIMILAR_TO,
     other => return Err(format!("unknown graph verb '{other}'")),
   };
   let matches = resolve_target(kg, target).map_err(|err| err.to_string())?;
@@ -860,6 +1001,7 @@ pub fn related_records(
         Some(RelatedRecord {
           node: node_record(kg, id)?,
           grade: crate::confidence_label(confidence).to_string(),
+          similarity: (edge.base() == vorpal_kg::EdgeType::SIMILAR_TO).then_some(confidence),
         })
       })
       .collect(),
@@ -922,8 +1064,10 @@ pub fn selected_page_value<T: Serialize>(
 /// but the heap-string record construction is paid per page, not per closure. An
 /// undirected kernel walk reaches 200K+ nodes; building 200K records to emit 100 was the
 /// dominant cost of the paged surface.
+#[allow(clippy::too_many_arguments)] // one traversal surface; every input is load-bearing
 pub fn reach_records_page(
   kg: &Kg,
+  flows_dir: Option<&std::path::Path>,
   target: &GraphTarget,
   dir: vorpal_kg::Direction,
   relations: &[vorpal_kg::EdgeType],
@@ -944,6 +1088,8 @@ pub fn reach_records_page(
   for &seed in &matches {
     steps.extend(kg.reachable_via_paths(seed, dir, relations, max_depth, min_confidence));
   }
+  // The flow sidecar joins per data_flows hop (G-M5): loaded once, absent-tolerant.
+  let flow_store = crate::flow_store_for(flows_dir, relations);
   let PageBounds { start, end, total } = page_bounds(steps.len(), page.cursor, page.limit)?;
   let records = steps[start..end]
     .iter()
@@ -955,6 +1101,12 @@ pub fn reach_records_page(
         relation: step.via.1.name().to_string(),
         grade: crate::confidence_label(step.via.1.confidence()).to_string(),
         edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        flow_exprs: crate::flow_exprs_for_hop(
+          flow_store.as_ref(),
+          step.via.0,
+          step.node,
+          step.inbound,
+        ),
       })
     })
     .collect();
@@ -1007,7 +1159,8 @@ pub fn code_search(
   k: usize,
 ) -> Result<CodeSearchReport, String> {
   use rayon::prelude::*;
-  use vorpal_language::{Language, LanguageExt, SupportLang};
+  use vorpal_ingest::SgLang;
+  use vorpal_language::{Language, LanguageExt};
 
   let runs = crate::cached_runs(kg, artifacts_dir);
   let pack = artifacts_dir.and_then(crate::cached_pack);
@@ -1043,9 +1196,9 @@ pub fn code_search(
   let per_file: Vec<Option<FileOutcome>> = runs
     .par_chunks(256)
     .flat_map_iter(|chunk| {
-      let mut compiled: Vec<(SupportLang, vorpal_core::matcher::Pattern)> = Vec::new();
+      let mut compiled: Vec<(SgLang, vorpal_core::matcher::Pattern)> = Vec::new();
       chunk.iter().map(move |run| {
-      let lang = SupportLang::from_path(&run.path)?;
+      let lang = SgLang::from_path(&run.path)?;
       if let Some(filter) = lang_filter {
         if !format!("{lang:?}").eq_ignore_ascii_case(filter) && lang.to_string() != filter {
           return None;
@@ -1464,6 +1617,18 @@ pub struct HubRecord {
   pub semantic_in_degree: u64,
 }
 
+/// One `calls`-graph community: its size, its most-called member, and the module that
+/// holds most of it.
+#[derive(Serialize, Debug)]
+pub struct ClusterRow {
+  pub community: u32,
+  pub members: u64,
+  /// The member with the highest semantic in-degree — the cluster's face.
+  pub representative: NodeRecord,
+  /// The directory holding the plurality of members.
+  pub dominant_module: String,
+}
+
 /// The orientation summary an agent asks for first: where the mass is, what everything
 /// leans on, and where execution enters.
 #[derive(Serialize, Debug)]
@@ -1475,6 +1640,13 @@ pub struct ArchitectureReport {
   /// Exported definitions nothing semantic reaches: entry-point candidates — capped by `top`.
   pub entries: Vec<NodeRecord>,
   pub total_modules: u64,
+  /// `calls`-graph communities by size (desc, then id) — capped by `top`; empty with
+  /// `clusters_note` set when the sidecar has not been built for this generation.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub clusters: Vec<ClusterRow>,
+  pub total_clusters: u64,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub clusters_note: Option<String>,
 }
 
 /// Compute the summary: one parallel pass over every node's in-edge types (semantic
@@ -1613,11 +1785,100 @@ pub fn architecture_report(
     }
   }
 
+  // Clusters from the warm-time community sidecar. Community ids are dense, so sizing is
+  // one integer pass; only the `top` largest multi-member communities are then walked for
+  // a face (highest semantic in-degree member) and a plurality module — no strings touched
+  // for the millions of rows outside them. An unbuilt sidecar is stated, never rendered as
+  // "no communities".
+  let (clusters, total_clusters, clusters_note) = match kg.communities() {
+    None => (
+      Vec::new(),
+      0,
+      Some(
+        "communities not built for this generation — a search warm (or the daemon's \
+         background warm) builds them"
+          .to_string(),
+      ),
+    ),
+    Some(table) => {
+      let is_file = |row: usize| match kind_tags {
+        Some(tags) => tags.get(row) == Some(&vorpal_kg::SymbolKind::File.tag()),
+        None => kg.node_kind(NodeId::new(row as u64)) == Some(vorpal_kg::SymbolKind::File),
+      };
+      let community_count = table.iter().copied().max().map_or(0, |m| m as usize + 1);
+      let mut members = vec![0u64; community_count];
+      for (row, &community) in table.iter().enumerate() {
+        if !is_file(row) {
+          members[community as usize] += 1;
+        }
+      }
+      let total = members.iter().filter(|&&m| m > 1).count() as u64;
+      let mut ranked: Vec<(u64, u32)> = members
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m > 1)
+        .map(|(community, &m)| (m, community as u32))
+        .collect();
+      ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+      ranked.truncate(top);
+      // slot[community] = rank within the top list, for the single gathering pass.
+      let mut slot = vec![u32::MAX; community_count];
+      for (rank, &(_, community)) in ranked.iter().enumerate() {
+        slot[community as usize] = rank as u32;
+      }
+      struct Face<'a> {
+        best: u64,
+        best_degree: u32,
+        modules: std::collections::HashMap<&'a str, u64>,
+      }
+      let mut faces: Vec<Option<Face>> = (0..ranked.len()).map(|_| None).collect();
+      for (row, &community) in table.iter().enumerate() {
+        let rank = slot[community as usize];
+        if rank == u32::MAX || is_file(row) {
+          continue;
+        }
+        let degree = in_semantic[row];
+        let face = faces[rank as usize].get_or_insert_with(|| Face {
+          best: row as u64,
+          best_degree: degree,
+          modules: std::collections::HashMap::new(),
+        });
+        if degree > face.best_degree {
+          face.best_degree = degree;
+          face.best = row as u64;
+        }
+        if let Some(path) = kg.node_path(NodeId::new(row as u64)) {
+          *face.modules.entry(dir_of(path)).or_insert(0) += 1;
+        }
+      }
+      let clusters = ranked
+        .into_iter()
+        .zip(faces)
+        .filter_map(|((count, community), face)| {
+          let face = face?;
+          let representative = node_record(kg, NodeId::new(face.best))?;
+          let mut modules: Vec<(&str, u64)> = face.modules.into_iter().collect();
+          modules.sort_unstable_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(y.0)));
+          Some(ClusterRow {
+            community,
+            members: count,
+            representative,
+            dominant_module: modules.first().map(|(m, _)| (*m).to_string()).unwrap_or_default(),
+          })
+        })
+        .collect();
+      (clusters, total, None)
+    }
+  };
+
   ArchitectureReport {
     modules,
     hubs,
     entries,
     total_modules,
+    clusters,
+    total_clusters,
+    clusters_note,
   }
 }
 
@@ -1644,6 +1905,30 @@ pub fn render_architecture(report: &ArchitectureReport) -> String {
   let _ = writeln!(out, "entry-point candidates (exported, semantically unreached):");
   for entry in &report.entries {
     let _ = writeln!(out, "  {} [{}] {}", entry.name, entry.kind, entry.path);
+  }
+  match &report.clusters_note {
+    Some(note) => {
+      let _ = writeln!(out, "clusters: {note}");
+    }
+    None => {
+      let _ = writeln!(
+        out,
+        "clusters ({} calls-graph communities; top by size):",
+        report.total_clusters
+      );
+      for row in &report.clusters {
+        let _ = writeln!(
+          out,
+          "  #{:<6} {:>6} members  {} [{}] {}  ({})",
+          row.community,
+          row.members,
+          row.representative.name,
+          row.representative.kind,
+          row.representative.path,
+          row.dominant_module
+        );
+      }
+    }
   }
   out
 }
@@ -1792,6 +2077,8 @@ pub fn impact_page(
         relation: step.via.1.name().to_string(),
         grade: crate::confidence_label(step.via.1.confidence()).to_string(),
         edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        // Impact semantics are blast-radius, not argument tracing — no sidecar join here.
+        flow_exprs: Vec::new(),
       })
     })
     .collect();
@@ -1871,6 +2158,8 @@ pub fn reach_records(
         relation: step.via.1.name().to_string(),
         grade: crate::confidence_label(step.via.1.confidence()).to_string(),
         edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        // The unpaged variant serves dir-less callers; annotations need the sidecar.
+        flow_exprs: Vec::new(),
       });
     }
   }

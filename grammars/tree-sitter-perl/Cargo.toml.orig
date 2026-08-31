@@ -1,0 +1,28 @@
+[package]
+name = "tree-sitter-perl"
+description = "perl grammar for the tree-sitter parsing library"
+version = "1.1.2"
+keywords = ["incremental", "parsing", "perl"]
+categories = ["parsing", "text-editors"]
+repository = "https://github.com/ganezdragon/tree-sitter-perl"
+edition = "2018"
+license = "MIT"
+authors = ["ganezdragon <ganesh.raja.93@gmail.com>"]
+
+build = "bindings/rust/build.rs"
+include = [
+  "bindings/rust/*",
+  "grammar.js",
+  "queries/*",
+  "src/*",
+]
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter = "0.26.3"
+tree-sitter-language = "0.1.6"
+
+[build-dependencies]
+cc = "1.2.51"

@@ -1,0 +1,14 @@
+id: r-function
+language: R
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: binary_operator
+    - has:
+        field: rhs
+        kind: function_definition
+    - has:
+        field: lhs
+        pattern: $NAME
+name: '$NAME'

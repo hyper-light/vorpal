@@ -441,3 +441,248 @@ fn cpp_resolution_meets_published_labels() {
     ],
   });
 }
+
+#[test]
+fn typed_receivers_meet_published_labels() {
+  // G-M2: the receiver's file-locally bound type narrows same-named methods that untyped
+  // Method-form resolution must refuse. Every origin class is labelled, the Python cap is
+  // pinned, unknown types fall through (upgrade, never veto), and same-type duplicates tie.
+  run(&Fixture {
+    lang: "rust-typed",
+    files: &[
+      (
+        "tw.rs",
+        "pub struct Widget;\nimpl Widget {\n  pub fn render(&self) -> u32 { 1 }\n}\n\
+         pub struct Gadget;\nimpl Gadget {\n  pub fn render(&self) -> u32 { 2 }\n}\n",
+      ),
+      (
+        "tuse.rs",
+        "use crate::tw::Widget;\nuse crate::tw::Gadget;\n\
+         pub fn t_annotated() -> u32 {\n    let wa: Widget = make();\n    wa.render()\n}\n\
+         pub fn t_constructed() -> u32 {\n    let gc = Gadget::new();\n    gc.render()\n}\n\
+         pub fn t_param(wp: Widget) -> u32 {\n    wp.render()\n}\n\
+         pub fn t_unknown() -> u32 {\n    let x: Mystery = make();\n    x.render()\n}\n",
+      ),
+    ],
+    expected: &[
+      // Annotated in a checked language, cross-file target: compiler-grade evidence.
+      ("t_annotated", "render", "calls", "constrained", "receiver-annotated"),
+      // Constructor-inferred: capped at TYPE_BOUND — still constrained, differently earned.
+      ("t_constructed", "render", "calls", "constrained", "receiver-constructed"),
+      ("t_param", "render", "calls", "constrained", "receiver-param-typed"),
+      // Exhaustive-labelling contract: the use-lines' imports AND the annotations' type
+      // uses (an annotation is itself an of_type reference).
+      ("tuse.rs", "Widget", "imports", "constrained", "qualifier-match"),
+      ("tuse.rs", "Gadget", "imports", "constrained", "qualifier-match"),
+      ("t_annotated", "Widget", "of_type", "constrained", "import-bound"),
+      ("t_param", "Widget", "of_type", "constrained", "import-bound"),
+    ],
+    absent: &[
+      // Mystery names no in-tree owner: the hint upgrades, never vetoes — and untyped
+      // Method form on a two-way tie must refuse, exactly as before G-M2.
+      ("t_unknown", "render"),
+    ],
+  });
+}
+
+#[test]
+fn typed_receivers_python_cap_and_tie() {
+  run(&Fixture {
+    lang: "python-typed",
+    files: &[
+      (
+        "pw.py",
+        "class Widget:\n    def render(self):\n        return 1\n\n\
+         class Gadget:\n    def render(self):\n        return 2\n",
+      ),
+      (
+        "puse.py",
+        "from pw import Widget\n\n\
+         def p_annotated():\n    w: Widget = make()\n    return w.render()\n\n\
+         def p_constructed():\n    g = Widget()\n    return g.render()\n",
+      ),
+    ],
+    expected: &[
+      // Python annotations are unenforced hints: BOTH origins cap at TYPE_BOUND (grade
+      // constrained), and the labels say how each was earned.
+      ("p_annotated", "render", "calls", "constrained", "receiver-annotated"),
+      ("p_constructed", "render", "calls", "constrained", "receiver-constructed"),
+      // The constructor call itself is a call edge to the class, bound via the import.
+      ("p_constructed", "Widget", "calls", "constrained", "import-bound"),
+      ("puse.py", "Widget", "imports", "constrained", "qualifier-match"),
+    ],
+    absent: &[],
+  });
+}
+
+#[test]
+fn typed_receivers_typescript_and_same_type_tie() {
+  run(&Fixture {
+    lang: "ts-typed",
+    files: &[
+      (
+        "tsw.ts",
+        "export class Widget { render(): number { return 1 } }\n\
+         export class Gadget { render(): number { return 2 } }\n",
+      ),
+      (
+        "tsuse.ts",
+        "import { Widget } from \"./tsw\";\n\
+         export function s_new(): number {\n  const b = new Widget();\n  return b.render();\n}\n",
+      ),
+    ],
+    expected: &[
+      ("s_new", "render", "calls", "constrained", "receiver-constructed"),
+      ("tsuse.ts", "tsw.ts", "imports", "constrained", "import-path"),
+    ],
+    absent: &[],
+  });
+}
+
+#[test]
+fn typed_receivers_go_all_origins() {
+  // G-M5 + Go method ownership: annotations (`var v Widget`), composite literals
+  // (`x := Gadget{}`) and typed parameters narrow same-named methods — the go-method
+  // outline rule declares `memberOf: $RECV`, so a method beside its type is adopted as
+  // its member (file-local), giving owner==receiver_type something to meet. A method
+  // whose type lives in another file stays top-level and the tie still refuses.
+  run(&Fixture {
+    lang: "go-typed",
+    files: &[
+      (
+        "gw.go",
+        "package m\n\ntype Widget struct{}\n\nfunc (w Widget) Render() int { return 1 }\n\n\
+         type Gadget struct{}\n\nfunc (g Gadget) Render() int { return 2 }\n",
+      ),
+      (
+        "guse.go",
+        "package m\n\nfunc gAnnotated() int {\n\tvar v Widget\n\treturn v.Render()\n}\n\n\
+         func gComposite() int {\n\tx := Gadget{}\n\treturn x.Render()\n}\n\n\
+         func gParam(p Widget) int {\n\treturn p.Render()\n}\n",
+      ),
+    ],
+    expected: &[
+      ("gAnnotated", "Render", "calls", "constrained", "receiver-annotated"),
+      ("gComposite", "Render", "calls", "constrained", "receiver-constructed"),
+      ("gParam", "Render", "calls", "constrained", "receiver-param-typed"),
+      // Type mentions resolve (annotation, composite literal, parameter, receivers).
+      ("gAnnotated", "Widget", "of_type", "constrained", "visible-export"),
+      ("gComposite", "Gadget", "of_type", "constrained", "visible-export"),
+      ("gParam", "Widget", "of_type", "constrained", "visible-export"),
+      ("Render", "Widget", "of_type", "exact", "same-file"),
+      ("Render", "Gadget", "of_type", "exact", "same-file"),
+    ],
+    absent: &[],
+  });
+}
+
+#[test]
+fn typed_receivers_java_all_origins() {
+  // G-M5: Java joins the capture set — declared locals, fields, formal parameters, and
+  // `var` + constructor recovery all narrow; generic heads strip to the owner name.
+  run(&Fixture {
+    lang: "java-typed",
+    files: &[
+      (
+        "Jw.java",
+        "class Widget {\n  int render() { return 1; }\n}\n\
+         class Gadget {\n  int render() { return 2; }\n}\n",
+      ),
+      (
+        "Juse.java",
+        "class Runner {\n  Widget canvas;\n\n\
+         \x20 int jAnnotated() {\n    Widget x = make();\n    return x.render();\n  }\n\n\
+         \x20 int jVar() {\n    var y = new Widget();\n    return y.render();\n  }\n\n\
+         \x20 int jParam(Gadget p) {\n    return p.render();\n  }\n\n\
+         \x20 int jField() {\n    return canvas.render();\n  }\n}\n",
+      ),
+    ],
+    expected: &[
+      ("jAnnotated", "render", "calls", "constrained", "receiver-annotated"),
+      ("jVar", "render", "calls", "constrained", "receiver-constructed"),
+      ("jParam", "render", "calls", "constrained", "receiver-param-typed"),
+      ("jField", "render", "calls", "constrained", "receiver-field-typed"),
+      // Exhaustive-labelling contract: the declarations' type mentions.
+      ("canvas", "Widget", "of_type", "constrained", "visible-export"),
+      ("jAnnotated", "Widget", "of_type", "constrained", "visible-export"),
+      ("jVar", "Widget", "of_type", "constrained", "visible-export"),
+      ("jParam", "Gadget", "of_type", "constrained", "visible-export"),
+    ],
+    absent: &[],
+  });
+}
+
+#[test]
+fn chained_call_return_typing() {
+  // G-M5: `let m = make(); m.render()` — the receiver's "type" is really the callee name;
+  // the corpus-wide return ledger (fn name → declared return type, disagreements poisoned)
+  // upgrades it at TYPE_BOUND with its own reason. Inference on inference never tie-picks,
+  // and a poisoned name falls through to the untyped refusal.
+  run(&Fixture {
+    lang: "rust-chained",
+    files: &[
+      (
+        "cw.rs",
+        "pub struct Widget;\nimpl Widget {\n  pub fn render(&self) -> u32 { 1 }\n}\n\
+         pub struct Gadget;\nimpl Gadget {\n  pub fn render(&self) -> u32 { 2 }\n}\n\
+         pub fn make() -> Widget { Widget }\n\
+         pub fn fickle() -> Widget { Widget }\n",
+      ),
+      (
+        "cuse.rs",
+        "use crate::cw::make;\nuse crate::cw::fickle;\n\
+         pub fn c_chained() -> u32 {\n    let m = make();\n    m.render()\n}\n\
+         pub fn c_poisoned() -> u32 {\n    let f = fickle();\n    f.render()\n}\n",
+      ),
+      (
+        // A second `fickle` with a DIFFERENT return type poisons the name corpus-wide.
+        "cnoise.rs",
+        "pub struct Other;\npub fn fickle() -> Other { Other }\n",
+      ),
+    ],
+    expected: &[
+      ("c_chained", "render", "calls", "constrained", "receiver-chained"),
+      // The let-bindings' initializer calls resolve through the imports.
+      ("c_chained", "make", "calls", "constrained", "import-bound"),
+      ("c_poisoned", "fickle", "calls", "constrained", "import-bound"),
+      ("cuse.rs", "make", "imports", "constrained", "qualifier-match"),
+      ("cuse.rs", "fickle", "imports", "constrained", "qualifier-match"),
+      // Return-type annotations are of_type references from the declaring functions.
+      ("make", "Widget", "of_type", "exact", "same-file"),
+      ("fickle", "Widget", "of_type", "exact", "same-file"),
+      ("fickle", "Other", "of_type", "exact", "same-file"),
+    ],
+    absent: &[
+      // fickle() returns Widget in one file, Other in another → poisoned → no upgrade.
+      ("c_poisoned", "render"),
+    ],
+  });
+}
+
+#[test]
+fn chained_call_return_typing_python() {
+  run(&Fixture {
+    lang: "python-chained",
+    files: &[
+      (
+        "cpw.py",
+        "class Widget:\n    def render(self):\n        return 1\n\n\
+         class Gadget:\n    def render(self):\n        return 2\n\n\
+         def mk() -> Widget:\n    return Widget()\n",
+      ),
+      (
+        "cpuse.py",
+        "from cpw import mk\n\n\
+         def p_chained():\n    m = mk()\n    return m.render()\n",
+      ),
+    ],
+    expected: &[
+      ("p_chained", "render", "calls", "constrained", "receiver-chained"),
+      ("p_chained", "mk", "calls", "constrained", "import-bound"),
+      ("cpuse.py", "mk", "imports", "constrained", "qualifier-match"),
+      // mk's body constructs a Widget — a same-file constructor call.
+      ("mk", "Widget", "calls", "exact", "same-file"),
+    ],
+    absent: &[],
+  });
+}

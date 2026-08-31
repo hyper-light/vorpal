@@ -117,3 +117,36 @@ rule:
     pattern: $NAME
 name: $NAME
 isPublic: true
+---
+id: ruby-http-route
+language: Ruby
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call
+  all:
+    - has:
+        field: method
+        kind: identifier
+        regex: '^(get|post|put|patch|delete)$'
+        pattern: $METHOD
+    - not:
+        has:
+          field: receiver
+          pattern: $RECV
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: string
+          has:
+            kind: string_content
+            regex: '^/'
+            pattern: $ROUTE
+transform:
+  VERB:
+    convert:
+      source: $METHOD
+      toCase: upperCase
+name: $VERB $ROUTE

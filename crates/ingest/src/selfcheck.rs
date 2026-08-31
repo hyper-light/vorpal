@@ -240,6 +240,155 @@ const CANARIES: &[Canary] = &[
     min_items: 1,
     min_refs: 0,
   },
+  Canary {
+    lang: SupportLang::Dockerfile,
+    path: "vorpal-selfcheck/Dockerfile",
+    source: "FROM alpine:3\nARG VERSION=1\nENV KEY=value\n",
+    min_items: 3,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::Make,
+    path: "vorpal-selfcheck/Makefile",
+    source: "VAR := 1\n\nall: dep\n\techo hi\n",
+    min_items: 2,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::CMake,
+    path: "vorpal-selfcheck/CMakeLists.txt",
+    source: "function(canary_fn arg)\nendfunction()\n",
+    min_items: 1,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::Ini,
+    path: "vorpal-selfcheck/canary.ini",
+    source: "top = 1\n\n[section]\nkey = value\n",
+    min_items: 2,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::Xml,
+    path: "vorpal-selfcheck/canary.xml",
+    source: "<root><child attr=\"1\"/></root>\n",
+    min_items: 1,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::Proto,
+    path: "vorpal-selfcheck/canary.proto",
+    source: "syntax = \"proto3\";\nmessage Canary {\n  string name = 1;\n}\n",
+    min_items: 1,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::GraphQL,
+    path: "vorpal-selfcheck/canary.graphql",
+    source: "type Canary {\n  id: ID\n}\n\nenum Kind {\n  A\n}\n",
+    min_items: 2,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::Sql,
+    path: "vorpal-selfcheck/canary.sql",
+    source: "CREATE TABLE canary (id INT);\nSELECT count(id) FROM canary;\n",
+    min_items: 1,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::ObjectiveC,
+    path: "vorpal-selfcheck/canary.m",
+    source: "#include \"dep.h\"\n\n@interface Canary : Base\n@end\n\n@implementation Canary\n- (void)run { helper(); }\n@end\n",
+    min_items: 2,
+    min_refs: 2,
+  },
+  Canary {
+    lang: SupportLang::Perl,
+    path: "vorpal-selfcheck/canary.pl",
+    source: "use Canary::Dep;\n\nsub canary {\n  helper();\n}\n",
+    min_items: 1,
+    min_refs: 2,
+  },
+  Canary {
+    lang: SupportLang::Zig,
+    path: "vorpal-selfcheck/canary.zig",
+    source: "const std = @import(\"std\");\n\nfn canary() void {\n    helper();\n}\n",
+    min_items: 1,
+    min_refs: 2,
+  },
+  Canary {
+    lang: SupportLang::Erlang,
+    path: "vorpal-selfcheck/canary.erl",
+    source: "-module(canary).\n-behaviour(gen_server).\n\ncanary() ->\n    helper().\n",
+    min_items: 1,
+    min_refs: 2,
+  },
+  Canary {
+    lang: SupportLang::OCaml,
+    path: "vorpal-selfcheck/canary.ml",
+    source: "open Dep\n\nlet canary x = helper x\n",
+    min_items: 1,
+    min_refs: 2,
+  },
+  Canary {
+    lang: SupportLang::R,
+    path: "vorpal-selfcheck/canary.R",
+    source: "library(dep)\n\ncanary <- function(x) {\n  helper(x)\n}\n",
+    min_items: 1,
+    min_refs: 2,
+  },
+  Canary {
+    lang: SupportLang::Julia,
+    path: "vorpal-selfcheck/canary.jl",
+    source: "using Dep\n\nfunction canary(x)\n    helper(x)\nend\n",
+    min_items: 1,
+    min_refs: 2,
+  },
+  Canary {
+    lang: SupportLang::PowerShell,
+    path: "vorpal-selfcheck/canary.ps1",
+    source: "function Invoke-Canary {\n  Write-Host \"hi\"\n}\n",
+    min_items: 1,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::Vue,
+    path: "vorpal-selfcheck/canary.vue",
+    source: "<template><div/></template>\n<script>\nfunction canary() { helper() }\n</script>\n",
+    min_items: 2,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::Svelte,
+    path: "vorpal-selfcheck/canary.svelte",
+    source: "<script>\nfunction canary() { helper() }\n</script>\n<div/>\n",
+    min_items: 2,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::Astro,
+    path: "vorpal-selfcheck/canary.astro",
+    source: "---\nfunction canary() { helper() }\n---\n<div/>\n",
+    min_items: 1,
+    min_refs: 1,
+  },
+  Canary {
+    lang: SupportLang::JsDoc,
+    path: "vorpal-selfcheck/canary.jsdoc",
+    // The jsdoc grammar parses comment CONTENT (injection ranges exclude the /** */ fence).
+    source: "@param {number} x\n",
+    min_items: 1,
+    min_refs: 0,
+  },
+  Canary {
+    lang: SupportLang::Toml,
+    path: "vorpal-selfcheck/canary.toml",
+    source: "top = 1\n\n[package]\nname = \"canary\"\n",
+    // Top-level items only (the [package] member pair nests inside the table item).
+    min_items: 2,
+    min_refs: 0,
+  },
 ];
 
 /// Run every canary through `extractor` and report all shortfalls at once.
@@ -298,6 +447,57 @@ pub fn verify_default_extraction(extractor: &OutlineExtractor) -> Result<(), Str
   }
   static VERDICT: OnceLock<Result<(), String>> = OnceLock::new();
   VERDICT.get_or_init(|| verify_extraction(extractor)).clone()
+}
+
+/// The dynamic-language counterpart of the builtin canary gate (F-M4): each configured canary
+/// extracts under the *environment's* extractor and must reach its floors, or the build refuses
+/// exactly like a gutted builtin would. Not memoized — the verdict depends on the environment,
+/// not just the binary. Honors `VORPAL_NO_SELFCHECK=1` with the same warning.
+pub fn verify_env_extraction(
+  extractor: &OutlineExtractor,
+  canaries: &[crate::DynamicCanary],
+) -> Result<(), String> {
+  if canaries.is_empty() {
+    return Ok(());
+  }
+  if std::env::var_os("VORPAL_NO_SELFCHECK").is_some_and(|v| v == "1") {
+    eprintln!(
+      "warning: VORPAL_NO_SELFCHECK=1 — skipping the dynamic-language extraction self-check; a \
+       broken grammar or spec will index silently"
+    );
+    return Ok(());
+  }
+  for canary in canaries {
+    let Some(product) = extractor.extract_product(&canary.path, &canary.source) else {
+      return Err(format!(
+        "extraction self-check failed for dynamic language '{}': canary '{}' produced no \
+         product — the language is not extractable in this environment (missing rules/spec, or \
+         the extension is not registered)",
+        canary.lang, canary.path
+      ));
+    };
+    if product.items.len() < canary.min_items {
+      return Err(format!(
+        "extraction self-check failed for dynamic language '{}': canary '{}' yielded {} outline \
+         item(s), expected at least {} — grammar/rules mismatch",
+        canary.lang,
+        canary.path,
+        product.items.len(),
+        canary.min_items
+      ));
+    }
+    if product.refs.len() < canary.min_refs {
+      return Err(format!(
+        "extraction self-check failed for dynamic language '{}': canary '{}' yielded {} \
+         reference(s), expected at least {} — ref spec mismatch",
+        canary.lang,
+        canary.path,
+        product.refs.len(),
+        canary.min_refs
+      ));
+    }
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -361,7 +561,7 @@ mod tests {
     for &lang in SupportLang::all_langs() {
       // all_langs() is the ENABLED set, so this coverage check matches what selfcheck runs.
       let canary = CANARIES.iter().find(|c| c.lang == lang);
-      let has_ref_spec = crate::references::ref_spec(lang).is_some();
+      let has_ref_spec = crate::references::ref_spec(vorpal_lang_registry::SgLang::from(lang)).is_some();
       match canary {
         Some(canary) => {
           assert!(

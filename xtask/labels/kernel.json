@@ -1,0 +1,80 @@
+{
+  "description": "Linux kernel graded set — the 8 tier-vs-exact queries from docs/wip/BENCHMARKS.md, graded 2026-08-30 against Linux 7.2-rc4 (labels are tree-dependent; the existence gate re-verifies every run).",
+  "queries": [
+    {
+      "class": "short-keyword",
+      "query": "socket buffer alloc",
+      "relevant": [
+        { "name": "alloc_skb", "grade": 3 },
+        { "name": "__alloc_skb", "grade": 2 },
+        { "name": "sock_alloc_send_skb", "grade": 2 },
+        { "name": "socket_alloc", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "page fault handler",
+      "relevant": [
+        { "name": "handle_mm_fault", "grade": 3 },
+        { "name": "__handle_mm_fault", "grade": 2 },
+        { "name": "do_user_addr_fault", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "tcp congestion window",
+      "relevant": [
+        { "name": "tcp_cong_avoid_ai", "grade": 3 },
+        { "name": "tcp_slow_start", "grade": 2 },
+        { "name": "tcp_cwnd_reduction", "grade": 2 },
+        { "name": "tcp_cwnd_restart", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "mutex lock acquire",
+      "relevant": [
+        { "name": "mutex_lock", "grade": 3 },
+        { "name": "__mutex_lock", "grade": 2 },
+        { "name": "mutex_trylock", "grade": 1 },
+        { "name": "mutex_lock_interruptible", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "inode lookup path",
+      "relevant": [
+        { "name": "path_lookupat", "grade": 3 },
+        { "name": "lookup_fast", "grade": 2 },
+        { "name": "lookup_slow", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "interrupt request register",
+      "relevant": [
+        { "name": "request_threaded_irq", "grade": 3 },
+        { "name": "request_irq", "grade": 3 },
+        { "name": "__setup_irq", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "dma coherent alloc",
+      "relevant": [
+        { "name": "dma_alloc_coherent", "grade": 3 },
+        { "name": "dma_alloc_attrs", "grade": 2 },
+        { "name": "dma_direct_alloc", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "scheduler pick next task",
+      "relevant": [
+        { "name": "pick_next_task", "grade": 3 },
+        { "name": "__pick_next_task", "grade": 2 },
+        { "name": "pick_next_entity", "grade": 1 }
+      ]
+    }
+  ]
+}

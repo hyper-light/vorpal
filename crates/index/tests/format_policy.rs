@@ -66,6 +66,13 @@ fn version_table_matches_the_constants() {
       "sidecar treated as absent → `why` reports no evidence",
     ),
     (
+      "data-flow sidecar (`dataflow.bin`)",
+      "VERSION",
+      "crates/kg/src/dataflow.rs",
+      version_of("crates/kg/src/dataflow.rs", "VERSION"),
+      "load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows)",
+    ),
+    (
       "lexical posting tier (`postings.bin`)",
       "VERSION",
       "crates/index/src/postings.rs",
@@ -78,6 +85,13 @@ fn version_table_matches_the_constants() {
       "crates/ann/src/embed.rs",
       version_of("crates/ann/src/embed.rs", "LEXICAL_EMBED_VERSION"),
       "ANN tier distrusted → exact fallback → warm rebuilds",
+    ),
+    (
+      "calls-graph communities (`communities.bin`)",
+      "VERSION",
+      "crates/kg/src/communities.rs",
+      version_of("crates/kg/src/communities.rs", "VERSION"),
+      "sidecar treated as absent → `community` answers `null`, `architecture` says not built → warm rebuilds",
     ),
   ];
 

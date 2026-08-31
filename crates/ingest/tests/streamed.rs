@@ -186,7 +186,7 @@ fn spilled_references_are_byte_identical_to_the_ram_path() {
   // Exercise the disk-streamed heap too: the merged writer's strings must round-trip
   // identically through write-through + map-back.
   let heap_stream = base.join("strings.heap.tmp");
-  let (writer, spill, stats) = stream_apply_spilled(
+  let (writer, spill, stats, _arg_spill) = stream_apply_spilled(
     itn(),
     &entries,
     64 * 1024 * 1024,

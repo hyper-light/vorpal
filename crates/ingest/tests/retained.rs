@@ -73,8 +73,9 @@ fn retained_edits_link_identical_to_scratch_pipeline() {
   retained.apply_file(itn(), "w.py", None).expect("delete w");
   assert_eq!(retained.file_count(), 3);
   assert!(retained.dead_row_fraction() > 0.0);
-  let (kg_live, stats_live, evidence_live) =
-    retained.link(itn(), &Resolver::new()).expect("retained link");
+  let (kg_live, stats_live, evidence_live, _flows_live) = retained
+    .link(itn(), &Resolver::new(), &[])
+    .expect("retained link");
 
   // Scratch: the independent pipeline over the final live tree, in canonical (path) order.
   let scratch_products: Vec<(&str, vorpal_ingest::FileProduct)> =
@@ -129,8 +130,9 @@ fn retained_edits_link_identical_to_scratch_pipeline() {
     fresh_inputs.iter().map(|(p, b)| (*p, b.as_slice())),
   )
   .expect("fresh retained build");
-  let (_kg_fresh, _stats_fresh, evidence_fresh) =
-    fresh.link(itn(), &Resolver::new()).expect("fresh link");
+  let (_kg_fresh, _stats_fresh, evidence_fresh, _flows_fresh) = fresh
+    .link(itn(), &Resolver::new(), &[])
+    .expect("fresh link");
   let ev_dir_a = root.join("ev-a");
   let ev_dir_b = root.join("ev-b");
   fs::create_dir_all(&ev_dir_a).unwrap();

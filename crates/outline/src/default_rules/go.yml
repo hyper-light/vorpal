@@ -27,10 +27,22 @@ role: item
 symbolType: method
 rule:
   kind: method_declaration
-  has:
-    field: name
-    pattern: $NAME
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: receiver
+        has:
+          kind: type_identifier
+          stopBy: end
+          pattern: $RECV
 name: $NAME
+# Semantic membership: `func (w Widget) Render()` belongs to Widget. Adoption is
+# file-local — a method beside its type (the dominant Go layout) nests under it, giving
+# the method an owner (typed-receiver resolution) and a `Widget.Render` entity path;
+# a method whose type lives in another file stays top-level, exactly as before.
+memberOf: $RECV
 ---
 id: go-struct-type
 language: Go
@@ -138,3 +150,124 @@ rule:
   has:
     pattern: $NAME
 name: $NAME
+---
+id: go-http-route-verb
+language: Go
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: selector_expression
+        has:
+          field: field
+          regex: '^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Get|Post|Put|Delete|Patch|Head|Options|Any)$'
+          pattern: $METHOD
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: interpreted_string_literal
+          has:
+            kind: interpreted_string_literal_content
+            regex: '^/'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+transform:
+  VERB:
+    convert:
+      source: $METHOD
+      toCase: upperCase
+name: $VERB $ROUTE
+---
+id: go-http-route-handle
+language: Go
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: selector_expression
+        has:
+          field: field
+          regex: '^(HandleFunc|Handle)$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: interpreted_string_literal
+          has:
+            kind: interpreted_string_literal_content
+            regex: '^/'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+name: ROUTE $ROUTE
+---
+id: go-http-route-pattern
+language: Go
+role: item
+symbolType: route
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: selector_expression
+        has:
+          field: field
+          regex: '^(HandleFunc|Handle)$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: interpreted_string_literal
+          has:
+            kind: interpreted_string_literal_content
+            regex: '^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /'
+            pattern: $ROUTE
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+name: $ROUTE
+---
+id: go-event-channel
+language: Go
+role: item
+symbolType: channel
+nested: true
+rule:
+  kind: call_expression
+  all:
+    - has:
+        field: function
+        kind: selector_expression
+        has:
+          field: field
+          regex: '^Subscribe$'
+    - has:
+        field: arguments
+        has:
+          nthChild: 1
+          kind: interpreted_string_literal
+          has:
+            kind: interpreted_string_literal_content
+            pattern: $TOPIC
+    - has:
+        field: arguments
+        has:
+          nthChild: 2
+name: EVENT $TOPIC

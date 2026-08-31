@@ -1,0 +1,44 @@
+id: ps-function
+language: PowerShell
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_statement
+    - has:
+        kind: function_name
+        pattern:
+          context: function $NAME {}
+          selector: function_name
+name: '$NAME'
+---
+id: ps-class
+language: PowerShell
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: class_statement
+    - has:
+        stopBy: end
+        kind: simple_name
+        pattern:
+          context: class $NAME {}
+          selector: simple_name
+name: '$NAME'
+---
+id: ps-method
+language: PowerShell
+role: member
+parentRuleIds: [ps-class]
+symbolType: method
+rule:
+  all:
+    - kind: class_method_definition
+    - has:
+        stopBy: end
+        kind: simple_name
+        pattern:
+          context: class C { $NAME () {} }
+          selector: simple_name
+name: '$NAME'

@@ -28,7 +28,7 @@ fn hinted_builds_commit_the_full_scan_generation() {
   // Modified file, hinted.
   fs::write(&b, "extern int helper(int);\nint twice(int v) { return helper(v) * 2; }\n").unwrap();
   let hints: HashSet<PathBuf> = [b.clone()].into();
-  vorpal_index::build_index_watched(&src, &out, &hints).unwrap();
+  vorpal_index::build_index_watched(&src, &out, &hints, &Default::default()).unwrap();
   let hinted = gen_id(&out);
   let scratch = root.join("scratch1");
   vorpal_index::build_index(&src, &scratch).unwrap();
@@ -37,7 +37,7 @@ fn hinted_builds_commit_the_full_scan_generation() {
   // Deleted file, hinted.
   fs::remove_file(&b).unwrap();
   let hints: HashSet<PathBuf> = [b.clone()].into();
-  vorpal_index::build_index_watched(&src, &out, &hints).unwrap();
+  vorpal_index::build_index_watched(&src, &out, &hints, &Default::default()).unwrap();
   let hinted = gen_id(&out);
   let scratch = root.join("scratch2");
   vorpal_index::build_index(&src, &scratch).unwrap();
@@ -48,7 +48,7 @@ fn hinted_builds_commit_the_full_scan_generation() {
   let c = src.join("c.c");
   fs::write(&c, "int lonely(void) { return 7; }\n").unwrap();
   let hints: HashSet<PathBuf> = [c.clone()].into();
-  vorpal_index::build_index_watched(&src, &out, &hints).unwrap();
+  vorpal_index::build_index_watched(&src, &out, &hints, &Default::default()).unwrap();
   let hinted = gen_id(&out);
   let scratch = root.join("scratch3");
   vorpal_index::build_index(&src, &scratch).unwrap();
@@ -59,7 +59,7 @@ fn hinted_builds_commit_the_full_scan_generation() {
   fs::write(&junk, "not code").unwrap();
   fs::write(&a, "int helper(int x) { return x + 2; }\nint main(void) { return helper(40); }\n").unwrap();
   let hints: HashSet<PathBuf> = [a.clone(), junk.clone()].into();
-  vorpal_index::build_index_watched(&src, &out, &hints).unwrap();
+  vorpal_index::build_index_watched(&src, &out, &hints, &Default::default()).unwrap();
   let hinted = gen_id(&out);
   let scratch = root.join("scratch4");
   vorpal_index::build_index(&src, &scratch).unwrap();

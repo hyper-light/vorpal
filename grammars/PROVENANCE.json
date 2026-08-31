@@ -1,4 +1,13 @@
 {
+  "tree-sitter-astro-next": {
+    "abi": 14,
+    "commit": "15a3b95bf444",
+    "license": "MIT or Apache-2.0",
+    "patches": [],
+    "repository": "https://github.com/PRRPCHT/tree-sitter-astro-next",
+    "source_digest": "xxh3:c0c4b6c2cd7fc6c9",
+    "version": "0.1.1"
+  },
   "tree-sitter-bash": {
     "abi": 15,
     "commit": "a06c2e4415e9",
@@ -31,6 +40,15 @@
     "repository": "https://github.com/tree-sitter/tree-sitter-c-sharp",
     "source_digest": "xxh3:8fbd5adaa16a66a7",
     "version": "0.23.5"
+  },
+  "tree-sitter-cmake": {
+    "abi": 14,
+    "commit": "v0.7.4",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/uyha/tree-sitter-cmake",
+    "source_digest": "xxh3:e5431e2fcbac4b92",
+    "version": "0.7.4"
   },
   "tree-sitter-cpp": {
     "abi": 14,
@@ -65,6 +83,17 @@
     "source_digest": "xxh3:8874798438ded27e",
     "version": "0.2.0"
   },
+  "tree-sitter-dockerfile": {
+    "abi": 14,
+    "commit": "v0.2.0",
+    "license": "MIT",
+    "patches": [
+      "bindings/rust modernized to the LanguageFn shape (tree-sitter-language 0.1): crate 0.2.0 shipped `fn language()` bound to tree-sitter 0.20, which would drag a second incompatible runtime; the compiled parser (src/) is untouched"
+    ],
+    "repository": "https://github.com/camdencheek/tree-sitter-dockerfile",
+    "source_digest": "xxh3:909d4e553904b2d7",
+    "version": "0.2.0"
+  },
   "tree-sitter-elixir": {
     "abi": 14,
     "commit": "e2d9e6e0e76b",
@@ -76,6 +105,15 @@
     "source_digest": "xxh3:95ee4b6f42e3c5db",
     "version": "0.3.5"
   },
+  "tree-sitter-erlang": {
+    "abi": 14,
+    "commit": "0.20",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/WhatsApp/tree-sitter-erlang",
+    "source_digest": "xxh3:36d19038e2b87557",
+    "version": "0.20.0"
+  },
   "tree-sitter-go": {
     "abi": 15,
     "commit": "1547678a9da5",
@@ -86,6 +124,15 @@
     "repository": "https://github.com/tree-sitter/tree-sitter-go",
     "source_digest": "xxh3:f5ee27c0146dcccc",
     "version": "0.25.0"
+  },
+  "tree-sitter-graphql": {
+    "abi": 15,
+    "commit": "v0.2.1",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/joowani/tree-sitter-graphql",
+    "source_digest": "xxh3:95c86330ea0003ed",
+    "version": "0.2.1"
   },
   "tree-sitter-haskell": {
     "abi": 14,
@@ -120,6 +167,15 @@
     "source_digest": "xxh3:a003508f85bc533e",
     "version": "0.23.2"
   },
+  "tree-sitter-ini": {
+    "abi": 15,
+    "commit": "v1.4.0",
+    "license": "Apache-2.0",
+    "patches": [],
+    "repository": "https://github.com/justinmk/tree-sitter-ini",
+    "source_digest": "xxh3:31d0d752a67366a0",
+    "version": "1.4.0"
+  },
   "tree-sitter-java": {
     "abi": 14,
     "commit": "94703d5a6bed",
@@ -142,6 +198,15 @@
     "source_digest": "xxh3:920237063fe7966d",
     "version": "0.25.0"
   },
+  "tree-sitter-jsdoc": {
+    "abi": 15,
+    "commit": "658d18dcdddb",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter/tree-sitter-jsdoc",
+    "source_digest": "xxh3:77e67efc94181d18",
+    "version": "0.25.0"
+  },
   "tree-sitter-json": {
     "abi": 14,
     "commit": "ee35a6ebefce",
@@ -152,6 +217,15 @@
     "repository": "https://github.com/tree-sitter/tree-sitter-json",
     "source_digest": "xxh3:7c0a9ca98fff1722",
     "version": "0.24.8"
+  },
+  "tree-sitter-julia": {
+    "abi": 14,
+    "commit": "a8e1262997d5",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter/tree-sitter-julia",
+    "source_digest": "xxh3:c93d672fb22816c3",
+    "version": "0.23.1"
   },
   "tree-sitter-kotlin-sg": {
     "abi": 14,
@@ -175,6 +249,15 @@
     "source_digest": "xxh3:1dd4d8d4f8cd09d0",
     "version": "0.5.0"
   },
+  "tree-sitter-make": {
+    "abi": 14,
+    "commit": "v1.1.1",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-make",
+    "source_digest": "xxh3:d5880a8ccf776054",
+    "version": "1.1.1"
+  },
   "tree-sitter-md": {
     "abi": 15,
     "commit": "f969cd3ae3f9",
@@ -193,6 +276,33 @@
     "source_digest": "xxh3:a741893b888914cb",
     "version": "0.3.0"
   },
+  "tree-sitter-objc": {
+    "abi": 14,
+    "commit": "v3.0.2",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-objc",
+    "source_digest": "xxh3:c355dd9bdef2c0e3",
+    "version": "3.0.2"
+  },
+  "tree-sitter-ocaml": {
+    "abi": 15,
+    "commit": "v0.25.0",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter/tree-sitter-ocaml",
+    "source_digest": "xxh3:bcd4338409ae0746",
+    "version": "0.25.0"
+  },
+  "tree-sitter-perl": {
+    "abi": 15,
+    "commit": "883ab51150f3",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/ganezdragon/tree-sitter-perl",
+    "source_digest": "xxh3:1b1332a0f4e9f3d1",
+    "version": "1.1.2"
+  },
   "tree-sitter-php": {
     "abi": 15,
     "commit": "5b5627faaa29",
@@ -201,6 +311,24 @@
     "repository": "https://github.com/tree-sitter/tree-sitter-php",
     "source_digest": "xxh3:ce94537895a242cd",
     "version": "0.24.2"
+  },
+  "tree-sitter-powershell": {
+    "abi": 15,
+    "commit": "v0.26.4",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/airbus-cert/tree-sitter-powershell",
+    "source_digest": "xxh3:397e7af38477696e",
+    "version": "0.26.4"
+  },
+  "tree-sitter-proto": {
+    "abi": 15,
+    "commit": "0.5.0",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/coder3101/tree-sitter-proto",
+    "source_digest": "xxh3:01bcb806568f2191",
+    "version": "0.5.0"
   },
   "tree-sitter-python": {
     "abi": 15,
@@ -213,6 +341,15 @@
     "repository": "https://github.com/tree-sitter/tree-sitter-python",
     "source_digest": "xxh3:528b84851d2e3f20",
     "version": "0.25.0"
+  },
+  "tree-sitter-r": {
+    "abi": 14,
+    "commit": "v1.3.0",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/r-lib/tree-sitter-r",
+    "source_digest": "xxh3:5987f7dc44818ed7",
+    "version": "1.3.0"
   },
   "tree-sitter-ruby": {
     "abi": 14,
@@ -247,6 +384,15 @@
     "source_digest": "xxh3:45822ef1a0f11bbf",
     "version": "0.26.0"
   },
+  "tree-sitter-sequel": {
+    "abi": 14,
+    "commit": "v0.3.11",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/derekstride/tree-sitter-sql.git",
+    "source_digest": "xxh3:05d454fbdfddfed9",
+    "version": "0.3.11"
+  },
   "tree-sitter-solidity": {
     "abi": 15,
     "commit": "4e938a46c703",
@@ -257,6 +403,15 @@
     "repository": "https://github.com/JoranHonig/tree-sitter-solidity",
     "source_digest": "xxh3:26f79f55aee5b8d4",
     "version": "1.2.13"
+  },
+  "tree-sitter-svelte-ng": {
+    "abi": 14,
+    "commit": "774a65aea563",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-svelte",
+    "source_digest": "xxh3:0a1b77b6cefe3b36",
+    "version": "1.0.2"
   },
   "tree-sitter-swift": {
     "abi": 15,
@@ -270,6 +425,15 @@
     "source_digest": "xxh3:7b1b1dadd0d67a36",
     "version": "0.7.3"
   },
+  "tree-sitter-toml-ng": {
+    "abi": 14,
+    "commit": "64b56832c2cf",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-toml",
+    "source_digest": "xxh3:55ac0991b76fda72",
+    "version": "0.7.0"
+  },
   "tree-sitter-typescript": {
     "abi": 14,
     "commit": "f975a621f4e7",
@@ -278,6 +442,26 @@
     "repository": "https://github.com/tree-sitter/tree-sitter-typescript",
     "source_digest": "xxh3:019c30f748c9184b",
     "version": "0.23.2"
+  },
+  "tree-sitter-vue": {
+    "abi": 14,
+    "commit": "8bbcd4cbd59c",
+    "license": "MIT",
+    "patches": [
+      "embedded tree-sitter-html scanner copy no longer exports the five tree_sitter_html_external_scanner_* C symbols (duplicate definitions across static libraries let the linker silently replace the real HTML grammar's scanner — corpus-wide HTML breakage); bindings/rust modernized to LanguageFn (crate 0.0.3 shipped fn language() on tree-sitter 0.19)"
+    ],
+    "repository": "https://github.com/xiaoxin-sky/tree-sitter-vue",
+    "source_digest": "xxh3:01c59ff4e1ed9755",
+    "version": "0.0.3"
+  },
+  "tree-sitter-xml": {
+    "abi": 14,
+    "commit": "v0.7.0",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-xml",
+    "source_digest": "xxh3:ca01f5fad3e39e2c",
+    "version": "0.7.0"
   },
   "tree-sitter-yaml": {
     "abi": 14,
@@ -289,5 +473,14 @@
     "repository": "https://github.com/tree-sitter-grammars/tree-sitter-yaml",
     "source_digest": "xxh3:d1efdda20594bb74",
     "version": "0.7.2"
+  },
+  "tree-sitter-zig": {
+    "abi": 14,
+    "commit": "v1.1.2",
+    "license": "MIT",
+    "patches": [],
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-zig",
+    "source_digest": "xxh3:ed482975eb677866",
+    "version": "1.1.2"
   }
 }

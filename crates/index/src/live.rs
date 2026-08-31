@@ -134,6 +134,11 @@ pub struct LiveOverlay {
   /// build's persistence writes it verbatim, byte-equal to what the pipeline's
   /// `patch_manifest` would produce from the same stats.
   manifest: Manifest,
+  /// The watched source root — the co-change pass consults its git history per link (the
+  /// HEAD-keyed cache makes that a file read between commits).
+  src: PathBuf,
+  /// The index ROOT (not the generation): where `cochange.cache` lives.
+  index_dir: PathBuf,
 }
 
 impl LiveOverlay {
@@ -142,7 +147,7 @@ impl LiveOverlay {
   /// one full product replay — so callers run it on a background thread. Refuses to build
   /// when the extraction identity changed since the generation was committed (a grammar or
   /// outline-rule edit): mixing old products with new extraction would fork answers.
-  pub fn build(index_dir: &Path) -> Result<Self, String> {
+  pub fn build(index_dir: &Path, src: &Path) -> Result<Self, String> {
     vorpal_kg::phase_stamp("overlay: build start");
     let generation = vorpal_kg::resolve_index_dir(index_dir);
     let manifest = Manifest::load(&generation.join("manifest.bin"))
@@ -240,7 +245,82 @@ impl LiveOverlay {
       index,
       extractor,
       manifest,
+      src: src.to_path_buf(),
+      index_dir: index_dir.to_path_buf(),
     })
+  }
+
+  /// Recover the exact change set by stat-diffing the live tree against the retained
+  /// manifest — the overlay's answer to watcher capture loss. Same walker, same
+  /// handled-filter, same (size, mtime) trust model as the pipeline's own sweep, so the
+  /// recovered set is precisely what a full sweep would re-extract; vanished files ride
+  /// along for retraction. ~a stat sweep at kernel scale, in place of a full rebuild.
+  pub fn stat_changes(&self, src: &Path) -> Result<std::collections::HashSet<PathBuf>, String> {
+    let scan = Manifest::scan(src, |path| self.extractor.handles(path))
+      .map_err(|err| format!("overlay: change scan failed: {err}"))?;
+    let mut changed = std::collections::HashSet::new();
+    let (current, retained) = (scan.entries(), self.manifest.entries());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < current.len() && j < retained.len() {
+      match current[i].path.cmp(&retained[j].path) {
+        std::cmp::Ordering::Less => {
+          changed.insert(src.join(&current[i].path)); // new file
+          i += 1;
+        }
+        std::cmp::Ordering::Greater => {
+          changed.insert(src.join(&retained[j].path)); // vanished file
+          j += 1;
+        }
+        std::cmp::Ordering::Equal => {
+          if current[i].size != retained[j].size || current[i].mtime_ns != retained[j].mtime_ns
+          {
+            changed.insert(src.join(&current[i].path));
+          }
+          i += 1;
+          j += 1;
+        }
+      }
+    }
+    for entry in &current[i..] {
+      changed.insert(src.join(&entry.path));
+    }
+    for entry in &retained[j..] {
+      changed.insert(src.join(&entry.path));
+    }
+    Ok(changed)
+  }
+
+  /// Change-set routing: whether `changed` files fit the retained absorb envelope (the
+  /// store's own measured escalation shape) — past it the caller takes the streaming
+  /// pipeline deliberately.
+  pub fn within_absorb_budget(&self, changed: usize) -> bool {
+    self.index.within_absorb_budget(changed)
+  }
+
+  /// The pre-link co-change edges the bulk pipeline derives before resolution (symmetric
+  /// `changes_with` pairs from git history), in retained id space and the bulk emission
+  /// order. Reads the same HEAD-keyed `cochange.cache` the pipeline maintains, so a serve
+  /// pays a file read — a git walk only when a commit re-keyed the cache.
+  fn cochange_pre_edges(&self) -> Vec<(u32, u32, vorpal_kg::EdgeType)> {
+    let pending = crate::cochange::start(&self.src, &self.index_dir.join("cochange.cache"));
+    let cochange = crate::cochange::finish(
+      pending,
+      &self.src,
+      self.manifest.entries().iter().map(|e| e.path.as_str()),
+    );
+    let mut edges = Vec::with_capacity(cochange.edges.len() * 2);
+    for edge in &cochange.edges {
+      let (Some(a), Some(b)) = (
+        self.index.file_node(&edge.a),
+        self.index.file_node(&edge.b),
+      ) else {
+        continue;
+      };
+      let label = vorpal_kg::EdgeType::CHANGES_WITH.with_confidence(edge.confidence);
+      edges.push((a, b, label));
+      edges.push((b, a, label));
+    }
+    edges
   }
 
   /// Absorb a set of changed paths — re-extract present files, retract vanished ones —
@@ -373,9 +453,10 @@ impl LiveOverlay {
   }
 
   fn link_served(&mut self) -> Result<Kg, String> {
+    let pre_edges = self.cochange_pre_edges();
     let (kg, _stats) = self
       .index
-      .link_for_serving(&self.interner, &Resolver::new())
+      .link_for_serving(&self.interner, &Resolver::new(), &pre_edges)
       .map_err(|err| format!("overlay: link failed: {err}"))?;
     // The canonical seal embeds the in-memory name index (built in parallel with the
     // segment), so the served graph is lookup-ready as returned.
@@ -397,9 +478,10 @@ impl LiveOverlay {
   ) -> Result<(Arc<Kg>, ServedPersist), String> {
     vorpal_kg::phase_stamp("overlay: apply start");
     self.absorb_probed(&probe)?;
-    let (kg, _stats, evidence) = self
+    let pre_edges = self.cochange_pre_edges();
+    let (kg, _stats, evidence, flows) = self
       .index
-      .link(&self.interner, &Resolver::new())
+      .link(&self.interner, &Resolver::new(), &pre_edges)
       .map_err(|err| format!("overlay: link failed: {err}"))?;
     vorpal_kg::phase_stamp("overlay: link done");
     let mut new_products = Vec::new();
@@ -424,6 +506,7 @@ impl LiveOverlay {
     let persist = ServedPersist {
       kg: kg.clone(),
       evidence,
+      flows,
       manifest: self.manifest.clone(),
       prior,
       out,
@@ -452,6 +535,9 @@ impl LiveOverlay {
 pub struct ServedPersist {
   kg: Arc<Kg>,
   evidence: Vec<vorpal_kg::EvidenceRow>,
+  /// Data-flow rows in sealed-id space — `dataflow.bin` is part of the generation's
+  /// content identity, so the served commit must stage it like every other artifact.
+  flows: Vec<vorpal_kg::DataflowRow>,
   manifest: Manifest,
   prior: PathBuf,
   out: PathBuf,
@@ -463,6 +549,7 @@ impl ServedPersist {
     let ServedPersist {
       kg,
       evidence,
+      flows,
       manifest,
       prior,
       out,
@@ -477,36 +564,40 @@ impl ServedPersist {
     fs::create_dir_all(&staging).map_err(|err| format!("served persist: staging: {err}"))?;
     // Three independent artifact groups write concurrently; the manifest stays last (the
     // commit point), exactly like the pipeline's tail.
-    let (pack_result, evidence_result, kg_result) = std::thread::scope(|scope| {
-      let pack_task = scope.spawn(|| -> std::io::Result<()> {
-        let reader = PackReader::open(&prior).map(Arc::new);
-        let writer = PackWriter::new(&staging, reader);
-        let sink = writer.sink();
-        for (path, body) in new_products {
-          sink
-            .send(PackMsg { path, body })
-            .map_err(|_| std::io::Error::other("pack sink closed"))?;
-        }
-        drop(sink);
-        writer.finish(manifest.entries().iter().map(|entry| entry.path.clone()))
+    let (pack_result, evidence_result, dataflow_result, kg_result) =
+      std::thread::scope(|scope| {
+        let pack_task = scope.spawn(|| -> std::io::Result<()> {
+          let reader = PackReader::open(&prior).map(Arc::new);
+          let writer = PackWriter::new(&staging, reader);
+          let sink = writer.sink();
+          for (path, body) in new_products {
+            sink
+              .send(PackMsg { path, body })
+              .map_err(|_| std::io::Error::other("pack sink closed"))?;
+          }
+          drop(sink);
+          writer.finish(manifest.entries().iter().map(|entry| entry.path.clone()))
+        });
+        let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+        let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
+        let kg_result = kg.save(&staging);
+        (
+          pack_task.join().expect("pack writer panicked"),
+          evidence_task.join().expect("evidence saver panicked"),
+          dataflow_task.join().expect("dataflow saver panicked"),
+          kg_result,
+        )
       });
-      let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
-      let kg_result = kg.save(&staging);
-      (
-        pack_task.join().expect("pack writer panicked"),
-        evidence_task.join().expect("evidence saver panicked"),
-        kg_result,
-      )
-    });
     pack_result.map_err(|err| format!("served persist: pack: {err}"))?;
     evidence_result.map_err(|err| format!("served persist: evidence: {err}"))?;
+    dataflow_result.map_err(|err| format!("served persist: dataflow: {err}"))?;
     kg_result.map_err(|err| format!("served persist: graph: {err}"))?;
     manifest
       .save(&staging.join("manifest.bin"))
       .map_err(|err| format!("served persist: manifest: {err}"))?;
-    let committed = crate::commit_generation(&out, &prior, staging)
+    let id = crate::commit_generation(&out, &prior, staging)
       .map_err(|err| format!("served persist: commit: {err}"))?;
     vorpal_kg::phase_stamp("served persist: committed");
-    Ok(committed)
+    Ok(out.join("gen").join(id))
   }
 }

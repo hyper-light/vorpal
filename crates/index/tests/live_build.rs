@@ -59,7 +59,7 @@ fn live_deferred_persist_matches_synchronous_build() {
   let out = root.join("idx");
 
   // Live: full pipeline with deferred persistence; the graph serves before persist runs.
-  let build = vorpal_index::build_index_live(&src, &out, None).expect("live build");
+  let build = vorpal_index::build_index_live(&src, &out, None, &Default::default()).expect("live build");
   let served = build.kg.expect("full pipeline hands the sealed graph back");
   let served_battery = battery_on(&served);
   let pending = build.pending.expect("full pipeline defers persistence");
@@ -106,7 +106,7 @@ fn live_fast_paths_commit_synchronously_and_hand_back_no_graph() {
   let before = gen_id(&out);
 
   // Unchanged tree: whole-tree fast path — reused, no graph, no pending, gen unchanged.
-  let build = vorpal_index::build_index_live(&src, &out, None).expect("noop live");
+  let build = vorpal_index::build_index_live(&src, &out, None, &Default::default()).expect("noop live");
   assert!(build.report.reused);
   assert!(build.kg.is_none(), "fast path must not rebuild the graph");
   assert!(build.pending.is_none(), "fast path commits synchronously");
@@ -120,7 +120,7 @@ fn live_fast_paths_commit_synchronously_and_hand_back_no_graph() {
   )
   .unwrap();
   let hints: HashSet<PathBuf> = [src.join("alpha.py")].into_iter().collect();
-  let build = vorpal_index::build_index_live(&src, &out, Some(&hints)).expect("hinted live");
+  let build = vorpal_index::build_index_live(&src, &out, Some(&hints), &Default::default()).expect("hinted live");
   let pending = build.pending.expect("semantic change runs the full pipeline");
   pending.persist().expect("persist hinted build");
   let out2 = root.join("idx2");

@@ -198,6 +198,34 @@ All under `grammars/<crate>/`, patched into the workspace. `Local patches` is "�
 | tree-sitter-solidity | 1.2.13 | `4e938a46c703` | — |
 | tree-sitter-swift | 0.7.3 | `b8b22bffbb34` | — |
 | tree-sitter-typescript | 0.23.2 | `f975a621f4e7` | — (typescript + tsx parsers) |
+| tree-sitter-astro-next | 0.1.1 | `15a3b95bf444` (crate vcs commit) | upstream ships no test corpus; canary + lang_matrix gate extraction |
+| tree-sitter-cmake | 0.7.4 | `v0.7.4` tag | — |
+| tree-sitter-erlang | 0.20.0 | `0.20` tag | — |
+| tree-sitter-jsdoc | 0.25.0 | `658d18dcdddb` (crate vcs commit) | injection-target grammar (JS comment blocks via languageInjections config) |
+| tree-sitter-julia | 0.23.1 | `a8e1262997d5` (crate vcs commit) | corpus imported at the same commit |
+| tree-sitter-objc | 3.0.2 | `v3.0.2` tag | — |
+| tree-sitter-ocaml | 0.25.0 | `v0.25.0` tag | multi-grammar crate; vorpal binds LANGUAGE_OCAML (.ml); .mli deferred |
+| tree-sitter-perl | 1.1.2 | `883ab51150f3` (crate vcs commit) | corpus imported at the same commit (no 1.1.2 tag upstream) |
+| tree-sitter-powershell | 0.26.4 | `v0.26.4` tag | — |
+| tree-sitter-r | 1.3.0 | `v1.3.0` tag | — |
+| tree-sitter-sequel | 0.3.11 | `v0.3.11` tag | derekstride/tree-sitter-sql, published as tree-sitter-sequel |
+| tree-sitter-zig | 1.1.2 | `v1.1.2` tag | upstream ships NO test corpus (any version); canary + lang_matrix are the extraction gates |
+| tree-sitter-dockerfile | 0.2.0 | `v0.2.0` tag | bindings modernized to LanguageFn (crate 0.2.0 shipped `fn language()` on tree-sitter 0.20) |
+| tree-sitter-graphql | 0.2.1 | `v0.2.1` tag | — |
+| tree-sitter-ini | 1.4.0 | `v1.4.0` tag | — |
+| tree-sitter-make | 1.1.1 | `v1.1.1` tag | — |
+| tree-sitter-proto | 0.5.0 | `0.5.0` tag | — |
+| tree-sitter-svelte-ng | 1.0.2 | `774a65aea563` (crate vcs commit) | — |
+| tree-sitter-toml-ng | 0.7.0 | `64b56832c2cf` | — |
+| tree-sitter-vue | 0.0.3 | `8bbcd4cbd59c` (crate vcs commit) | embedded html-scanner copy de-exported (duplicate C symbols silently replaced the real HTML scanner at link); bindings modernized to LanguageFn |
+| tree-sitter-xml | 0.7.0 | `v0.7.0` tag | — |
+
+Deliberately NOT vendored: **tree-sitter-jinja2** (crates.io 0.0.16, uros-5) — Cargo.toml
+declares MIT but the repository ships no license text at any ref (GitHub license API: none);
+blocked pending upstream. Also deliberately NOT vendored: **tree-sitter-groovy** (crates.io 0.1.2, amaanq) — its Cargo.toml
+declares MIT but the repository ships **no license text at any ref** (GitHub license API:
+none). Vendoring is blocked until upstream adds one; Gradle Kotlin-DSL files (.gradle.kts)
+already route through Kotlin.
 | tree-sitter-yaml | 0.7.2 | `7708026449be` | — |
 
 ## Planned

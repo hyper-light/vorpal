@@ -24,6 +24,11 @@ pub enum SymbolKind {
   Constant = 14,
   Import = 15,
   TypeParameter = 16,
+  /// An HTTP route registration — `GET /users/:id`; edges to its handler are `calls`.
+  Route = 17,
+  /// An event/message listener registration — `EVENT user.created`; edges to its handler
+  /// are `calls`, and emitters reach it through `notifies`.
+  Channel = 18,
   Other = 255,
 }
 
@@ -50,6 +55,8 @@ impl SymbolKind {
       Self::Constant,
       Self::Import,
       Self::TypeParameter,
+      Self::Route,
+      Self::Channel,
       Self::Other,
     ]
     .into_iter()
@@ -90,6 +97,8 @@ impl SymbolKind {
       14 => SymbolKind::Constant,
       15 => SymbolKind::Import,
       16 => SymbolKind::TypeParameter,
+      17 => SymbolKind::Route,
+      18 => SymbolKind::Channel,
       _ => SymbolKind::Other,
     }
   }
@@ -116,6 +125,8 @@ impl SymbolKind {
       SymbolType::Variable => SymbolKind::Variable,
       SymbolType::Constant => SymbolKind::Constant,
       SymbolType::TypeParameter => SymbolKind::TypeParameter,
+      SymbolType::Route => SymbolKind::Route,
+      SymbolType::Channel => SymbolKind::Channel,
       // Structural-language keys (JSON/YAML pairs, Nix bindings) read as properties.
       SymbolType::Key => SymbolKind::Property,
       _ => SymbolKind::Other,

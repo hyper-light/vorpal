@@ -103,6 +103,30 @@ struct Sexp {
 /// Parse one or more sibling sexps from `text` (expected trees are a single root; parsing
 /// stays general). Tokens: parens, `field:` labels, atoms.
 fn parse_sexp(text: &str) -> Option<Sexp> {
+  // Upstream `tree-sitter test` allows `;` line comments inside expectations (Julia's corpus
+  // annotates groups with `;; …`); strip them before tokenizing — but only outside quotes,
+  // since expectations may name anonymous tokens like (";").
+  let mut stripped = String::with_capacity(text.len());
+  let mut in_quotes = false;
+  let mut chars = text.chars().peekable();
+  while let Some(c) = chars.next() {
+    match c {
+      '"' => {
+        in_quotes = !in_quotes;
+        stripped.push(c);
+      }
+      ';' if !in_quotes => {
+        for skipped in chars.by_ref() {
+          if skipped == '\n' {
+            stripped.push('\n');
+            break;
+          }
+        }
+      }
+      _ => stripped.push(c),
+    }
+  }
+  let text = stripped;
   let mut tokens = Vec::new();
   let mut current = String::new();
   for c in text.chars() {
@@ -224,6 +248,25 @@ fn corpus_roots() -> Vec<(PathBuf, SupportLang)> {
     ("tree-sitter-solidity/test/corpus", Solidity),
     ("tree-sitter-swift/test/corpus", Swift),
     ("tree-sitter-typescript/test/corpus", TypeScript),
+    ("tree-sitter-cmake/test/corpus", CMake),
+    ("tree-sitter-dockerfile/test/corpus", Dockerfile),
+    ("tree-sitter-graphql/test/corpus", GraphQL),
+    ("tree-sitter-ini/test/corpus", Ini),
+    ("tree-sitter-make/test/corpus", Make),
+    ("tree-sitter-proto/test/corpus", Proto),
+    ("tree-sitter-jsdoc/test/corpus", JsDoc),
+    ("tree-sitter-svelte-ng/test/corpus", Svelte),
+    ("tree-sitter-vue/corpus", Vue),
+    ("tree-sitter-erlang/test/corpus", Erlang),
+    ("tree-sitter-julia/test/corpus", Julia),
+    ("tree-sitter-objc/test/corpus", ObjectiveC),
+    ("tree-sitter-ocaml/test/corpus", OCaml),
+    ("tree-sitter-perl/test/corpus", Perl),
+    ("tree-sitter-powershell/test/corpus", PowerShell),
+    ("tree-sitter-r/test/corpus", R),
+    ("tree-sitter-sequel/test/corpus", Sql),
+    ("tree-sitter-toml-ng/test/corpus", Toml),
+    ("tree-sitter-xml/test/corpus", Xml),
     ("tree-sitter-yaml/test/corpus", Yaml),
   ];
   map
@@ -255,12 +298,32 @@ const EXCLUDED_FILES: &[(SupportLang, &str, &str)] = &[(
 
 /// Known-mismatch allowlist: (corpus file basename, test name) → reason. Every entry must
 /// KEEP failing; an entry that starts passing fails the suite until removed.
-const ALLOWLIST: &[(&str, &str, &str)] = &[(
-  "varsym.txt",
-  "varsym: error: carrow",
-  "explicit ERROR-tree expectation: error-recovery shape depends on the tree-sitter runtime \
-   version, and ours differs from the CLI that generated upstream's expectation",
-)];
+const ALLOWLIST: &[(&str, &str, &str)] = &[
+  (
+    "varsym.txt",
+    "varsym: error: carrow",
+    "explicit ERROR-tree expectation: error-recovery shape depends on the tree-sitter runtime \
+     version, and ours differs from the CLI that generated upstream's expectation",
+  ),
+  (
+    "expressions-errors.txt",
+    "Not A Parenthesized Expression 3",
+    "explicit ERROR-tree expectation (R): error-recovery shape depends on the tree-sitter \
+     runtime version, and ours differs from the CLI that generated upstream's expectation",
+  ),
+  (
+    "errors.txt",
+    "Function body with a unbalanced $$",
+    "explicit ERROR-tree expectation (SQL dollar-quoting): error-recovery shape depends on \
+     the tree-sitter runtime version",
+  ),
+  (
+    "errors.txt",
+    "Function body with a tag name contains whitespace",
+    "explicit ERROR-tree expectation (SQL dollar-quoting): error-recovery shape depends on \
+     the tree-sitter runtime version",
+  ),
+];
 
 #[test]
 fn upstream_corpora_pass_against_the_compiled_parsers() {

@@ -1,0 +1,32 @@
+[package]
+name = "vorpal-lang-registry"
+description = "The runtime language universe for vorpal: builtin + dynamic grammars, globs, injections, and grammar identity"
+keywords = ["ast", "pattern", "codemod", "search", "rewrite"]
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+vorpal-core = { workspace = true, features = ["tree-sitter"] }
+vorpal-config.workspace = true
+vorpal-dynamic.workspace = true
+vorpal-language.workspace = true
+
+anyhow.workspace = true
+ignore.workspace = true
+serde.workspace = true
+tree-sitter.workspace = true
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+[features]
+# Composability forwards for library embedders; every vorpal artifact ships with the full
+# grammar set (vorpal-language's default), so these are pass-throughs, not product knobs.
+builtin-parser = ["vorpal-language/builtin-parser"]
+napi-langs = ["vorpal-language/napi-lang"]
+
+[dev-dependencies]
+serde_yaml.workspace = true

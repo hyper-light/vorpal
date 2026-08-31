@@ -399,6 +399,20 @@ impl KgWriter {
     self.kind.get(row).map(|&tag| SymbolKind::from_tag(tag))
   }
 
+  /// Visit every File node with its path — the kind column gates the string decode, so a
+  /// pass that relates files (co-change) touches 76k rows' strings at kernel scale, not 2.7M.
+  pub fn for_each_file<F: FnMut(NodeId, &str)>(&self, mut visit: F) {
+    let file_tag = SymbolKind::File.tag();
+    for row in 0..self.kind.len() {
+      if self.kind[row] == file_tag {
+        visit(
+          NodeId::new(row as u64),
+          self.heap_str(self.path_off[row], self.path_len[row]),
+        );
+      }
+    }
+  }
+
   /// One interned definition by dense row (`row == id`): random access for sharded table
   /// builds, where contiguous row ranges are processed on independent threads (§7.5).
   pub fn definition(&self, row: usize) -> Option<(NodeId, &str, &str, SymbolKind, bool)> {
@@ -458,8 +472,13 @@ impl KgWriter {
   /// column's worth, not a second full copy of every column at once. The edge log is likewise
   /// dropped as soon as the compacted graph exists.
   pub fn seal(mut self) -> Kg {
-    crate::phase_stamp("seal: columns");
+    crate::phase_stamp("seal: scc");
     let n = self.kind.len() as u32;
+    // Strongly-connected-component sizes over calls edges (B6 v1.5): computed here from
+    // the finished edge log — a DERIVED column, so shard absorption has nothing to merge
+    // and the absorb/shrink column discipline does not apply to it.
+    let scc = crate::scc::scc_sizes(n as usize, &self.edges);
+    crate::phase_stamp("seal: columns");
     self.canonical.seal();
     drop(std::mem::take(&mut self.canonical));
 
@@ -483,6 +502,7 @@ impl KgWriter {
       builder.add_u8("flags", &self.flags).unwrap();
       builder.add_u32("span_start", &self.span_start).unwrap();
       builder.add_u32("span_end", &self.span_end).unwrap();
+      builder.add_u32("scc_size", &scc).unwrap();
       Segment::open_owned(builder.build().unwrap()).unwrap()
     };
     drop(std::mem::take(&mut self.kind));
@@ -669,6 +689,37 @@ impl KgWriter {
     );
 
     let n = total_rows as u32;
+    crate::phase_stamp("seal-canonical: edges");
+    // Remap the surviving edge log into canonical id space FIRST — both remaining tracks
+    // consume it: the graph compacts it, and the node segment's derived `scc_size` column
+    // must be computed over exactly these edges (component sizes are permutation-invariant,
+    // but the writer-space log still holds retired blocks' edges, so remap-then-compute is
+    // the only order that matches a scratch build's plain seal).
+    let mut new_edges = EdgeLog::new();
+    for block in blocks {
+      for i in block.edges.start as usize..block.edges.end as usize {
+        let (src, dst, etype) = self.edges.triple(i);
+        let (s, d) = (lut[src as usize], lut[dst as usize]);
+        debug_assert!(
+          s != u32::MAX && d != u32::MAX,
+          "containment edge touches a dead row"
+        );
+        if s != u32::MAX && d != u32::MAX {
+          new_edges.push(s, d, etype);
+        }
+      }
+    }
+    for (src, dst, etype) in resolution {
+      let (s, d) = (lut[src as usize], lut[dst as usize]);
+      debug_assert!(
+        s != u32::MAX && d != u32::MAX,
+        "resolution edge touches a dead row"
+      );
+      if s != u32::MAX && d != u32::MAX {
+        new_edges.push(s, d, etype);
+      }
+    }
+    let scc = crate::scc::scc_sizes(n as usize, &new_edges);
     crate::phase_stamp("seal-canonical: tracks");
     // Three independent tracks fan out: the node segment (zone maps + whole-segment digest),
     // the in-memory name index (hash + sort over the gathered name column — the very pairs
@@ -693,6 +744,7 @@ impl KgWriter {
             builder.add_u8("flags", &flags).unwrap();
             builder.add_u32("span_start", &span_start).unwrap();
             builder.add_u32("span_end", &span_end).unwrap();
+            builder.add_u32("scc_size", &scc).unwrap();
             Segment::open_owned(builder.build().unwrap()).unwrap()
           },
           || {
@@ -715,38 +767,7 @@ impl KgWriter {
           },
         )
       },
-      || {
-        // Containment edges per block (scratch order = per-file, path-major), then this
-        // link's resolution edges. Dead-endpoint containment edges cannot exist (blocks
-        // only cover alive rows and containment never crosses files); a dead endpoint in a
-        // resolution edge is an upstream logic error — checked in debug, dropped
-        // defensively in release.
-        let mut new_edges = EdgeLog::new();
-        for block in blocks {
-          for i in block.edges.start as usize..block.edges.end as usize {
-            let (src, dst, etype) = self.edges.triple(i);
-            let (s, d) = (lut[src as usize], lut[dst as usize]);
-            debug_assert!(
-              s != u32::MAX && d != u32::MAX,
-              "containment edge touches a dead row"
-            );
-            if s != u32::MAX && d != u32::MAX {
-              new_edges.push(s, d, etype);
-            }
-          }
-        }
-        for (src, dst, etype) in resolution {
-          let (s, d) = (lut[src as usize], lut[dst as usize]);
-          debug_assert!(
-            s != u32::MAX && d != u32::MAX,
-            "resolution edge touches a dead row"
-          );
-          if s != u32::MAX && d != u32::MAX {
-            new_edges.push(s, d, etype);
-          }
-        }
-        Graph::compact(n, &new_edges)
-      },
+      || Graph::compact(n, &new_edges),
     );
     crate::phase_stamp("seal-canonical: assemble kg");
 

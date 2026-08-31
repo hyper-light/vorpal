@@ -1,0 +1,23 @@
+id: perl-sub
+language: Perl
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: perl-package
+language: Perl
+role: item
+symbolType: module
+rule:
+  all:
+    - kind: package_statement
+    - has:
+        kind: package_name
+        pattern: $NAME
+name: '$NAME'

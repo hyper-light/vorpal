@@ -1,0 +1,40 @@
+id: svelte-element
+language: Svelte
+role: item
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'
+---
+id: svelte-child-element
+language: Svelte
+role: member
+parentRuleIds: [svelte-element]
+symbolType: object
+rule:
+  all:
+    - kind: element
+    - any:
+        - has:
+            kind: start_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+        - has:
+            kind: self_closing_tag
+            has:
+              kind: tag_name
+              pattern: $NAME
+name: '$NAME'

@@ -158,6 +158,8 @@ struct NodeColumns {
   /// Durable external id halves — `None` on pre-eid segments (external ids then read `None`).
   eid_lo: Option<usize>,
   eid_hi: Option<usize>,
+  /// Calls-SCC size (B6 v1.5) — `None` on segments sealed before the column existed.
+  scc_size: Option<usize>,
 }
 
 impl NodeColumns {
@@ -176,6 +178,7 @@ impl NodeColumns {
       span_end: segment.column_index("span_end"),
       eid_lo: segment.column_index("eid_lo"),
       eid_hi: segment.column_index("eid_hi"),
+      scc_size: segment.column_index("scc_size"),
     })
   }
 }
@@ -198,6 +201,9 @@ pub struct Kg {
   evidence: Option<crate::evidence::EvidenceStore>,
   graph: Graph,
   directory: SegmentDirectory,
+  /// The community sidecar (`communities.bin`), loaded on first use and validated against
+  /// the node-segment stamp — absent or stale reads as `None` for every node.
+  communities: std::sync::OnceLock<Option<Vec<u32>>>,
 }
 
 impl Kg {
@@ -237,11 +243,37 @@ impl Kg {
       evidence: None,
       graph,
       directory,
+      communities: std::sync::OnceLock::new(),
     })
+  }
+
+  /// This node's `calls`-graph community (dense id), from the warm-time sidecar. `None`
+  /// until a warm has built it for this generation — "unknown", never "alone".
+  pub fn community(&self, id: NodeId) -> Option<u32> {
+    let table = self.communities.get_or_init(|| {
+      let dir = self.heap_file.as_ref()?.parent()?;
+      let stamp = xxhash_rust::xxh3::xxh3_64(self.node_segment_bytes());
+      crate::communities::load(dir, stamp, self.node_count())
+    });
+    table.as_ref()?.get(id.raw() as usize).copied()
+  }
+
+  /// The whole community table, when built (for summaries that walk every node once).
+  pub fn communities(&self) -> Option<&[u32]> {
+    self.community(NodeId::new(0));
+    self.communities.get().and_then(|t| t.as_deref())
   }
 
   pub fn node_count(&self) -> usize {
     self.nodes.row_count() as usize
+  }
+
+  /// This node's calls-cycle component size: 1 outside any recursion, the knot's node
+  /// count inside one. `None` on segments sealed before the column existed — absence is
+  /// "unknown", never "acyclic".
+  pub fn scc_size(&self, id: NodeId) -> Option<u32> {
+    let (_segment, row) = self.directory.locate(id)?;
+    self.nodes.column_at(self.cols.scc_size?)?.get_u32(row)
   }
 
   /// Total directed edges (each stored edge counted once).
@@ -249,10 +281,44 @@ impl Kg {
     self.graph.edge_count() as u64
   }
 
+  /// The underlying CSR/CSC graph — read-only access for traversal engines that need
+  /// allocation-free adjacency walks with their own budgets (vorpal-query's bounded BFS),
+  /// which `out_neighbors`/`in_neighbors` (allocating) and the fixed-shape `reachable_*`
+  /// wrappers don't serve.
+  pub fn graph(&self) -> &vorpal_graph::Graph {
+    &self.graph
+  }
+
   /// Incoming-edge count for one node — two mapped offset reads, no allocation (unlike
   /// [`Kg::in_neighbors`], which materializes the row).
   pub fn in_degree(&self, id: NodeId) -> usize {
     self.graph.in_degree(id.raw() as u32)
+  }
+
+  /// In-degree over REFERENTIAL edges only — the "how used" signal: resolution-emitted
+  /// reference families plus request/notify usage, EXCLUDING derived and topological
+  /// families (`data_flows` duplicates its call pair; `similar_to` and `changes_with` are
+  /// similarity/history topology, not usage) and structural containment. The flow-era
+  /// merge added those families, silently inflating every raw-degree "popularity" reading;
+  /// rank signals must consume THIS, never the raw CSC degree.
+  pub fn in_degree_referential(&self, id: NodeId) -> usize {
+    self
+      .in_edge_types_of(id)
+      .iter()
+      .filter(|&&tag| {
+        matches!(
+          EdgeType(tag).base(),
+          EdgeType::CALLS
+            | EdgeType::REFERENCES
+            | EdgeType::IMPORTS
+            | EdgeType::IMPLEMENTS
+            | EdgeType::OF_TYPE
+            | EdgeType::OVERRIDES
+            | EdgeType::REQUESTS
+            | EdgeType::NOTIFIES
+        )
+      })
+      .count()
   }
 
   /// The incoming edges' packed type tags for one node, zero-copy (confidence in the high
@@ -634,6 +700,13 @@ impl Kg {
   /// `names.idx` when the index dir carries one (two binary searches + per-hit string
   /// verification against hash collisions); the parallel scan fallback returns the identical
   /// list for older dirs.
+  /// The node-segment identity stamp additive sidecars are keyed by (ANN tier,
+  /// `communities.bin`, `observed.bin`): any regeneration changes it, so stale sidecars
+  /// read as absent instead of answering with renumbered ids.
+  pub fn node_segment_stamp(&self) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(self.node_segment_bytes())
+  }
+
   pub fn nodes_named(&self, name: &str) -> Vec<NodeId> {
     if let Some((hashes, ids)) = &self.names {
       let hash = xxhash_rust::xxh3::xxh3_64(name.as_bytes());

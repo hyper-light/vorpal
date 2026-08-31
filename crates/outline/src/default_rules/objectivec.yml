@@ -1,0 +1,43 @@
+id: objc-interface
+language: ObjectiveC
+role: item
+symbolType: class
+rule:
+  all:
+    - any:
+        - kind: class_interface
+        - kind: class_implementation
+        - kind: protocol_declaration
+    - has:
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+---
+id: objc-method
+language: ObjectiveC
+role: member
+parentRuleIds: [objc-interface]
+symbolType: method
+rule:
+  all:
+    - any:
+        - kind: method_definition
+        - kind: method_declaration
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+---
+id: objc-function
+language: ObjectiveC
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: function_definition
+    - has:
+        stopBy: end
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'

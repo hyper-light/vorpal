@@ -368,6 +368,19 @@ edit→answer), and patchable sealed columns are the Phase-4 format question bel
 Also fixed the same day: daemon↔CLI alternation used to re-parse the world (path
 spelling split, see "one tree, one spelling" commit) — interop now replays 72,540/72,541.
 
+## CLI edit-one floor 2026-08-31 — the replay wall (Phase-4 motivation, measured)
+
+Post-merge grind took kernel edit-one 3.1 s → 1.67 s: the space-invariant run-order pick
+removed ~1.35 s of hub-name tie-break comparisons, the near-clone pairing now spawns at the
+stream tail (overlapping the pack tail, cochange, table, and resolution — it was the link's
+critical path by ~110 ms), and the pack consolidation tail joins after the link instead of
+before it (riding into `PendingPersist` on the live path). Remaining layout: 713 ms product
+replay (75,953 unchanged files re-applied because one edit renumbers every later id),
+243 ms resolve, ~145 ms seal, ~250 ms artifact writes + content hash, 140 ms stat scan.
+The replay is the design law's price at CLI grain — sub-second edit-one is Phase 4's
+file-local ids, not a tuning pass. (The daemon already serves the same edit at 0.57 s
+steady; restamp-class saves ~10 ms.)
+
 ## Phase 4 — Format v-next (canonical semantic edits at 100–250ms)
 
 The consensus lesson from Glean/SCIP/stack-graphs/Kythe: identity must be file-local or
@@ -394,3 +407,55 @@ Then 1a/1b/1c (new convergence tests), then 2 (recall gates + new ANN lineage te
 (differential harness gates every merge), then 4 (format-version bump, migration test matrix,
 nightly golden convergence). Perf numbers recorded per chunk in README.md#performance
 methodology: release builds, best-of-3, fixed tree state, thermal notes.
+
+## Status 2026-08-30 — flow-era unification: retained ledger parity LANDED, tier default-on
+
+The feature-line merge widened what a committed generation contains (chain-resolved calls,
+`data_flows` + `dataflow.bin`, `similar_to`, `requests`/`notifies`, `changes_with`). The
+retained tier now reproduces all of it:
+
+- **Per-file flow ledgers**: `RetainedIndex` keeps each file's `FlowSidecar` (args, params,
+  rets, sigs, requests) in retained id space — rebased at absorb exactly like the bulk
+  committer (rets are name-keyed, never rebased), replaced on edit, dropped on delete.
+- **Chain-aware scoped rederive**: a rets delta dirties the affected function NAMES (the
+  definition row is unchanged, so candidate-set diffing cannot see it); the postings
+  expansion re-resolves every file referencing them. Pinned by live_differential's
+  return-annotation-retarget class (scoped link, 1 dirty file, answers move).
+- **Link-time joins**: the retained link folds `ChainReturns` into resolution, interleaves
+  `DATA_FLOWS` through the shared `join_call_edge` (one function, both linkers), pairs
+  near-clones over CANONICAL ids (the pairing tie-breaks on id values — star centers,
+  partner caps — so retained ids would fork the pair set), matches requests, and accepts
+  caller-derived co-change pre-edges — all in the bulk pipeline's exact edge-log order,
+  because the CSR build is an insertion-stable counting scatter.
+- **Persist parity**: `ServedPersist` stages `dataflow.bin` (rows LUT-remapped to sealed
+  ids); the served commit's generation id equals a scratch build's.
+
+**No-bypass routing (same day):** the overlay is the guaranteed path for absorbable edits —
+the probe runs for ANY captured change set (the old ≤8-file cap was the only absorb bound
+and is gone), watcher capture loss recovers via `LiveOverlay::stat_changes` (a stat sweep
+against the retained manifest, same trust model as the pipeline's own sweep) instead of a
+full rebuild, the overlay builder spawns at daemon construction, and the only remaining
+pipeline fallbacks are stated ones: past the shared absorb budget
+(`RetainedIndex::within_absorb_budget`, the link's own measured escalation shape), a
+missing/retired overlay, a custom extraction environment, or boot.
+
+**Space-invariant ambiguous pick (kernel A/B find):** the deterministic tie-break for
+ambiguous resolutions was lowest-RAW-ID — path-ordered in bulk space but tail-inverted in
+the retained writer whenever an edited file defines one of the tied candidates
+(kernel repro: `slab_is_available`, mm/slab_common.c vs tools/testing/memblock/lib/slab.c,
+41 flipped rows). The pick now orders by (path text, id) — `pick_key` in
+crates/resolve/src/resolver.rs — the same definition in every id space. This legitimately
+re-picks ties whose import-seeded binding symbols ordered differently, so content ids moved
+once, with the tie set still retained in alternatives.
+
+Gates: canonical_seal, retained, differential, stamp_cutoff, hinted_scan, live_differential
+(flow corpus + generation-convergence pin; traced to 10 overlay serves / 10 retained-persist
+commits in one run), and the KERNEL-SCALE A/B: daemon boot on linux → first edit (capture
+lost → stat sweep recovered 1 path) → overlay serve → retained persist —
+`gen/015477582e27fdcd51e4cd6f46f1f639` == the from-scratch build of the same tree, byte for
+byte. Cold-first-serve edit→queryable 3.23 s (stat sweep + the first link after an overlay
+build is a FULL retained link by design); steady-state scoped-serve latency re-measured on
+the merge benches.
+
+
+
