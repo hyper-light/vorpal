@@ -26,10 +26,25 @@ const RECORD_BYTES: usize = 16;
 /// Derive the event-buffer capacity (in events) for an expected total: `√N` balanced
 /// against the policy's arena clamp as the floor (small corpora stay entirely in the
 /// buffer; the floor is the SAME 64 KiB–2 MiB clamp every batch structure uses).
-pub fn buffer_events_for(expected_events: u64, arena_chunk_bytes: usize) -> usize {
-  let sqrt = (expected_events as f64).sqrt().ceil() as usize;
-  let floor_events = arena_chunk_bytes / std::mem::size_of::<(u32, u32)>();
-  sqrt.max(floor_events).max(1)
+pub fn buffer_events_for(
+  expected_events: u64,
+  page_bytes: usize,
+  arena_chunk_bytes: usize,
+) -> usize {
+  // The classical ONE-merge-pass external-sort balance: a buffer of M events yields
+  // ≈ N/M sorted runs and k-way-merges buffer_bytes/page_bytes of them at once, so a
+  // single level suffices when N/M ≤ M·pair_bytes/page_bytes ⇒
+  // M ≥ √(N · page_bytes / pair_bytes) (Knuth, TAOCP vol. 3 §5.4 merge balance).
+  // The earlier plain √N dropped the page factor — measured at kernel scale as ~4,200
+  // runs through TWO merge levels, 56 s of pure rewrite I/O. The policy arena chunk
+  // stays as the floor so tiny corpora keep their zero-spill fast path; N is a sizing
+  // ESTIMATE shaping only the buffer, never correctness.
+  let pair_bytes = std::mem::size_of::<(u32, u32)>();
+  let balanced = ((expected_events as f64) * (page_bytes.max(1) as f64) / pair_bytes as f64)
+    .sqrt()
+    .ceil() as usize;
+  let floor_events = arena_chunk_bytes / pair_bytes;
+  balanced.max(floor_events).max(1)
 }
 
 /// Streaming pair counter with spill-to-scratch overflow.
@@ -222,7 +237,9 @@ impl SpilledCounts {
           offset += records * RECORD_BYTES as u64;
         }
         Ok(PairIter {
-          inner: PairIterInner::Runs { cursors },
+          inner: PairIterInner::Runs {
+            merge: RunMerge::new(cursors),
+          },
         })
       }
     }
@@ -305,7 +322,7 @@ pub struct PairIter<'a> {
 
 enum PairIterInner<'a> {
   Memory(std::slice::Iter<'a, (u32, u32, u64)>),
-  Runs { cursors: Vec<RunCursor> },
+  Runs { merge: RunMerge },
 }
 
 impl Iterator for PairIter<'_> {
@@ -314,47 +331,68 @@ impl Iterator for PairIter<'_> {
   fn next(&mut self) -> Option<Self::Item> {
     match &mut self.inner {
       PairIterInner::Memory(iter) => iter.next().map(|&record| Ok(record)),
-      PairIterInner::Runs { cursors } => merge_step(cursors).transpose(),
+      PairIterInner::Runs { merge } => merge.next_pair().transpose(),
     }
   }
 }
 
-/// One k-way aggregation step: the smallest head across cursors, ALL equal heads
-/// drained and summed (aggregation makes cursor order irrelevant to the output).
-/// `Ok(None)` = every cursor exhausted.
-fn merge_step(cursors: &mut [RunCursor]) -> Result<Option<(u32, u32, u64)>, String> {
-  let mut smallest: Option<(u32, u32)> = None;
-  for cursor in cursors.iter() {
-    if let Some((a, b, _)) = cursor.head {
-      let key = (a, b);
-      if smallest.is_none_or(|s| key < s) {
-        smallest = Some(key);
+/// K-way aggregating merge over run cursors: a min-heap of `(pair, cursor)` heads
+/// costs O(log k) per record instead of two O(k) head scans — measured at kernel
+/// scale, the linear form put ~176 s of pure head-scanning into the σ and CSR
+/// streaming passes once the one-level merge balance left ~700 live runs. Every run
+/// holds at most one record per key (runs are aggregated at birth), so draining a
+/// key pops each contributing cursor exactly once; counts are integers, so the
+/// summation order cannot change a single bit.
+struct RunMerge {
+  cursors: Vec<RunCursor>,
+  heap: std::collections::BinaryHeap<std::cmp::Reverse<((u32, u32), usize)>>,
+}
+
+impl RunMerge {
+  fn new(cursors: Vec<RunCursor>) -> Self {
+    let mut heap = std::collections::BinaryHeap::with_capacity(cursors.len());
+    for (index, cursor) in cursors.iter().enumerate() {
+      if let Some((a, b, _)) = cursor.head {
+        heap.push(std::cmp::Reverse(((a, b), index)));
       }
     }
+    RunMerge { cursors, heap }
   }
-  let Some(key) = smallest else {
-    return Ok(None);
-  };
-  let mut total = 0u64;
-  for cursor in cursors.iter_mut() {
-    while let Some((a, b, count)) = cursor.head {
-      if (a, b) == key {
-        total += count;
-        cursor.advance()?;
-      } else {
+
+  /// The smallest head across cursors, ALL equal heads drained and summed
+  /// (aggregation makes cursor order irrelevant to the output). `Ok(None)` = every
+  /// cursor exhausted.
+  fn next_pair(&mut self) -> Result<Option<(u32, u32, u64)>, String> {
+    let Some(&std::cmp::Reverse((key, _))) = self.heap.peek() else {
+      return Ok(None);
+    };
+    let mut total = 0u64;
+    while let Some(&std::cmp::Reverse((head, index))) = self.heap.peek() {
+      if head != key {
         break;
       }
+      self.heap.pop();
+      let cursor = &mut self.cursors[index];
+      let Some((_, _, count)) = cursor.head else {
+        return Err("merge heap referenced an exhausted cursor (invariant)".to_string());
+      };
+      total += count;
+      cursor.advance()?;
+      if let Some((a, b, _)) = cursor.head {
+        self.heap.push(std::cmp::Reverse(((a, b), index)));
+      }
     }
+    Ok(Some((key.0, key.1, total)))
   }
-  Ok(Some((key.0, key.1, total)))
 }
 
-/// Callback loop over [`merge_step`] (the merge-level writer path).
+/// Callback loop over [`RunMerge`] (the merge-level writer path).
 fn merge_cursors(
-  cursors: &mut [RunCursor],
+  cursors: Vec<RunCursor>,
   consumer: &mut impl FnMut(u32, u32, u64) -> Result<(), String>,
 ) -> Result<(), String> {
-  while let Some((a, b, count)) = merge_step(cursors)? {
+  let mut merge = RunMerge::new(cursors);
+  while let Some((a, b, count)) = merge.next_pair()? {
     consumer(a, b, count)?;
   }
   Ok(())
@@ -385,7 +423,7 @@ fn merge_level(
       offset += records * RECORD_BYTES as u64;
     }
     let mut records = 0u64;
-    merge_cursors(&mut cursors, &mut |a, b, count| {
+    merge_cursors(cursors, &mut |a, b, count| {
       write_record(&mut writer, a, b, count)?;
       records += 1;
       Ok(())
@@ -479,11 +517,22 @@ mod tests {
   }
 
   #[test]
-  fn buffer_derivation_is_sqrt_with_policy_floor() {
-    // √N above the floor…
-    assert_eq!(buffer_events_for(1_000_000_000_000, 64 * 1024), 1_000_000);
+  fn buffer_derivation_is_merge_balance_with_policy_floor() {
+    // Exact at a perfect square: M = √(N·page/pair) = √(2048·16384/8) = 2048.
+    assert_eq!(buffer_events_for(2048, 16384, 8), 2048);
+    // The ONE-merge-pass property the derivation exists for: runs = ⌈N/M⌉ never
+    // exceeds the k-way fan-in M·pair_bytes/page_bytes (± the final resident run).
+    for &(events, page) in &[(1_000_000_000_000u64, 16384usize), (1_100_000_000, 16384)] {
+      let m = buffer_events_for(events, page, 8) as u64;
+      let runs = events.div_ceil(m);
+      let fan_in = (m as usize * std::mem::size_of::<(u32, u32)>() / page) as u64;
+      assert!(
+        runs <= fan_in + 1,
+        "{events} events, page {page}: {runs} runs > fan-in {fan_in}"
+      );
+    }
     // …and the arena-clamp floor below it (64 KiB / 8 B per event = 8192 events).
-    assert_eq!(buffer_events_for(100, 64 * 1024), 8192);
+    assert_eq!(buffer_events_for(100, 16384, 64 * 1024), 8192);
   }
 
   #[test]

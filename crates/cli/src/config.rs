@@ -52,6 +52,11 @@ pub struct VorpalConfig {
   /// injection config for embedded languages
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub language_injections: Vec<SerializableInjection>,
+  /// semantic embedding tier for `vorpal kg index` builds: "lexical" (default) or
+  /// "learned" (corpus-trained static embeddings; small corpora fall back to lexical
+  /// and state it in the index's provenance record)
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub semantic_tier: Option<String>,
 }
 
 #[derive(Clone)]
@@ -70,6 +75,9 @@ pub struct ProjectConfig {
   pub custom_languages: Option<HashMap<String, CustomLang>>,
   pub language_globs: Option<LanguageGlobs>,
   pub language_injections: Vec<SerializableInjection>,
+  /// `semanticTier` from vorpalconfig.yml, applied by `vorpal kg index` (None = keep
+  /// the index's existing selection).
+  pub semantic_tier: Option<String>,
 }
 
 impl ProjectConfig {
@@ -115,6 +123,7 @@ impl ProjectConfig {
       custom_languages: sg_config.custom_languages.clone(),
       language_globs: sg_config.language_globs.clone(),
       language_injections: sg_config.language_injections.clone(),
+      semantic_tier: sg_config.semantic_tier.clone(),
     };
     // sg_config will not use rule dirs and test configs anymore
     register_custom_language(&config.project_dir, sg_config)?;
@@ -148,6 +157,7 @@ impl ProjectConfig {
       custom_languages: sg_config.custom_languages.clone(),
       language_globs: sg_config.language_globs.clone(),
       language_injections: sg_config.language_injections.clone(),
+      semantic_tier: sg_config.semantic_tier.clone(),
     }))
   }
 }

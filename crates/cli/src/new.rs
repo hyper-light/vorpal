@@ -221,6 +221,7 @@ fn create_new_project(arg: NewArg, project_dir: &Path) -> Result<ExitCode> {
     custom_languages: None,      // advanced feature, skip now
     language_globs: None,        // advanced feature, skip now
     language_injections: vec![], // advanced feature
+    semantic_tier: None,         // embedding tier: absent = keep the index's selection
   };
   let config_path = project_dir.join("vorpalconfig.yml");
   let f = File::create(config_path)?;

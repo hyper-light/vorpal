@@ -562,9 +562,21 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
   } else {
     vorpal_index::CacheMode::default()
   };
+  let project = project.ok();
+  // `semanticTier` in vorpalconfig.yml selects the index's embedding tier; the selection
+  // file at the index root is the single cross-process truth every warm reads (absent
+  // key = keep the existing selection; absent file = lexical).
+  if let Some(tier) = project.as_ref().and_then(|p| p.semantic_tier.as_deref()) {
+    let tier = match tier {
+      "lexical" => vorpal_index::SemanticTier::Lexical,
+      "learned" => vorpal_index::SemanticTier::Learned,
+      other => anyhow::bail!("vorpalconfig.yml semanticTier wants lexical|learned, got '{other}'"),
+    };
+    vorpal_index::write_tier_selection(&out, tier).map_err(boxed)?;
+  }
   // Custom/dynamic languages were registered at CLI setup (the one-shot dlopen); here their
   // configured outline rules extend extraction (F-M3). No project config = bundled behavior.
-  let env = extraction_env_from_project(project.ok().as_ref())?;
+  let env = extraction_env_from_project(project.as_ref())?;
   let report =
     vorpal_index::build_index_env(&arg.src, &out, mode, Default::default(), &env)
       .map_err(boxed)

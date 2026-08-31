@@ -100,6 +100,13 @@ fn version_table_matches_the_constants() {
       version_of("crates/index/src/lib.rs", "ANN_CALIB_VERSION"),
       "calibration treated as absent → structural routing floor (full-population fetches scan; the beam keeps everything below) → next warm re-measures",
     ),
+    (
+      "learned embedding model (`ann.model.bin`)",
+      "LEARNED_MODEL_VERSION",
+      "crates/ann/src/learned/persist.rs",
+      version_of("crates/ann/src/learned/persist.rs", "LEARNED_MODEL_VERSION"),
+      "model unreadable/stale → lexical fallback stated in provenance → warm retrains",
+    ),
   ];
 
   let mut table = String::from("| Artifact | Constant | Value | On mismatch |\n|---|---|---|---|\n");

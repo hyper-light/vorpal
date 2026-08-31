@@ -343,6 +343,23 @@ impl Server {
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
         };
+        // Optional embedding-tier selection: written to the index ROOT before the build,
+        // because the selection file is the single cross-process truth every warm reads
+        // (in-daemon or child indexer alike). Absent = keep the existing selection.
+        if let Some(tier) = args.get("semantic_tier").and_then(Value::as_str) {
+          let tier = match tier {
+            "lexical" => vorpal_index::SemanticTier::Lexical,
+            "learned" => vorpal_index::SemanticTier::Learned,
+            other => {
+              return Err(ToolError::coded(
+                "bad-argument",
+                format!("semantic_tier wants lexical|learned, got '{other}'"),
+              ));
+            }
+          };
+          vorpal_index::write_tier_selection(&self.index_dir, tier)
+            .map_err(|err| ToolError::coded("index-unavailable", err.to_string()))?;
+        }
         // Supervised when a child indexer exists (D3): a crashing input costs this call,
         // never the daemon. NOTE: the child runs the default cache/health policy; explicit
         // policy args force the in-process path so they are honored exactly.
@@ -1175,7 +1192,8 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
         "src": {"type": "string", "description": "Source directory to index"},
         "verify": {"type": "boolean", "description": "Content-authoritative cache validation: verify every replay against current file bytes (default fast-stat trusts size+mtime outside the racy window)"},
         "parse_health": {"type": "string", "enum": ["warn", "exclude", "fail"], "description": "Policy for files whose parse produced ERROR nodes: warn reports (default), exclude drops them from the graph, fail aborts before committing"},
-        "max_error_ratio": {"type": "number", "description": "Unhealthy threshold: error bytes / file size above this ratio (default 0.0 = any error byte)"}
+        "max_error_ratio": {"type": "number", "description": "Unhealthy threshold: error bytes / file size above this ratio (default 0.0 = any error byte)"},
+        "semantic_tier": {"type": "string", "enum": ["lexical", "learned"], "description": "Embedding tier for this index: lexical (default surface hashing) or learned (embeddings trained on this corpus at warm time; small corpora state a lexical fallback in provenance). Omit to keep the index's current selection."}
       }),
       &["src"],
     ),

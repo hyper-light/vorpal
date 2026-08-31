@@ -427,6 +427,80 @@ insert when the cap cannot bind (`take ≥ chunk len` — O(len²) memmove → l
 crates/ann/src/scan.rs), and exhaustive candidates skip the rerank (the scan already
 returns the rerank's exact `(dist, id)` total order).
 
+## Learned semantic tier (semantic-tier Stage 1): training cost + engine integration
+
+The corpus-trained static-embedding tier (`--semantic-tier learned`, vorpalconfig
+`semanticTier`, MCP `semantic_tier`) trains at warm time over the generation's node
+surfaces and persists `ann.model.bin` (VMD v2, xxh3-checksummed; `ann.model.json`
+carries tier + weights hash; flips are staleness; incoherent artifacts route to the
+lexical default — never mixed embedders, never a silent zero).
+
+```
+vorpal-index index <tree> <idx> --semantic-tier learned && vorpal-index __warm-ann <idx>
+VORPAL_PHASE_TRACE=1 vorpal-index __warm-ann <idx>   # per-phase attribution
+```
+
+2026-08-31, linux @ `1590cf032971` (2.76M nodes) and cpython @ `b86a41cbf63` (150K
+nodes), release, quiet machine. Warm totals (lexical warm on the same day: linux
+13.45 s, cpython 0.50 s):
+
+| corpus | learned warm | train | ann build | calib | model |
+|---|---:|---:|---:|---:|---|
+| linux | 78.4 s | 65.6 s | 11.0 s | ~1.4 s | dim 249 (PIP), 462 MB, exact gram table |
+| cpython | 6.0 s | ~5.4 s | 0.4 s | ~0.1 s | dim 238 (PIP), 69 MB |
+
+Training went 52.6 s → 11.5 s (cpython) and 200.7 s → 65.6 s (kernel) across four
+measured, output-preserving fixes — each found by phase stamps + `sample(1)`
+attribution, each pinned by the existing bit-identity oracles:
+
+| kernel train phase | before | after | fix |
+|---|---:|---:|---|
+| factorization (eigen) | dominated 52 s cpython trains | 12.2 s | right-looking MGS as contiguous row sweeps + one bounded `block_gram` for QᵀMQ (the strided per-pair form spent 308 s SYS in rayon yield-spin); rank-revealing via UNCONDITIONAL second sweep — "twice is enough" (Giraud–Langou–Rozložník 2005) after the single-pass basis measurably lost orthogonality (5.8e-3) on graded survivors |
+| uSIF/sentence passes | 75.7 s | 5.5 s | word vectors stored COMPOSED (VMD v2: factor row + Σ gram rows precomputed — same sum, bit-identical vectors); sentence-PC Gram batched 65,536 docs and accumulated by the deterministic `block_gram` |
+| cooc merge | 55.9 s | 0.02 s | spill buffer = the one-merge-pass balance M ≥ √(N·page/pair) (Knuth §5.4) — the plain √N missed the page factor and forced two rewrite levels over ~4,200 runs |
+| σ + CSR streaming | 176 s (after the balance fix left ~700 live runs) | 29.4 s | k-way run merge via a min-heap of (pair, cursor) heads — O(log k)/record instead of two O(k) scans; integer sums, bytes unchanged |
+
+Peak training RSS 2.26 GB (CSR + eigen + composed tables at the kernel's 464K matrix
+rows); double-warm byte-identity of `ann.bin` + `ann.model.bin` is a standing test
+(`crates/index/tests/learned_tier.rs`), and the starved-vs-roomy spill oracle keeps the
+external pipeline bit-equal to the in-RAM reference at every buffer shape.
+
+**Query/calibration engine rule (measured, then locked):** under the learned tier an
+exhaustive fetch NEVER re-embeds the population — the first kernel warm spent 191 s of
+404.7 s inside calibration's scan reference re-embedding 2.35M rows through uSIF
+(~50 µs/row). Exhaustive fetches and the calibration scan now walk the persisted i8
+codes (`AnnIndex::scan_codes` — the beam's own distance, complete over the admitted
+population, deterministic at any thread count), full precision returning for bounded
+pools and winners; a learned handle without its ann tier serves lexical entirely. The
+exact-only reference seam (bench-internals) still re-embeds: it is the truth oracle.
+
+### Retrieval quality: lexical vs learned, same day, same commits
+
+`target/release/xtask searcheval <idx> xtask/labels/<set>.json` on both tiers of the
+SAME indexes (flip via `--semantic-tier`, re-warm, re-run); the lexical rows reproduce
+the Stage-0 baselines exactly, pinning corpus-state identity. NDCG@10 / MRR / recall@5:
+
+| set · class | queries | lexical | learned |
+|---|---:|---|---|
+| linux · short-keyword | 7 | 0.103 / 0.143 / 0.048 | **0.170 / 0.227 / 0.095** |
+| linux · descriptive | 1 | 0.947 / 1.000 / 1.000 | 0.947 / 1.000 / 1.000 |
+| linux · **all** | 8 | 0.208 / 0.250 / 0.167 | **0.267 / 0.324 / 0.208** |
+| cpython · descriptive | 4 | 0.042 / 0.083 / 0.125 | **0.333 / 0.250 / 0.500** |
+| cpython · short-keyword | 2 | 0.338 / 0.500 / 0.500 | 0.293 / 0.500 / 0.250 |
+| cpython · **all** | 6 | 0.141 / 0.222 / 0.250 | **0.320 / 0.333 / 0.417** |
+
+Stage-1 gates: the paraphrase-shaped split is STRICTLY better (cpython descriptive
+NDCG 0.042 → 0.333 — "append item to list" and "dictionary insert entry" now rank 3/2;
+these scored ~0 lexically by construction). Short-keyword supremacy holds: the kernel
+class — 7 queries at the scale where Stage 0 measured the collapse — improves 0.103 →
+0.170 ("dma coherent alloc" → rank 0). Honest exception: cpython's 2-query
+short-keyword class dips 0.338 → 0.293 NDCG — "garbage collect run" scores 0 under
+BOTH tiers, and "import find spec" slips one label from top-5 to rank 7; a marginal
+rank shift, not a collapse, and the 9-query short-keyword aggregate across both sets
+improves. Query latency (k=25, tier path): linux mean 2.05 ms lexical → 4.06 ms
+learned; cpython 0.75 → 2.83 ms — the learned query embed + 249-dim rerank, well
+inside budget.
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

@@ -276,6 +276,75 @@ impl AnnIndex {
     self.config
   }
 
+  /// Exhaustive linear walk over the PERSISTED i8 codes: every admitted row is scored
+  /// with the same code-space distance the beam traversal ranks by
+  /// (`QuantMatrix::dist_to_query` — an exact, deterministic function of the stored
+  /// codes and the query), so "exhaustive" keeps its completeness guarantee — every
+  /// admitted row is considered — while costing a code walk instead of an embedder
+  /// call per row. Callers re-score bounded pools and winners at full precision
+  /// (approximation picks pools, never final semantic order). Only the Vamana tier
+  /// carries codes; other tiers return `None` and callers keep their full-precision
+  /// paths (flat tiers exist only below the sizes where those are cheap —
+  /// [`AnnConfig::for_n`]).
+  ///
+  /// Determinism: `(distance, id)` is a total order (`total_cmp`, then id), per-row
+  /// scores are independent of scheduling, and the final sort runs under the same
+  /// order — the result is a pure function of the codes and the query at any thread
+  /// count.
+  pub fn scan_codes<A>(&self, query: &[f32], take: usize, admit: A) -> Option<Vec<(u64, f32)>>
+  where
+    A: Fn(u64) -> bool + Sync,
+  {
+    use rayon::prelude::*;
+
+    use crate::scan::HeapEntry;
+    if self.config != AnnConfig::Vamana {
+      return None;
+    }
+    let quant = self.quant.as_ref()?;
+    let n = self.len();
+    if n == 0 || take == 0 {
+      return Some(Vec::new());
+    }
+    let mut q = query.to_vec();
+    q.resize(self.dim, 0.0);
+    normalize(&mut q);
+    let quantized = quant.quantize_query(&q);
+    let evict_push = |heap: &mut std::collections::BinaryHeap<HeapEntry>, entry: HeapEntry| {
+      if heap.len() == take {
+        // Full: admit only candidates strictly better than the current worst.
+        if let Some(worst) = heap.peek()
+          && entry.cmp(worst) != std::cmp::Ordering::Less
+        {
+          return;
+        }
+        heap.pop();
+      }
+      heap.push(entry);
+    };
+    let top = (0..n as u32)
+      .into_par_iter()
+      .fold(std::collections::BinaryHeap::new, |mut heap, i| {
+        let id = self.ids[i as usize];
+        if admit(id) {
+          evict_push(&mut heap, HeapEntry(quant.dist_to_query(i, &quantized), id));
+        }
+        heap
+      })
+      .reduce(std::collections::BinaryHeap::new, |mut a, mut b| {
+        if b.len() > a.len() {
+          std::mem::swap(&mut a, &mut b);
+        }
+        for entry in b {
+          evict_push(&mut a, entry);
+        }
+        a
+      });
+    let mut merged: Vec<(f32, u64)> = top.into_iter().map(|HeapEntry(d, id)| (d, id)).collect();
+    merged.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    Some(merged.into_iter().map(|(dist, id)| (id, dist)).collect())
+  }
+
   /// Top-`k` nearest rows as `(stable id, squared L2 distance)`, closest first. Every tier ends
   /// in an exact rerank over full-precision vectors.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {

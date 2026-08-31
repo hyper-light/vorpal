@@ -20,9 +20,10 @@ use crate::l2_sq;
 /// (distance, id) under the crate's total order — the bounded-selection heap key. `Ord`
 /// is `total_cmp` then id: the same total order the final merge sorts by, so the kept
 /// set is the UNIQUE top-`take` prefix regardless of heap internals — output bytes
-/// cannot depend on the selection structure.
+/// cannot depend on the selection structure. Shared with [`crate::AnnIndex::scan_codes`],
+/// which selects under the SAME order over code-space distances.
 #[derive(PartialEq)]
-struct HeapEntry(f32, u64);
+pub(crate) struct HeapEntry(pub(crate) f32, pub(crate) u64);
 
 impl Eq for HeapEntry {}
 

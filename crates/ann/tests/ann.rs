@@ -164,3 +164,45 @@ fn empty_and_lexical_end_to_end() {
   let hits = index.search(&embedder.embed("import path resolution"), 1);
   assert_eq!(hits[0].0, 0, "{hits:?}");
 }
+
+#[test]
+fn scan_codes_is_complete_deterministic_and_beam_consistent() {
+  // 800 rows, tier forced: only the Vamana tier carries the i8 codes the walk reads.
+  let (rows, queries) = clustered(32, 40, 20, 23);
+  let index = AnnIndex::build(32, rows.clone(), Some(AnnConfig::Vamana));
+  let full = index
+    .scan_codes(&queries[0], rows.len() * 2, |_| true)
+    .expect("vamana tier carries codes");
+  // Complete over the population, ascending under the (dist, id) total order.
+  assert_eq!(full.len(), rows.len());
+  for pair in full.windows(2) {
+    let order = pair[0].1.total_cmp(&pair[1].1).then(pair[0].0.cmp(&pair[1].0));
+    assert_ne!(order, std::cmp::Ordering::Greater, "not ascending: {pair:?}");
+  }
+  // A bounded take is EXACTLY the full ranking's prefix (unique top-take).
+  let top = index.scan_codes(&queries[0], 7, |_| true).unwrap();
+  assert_eq!(top.as_slice(), &full[..7]);
+  // The admit filter yields the full ranking's admitted subsequence, same order.
+  let even = index.scan_codes(&queries[0], 9, |id| id % 2 == 0).unwrap();
+  let expect: Vec<(u64, f32)> = full
+    .iter()
+    .copied()
+    .filter(|(id, _)| id % 2 == 0)
+    .take(9)
+    .collect();
+  assert_eq!(even, expect);
+  // Bit-stable across calls.
+  assert_eq!(
+    full,
+    index.scan_codes(&queries[0], rows.len() * 2, |_| true).unwrap()
+  );
+  // Beam consistency: the traversal ranks by the SAME code-space distance, so every
+  // beam hit carries bit-identically the distance the walk assigns that id.
+  let by_id: std::collections::HashMap<u64, f32> = full.iter().copied().collect();
+  for (id, dist) in index.search(&queries[0], 5) {
+    assert_eq!(by_id[&id].to_bits(), dist.to_bits());
+  }
+  // Flat tiers carry no codes — callers keep their full-precision scan.
+  let flat = AnnIndex::build(32, rows, None);
+  assert!(flat.scan_codes(&queries[0], 5, |_| true).is_none());
+}

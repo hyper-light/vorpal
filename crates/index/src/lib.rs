@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+use vorpal_ann::learned::{LearnedModel, LearnedStaticEmbedder, TrainResources, load_model, save_model};
 use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, ModelProvenance, tokenize};
 use vorpal_ingest::{
   ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
@@ -858,7 +859,13 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // this generation unlinks its name without touching the prior generation's inode. Never
   // overwrites — a generation that already warmed its own tier keeps it.
   if *prior != final_dir {
-    for ann_file in ["ann.bin", "ann.files", "ann.stamp"] {
+    for ann_file in [
+      "ann.bin",
+      "ann.files",
+      "ann.model.bin",
+      "ann.model.json",
+      "ann.stamp",
+    ] {
       let from = prior.join(ann_file);
       let to = final_dir.join(ann_file);
       if from.exists() && !to.exists() && fs::hard_link(&from, &to).is_err() {
@@ -913,6 +920,9 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       ".refs.spill",
       "ann.bin",
       "ann.files",
+      "ann.model.bin",
+      "ann.model.json",
+      "ann.calib",
       "ann.stamp",
       "ann.build.lock",
       "products.pack.tmp",
@@ -954,11 +964,11 @@ fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
 
 /// Embed node `id`'s parts into `row` — the one embedding recipe (name double-weighted,
 /// signature, file basename) shared by the index build, the cold fallback, and the rerank.
-fn embed_node_into(kg: &Kg, embedder: &LexicalEmbedder, id: u64, row: &mut [f32]) {
+fn embed_node_into(kg: &Kg, embedder: &ActiveEmbedder, id: u64, row: &mut [f32]) {
   if let Some(view) = kg.node(NodeId::new(id)) {
     let basename = view.path.rsplit('/').next().unwrap_or(view.path);
     let parts = [view.name, view.name, view.signature, basename];
-    embedder.embed_parts_into(&parts, row);
+    embedder.embed_node_parts(&parts, row);
   } else {
     row.fill(0.0);
   }
@@ -1003,59 +1013,309 @@ fn active_embedder() -> LexicalEmbedder {
   LexicalEmbedder::default()
 }
 
+/// The build/query embedder, selected PER INDEX (docs/wip/SEMANTIC_TIER.md Stage 1):
+/// the deterministic lexical hasher is the default everywhere; the learned tier
+/// activates only through the `semantic.tier` selection file (build side) or a fully
+/// coherent persisted model (query side) — never silently, never mixed.
+pub enum ActiveEmbedder {
+  Lexical(LexicalEmbedder),
+  Learned(Box<LearnedStaticEmbedder>),
+}
+
+impl ActiveEmbedder {
+  pub fn dim(&self) -> usize {
+    match self {
+      ActiveEmbedder::Lexical(lexical) => lexical.dim(),
+      ActiveEmbedder::Learned(learned) => learned.dim(),
+    }
+  }
+
+  pub fn embed(&self, text: &str) -> Vec<f32> {
+    match self {
+      ActiveEmbedder::Lexical(lexical) => lexical.embed(text),
+      ActiveEmbedder::Learned(learned) => learned.embed(text),
+    }
+  }
+
+  pub fn provenance(&self) -> ModelProvenance {
+    match self {
+      ActiveEmbedder::Lexical(lexical) => lexical.provenance(),
+      ActiveEmbedder::Learned(learned) => learned.provenance(),
+    }
+  }
+
+  fn tier_label(&self) -> &'static str {
+    match self {
+      ActiveEmbedder::Lexical(_) => "lexical",
+      ActiveEmbedder::Learned(_) => "learned",
+    }
+  }
+
+  /// Embed one node's parts (the [`embed_node_into`] recipe). The lexical hasher takes
+  /// the zero-alloc parts path; the learned model embeds the space-joined surface
+  /// (part boundaries are token boundaries under the shared tokenizer either way).
+  fn embed_node_parts(&self, parts: &[&str], out: &mut [f32]) {
+    match self {
+      ActiveEmbedder::Lexical(lexical) => lexical.embed_parts_into(parts, out),
+      ActiveEmbedder::Learned(learned) => {
+        let joined = parts.join(" ");
+        learned.model().embed_text(&joined, out);
+      }
+    }
+  }
+}
+
+/// The per-index semantic-tier selection, persisted at `<root>/semantic.tier`. Written
+/// only by index-shaped commands (CLI/MCP `index`, `vorpal-index index`); the warm
+/// child, the daemon, and every query path are pure READERS — no env var, no
+/// process-global (an env would be the hijack surface autowarm's argv sentinel exists
+/// to avoid; a global cannot serve one process holding many indexes). A missing file
+/// means lexical; an unreadable or unknown file is a typed error, never a silent
+/// default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SemanticTier {
+  Lexical,
+  Learned,
+}
+
+impl SemanticTier {
+  pub fn label(self) -> &'static str {
+    match self {
+      SemanticTier::Lexical => "lexical",
+      SemanticTier::Learned => "learned",
+    }
+  }
+}
+
+/// Read `<root>/semantic.tier` (see [`SemanticTier`]).
+pub fn tier_selection(index_root: &Path) -> Result<SemanticTier, Box<dyn Error>> {
+  let path = index_root.join("semantic.tier");
+  let text = match fs::read_to_string(&path) {
+    Ok(text) => text,
+    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SemanticTier::Lexical),
+    Err(error) => return Err(format!("reading {}: {error}", path.display()).into()),
+  };
+  let value: serde_json::Value = serde_json::from_str(&text)
+    .map_err(|error| format!("unparseable {}: {error}", path.display()))?;
+  match value.get("tier").and_then(|tier| tier.as_str()) {
+    Some("lexical") => Ok(SemanticTier::Lexical),
+    Some("learned") => Ok(SemanticTier::Learned),
+    other => Err(format!("unknown semantic tier {other:?} in {}", path.display()).into()),
+  }
+}
+
+/// Persist the tier selection at `<root>/semantic.tier` (tmp + rename).
+pub fn write_tier_selection(index_root: &Path, tier: SemanticTier) -> Result<(), Box<dyn Error>> {
+  // Selection legitimately precedes the first build (every writer is an index-shaped
+  // command that writes BEFORE building) — the root may not exist yet.
+  fs::create_dir_all(index_root)?;
+  let tmp = index_root.join("semantic.tier.tmp");
+  fs::write(&tmp, format!("{{\"tier\":\"{}\"}}\n", tier.label()))?;
+  fs::rename(&tmp, index_root.join("semantic.tier"))?;
+  Ok(())
+}
+
 /// The active embedding model's provenance — the public configuration contract: model id,
 /// dimensionality, normalization, semantics version, and whether weights are learned.
 pub fn model_provenance() -> ModelProvenance {
   active_embedder().provenance()
 }
 
-/// The provenance persisted beside `index_dir`'s vector tier, if any — what the tier's
-/// vectors were actually built with (may differ from [`model_provenance`] until a re-warm).
-pub fn persisted_model_provenance(index_dir: &Path) -> Option<ModelProvenance> {
-  let text = fs::read_to_string(vorpal_kg::resolve_index_dir(index_dir).join("ann.model.json")).ok()?;
+/// The full persisted tier record beside the vector artifacts: the embedding-model
+/// provenance, which tier built it, the model-file checksum for learned tiers, and an
+/// optional stated fallback note.
+struct PersistedTierRecord {
+  provenance: ModelProvenance,
+  tier: String,
+  weights_hash: Option<u128>,
+  /// Present exactly when the build STATED a fallback (learned selection, lexical
+  /// outcome) — the bit that distinguishes it from a deliberate lexical selection.
+  note: Option<String>,
+}
+
+fn persisted_tier_record(index_dir: &Path) -> Option<PersistedTierRecord> {
+  let text =
+    fs::read_to_string(vorpal_kg::resolve_index_dir(index_dir).join("ann.model.json")).ok()?;
   let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-  Some(ModelProvenance {
+  let provenance = ModelProvenance {
     model_id: value.get("model_id")?.as_str()?.to_string(),
     dim: value.get("dim")?.as_u64()? as usize,
     normalization: value.get("normalization")?.as_str()?.to_string(),
     version: value.get("version")?.as_u64()? as u32,
     learned: value.get("learned")?.as_bool()?,
+  };
+  // Files written by pre-tier builds carry no `tier` field: they are lexical by
+  // construction (the only embedder that existed).
+  let tier = value
+    .get("tier")
+    .and_then(|tier| tier.as_str())
+    .unwrap_or("lexical")
+    .to_string();
+  let weights_hash = match value.get("weights_hash") {
+    None | Some(serde_json::Value::Null) => None,
+    Some(serde_json::Value::String(hex)) => Some(u128::from_str_radix(hex, 16).ok()?),
+    Some(_) => return None,
+  };
+  let note = match value.get("note") {
+    None | Some(serde_json::Value::Null) => None,
+    Some(serde_json::Value::String(note)) => Some(note.clone()),
+    Some(_) => return None,
+  };
+  Some(PersistedTierRecord {
+    provenance,
+    tier,
+    weights_hash,
+    note,
   })
 }
 
-/// Persist the active model's provenance beside the tier — written before the stamp commit,
-/// so a committed stamp always implies readable provenance. Canonical field order keeps the
-/// file byte-reproducible.
-fn write_model_provenance(index_dir: &Path, provenance: &ModelProvenance) -> io::Result<()> {
+/// The provenance persisted beside `index_dir`'s vector tier, if any — what the tier's
+/// vectors were actually built with (may differ from [`model_provenance`] until a re-warm).
+pub fn persisted_model_provenance(index_dir: &Path) -> Option<ModelProvenance> {
+  persisted_tier_record(index_dir).map(|record| record.provenance)
+}
+
+/// Persist the tier record — written before the stamp commit, so a committed stamp
+/// always implies a readable record. Canonical field order keeps the file
+/// byte-reproducible; `note` appears only on stated fallbacks.
+fn write_model_provenance(
+  index_dir: &Path,
+  provenance: &ModelProvenance,
+  tier: &str,
+  weights_hash: Option<u128>,
+  note: Option<&str>,
+) -> io::Result<()> {
+  let weights = match weights_hash {
+    Some(hash) => format!("\"{hash:032x}\""),
+    None => "null".to_string(),
+  };
+  let note_field = match note {
+    Some(text) => format!(",\"note\":{}", serde_json::Value::String(text.to_string())),
+    None => String::new(),
+  };
   let json = format!(
-    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{}}}\n",
+    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{},\"tier\":{},\"weights_hash\":{}{}}}\n",
     serde_json::Value::String(provenance.model_id.clone()),
     provenance.dim,
     serde_json::Value::String(provenance.normalization.clone()),
     provenance.version,
-    provenance.learned
+    provenance.learned,
+    serde_json::Value::String(tier.to_string()),
+    weights,
+    note_field,
   );
   let tmp = index_dir.join("ann.model.json.tmp");
   fs::write(&tmp, json)?;
   fs::rename(tmp, index_dir.join("ann.model.json"))
 }
 
-/// Whether the persisted vector tier matches `current_stamp` (and this build's format and
-/// embedder shape). Read-only — never blocks on, or triggers, a build.
-fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
-  fs::read(index_dir.join("ann.stamp"))
+/// Verify `ann.model.bin`'s sealed checksum equals both its own trailer and the
+/// recorded hash — WITHOUT constructing the model (the freshness-gate path).
+fn model_file_checksum_ok(path: &Path, expected: u128) -> bool {
+  let Ok(bytes) = fs::read(path) else {
+    return false;
+  };
+  if bytes.len() < 16 {
+    return false;
+  }
+  // Header compatibility FIRST (magic + format version, no deserialization): a
+  // checksum-intact file of an older format version must read as stale — otherwise a
+  // version bump wedges the tier ("fresh" to the builder, unloadable to every query,
+  // so no warm ever retrains it).
+  if !vorpal_ann::learned::model_bytes_compatible(&bytes) {
+    return false;
+  }
+  let body = bytes.len() - 16;
+  let Ok(trailer) = <[u8; 16]>::try_from(&bytes[body..]) else {
+    return false;
+  };
+  let stored = u128::from_le_bytes(trailer);
+  stored == expected && xxhash_rust::xxh3::xxh3_128(&bytes[..body]) == stored
+}
+
+/// Query-side coherence: are the persisted vector artifacts internally consistent for
+/// `current_stamp` — stamp file, bin header, tier record, and (learned) the model file
+/// verified against the recorded checksum? Returns the embedder the tier was BUILT
+/// with, so the handle queries through exactly that model: mixing embedders in one
+/// pool is structurally impossible. Read-only; never triggers a build.
+fn coherent_persisted_embedder(index_dir: &Path, current_stamp: u64) -> Option<ActiveEmbedder> {
+  let stamp_ok = fs::read(index_dir.join("ann.stamp"))
     .ok()
     .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
-    .is_some_and(|stored| stored == current_stamp)
-    // The bin's own header must carry the same generation: a rebuild window can rename the
-    // new bin before the new stamp lands, and the stamp file alone cannot see that.
-    && AnnIndex::peek_header(&index_dir.join("ann.bin"))
-      .is_some_and(|(bin_dim, bin_stamp)| bin_dim == dim && bin_stamp == current_stamp)
-    // Model-provenance gate (IMPROVEMENTS #9): the tier's vectors must have been built by
-    // exactly the active model — id, dim, normalization, semantics version, learned flag.
-    // Missing/foreign provenance (tiers warmed by older builds) reads as stale, which routes
-    // queries to the exact fallback and lets the next warm rebuild under the active model.
-    && persisted_model_provenance(index_dir).as_ref() == Some(&active_embedder().provenance())
+    .is_some_and(|stored| stored == current_stamp);
+  if !stamp_ok {
+    return None;
+  }
+  let record = persisted_tier_record(index_dir)?;
+  // The bin's own header must carry the same generation AND the record's dimension: a
+  // rebuild window can rename the new bin before the new stamp lands, and a carried-
+  // forward bin under a changed model must never pass.
+  let (bin_dim, bin_stamp) = AnnIndex::peek_header(&index_dir.join("ann.bin"))?;
+  if bin_stamp != current_stamp || bin_dim != record.provenance.dim {
+    return None;
+  }
+  match record.tier.as_str() {
+    "lexical" => {
+      let lexical = LexicalEmbedder::default();
+      (record.provenance == lexical.provenance()).then_some(ActiveEmbedder::Lexical(lexical))
+    }
+    "learned" => {
+      let expected = record.weights_hash?;
+      let path = index_dir.join("ann.model.bin");
+      let (model, stored) = load_model(&path).ok()?;
+      if stored != expected || model.dim != record.provenance.dim {
+        return None;
+      }
+      let learned = LearnedStaticEmbedder::new(model);
+      (record.provenance == learned.provenance())
+        .then(|| ActiveEmbedder::Learned(Box::new(learned)))
+    }
+    _ => None,
+  }
+}
+
+/// Build-side freshness: coherent artifacts AND the persisted tier matches the
+/// selection (a tier flip is staleness — the next warm rebuilds under the selected
+/// model). The learned check verifies the model file's checksum without loading it.
+fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -> bool {
+  let stamp_ok = fs::read(index_dir.join("ann.stamp"))
+    .ok()
+    .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
+    .is_some_and(|stored| stored == current_stamp);
+  if !stamp_ok {
+    return false;
+  }
+  let Some(record) = persisted_tier_record(index_dir) else {
+    return false;
+  };
+  let header_ok = AnnIndex::peek_header(&index_dir.join("ann.bin"))
+    .is_some_and(|(bin_dim, bin_stamp)| bin_dim == record.provenance.dim && bin_stamp == current_stamp);
+  if !header_ok {
+    return false;
+  }
+  match record.tier.as_str() {
+    // The record must describe EXACTLY the (selection, outcome) pair. A lexical record
+    // satisfies a Lexical selection only without a fallback note (a lingering note
+    // would misdescribe a deliberate selection), and satisfies a Learned selection
+    // only WITH one — the stated small-corpus fallback, which rebuilding cannot help
+    // until content changes (re-warms retry naturally then). The note split is what
+    // lets a deliberate lexical→learned flip retrain instead of no-op'ing.
+    "lexical" => {
+      record.provenance == LexicalEmbedder::default().provenance()
+        && match selection {
+          SemanticTier::Lexical => record.note.is_none(),
+          SemanticTier::Learned => record.note.is_some(),
+        }
+    }
+    "learned" => {
+      selection == SemanticTier::Learned
+        && record.provenance.learned
+        && record
+          .weights_hash
+          .is_some_and(|expected| model_file_checksum_ok(&index_dir.join("ann.model.bin"), expected))
+    }
+    _ => false,
+  }
 }
 
 /// Build the ANN tier iff its stamp no longer matches the persisted graph (or it does not
@@ -1065,6 +1325,10 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, dim: usize) -> bool {
 /// build; a search that arrives mid-build serializes on the same lock and proceeds the
 /// moment the tier is fresh.
 pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+  // The tier selection lives at the ROOT (it survives generations); read it before
+  // resolving. A caller handing a raw generation dir gets the lexical default — only
+  // index-shaped commands write selections, and they operate on roots.
+  let selection = tier_selection(index_dir)?;
   // Warm the generation CURRENT names right now; its artifacts land inside that generation
   // (the ANN tier is the one stamp-validated sidecar an existing generation admits). If a
   // rebuild supersedes it mid-warm, the work is simply for a generation about to retire —
@@ -1085,10 +1349,10 @@ pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   let Ok(_guard) = lock.try_write() else {
     return Ok(());
   };
-  ensure_ann(index_dir)
+  ensure_ann(index_dir, selection)
 }
 
-fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn Error>> {
   // One build at a time **per index directory**: an eager background warm and a foreground
   // search on the same index must not both build (duplicate work, racing writes), but a
   // host serving several indexes warms them concurrently — the old process-wide mutex
@@ -1110,28 +1374,60 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   // actually embedded, even if `nodes.vseg` is replaced underneath us mid-decision.
   let kg = Kg::load(index_dir)?;
   let current = stamp_of(&kg);
-  if ann_is_fresh(index_dir, current, active_embedder().dim()) {
+  if ann_is_fresh(index_dir, current, selection) {
     // The vector tier is current, but the lexical tier heals independently (it can be
     // missing on indexes warmed by older builds, or after a partial cleanup).
     if !postings::postings_are_fresh(index_dir, current) {
       postings::build_postings(&kg, index_dir, current)?;
     }
     ensure_communities(&kg, index_dir, current)?;
-    // The engine calibration heals independently too (older warms never measured one).
+    // The engine calibration heals independently too (older warms never measured one)
+    // — probing through the embedder the persisted tier was actually built with.
     if load_ann_calibration(index_dir, current, kg.node_count()).is_none()
       && let Ok(ann) = AnnIndex::load(&index_dir.join("ann.bin"))
+      && let Some(embedder) = coherent_persisted_embedder(index_dir, current)
     {
-      let crossover = calibrate_semantic_cutover(&kg, &ann, active_embedder().dim());
+      let crossover = calibrate_semantic_cutover(&kg, &ann, &embedder);
       write_ann_calibration(index_dir, current, crossover)?;
     }
     return Ok(());
   }
-  build_ann(&kg, index_dir, current).map_err(|err| err as Box<dyn Error>)?;
-  // Commit order: ann.bin → ann.files (both inside build_ann) → ann.model.json → ann.stamp.
-  // The stamp is the commit point (so a committed tier always has readable provenance); a
-  // crash anywhere earlier leaves a mismatch that routes searches to the exhaustive
-  // fallback until the next warm heals it.
-  write_model_provenance(index_dir, &active_embedder().provenance())?;
+  // Build under the SELECTED tier. A learned selection whose corpus is below the
+  // learned tier's floor falls back to lexical with the reason STATED in the persisted
+  // record — never a silent zero.
+  let (embedder, note) = match selection {
+    SemanticTier::Lexical => (ActiveEmbedder::Lexical(LexicalEmbedder::default()), None),
+    SemanticTier::Learned => match train_learned_model(&kg, index_dir) {
+      Ok(learned) => (ActiveEmbedder::Learned(Box::new(learned)), None),
+      Err(reason) => (
+        ActiveEmbedder::Lexical(LexicalEmbedder::default()),
+        Some(format!("learned tier fell back to lexical: {reason}")),
+      ),
+    },
+  };
+  build_ann(&kg, index_dir, current, &embedder).map_err(|err| err as Box<dyn Error>)?;
+  // Commit order: ann.bin → ann.files (both inside build_ann) → ann.model.bin →
+  // ann.model.json → ann.stamp. The stamp is the commit point (a committed tier always
+  // has a readable record); a crash anywhere earlier leaves a mismatch that routes
+  // searches to the exhaustive fallback until the next warm heals it.
+  let weights_hash = match &embedder {
+    ActiveEmbedder::Learned(learned) => {
+      Some(save_model(learned.model(), &index_dir.join("ann.model.bin"))?)
+    }
+    ActiveEmbedder::Lexical(_) => {
+      // A lexical build leaves no model file behind: a stale ann.model.bin beside a
+      // lexical record would be dead weight the coherence gate ignores — remove it.
+      let _ = fs::remove_file(index_dir.join("ann.model.bin"));
+      None
+    }
+  };
+  write_model_provenance(
+    index_dir,
+    &embedder.provenance(),
+    embedder.tier_label(),
+    weights_hash,
+    note.as_deref(),
+  )?;
   let stamp_path = index_dir.join("ann.stamp");
   let stamp_tmp = index_dir.join("ann.stamp.tmp");
   fs::write(&stamp_tmp, current.to_le_bytes())?;
@@ -1144,11 +1440,59 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   }
   ensure_communities(&kg, index_dir, current)?;
   // Calibrate the semantic-engine crossover on the just-built tier — measured on this
-  // machine over this index's rows (see `calibrate_semantic_cutover`).
+  // machine over this index's rows, through the tier's own embedder.
   let ann = AnnIndex::load(&index_dir.join("ann.bin"))?;
-  let crossover = calibrate_semantic_cutover(&kg, &ann, active_embedder().dim());
+  let crossover = calibrate_semantic_cutover(&kg, &ann, &embedder);
   write_ann_calibration(index_dir, current, crossover)?;
   Ok(())
+}
+
+/// Seed of the learned training run — an IDENTIFIER of the deterministic protocol
+/// (like the Vamana build seed), not a tuned quantity: any fixed value defines a valid
+/// deterministic pipeline.
+const LEARNED_TRAIN_SEED: u64 = 1;
+
+/// Train the Tier-1 model over this generation's node surfaces (the same
+/// name/signature/basename recipe the embedder hashes; Imports excluded like the row
+/// set), with bounded-memory resources derived from the machine and corpus probes. The
+/// training scratch lives inside the generation dir, swept before and removed after —
+/// the scratch lifecycle law.
+fn train_learned_model(kg: &Kg, index_dir: &Path) -> Result<LearnedStaticEmbedder, String> {
+  let scratch = index_dir.join("train.scratch");
+  let _ = fs::remove_dir_all(&scratch);
+  fs::create_dir_all(&scratch).map_err(|e| format!("creating {}: {e}", scratch.display()))?;
+  let policy = vorpal_mem::ResourcePolicy::new(
+    vorpal_mem::HardwareProbe::detect(),
+    vorpal_mem::CorpusProbe::new(kg.node_segment_bytes().len() as u64, kg.node_count() as u64),
+  );
+  let resources = TrainResources {
+    scratch_dir: scratch.clone(),
+    page_bytes: policy.hardware().base_page_bytes,
+    arena_chunk_bytes: policy.arena_chunk_bytes(kg.node_segment_bytes().len() as u64),
+    // Training sub-steps land in the same phase-stamp stream as every warm phase
+    // (`VORPAL_PHASE_TRACE=1`) — the kernel-scale attribution discipline.
+    progress: vorpal_kg::phase_stamp,
+  };
+  let corpus = |callback: &mut dyn FnMut(&[String])| {
+    for id in 0..kg.node_count() as u64 {
+      let Some(view) = kg.node(NodeId::new(id)) else {
+        continue;
+      };
+      if view.kind == vorpal_kg::SymbolKind::Import {
+        continue;
+      }
+      let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+      let mut doc = tokenize(view.name);
+      doc.extend(tokenize(view.signature));
+      doc.extend(tokenize(basename));
+      callback(&doc);
+    }
+  };
+  vorpal_kg::phase_stamp("ann: train start");
+  let (model, _report) = LearnedModel::train(&corpus, LEARNED_TRAIN_SEED, &resources)?;
+  vorpal_kg::phase_stamp("ann: train done");
+  let _ = fs::remove_dir_all(&scratch);
+  Ok(LearnedStaticEmbedder::new(model))
 }
 
 /// The community sidecar warms beside the search tiers: same stamp discipline, same
@@ -1181,16 +1525,20 @@ fn ensure_communities(kg: &Kg, index_dir: &Path, current: u64) -> Result<(), Box
   Ok(())
 }
 
-fn build_ann(kg: &Kg, out: &Path, base_stamp: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn build_ann(
+  kg: &Kg,
+  out: &Path,
+  base_stamp: u64,
+  embedder: &ActiveEmbedder,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
   vorpal_kg::phase_stamp("ann: build start");
-  let embedder = active_embedder();
   let dim = embedder.dim();
   let ids = semantic_row_ids(kg);
   let row_ids = ids.clone();
   // Rows embed straight into the index's storage (i8 codes at scale, in parallel): the
   // full-precision matrix never materializes — 2.9 GB of pure transient at kernel scale.
   let index = AnnIndex::build_rows(dim, ids, |i, row| {
-    embed_node_into(kg, &embedder, row_ids[i], row)
+    embed_node_into(kg, embedder, row_ids[i], row)
   });
   vorpal_kg::phase_stamp("ann: save start");
   index
@@ -1384,7 +1732,8 @@ const ANN_CALIB_MAGIC: &[u8; 4] = b"VCAL";
 /// scan reference — early exit keeps probing cheap by construction, because every probe
 /// before the crossover is below the crossover. No crossing before `node_count` → the
 /// structural floor stands.
-fn calibrate_semantic_cutover(kg: &Kg, ann: &AnnIndex, dim: usize) -> usize {
+fn calibrate_semantic_cutover(kg: &Kg, ann: &AnnIndex, embedder: &ActiveEmbedder) -> usize {
+  let dim = embedder.dim();
   let node_count = kg.node_count();
   let rows = semantic_row_ids(kg);
   if rows.is_empty() || node_count == 0 {
@@ -1417,18 +1766,30 @@ fn calibrate_semantic_cutover(kg: &Kg, ann: &AnnIndex, dim: usize) -> usize {
     samples.sort_by(f64::total_cmp);
     samples.get(samples.len() / 2).copied().unwrap_or(0.0)
   };
-  let embedder = active_embedder();
   let mut scan_samples = Vec::new();
   for _ in 0..3 {
     for query in &queries {
       let started = std::time::Instant::now();
-      std::hint::black_box(vorpal_ann::exhaustive_semantic(
-        dim,
-        &rows,
-        |i, row| embed_node_into(kg, &embedder, rows[i], row),
-        query,
-        1,
-      ));
+      // Measure the tier's PRODUCTION exhaustive engine, mirroring `channel_lists`'s
+      // dispatch exactly: the learned tier walks the persisted codes (a full-population
+      // re-embed through the model measured 191 s of a 405 s kernel warm before this
+      // split); the lexical tier re-embeds (hash-cheap, byte-exact). A learned FLAT
+      // tier has no codes and falls through to the re-embed scan — exactly what its
+      // queries pay.
+      let code_walk = match embedder {
+        ActiveEmbedder::Learned(_) => ann.scan_codes(query, 1, |_| true),
+        ActiveEmbedder::Lexical(_) => None,
+      };
+      if code_walk.is_none() {
+        std::hint::black_box(vorpal_ann::exhaustive_semantic(
+          dim,
+          &rows,
+          |i, row| embed_node_into(kg, embedder, rows[i], row),
+          query,
+          1,
+        ));
+      }
+      std::hint::black_box(code_walk);
       scan_samples.push(started.elapsed().as_secs_f64());
     }
   }
@@ -1826,6 +2187,11 @@ pub struct Searcher {
   ann: Option<AnnIndex>,
   /// The persisted lexical posting tier — present only when its stamp matches this generation.
   postings: Option<postings::Postings>,
+  /// The embedder this handle queries with — the PERSISTED tier's model when coherent
+  /// (learned models checksum-verified at open), else the lexical default. Every query
+  /// vector, overlay embed, and rerank goes through it, so vectors from different
+  /// models can never meet in one pool.
+  embedder: ActiveEmbedder,
   /// Fetch width at/above which the semantic channel takes the flat exact scan instead
   /// of the beam. LEARNED at warm time from the ingested index on the running machine
   /// (`ann.calib`); an absent/stale/torn calibration falls back to the structural floor
@@ -1846,11 +2212,24 @@ impl Searcher {
     let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
     let kg = Kg::load(&generation_dir)?;
     let stamp = stamp_of(&kg);
-    let dim = active_embedder().dim();
-    let ann = if ann_is_fresh(&generation_dir, stamp, dim) {
-      AnnIndex::load(&generation_dir.join("ann.bin")).ok()
-    } else {
-      None
+    // The handle queries through EXACTLY the embedder the persisted tier was built
+    // with (coherence-verified; learned models checksum-verified); incoherent or
+    // absent artifacts fall back to the lexical default over the exact paths.
+    let (ann, embedder) = match coherent_persisted_embedder(&generation_dir, stamp) {
+      Some(embedder) => {
+        let ann = AnnIndex::load(&generation_dir.join("ann.bin")).ok();
+        // A LEARNED tier is servable only WITH its ann tier: exhaustive fallbacks
+        // under the model would re-embed the population per query (minutes at kernel
+        // scale, measured) — a torn/unloadable ann.bin under a learned record routes
+        // the whole handle to the lexical default over the exact paths instead.
+        match (&ann, &embedder) {
+          (None, ActiveEmbedder::Learned(_)) => {
+            (None, ActiveEmbedder::Lexical(LexicalEmbedder::default()))
+          }
+          _ => (ann, embedder),
+        }
+      }
+      None => (None, ActiveEmbedder::Lexical(LexicalEmbedder::default())),
     };
     let postings = postings::Postings::load(&generation_dir).filter(|p| p.stamp() == stamp);
     let semantic_cutover =
@@ -1860,6 +2239,7 @@ impl Searcher {
       kg,
       ann,
       postings,
+      embedder,
       semantic_cutover,
       exact_only: false,
     })
@@ -1875,12 +2255,18 @@ impl Searcher {
   pub fn open_exact(index_dir: &Path) -> Result<Searcher, Box<dyn Error>> {
     let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
     let kg = Kg::load(&generation_dir)?;
+    let stamp = stamp_of(&kg);
+    // The reference path embeds with the persisted tier's model when one is coherent
+    // (so exact answers stay comparable to tier answers), else the lexical default.
+    let embedder = coherent_persisted_embedder(&generation_dir, stamp)
+      .unwrap_or_else(|| ActiveEmbedder::Lexical(LexicalEmbedder::default()));
     let semantic_cutover = kg.node_count();
     Ok(Searcher {
       generation_dir,
       kg,
       ann: None,
       postings: None,
+      embedder,
       semantic_cutover,
       exact_only: true,
     })
@@ -2184,7 +2570,9 @@ impl Searcher {
     let kg = &self.kg;
     let index_dir = self.generation_dir.as_path();
     let compiled_filter = CompiledSearchFilter::compile(filter)?;
-    let embedder = active_embedder();
+    // The handle's embedder — the persisted tier's own model (see `Searcher::open`),
+    // so query vectors, overlay embeds, and the rerank always match the stored rows.
+    let embedder = &self.embedder;
     let query_vec = embedder.embed(query);
 
   // Semantic candidate pool, by tier — a search NEVER waits on an ANN build:
@@ -2215,6 +2603,12 @@ impl Searcher {
     /// `(dist, id)` total order the rerank would produce — re-embedding them would
     /// re-derive byte-identical results, so the rerank is skipped.
     Exact(Vec<(u64, f32)>),
+    /// From the persisted code walk (LEARNED tier): complete over the admitted
+    /// population and ordered by the beam's own code-space distance
+    /// ([`AnnIndex::scan_codes`]) — full precision re-scores winners and bounded
+    /// pools, never n rows through the model. Distances (and the
+    /// [`POSITIVE_BOUNDARY`] trim they feed) are the same algebra at code precision.
+    Quantized(Vec<(u64, f32)>),
   }
   let candidates: SemanticCandidates = if !take_exhaustive && let Some(ann) = &self.ann {
     SemanticCandidates::Approx(
@@ -2224,7 +2618,13 @@ impl Searcher {
         .map(|(id, _)| id)
         .collect(),
     )
-  } else if let Some(overlay) = (!take_exhaustive && !self.exact_only)
+  } else if let Some(overlay) = (!take_exhaustive
+    && !self.exact_only
+    // Provenance gap fix (the mixing hazard found in planning): a carried-forward
+    // ann.bin under a CHANGED model must never assemble — the overlay only exists
+    // when the persisted record matches the embedder this handle queries with, and
+    // overlay rows embed through that same embedder below.
+    && persisted_model_provenance(index_dir).as_ref() == Some(&embedder.provenance()))
     .then(|| annfiles::OverlayView::assemble(index_dir, kg, embedder.dim()))
     .flatten()
   {
@@ -2239,7 +2639,7 @@ impl Searcher {
     let overlay_hits = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &overlay.overlay_ids,
-      |i, row| embed_node_into(kg, &embedder, overlay.overlay_ids[i], row),
+      |i, row| embed_node_into(kg, embedder, overlay.overlay_ids[i], row),
       &query_vec,
       take,
     );
@@ -2255,19 +2655,41 @@ impl Searcher {
     if !self.exact_only && self.ann.is_none() {
       autowarm::maybe_spawn(index_dir);
     }
-    let mut ids = semantic_row_ids(kg);
-    // The exhaustive path filters BEFORE scoring: exact recall over exactly the admitted
-    // population, no overfetch slack needed.
-    if !filter.is_empty() {
-      ids.retain(|&id| compiled_filter.admits(kg, id));
+    // Under the LEARNED tier a full-population re-embed is unaffordable (the model
+    // pools subwords per token — measured: calibration's scan probes alone cost 191 s
+    // of a 405 s kernel warm), so exhaustive fetches walk the persisted i8 codes:
+    // the same distance the beam ranks by, complete over the admitted population,
+    // full precision returning for bounded pools and winners. `Searcher::open`
+    // guarantees a learned handle carries its ann tier, so the walk is available
+    // wherever it matters (flat tiers fall through — they exist only at sizes where
+    // the re-embed scan is cheap). The exact-only reference seam still re-embeds:
+    // it IS the full-precision truth, cost accepted.
+    let quantized = match (&self.embedder, &self.ann) {
+      (ActiveEmbedder::Learned(_), Some(ann)) if !self.exact_only => ann.scan_codes(
+        &query_vec,
+        take,
+        |id| filter.is_empty() || compiled_filter.admits(kg, id),
+      ),
+      _ => None,
+    };
+    match quantized {
+      Some(scored) => SemanticCandidates::Quantized(scored),
+      None => {
+        let mut ids = semantic_row_ids(kg);
+        // The exhaustive path filters BEFORE scoring: exact recall over exactly the
+        // admitted population, no overfetch slack needed.
+        if !filter.is_empty() {
+          ids.retain(|&id| compiled_filter.admits(kg, id));
+        }
+        SemanticCandidates::Exact(vorpal_ann::exhaustive_semantic(
+          embedder.dim(),
+          &ids,
+          |i, row| embed_node_into(kg, embedder, ids[i], row),
+          &query_vec,
+          take,
+        ))
+      }
     }
-    SemanticCandidates::Exact(vorpal_ann::exhaustive_semantic(
-      embedder.dim(),
-      &ids,
-      |i, row| embed_node_into(kg, &embedder, ids[i], row),
-      &query_vec,
-      take,
-    ))
   };
 
   // Exactly order the pool as (distance, id). Approximate candidates are re-embedded at
@@ -2278,7 +2700,10 @@ impl Searcher {
   // re-deriving them would be pure duplicate work at full-population sizes.
   let (semantic, semantic_dist2): (Vec<u64>, Vec<f32>) = {
     let mut scored: Vec<(f32, u64)> = match candidates {
-      SemanticCandidates::Exact(scored) => {
+      // Quantized lists arrive complete and ordered by the code-space distance the
+      // beam itself ranks by; re-embedding them here would put n rows through the
+      // model — full precision instead re-scores the bounded winners downstream.
+      SemanticCandidates::Exact(scored) | SemanticCandidates::Quantized(scored) => {
         scored.into_iter().map(|(id, dist)| (dist, id)).collect()
       }
       SemanticCandidates::Approx(ids) => {
@@ -2287,7 +2712,7 @@ impl Searcher {
           .filter(|&id| filter.is_empty() || compiled_filter.admits(kg, id))
           .map(|id| {
             let mut row = vec![0.0f32; embedder.dim()];
-            embed_node_into(kg, &embedder, id, &mut row);
+            embed_node_into(kg, embedder, id, &mut row);
             // The ONE shared distance tree (vorpal_ann::l2_sq — lane-decomposed SIMD,
             // bit-deterministic): the exhaustive arm's rerank-skip is sound only
             // because scan and rerank distances agree bit-for-bit.
@@ -2562,10 +2987,12 @@ pub mod bench {
     super::semantic_row_ids(kg)
   }
 
-  /// Embed one node exactly as production does (name ×2, signature, basename) — the
-  /// sweep must time the real fill cost, never a drifted replica.
+  /// Embed one node exactly as production does under the DEFAULT (lexical) model —
+  /// the sweep must time the real fill cost, never a drifted replica. (Learned-tier
+  /// fill costs are the training/warm phase stamps' business.)
   pub fn embed_row(kg: &Kg, id: u64, row: &mut [f32]) {
-    super::embed_node_into(kg, &super::active_embedder(), id, row);
+    let embedder = super::ActiveEmbedder::Lexical(super::active_embedder());
+    super::embed_node_into(kg, &embedder, id, row);
   }
 
   /// A query embedding, as production computes it.
@@ -2577,16 +3004,13 @@ pub mod bench {
     super::active_embedder().dim()
   }
 
-  /// True iff the persisted ann tier is fresh for this index — the sweep refuses stale
+  /// True iff the persisted ann tier is coherent for this index (stamp, header, tier
+  /// record, and — learned — the checksum-verified model) — the sweep refuses stale
   /// tiers so it can never silently time the wrong engine.
   pub fn ann_tier_fresh(index_dir: &Path) -> Result<bool, Box<dyn Error>> {
     let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
     let kg = Kg::load(&generation_dir)?;
-    Ok(super::ann_is_fresh(
-      &generation_dir,
-      super::stamp_of(&kg),
-      super::active_embedder().dim(),
-    ))
+    Ok(super::coherent_persisted_embedder(&generation_dir, super::stamp_of(&kg)).is_some())
   }
 }
 

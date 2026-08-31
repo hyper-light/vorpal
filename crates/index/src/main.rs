@@ -33,7 +33,7 @@ mod jemalloc_conf {
 use vorpal_index::search_index;
 
 const USAGE: &str = "usage:
-  vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F]
+  vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F] [--semantic-tier lexical|learned]
                                                     build + persist a knowledge graph
   vorpal-index export       <index-root> <file.vidx>  pack the live generation into one shareable artifact
   vorpal-index import       <file.vidx> <index-root>  verify + install an exported generation (atomic CURRENT swap)
@@ -91,6 +91,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ["index", src, out, rest @ ..] => {
       let mut mode = vorpal_index::CacheMode::default();
       let mut policy = vorpal_index::ParseHealthPolicy::default();
+      let mut semantic_tier: Option<vorpal_index::SemanticTier> = None;
       let mut flags = rest.iter();
       while let Some(flag) = flags.next() {
         match *flag {
@@ -113,8 +114,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
               .and_then(|v| v.parse().ok())
               .ok_or("--max-error-ratio wants a number in [0,1]")?;
           }
+          "--semantic-tier" => {
+            semantic_tier = Some(match flags.next().copied() {
+              Some("lexical") => vorpal_index::SemanticTier::Lexical,
+              Some("learned") => vorpal_index::SemanticTier::Learned,
+              other => {
+                return Err(format!("--semantic-tier wants lexical|learned, got {other:?}").into());
+              }
+            });
+          }
           other => return Err(format!("unknown flag '{other}'\n{USAGE}").into()),
         }
+      }
+      if let Some(tier) = semantic_tier {
+        vorpal_index::write_tier_selection(Path::new(out), tier)?;
+        println!("semantic tier selection: {}", tier.label());
       }
       let report =
         vorpal_index::build_index_full(Path::new(src), Path::new(out), mode, policy)?;

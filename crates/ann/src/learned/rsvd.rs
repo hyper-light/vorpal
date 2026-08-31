@@ -242,76 +242,198 @@ impl SymmetricCsr {
   }
 }
 
-/// Fixed-order parallel dot product: the explicit-SIMD wide-dot kernel inside fixed
-/// blocks (one rounding tree on every architecture — see `crate::kernels`), block
-/// partials combined serially — the same bits at any thread count on any machine.
-fn det_dot(a: &[f32], b: &[f32]) -> f64 {
-  let partials: Vec<f64> = a
-    .par_chunks(REDUCTION_BLOCK)
-    .zip(b.par_chunks(REDUCTION_BLOCK))
-    .map(|(xa, xb)| crate::kernels::dot_wide(xa, xb))
-    .collect();
-  partials.iter().sum()
-}
-
-/// Column view helpers over a row-major n×k block.
-fn column_copy(block: &[f32], k: usize, column: usize, out: &mut [f32]) {
-  for (row, slot) in out.iter_mut().enumerate() {
-    *slot = block[row * k + column];
-  }
-}
-
-fn column_store(block: &mut [f32], k: usize, column: usize, data: &[f32]) {
-  for (row, &value) in data.iter().enumerate() {
-    block[row * k + column] = value;
-  }
-}
-
-/// Modified Gram–Schmidt orthonormalization of the k columns of a row-major n×k block,
-/// in place, RANK-REVEALING: a dependent column (residual below f32 representability
-/// relative to that column's own pre-projection norm — the storage precision defines
-/// what counts as signal) is dropped and survivors compact left, still at stride k.
-/// Returns the independent-column count. A rank-deficient matrix thereby yields its
-/// ENTIRE numerical range exactly — HMT's range-finder semantics; small corpora are
-/// routinely rank-deficient and must factor, never error. Zero surviving columns (the
-/// zero matrix) is the only failure. Deterministic: columns in order, `det_dot` trees.
-fn orthonormalize(block: &mut [f32], n: usize, k: usize) -> Result<usize, String> {
-  let mut current = vec![0.0f32; n];
-  let mut earlier = vec![0.0f32; n];
-  let mut kept = 0usize;
-  for column in 0..k {
-    column_copy(block, k, column, &mut current);
-    let original = det_dot(&current, &current).sqrt();
-    for prior in 0..kept {
-      column_copy(block, k, prior, &mut earlier);
-      let projection = det_dot(&current, &earlier);
-      current
-        .par_chunks_mut(REDUCTION_BLOCK)
-        .zip(earlier.par_chunks(REDUCTION_BLOCK))
-        .for_each(|(cur, ear)| {
-          for (c, e) in cur.iter_mut().zip(ear) {
-            *c -= (projection * *e as f64) as f32;
-          }
-        });
+/// Serial chunk-order fold of per-chunk partial vectors — the ONE combine order every
+/// parallel sweep below shares, so their bits are invariant to thread count and
+/// scheduling on every machine.
+fn fold_partials(partials: Vec<Vec<f64>>, width: usize) -> Vec<f64> {
+  let mut totals = vec![0.0f64; width];
+  for partial in &partials {
+    for (total, part) in totals.iter_mut().zip(partial) {
+      *total += part;
     }
-    let norm = det_dot(&current, &current).sqrt();
+  }
+  totals
+}
+
+/// Pristine per-column self-products `‖col_l‖²` of the first `active` columns of a
+/// row-major stride-`stride` block in ONE contiguous sweep — the rank test's
+/// reference norms, captured before any update touches the block. f64 accumulation in
+/// fixed [`REDUCTION_BLOCK`]-row chunks.
+fn column_self_products(block: &[f32], stride: usize, active: usize) -> Vec<f64> {
+  let partials: Vec<Vec<f64>> = block
+    .par_chunks(REDUCTION_BLOCK * stride)
+    .map(|rows| {
+      let mut acc = vec![0.0f64; active];
+      for row in rows.chunks_exact(stride) {
+        for (slot, &value) in acc.iter_mut().zip(&row[..active]) {
+          *slot += value as f64 * value as f64;
+        }
+      }
+      acc
+    })
+    .collect();
+  fold_partials(partials, active)
+}
+
+/// One MGS product pass for a pivot column over the first `active` columns of a
+/// row-major stride-`stride` block: returns the (active − pivot) products
+/// `[vⱼ·vⱼ, vⱼ·col_{j+1}, …]`. Every row contributes its contiguous
+/// `row[pivot..active]` tail — no strided column extraction, no per-pair reductions:
+/// the pivot's whole coefficient set costs one sweep. Fixed [`REDUCTION_BLOCK`]-row
+/// chunks, partials folded in chunk order.
+fn mgs_products(block: &[f32], stride: usize, active: usize, pivot: usize) -> Vec<f64> {
+  let width = active - pivot;
+  let partials: Vec<Vec<f64>> = block
+    .par_chunks(REDUCTION_BLOCK * stride)
+    .map(|rows| {
+      let mut acc = vec![0.0f64; width];
+      for row in rows.chunks_exact(stride) {
+        let v = row[pivot] as f64;
+        for (slot, &value) in acc.iter_mut().zip(&row[pivot..active]) {
+          *slot += v * value as f64;
+        }
+      }
+      acc
+    })
+    .collect();
+  fold_partials(partials, width)
+}
+
+/// The MGS update for a kept pivot: every later active column sheds its projection on
+/// the pivot (`col_l −= (vⱼ·col_l / vⱼ·vⱼ)·vⱼ` — coefficients arrive pre-divided) and
+/// the pivot itself scales to unit length. Row-local arithmetic only, no reduction:
+/// rows parallelize freely and the bits are thread-count-invariant by construction.
+fn mgs_update(
+  block: &mut [f32],
+  stride: usize,
+  active: usize,
+  pivot: usize,
+  coefficients: &[f64],
+  inverse: f32,
+) {
+  block.par_chunks_mut(stride).for_each(|row| {
+    let v = row[pivot];
+    for (value, coefficient) in row[pivot + 1..active].iter_mut().zip(coefficients) {
+      *value -= (coefficient * v as f64) as f32;
+    }
+    row[pivot] = v * inverse;
+  });
+}
+
+/// One right-looking MGS sweep over the first `active` columns: each kept pivot
+/// normalizes in place and immediately reduces every later active column in one
+/// contiguous row sweep. Returns the kept slot list; performs NO compaction.
+fn mgs_pass(block: &mut [f32], stride: usize, active: usize) -> Result<Vec<usize>, String> {
+  let pristine = column_self_products(block, stride, active);
+  let mut kept_slots: Vec<usize> = Vec::with_capacity(active);
+  for (column, &pristine_squared) in pristine.iter().enumerate() {
+    let products = mgs_products(block, stride, active, column);
+    let squared = products[0];
+    let original = pristine_squared.sqrt();
+    let norm = squared.sqrt();
     if !norm.is_finite() || !original.is_finite() {
       return Err(format!("non-finite column {column} during orthonormalization"));
     }
     if norm == 0.0 || norm <= original * f32::EPSILON as f64 {
       continue; // dependent direction — drop it, keep scanning the rest
     }
-    let inverse = (1.0 / norm) as f32;
-    for value in current.iter_mut() {
-      *value *= inverse;
-    }
-    column_store(block, k, kept, &current);
-    kept += 1;
+    let coefficients: Vec<f64> = products[1..].iter().map(|t| t / squared).collect();
+    mgs_update(block, stride, active, column, &coefficients, (1.0 / norm) as f32);
+    kept_slots.push(column);
   }
-  if kept == 0 {
+  Ok(kept_slots)
+}
+
+/// Left-pack the kept columns within each row (target ≤ source, so the forward walk
+/// never clobbers an unread slot); residue beyond the kept width is dead space.
+fn left_pack(block: &mut [f32], stride: usize, kept_slots: &[usize]) {
+  if kept_slots
+    .iter()
+    .enumerate()
+    .all(|(target, &source)| target == source)
+  {
+    return;
+  }
+  block.par_chunks_mut(stride).for_each(|row| {
+    for (target, &source) in kept_slots.iter().enumerate() {
+      row[target] = row[source];
+    }
+  });
+}
+
+/// Bounds `block_gram`'s transient per-chunk partials at GRAM_PARTIAL_CAP·k²·8 bytes
+/// (≤ 37 MB at the D2 dimension clamp's k ≤ 266) for ANY corpus size. Memory/
+/// scheduling shape only — the fold order is the fixed chunk order, so the resulting
+/// bits are invariant to this cap and to thread count.
+const GRAM_PARTIAL_CAP: usize = 64;
+
+/// Deterministic block Gram product `Bᵢⱼ = Σ_r a[r,i]·b[r,j]` over two row-major n×k
+/// blocks (B = Aᵀ·B̃) as per-row rank-1 accumulations — contiguous row reads, one
+/// parallel launch, chunk rows = max([`REDUCTION_BLOCK`], ⌈rows/[`GRAM_PARTIAL_CAP`]⌉),
+/// partials folded in chunk order.
+pub(super) fn block_gram(a: &[f32], b: &[f32], k: usize) -> Vec<f64> {
+  debug_assert_eq!(a.len(), b.len());
+  if k == 0 {
+    return Vec::new();
+  }
+  let rows = a.len() / k;
+  let chunk_rows = REDUCTION_BLOCK.max(rows.div_ceil(GRAM_PARTIAL_CAP)).max(1);
+  let partials: Vec<Vec<f64>> = a
+    .par_chunks(chunk_rows * k)
+    .zip(b.par_chunks(chunk_rows * k))
+    .map(|(rows_a, rows_b)| {
+      let mut acc = vec![0.0f64; k * k];
+      for (row_a, row_b) in rows_a.chunks_exact(k).zip(rows_b.chunks_exact(k)) {
+        for (i, &left) in row_a.iter().enumerate() {
+          let left = left as f64;
+          for (slot, &right) in acc[i * k..(i + 1) * k].iter_mut().zip(row_b) {
+            *slot += left * right as f64;
+          }
+        }
+      }
+      acc
+    })
+    .collect();
+  fold_partials(partials, k * k)
+}
+
+/// Modified Gram–Schmidt orthonormalization of the k columns of a row-major n×k block,
+/// in place, RANK-REVEALING: a dependent column (residual below f32 representability
+/// relative to that column's own pristine norm — the storage precision defines what
+/// counts as signal) is dropped and survivors compact left, still at stride k.
+/// Returns the independent-column count. A rank-deficient matrix thereby yields its
+/// ENTIRE numerical range exactly — HMT's range-finder semantics; small corpora are
+/// routinely rank-deficient and must factor, never error. Zero surviving columns (the
+/// zero matrix) is the only failure.
+///
+/// RIGHT-LOOKING row-major formulation: each kept pivot immediately reduces every
+/// later column in one contiguous row sweep. Per column this performs exactly the
+/// left-looking sequence — one subtraction per kept prior, in prior order, against
+/// the progressively updated column — but as streaming passes instead of k² strided
+/// column extractions with a micro-reduction each (measured on cpython: the
+/// extraction form spent the whole factorization in rayon worker wake/yield — 308 s
+/// sys under 52 s of training). Deterministic: fixed chunks, chunk-order folds.
+fn orthonormalize(block: &mut [f32], n: usize, k: usize) -> Result<usize, String> {
+  debug_assert_eq!(block.len(), n * k);
+  let first = mgs_pass(block, k, k)?;
+  if first.is_empty() {
     return Err("orthonormalization found no independent directions (zero matrix)".to_string());
   }
-  Ok(kept)
+  left_pack(block, k, &first);
+  // Second unconditional sweep — "twice is enough" (Giraud–Langou–Rozložník 2005): a
+  // single Gram–Schmidt pass loses orthogonality as O(ε·κ), and severely graded
+  // survivors make κ arbitrary — a storage-noise direction normalized to unit length
+  // carries its f32 signal residue amplified by 1/‖residual‖ (measured on the rank-5
+  // fixture before this pass: two kept noise columns at 5.8e-3 cross-correlation
+  // inflated the top Ritz value 13× past its derived tolerance). The second pass over
+  // the survivors restores ‖I − QᵀQ‖ = O(ε) UNCONDITIONALLY — a cited theorem, so no
+  // selective-reorthogonalization threshold exists to tune.
+  let second = mgs_pass(block, k, first.len())?;
+  if second.is_empty() {
+    return Err("orthonormalization found no independent directions (zero matrix)".to_string());
+  }
+  left_pack(block, k, &second);
+  Ok(second.len())
 }
 
 /// [`orthonormalize`], then repack the surviving columns from stride `width` down to a
@@ -471,16 +593,7 @@ pub fn top_symmetric_eigen(
 
   // Projected small matrix B = Qᵀ (M Q): k×k symmetric (up to rounding — symmetrize).
   matrix.apply(block.as_slice(), k, scratch.as_mut_slice()); // scratch = M·Q
-  let mut projected = vec![0.0f64; k * k];
-  let mut q_column = vec![0.0f32; n];
-  let mut mq_column = vec![0.0f32; n];
-  for i in 0..k {
-    column_copy(block.as_slice(), k, i, &mut q_column);
-    for j in 0..k {
-      column_copy(scratch.as_slice(), k, j, &mut mq_column);
-      projected[i * k + j] = det_dot(&q_column, &mq_column);
-    }
-  }
+  let mut projected = block_gram(block.as_slice(), scratch.as_slice(), k);
   for i in 0..k {
     for j in (i + 1)..k {
       let mean = 0.5 * (projected[i * k + j] + projected[j * k + i]);
@@ -703,6 +816,39 @@ mod tests {
         "phantom factor above storage noise: {extra} (tolerance {tolerance})"
       );
     }
+  }
+
+  #[test]
+  fn rank_deficient_survivors_stay_orthonormal() {
+    // The drop path's own orthonormality oracle: on a numerically rank-deficient
+    // probe (25 of 30 columns are storage noise), the returned factors U = Q·V are
+    // orthonormal iff the rank-revealing orthonormalization actually delivered an
+    // orthonormal Q — a Ritz value can exceed λ₁ only through THIS invariant breaking.
+    let n = 60;
+    let spectrum = vec![30.0, 14.0, 7.0, 3.0, 1.5];
+    let (sparse, _) = prescribed_spectrum(n, &spectrum, 21);
+    let got = top_symmetric_eigen(&sparse, 20, 5, FactorWorkspace::InRam).unwrap();
+    let k = got.eigenvalues.len();
+    let mut worst = 0.0f64;
+    let mut worst_pair = (0usize, 0usize);
+    for a in 0..k {
+      for b in a..k {
+        let mut dot = 0.0f64;
+        for row in 0..n {
+          dot += got.vectors[row * k + a] as f64 * got.vectors[row * k + b] as f64;
+        }
+        let want = if a == b { 1.0 } else { 0.0 };
+        if (dot - want).abs() > worst {
+          worst = (dot - want).abs();
+          worst_pair = (a, b);
+        }
+      }
+    }
+    assert!(
+      worst <= 1e-4,
+      "UᵀU deviates from identity by {worst} at {worst_pair:?}; width {k}; eigenvalues {:?}",
+      got.eigenvalues
+    );
   }
 
   #[test]

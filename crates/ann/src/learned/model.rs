@@ -40,7 +40,7 @@ pub const COOC_WINDOW: usize = 2;
 pub const DIMENSION_CLAMP: (usize, usize) = (64, 256);
 
 /// How subword grams are addressed in the trained tables.
-enum GramTable {
+pub(super) enum GramTable {
   /// Every observed gram interned exactly — collision-free.
   Exact(HashMap<String, u32>),
   /// Grams hashed into `GRAM_BUCKET_BOUND` buckets (fnv1a64 % buckets).
@@ -56,7 +56,7 @@ impl GramTable {
   }
 }
 
-fn fnv1a64(text: &str) -> u64 {
+pub(super) fn fnv1a64(text: &str) -> u64 {
   let mut hash = 0xcbf2_9ce4_8422_2325u64;
   for byte in text.as_bytes() {
     hash ^= *byte as u64;
@@ -71,19 +71,21 @@ fn fnv1a64(text: &str) -> u64 {
 pub struct LearnedModel {
   pub dim: usize,
   /// Matrix-vocabulary words in row order.
-  word_terms: Vec<String>,
-  word_ids: HashMap<String, u32>,
-  /// Row-major (word_terms.len() × dim).
-  word_rows: Vec<f32>,
-  gram_table: GramTable,
+  pub(super) word_terms: Vec<String>,
+  pub(super) word_ids: HashMap<String, u32>,
+  /// Row-major (word_terms.len() × dim). COMPOSED word vectors — factor row + Σ gram
+  /// rows, precomputed once at train time: composition per vocab word is invariant,
+  /// so neither training's pooling passes nor queries re-derive grams for known words.
+  pub(super) word_rows: Vec<f32>,
+  pub(super) gram_table: GramTable,
   /// Row-major (gram slots × dim).
-  gram_rows: Vec<f32>,
+  pub(super) gram_rows: Vec<f32>,
   /// Unigram probabilities over EVERY corpus token (not just matrix vocabulary) — uSIF
   /// weights are defined for rare tokens precisely because they matter most.
-  frequencies: HashMap<String, f64>,
-  usif: UsifWeighting,
-  abtt: Abtt,
-  sentence: SentenceComponents,
+  pub(super) frequencies: HashMap<String, f64>,
+  pub(super) usif: UsifWeighting,
+  pub(super) abtt: Abtt,
+  pub(super) sentence: SentenceComponents,
 }
 
 /// What the training run measured and decided — persisted into provenance so the model
@@ -115,6 +117,10 @@ pub struct TrainResources {
   pub scratch_dir: std::path::PathBuf,
   pub page_bytes: usize,
   pub arena_chunk_bytes: usize,
+  /// Phase-boundary progress hook (e.g. the host's warm phase stamps): called at each
+  /// training sub-step so kernel-scale runs attribute their time without a profiler.
+  /// A plain fn pointer — no captures, no new dependency; pass `|_| {}` to silence.
+  pub progress: fn(&str),
 }
 
 /// The PPMI stream of one spilled count set (pull-based; re-streamable).
@@ -157,6 +163,7 @@ impl LearnedModel {
       .iter()
       .map(|(term, &count)| (term.clone(), count as f64 / total_tokens))
       .collect();
+    (resources.progress)("learned: pass1 token counts");
 
     let mut vocab = Vocab::default();
     for term in &order {
@@ -211,6 +218,7 @@ impl LearnedModel {
       (table, GRAM_BUCKET_BOUND, rebuilt)
     };
     let matrix_rows = matrix_words + gram_slots;
+    (resources.progress)("learned: gram tables");
 
     // Pass 2 — co-occurrence events (symmetric window over matrix-vocabulary tokens;
     // out-of-vocabulary tokens are transparent, per the count formulation). fastText
@@ -229,8 +237,13 @@ impl LearnedModel {
       word_grams.iter().map(Vec::len).sum::<usize>() as f64 / matrix_words.max(1) as f64;
     let expected_events =
       (token_events as f64 * COOC_WINDOW as f64 * (1.0 + 2.0 * average_grams)) as u64;
-    let buffer = buffer_events_for(expected_events, resources.arena_chunk_bytes);
-    let half_buffer = buffer_events_for(expected_events / 2, resources.arena_chunk_bytes);
+    let buffer =
+      buffer_events_for(expected_events, resources.page_bytes, resources.arena_chunk_bytes);
+    let half_buffer = buffer_events_for(
+      expected_events / 2,
+      resources.page_bytes,
+      resources.arena_chunk_bytes,
+    );
     let spill_path = |name: &str| resources.scratch_dir.join(format!("train-cooc-{name}.spill"));
     let mut full = SpillCounter::new(spill_path("full"), buffer, resources.page_bytes);
     let mut half_counters = [
@@ -273,6 +286,7 @@ impl LearnedModel {
     if let Some(error) = spill_error {
       return Err(format!("co-occurrence spill failed: {error}"));
     }
+    (resources.progress)("learned: cooc events fed");
     let counts = full.finish()?;
     if counts.total_events() == 0 {
       return Err("no co-occurrence events — documents too short (lexical fallback)".to_string());
@@ -280,6 +294,7 @@ impl LearnedModel {
     let [half_a, half_b] = half_counters;
     let half_a = half_a.finish()?;
     let half_b = half_b.finish()?;
+    (resources.progress)("learned: cooc spilled+merged");
 
     // σ from the streamed half-split difference — the halves never materialize either.
     let sigma = {
@@ -297,6 +312,7 @@ impl LearnedModel {
     };
     half_a.delete()?;
     half_b.delete()?;
+    (resources.progress)("learned: noise sigma");
 
     // Factorize and pick d by PIP on the corpus's own (thresholded) spectrum. The CSR
     // builds by streaming the PPMI twice (size, then fill) — triples never exist as a
@@ -304,6 +320,7 @@ impl LearnedModel {
     let matrix = SymmetricCsr::from_pair_stream(matrix_rows, || counts_ppmi(&counts))?;
     let cooc_pairs = matrix.nnz();
     counts.delete()?;
+    (resources.progress)("learned: ppmi csr");
 
     let probe_dim = DIMENSION_CLAMP.1.min(matrix_rows);
     let eigen = top_symmetric_eigen(
@@ -318,6 +335,7 @@ impl LearnedModel {
     // numerical range, exactly (the small-corpus regime). D2's floor applies only when
     // the rank supports it; the achieved d is recorded in provenance either way, and
     // the vectors' stride is the returned factor count, never the request.
+    (resources.progress)("learned: eigen");
     let factors = eigen.eigenvalues.len();
     let magnitudes: Vec<f64> = eigen.eigenvalues.iter().map(|v| v.abs()).collect();
     let signal = soft_threshold(&magnitudes, sigma, matrix_rows);
@@ -366,6 +384,13 @@ impl LearnedModel {
       prototype.compose_word_raw(word_id as u32, row);
     }
     prototype.abtt = Abtt::fit(&composed, matrix_words, dim)?;
+    // The composed table IS the stored word table from here on: composition per vocab
+    // word is invariant, and recomposing it per token OCCURRENCE dominated kernel-scale
+    // training (sampled mid-train: the uSIF/sentence pass lived in compose_raw's gram
+    // lookups and per-call allocations across 27M+ occurrences). Same sum, same order —
+    // token vectors are bit-identical; gram rows remain for OOV composition.
+    prototype.word_rows = composed;
+    (resources.progress)("learned: abtt+composed");
 
     // uSIF: closed-form a from the frequency table + average length; sentence
     // components from the training documents' embeddings (d×d Gram, fixed order).
@@ -375,20 +400,55 @@ impl LearnedModel {
     // (α is a count over the set, so map-iteration order cannot affect the result.)
     let probabilities: Vec<f64> = prototype.frequencies.values().copied().collect();
     prototype.usif = UsifWeighting::from_frequencies(&probabilities, average_doc_len)?;
+    (resources.progress)("learned: usif fit");
+    // Sentence-PC Gram over every training document, batched: docs buffer in corpus
+    // order, each batch pools in parallel (documents are independent; a failed pool
+    // leaves a zero row, contributing exactly the nothing it contributed before), and
+    // the batch Gram is ONE deterministic `block_gram` (per-doc rank-1 accumulation as
+    // contiguous row sweeps, fixed chunks folded in chunk order). The serial per-doc
+    // d×d loop this replaces was 42% of kernel-scale training (75.7 s: 2.76M docs ×
+    // 249² f64 on one thread). FIXED batch size — boundaries shape the f64 fold order,
+    // so a machine-derived value would break cross-machine bit-determinism; 65,536
+    // rows also cap the batch matrix at 64 MB under the D2 dimension clamp (≤256·4 B
+    // per row).
+    const SENTENCE_BATCH_DOCS: usize = 65_536;
     let mut gram_acc = vec![0.0f64; dim * dim];
-    let mut doc_vector = vec![0.0f32; dim];
+    let mut batch: Vec<Vec<String>> = Vec::with_capacity(SENTENCE_BATCH_DOCS);
+    fn flush_batch(
+      model: &LearnedModel,
+      dim: usize,
+      batch: &mut Vec<Vec<String>>,
+      gram_acc: &mut [f64],
+    ) {
+      use rayon::prelude::*;
+      if batch.is_empty() {
+        return;
+      }
+      let mut matrix = vec![0.0f32; batch.len() * dim];
+      matrix
+        .par_chunks_mut(dim)
+        .zip(batch.par_iter())
+        .for_each(|(row, doc)| {
+          // Err leaves the row's entry-fill zeros — a zero row adds zero to the Gram.
+          let _ = model.pooled_document(doc, row);
+        });
+      for (total, part) in gram_acc
+        .iter_mut()
+        .zip(super::rsvd::block_gram(&matrix, &matrix, dim))
+      {
+        *total += part;
+      }
+      batch.clear();
+    }
     corpus(&mut |doc: &[String]| {
-      if prototype.pooled_document(doc, &mut doc_vector).is_ok() {
-        for i in 0..dim {
-          let vi = doc_vector[i] as f64;
-          let row = &mut gram_acc[i * dim..(i + 1) * dim];
-          for (j, slot) in row.iter_mut().enumerate() {
-            *slot += vi * doc_vector[j] as f64;
-          }
-        }
+      batch.push(doc.to_vec());
+      if batch.len() == SENTENCE_BATCH_DOCS {
+        flush_batch(&prototype, dim, &mut batch, &mut gram_acc);
       }
     });
+    flush_batch(&prototype, dim, &mut batch, &mut gram_acc);
     prototype.sentence = SentenceComponents::from_gram(&gram_acc, dim)?;
+    (resources.progress)("learned: sentence pass");
 
     let report = TrainReport {
       documents,
@@ -405,17 +465,17 @@ impl LearnedModel {
   }
 
   /// Raw factor-space composition (fastText: word row + its gram rows; OOV = gram rows
-  /// alone). No ABTT, no normalization — callers post-process.
+  /// alone). No ABTT, no normalization — callers post-process. A known word's stored
+  /// row already carries its gram sum (composed at train time), so the vocabulary path
+  /// is a straight copy — the gram walk runs only for OOV tokens.
   fn compose_raw(&self, token: &str, out: &mut [f32]) {
+    if let Some(&word_id) = self.word_ids.get(token) {
+      let row = &self.word_rows[word_id as usize * self.dim..(word_id as usize + 1) * self.dim];
+      out.copy_from_slice(row);
+      return;
+    }
     out.fill(0.0);
     let mut any = false;
-    if let Some(&word_id) = self.word_ids.get(token) {
-      any = true;
-      let row = &self.word_rows[word_id as usize * self.dim..(word_id as usize + 1) * self.dim];
-      for (slot, value) in out.iter_mut().zip(row) {
-        *slot += value;
-      }
-    }
     for gram in SubwordTokenizer::grams(token) {
       if let Some(slot_id) = self.gram_table.slot(&gram) {
         let start = slot_id as usize * self.dim;
@@ -432,9 +492,26 @@ impl LearnedModel {
     }
   }
 
+  /// Training-time composition of one vocabulary word from the RAW factor tables (word
+  /// row + gram rows) — the pass that BUILDS the composed table [`compose_raw`] then
+  /// serves from. Only meaningful before `word_rows` is swapped to composed values.
   fn compose_word_raw(&self, word_id: u32, out: &mut [f32]) {
-    let term = self.word_terms[word_id as usize].clone();
-    self.compose_raw(&term, out);
+    out.fill(0.0);
+    let word = word_id as usize;
+    let row = &self.word_rows[word * self.dim..(word + 1) * self.dim];
+    for (slot, value) in out.iter_mut().zip(row) {
+      *slot += value;
+    }
+    for gram in SubwordTokenizer::grams(&self.word_terms[word]) {
+      if let Some(slot_id) = self.gram_table.slot(&gram) {
+        let start = slot_id as usize * self.dim;
+        if let Some(row) = self.gram_rows.get(start..start + self.dim) {
+          for (slot, value) in out.iter_mut().zip(row) {
+            *slot += value;
+          }
+        }
+      }
+    }
   }
 
   /// One token's finished vector: compose → ABTT → unit-normalize (uSIF normalizes
@@ -507,17 +584,17 @@ impl LearnedModel {
   }
 }
 
+/// Shared test corpus, visible to sibling modules' tests (persist round-trips train
+/// through it).
 #[cfg(test)]
-mod tests {
-  use super::*;
-
+pub(super) mod tests_support {
   /// Six word families that never co-occur, repeated enough to clear the min-count
   /// floor and de-generate α. SIX, deliberately: ABTT removes ⌈d/100⌉ = 1 principal
   /// component, and with F families the centered word cloud spans F−1 directions — the
   /// method's premise (top PCs are artifacts, not the only signal axis) requires
-  /// F − 1 > components removed. F = 2 is the exact degenerate point, pinned separately
-  /// below.
-  const FAMILIES: [[&str; 4]; 6] = [
+  /// F − 1 > components removed. F = 2 is the exact degenerate point, pinned in the
+  /// model tests.
+  pub const FAMILIES: [[&str; 4]; 6] = [
     ["socket", "buffer", "alloc", "packet"],
     ["parser", "token", "grammar", "syntax"],
     ["thread", "mutex", "futex", "sched"],
@@ -526,7 +603,7 @@ mod tests {
     ["crypto", "cipher", "digest", "nonce"],
   ];
 
-  fn corpus_fn(callback: &mut dyn FnMut(&[String])) {
+  pub fn corpus(callback: &mut dyn FnMut(&[String])) {
     let doc = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
     for i in 0..30 {
       for family in FAMILIES {
@@ -536,6 +613,12 @@ mod tests {
       callback(&doc(&[&format!("noise{i}"), "socket"]));
     }
   }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::tests_support::corpus as corpus_fn;
+  use super::*;
 
   fn test_resources(tag: &str) -> TrainResources {
     let dir = std::env::temp_dir().join(format!("vorpal-train-{}-{tag}", std::process::id()));
@@ -545,6 +628,7 @@ mod tests {
       scratch_dir: dir,
       page_bytes: 4096,
       arena_chunk_bytes: 64 * 1024,
+      progress: |_| {},
     }
   }
 
@@ -654,6 +738,7 @@ mod tests {
       scratch_dir: test_resources("starved").scratch_dir,
       page_bytes: 64,
       arena_chunk_bytes: 16,
+      progress: |_| {},
     };
     let (model_a, _) = LearnedModel::train(&corpus_fn, 7, &roomy).unwrap();
     let (model_b, _) = LearnedModel::train(&corpus_fn, 7, &starved).unwrap();
@@ -732,14 +817,14 @@ mod tests {
         cos(&fin_x, &fin_y),
       );
     }
-    // Word-row-only cosines (no gram composition), directly from the factor table.
+    // Stored-row cosines (the persisted COMPOSED word vectors), directly from the table.
     let row = |term: &str| -> Vec<f32> {
       let id = model.word_ids[term] as usize;
       model.word_rows[id * model.dim..(id + 1) * model.dim].to_vec()
     };
     for (x, y) in pairs {
       println!(
-        "{x:>7}/{y:<7}  word-row-only {:+.3}",
+        "{x:>7}/{y:<7}  stored-composed-row {:+.3}",
         cos(&row(x), &row(y))
       );
     }
