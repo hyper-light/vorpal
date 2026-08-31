@@ -607,6 +607,9 @@ impl ServedPersist {
         live_files: manifest.entries().len(),
       },
     };
+    let evidence_bases = kg
+      .node_id_map(&layout)
+      .map_err(|err| format!("served persist: evidence bases: {err}"))?;
     // Three independent artifact groups write concurrently; the manifest stays last (the
     // commit point), exactly like the pipeline's tail.
     let (pack_result, evidence_result, dataflow_result, kg_result) =
@@ -628,7 +631,16 @@ impl ServedPersist {
           drop(sink);
           writer.finish(manifest.entries().iter().map(|entry| entry.path.clone()))
         });
-        let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+        let evidence_task = scope.spawn(|| {
+          let evidence_layout = match &evidence_bases {
+            None => vorpal_kg::EvidenceLayout::Flat,
+            Some(map) => vorpal_kg::EvidenceLayout::Bucketed {
+              nodes: map,
+              prior: Some(&prior),
+            },
+          };
+          vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
+        });
         let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
         let kg_result = kg.save_with(&staging, &layout);
         (

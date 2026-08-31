@@ -672,6 +672,40 @@ dataflow.bin, names.idx (46 MB).
   (regeneration law shared with postings) or leave in-identity; 46 MB/edit rides on it.
 - dataflow.bin follows the evidence coding (same row surgery, tiny file).
 
+#### P4.3 results (2026-08-31) — including a prototype rejected by measurement
+
+The decomposition's endpoint-coding tension was settled the way it demanded: prototype,
+measure, commit. **`(bucket, bucket-local)` (6-byte destinations, 36-byte rows) FAILED at
+kernel scale** — a one-file function append shifts bucket-mates' ordinals, and incoming
+references cascade globally: evidence carried 6/257 slabs (370 MB rewritten), edges
+128/257 (53 MB). Recoded to the P4.0 identity **`(file_key u64, ordinal u32)`** (12-byte
+destinations, 42-byte evidence rows, 18-byte edge rows), anchored by the node-store TOC's
+new FILE TABLE (v2: per file `{key, dense start, rows}` — `NodeIdMap`, the one dense⇄key
+map every coded family shares):
+
+| family    | size (kernel) | one-file append edit          |
+|-----------|---------------|-------------------------------|
+| evidence  | 466 MB (+28%) | **255/257 linked, 2.0 MB**    |
+| edges     | 154 MB (+50%) | **255/257 linked, 0.6 MB**    |
+| nodes     | 335 MB        | 510/513 linked, 2.7 MB        |
+| products  | 730 MB        | 255/257 linked, 6.8 MB        |
+
+Truth-writes per kernel edit: ~900 MB of monoliths → **~12 MB of slabs + TOCs**. The two
+derived caches (graph.bin 146 MB, names.idx 46 MB) are now the dominant residual writes —
+written eagerly for query UX, excluded from identity, P4.5 revisits skipping them on the
+scoped path. Walls: full edit 1.95–2.03 s, cold 8.78 s (≈ +6–8% vs pre-P4.3 under a
+noisy machine; the digest-compare law builds all slab bytes to prove them unchanged —
+~200 ms honest cost, with the P4.5 dirty-set as the recorded hook). Identity A/B PASS
+through edit+revert. Bulk endpoint conversion goes through a lazily built dense table
+(binary-search-per-endpoint measured ~0.6 s/edit and was fixed before landing); the
+cache-miss graph rebuild densifies through a transient key map.
+
+CSC law shipped: under the bucketed format the seal builds the CSC over the src-major
+enumeration (`Graph::compact_src_major`) — exactly the slab concatenation — so a
+slab-rebuilt graph is bit-identical to the sealed one and the daemon's in-RAM graph
+equals the loaded one. E2E: cache delete → identical answers → lazy re-cache, proven.
+dataflow.bin stays global and in-identity (0.8 MB; bucketing buys nothing measurable).
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

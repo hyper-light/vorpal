@@ -373,8 +373,20 @@ impl PendingPersist {
       layout,
       pack,
     } = self;
+    let evidence_bases = kg
+      .node_id_map(&layout)
+      .map_err(|err| format!("evidence bases: {err}"))?;
     let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
-      let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+      let evidence_task = scope.spawn(|| {
+        let evidence_layout = match &evidence_bases {
+          None => vorpal_kg::EvidenceLayout::Flat,
+          Some(map) => vorpal_kg::EvidenceLayout::Bucketed {
+            nodes: map,
+            prior: Some(&prior),
+          },
+        };
+        vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
+      });
       let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
       let kg_result = kg.save_with(&staging, &layout);
       (
@@ -1101,8 +1113,18 @@ fn build_index_inner(
   // 17 cores idle for the longer of the two. Evidence is canonically sorted (total order)
   // inside its saver, so it still joins the content identity deterministically. The
   // manifest stays strictly last — it is the commit point.
+  let evidence_bases = kg.node_id_map(&layout)?;
   let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
-    let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
+    let evidence_task = scope.spawn(|| {
+      let evidence_layout = match &evidence_bases {
+        None => vorpal_kg::EvidenceLayout::Flat,
+        Some(map) => vorpal_kg::EvidenceLayout::Bucketed {
+          nodes: map,
+          prior: Some(&prior),
+        },
+      };
+      vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
+    });
     let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
     let kg_result = kg.save_with(&staging, &layout);
     (
@@ -1143,6 +1165,8 @@ pub(crate) fn is_generation_artifact_name(name: &str) -> bool {
   GENERATION_ARTIFACTS.contains(&name)
     || vorpal_ingest::is_pack_member(name)
     || vorpal_kg::is_nodes_member(name)
+    || vorpal_kg::is_evidence_member(name)
+    || vorpal_kg::is_edges_member(name)
 }
 
 /// Every artifact name this generation actually carries, in fixed order: the flat list
@@ -1150,8 +1174,21 @@ pub(crate) fn is_generation_artifact_name(name: &str) -> bool {
 /// members sorted by name (`products/…`, then `nodes/…`). The bucketed families have
 /// corpus-dependent file counts, so identity and staging walk THIS, never the const alone.
 pub(crate) fn generation_artifact_names(dir: &Path) -> Vec<String> {
-  let mut names: Vec<String> = GENERATION_ARTIFACTS.iter().map(|s| s.to_string()).collect();
-  for family in [vorpal_ingest::PACK_DIR, vorpal_kg::NODES_DIR] {
+  // Bucketed generations (P4.2/P4.3) carry two DERIVED caches the identity must not fold:
+  // graph.bin (rebuilt from the edge slabs on any stamp mismatch) and names.idx (queries
+  // fall back to the scan). Flat generations keep both as truth.
+  let bucketed = dir.join(vorpal_kg::NODES_TOC).is_file();
+  let mut names: Vec<String> = GENERATION_ARTIFACTS
+    .iter()
+    .filter(|name| !(bucketed && (**name == "graph.bin" || **name == "names.idx")))
+    .map(|s| s.to_string())
+    .collect();
+  for family in [
+    vorpal_ingest::PACK_DIR,
+    vorpal_kg::NODES_DIR,
+    vorpal_kg::EVIDENCE_DIR,
+    vorpal_kg::EDGES_DIR,
+  ] {
     if let Ok(dirents) = fs::read_dir(dir.join(family)) {
       let mut members: Vec<String> = dirents
         .flatten()
@@ -1368,18 +1405,27 @@ fn try_stamp_only_cutoff(
   {
     return Ok(None);
   }
-  const CARRIED: [&str; 4] = ["graph.bin", "evidence.bin", "dataflow.bin", "names.idx"];
-  for artifact in CARRIED.iter().chain(&["manifest.bin"]) {
+  for artifact in ["dataflow.bin", "manifest.bin"] {
     if !prior.join(artifact).exists() {
       return Ok(None);
     }
   }
-  // The node store is a format-dependent family: the flat pair, or the bucketed members
-  // (nodes/toc.bin present ⇒ every member it names is verified by the loader; the cutoff
-  // links the whole directory verbatim — stamps never live in the node store).
+  // The node store, evidence, and edges are format-dependent families: flat files, or
+  // bucketed members (a family's toc present ⇒ every member it names is verified by its
+  // loader; the cutoff links whole families verbatim — stamps never live in any of them).
+  // graph.bin/names.idx are TRUTH for flat generations (required) and derived CACHES for
+  // bucketed ones (linked when present, never required).
   let nodes_bucketed = prior.join(vorpal_kg::NODES_TOC).is_file();
-  if !nodes_bucketed
-    && (!prior.join("nodes.vseg").exists() || !prior.join("strings.heap").exists())
+  if nodes_bucketed {
+    if !prior.join(vorpal_kg::EVIDENCE_TOC).is_file() || !prior.join(vorpal_kg::EDGES_TOC).is_file()
+    {
+      return Ok(None);
+    }
+  } else if !prior.join("nodes.vseg").exists()
+    || !prior.join("strings.heap").exists()
+    || !prior.join("graph.bin").exists()
+    || !prior.join("evidence.bin").exists()
+    || !prior.join("names.idx").exists()
   {
     return Ok(None);
   }
@@ -1451,35 +1497,46 @@ fn try_stamp_only_cutoff(
   ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
-  for artifact in CARRIED {
+  // Required flat carries; under the bucketed format graph.bin/names.idx are caches —
+  // linked when present via the optional list below, never required.
+  let link_required: &[&str] = if nodes_bucketed {
+    &["dataflow.bin"]
+  } else {
+    &["graph.bin", "evidence.bin", "dataflow.bin", "names.idx", "nodes.vseg", "strings.heap"]
+  };
+  for artifact in link_required {
     let (from, to) = (prior.join(artifact), staging.join(artifact));
     if fs::hard_link(&from, &to).is_err() {
       fs::copy(&from, &to)?;
     }
   }
-  // Carry the node store byte-identically: the flat pair, or every bucketed member
-  // (hard-links — the cutoff never patches node bytes, stamps live in the manifest and
-  // the pack).
   if nodes_bucketed {
-    fs::create_dir_all(staging.join(vorpal_kg::NODES_DIR))?;
-    for entry in fs::read_dir(prior.join(vorpal_kg::NODES_DIR))?.flatten() {
-      let Ok(file) = entry.file_name().into_string() else {
-        continue;
-      };
-      let member = format!("{}/{file}", vorpal_kg::NODES_DIR);
-      if !vorpal_kg::is_nodes_member(&member) {
-        continue;
-      }
-      let (from, to) = (prior.join(&member), staging.join(&member));
-      if fs::hard_link(&from, &to).is_err() {
+    for artifact in ["graph.bin", "graph.stamp", "names.idx"] {
+      let (from, to) = (prior.join(artifact), staging.join(artifact));
+      if from.exists() && fs::hard_link(&from, &to).is_err() {
         fs::copy(&from, &to)?;
       }
     }
-  } else {
-    for artifact in ["nodes.vseg", "strings.heap"] {
-      let (from, to) = (prior.join(artifact), staging.join(artifact));
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
+    // Carry the bucketed families byte-identically (hard-links — the cutoff never patches
+    // their bytes; stamps live in the manifest and the pack).
+    for (family, member_ok) in [
+      (vorpal_kg::NODES_DIR, vorpal_kg::is_nodes_member as fn(&str) -> bool),
+      (vorpal_kg::EVIDENCE_DIR, vorpal_kg::is_evidence_member),
+      (vorpal_kg::EDGES_DIR, vorpal_kg::is_edges_member),
+    ] {
+      fs::create_dir_all(staging.join(family))?;
+      for entry in fs::read_dir(prior.join(family))?.flatten() {
+        let Ok(file) = entry.file_name().into_string() else {
+          continue;
+        };
+        let member = format!("{family}/{file}");
+        if !member_ok(&member) {
+          continue;
+        }
+        let (from, to) = (prior.join(&member), staging.join(&member));
+        if fs::hard_link(&from, &to).is_err() {
+          fs::copy(&from, &to)?;
+        }
       }
     }
   }
@@ -1601,6 +1658,9 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
     // their members are swept by the predicate below.
     let keep = name.as_os_str() == vorpal_ingest::PACK_DIR
       || name.as_os_str() == vorpal_kg::NODES_DIR
+      || name.as_os_str() == vorpal_kg::EVIDENCE_DIR
+      || name.as_os_str() == vorpal_kg::EDGES_DIR
+      || name.as_os_str() == "graph.stamp"
       || GENERATION_ARTIFACTS
         .iter()
         .any(|artifact| name.as_os_str() == *artifact);
@@ -1613,7 +1673,12 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       };
     }
   }
-  for family in [vorpal_ingest::PACK_DIR, vorpal_kg::NODES_DIR] {
+  for family in [
+    vorpal_ingest::PACK_DIR,
+    vorpal_kg::NODES_DIR,
+    vorpal_kg::EVIDENCE_DIR,
+    vorpal_kg::EDGES_DIR,
+  ] {
     if let Ok(dirents) = fs::read_dir(staging.join(family)) {
       for entry in dirents.flatten() {
         let member = entry

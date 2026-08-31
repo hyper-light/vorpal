@@ -13,12 +13,16 @@ pub const NODES_DIR: &str = "nodes";
 pub const NODES_TOC: &str = "nodes/toc.bin";
 const NODES_TOC_FILE: &str = "toc.bin";
 const NODES_TOC_MAGIC: &[u8; 4] = b"VNTC";
-/// Version counter for the bucketed node-store TOC (`VNTC`).
-const NODES_VERSION: u32 = 1;
+/// Version counter for the bucketed node-store TOC (`VNTC`). v2 (P4.3) appends the FILE
+/// TABLE — per file `{file_key u64, dense row_start u64, rows u32}` in dense order — the
+/// one map every `(file_key, ordinal)`-coded family (evidence, edges) densifies through.
+const NODES_VERSION: u32 = 2;
 /// TOC header: magic + version + bucket count u32 + total rows u64.
 const NODES_TOC_HEADER: usize = 20;
 /// One per-bucket TOC row: rows u32 + vseg len/digest u64 + heap len/digest u64.
 const NODES_TOC_ROW: usize = 36;
+/// One file-table row: file_key u64 + dense row_start u64 + rows u32.
+const NODES_FILE_ROW: usize = 20;
 
 /// Which node-store layout [`Kg::save_with`] publishes. Readers sniff; only writers choose.
 #[derive(Debug, Clone)]
@@ -49,6 +53,37 @@ pub fn is_nodes_member(name: &str) -> bool {
     .is_some_and(|k| !k.is_empty() && k.len() <= 5 && k.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Test fixture: a minimal `nodes/toc.bin` whose prefix sums equal `bases` — lets the
+/// evidence unit tests exercise the bucketed store without building a full generation.
+#[cfg(test)]
+pub(crate) fn write_node_bases_fixture(dir: &Path, bases: &[u64]) -> io::Result<()> {
+  use std::io::Write as _;
+  fs::create_dir_all(dir.join(NODES_DIR))?;
+  let mut out = fs::File::create(dir.join(NODES_TOC))?;
+  out.write_all(NODES_TOC_MAGIC)?;
+  out.write_all(&NODES_VERSION.to_le_bytes())?;
+  out.write_all(&((bases.len() - 1) as u32).to_le_bytes())?;
+  out.write_all(&bases[bases.len() - 1].to_le_bytes())?;
+  for pair in bases.windows(2) {
+    out.write_all(&((pair[1] - pair[0]) as u32).to_le_bytes())?;
+    out.write_all(&[0u8; 32])?; // vseg/heap lens + digests: unread by the bases derivation
+  }
+  // Synthetic file table: one file per non-empty bucket, key = 0x1000 + bucket index.
+  let files: Vec<(u64, u64, u32)> = bases
+    .windows(2)
+    .enumerate()
+    .filter(|(_, pair)| pair[1] > pair[0])
+    .map(|(k, pair)| (0x1000 + k as u64, pair[0], (pair[1] - pair[0]) as u32))
+    .collect();
+  out.write_all(&(files.len() as u64).to_le_bytes())?;
+  for (key, start, rows) in files {
+    out.write_all(&key.to_le_bytes())?;
+    out.write_all(&start.to_le_bytes())?;
+    out.write_all(&rows.to_le_bytes())?;
+  }
+  Ok(())
+}
+
 /// Dense-id point lookup over contiguous per-slab column stripes: binary search on the
 /// stripe bases (one stripe — the flat/sealed case — resolves in a single probe).
 pub struct Striped<'a, T> {
@@ -67,10 +102,12 @@ impl<'a, T: Copy> Striped<'a, T> {
   }
 }
 
-/// Per-bucket row/heap boundaries of a sealed graph (row_starts has buckets+1 entries).
+/// Per-bucket row/heap boundaries of a sealed graph (row_starts has buckets+1 entries),
+/// plus the per-file identity table (`(file_key, dense row_start, rows)` in dense order).
 struct BucketBounds {
   buckets: u32,
   row_starts: Vec<u64>,
+  files: Vec<(u64, u64, u32)>,
 }
 
 /// One bucket's freshly built slab, ready to land or be carried.
@@ -94,6 +131,8 @@ struct NodesTocRow {
 struct NodesToc {
   total: u64,
   rows: Vec<NodesTocRow>,
+  /// Per file: `(file_key, dense row_start, rows)` in dense (row_start) order.
+  files: Vec<(u64, u64, u32)>,
 }
 
 impl NodesToc {
@@ -130,7 +169,118 @@ impl NodesToc {
     if rows.iter().map(|r| u64::from(r.rows)).sum::<u64>() != total {
       return None;
     }
-    Some(NodesToc { total, rows })
+    let files_at = NODES_TOC_HEADER + buckets * NODES_TOC_ROW;
+    let file_count =
+      u64::from_le_bytes(bytes.get(files_at..files_at + 8)?.try_into().ok()?) as usize;
+    let table_at = files_at + 8;
+    if bytes.len() < table_at + file_count * NODES_FILE_ROW {
+      return None;
+    }
+    let mut files = Vec::with_capacity(file_count);
+    let mut prev_start = 0u64;
+    for i in 0..file_count {
+      let at = table_at + i * NODES_FILE_ROW;
+      let row = &bytes[at..at + NODES_FILE_ROW];
+      let key = u64::from_le_bytes(row[0..8].try_into().ok()?);
+      let start = u64::from_le_bytes(row[8..16].try_into().ok()?);
+      let rows_in_file = u32::from_le_bytes(row[16..20].try_into().ok()?);
+      if start < prev_start || start + u64::from(rows_in_file) > total {
+        return None; // not dense order or beyond the universe
+      }
+      prev_start = start;
+      files.push((key, start, rows_in_file));
+    }
+    Some(NodesToc { total, rows, files })
+  }
+}
+
+/// The dense-id ⇄ `(file_key, ordinal)` map of one bucketed generation — built from the
+/// node-store TOC's file table, consumed by every family that stores durable coordinates
+/// (evidence, edges). Also carries the per-bucket dense bases.
+pub struct NodeIdMap {
+  /// Per-bucket dense bases (`buckets + 1` prefix sums).
+  bases: Vec<u64>,
+  /// `(file_key, dense row_start, rows)` in dense order — locate by row_start.
+  by_start: Vec<(u64, u64, u32)>,
+  /// The same rows sorted by file_key — densify by key. Keys are collision-gated at build.
+  by_key: Vec<(u64, u64, u32)>,
+  /// Dense per-id `(file_key, ordinal)` table, built on first bulk use (the WRITE paths
+  /// convert tens of millions of endpoints — a binary search each measured ~0.6 s per
+  /// kernel edit; readers doing per-query point lookups never pay the table).
+  dense: std::sync::OnceLock<Vec<(u64, u32)>>,
+}
+
+impl NodeIdMap {
+  /// Load from a generation directory's node-store TOC.
+  pub fn from_dir(dir: &Path) -> Option<NodeIdMap> {
+    let toc = NodesToc::load(&dir.join(NODES_TOC))?;
+    let mut bases = Vec::with_capacity(toc.rows.len() + 1);
+    let mut base = 0u64;
+    for row in &toc.rows {
+      bases.push(base);
+      base += u64::from(row.rows);
+    }
+    bases.push(base);
+    Some(Self::from_parts(bases, toc.files))
+  }
+
+  pub(crate) fn from_parts(bases: Vec<u64>, by_start: Vec<(u64, u64, u32)>) -> NodeIdMap {
+    let mut by_key = by_start.clone();
+    by_key.sort_unstable_by_key(|&(key, _, _)| key);
+    NodeIdMap {
+      bases,
+      by_start,
+      by_key,
+      dense: std::sync::OnceLock::new(),
+    }
+  }
+
+  /// The dense table for bulk conversion (write paths): one O(nodes) fill, then O(1) per
+  /// endpoint.
+  fn dense_table(&self) -> &[(u64, u32)] {
+    self.dense.get_or_init(|| {
+      let total = self.bases.last().copied().unwrap_or(0) as usize;
+      let mut table = vec![(u64::MAX, u32::MAX); total];
+      for &(key, start, rows) in &self.by_start {
+        for ordinal in 0..rows {
+          table[(start + u64::from(ordinal)) as usize] = (key, ordinal);
+        }
+      }
+      table
+    })
+  }
+
+  /// [`NodeIdMap::locate`] through the dense table — the bulk-conversion form.
+  pub fn locate_bulk(&self, id: u32) -> Option<(u64, u32)> {
+    let entry = *self.dense_table().get(id as usize)?;
+    (entry.0 != u64::MAX).then_some(entry)
+  }
+
+  pub fn bases(&self) -> &[u64] {
+    &self.bases
+  }
+
+  /// The per-file identity rows `(file_key, dense row_start, rows)` in dense order.
+  pub fn files(&self) -> &[(u64, u64, u32)] {
+    &self.by_start
+  }
+
+  /// Dense id → `(file_key, ordinal)`. `None` outside the universe.
+  pub fn locate(&self, id: u32) -> Option<(u64, u32)> {
+    let raw = u64::from(id);
+    let at = self
+      .by_start
+      .partition_point(|&(_, start, _)| start <= raw)
+      .checked_sub(1)?;
+    let (key, start, rows) = self.by_start[at];
+    (raw < start + u64::from(rows)).then(|| (key, (raw - start) as u32))
+  }
+
+  /// `(file_key, ordinal)` → dense id. `None` for unknown keys or out-of-file ordinals.
+  pub fn densify(&self, key: u64, ordinal: u32) -> Option<u32> {
+    let at = self.by_key.partition_point(|&(k, _, _)| k < key);
+    let &(k, start, rows) = self.by_key.get(at)?;
+    (k == key && ordinal < rows).then(|| (start + u64::from(ordinal)) as u32)
   }
 }
 
@@ -1069,29 +1219,61 @@ impl Kg {
     // The artifacts are independent; writing them serially left the save's wall time as
     // their SUM (the largest single chunk of the post-stream tail). A scope writes them
     // concurrently — wall becomes the max — and each write is still tmp+rename atomic.
-    let (nodes_result, names_result, graph_result) = std::thread::scope(|scope| {
-      let nodes_task = scope.spawn(|| match layout {
-        SegmentLayout::Flat => self.save_nodes_flat(dir),
-        SegmentLayout::Bucketed {
-          tree_root,
-          prior,
-          live_files,
-        } => self.save_nodes_bucketed(dir, tree_root, prior.as_deref(), *live_files),
-      });
-      let names_task = scope.spawn(|| self.write_names_index(dir));
-      // Both CSR directions persist as one aligned section file the load path maps
-      // zero-copy — the edge-list form forced every open to re-run compaction (~64 ms at
-      // kernel scale).
-      let graph_result = write_via_tmp(dir, "graph.bin", |out| self.graph.write_to(out));
-      (
-        nodes_task.join().expect("nodes/heap saver panicked"),
-        names_task.join().expect("names saver panicked"),
-        graph_result,
-      )
-    });
-    nodes_result?;
-    names_result?;
-    graph_result?;
+    match layout {
+      SegmentLayout::Flat => {
+        let (nodes_result, names_result, graph_result) = std::thread::scope(|scope| {
+          let nodes_task = scope.spawn(|| self.save_nodes_flat(dir));
+          let names_task = scope.spawn(|| self.write_names_index(dir));
+          // Both CSR directions persist as one aligned section file the load path maps
+          // zero-copy — the edge-list form forced every open to re-run compaction (~64 ms
+          // at kernel scale). Flat lane: graph.bin is the TRUTH and joins the identity.
+          let graph_result = write_via_tmp(dir, "graph.bin", |out| self.graph.write_to(out));
+          (
+            nodes_task.join().expect("nodes/heap saver panicked"),
+            names_task.join().expect("names saver panicked"),
+            graph_result,
+          )
+        });
+        nodes_result?;
+        names_result?;
+        graph_result?;
+      }
+      SegmentLayout::Bucketed {
+        tree_root,
+        prior,
+        live_files,
+      } => {
+        // Bucket boundaries once, shared by the node slabs and the edge slabs.
+        let bounds = self.bucket_bounds(tree_root, *live_files)?;
+        let id_map = NodeIdMap::from_parts(bounds.row_starts.clone(), bounds.files.clone());
+        let (nodes_result, names_result, edges_result) = std::thread::scope(|scope| {
+          let nodes_task =
+            scope.spawn(|| self.save_nodes_bucketed(dir, &bounds, prior.as_deref()));
+          // names.idx under the bucketed format is a WARM DERIVED artifact: written
+          // eagerly for query UX, excluded from the generation's identity (its ids move
+          // with every id shift, and queries fall back to the scan when it is absent).
+          let names_task = scope.spawn(|| self.write_names_index(dir));
+          // The graph's TRUTH is the per-source-bucket edge slabs (P4.3); the dense
+          // CSR/CSC cache is written after the scope, once the TOC it is stamped
+          // against exists.
+          let edges_result =
+            crate::edgestore::save(dir, &self.graph, &id_map, prior.as_deref());
+          (
+            nodes_task.join().expect("nodes/heap saver panicked"),
+            names_task.join().expect("names saver panicked"),
+            edges_result,
+          )
+        });
+        let node_fold = nodes_result?;
+        names_result?;
+        edges_result?;
+        // Derived CSR/CSC cache (`graph.bin` + `graph.stamp`): best-effort — never
+        // load-bearing (the loader rebuilds from slabs on any mismatch), never identity.
+        if let Some(stamp) = crate::edgestore::expected_stamp(dir, node_fold) {
+          let _ = crate::edgestore::write_cache(dir, &self.graph, stamp);
+        }
+      }
+    }
     crate::phase_stamp("kg save: done");
     Ok(())
   }
@@ -1133,16 +1315,16 @@ impl Kg {
   /// hard-links any bucket whose freshly built bytes match the prior TOC's digests
   /// (exactness by comparison: a cross-file `scc_size` change honestly rewrites the
   /// buckets it reached, and nothing else is assumed).
+  /// Returns the fold over the slab bytes in bucket order — the node-store stamp a LOADED
+  /// bucketed generation reports, which the graph cache is stamped against.
   fn save_nodes_bucketed(
     &self,
     dir: &Path,
-    tree_root: &str,
+    bounds: &BucketBounds,
     prior: Option<&Path>,
-    live_files: usize,
-  ) -> io::Result<()> {
+  ) -> io::Result<u64> {
     use rayon::prelude::*;
     use std::io::Write;
-    let bounds = self.bucket_bounds(tree_root, live_files)?;
     let buckets = bounds.buckets;
     let nodes_dir = dir.join(NODES_DIR);
     fs::create_dir_all(&nodes_dir)?;
@@ -1155,7 +1337,7 @@ impl Kg {
     // columns), then land them: identical-to-prior buckets hard-link, changed ones write.
     let built: io::Result<Vec<BuiltBucket>> = (0..buckets as usize)
       .into_par_iter()
-      .map(|k| self.build_bucket_slab(&bounds, k))
+      .map(|k| self.build_bucket_slab(bounds, k))
       .collect();
     let built = built?;
     for (k, bucket) in built.iter().enumerate() {
@@ -1212,6 +1394,14 @@ impl Kg {
         out.write_all(&(bucket.heap_len as u64).to_le_bytes())?;
         out.write_all(&bucket.heap_digest.to_le_bytes())?;
       }
+      // The file table (TOC v2): the dense-id anchor for every (file_key, ordinal)-coded
+      // family. Dense order; keys are collision-gated at build.
+      out.write_all(&(bounds.files.len() as u64).to_le_bytes())?;
+      for &(key, start, rows_in_file) in &bounds.files {
+        out.write_all(&key.to_le_bytes())?;
+        out.write_all(&start.to_le_bytes())?;
+        out.write_all(&rows_in_file.to_le_bytes())?;
+      }
       Ok(())
     })?;
     // One truth per directory: retire the flat pair (upgrade in a legacy same-dir publish)
@@ -1232,7 +1422,27 @@ impl Kg {
         }
       }
     }
-    Ok(())
+    let mut fold = xxhash_rust::xxh3::Xxh3::new();
+    for bucket in &built {
+      fold.update(&bucket.vseg);
+    }
+    Ok(fold.digest())
+  }
+
+  /// The dense-id ⇄ `(file_key, ordinal)` map this graph persists under `layout` — what
+  /// the evidence and edge savers convert endpoints against. `None` for the flat layout.
+  pub fn node_id_map(&self, layout: &SegmentLayout) -> io::Result<Option<NodeIdMap>> {
+    match layout {
+      SegmentLayout::Flat => Ok(None),
+      SegmentLayout::Bucketed {
+        tree_root,
+        live_files,
+        ..
+      } => {
+        let bounds = self.bucket_bounds(tree_root, *live_files)?;
+        Ok(Some(NodeIdMap::from_parts(bounds.row_starts, bounds.files)))
+      }
+    }
   }
 
   /// Per-bucket row/heap boundaries of this sealed single-slab graph, derived from the
@@ -1262,15 +1472,14 @@ impl Kg {
     }
     let buckets = crate::identity::bucket_count_for(live_files);
     let mut row_starts: Vec<u64> = vec![u64::MAX; buckets as usize + 1];
+    let mut files: Vec<(u64, u64, u32)> = Vec::with_capacity(file_rows.len());
     let mut last_bucket: i64 = -1;
-    for &file_row in &file_rows {
+    for (i, &file_row) in file_rows.iter().enumerate() {
       let path = self
         .heap_str(0, cols.path_off, cols.path_len, file_row)
         .ok_or_else(|| io::Error::other("File node without a path"))?;
-      let bucket = crate::identity::bucket_of(
-        crate::identity::tree_relative(path, tree_root),
-        buckets,
-      );
+      let rel = crate::identity::tree_relative(path, tree_root);
+      let bucket = crate::identity::bucket_of(rel, buckets);
       if i64::from(bucket) < last_bucket {
         return Err(io::Error::other(
           "graph is not sealed in bucket-major canonical order — bucketed save refused",
@@ -1282,6 +1491,12 @@ impl Kg {
         }
         last_bucket = i64::from(bucket);
       }
+      let end = file_rows.get(i + 1).copied().unwrap_or(rows);
+      files.push((
+        crate::identity::FileKey::of(rel).0,
+        file_row,
+        (end - file_row) as u32,
+      ));
     }
     for start in &mut row_starts[(last_bucket + 1) as usize..=buckets as usize] {
       *start = rows;
@@ -1289,6 +1504,7 @@ impl Kg {
     Ok(BucketBounds {
       buckets,
       row_starts,
+      files,
     })
   }
 
@@ -1503,7 +1719,8 @@ impl Kg {
   pub fn load(dir: &Path) -> Result<Self, SegmentError> {
     let dir = &resolve_index_dir(dir);
     crate::phase_stamp("kg load: nodes");
-    let (segments, heaps, heap_file, directory) = if dir.join(NODES_TOC).is_file() {
+    let bucketed = dir.join(NODES_TOC).is_file();
+    let (segments, heaps, heap_file, directory) = if bucketed {
       Self::open_bucketed_slabs(dir)?
     } else {
       Self::open_flat_slabs(dir)?
@@ -1511,17 +1728,49 @@ impl Kg {
     crate::phase_stamp("kg load: map graph");
     let size = segments.iter().map(|s| s.bytes().len() as u64).sum();
     let policy = ResourcePolicy::probe(CorpusProbe::new(size, 1));
-    let graph_store = std::sync::Arc::new(
-      vorpal_mem::MappedStore::map_file(
-        &dir.join("graph.bin"),
-        vorpal_mem::StoreKind::EdgesCsr,
-        vorpal_mem::AccessPattern::Random,
-        vorpal_mem::Hotness::Hot,
-        &policy,
-      )
-      .map_err(SegmentError::from)?,
-    );
-    let graph = Graph::open_mapped(graph_store).map_err(SegmentError::from)?;
+    let map_cached_graph = || -> Result<Graph, SegmentError> {
+      let graph_store = std::sync::Arc::new(
+        vorpal_mem::MappedStore::map_file(
+          &dir.join("graph.bin"),
+          vorpal_mem::StoreKind::EdgesCsr,
+          vorpal_mem::AccessPattern::Random,
+          vorpal_mem::Hotness::Hot,
+          &policy,
+        )
+        .map_err(SegmentError::from)?,
+      );
+      Graph::open_mapped(graph_store).map_err(SegmentError::from)
+    };
+    let graph = if bucketed {
+      // The truth is the per-source-bucket edge slabs; `graph.bin` is a stamped derived
+      // cache. Serve the cache only when its stamp matches BOTH the loaded node slabs and
+      // the edge TOC; otherwise rebuild from the slabs and re-cache best-effort (the lazy
+      // sidecar posture ANN established for committed generations).
+      let mut fold = xxhash_rust::xxh3::Xxh3::new();
+      for segment in &segments {
+        fold.update(segment.bytes());
+      }
+      let node_fold = fold.digest();
+      let id_map = NodeIdMap::from_dir(dir).ok_or(SegmentError::Corrupt(
+        "bucketed node store: unreadable TOC for the id map",
+      ))?;
+      let expected = crate::edgestore::expected_stamp(dir, node_fold);
+      let fresh = expected.is_some() && expected == crate::edgestore::cache_stamp_of(dir);
+      let cached = if fresh { map_cached_graph().ok() } else { None };
+      match cached {
+        Some(graph) => graph,
+        // A stale, missing, or unreadable cache all land here — never an error.
+        None => {
+          let graph = crate::edgestore::load_graph(dir, &id_map).map_err(SegmentError::from)?;
+          if let Some(stamp) = expected {
+            let _ = crate::edgestore::write_cache(dir, &graph, stamp);
+          }
+          graph
+        }
+      }
+    } else {
+      map_cached_graph()?
+    };
     crate::phase_stamp("kg load: done");
     let mut kg = Self::with_slabs(
       segments,

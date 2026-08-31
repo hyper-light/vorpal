@@ -103,6 +103,13 @@ fn bucketed_pack_end_to_end() {
   assert!(gen_a.join("nodes/toc.bin").is_file(), "v2 node-store TOC missing");
   assert!(!gen_a.join("nodes.vseg").exists(), "flat node segment must not ride along");
   assert!(!gen_a.join("strings.heap").exists(), "flat heap must not ride along");
+  assert!(gen_a.join("evidence/toc.bin").is_file(), "v2 evidence TOC missing");
+  assert!(!gen_a.join("evidence.bin").exists(), "flat evidence must not ride along");
+  assert!(gen_a.join("edges/toc.bin").is_file(), "v2 edge-store TOC missing");
+  assert!(
+    gen_a.join("graph.bin").is_file() && gen_a.join("graph.stamp").is_file(),
+    "the derived CSR cache is written eagerly"
+  );
   let buckets = bucket_stats(&gen_a);
   assert_eq!(buckets.len(), 16, "25 files land in the clamped minimum bucket count");
   let node_slabs = fs::read_dir(gen_a.join("nodes"))
@@ -145,6 +152,67 @@ fn bucketed_pack_end_to_end() {
     node_universe(&out_flat),
     node_universe(&out_a),
     "flat and bucketed generations must describe the identical node universe"
+  );
+  // …and the identical EDGE + EVIDENCE universe: every relation and every retained
+  // occurrence, keyed by names (dense ids legitimately differ), compared as sets.
+  let relation_universe = |root: &std::path::Path| -> Vec<String> {
+    let kg = vorpal_kg::Kg::load(root).unwrap();
+    let name_of = |id: vorpal_kg::NodeId| {
+      kg.node(id)
+        .map(|view| format!("{}#{}", view.path, view.name))
+        .unwrap_or_default()
+    };
+    let mut rows: Vec<String> = Vec::new();
+    for id in 0..kg.node_count() as u64 {
+      let id = vorpal_kg::NodeId::new(id);
+      for (target, etype) in kg.out_neighbors(id) {
+        rows.push(format!("E|{}|{}|{}", name_of(id), etype.base().0, name_of(target)));
+      }
+      for row in kg.evidence_from(id) {
+        let target = if row.to == vorpal_kg::NO_EDGE {
+          "<none>".to_string()
+        } else {
+          name_of(vorpal_kg::NodeId::new(row.to as u64))
+        };
+        let mut alts: Vec<String> = row
+          .alternatives
+          .iter()
+          .map(|&alt| name_of(vorpal_kg::NodeId::new(alt as u64)))
+          .collect();
+        alts.sort_unstable();
+        rows.push(format!(
+          "V|{}|{}|{}|{}|{}|{}|{}|{:?}",
+          name_of(id),
+          target,
+          row.etype,
+          row.reason,
+          row.confidence,
+          row.candidates,
+          row.span_start,
+          alts,
+        ));
+      }
+    }
+    rows.sort_unstable();
+    rows
+  };
+  assert_eq!(
+    relation_universe(&out_flat),
+    relation_universe(&out_a),
+    "flat and bucketed generations must describe the identical relation/evidence universe"
+  );
+  // The derived CSR cache is never load-bearing: delete it, load again (forces the
+  // slab rebuild), answers hold, and the lazy write-back restores the cache files.
+  fs::remove_file(gen_a.join("graph.bin")).unwrap();
+  fs::remove_file(gen_a.join("graph.stamp")).unwrap();
+  assert_eq!(
+    relation_universe(&out_flat),
+    relation_universe(&out_a),
+    "slab-rebuilt graph must answer identically to the cached one"
+  );
+  assert!(
+    gen_a.join("graph.bin").is_file() && gen_a.join("graph.stamp").is_file(),
+    "the rebuild lazily re-caches"
   );
   let out_b = base.join("index-b");
   build_index(&src, &out_b).unwrap();
@@ -219,6 +287,41 @@ fn bucketed_pack_end_to_end() {
       ],
       "an edit must rewrite exactly the edited file's node slabs and hard-link the rest"
     );
+    // Evidence follows the same law (spans in the edited file moved)…
+    let mut evidence_rewritten: Vec<String> = Vec::new();
+    for entry in fs::read_dir(gen_a.join("evidence")).unwrap().flatten() {
+      let name = entry.file_name().into_string().unwrap();
+      if !name.ends_with(".bin") || name == "toc.bin" {
+        continue;
+      }
+      let prior_ino = entry.metadata().unwrap().ino();
+      let new_ino = fs::metadata(gen_a2.join("evidence").join(&name)).unwrap().ino();
+      if prior_ino != new_ino {
+        evidence_rewritten.push(name);
+      }
+    }
+    assert_eq!(
+      evidence_rewritten,
+      vec![format!("{expected_bucket:04}.bin")],
+      "an edit must rewrite exactly the edited file's evidence slab"
+    );
+    // …and the EDGE slabs rewrite AT MOST the edited file's bucket (this edit changes the
+    // call-argument shape, so its DATA_FLOWS rows legitimately move); every other bucket's
+    // endpoints are position-independent (bucket, local) coordinates and must hard-link.
+    for entry in fs::read_dir(gen_a.join("edges")).unwrap().flatten() {
+      let name = entry.file_name().into_string().unwrap();
+      if !name.ends_with(".bin") || name == "toc.bin" {
+        continue;
+      }
+      if name == format!("{expected_bucket:04}.bin") {
+        continue;
+      }
+      assert_eq!(
+        entry.metadata().unwrap().ino(),
+        fs::metadata(gen_a2.join("edges").join(&name)).unwrap().ino(),
+        "unedited edge slab {name} must hard-link across a single-file edit"
+      );
+    }
   }
   let out_c = base.join("index-c");
   build_index(&src, &out_c).unwrap();
@@ -258,14 +361,17 @@ fn bucketed_pack_end_to_end() {
       vec![format!("{touched_bucket:04}.pack")],
       "the cutoff must copy-patch exactly the touched file's bucket and link the rest"
     );
-    // The node store never carries stamps: the cutoff hard-links EVERY node slab + TOC.
-    for entry in fs::read_dir(gen_a2.join("nodes")).unwrap().flatten() {
-      let name = entry.file_name().into_string().unwrap();
-      assert_eq!(
-        entry.metadata().unwrap().ino(),
-        fs::metadata(gen_a3.join("nodes").join(&name)).unwrap().ino(),
-        "cutoff must hard-link node-store member {name}"
-      );
+    // The node store, evidence, and edge families never carry stamps: the cutoff
+    // hard-links EVERY member + TOC of all three.
+    for family in ["nodes", "evidence", "edges"] {
+      for entry in fs::read_dir(gen_a2.join(family)).unwrap().flatten() {
+        let name = entry.file_name().into_string().unwrap();
+        assert_eq!(
+          entry.metadata().unwrap().ino(),
+          fs::metadata(gen_a3.join(family).join(&name)).unwrap().ino(),
+          "cutoff must hard-link {family} member {name}"
+        );
+      }
     }
   }
   let out_d = base.join("index-d");
@@ -285,6 +391,9 @@ fn bucketed_pack_end_to_end() {
   assert!(!gen_e.join("products").exists(), "no bucketed members in a flat generation");
   assert!(gen_e.join("nodes.vseg").is_file(), "flat build still writes the flat node store");
   assert!(!gen_e.join("nodes").exists(), "no bucketed node members in a flat generation");
+  assert!(gen_e.join("evidence.bin").is_file(), "flat build still writes flat evidence");
+  assert!(!gen_e.join("evidence").exists());
+  assert!(!gen_e.join("edges").exists(), "no edge slabs in a flat generation");
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
   // A structural edit (span-shifting), so the stamp-only cutoff — which correctly carries
   // the PRIOR's pack format byte-for-byte — cannot swallow the migration build.
@@ -304,6 +413,9 @@ fn bucketed_pack_end_to_end() {
   assert!(!gen_e2.join("products.pack").exists());
   assert!(gen_e2.join("nodes/toc.bin").is_file(), "migration publishes the v2 node store");
   assert!(!gen_e2.join("nodes.vseg").exists());
+  assert!(gen_e2.join("evidence/toc.bin").is_file(), "migration publishes v2 evidence");
+  assert!(!gen_e2.join("evidence.bin").exists());
+  assert!(gen_e2.join("edges/toc.bin").is_file(), "migration publishes the v2 edge store");
   let out_f = base.join("index-f");
   build_index(&src, &out_f).unwrap();
   assert_eq!(

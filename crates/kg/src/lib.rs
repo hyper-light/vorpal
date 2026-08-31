@@ -12,17 +12,22 @@
 //! [`KgWriter`] accumulates and [`KgWriter::seal`]s into a queryable [`Kg`].
 
 mod dataflow;
+mod edgestore;
 mod evidence;
 mod kg;
 mod model;
 mod writer;
 
 pub use kg::{
-  Kg, NODES_DIR, NODES_TOC, NodeView, SegmentLayout, SymbolSelector, is_nodes_member,
-  resolve_index_dir,
+  Kg, NODES_DIR, NODES_TOC, NodeIdMap, NodeView, SegmentLayout, SymbolSelector,
+  is_nodes_member, resolve_index_dir,
 };
 pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
-pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
+pub use edgestore::{EDGES_DIR, EDGES_TOC, is_edges_member};
+pub use evidence::{
+  EVIDENCE_DIR, EVIDENCE_TOC, EvidenceLayout, EvidenceOutcome, EvidenceRow, EvidenceStore,
+  NO_EDGE, is_evidence_member, save as save_evidence, save_with as save_evidence_with,
+};
 pub use model::SymbolKind;
 pub mod communities;
 pub mod identity;

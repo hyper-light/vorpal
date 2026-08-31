@@ -124,11 +124,21 @@ pub struct KgWriter {
   flags: Vec<u8>,
   span_start: Vec<u32>,
   span_end: Vec<u32>,
+  /// P4.3 CSC law: seal the in-coming CSC over the src-major enumeration (bucketed format)
+  /// instead of the raw interleaved log (flat format). Set by whoever knows the
+  /// generation's format BEFORE the first seal — the served graph must equal the loaded
+  /// one bit-for-bit, per-destination adjacency order included.
+  csc_src_major: bool,
 }
 
 impl KgWriter {
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Adopt the bucketed format's CSC law (see the field docs). Idempotent; set at boot.
+  pub fn set_csc_src_major(&mut self, on: bool) {
+    self.csc_src_major = on;
   }
 
   /// Intern an entity; if new, append its column row. Returns the dense node id. Re-defining the
@@ -532,7 +542,11 @@ impl KgWriter {
 
     crate::phase_stamp("seal: compact");
     let edges = std::mem::take(&mut self.edges);
-    let graph = Graph::compact(n, &edges);
+    let graph = if self.csc_src_major {
+      Graph::compact_src_major(n, &edges)
+    } else {
+      Graph::compact(n, &edges)
+    };
     drop(edges);
     crate::phase_stamp("seal: kg assemble");
 
@@ -778,7 +792,13 @@ impl KgWriter {
           },
         )
       },
-      || Graph::compact(n, &new_edges),
+      || {
+        if self.csc_src_major {
+          Graph::compact_src_major(n, &new_edges)
+        } else {
+          Graph::compact(n, &new_edges)
+        }
+      },
     );
     crate::phase_stamp("seal-canonical: assemble kg");
 
