@@ -45,9 +45,54 @@ fn write_fixture(src: &Path) {
     )
     .unwrap();
   }
+  // Near-clone pairs ABOVE the signing floor (signature.rs MIN_TOKENS): the tiny helpers
+  // above are never sketched, so without these the sigs family (P4.5c) would be empty and
+  // its content oracle vacuous. One pair per language family that P4.5c's scoped
+  // re-pairing must serve — the bodies differ by one constant.
+  for (name, rotate) in [("clone_a.rs", 7u32), ("clone_b.rs", 9u32)] {
+    fs::write(
+      src.join("core").join(name),
+      format!(
+        "pub fn checksum_stream_{rotate}(data: &[u8]) -> u64 {{\n    let mut acc: u64 = \
+         1469598103934665603;\n    for byte in data {{\n        acc ^= *byte as u64;\n        \
+         acc = acc.wrapping_mul(1099511628211);\n        acc = acc.rotate_left({rotate}) ^ \
+         0x1234;\n    }}\n    acc ^ (data.len() as u64)\n}}\n"
+      ),
+    )
+    .unwrap();
+  }
+  for (name, seed) in [("digest_a.py", 17u32), ("digest_b.py", 23u32)] {
+    fs::write(
+      src.join("util").join(name),
+      format!(
+        "def digest_rows_{seed}(rows):\n    total = {seed}\n    for row in rows:\n        \
+         value = row * 31 + 7\n        total = total ^ value\n        total = (total * \
+         1099511628211) % 18446744073709551616\n    return total + len(rows)\n"
+      ),
+    )
+    .unwrap();
+  }
   fs::write(
     src.join("main.go"),
     "package main\n\nfunc compute(n int) int {\n\treturn n * 2\n}\n\nfunc main() {\n\t_ = compute(21)\n}\n",
+  )
+  .unwrap();
+  // The convergence gates must hold beyond any one language family (the generic-tool
+  // law): TypeScript, Java, and C ride through every step — scratch determinism, the
+  // single-bucket laws, the cutoff, the respan compose, and the migration.
+  fs::write(
+    src.join("web.ts"),
+    "export function fetchUser(id: number): string {\n  return renderUser(id);\n}\n\nexport function renderUser(id: number): string {\n  return `user-${id}`;\n}\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("Service.java"),
+    "public class Service {\n  public int handle(int input) {\n    return transform(input);\n  }\n\n  private int transform(int input) {\n    return input * 3;\n  }\n}\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("native.c"),
+    "static int scale(int value) {\n  return value * 5;\n}\n\nint entry_point(int seed) {\n  return scale(seed);\n}\n",
   )
   .unwrap();
 }
@@ -95,7 +140,7 @@ fn bucketed_pack_end_to_end() {
   let out_a = base.join("index-a");
   let report = build_index(&src, &out_a).unwrap();
   assert!(!report.reused);
-  assert_eq!(report.indexed, 25, "12 rs + 12 py + 1 go");
+  assert_eq!(report.indexed, 32, "12+2 rs + 12+2 py + go + ts + java + c");
   let gen_a = live(&out_a);
   assert!(gen_a.join("products/toc.bin").is_file(), "v2 pack TOC missing");
   assert!(!gen_a.join("products.pack").exists(), "flat pack must not ride along");
@@ -107,12 +152,13 @@ fn bucketed_pack_end_to_end() {
   assert!(!gen_a.join("evidence.bin").exists(), "flat evidence must not ride along");
   assert!(gen_a.join("edges/toc.bin").is_file(), "v2 edge-store TOC missing");
   assert!(gen_a.join("usage/toc.bin").is_file(), "v2 usage TOC missing");
+  assert!(gen_a.join("sigs/toc.bin").is_file(), "v2 sigs TOC missing");
   assert!(
     gen_a.join("graph.bin").is_file() && gen_a.join("graph.stamp").is_file(),
     "the derived CSR cache is written eagerly"
   );
   let buckets = bucket_stats(&gen_a);
-  assert_eq!(buckets.len(), 16, "25 files land in the clamped minimum bucket count");
+  assert_eq!(buckets.len(), 16, "32 files land in the clamped minimum bucket count");
   let node_slabs = fs::read_dir(gen_a.join("nodes"))
     .unwrap()
     .flatten()
@@ -223,6 +269,57 @@ fn bucketed_pack_end_to_end() {
     }
     assert!(!expected.is_empty(), "the fixture references names");
   }
+  // Sigs oracle (P4.5c-1): the family holds EXACTLY the near-clone sketch ledger the
+  // packed products carry — per file, multiset-equal on (shingles, sketch bytes) — and
+  // every row's (file_key, ordinal) resolves inside the node universe.
+  {
+    let map = vorpal_kg::NodeIdMap::from_dir(&gen_a).unwrap();
+    let sigs = vorpal_kg::SigStore::open(&gen_a).expect("sigs family opens");
+    let rows = sigs.rows(&map).expect("every sig row must resolve in the node universe");
+    let mut got: std::collections::BTreeMap<u64, Vec<(u32, Vec<u8>)>> =
+      std::collections::BTreeMap::new();
+    for row in &rows {
+      let (file_key, _) = map.locate(row.node).unwrap();
+      got.entry(file_key).or_default().push((row.shingles, row.sketch.to_vec()));
+    }
+    let tree_root = src.canonicalize().unwrap();
+    let pack =
+      vorpal_ingest::PackReader::open_rooted(&gen_a, Some(&tree_root.to_string_lossy()))
+        .expect("v2 pack opens");
+    let mut want: std::collections::BTreeMap<u64, Vec<(u32, Vec<u8>)>> =
+      std::collections::BTreeMap::new();
+    let mut stack = vec![tree_root.clone()];
+    while let Some(dir) = stack.pop() {
+      for entry in fs::read_dir(&dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+          stack.push(path);
+          continue;
+        }
+        let bytes = pack
+          .get(&path.to_string_lossy())
+          .expect("every fixture file has a packed product");
+        let view = vorpal_ingest::decode_product_view(bytes).unwrap();
+        if view.signatures.is_empty() {
+          continue;
+        }
+        let rel = path.strip_prefix(&tree_root).unwrap().to_string_lossy().into_owned();
+        let key = vorpal_kg::identity::FileKey::of(&rel).0;
+        want
+          .entry(key)
+          .or_default()
+          .extend(view.signatures.iter().map(|sig| (sig.shingles, sig.sketch.to_vec())));
+      }
+    }
+    for list in got.values_mut() {
+      list.sort_unstable();
+    }
+    for list in want.values_mut() {
+      list.sort_unstable();
+    }
+    assert_eq!(got, want, "sigs family must equal the products' sketch ledger");
+    assert!(!rows.is_empty(), "the fixture signs the near-clone pairs");
+  }
 
   // The derived CSR cache is never load-bearing: delete it, load again (forces the
   // slab rebuild), answers hold, and the lazy write-back restores the cache files.
@@ -257,7 +354,7 @@ fn bucketed_pack_end_to_end() {
   let health = vorpal_index::parse_health_report(&out_a).unwrap();
   assert!(!health.is_empty());
   let coverage = vorpal_index::records::coverage_records(Some(&gen_a));
-  assert_eq!(coverage.total_files, 25, "coverage sweep sees every packed product");
+  assert_eq!(coverage.total_files, 32, "coverage sweep sees every packed product");
 
   // 3: the single-bucket rewrite law.
   let edited_rel = "core/mod_07.rs";
@@ -347,6 +444,23 @@ fn bucketed_pack_end_to_end() {
         "usage slab {name} must hard-link across a name-preserving edit"
       );
     }
+    // The SIGS slabs rewrite AT MOST the edited file's bucket (the body edit rewrites
+    // helper_7's file rows — none of which are signed, so full carry is equally legal);
+    // every other bucket is keyed position-independently and must hard-link.
+    for entry in fs::read_dir(gen_a.join("sigs")).unwrap().flatten() {
+      let name = entry.file_name().into_string().unwrap();
+      if !name.ends_with(".bin") || name == "toc.bin" {
+        continue;
+      }
+      if name == format!("{expected_bucket:04}.bin") {
+        continue;
+      }
+      assert_eq!(
+        entry.metadata().unwrap().ino(),
+        fs::metadata(gen_a2.join("sigs").join(&name)).unwrap().ino(),
+        "unedited sig slab {name} must hard-link across a single-file edit"
+      );
+    }
     // …and the EDGE slabs rewrite AT MOST the edited file's bucket (this edit changes the
     // call-argument shape, so its DATA_FLOWS rows legitimately move); every other bucket's
     // endpoints are position-independent (bucket, local) coordinates and must hard-link.
@@ -412,7 +526,7 @@ fn bucketed_pack_end_to_end() {
     );
     // The node store, evidence, and edge families never carry stamps: the cutoff
     // hard-links EVERY member + TOC of all three.
-    for family in ["nodes", "evidence", "edges", "usage"] {
+    for family in ["nodes", "evidence", "edges", "usage", "sigs"] {
       for entry in fs::read_dir(gen_a2.join(family)).unwrap().flatten() {
         let name = entry.file_name().into_string().unwrap();
         assert_eq!(
@@ -459,8 +573,9 @@ fn bucketed_pack_end_to_end() {
   #[cfg(unix)]
   {
     use std::os::unix::fs::MetadataExt;
-    // The compose's signature: edges + usage fully linked; both derived caches linked.
-    for family in ["edges", "usage"] {
+    // The compose's signature: edges + usage + sigs fully linked (sketch equality is an
+    // eligibility premise); both derived caches linked.
+    for family in ["edges", "usage", "sigs"] {
       for entry in fs::read_dir(gen_a3.join(family)).unwrap().flatten() {
         let name = entry.file_name().into_string().unwrap();
         assert_eq!(
@@ -504,6 +619,7 @@ fn bucketed_pack_end_to_end() {
   assert!(gen_e.join("evidence.bin").is_file(), "flat build still writes flat evidence");
   assert!(!gen_e.join("evidence").exists());
   assert!(!gen_e.join("edges").exists(), "no edge slabs in a flat generation");
+  assert!(!gen_e.join("sigs").exists(), "no sig slabs in a flat generation");
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
   // A structural edit (span-shifting), so the stamp-only cutoff — which correctly carries
   // the PRIOR's pack format byte-for-byte — cannot swallow the migration build.
@@ -526,6 +642,7 @@ fn bucketed_pack_end_to_end() {
   assert!(gen_e2.join("evidence/toc.bin").is_file(), "migration publishes v2 evidence");
   assert!(!gen_e2.join("evidence.bin").exists());
   assert!(gen_e2.join("edges/toc.bin").is_file(), "migration publishes the v2 edge store");
+  assert!(gen_e2.join("sigs/toc.bin").is_file(), "migration publishes the sigs family");
   let out_f = base.join("index-f");
   build_index(&src, &out_f).unwrap();
   assert_eq!(

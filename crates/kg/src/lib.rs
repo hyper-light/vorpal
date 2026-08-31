@@ -16,6 +16,7 @@ mod edgestore;
 mod evidence;
 mod kg;
 pub mod respan;
+mod sigstore;
 mod usagestore;
 mod model;
 mod writer;
@@ -26,6 +27,9 @@ pub use kg::{
 };
 pub use dataflow::{DataflowRow, DataflowStore, FlowView, load_dataflow, save_dataflow};
 pub use edgestore::{EDGES_DIR, EDGES_TOC, is_edges_member};
+pub use sigstore::{
+  SIG_SKETCH_LEN, SIGS_DIR, SIGS_TOC, SigFamilyRow, SigStore, is_sigs_member, save_sigs,
+};
 pub use usagestore::{USAGE_DIR, USAGE_TOC, UsageStore, is_usage_member};
 pub use evidence::{
   EVIDENCE_DIR, EVIDENCE_TOC, EvidenceLayout, EvidenceOutcome, EvidenceRow, EvidenceStore,

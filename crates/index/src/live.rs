@@ -502,7 +502,7 @@ impl LiveOverlay {
     vorpal_kg::phase_stamp("overlay: apply start");
     self.absorb_probed(&probe)?;
     let pre_edges = self.cochange_pre_edges();
-    let (kg, _stats, evidence, flows) = self
+    let (kg, _stats, evidence, flows, sigs) = self
       .index
       .link(&self.interner, &Resolver::new(), &pre_edges)
       .map_err(|err| format!("overlay: link failed: {err}"))?;
@@ -530,6 +530,7 @@ impl LiveOverlay {
       kg: kg.clone(),
       evidence,
       flows,
+      sigs,
       manifest: self.manifest.clone(),
       prior,
       out,
@@ -569,6 +570,9 @@ pub struct ServedPersist {
   /// Data-flow rows in sealed-id space — `dataflow.bin` is part of the generation's
   /// content identity, so the served commit must stage it like every other artifact.
   flows: Vec<vorpal_kg::DataflowRow>,
+  /// Sigs-family rows (P4.5c) in sealed-id space — staged beside evidence under the
+  /// bucketed format, nothing under flat.
+  sigs: Vec<vorpal_ingest::SigRow>,
   manifest: Manifest,
   prior: PathBuf,
   out: PathBuf,
@@ -583,6 +587,7 @@ impl ServedPersist {
       kg,
       evidence,
       flows,
+      sigs,
       manifest,
       prior,
       out,
@@ -612,7 +617,7 @@ impl ServedPersist {
       .map_err(|err| format!("served persist: evidence bases: {err}"))?;
     // Three independent artifact groups write concurrently; the manifest stays last (the
     // commit point), exactly like the pipeline's tail.
-    let (pack_result, evidence_result, dataflow_result, kg_result) =
+    let (pack_result, evidence_result, dataflow_result, sigs_result, kg_result) =
       std::thread::scope(|scope| {
         let pack_task = scope.spawn(|| -> std::io::Result<()> {
           let reader = PackReader::open_rooted(&prior, Some(&tree_root)).map(Arc::new);
@@ -642,17 +647,21 @@ impl ServedPersist {
           vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
         });
         let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
+        let sigs_task =
+          scope.spawn(|| crate::save_sig_family(&staging, &sigs, &evidence_bases, &prior));
         let kg_result = kg.save_with(&staging, &layout);
         (
           pack_task.join().expect("pack writer panicked"),
           evidence_task.join().expect("evidence saver panicked"),
           dataflow_task.join().expect("dataflow saver panicked"),
+          sigs_task.join().expect("sigs saver panicked"),
           kg_result,
         )
       });
     pack_result.map_err(|err| format!("served persist: pack: {err}"))?;
     evidence_result.map_err(|err| format!("served persist: evidence: {err}"))?;
     dataflow_result.map_err(|err| format!("served persist: dataflow: {err}"))?;
+    sigs_result.map_err(|err| format!("served persist: sigs: {err}"))?;
     kg_result.map_err(|err| format!("served persist: graph: {err}"))?;
     manifest
       .save(&staging.join("manifest.bin"))

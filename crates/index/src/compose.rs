@@ -48,6 +48,7 @@ pub(crate) fn try_respan_compose(
     vorpal_kg::EVIDENCE_TOC,
     vorpal_kg::EDGES_TOC,
     vorpal_kg::USAGE_TOC,
+    vorpal_kg::SIGS_TOC,
     "products/toc.bin",
   ] {
     if !prior.join(toc).is_file() {

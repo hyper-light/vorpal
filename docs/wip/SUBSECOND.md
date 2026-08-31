@@ -758,14 +758,41 @@ its disk twin, landed in three certified sub-slices:
   folds) — the convergence gate also self-proves the compose ran (a cutoff misfire would
   carry stale spans and diverge). Falls back loudly on any proof failure; error-span
   SHIFTS are eligible (they live only in the republished product), error COUNTS are not.
-- **P4.5c — the full dirty closure.** Cross-file impact (changed defs with external
-  referrers): re-resolve exactly the dirty files, decoding products (pack) for the dirty
-  closure to re-derive flow ledgers (chains/args/similar context) — products are the
-  persisted source of those, no new family needed. The escalation threshold stays the
-  measured shape (the retained tier's `within_absorb_budget`), and any closure the
-  reasoning under-approximates falls back LOUDLY to the full pipeline, never to a wrong
-  generation. Gate: scoped == full bytes across the differential ladder + kernel identity
-  A/B per edit class.
+- **P4.5c — the full dirty closure**, landed as three certified sub-slices. The original
+  "no new family needed" premise fell to one analysis: near-clone pairing is GLOBAL (LSH
+  banding + star centers over the ENTIRE sketch ledger), so a scoped build re-pairing
+  after an edit needs every prior sketch — decodable only by a corpus-wide product
+  decode, which is exactly what scoped builds exist to avoid. Hence:
+  - **c-1 — the sigs family: SHIPPED (2026-08-31).** `sigs/<k>.bin` + `sigs/toc.bin`,
+    80-byte rows `[file_key u64][ordinal u32][shingles u32][sketch;64]`, sorted
+    (bucket, key, ordinal), digest-carried per bucket like every family; in the Merkle
+    fold ("sigs/toc.bin" — an older prior without it simply fails the cutoff/compose
+    pre-checks and migrates through the full pipeline). Rows ride the existing pairing
+    thread (both linkers hand them back beside the pairs; bulk writer ids ARE sealed ids
+    — the P4.2 canonical stream makes the seal remap-free — and the retained pre-LUT is
+    asserted equal to the seal's), saved concurrently with evidence/dataflow/kg in all
+    three persistence tails (sync, deferred, served), flat lane untouched. Respan
+    hard-links the whole family (sketch equality is an eligibility premise); the cutoff
+    links it like every stamp-free family. Width is pinned (`BINS ==
+    vorpal_kg::SIG_SKETCH_LEN`, compile-time). Gates: pack_v2 content oracle — family
+    multiset-equals the packed products' sketch ledger per file (fixture grew signable
+    near-clone pairs in rs+py above the MIN_TOKENS floor; 6 languages, 32 files);
+    single-bucket rewrite law on edit; full-link law on cutoff+respan; migration
+    publishes the family; both daemon differentials green. Kernel: 49 MB family
+    (257 members, ~2.6% of generation), cold 7.56–8.28 s (band unchanged — the save
+    overlaps evidence), determinism ×2 PASS, edit/revert/respan/cutoff convergence PASS,
+    respan 0.86 s + 257/257 sig slabs linked, cutoff 0.49 s + 257/257 linked.
+  - **c-2 — defs-stable scoped resolve (single-file semantic edits):** prior kg + bounded
+    product-decode closure for chains/DF/requests + sigs-family scoped re-pairing;
+    byte-convergence gates per edit class.
+  - **c-3 — defs-changed closure via the usage family** + measured escalation threshold
+    (the retained tier's `within_absorb_budget` shape); then default-format flip and v1
+    read retirement.
+  Standing gate for c-2/c-3 (the generic-tool law): a real-repo convergence battery —
+  scripts/-level, ≥3 diverse modest repos, real edit shapes (comment insert, body change,
+  import add, function append), scoped-vs-full BYTE compare per class — beyond the kernel
+  and the fixture. Escalation stays LOUD: any under-approximated closure falls back to
+  the full pipeline, never to a wrong generation.
 
 ## Execution order & gates
 

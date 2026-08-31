@@ -871,7 +871,7 @@ pub fn link_writer_spilled<'i>(
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
 ) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
-  let (kg, stats, evidence, _flows, _similar, _requests) =
+  let (kg, stats, evidence, _flows, _similar, _requests, _sigs) =
     link_writer_spilled_with_flows(interner, writer, spill, resolver, None, None)?;
   Ok((kg, stats, evidence))
 }
@@ -978,11 +978,18 @@ pub type LinkedGraph = (
   Vec<vorpal_kg::DataflowRow>,
   crate::similar::SimilarReport,
   crate::requests::RequestReport,
+  // Every signed definition's sketch, canonical-id keyed — the sigs family's rows
+  // (P4.5c: persisted per bucketed generation for scoped re-pairing).
+  Vec<crate::similar::SigRow>,
 );
 
-/// The near-clone pairing thread's yield: sorted canonical-id pairs plus the pass report.
-pub type PairingHandle =
-  std::thread::JoinHandle<(Vec<(u64, u64, u8)>, crate::similar::SimilarReport)>;
+/// The near-clone pairing thread's yield: sorted canonical-id pairs, the pass report, and
+/// the sketch rows handed back for the sigs family.
+pub type PairingHandle = std::thread::JoinHandle<(
+  Vec<(u64, u64, u8)>,
+  crate::similar::SimilarReport,
+  Vec<crate::similar::SigRow>,
+)>;
 
 /// Start the near-clone pairing as early as its input exists — the sig spill closes with
 /// the stream phase, and the pairing needs nothing else, so a caller that spawns here
@@ -1041,7 +1048,7 @@ pub fn link_writer_spilled_with_flows<'i>(
     .join()
     .map_err(|_| io::Error::other("similarity pairing panicked"));
   let (stats, evidence, flows) = link?;
-  let (similar_pairs, similar_report) = pairing?;
+  let (similar_pairs, similar_report, sig_family_rows) = pairing?;
   phase_trace("link: resolve done");
   // Symmetric near-clone edges, sorted pairs — deterministic edge-log order.
   for &(a, b, confidence) in &similar_pairs {
@@ -1087,7 +1094,7 @@ pub fn link_writer_spilled_with_flows<'i>(
   let kg = writer.seal();
   release_freed_pages();
   phase_trace("link: seal done");
-  Ok((kg, stats, evidence, flows, similar_report, request_report))
+  Ok((kg, stats, evidence, flows, similar_report, request_report, sig_family_rows))
 }
 
 /// The resolution half of a spilled link: load the flow spills, build the table, resolve

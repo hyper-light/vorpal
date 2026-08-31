@@ -334,6 +334,29 @@ pub fn build_index_env(
   build_index_inner(src, out, cache_mode, policy, None, None, env)
 }
 
+/// Persist the sigs family (P4.5c): every signed definition's near-clone sketch, keyed by
+/// sealed node id, identity-coded to `(file_key, ordinal)` and bucketed for hard-link carry.
+/// Bucketed generations only — the flat lane's artifact set is frozen (its byte-identity to
+/// the pre-P4 binary is a proven law), so under `SegmentLayout::Flat` this writes nothing.
+/// The u64→u32 narrowing is checked: a sealed id past u32 is a corrupt universe, not data.
+pub(crate) fn save_sig_family(
+  staging: &Path,
+  rows: &[vorpal_ingest::SigRow],
+  bases: &Option<vorpal_kg::NodeIdMap>,
+  prior: &Path,
+) -> io::Result<()> {
+  let Some(map) = bases else {
+    return Ok(());
+  };
+  let mut family = Vec::with_capacity(rows.len());
+  for row in rows {
+    let node = u32::try_from(row.node)
+      .map_err(|_| io::Error::other("sig row node id exceeds the sealed id space"))?;
+    family.push(vorpal_kg::SigFamilyRow { node, shingles: row.shingles, sketch: row.sketch });
+  }
+  vorpal_kg::save_sigs(staging, &family, map, Some(prior))
+}
+
 /// A full-pipeline build whose persistence tail was deferred (SUBSECOND.md Phase 3, live
 /// rebuild v1). Everything answer-affecting is already computed — the graph is sealed and
 /// [`PendingPersist::persist`] performs only writes: evidence + segments + manifest into the
@@ -346,6 +369,9 @@ pub struct PendingPersist {
   staging: PathBuf,
   evidence: Vec<vorpal_kg::EvidenceRow>,
   flows: Vec<vorpal_kg::DataflowRow>,
+  /// Sigs-family rows (P4.5c) in sealed-id space — persisted beside evidence, bucketed
+  /// generations only.
+  sigs: Vec<vorpal_ingest::SigRow>,
   manifest: Manifest,
   kg: Arc<Kg>,
   /// The node-store layout this generation persists under (P4.2) — decided by the build
@@ -368,6 +394,7 @@ impl PendingPersist {
       staging,
       evidence,
       flows,
+      sigs,
       manifest,
       kg,
       layout,
@@ -376,7 +403,7 @@ impl PendingPersist {
     let evidence_bases = kg
       .node_id_map(&layout)
       .map_err(|err| format!("evidence bases: {err}"))?;
-    let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
+    let (evidence_result, dataflow_result, sigs_result, kg_result) = std::thread::scope(|scope| {
       let evidence_task = scope.spawn(|| {
         let evidence_layout = match &evidence_bases {
           None => vorpal_kg::EvidenceLayout::Flat,
@@ -388,15 +415,18 @@ impl PendingPersist {
         vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
       });
       let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
+      let sigs_task = scope.spawn(|| save_sig_family(&staging, &sigs, &evidence_bases, &prior));
       let kg_result = kg.save_with(&staging, &layout);
       (
         evidence_task.join().expect("evidence saver panicked"),
         dataflow_task.join().expect("dataflow saver panicked"),
+        sigs_task.join().expect("sigs saver panicked"),
         kg_result,
       )
     });
     evidence_result.map_err(|err| format!("evidence save failed: {err}"))?;
     dataflow_result.map_err(|err| format!("dataflow save failed: {err}"))?;
+    sigs_result.map_err(|err| format!("sigs save failed: {err}"))?;
     kg_result.map_err(|err| format!("graph save failed: {err}"))?;
     if let Some(pack) = pack {
       pack
@@ -1047,7 +1077,7 @@ fn build_index_inner(
     Some(arg_spill),
     pairing,
   );
-  let (kg, resolve, evidence, flows, similar, request_report) = match linked {
+  let (kg, resolve, evidence, flows, similar, request_report, sig_rows) = match linked {
     Ok(parts) => parts,
     Err(err) => {
       let _ = pack_thread.join();
@@ -1105,6 +1135,7 @@ fn build_index_inner(
       staging,
       evidence,
       flows,
+      sigs: sig_rows,
       manifest,
       kg,
       layout,
@@ -1123,7 +1154,7 @@ fn build_index_inner(
   // inside its saver, so it still joins the content identity deterministically. The
   // manifest stays strictly last — it is the commit point.
   let evidence_bases = kg.node_id_map(&layout)?;
-  let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
+  let (evidence_result, dataflow_result, sigs_result, kg_result) = std::thread::scope(|scope| {
     let evidence_task = scope.spawn(|| {
       let evidence_layout = match &evidence_bases {
         None => vorpal_kg::EvidenceLayout::Flat,
@@ -1135,15 +1166,18 @@ fn build_index_inner(
       vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
     });
     let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
+    let sigs_task = scope.spawn(|| save_sig_family(&staging, &sig_rows, &evidence_bases, &prior));
     let kg_result = kg.save_with(&staging, &layout);
     (
       evidence_task.join().map_err(|_| io::Error::other("evidence saver panicked")),
       dataflow_task.join().map_err(|_| io::Error::other("dataflow saver panicked")),
+      sigs_task.join().map_err(|_| io::Error::other("sigs saver panicked")),
       kg_result,
     )
   });
   evidence_result??;
   dataflow_result??;
+  sigs_result??;
   kg_result?;
   manifest.save(&staging.join("manifest.bin"))?;
   // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
@@ -1177,6 +1211,7 @@ pub(crate) fn is_generation_artifact_name(name: &str) -> bool {
     || vorpal_kg::is_evidence_member(name)
     || vorpal_kg::is_edges_member(name)
     || vorpal_kg::is_usage_member(name)
+    || vorpal_kg::is_sigs_member(name)
 }
 
 /// Every artifact name this generation actually carries, in fixed order: the flat list
@@ -1199,6 +1234,7 @@ pub(crate) fn generation_artifact_names(dir: &Path) -> Vec<String> {
     vorpal_kg::EVIDENCE_DIR,
     vorpal_kg::EDGES_DIR,
     vorpal_kg::USAGE_DIR,
+    vorpal_kg::SIGS_DIR,
   ] {
     if let Ok(dirents) = fs::read_dir(dir.join(family)) {
       let mut members: Vec<String> = dirents
@@ -1277,6 +1313,7 @@ fn merkle_artifact_names() -> Vec<String> {
     "manifest.bin",
     "nodes/toc.bin",
     "products/toc.bin",
+    "sigs/toc.bin",
     "usage/toc.bin",
   ]
   .into_iter()
@@ -1470,6 +1507,7 @@ fn try_stamp_only_cutoff(
     if !prior.join(vorpal_kg::EVIDENCE_TOC).is_file()
       || !prior.join(vorpal_kg::EDGES_TOC).is_file()
       || !prior.join(vorpal_kg::USAGE_TOC).is_file()
+      || !prior.join(vorpal_kg::SIGS_TOC).is_file()
     {
       return Ok(None);
     }
@@ -1576,6 +1614,7 @@ fn try_stamp_only_cutoff(
       (vorpal_kg::EVIDENCE_DIR, vorpal_kg::is_evidence_member),
       (vorpal_kg::EDGES_DIR, vorpal_kg::is_edges_member),
       (vorpal_kg::USAGE_DIR, vorpal_kg::is_usage_member),
+      (vorpal_kg::SIGS_DIR, vorpal_kg::is_sigs_member),
     ] {
       fs::create_dir_all(staging.join(family))?;
       for entry in fs::read_dir(prior.join(family))?.flatten() {
@@ -1714,6 +1753,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       || name.as_os_str() == vorpal_kg::EVIDENCE_DIR
       || name.as_os_str() == vorpal_kg::EDGES_DIR
       || name.as_os_str() == vorpal_kg::USAGE_DIR
+      || name.as_os_str() == vorpal_kg::SIGS_DIR
       || name.as_os_str() == "graph.stamp"
       || GENERATION_ARTIFACTS
         .iter()
@@ -1733,6 +1773,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
     vorpal_kg::EVIDENCE_DIR,
     vorpal_kg::EDGES_DIR,
     vorpal_kg::USAGE_DIR,
+    vorpal_kg::SIGS_DIR,
   ] {
     if let Ok(dirents) = fs::read_dir(staging.join(family)) {
       for entry in dirents.flatten() {

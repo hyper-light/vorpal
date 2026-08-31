@@ -25,7 +25,7 @@ pub mod requests;
 pub use requests::RequestReport;
 pub mod signature;
 pub mod similar;
-pub use similar::SimilarReport;
+pub use similar::{SigRow, SimilarReport};
 pub mod typefacts;
 
 pub use manifest::{FileStat, Manifest};

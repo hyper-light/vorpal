@@ -29,7 +29,7 @@ const MAX_CANDIDATES: usize = 8_000_000;
 
 /// One signed definition, as replayed from its product.
 #[derive(Clone)]
-pub(crate) struct SigRow {
+pub struct SigRow {
   pub node: u64,
   pub shingles: u32,
   pub sketch: [u8; BINS],
@@ -50,7 +50,12 @@ pub struct SimilarReport {
 }
 
 /// Similar pairs `(a, b, confidence)` with `a < b`, sorted; confidence = similarity × 100.
-pub(crate) fn similar_pairs(mut rows: Vec<SigRow>) -> (Vec<(u64, u64, u8)>, SimilarReport) {
+// The sigs family (P4.5c) persists exactly these sketches; the widths must never drift.
+const _: () = assert!(BINS == vorpal_kg::SIG_SKETCH_LEN);
+
+pub(crate) fn similar_pairs(
+  mut rows: Vec<SigRow>,
+) -> (Vec<(u64, u64, u8)>, SimilarReport, Vec<SigRow>) {
   let mut report = SimilarReport {
     signed: rows.len() as u64,
     ..SimilarReport::default()
@@ -60,7 +65,7 @@ pub(crate) fn similar_pairs(mut rows: Vec<SigRow>) -> (Vec<(u64, u64, u8)>, Simi
       0 => "no definition reached the signing floor (32 tokens)".to_string(),
       _ => "one signed definition — nothing to pair".to_string(),
     });
-    return (Vec::new(), report);
+    return (Vec::new(), report, rows);
   }
   let started = std::time::Instant::now();
   rows.par_sort_unstable_by_key(|r| r.node);
@@ -185,7 +190,7 @@ pub(crate) fn similar_pairs(mut rows: Vec<SigRow>) -> (Vec<(u64, u64, u8)>, Simi
   } else if pairs.is_empty() {
     report.note = Some("no pair of signed definitions reached 0.7 similarity".to_string());
   }
-  (pairs, report)
+  (pairs, report, rows)
 }
 
 #[cfg(test)]
@@ -210,7 +215,7 @@ mod tests {
       row(3, 2, 100),   // unrelated fill
       row(4, 1, 10),    // equal sketch, but a tenth of the size: refused by the ratio
     ];
-    let (pairs, report) = similar_pairs(rows);
+    let (pairs, report, _) = similar_pairs(rows);
     assert_eq!(pairs.len(), 1, "{pairs:?}");
     assert_eq!((pairs[0].0, pairs[0].1), (1, 2));
     assert!(pairs[0].2 >= 97, "{}", pairs[0].2);
@@ -224,7 +229,7 @@ mod tests {
     // 100 identical definitions: every bucket exceeds the all-pairs bound, so each member
     // pairs with the lowest id, and the hub keeps only MAX_PARTNERS partners.
     let rows: Vec<SigRow> = (0..100).map(|n| row(n, 5, 50)).collect();
-    let (pairs, report) = similar_pairs(rows);
+    let (pairs, report, _) = similar_pairs(rows);
     assert!(report.starred_buckets > 0);
     assert!(pairs.iter().all(|&(a, _, _)| a == 0), "{pairs:?}");
     // Every member keeps its one pair to the representative (a pair survives when either
@@ -234,7 +239,7 @@ mod tests {
     assert!(report.note.is_none());
     // A mid-sized family under the all-pairs bound is still capped per member.
     let rows: Vec<SigRow> = (0..40).map(|n| row(n, 5, 50)).collect();
-    let (pairs, _) = similar_pairs(rows);
+    let (pairs, _, _) = similar_pairs(rows);
     let mut degree = vec![0usize; 40];
     for &(a, b, _) in &pairs {
       degree[a as usize] += 1;
@@ -248,9 +253,9 @@ mod tests {
 
   #[test]
   fn nothing_to_pair_is_stated() {
-    let (_, report) = similar_pairs(vec![row(1, 1, 40)]);
+    let (_, report, _) = similar_pairs(vec![row(1, 1, 40)]);
     assert!(report.note.as_deref().unwrap().contains("one signed"));
-    let (_, report) = similar_pairs(vec![row(1, 1, 40), row(2, 2, 40)]);
+    let (_, report, _) = similar_pairs(vec![row(1, 1, 40), row(2, 2, 40)]);
     assert!(report.note.as_deref().unwrap().contains("no pair"));
   }
 }

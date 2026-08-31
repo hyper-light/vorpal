@@ -267,10 +267,13 @@ pub fn respan_generation(
   fs::write(&toc_tmp, &ev_toc)?;
   fs::rename(&toc_tmp, staging.join(crate::evidence::EVIDENCE_TOC))?;
 
-  // ---- untouched families: edges, usage — link members + TOCs verbatim ----
+  // ---- untouched families: edges, usage, sigs — link members + TOCs verbatim ----
+  // (sigs carry: the compose eligibility ladder proves every sketch and shingle count
+  // equal, and (file_key, ordinal) keys are span-free — the slabs are byte-identical.)
   for (family, toc_rel) in [
     (crate::edgestore::EDGES_DIR, crate::edgestore::EDGES_TOC),
     (crate::usagestore::USAGE_DIR, crate::usagestore::USAGE_TOC),
+    (crate::sigstore::SIGS_DIR, crate::sigstore::SIGS_TOC),
   ] {
     fs::create_dir_all(staging.join(family))?;
     for entry in fs::read_dir(prior.join(family))?.flatten() {

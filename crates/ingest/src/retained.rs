@@ -31,6 +31,17 @@ use crate::pipeline::{
 
 use crate::pipeline::PairingHandle;
 
+/// What a retained link yields: the sealed graph, resolution stats, evidence and data-flow
+/// rows in sealed-id space, and the sigs-family rows (P4.5c) — every signed definition's
+/// sketch, sealed-id keyed, for the persisted near-clone family.
+pub type LinkedRetained = std::io::Result<(
+  Kg,
+  crate::ResolveStats,
+  Vec<vorpal_kg::EvidenceRow>,
+  Vec<vorpal_kg::DataflowRow>,
+  Vec<crate::similar::SigRow>,
+)>;
+
 /// One file's resolution outcome, in retained-writer id space: its emitted edges (in
 /// emission order — the canonical-order feed makes that the from-scratch order), its
 /// evidence rows, and its share of the stats. Bucketing by source file is what makes
@@ -638,7 +649,7 @@ impl RetainedIndex {
     resolver: &Resolver,
     pre_edges: &[(u32, u32, EdgeType)],
   ) -> io::Result<(Kg, crate::ResolveStats)> {
-    let (kg, stats, _, _) = self.link_inner(interner, resolver, false, pre_edges)?;
+    let (kg, stats, _, _, _) = self.link_inner(interner, resolver, false, pre_edges)?;
     Ok((kg, stats))
   }
 
@@ -647,12 +658,7 @@ impl RetainedIndex {
     interner: &vorpal_resolve::Interner,
     resolver: &Resolver,
     pre_edges: &[(u32, u32, EdgeType)],
-  ) -> io::Result<(
-    Kg,
-    crate::ResolveStats,
-    Vec<vorpal_kg::EvidenceRow>,
-    Vec<vorpal_kg::DataflowRow>,
-  )> {
+  ) -> LinkedRetained {
     self.link_inner(interner, resolver, true, pre_edges)
   }
 
@@ -662,12 +668,7 @@ impl RetainedIndex {
     resolver: &Resolver,
     want_evidence: bool,
     pre_edges: &[(u32, u32, EdgeType)],
-  ) -> io::Result<(
-    Kg,
-    crate::ResolveStats,
-    Vec<vorpal_kg::EvidenceRow>,
-    Vec<vorpal_kg::DataflowRow>,
-  )> {
+  ) -> LinkedRetained {
     self.writer.truncate_edges(self.watermark);
     // Canonical file order for every order-sensitive consumer below: the same sequence a
     // from-scratch build under the same format processes (path-sorted, or bucket-major
@@ -904,7 +905,10 @@ impl RetainedIndex {
           sketch: rec.sketch,
         }));
       }
-      (sig_rows.len() > 1).then(|| std::thread::spawn(move || crate::similar::similar_pairs(sig_rows)))
+      // Non-empty row sets always go through the thread: pairing needs >=2, but the
+      // sigs FAMILY (P4.5c) persists every sketch — a lone signed definition's row must
+      // come back through the join, not vanish with a skipped spawn.
+      (!sig_rows.is_empty()).then(|| std::thread::spawn(move || crate::similar::similar_pairs(sig_rows)))
     };
     vorpal_kg::phase_stamp("retained: chain build start");
     let chain = {
@@ -1098,12 +1102,7 @@ impl RetainedIndex {
     pre_lut: Vec<u32>,
     inverse: Vec<u32>,
     pairing: Option<PairingHandle>,
-  ) -> io::Result<(
-    Kg,
-    crate::ResolveStats,
-    Vec<vorpal_kg::EvidenceRow>,
-    Vec<vorpal_kg::DataflowRow>,
-  )> {
+  ) -> LinkedRetained {
     let mut stats = crate::ResolveStats::default();
     for bits in order {
       if let Some(bucket) = self.resolution.get(bits) {
@@ -1146,11 +1145,11 @@ impl RetainedIndex {
     vorpal_kg::phase_stamp("retained: ledger gather done");
     let arg_join = ArgJoin::from_records(arg_records);
     let param_table = ParamTable::from_rows(param_rows);
-    let (similar_pairs, _similar_report) = match pairing {
+    let (similar_pairs, _similar_report, sig_family_rows) = match pairing {
       Some(handle) => handle
         .join()
         .map_err(|_| io::Error::other("near-clone pairing thread panicked"))?,
-      None => (Vec::new(), crate::similar::SimilarReport::default()),
+      None => (Vec::new(), crate::similar::SimilarReport::default(), Vec::new()),
     };
     vorpal_kg::phase_stamp("retained: similar pairing joined");
     // Routes from the per-file ledger in canonical order: block-major, row-ascending —
@@ -1233,7 +1232,7 @@ impl RetainedIndex {
       row.to = lut[row.to as usize];
     }
     if !want_evidence {
-      return Ok((kg, stats, Vec::new(), flows));
+      return Ok((kg, stats, Vec::new(), flows, sig_family_rows));
     }
     // Materialize sealed-id evidence copies in parallel per bucket (the saver's canonical
     // total-order sort makes concatenation order irrelevant): ~7M row clones were ~100ms
@@ -1269,6 +1268,6 @@ impl RetainedIndex {
     for mut bucket in per_bucket {
       evidence.append(&mut bucket);
     }
-    Ok((kg, stats, evidence, flows))
+    Ok((kg, stats, evidence, flows, sig_family_rows))
   }
 }
