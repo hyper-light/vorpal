@@ -1351,13 +1351,15 @@ fn apply_parts<'a, 'i>(
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
   writer.forget_identity_scope();
-  // ONE layout per file: these entity paths feed both the writer's node identities and the
-  // reference-index lookups below. The writer recomputing its own copy was a duplicate
-  // per-entity String build (~5 % of stream-phase allocation samples at kernel scale).
-  // References carry entity *indices* into the file's local layout; resolve them through
-  // this layout (an out-of-range index — a corrupt product — simply drops the ref).
-  let (entities, _spans) = crate::outline_extractor::local_layout(items);
-  writer.ingest_file_with_layout(path, items, &entities);
+  // ONE layout per file, and the writer hands back each layout position's NodeId in the
+  // same order (spans[0] = the file node, then items and members in walk order — the
+  // exact order product entity indices use). Attribution below is therefore ARRAY
+  // INDEXING; the per-reference canonical lookup this replaces hashed (blake3) the
+  // path+entity strings ~5.8M times per kernel link. An out-of-range index — a corrupt
+  // product — still simply drops the row.
+  let entity_paths = vorpal_kg::layout_entity_paths(items);
+  let spans = writer.ingest_file_with_layout(path, items, &entity_paths);
+  let id_at = |index: u32| spans.get(index as usize).map(|(_, id)| *id);
   // Intern the file's path once; every reference carries the 4-byte id.
   let path_id = interner.intern(path);
   // Callee parameter ledgers (G-M5): Python entities only — the one language whose call
@@ -1365,10 +1367,7 @@ fn apply_parts<'a, 'i>(
   if let Some(flow_out) = flow_out.as_deref_mut() {
     if !entity_params.is_empty() && is_python_path(path) {
       for (entity_index, names) in entity_params {
-        let Some(entity) = entities.get(*entity_index as usize) else {
-          continue;
-        };
-        if let Some(id) = writer.entity_id(path, entity) {
+        if let Some(id) = id_at(*entity_index) {
           if !names.is_empty() {
             flow_out.params.push(ParamRec {
               entity: id,
@@ -1383,13 +1382,10 @@ fn apply_parts<'a, 'i>(
   // collector exists (the spilled index-build path).
   if let Some(flow_out) = flow_out.as_deref_mut() {
     for (entity_index, shingles, sketch) in signatures {
-      let Some(entity) = entities.get(entity_index as usize) else {
-        continue;
-      };
       let Ok(sketch) = <[u8; crate::signature::BINS]>::try_from(sketch) else {
         continue; // a corrupt width — the decoder guarantees 64, so this never fires
       };
-      if let Some(id) = writer.entity_id(path, entity) {
+      if let Some(id) = id_at(entity_index) {
         flow_out.sigs.push(SigRec {
           entity: id,
           shingles,
@@ -1402,10 +1398,7 @@ fn apply_parts<'a, 'i>(
   // collector exists (the spilled index-build path).
   if let Some(flow_out) = flow_out.as_deref_mut() {
     for (entity_index, method, url, span) in requests {
-      let Some(entity) = entities.get(entity_index as usize) else {
-        continue;
-      };
-      if let Some(from) = writer.entity_id(path, entity) {
+      if let Some(from) = id_at(entity_index) {
         flow_out.requests.push(ReqRec {
           from,
           method: Box::from(method),
@@ -1416,10 +1409,7 @@ fn apply_parts<'a, 'i>(
     }
   }
   for r in refs {
-    let Some(entity) = entities.get(r.from_entity_index as usize) else {
-      continue;
-    };
-    if let Some(from) = writer.entity_id(path, entity) {
+    if let Some(from) = id_at(r.from_entity_index) {
       // Traceable call-site arguments ride beside the reference (G-M3): lazily decoded off
       // the view, captured only where a collector exists (the spilled index-build path).
       if let Some(flow_out) = flow_out.as_deref_mut() {
