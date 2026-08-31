@@ -15,6 +15,41 @@ use std::process::ExitCode;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Batch-index runs retain dirty pages for the process lifetime (decay off): with default
+/// decay, jemalloc purged pages mid-run while ~65 GB of churn cycled through a ~1 GB live
+/// set, and re-touching them cost a kernel-scale build 2.25 M soft faults and ~4 s of sys
+/// time (A/B: faults 2,245,820 → 474,390, sys 10.6 s → 6.6 s, wall −0.7 s; peak footprint
+/// 2.58 → 4.36 GB — retained pages die with the process at exit, so the tail cost is zero).
+/// Scoped to the `index` COMMAND only: long-lived daemon/serve paths keep default decay,
+/// which is exactly what returns their idle memory to the OS.
+/// (`oversize_threshold:0` was measured and rejected: faults flat, +5 s user CPU combined.)
+#[cfg(all(
+  feature = "jemalloc",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+fn retain_dirty_pages_for_batch_run() {
+  // `arenas.*` sets the DEFAULT for arenas created after this point (all the worker
+  // arenas); `arena.4096.*` is MALLCTL_ARENAS_ALL — every arena that already exists.
+  // Upstream jemalloc 5.3.1 admits the ALL sentinel into the decay_ms handler but never
+  // checks for it, indexing one past the arenas array and dereferencing garbage
+  // (EXC_BAD_ACCESS in `pac_decay_ms_set`); our vendored copy fixes the handler to iterate
+  // initialized arenas, mirroring `arena_i_decay` — see vendor/tikv-jemalloc-sys and the
+  // upstream ledger. A refused knob merely leaves default decay in place — this is a
+  // performance hint, never a correctness input — so results are deliberately discarded.
+  unsafe {
+    let _ = tikv_jemalloc_ctl::raw::write(b"arenas.dirty_decay_ms\0", -1isize);
+    let _ = tikv_jemalloc_ctl::raw::write(b"arenas.muzzy_decay_ms\0", -1isize);
+    let _ = tikv_jemalloc_ctl::raw::write(b"arena.4096.dirty_decay_ms\0", -1isize);
+    let _ = tikv_jemalloc_ctl::raw::write(b"arena.4096.muzzy_decay_ms\0", -1isize);
+  }
+}
+
+#[cfg(not(all(
+  feature = "jemalloc",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+)))]
+fn retain_dirty_pages_for_batch_run() {}
+
 /// Ledger builds (feature `alloc-ledger`): the same jemalloc, wrapped in exact
 /// event counters — every alloc/dealloc/realloc bumps the vorpal-kg ledger the
 /// phase stamps print. Two relaxed atomic adds per event; profiling builds only.
@@ -183,6 +218,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
   let argv: Vec<&str> = args.iter().map(String::as_str).collect();
   match argv.as_slice() {
     ["index", src, out, rest @ ..] => {
+      // Fault economics for the batch build: keep dirty pages for the process lifetime.
+      retain_dirty_pages_for_batch_run();
       let mut mode = vorpal_index::CacheMode::default();
       let mut policy = vorpal_index::ParseHealthPolicy::default();
       let mut semantic_tier: Option<vorpal_index::SemanticTier> = None;

@@ -72,6 +72,12 @@ rayon = "1.10.0"
 # CPU, so the C runtime (lexer/parser/subtree/stack) is ours to profile and optimize in-tree.
 # See docs/UPSTREAM.md for the sync ledger.
 tree-sitter = { path = "vendor/tree-sitter" }
+# Vendored jemalloc (tikv-jemalloc-sys 0.7.1 / jemalloc 5.3.1): fixes the ctl handler for
+# `arena.<MALLCTL_ARENAS_ALL>.{dirty,muzzy}_decay_ms` — upstream admits the ALL sentinel
+# through the mib resolver but never checks for it, indexing one past the arenas array
+# (observed EXC_BAD_ACCESS in pac_decay_ms_set). The batch indexer sets decay off through
+# that sentinel (fault economics; see BENCHMARKS). Sync ledger: docs/UPSTREAM.md.
+tikv-jemalloc-sys = { path = "vendor/tikv-jemalloc-sys" }
 tree-sitter-cmake = { path = "grammars/tree-sitter-cmake" }
 tree-sitter-astro-next = { path = "grammars/tree-sitter-astro-next" }
 tree-sitter-erlang = { path = "grammars/tree-sitter-erlang" }
