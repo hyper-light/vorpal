@@ -114,6 +114,13 @@ pub struct SerializableItemRule<L> {
   /// members and never suppress the traversal around them.
   #[serde(default)]
   pub nested: Option<bool>,
+  /// Container transparency (namespaces, ambient modules): after this item is
+  /// extracted, the traversal DESCENDS into its body and keeps matching items —
+  /// the container's contents are items in their own right (classes with their
+  /// own members), not members of the container. Without this, a matched item's
+  /// subtree is never re-entered (functions inside functions stay internal).
+  #[serde(default)]
+  pub transparent: Option<bool>,
 }
 
 /// Member extractor for direct child structure under an item.
@@ -264,6 +271,8 @@ pub struct ItemExtractor<L: Language> {
   member_of: Option<TemplateFix>,
   /// See [`SerializableItemRule::nested`].
   pub nested: bool,
+  /// See [`SerializableItemRule::transparent`].
+  pub transparent: bool,
 }
 
 impl<L: Language> ItemExtractor<L> {
@@ -278,6 +287,7 @@ impl<L: Language> ItemExtractor<L> {
       is_exported,
       member_of,
       nested,
+      transparent,
     } = item;
     let member_of = member_of
       .as_deref()
@@ -292,6 +302,7 @@ impl<L: Language> ItemExtractor<L> {
       is_exported,
       member_of,
       nested: nested.unwrap_or(false),
+      transparent: transparent.unwrap_or(false),
     })
   }
 
@@ -735,6 +746,7 @@ name: member
     let rule = SerializableOutlineRule::Item(SerializableItemRule {
       member_of: None,
       nested: None,
+      transparent: None,
       common: SerializableOutlineCommon {
         id: "ts-function".into(),
         language: SupportLang::TypeScript,

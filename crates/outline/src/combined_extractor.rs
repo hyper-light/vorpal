@@ -320,6 +320,18 @@ impl<'a, 'tree, L: LanguageExt> OutlineItemIter<'a, 'tree, L> {
       return None;
     };
     let member_of = extractor.resolve_member_of(&node_match);
+    if extractor.transparent {
+      // Transparent containers (namespaces, ambient modules): extract the container
+      // itself, then keep ITEM-matching inside its body — its contents are items in
+      // their own right (classes with their own members), never members of the
+      // container. See `SerializableItemRule::transparent`.
+      let item = extractor.extract(&node_match, vec![]);
+      self.traversal.descend();
+      return combined
+        .options
+        .keep_item(&item)
+        .then_some((item, member_of));
+    }
     let members = self.collect_members_for_item(&extractor.common.rule.id, item_subtree);
     let item = extractor.extract(&node_match, members);
     combined
@@ -623,6 +635,68 @@ function after() {}
       .collect::<Vec<_>>();
 
     assert_eq!(names, vec!["outer", "after"]);
+  }
+
+  #[test]
+  fn transparent_containers_expose_inner_items() {
+    let extractors = parse_outline_rules::<SupportLang>(
+      r#"
+id: ts-namespace
+language: TypeScript
+role: item
+symbolType: module
+rule:
+  kind: internal_module
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+transparent: true
+---
+id: ts-class
+language: TypeScript
+role: item
+symbolType: class
+rule:
+  pattern: class $NAME { $$$BODY }
+name: $NAME
+---
+id: ts-method
+language: TypeScript
+role: member
+parentRuleIds: [ts-class]
+symbolType: method
+rule:
+  pattern:
+    context: 'class A { $NAME() { $$$BODY } }'
+    selector: method_definition
+name: $NAME
+"#,
+    )
+    .expect("extractors should deserialize");
+    let combined = CombinedExtractors::try_from(extractors, &Default::default())
+      .expect("extractors should parse");
+    let grep = SupportLang::TypeScript.grep(
+      r#"
+namespace Outer {
+  export class Widget {
+    render() {}
+  }
+}
+class Top {}
+"#,
+    );
+
+    let items = combined.extract(grep.root()).collect::<Vec<_>>();
+    let names = items
+      .iter()
+      .map(|item| item.entry.name.as_ref())
+      .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["Outer", "Widget", "Top"]);
+    assert!(items[0].members.is_empty(), "container carries no members");
+    assert_eq!(items[1].members.len(), 1, "inner class keeps its own members");
+    assert_eq!(items[1].members[0].entry.name, "render");
   }
 
   #[test]

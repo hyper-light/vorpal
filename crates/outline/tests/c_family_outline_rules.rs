@@ -18,6 +18,7 @@ public enum Mode { Fast, Slow }
 "#,
     r#"
 - Module import private System
+- Module item exported Demo.Core
 - Interface item exported IService
   - Method public Run
 - Class item exported Parser
@@ -74,6 +75,7 @@ int helper(int value) { return value; }
 "#,
     r#"
 - Module import private <vector>
+- Module item exported demo
 - Class item exported Parser
   - Constructor private Parser
   - Method private parse

@@ -220,14 +220,35 @@ symbolType: typeAlias
 # discipline.
 rule:
   kind: type_definition
-  has:
-    field: declarator
-    any:
-      - kind: type_identifier
-        pattern: $NAME
-      - has:
-          kind: type_identifier
-          stopBy: end
-          pattern: $NAME
+  all:
+    - has:
+        field: declarator
+        any:
+          - kind: type_identifier
+            pattern: $NAME
+          - has:
+              kind: type_identifier
+              stopBy: end
+              pattern: $NAME
+    # A body-bearing record/enum under typedef is that record's DEFINITION —
+    # extracted by the struct/union/enum rules, which the traversal reaches
+    # once this rule declines. Only bodyless forms (`typedef struct Foo Bar;`,
+    # `typedef int u32;`) are aliases.
+    - not:
+        has:
+          field: type
+          any:
+            - kind: struct_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: union_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: enum_specifier
+              has:
+                field: body
+                kind: enumerator_list
 name: $NAME
 isExported: true

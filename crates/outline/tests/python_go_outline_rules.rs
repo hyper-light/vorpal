@@ -144,7 +144,7 @@ func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
 - Module import private strings
 - Constant item exported defaultMultipartMemory
 - Variable item exported defaultTrustedCIDRs
-- TypeParameter item exported HandlerFunc
+- TypeAlias item exported HandlerFunc
 - Struct item exported Engine
   - Field private trees
   - Field private maxParams
@@ -190,7 +190,7 @@ func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {
 "#,
     r#"
 - Module import private net/http | "net/http"
-- TypeParameter item exported HandlerFunc | type HandlerFunc func(*Context)
+- TypeAlias item exported HandlerFunc | type HandlerFunc func(*Context)
 - Struct item exported Engine | type Engine struct {
   - Field private maxParams | maxParams uint16
   - Method public Use | func (engine *Engine) Use(middleware ...HandlerFunc) IRoutes {

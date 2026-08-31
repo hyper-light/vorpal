@@ -113,7 +113,9 @@ isPublic:
 id: go-type
 language: Go
 role: item
-symbolType: typeParameter
+# `type Foo int` defines a distinct named type — typedef-shaped, not a generic
+# type parameter (extraction-coverage Wave 2 correction).
+symbolType: typeAlias
 rule:
   all:
     - kind: type_declaration
@@ -129,6 +131,17 @@ rule:
           - not:
               has:
                 kind: interface_type
+name: $NAME
+---
+id: go-type-alias
+language: Go
+role: item
+symbolType: typeAlias
+rule:
+  kind: type_alias
+  has:
+    field: name
+    pattern: $NAME
 name: $NAME
 ---
 id: go-const

@@ -118,7 +118,7 @@ isExported: false
 id: ts-export-type
 language: TypeScript
 role: item
-symbolType: struct
+symbolType: typeAlias
 rule:
   kind: export_statement
   has:
@@ -133,7 +133,7 @@ isExported: true
 id: ts-type
 language: TypeScript
 role: item
-symbolType: struct
+symbolType: typeAlias
 rule:
   kind: type_alias_declaration
   has:
@@ -564,7 +564,7 @@ isExported: false
 id: tsx-export-type
 language: Tsx
 role: item
-symbolType: struct
+symbolType: typeAlias
 rule:
   kind: export_statement
   has:
@@ -579,7 +579,7 @@ isExported: true
 id: tsx-type
 language: Tsx
 role: item
-symbolType: struct
+symbolType: typeAlias
 rule:
   kind: type_alias_declaration
   has:
@@ -914,6 +914,7 @@ rule:
             pattern: $NAME
 name: $NAME
 isExported: true
+transparent: true
 
 ---
 
@@ -941,6 +942,7 @@ isExported:
     - inside:
         kind: export_statement
         stopBy: neighbor
+transparent: true
 
 ---
 
@@ -984,6 +986,7 @@ rule:
         pattern: $NAME
 name: $NAME
 isExported: true
+transparent: true
 
 ---
 
@@ -1009,6 +1012,7 @@ rule:
             pattern: $NAME
 name: $NAME
 isExported: true
+transparent: true
 
 ---
 
@@ -1036,6 +1040,7 @@ isExported:
     - inside:
         kind: export_statement
         stopBy: neighbor
+transparent: true
 
 ---
 
@@ -1079,6 +1084,257 @@ rule:
         pattern: $NAME
 name: $NAME
 isExported: true
+transparent: true
+---
+id: ts-export-generator-function
+language: TypeScript
+role: item
+symbolType: function
+rule:
+  kind: export_statement
+  has:
+    field: declaration
+    kind: generator_function_declaration
+    has:
+      field: name
+      pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: ts-generator-function
+language: TypeScript
+role: item
+symbolType: function
+rule:
+  kind: generator_function_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: false
+---
+id: ts-function-signature
+language: TypeScript
+role: item
+symbolType: function
+rule:
+  kind: function_signature
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported:
+  any:
+    - inside:
+        kind: export_statement
+        stopBy: neighbor
+    - inside:
+        kind: ambient_declaration
+        stopBy: end
+---
+id: ts-top-level-var-arrow-function
+language: TypeScript
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: variable_declarator
+    - has:
+        field: name
+        kind: identifier
+        pattern: $NAME
+    - has:
+        field: value
+        kind: arrow_function
+    - inside:
+        all:
+          - kind: variable_declaration
+          - inside:
+              kind: program
+              stopBy: neighbor
+        stopBy: neighbor
+name: $NAME
+isExported: false
+---
+id: ts-top-level-var
+language: TypeScript
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: variable_declarator
+    - has:
+        field: name
+        kind: identifier
+        pattern: $NAME
+    - not:
+        has:
+          field: value
+          kind: arrow_function
+    - inside:
+        all:
+          - kind: variable_declaration
+          - inside:
+              kind: program
+              stopBy: neighbor
+        stopBy: neighbor
+name: $NAME
+isExported: false
+---
+id: ts-interface-index-signature
+language: TypeScript
+role: member
+parentRuleIds: [ts-export-interface, ts-interface]
+symbolType: property
+rule:
+  kind: index_signature
+name: '[index]'
+isPublic: true
+---
+id: ts-interface-call-signature
+language: TypeScript
+role: member
+parentRuleIds: [ts-export-interface, ts-interface]
+symbolType: method
+rule:
+  kind: call_signature
+name: '()'
+isPublic: true
+---
+id: ts-interface-construct-signature
+language: TypeScript
+role: member
+parentRuleIds: [ts-export-interface, ts-interface]
+symbolType: method
+rule:
+  kind: construct_signature
+name: 'new()'
+isPublic: true
+---
+id: tsx-export-generator-function
+language: Tsx
+role: item
+symbolType: function
+rule:
+  kind: export_statement
+  has:
+    field: declaration
+    kind: generator_function_declaration
+    has:
+      field: name
+      pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: tsx-generator-function
+language: Tsx
+role: item
+symbolType: function
+rule:
+  kind: generator_function_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: false
+---
+id: tsx-function-signature
+language: Tsx
+role: item
+symbolType: function
+rule:
+  kind: function_signature
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported:
+  any:
+    - inside:
+        kind: export_statement
+        stopBy: neighbor
+    - inside:
+        kind: ambient_declaration
+        stopBy: end
+---
+id: tsx-top-level-var-arrow-function
+language: Tsx
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: variable_declarator
+    - has:
+        field: name
+        kind: identifier
+        pattern: $NAME
+    - has:
+        field: value
+        kind: arrow_function
+    - inside:
+        all:
+          - kind: variable_declaration
+          - inside:
+              kind: program
+              stopBy: neighbor
+        stopBy: neighbor
+name: $NAME
+isExported: false
+---
+id: tsx-top-level-var
+language: Tsx
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: variable_declarator
+    - has:
+        field: name
+        kind: identifier
+        pattern: $NAME
+    - not:
+        has:
+          field: value
+          kind: arrow_function
+    - inside:
+        all:
+          - kind: variable_declaration
+          - inside:
+              kind: program
+              stopBy: neighbor
+        stopBy: neighbor
+name: $NAME
+isExported: false
+---
+id: tsx-interface-index-signature
+language: Tsx
+role: member
+parentRuleIds: [tsx-export-interface, tsx-interface]
+symbolType: property
+rule:
+  kind: index_signature
+name: '[index]'
+isPublic: true
+---
+id: tsx-interface-call-signature
+language: Tsx
+role: member
+parentRuleIds: [tsx-export-interface, tsx-interface]
+symbolType: method
+rule:
+  kind: call_signature
+name: '()'
+isPublic: true
+---
+id: tsx-interface-construct-signature
+language: Tsx
+role: member
+parentRuleIds: [tsx-export-interface, tsx-interface]
+symbolType: method
+rule:
+  kind: construct_signature
+name: 'new()'
+isPublic: true
 ---
 id: ts-http-route
 language: TypeScript

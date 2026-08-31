@@ -197,6 +197,145 @@ rule:
 name: $NAME
 isPublic: true
 ---
+id: csharp-namespace
+language: CSharp
+role: item
+symbolType: module
+rule:
+  kind: namespace_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+transparent: true
+---
+id: csharp-namespace-file-scoped
+language: CSharp
+role: item
+symbolType: module
+rule:
+  kind: file_scoped_namespace_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: csharp-member-event
+language: CSharp
+role: member
+parentRuleIds: [csharp-class, csharp-record, csharp-struct, csharp-interface]
+symbolType: property
+rule:
+  kind: event_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic:
+  has:
+    kind: modifier
+    regex: '^public$'
+---
+id: csharp-member-event-field
+language: CSharp
+role: member
+parentRuleIds: [csharp-class, csharp-record, csharp-struct, csharp-interface]
+symbolType: field
+rule:
+  kind: event_field_declaration
+  has:
+    kind: variable_declarator
+    stopBy: end
+    has:
+      field: name
+      pattern: $NAME
+name: $NAME
+isPublic:
+  has:
+    kind: modifier
+    regex: '^public$'
+---
+id: csharp-member-operator
+language: CSharp
+role: member
+parentRuleIds: [csharp-class, csharp-record, csharp-struct]
+symbolType: method
+# The operator token (`+`, `==`, …) is an anonymous node — metavariables cannot
+# bind it, so the name is literal; overloads stay distinct by signature (the
+# full declaration text), per `SymbolKind::is_overloadable`.
+rule:
+  kind: operator_declaration
+name: operator
+isPublic:
+  has:
+    kind: modifier
+    regex: '^public$'
+---
+id: csharp-member-conversion-operator
+language: CSharp
+role: member
+parentRuleIds: [csharp-class, csharp-record, csharp-struct]
+symbolType: method
+rule:
+  kind: conversion_operator_declaration
+  has:
+    field: type
+    pattern: $TYPE
+name: operator $TYPE
+isPublic:
+  has:
+    kind: modifier
+    regex: '^public$'
+---
+id: csharp-member-indexer
+language: CSharp
+role: member
+parentRuleIds: [csharp-class, csharp-record, csharp-struct, csharp-interface]
+symbolType: property
+rule:
+  kind: indexer_declaration
+  has:
+    field: type
+    pattern: $TYPE
+name: this[]
+isPublic:
+  has:
+    kind: modifier
+    regex: '^public$'
+---
+id: csharp-member-destructor
+language: CSharp
+role: member
+parentRuleIds: [csharp-class]
+symbolType: method
+rule:
+  kind: destructor_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: ~$NAME
+isPublic: true
+---
+id: csharp-macro
+language: CSharp
+role: item
+symbolType: macro
+rule:
+  kind: preproc_define
+  has:
+    kind: preproc_arg
+    pattern: $NAME
+transform:
+  SYMBOL:
+    replace:
+      source: $NAME
+      replace: '\s+$'
+      by: ''
+name: $SYMBOL
+isExported: true
+---
 id: csharp-http-route
 language: CSharp
 role: item

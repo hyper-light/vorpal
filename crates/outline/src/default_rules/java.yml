@@ -74,7 +74,7 @@ isExported:
 id: java-member-method
 language: Java
 role: member
-parentRuleIds: [java-interface, java-enum, java-class]
+parentRuleIds: [java-interface, java-enum, java-class, java-record]
 symbolType: method
 rule:
   all:
@@ -92,7 +92,7 @@ isPublic:
 id: java-member-constructor
 language: Java
 role: member
-parentRuleIds: [java-enum, java-class]
+parentRuleIds: [java-enum, java-class, java-record]
 symbolType: constructor
 rule:
   all:
@@ -110,7 +110,7 @@ isPublic:
 id: java-member-field
 language: Java
 role: member
-parentRuleIds: [java-interface, java-enum, java-class]
+parentRuleIds: [java-interface, java-enum, java-class, java-record]
 symbolType: field
 rule:
   all:
@@ -133,6 +133,124 @@ isPublic:
     kind: modifiers
     has:
       pattern: public
+---
+id: java-record
+language: Java
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: record_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: $NAME
+isExported:
+  has:
+    kind: modifiers
+    has:
+      pattern: public
+---
+id: java-record-compact-constructor
+language: Java
+role: member
+parentRuleIds: [java-record]
+symbolType: constructor
+rule:
+  kind: compact_constructor_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic:
+  has:
+    kind: modifiers
+    has:
+      pattern: public
+---
+id: java-annotation-decl
+language: Java
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: annotation_type_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: $NAME
+isExported:
+  has:
+    kind: modifiers
+    has:
+      pattern: public
+---
+id: java-annotation-element
+language: Java
+role: member
+parentRuleIds: [java-annotation-decl]
+symbolType: method
+rule:
+  kind: annotation_type_element_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic: true
+---
+id: java-enum-member
+language: Java
+role: member
+parentRuleIds: [java-enum]
+symbolType: enumMember
+rule:
+  kind: enum_constant
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isPublic: true
+---
+id: java-interface-constant
+language: Java
+role: member
+parentRuleIds: [java-interface]
+symbolType: field
+rule:
+  kind: constant_declaration
+  has:
+    field: declarator
+    has:
+      field: name
+      pattern: $NAME
+name: $NAME
+isPublic: true
+---
+id: java-package
+language: Java
+role: item
+symbolType: package
+rule:
+  kind: package_declaration
+  has:
+    any:
+      - kind: scoped_identifier
+      - kind: identifier
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: java-module
+language: Java
+role: item
+symbolType: module
+rule:
+  kind: module_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
 ---
 id: java-http-route-mapping
 language: Java

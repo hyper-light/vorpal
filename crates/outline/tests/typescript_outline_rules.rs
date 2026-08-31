@@ -100,7 +100,7 @@ class NotebookFindWidget extends SimpleFindReplaceWidget {
   - Field public focus
   - Field public findScope
   - Field public matchIndex
-- Struct item exported FindDirection
+- TypeAlias item exported FindDirection
 - Enum item exported MatchKind
   - EnumMember public Exact
   - EnumMember public Fuzzy

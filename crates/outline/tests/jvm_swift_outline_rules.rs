@@ -165,6 +165,7 @@ public final class RealInterceptorChain implements Interceptor {
 enum Protocol { HTTP_1_1 }
 "#,
     r#"
+- Package item exported okhttp3
 - Module import private okhttp3.Request
 - Module import private java.util.Collections.emptyList
 - Interface item exported Interceptor
@@ -178,6 +179,7 @@ enum Protocol { HTTP_1_1 }
   - Method public proceed
   - Method private exchange
 - Enum item private Protocol
+  - EnumMember public HTTP_1_1
 "#,
   );
 }

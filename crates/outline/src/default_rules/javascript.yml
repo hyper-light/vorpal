@@ -65,6 +65,37 @@ rule:
 name: $NAME
 isExported: false
 ---
+id: js-export-generator-function
+language: JavaScript
+role: item
+symbolType: function
+rule:
+  kind: export_statement
+  has:
+    field: declaration
+    kind: generator_function_declaration
+    has:
+      field: name
+      pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: js-generator-function
+language: JavaScript
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: generator_function_declaration
+    - has:
+        field: name
+        pattern: $NAME
+    - inside:
+        kind: program
+        stopBy: neighbor
+name: $NAME
+isExported: false
+---
 id: js-export-class
 language: JavaScript
 role: item
@@ -215,6 +246,55 @@ rule:
         all:
           - kind: lexical_declaration
           - regex: '^let\b'
+          - inside:
+              kind: program
+              stopBy: neighbor
+        stopBy: neighbor
+name: $NAME
+isExported: false
+---
+id: js-top-level-var-arrow-function
+language: JavaScript
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: variable_declarator
+    - has:
+        field: name
+        kind: identifier
+        pattern: $NAME
+    - has:
+        field: value
+        kind: arrow_function
+    - inside:
+        all:
+          - kind: variable_declaration
+          - inside:
+              kind: program
+              stopBy: neighbor
+        stopBy: neighbor
+name: $NAME
+isExported: false
+---
+id: js-top-level-var
+language: JavaScript
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: variable_declarator
+    - has:
+        field: name
+        kind: identifier
+        pattern: $NAME
+    - not:
+        has:
+          field: value
+          kind: arrow_function
+    - inside:
+        all:
+          - kind: variable_declaration
           - inside:
               kind: program
               stopBy: neighbor
