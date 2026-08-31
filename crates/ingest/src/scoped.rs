@@ -450,3 +450,129 @@ pub fn scoped_resolve_file(
     stats,
   })
 }
+
+/// The global near-clone pair set of a sealed graph, extracted from its adjacency:
+/// every `SIMILAR_TO` edge once (`a < b`), with its confidence label. This is the PRIOR
+/// side of the scoped pairing diff — read from the sealed truth rather than re-paired,
+/// so the diff can never disagree with the bytes it is patching.
+pub fn similar_pairs_of_kg(kg: &Kg) -> Vec<(u64, u64, u8)> {
+  let mut pairs = Vec::new();
+  for id in 0..kg.node_count() as u64 {
+    for (dst, etype) in kg.out_neighbors(NodeId::new(id)) {
+      if etype.base() == vorpal_kg::EdgeType::SIMILAR_TO && id < dst.raw() {
+        pairs.push((id, dst.raw(), etype.confidence()));
+      }
+    }
+  }
+  pairs.sort_unstable();
+  pairs
+}
+
+/// The scoped pairing repair (P4.5c-2, slice ii). Near-clone pairing is GLOBAL — LSH
+/// banding, star caps, and partner limits act over the ENTIRE sketch ledger, and the
+/// candidate ceiling makes even bucket enumeration order-dependent — so the repair
+/// re-pairs the full row set with the edited file's run swapped in, in the ledger's
+/// canonical (bucket, file, ordinal) order (exactly `SigStore::rows` order, exactly the
+/// order the pipeline's stream feeds). The DIFF against the prior pair set names every
+/// source node whose similar segment must be rewritten; an empty diff — the common body
+/// edit, near-clone of nothing — leaves every other bucket's edges byte-carried.
+pub struct SimilarRepair {
+  /// The new global pair set, `(a, b, confidence)` with `a < b`, sorted.
+  pub fresh_pairs: Vec<(u64, u64, u8)>,
+  /// Every endpoint of every added, removed, or relabeled pair — ascending, deduped.
+  pub changed_srcs: Vec<u32>,
+}
+
+/// `live_files` is the MANIFEST's live entry count — the bucket law's one input
+/// (never derived from node-bearing files, which drift under parse-health Exclude).
+pub fn scoped_similar_repair(
+  map: &vorpal_kg::NodeIdMap,
+  live_files: usize,
+  prior_rows: &[SigRow],
+  prior_pairs: &[(u64, u64, u8)],
+  file_key: u64,
+  fresh_file_sigs: &[SigRow],
+) -> io::Result<SimilarRepair> {
+  // Swap the edited file's run in place: prior rows are canonically sorted and a file's
+  // rows are contiguous at its (bucket, key) position, so splicing the fresh run at the
+  // old run's position preserves the global feed order the ceiling depends on.
+  let mut rows: Vec<SigRow> = Vec::with_capacity(prior_rows.len() + fresh_file_sigs.len());
+  let mut spliced = false;
+  for row in prior_rows {
+    let Some((key, _)) = map.locate(
+      u32::try_from(row.node)
+        .map_err(|_| io::Error::other("scoped: sig row outside the dense space"))?,
+    ) else {
+      return Err(io::Error::other("scoped: sig row outside the prior universe"));
+    };
+    if key == file_key {
+      if !spliced {
+        rows.extend(fresh_file_sigs.iter().cloned());
+        spliced = true;
+      }
+      continue; // the old run is replaced wholesale
+    }
+    rows.push(row.clone());
+  }
+  if !spliced {
+    // The file had no signed definitions before: its fresh run enters at its canonical
+    // (bucket, key) position among the survivors.
+    let position = rows
+      .partition_point(|row| {
+        map
+          .locate(row.node as u32)
+          .map(|(key, _)| {
+            let buckets = u64::from(vorpal_kg::identity::bucket_count_for(live_files));
+            let row_bucket = key & (buckets - 1);
+            let file_bucket = file_key & (buckets - 1);
+            (row_bucket, key) < (file_bucket, file_key)
+          })
+          .unwrap_or(false)
+      });
+    let tail = rows.split_off(position);
+    rows.extend(fresh_file_sigs.iter().cloned());
+    rows.extend(tail);
+  }
+  let (mut fresh_pairs, _report, _rows) = crate::similar::similar_pairs(rows);
+  fresh_pairs.sort_unstable();
+
+  // Symmetric difference on (a, b, confidence): a relabeled pair appears on both sides
+  // with different confidences, contributing its endpoints exactly once each side.
+  let mut changed: Vec<u32> = Vec::new();
+  let (mut i, mut j) = (0usize, 0usize);
+  while i < prior_pairs.len() || j < fresh_pairs.len() {
+    match (prior_pairs.get(i), fresh_pairs.get(j)) {
+      (Some(old), Some(new)) if old == new => {
+        i += 1;
+        j += 1;
+      }
+      (Some(old), Some(new)) if old < new => {
+        changed.push(old.0 as u32);
+        changed.push(old.1 as u32);
+        i += 1;
+      }
+      (Some(_), Some(new)) => {
+        changed.push(new.0 as u32);
+        changed.push(new.1 as u32);
+        j += 1;
+      }
+      (Some(old), None) => {
+        changed.push(old.0 as u32);
+        changed.push(old.1 as u32);
+        i += 1;
+      }
+      (None, Some(new)) => {
+        changed.push(new.0 as u32);
+        changed.push(new.1 as u32);
+        j += 1;
+      }
+      (None, None) => unreachable!("loop condition"),
+    }
+  }
+  changed.sort_unstable();
+  changed.dedup();
+  Ok(SimilarRepair {
+    fresh_pairs,
+    changed_srcs: changed,
+  })
+}

@@ -274,3 +274,128 @@ fn scoped_resolution_equals_scratch_for_a_defs_stable_edit() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+/// The pairing-repair oracle (slice c2-ii): an edit that turns the file's signed function
+/// into a near-clone of an existing pair must reproduce the scratch build's GLOBAL
+/// similar-pair set — LSH banding, star caps, partner limits, ceiling and all — from the
+/// prior sigs family with only the edited file's run swapped, and the diff must name
+/// exactly the endpoints whose similar segments change.
+#[test]
+fn scoped_pairing_repair_equals_scratch_pair_set() {
+  unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
+  let base = std::env::temp_dir().join(format!("vorpal-scoped-pairs-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&base);
+  let src = base.join("repo");
+  fs::create_dir_all(&src).unwrap();
+  let clone_body = "    total = 0\n    for item in items:\n        if item < floor:\n            total += floor\n        elif item > ceiling:\n            total += ceiling\n        else:\n            total += item\n    return total + len(items)\n";
+  fs::write(
+    src.join("clones.py"),
+    format!(
+      "def sim_a(items, floor, ceiling):\n{clone_body}\n\ndef sim_b(items, floor, ceiling):\n{body2}",
+      body2 = clone_body.replace("total += item", "total += item + 1"),
+    ),
+  )
+  .unwrap();
+  let distinct_body = "    acc = 1469598103934665603\n    for byte in blob:\n        acc = acc ^ byte\n        acc = (acc * 1099511628211) % 18446744073709551616\n        acc = acc + (acc >> 7)\n    return acc - len(blob)\n";
+  let target = |edited: bool| {
+    let body = if edited { clone_body } else { distinct_body };
+    format!("def target_fn(items, floor, ceiling):\n{body}")
+  };
+  // The distinct body ignores two params — same SIGNATURE either way (defs-stable).
+  fs::write(src.join("target.py"), target(false).replace("blob", "items")).unwrap();
+  let src = src.canonicalize().unwrap();
+  let tree_root = src.to_string_lossy().into_owned();
+  let target_path = src.join("target.py");
+  let target_str = target_path.to_string_lossy().into_owned();
+
+  let out_prior = base.join("index-prior");
+  vorpal_index::build_index(&src, &out_prior).expect("prior build");
+  let gen_prior = live(&out_prior);
+  fs::write(&target_path, target(true)).unwrap();
+  let out_truth = base.join("index-truth");
+  vorpal_index::build_index(&src, &out_truth).expect("truth build");
+  let gen_truth = live(&out_truth);
+
+  let prior_kg = vorpal_kg::Kg::load(&gen_prior).expect("prior kg");
+  let prior_map = vorpal_kg::NodeIdMap::from_dir(&gen_prior).expect("prior map");
+  let truth_kg = vorpal_kg::Kg::load(&gen_truth).expect("truth kg");
+
+  // The edited file's fresh sketch rows, through the same scoped entry c2-i proved.
+  let extractor = OutlineExtractor::new().expect("extractor");
+  let product = extractor.extract_product(&target_str, &target(true)).expect("product");
+  let mut bytes = Vec::new();
+  encode_product_into(&product, &mut bytes);
+  let view = vorpal_ingest::decode_product_view(&bytes).unwrap();
+  let pack = PackReader::open_rooted(&gen_prior, Some(&tree_root)).expect("prior pack");
+  let file_key = vorpal_kg::identity::FileKey::of(
+    vorpal_kg::identity::tree_relative(&target_str, &tree_root),
+  )
+  .0;
+  let interner = vorpal_ingest::Interner::default();
+  let fetch = |path: &str| pack.get(path).map(<[u8]>::to_vec);
+  let outcome = vorpal_ingest::scoped_resolve_file(
+    &interner,
+    &prior_kg,
+    &prior_map,
+    &vorpal_ingest::Resolver::new(),
+    &fetch,
+    &target_str,
+    file_key,
+    &view,
+    usize::MAX,
+  )
+  .expect("scoped resolution");
+
+  // Prior side: the sigs family (canonical order) + the sealed pair set.
+  let prior_rows: Vec<vorpal_ingest::SigRow> = vorpal_kg::SigStore::open(&gen_prior)
+    .expect("prior sigs")
+    .rows(&prior_map)
+    .expect("rows resolve")
+    .into_iter()
+    .map(|row| vorpal_ingest::SigRow {
+      node: u64::from(row.node),
+      shingles: row.shingles,
+      sketch: row.sketch,
+    })
+    .collect();
+  let prior_pairs = vorpal_ingest::similar_pairs_of_kg(&prior_kg);
+  let live_files = vorpal_ingest::Manifest::load(&gen_prior.join("manifest.bin"))
+    .expect("prior manifest")
+    .entries()
+    .len();
+
+  let repair = vorpal_ingest::scoped_similar_repair(
+    &prior_map,
+    live_files,
+    &prior_rows,
+    &prior_pairs,
+    file_key,
+    &outcome.sigs,
+  )
+  .expect("pairing repair");
+
+  // THE gate: the repaired global pair set equals the scratch build's, exactly.
+  let truth_pairs = vorpal_ingest::similar_pairs_of_kg(&truth_kg);
+  assert_eq!(repair.fresh_pairs, truth_pairs, "repaired pair set must equal scratch");
+  assert_ne!(
+    prior_pairs, truth_pairs,
+    "the edit must actually change the pair set (non-vacuity)"
+  );
+
+  // The diff names exactly the endpoints of the symmetric difference.
+  let mut expected_changed: Vec<u32> = Vec::new();
+  for pair in prior_pairs.iter().filter(|pair| !truth_pairs.contains(pair)) {
+    expected_changed.push(pair.0 as u32);
+    expected_changed.push(pair.1 as u32);
+  }
+  for pair in truth_pairs.iter().filter(|pair| !prior_pairs.contains(pair)) {
+    expected_changed.push(pair.0 as u32);
+    expected_changed.push(pair.1 as u32);
+  }
+  expected_changed.sort_unstable();
+  expected_changed.dedup();
+  assert_eq!(repair.changed_srcs, expected_changed, "changed endpoints must be exact");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
