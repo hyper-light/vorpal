@@ -109,6 +109,47 @@ fn learned_selection_trains_persists_serves_and_falls_back() {
 }
 
 #[test]
+fn bm25_gate_verdict_is_deterministic_and_heals() {
+  unsafe { std::env::set_var("VORPAL_NO_AUTOWARM", "1") };
+  let base = std::env::temp_dir().join("vorpal-bm25-gate");
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  write_corpus(&src);
+  build_index(&src, &out).unwrap();
+
+  // The warm gates the fourth list on the corpus's own probes and STATES the verdict
+  // and its evidence in the record (tier-agnostic — this is the lexical default).
+  warm_ann(&out).unwrap();
+  let gated = json_of(&out);
+  assert!(gated.contains("\"bm25\":"), "warm must persist a gate verdict: {gated}");
+  assert!(
+    gated.contains("\"bm25_gate\":\"probes="),
+    "the verdict must carry its evidence: {gated}"
+  );
+
+  // Double-warm byte identity now covers the gated record: the probes derive from the
+  // node-segment stamp, so a re-warm of the same content reaches the same verdict.
+  let gen_dir = vorpal_kg::resolve_index_dir(&out);
+  fs::remove_file(gen_dir.join("ann.stamp")).unwrap();
+  warm_ann(&out).unwrap();
+  assert_eq!(gated, json_of(&out), "gate verdict must be reproducible");
+
+  // A pre-gate record (no bm25 fields — older build, or a crash between the stamp
+  // commit and the gate) HEALS on the next warm without a rebuild, converging to the
+  // same canonical bytes. The canonical writer puts the bm25 fields last here (no
+  // note), so truncating at the field boundary reconstructs the pre-gate file.
+  let cut = gated.find(",\"bm25\":").expect("canonical record carries the gate fields");
+  let pre_gate = format!("{}}}\n", &gated[..cut]);
+  fs::write(gen_dir.join("ann.model.json"), &pre_gate).unwrap();
+  warm_ann(&out).unwrap();
+  assert_eq!(gated, json_of(&out), "pre-gate records must heal to the gated bytes");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn below_floor_corpus_states_its_lexical_fallback() {
   unsafe { std::env::set_var("VORPAL_NO_AUTOWARM", "1") };
   let base = std::env::temp_dir().join("vorpal-learned-floor");

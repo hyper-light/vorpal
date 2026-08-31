@@ -233,6 +233,19 @@ improve.
 > generalization (0.206). cpython IMPROVED (all 0.308 → 0.392) — recorded as the
 > motivation for a future per-corpus, warm-time-gated enable. Tables in
 > docs/wip/BENCHMARKS.md "Stage 4".
+>
+> **DIRECTIVE-4 FOLLOW-UP (2026-08-31): per-corpus machinery shipped; gate
+> conservative.** The pin is replaced by a per-corpus persisted verdict
+> (`bm25`/`bm25_gate` in the tier record; heals like calibration; all fusion sites
+> dispatch on it) written by a label-free warm-time self-probe gate (seeded
+> known-item probes, paired on/off fusion, 95% sign-test bound). Validation against
+> the graded truth: kernel OFF reproduced; cpython's descriptive-class ON is NOT
+> reachable label-free — a signature-token probe family and a 64–512 probe sweep
+> were both measured-and-rejected (signal dilutes; no untuned rule separates the
+> corpora). The gate ships firing only on strong evidence (currently: nowhere);
+> cpython's enable stays labels-only, with a selection-file-shaped manual override
+> as the recorded follow-up option. Full record in BENCHMARKS "Per-corpus BM25
+> warm-time gate".
 
 **Stage 5 (conditional) — Tier 2.5: constrained direct optimization (NUDGE-style).**
 Trigger: sparse-name or NL-intent splits show headroom after Stage 2. Deterministic

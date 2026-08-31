@@ -723,6 +723,55 @@ sealed checksum, ~32 ms per kernel-scale freshness check. Prefix gates and reade
 drift; one shared criterion cannot. Regression-proved: v2-layout files under the fixed
 binary read stale and retrain (cpython 7.0 s, linux 79.9 s, files re-stamp v3).
 
+### Per-corpus BM25 warm-time gate (directive 4): machinery shipped, gate conservative
+
+The compile-time pin (`BM25_CHANNEL = false`) is replaced by a PER-CORPUS persisted
+verdict: the tier record gains `bm25` (consulted) + `bm25_gate` (evidence, deliberately
+unread), written by a warm-time gate that runs once per generation after the stamp
+commits and HEALS like calibration (pre-gate records fill in on the next warm; crash
+between stamp and gate → verdict absent → healed). `Searcher::open`/`open_exact` read
+the verdict; all three fusion sites (single-phrase, multi-phrase, gate probes) dispatch
+on it. Double-warm byte-identity extends over the gated record; determinism + heal are
+fixture-pinned (`learned_tier.rs::bm25_gate_verdict_is_deterministic_and_heals`).
+
+The gate itself is label-free known-item self-probing: nodes sampled in
+`xxh3(id, seed = node-segment stamp)` order (content-derived, deterministic), eligible
+= non-Import with ≥ 3 distinct name tokens; query = 2–3 leading name tokens (strict
+subset → the token-subset regime where channels disagree); metric = the probed node's
+reciprocal rank in the fused top 10, PAIRED on/off from one channel computation;
+enable iff mean strictly improves AND wins − losses > 1.96·√(wins+losses) (two-sided
+95% sign test, cited bound). Verdict + evidence go into the record verbatim.
+
+**Measured-and-rejected along the way** (both bench corpora, records stripped and
+re-healed per run): (a) a SIGNATURE-token probe family (2–3 signature tokens absent
+from the name, meant to reach the descriptive regime) — signature tokens are shared by
+thousands of nodes, the probed node never reaches the fused top 10, paired means
+0.0000/0.0000 (kernel) and 0.0000/0.0016 (cpython): no signal; (b) probe-count as a
+power fix — the sweep (production path, `bench-internals` env seam only):
+
+| probes | kernel wins:losses (mean on/off) | cpython wins:losses (mean on/off) | verdicts |
+|---:|---|---|---|
+| 64 | 0:6 (0.4795/0.4954) | 3:1 (0.4595/0.4453) | off / off |
+| 128 | 5:8 (0.4374/0.4449) | 7:4 (0.4534/0.4387) | off / off |
+| 256 | 15:16 (0.4345/0.4402) | 15:14 (0.4675/0.4612) | off / off |
+| 512 | 32:27 (0.4453/0.4444) | 33:21 (0.4677/0.4615) | off / off |
+
+The signal DILUTES with count (kernel drifts from 0:6 demotion to a wins-excess at
+512; cpython never clears the bound, 33−21 = 12 vs ~14.4 needed), and no rule
+separates kernel 1.19:1 from cpython 1.57:1 at n = 512 without inventing a tuned
+threshold. Conclusion, recorded honestly: label-free known-item probes measure the
+subset-reordering mechanism but cannot reproduce the graded cpython descriptive win —
+that class lives in NL-intent phrasing self-probes cannot synthesize. **The gate ships
+as the conservative enabler** (verdicts identical across the whole sweep; the largest
+count, 512, is pinned — ~2 s once per generation at kernel scale): it fires only on
+strong probe-visible evidence, correctly keeps the kernel off, and currently enables
+nowhere. cpython's graded enable (all 0.308 → 0.392) therefore remains reachable only
+by labeled evidence — a per-corpus manual override (selection-file-shaped, beside
+`semantic.tier`) is the natural follow-up if wanted. The same comparator + verdict +
+heal pattern is the designed substrate for a retrofit-quality auto-disable
+(retrofitted vs unretrofitted rows); unimplemented — it needs a second ANN build per
+warm, a cost question deferred with the design.
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

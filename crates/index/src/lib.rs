@@ -1138,6 +1138,11 @@ struct PersistedTierRecord {
   /// unretrofitted, and for every pre-retrofit file) — part of the tier's identity:
   /// a form change in code must retrain, never serve mixed row semantics.
   retrofit: String,
+  /// Per-corpus BM25 fourth-list verdict from the warm-time self-probe gate:
+  /// `None` = never gated (pre-gate file, or a crash before the gate ran) — healed
+  /// like calibration on the next warm; `Some(v)` = gated, `v` enables the list.
+  /// Deterministic from index content, so freshness never consults it.
+  bm25: Option<bool>,
 }
 
 fn persisted_tier_record(index_dir: &Path) -> Option<PersistedTierRecord> {
@@ -1174,12 +1179,22 @@ fn persisted_tier_record(index_dir: &Path) -> Option<PersistedTierRecord> {
     .and_then(|form| form.as_str())
     .unwrap_or("none")
     .to_string();
+  // Pre-gate files carry no field: never gated (None) — distinct from a gated OFF.
+  let bm25 = match value.get("bm25") {
+    None | Some(serde_json::Value::Null) => None,
+    Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
+    Some(_) => return None,
+  };
+  // The `bm25_gate` sibling in the file is the verdict's evidence line for humans
+  // and benches — deliberately unread: a mangled evidence string must never wedge
+  // an otherwise coherent tier.
   Some(PersistedTierRecord {
     provenance,
     tier,
     weights_hash,
     note,
     retrofit,
+    bm25,
   })
 }
 
@@ -1198,18 +1213,26 @@ fn write_model_provenance(
   tier: &str,
   weights_hash: Option<u128>,
   retrofit: &str,
+  bm25: Option<(bool, &str)>,
   note: Option<&str>,
 ) -> io::Result<()> {
   let weights = match weights_hash {
     Some(hash) => format!("\"{hash:032x}\""),
     None => "null".to_string(),
   };
+  let bm25_fields = match bm25 {
+    Some((enabled, evidence)) => format!(
+      ",\"bm25\":{enabled},\"bm25_gate\":{}",
+      serde_json::Value::String(evidence.to_string())
+    ),
+    None => String::new(),
+  };
   let note_field = match note {
     Some(text) => format!(",\"note\":{}", serde_json::Value::String(text.to_string())),
     None => String::new(),
   };
   let json = format!(
-    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{},\"tier\":{},\"weights_hash\":{},\"retrofit\":{}{}}}\n",
+    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{},\"tier\":{},\"weights_hash\":{},\"retrofit\":{}{}{}}}\n",
     serde_json::Value::String(provenance.model_id.clone()),
     provenance.dim,
     serde_json::Value::String(provenance.normalization.clone()),
@@ -1218,6 +1241,7 @@ fn write_model_provenance(
     serde_json::Value::String(tier.to_string()),
     weights,
     serde_json::Value::String(retrofit.to_string()),
+    bm25_fields,
     note_field,
   );
   let tmp = index_dir.join("ann.model.json.tmp");
@@ -1364,6 +1388,42 @@ pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   ensure_ann(index_dir, selection)
 }
 
+/// Run the warm-time per-corpus BM25 gate iff the committed record carries no
+/// verdict, and rewrite the record with one (atomic tmp+rename, same canonical
+/// writer). Deterministic: probes derive from the node-segment stamp, so every
+/// re-warm of the same content reaches the same verdict — healing converges and
+/// double-warm byte-identity extends over the gated record.
+fn ensure_bm25_gate(index_dir: &Path, current_stamp: u64) -> Result<(), Box<dyn Error>> {
+  let Some(record) = persisted_tier_record(index_dir) else {
+    return Ok(()); // no committed tier — nothing to gate
+  };
+  if record.bm25.is_some() {
+    return Ok(());
+  }
+  // The stamp must match: gating a half-replaced generation would persist a verdict
+  // for bytes the record does not describe. A mismatch just leaves the record
+  // ungated; the next fresh warm heals it.
+  let stamp_ok = fs::read(index_dir.join("ann.stamp"))
+    .ok()
+    .and_then(|bytes| bytes.try_into().ok().map(u64::from_le_bytes))
+    .is_some_and(|stored| stored == current_stamp);
+  if !stamp_ok {
+    return Ok(());
+  }
+  let searcher = Searcher::open(index_dir)?;
+  let (enabled, evidence) = searcher.bm25_self_probe_verdict(current_stamp)?;
+  write_model_provenance(
+    index_dir,
+    &record.provenance,
+    &record.tier,
+    record.weights_hash,
+    &record.retrofit,
+    Some((enabled, &evidence)),
+    record.note.as_deref(),
+  )?;
+  Ok(())
+}
+
 fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn Error>> {
   // One build at a time **per index directory**: an eager background warm and a foreground
   // search on the same index must not both build (duplicate work, racing writes), but a
@@ -1402,6 +1462,9 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
       let crossover = calibrate_semantic_cutover(&kg, &ann, &embedder);
       write_ann_calibration(index_dir, current, crossover)?;
     }
+    // The per-corpus BM25 gate heals independently too (pre-gate records carry no
+    // verdict) — deterministic from content, so healing converges in one pass.
+    ensure_bm25_gate(index_dir, current)?;
     return Ok(());
   }
   // Build under the SELECTED tier. A learned selection whose corpus is below the
@@ -1473,6 +1536,10 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
     embedder.tier_label(),
     weights_hash,
     retrofit_label,
+    // The BM25 verdict gates AFTER the stamp commits (the gate probes a fully
+    // servable generation); `None` = not yet gated — filled below, healed on
+    // later warms if a crash lands between.
+    None,
     note.as_deref(),
   )?;
   let stamp_path = index_dir.join("ann.stamp");
@@ -1491,6 +1558,9 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
   let ann = AnnIndex::load(&index_dir.join("ann.bin"))?;
   let crossover = calibrate_semantic_cutover(&kg, &ann, &embedder);
   write_ann_calibration(index_dir, current, crossover)?;
+  // Gate the per-corpus BM25 fourth list on the now-fully-servable generation and
+  // rewrite the record with the verdict (deterministic — see `ensure_bm25_gate`).
+  ensure_bm25_gate(index_dir, current)?;
   Ok(())
 }
 
@@ -2108,21 +2178,15 @@ fn build_warm_root(index_root: &Path) -> io::Result<Option<WarmRoot>> {
   Ok(None)
 }
 
-/// The fused ranking's channel names, in the order [`Searcher::run`] returns their ranks.
 /// The fused ranking's channel names, positional: the first three always fuse; the
-/// fourth exists only under [`BM25_CHANNEL`] (rank vectors zip against this list, so
-/// a 3-list fusion simply never reaches the fourth label).
+/// fourth exists only where the per-corpus warm-time gate enabled it
+/// (`PersistedTierRecord::bm25`, written by [`ensure_bm25_gate`]); rank vectors zip
+/// against this list, so a 3-list fusion simply never reaches the fourth label.
+/// The global-default story (the pin this gate replaces): at kernel scale the BM25
+/// list regressed every graded gate — true answers tokenize to subwords exact-token
+/// BM25 cannot see (sock ≠ socket) — while cpython IMPROVED (all 0.308 → 0.392);
+/// both rounds recorded in BENCHMARKS "Stage 4".
 const SEARCH_CHANNELS: [&str; 4] = ["name", "vector", "graph", "bm25"];
-
-/// PINNED BY MEASUREMENT (2026-08-31, two rounds, recorded in BENCHMARKS "Stage 4"):
-/// the BM25 fourth list is OFF. At kernel scale it regressed every gate — the true
-/// answers tokenize to subwords exact-token BM25 cannot see (sock ≠ socket), so its
-/// rank list carries structurally wrong evidence that RRF's scale-free 1/(60+r) mass
-/// rewards regardless (short-keyword 0.206 → 0.109 plain, → 0.137 with the ≥2-token
-/// match floor; descriptive 0.947 → 0.790). cpython IMPROVED (all 0.308 → 0.392) —
-/// the recorded motivation for a future per-corpus, warm-time-gated enable; the
-/// tested machinery (postings v2, parity twins, the floor) ships for that day.
-const BM25_CHANNEL: bool = false;
 
 /// One fused-ranking row: `(node id, RRF score, per-channel 0-based ranks)` — the shape
 /// [`Searcher::run`] returns.
@@ -2653,6 +2717,9 @@ pub struct Searcher {
   /// `node_count` (a beam has no completeness guarantee at take ≥ n). Never a shipped
   /// constant.
   semantic_cutover: usize,
+  /// Per-corpus BM25 fourth-list verdict from the persisted record's warm-time gate
+  /// (`None` verdict or absent record → off): whether fusion appends the BM25 list.
+  bm25_enabled: bool,
   /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
   /// effect (autowarm) so queries take the exact reference paths only. Set by
   /// [`Searcher::open_exact`]; never used in serving.
@@ -2689,6 +2756,9 @@ impl Searcher {
     let postings = postings::Postings::load(&generation_dir).filter(|p| p.stamp() == stamp);
     let semantic_cutover =
       load_ann_calibration(&generation_dir, stamp, kg.node_count()).unwrap_or(kg.node_count());
+    let bm25_enabled = persisted_tier_record(&generation_dir)
+      .and_then(|record| record.bm25)
+      .unwrap_or(false);
     Ok(Searcher {
       generation_dir,
       kg,
@@ -2696,6 +2766,7 @@ impl Searcher {
       postings,
       embedder,
       semantic_cutover,
+      bm25_enabled,
       exact_only: false,
     })
   }
@@ -2716,6 +2787,11 @@ impl Searcher {
     let embedder = coherent_persisted_embedder(&generation_dir, stamp)
       .unwrap_or_else(|| ActiveEmbedder::Lexical(LexicalEmbedder::default()));
     let semantic_cutover = kg.node_count();
+    // The exact path honors the same per-corpus verdict, so reference answers stay
+    // comparable to tier answers under whatever fusion this index actually serves.
+    let bm25_enabled = persisted_tier_record(&generation_dir)
+      .and_then(|record| record.bm25)
+      .unwrap_or(false);
     Ok(Searcher {
       generation_dir,
       kg,
@@ -2723,6 +2799,7 @@ impl Searcher {
       postings: None,
       embedder,
       semantic_cutover,
+      bm25_enabled,
       exact_only: true,
     })
   }
@@ -2858,7 +2935,7 @@ impl Searcher {
           .partition_point(|&dist2| dist2 < POSITIVE_BOUNDARY);
         channels.semantic.truncate(positive);
         let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
-        if BM25_CHANNEL {
+        if self.bm25_enabled {
           lists.push(channels.bm25);
         }
         let mut table = vec![0.0f32; node_count];
@@ -3010,10 +3087,131 @@ impl Searcher {
   pub fn run(&self, query: &str, k: usize, filter: &SearchFilter) -> Result<Vec<FusedHit>, Box<dyn Error>> {
     let channels = self.channel_lists(query, rerank_pool(k), filter)?;
     let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
-    if BM25_CHANNEL {
+    if self.bm25_enabled {
       lists.push(channels.bm25);
     }
     Ok(rrf_fuse_explained(&lists, k))
+  }
+
+  /// Label-free per-corpus BM25 gate (semantic-tier directive 4): known-item
+  /// self-probes, the fused ranking with and without the fourth list PAIRED from one
+  /// channel computation. Every choice below is derived or precedented, none tuned:
+  ///
+  /// * Probe nodes — seeded by the node-segment stamp (content-derived), taken in
+  ///   `xxh3_64(id bytes, seed=stamp)` ascending order, so the set is deterministic
+  ///   and stable under unrelated edits; eligible = non-Import nodes whose names
+  ///   carry ≥ 3 distinct tokens, because a STRICT token subset then lands each
+  ///   probe in the token-subset name regime where the channels genuinely disagree
+  ///   (a full-name probe is decided by the byte-exact tier and carries no signal —
+  ///   the tier ladder itself, not a tuning).
+  /// * Probe queries — 2 or 3 leading name tokens (alternating): a strict token
+  ///   subset of the probed name, landing each probe in the token-subset regime
+  ///   where the channels genuinely disagree and BM25's TF/length-norm evidence
+  ///   reorders competing subset-matches — the mechanism behind BOTH graded
+  ///   outcomes (the kernel's demotions and cpython's gains). A second,
+  ///   signature-token family was tried and MEASURED-AND-REJECTED: signature
+  ///   tokens are shared by thousands of nodes, the probed node never reaches
+  ///   the fused top 10 (paired means 0.0000 on both bench corpora), so that
+  ///   family carries no signal — recorded in BENCHMARKS.
+  /// * Metric — reciprocal rank of the probe's own node in the fused top 10
+  ///   (MRR@10; 10 is the campaign's standing ranking cutoff).
+  /// * Verdict — enable iff the paired mean STRICTLY improves AND wins − losses
+  ///   clears the two-sided 95% sign-test bound `1.96·√(wins+losses)` (standard
+  ///   normal approximation — a cited bound, not a tuned threshold). A corpus
+  ///   where the list demotes true answers fails both clauses; weak evidence
+  ///   stays conservatively off.
+  fn bm25_self_probe_verdict(&self, stamp: u64) -> Result<(bool, String), Box<dyn Error>> {
+    /// Probe count: pinned by the recorded sweep at two scales (BENCHMARKS
+    /// "per-corpus BM25 gate") — verdicts were identical across 64–512 on both
+    /// bench corpora; the largest swept count ships (maximum evidence per verdict,
+    /// ~2 s once per generation at kernel scale).
+    const PROBES: usize = 512;
+    // Sweep seam — measurement builds only, never a production knob (the
+    // selection-file lesson: env is a hijack surface; `bench-internals` binaries
+    // are never shipped).
+    #[cfg(feature = "bench-internals")]
+    let probe_target: usize = std::env::var("VORPAL_BM25_GATE_PROBES")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(PROBES);
+    #[cfg(not(feature = "bench-internals"))]
+    let probe_target: usize = PROBES;
+    /// MRR cutoff — the campaign's standing @10 ranking cutoff.
+    const CUTOFF: usize = 10;
+    let kg = &self.kg;
+    let mut order: Vec<(u64, u64)> = (0..kg.node_count() as u64)
+      .map(|id| {
+        (
+          xxhash_rust::xxh3::xxh3_64_with_seed(&id.to_le_bytes(), stamp),
+          id,
+        )
+      })
+      .collect();
+    order.sort_unstable();
+    let filter = SearchFilter::default();
+    let mut probes = 0usize;
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    let (mut mean_on, mut mean_off) = (0.0f64, 0.0f64);
+    for &(_, id) in &order {
+      if probes == probe_target {
+        break;
+      }
+      let Some(view) = kg.node(NodeId::new(id)) else {
+        continue;
+      };
+      if view.kind == vorpal_kg::SymbolKind::Import {
+        continue;
+      }
+      let tokens = tokenize(view.name);
+      let mut distinct = tokens.clone();
+      distinct.sort_unstable();
+      distinct.dedup();
+      if distinct.len() < 3 {
+        continue;
+      }
+      let take = 2 + (probes & 1);
+      let query = tokens
+        .iter()
+        .take(take)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+      // Both fusions PAIRED from one channel computation.
+      let channels = self.channel_lists_with_bm25(&query, rerank_pool(CUTOFF), &filter, true)?;
+      let base = vec![channels.named, channels.semantic, channels.by_degree];
+      let rank_of = |lists: &[Vec<u64>]| -> f64 {
+        rrf_fuse_explained(lists, CUTOFF)
+          .iter()
+          .position(|hit| hit.0 == id)
+          .map_or(0.0, |rank| 1.0 / (rank as f64 + 1.0))
+      };
+      let rr_off = rank_of(&base);
+      let mut with_bm25 = base;
+      with_bm25.push(channels.bm25);
+      let rr_on = rank_of(&with_bm25);
+      mean_on += rr_on;
+      mean_off += rr_off;
+      if rr_on > rr_off {
+        wins += 1;
+      } else if rr_on < rr_off {
+        losses += 1;
+      }
+      probes += 1;
+    }
+    if probes == 0 {
+      // Too small to measure: the fourth list stays off, and the record says why.
+      return Ok((false, "probes=0 (no eligible nodes)".to_string()));
+    }
+    mean_on /= probes as f64;
+    mean_off /= probes as f64;
+    let contested = (wins + losses) as f64;
+    let significant = wins as f64 - losses as f64 > 1.96 * contested.sqrt();
+    let enabled = significant && mean_on > mean_off;
+    let evidence = format!(
+      "probes={probes} wins={wins} losses={losses} mean_on={mean_on:.4} mean_off={mean_off:.4}"
+    );
+    Ok((enabled, evidence))
   }
 
   /// The three ranked candidate channels (name, semantic, graph) at one pool depth —
@@ -3025,6 +3223,19 @@ impl Searcher {
     query: &str,
     pool: usize,
     filter: &SearchFilter,
+  ) -> Result<Channels, Box<dyn Error>> {
+    self.channel_lists_with_bm25(query, pool, filter, self.bm25_enabled)
+  }
+
+  /// [`Searcher::channel_lists`] with the BM25 list computed on demand — the serving
+  /// path passes the record's per-corpus verdict; the warm-time gate passes `true`
+  /// so both fusions probe from ONE channel computation (paired by construction).
+  fn channel_lists_with_bm25(
+    &self,
+    query: &str,
+    pool: usize,
+    filter: &SearchFilter,
+    want_bm25: bool,
   ) -> Result<Channels, Box<dyn Error>> {
     let kg = &self.kg;
     let index_dir = self.generation_dir.as_path();
@@ -3262,7 +3473,7 @@ impl Searcher {
   // kernel scale (the measured short-keyword collapse this channel exists to fix).
   // Postings fresh → the persisted walk; anything else → the bit-identical exhaustive
   // pass, so results never depend on which tier answered.
-  let bm25 = if BM25_CHANNEL {
+  let bm25 = if want_bm25 {
     let bm25_admit = |id: u32| filter.is_empty() || compiled_filter.admits(kg, id as u64);
     match &self.postings {
       Some(postings) => postings
