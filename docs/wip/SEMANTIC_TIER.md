@@ -293,8 +293,10 @@ without regressing others — else recorded as measured-and-rejected in this doc
 > the gains (length ≠ intent); the pin gates GREEN at kernel scale (all-NDCG
 > 0.298 → 0.313, protected short-keyword 0.206 → 0.223, recall up) and mixed on
 > cpython (descriptive +8.5%, short-kw NDCG down) — so enabling is a PER-CORPUS
-> measured decision, exactly what the selection file expresses. ~3.5 s/query at
-> the correctness-first pass (f32/SIMD lead recorded). STILL OPEN (owner): the
+> measured decision, exactly what the selection file expresses. Latency: 3.6 s →
+> 1.29 s mean after the f32 GEMM round (parity ≤ 1e-4 held, kernel table
+> bit-identical); `encoderDir` in vorpalconfig.yml completes the opt-in surface.
+> STILL OPEN (owner): the
 > release-size decision (547 MB f32 / ~274 MB f16 vs npm+PyPI budgets: optional
 > model package vs LFS vs release asset).
 

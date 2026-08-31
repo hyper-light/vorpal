@@ -873,9 +873,16 @@ trades the kernel's gain for cpython's protection). DISPOSITION: the pinned
 rerank ships; enabling is PER-CORPUS by construction (`encoder.dir`) and should
 follow a measured gate on the target corpus — green at kernel scale, red on
 cpython, recorded here. Query cost with the encoder live: ~3.2–3.6 s mean at
-k=25 (the correctness-first f64 pass; the f32/SIMD GEMM lead stands, est.
-20–50×). The release-size decision (547 MB f32 / ~274 MB f16 vs npm+PyPI
-budgets) is an owner call, surfaced separately.
+k=25 on the correctness-first f64 pass; the f32 GEMM round (hidden state f32,
+six GEMMs in eight fixed f32 lanes reduced in fixed order — LN moments, rotary,
+attention dots/softmax/A·V sums stay f64) brings it to **1.29 s mean / 2.49 s
+max** with the parity oracle still ≤ 1e-4 and the kernel quality table
+BIT-IDENTICAL (0.223 / 0.313). Remaining latency leads: per-node embedding
+cache, batched candidate GEMM. The release-size decision (547 MB f32 / ~274 MB
+f16 vs npm+PyPI budgets) is an owner call, surfaced separately. The opt-in is
+also configurable: `encoderDir` in vorpalconfig.yml (relative to the project
+dir, must exist locally) writes the selection at `vorpal kg index` time, the
+`semanticTier` discipline.
 
 ## History (earlier passes, kept for the record)
 

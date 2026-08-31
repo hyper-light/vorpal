@@ -12,10 +12,15 @@
 //! * MLP: fc2( fc11(x) ⊙ silu(fc12(x)) ) — fc12 carries the gate.
 //! * pool: CLS (row 0) of the final hidden state.
 //!
-//! CORRECTNESS-FIRST numerics: every reduction accumulates in f64 in a fixed
-//! order, parallelism is only across independent output rows — bit-stable at any
-//! thread count. Throughput is the NEXT item (profile-after law); this pass exists
-//! to be provably right against the reference before any kernel work.
+//! Numerics (second pass — the measured optimization round): the hidden state is
+//! f32 and the six GEMMs accumulate in EIGHT fixed f32 lanes reduced in a fixed
+//! order (auto-vectorizes to NEON/AVX fma; ~an order of magnitude over the first
+//! f64-scalar pass), while the sensitive reductions — LayerNorm moments, rotary
+//! tables, attention dots, softmax, and the attention·V sums — keep f64
+//! accumulation. Lane structure and reduction order are FIXED, and parallelism is
+//! only across independent output rows, so outputs are bit-stable at any thread
+//! count; the reference-parity oracle (≤ 1e-4 vs the f64 numpy forward)
+//! re-arbitrates this numeric layout.
 
 use rayon::prelude::*;
 
@@ -47,31 +52,57 @@ pub struct ModelWeights<'a> {
   pub vocab_rows: usize,
 }
 
-/// LayerNorm over each `dim`-row of `x`, in place: population variance, f64.
-fn layer_norm(x: &mut [f64], dim: usize, weight: &[f32], bias: &[f32], eps: f64) {
+/// LayerNorm over each `dim`-row of `x`, in place: f64 moments (population
+/// variance), f32 storage.
+fn layer_norm(x: &mut [f32], dim: usize, weight: &[f32], bias: &[f32], eps: f64) {
   for row in x.chunks_exact_mut(dim) {
-    let mean = row.iter().sum::<f64>() / dim as f64;
-    let variance = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / dim as f64;
-    let inv = 1.0 / (variance + eps).sqrt();
+    let mut total = 0.0f64;
+    for value in row.iter() {
+      total += *value as f64;
+    }
+    let mean = total / dim as f64;
+    let mut spread = 0.0f64;
+    for value in row.iter() {
+      let diff = *value as f64 - mean;
+      spread += diff * diff;
+    }
+    let inv = 1.0 / (spread / dim as f64 + eps).sqrt();
     for (value, (w, b)) in row.iter_mut().zip(weight.iter().zip(bias)) {
-      *value = (*value - mean) * inv * *w as f64 + *b as f64;
+      *value = (((*value as f64 - mean) * inv) * *w as f64 + *b as f64) as f32;
     }
   }
 }
 
-/// `out[s][o] = Σ_d x[s][d] · w[o][d]` — w row-major `[rows_out][dim_in]`; f64
-/// accumulation in ascending d; rows of `out` are independent (rayon-safe).
-fn gemm(x: &[f64], dim_in: usize, w: &[f32], rows_out: usize, out: &mut [f64]) {
+/// How many parallel f32 accumulator lanes each GEMM dot product uses — a FIXED
+/// structural constant of the reduction order (part of the numeric layout the
+/// parity oracle pins), sized to fill a 256-bit vector unit.
+const GEMM_LANES: usize = 8;
+
+/// `out[s][o] = Σ_d x[s][d] · w[o][d]` — w row-major `[rows_out][dim_in]`.
+/// Eight fixed f32 lanes over ascending d, reduced pairwise in fixed order, scalar
+/// tail; rows of `out` are independent (rayon-safe, bit-stable at any thread count).
+fn gemm(x: &[f32], dim_in: usize, w: &[f32], rows_out: usize, out: &mut [f32]) {
   out
     .par_chunks_mut(rows_out)
     .enumerate()
     .for_each(|(s, out_row)| {
       let x_row = &x[s * dim_in..(s + 1) * dim_in];
+      let blocks = dim_in / GEMM_LANES * GEMM_LANES;
       for (o, slot) in out_row.iter_mut().enumerate() {
         let w_row = &w[o * dim_in..(o + 1) * dim_in];
-        let mut total = 0.0f64;
-        for (value, weight) in x_row.iter().zip(w_row) {
-          total += value * *weight as f64;
+        let mut lanes = [0.0f32; GEMM_LANES];
+        for (x_block, w_block) in x_row[..blocks]
+          .chunks_exact(GEMM_LANES)
+          .zip(w_row[..blocks].chunks_exact(GEMM_LANES))
+        {
+          for lane in 0..GEMM_LANES {
+            lanes[lane] = x_block[lane].mul_add(w_block[lane], lanes[lane]);
+          }
+        }
+        let mut total = ((lanes[0] + lanes[4]) + (lanes[1] + lanes[5]))
+          + ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]));
+        for (a, b) in x_row[blocks..].iter().zip(&w_row[blocks..]) {
+          total = a.mul_add(*b, total);
         }
         *slot = total;
       }
@@ -100,17 +131,17 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
   }
 
   // Embeddings + emb_ln.
-  let mut x = vec![0.0f64; seq * dim];
+  let mut x = vec![0.0f32; seq * dim];
   for (s, &id) in ids.iter().enumerate() {
     let word = &weights.word_embeddings[id as usize * dim..(id as usize + 1) * dim];
     let row = &mut x[s * dim..(s + 1) * dim];
     for ((slot, w), t) in row.iter_mut().zip(word).zip(weights.token_type_row0) {
-      *slot = *w as f64 + *t as f64;
+      *slot = w + t;
     }
   }
   layer_norm(&mut x, dim, weights.emb_ln_weight, weights.emb_ln_bias, weights.layer_norm_eps);
 
-  // Rotary tables: [seq][head_dim/2].
+  // Rotary tables: [seq][head_dim/2], f64.
   let half = head_dim / 2;
   let mut cos = vec![0.0f64; seq * half];
   let mut sin = vec![0.0f64; seq * half];
@@ -122,36 +153,36 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
       sin[s * half + f] = angle.sin();
     }
   }
-  let rotate = |vectors: &mut [f64]| {
-    // vectors: [seq][heads][head_dim], rotate-half non-interleaved.
+  let rotate = |vectors: &mut [f32]| {
+    // vectors: [seq][heads][head_dim], rotate-half non-interleaved, f64 mid-math.
     for s in 0..seq {
       for h in 0..heads {
         let base = (s * heads + h) * head_dim;
         for f in 0..half {
           let (c, n) = (cos[s * half + f], sin[s * half + f]);
-          let (a, b) = (vectors[base + f], vectors[base + half + f]);
-          vectors[base + f] = a * c - b * n;
-          vectors[base + half + f] = b * c + a * n;
+          let (a, b) = (vectors[base + f] as f64, vectors[base + half + f] as f64);
+          vectors[base + f] = (a * c - b * n) as f32;
+          vectors[base + half + f] = (b * c + a * n) as f32;
         }
       }
     }
   };
 
-  let mut qkv = vec![0.0f64; seq * 3 * dim];
-  let mut attn_out = vec![0.0f64; seq * dim];
-  let mut context = vec![0.0f64; seq * dim];
-  let mut mlp_y = vec![0.0f64; seq * weights.inner];
-  let mut mlp_gate = vec![0.0f64; seq * weights.inner];
-  let mut mlp_out = vec![0.0f64; seq * dim];
+  let mut qkv = vec![0.0f32; seq * 3 * dim];
+  let mut attn_out = vec![0.0f32; seq * dim];
+  let mut context = vec![0.0f32; seq * dim];
+  let mut mlp_y = vec![0.0f32; seq * weights.inner];
+  let mut mlp_gate = vec![0.0f32; seq * weights.inner];
+  let mut mlp_out = vec![0.0f32; seq * dim];
   let scale = 1.0 / (head_dim as f64).sqrt();
 
   for layer in &weights.layers {
     // qkv: [seq][3*dim] rows (t-major, then head, then component); unpack into
     // contiguous q/k/v matrices [seq][heads][head_dim] for the attention walk.
     gemm(&x, dim, layer.wqkv, 3 * dim, &mut qkv);
-    let mut q = vec![0.0f64; seq * dim];
-    let mut k = vec![0.0f64; seq * dim];
-    let mut v = vec![0.0f64; seq * dim];
+    let mut q = vec![0.0f32; seq * dim];
+    let mut k = vec![0.0f32; seq * dim];
+    let mut v = vec![0.0f32; seq * dim];
     for s in 0..seq {
       let row = &qkv[s * 3 * dim..(s + 1) * 3 * dim];
       q[s * dim..(s + 1) * dim].copy_from_slice(&row[0..dim]);
@@ -160,13 +191,14 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
     }
     rotate(&mut q);
     rotate(&mut k);
-    // Attention per (head, query-row): independent outputs, deterministic inner
-    // walks in ascending key order.
+    // Attention per (query-row, head): independent outputs; f64 dots, stable
+    // softmax, f64 A·V accumulation in ascending key order.
     context
       .par_chunks_mut(dim)
       .enumerate()
       .for_each(|(s, out_row)| {
         let mut weights_buffer = vec![0.0f64; seq];
+        let mut head_accumulator = vec![0.0f64; head_dim];
         for h in 0..heads {
           let q_row = &q[(s * heads + h) * head_dim..(s * heads + h + 1) * head_dim];
           let mut max_score = f64::NEG_INFINITY;
@@ -174,7 +206,7 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
             let k_row = &k[(t * heads + h) * head_dim..(t * heads + h + 1) * head_dim];
             let mut dot = 0.0f64;
             for (a, b) in q_row.iter().zip(k_row) {
-              dot += a * b;
+              dot += *a as f64 * *b as f64;
             }
             let score = dot * scale;
             *slot = score;
@@ -187,14 +219,17 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
             *slot = (*slot - max_score).exp();
             total += *slot;
           }
-          let out_head = &mut out_row[h * head_dim..(h + 1) * head_dim];
-          out_head.fill(0.0);
+          head_accumulator.fill(0.0);
           for (t, weight) in weights_buffer.iter().enumerate() {
             let value = weight / total;
             let v_row = &v[(t * heads + h) * head_dim..(t * heads + h + 1) * head_dim];
-            for (slot, component) in out_head.iter_mut().zip(v_row) {
-              *slot += value * component;
+            for (slot, component) in head_accumulator.iter_mut().zip(v_row) {
+              *slot += value * *component as f64;
             }
+          }
+          let out_head = &mut out_row[h * head_dim..(h + 1) * head_dim];
+          for (slot, value) in out_head.iter_mut().zip(&head_accumulator) {
+            *slot = *value as f32;
           }
         }
       });
@@ -206,7 +241,8 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
     gemm(&x, dim, layer.fc11, weights.inner, &mut mlp_y);
     gemm(&x, dim, layer.fc12, weights.inner, &mut mlp_gate);
     for (y, gate) in mlp_y.iter_mut().zip(&mlp_gate) {
-      *y *= gate / (1.0 + (-gate).exp());
+      let g = *gate as f64;
+      *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
     }
     gemm(&mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out);
     for (value, add) in x.iter_mut().zip(&mlp_out) {
@@ -214,7 +250,7 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
     }
     layer_norm(&mut x, dim, layer.norm2_weight, layer.norm2_bias, weights.layer_norm_eps);
   }
-  Ok(x[..dim].iter().map(|v| *v as f32).collect())
+  Ok(x[..dim].to_vec())
 }
 
 /// L2-normalize in place; a zero vector stays zero (stated by the caller's report).

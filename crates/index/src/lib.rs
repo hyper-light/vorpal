@@ -1328,6 +1328,16 @@ fn encoder_selection(index_root: &Path) -> Option<PathBuf> {
   }
 }
 
+/// Persist the encoder selection at `<root>/encoder.dir` (tmp + rename) — the
+/// Stage-6 reranker's opt-in, written by index-shaped commands only (the
+/// `semantic.tier` discipline: warms and searches are pure readers; removing the
+/// file turns the reranker off).
+pub fn write_encoder_selection(index_root: &Path, model_dir: &Path) -> io::Result<()> {
+  let tmp = index_root.join("encoder.dir.tmp");
+  fs::write(&tmp, format!("{}\n", model_dir.display()))?;
+  fs::rename(tmp, index_root.join("encoder.dir"))
+}
+
 fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -> bool {
   let stamp_ok = fs::read(index_dir.join("ann.stamp"))
     .ok()

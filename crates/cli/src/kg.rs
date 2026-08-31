@@ -574,6 +574,31 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
     };
     vorpal_index::write_tier_selection(&out, tier).map_err(boxed)?;
   }
+  // `encoderDir` opts this index into the Stage-6 encoder reranker: the selection
+  // file at the root is the cross-process truth (absent key = keep the existing
+  // selection); relative paths resolve against the project dir, and the directory
+  // must already exist — vorpal never downloads models.
+  if let Some(dir) = project.as_ref().and_then(|p| p.encoder_dir.as_deref()) {
+    let model_dir = {
+      let path = std::path::Path::new(dir);
+      if path.is_absolute() {
+        path.to_path_buf()
+      } else {
+        project
+          .as_ref()
+          .map(|p| p.project_dir.join(path))
+          .unwrap_or_else(|| path.to_path_buf())
+      }
+    };
+    if !model_dir.is_dir() {
+      anyhow::bail!(
+        "vorpalconfig.yml encoderDir names a missing directory: {}",
+        model_dir.display()
+      );
+    }
+    vorpal_index::write_encoder_selection(&out, &model_dir)
+      .map_err(|e| anyhow::anyhow!("writing encoder.dir: {e}"))?;
+  }
   // Custom/dynamic languages were registered at CLI setup (the one-shot dlopen); here their
   // configured outline rules extend extraction (F-M3). No project config = bundled behavior.
   let env = extraction_env_from_project(project.as_ref())?;

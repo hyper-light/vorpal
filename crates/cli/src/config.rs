@@ -57,6 +57,12 @@ pub struct VorpalConfig {
   /// and state it in the index's provenance record)
   #[serde(skip_serializing_if = "Option::is_none")]
   pub semantic_tier: Option<String>,
+  /// local model directory for the opt-in Stage-6 encoder reranker (semantic-tier
+  /// design): relative paths resolve against the project dir; absent key = keep the
+  /// index's existing selection. The directory must already exist locally — vorpal
+  /// never downloads models.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub encoder_dir: Option<String>,
 }
 
 #[derive(Clone)]
@@ -78,6 +84,9 @@ pub struct ProjectConfig {
   /// `semanticTier` from vorpalconfig.yml, applied by `vorpal kg index` (None = keep
   /// the index's existing selection).
   pub semantic_tier: Option<String>,
+  /// `encoderDir` from vorpalconfig.yml, applied by `vorpal kg index` (None = keep
+  /// the index's existing encoder selection).
+  pub encoder_dir: Option<String>,
 }
 
 impl ProjectConfig {
@@ -124,6 +133,7 @@ impl ProjectConfig {
       language_globs: sg_config.language_globs.clone(),
       language_injections: sg_config.language_injections.clone(),
       semantic_tier: sg_config.semantic_tier.clone(),
+      encoder_dir: sg_config.encoder_dir.clone(),
     };
     // sg_config will not use rule dirs and test configs anymore
     register_custom_language(&config.project_dir, sg_config)?;
@@ -158,6 +168,7 @@ impl ProjectConfig {
       language_globs: sg_config.language_globs.clone(),
       language_injections: sg_config.language_injections.clone(),
       semantic_tier: sg_config.semantic_tier.clone(),
+      encoder_dir: sg_config.encoder_dir.clone(),
     }))
   }
 }
