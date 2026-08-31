@@ -1,5 +1,6 @@
 mod completions;
 mod config;
+mod enable;
 mod grammars;
 mod graph_filter;
 mod kg;
@@ -23,6 +24,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use completions::{CompletionsArg, run_shell_completion};
 use config::ProjectConfig;
+use enable::{EnableArg, run_enable};
 use grammars::{GrammarsArg, run_grammars};
 use kg::{GraphArg, IndexArg, McpArg, QueryArg, SearchArg, run_graph, run_index, run_mcp, run_query, run_search};
 use lsp::{LspArg, run_language_server};
@@ -79,6 +81,9 @@ enum Commands {
   Query(QueryArg),
   /// Semantic search over indexed definitions.
   Search(SearchArg),
+  /// Install and enable the advanced semantic embedder (checksum-pinned weights;
+  /// semantic-f32 | semantic-f16 | off).
+  Enable(EnableArg),
   /// List the tree-sitter grammars compiled into this binary (versions, generation digests).
   Grammars(GrammarsArg),
   /// Serve knowledge-graph queries to agents over MCP (stdio).
@@ -180,6 +185,7 @@ pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
     Commands::Graph(arg) => run_graph(arg),
     Commands::Query(arg) => run_query(arg),
     Commands::Search(arg) => run_search(arg),
+    Commands::Enable(arg) => run_enable(arg),
     Commands::Grammars(arg) => run_grammars(arg),
     Commands::Mcp(arg) => run_mcp(arg, project),
     Commands::Completions(arg) => run_shell_completion::<App>(arg),

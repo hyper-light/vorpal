@@ -28,7 +28,7 @@ path = "src/bin/alias.rs"
 vorpal-core.workspace = true
 vorpal-config.workspace = true
 vorpal-dynamic.workspace = true
-vorpal-index.workspace = true
+vorpal-index = { workspace = true, features = ["model-install"] }
 vorpal-query.workspace = true
 vorpal-lang-registry.workspace = true
 vorpal-language.workspace = true

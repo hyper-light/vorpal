@@ -2,6 +2,7 @@
 
 mod doc;
 mod find_files;
+mod models;
 mod napi_lang;
 mod repo;
 mod sg_node;
@@ -18,6 +19,7 @@ use napi_lang::NapiLang;
 use sg_node::{SgNode, SgRoot};
 
 pub use find_files::parse_files;
+pub use models::{semantic_disable, semantic_enable, semantic_install};
 pub use repo::{index_build, index_graph, index_node, index_search};
 
 macro_rules! impl_lang_mod {

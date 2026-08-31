@@ -10,6 +10,7 @@
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod async_bridge;
+mod models;
 mod py_lang;
 mod py_node;
 mod range;
@@ -53,6 +54,10 @@ fn vorpal_py(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
   m.add_function(wrap_pyfunction!(async_bridge::search_many, m)?)?;
   m.add_function(wrap_pyfunction!(async_bridge::node, m)?)?;
   m.add_function(wrap_pyfunction!(async_bridge::graph, m)?)?;
+  // Optional-model install/enable (semantic-tier Stage 6) — see `models`.
+  m.add_function(wrap_pyfunction!(models::semantic_install, m)?)?;
+  m.add_function(wrap_pyfunction!(models::semantic_enable, m)?)?;
+  m.add_function(wrap_pyfunction!(models::semantic_disable, m)?)?;
   Ok(())
 }
 

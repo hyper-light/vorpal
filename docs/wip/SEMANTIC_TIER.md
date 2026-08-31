@@ -293,10 +293,22 @@ without regressing others — else recorded as measured-and-rejected in this doc
 > the gains (length ≠ intent); the pin gates GREEN at kernel scale (all-NDCG
 > 0.298 → 0.313, protected short-keyword 0.206 → 0.223, recall up) and mixed on
 > cpython (descriptive +8.5%, short-kw NDCG down) — so enabling is a PER-CORPUS
-> measured decision, exactly what the selection file expresses. Latency: 3.6 s →
-> 1.29 s mean after the f32 GEMM round (parity ≤ 1e-4 held, kernel table
-> bit-identical); `encoderDir` in vorpalconfig.yml completes the opt-in surface.
-> STILL OPEN (owner): the
+> measured decision, exactly what the selection file expresses. Latency ladder:
+> 3.6 s → 1.29 s (f32 GEMM round) → **0.89 s mean** (batched candidate forward —
+> one token matrix per query, bitwise equal to solo embeds by oracle — plus a
+> FIFO-bounded per-node embedding cache), kernel table bit-identical throughout.
+> PACKAGING SHIPPED (owner decision 2026-08-31: both precisions, optional
+> everywhere): `vorpal enable semantic-f32|semantic-f16|off` — the ONE explicit,
+> sha256-pinned download path — installs under `$VORPAL_HOME/models` and writes
+> the GLOBAL enable every Searcher honors when an index root has no selection
+> (per-index `encoder.dir`/`encoderDir` always wins); Python
+> (`semantic_install/enable/disable`) and Node (`semanticInstall/Enable/Disable`)
+> expose the same verbs with placement control. f16 = locally converted from the
+> verified f32 bytes (IEEE RNE, exhaustive 65 536-pattern round-trip oracle;
+> end-to-end embedding drift asserted ≤ 1% cosine; ~half the disk) — the loader
+> upconverts at open (full-size RSS while live; f16-native kernel is the
+> recorded lead). Weights never ship inside release artifacts. STILL OPEN
+> (owner): none — the
 > release-size decision (547 MB f32 / ~274 MB f16 vs npm+PyPI budgets: optional
 > model package vs LFS vs release asset).
 

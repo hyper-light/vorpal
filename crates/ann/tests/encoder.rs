@@ -116,3 +116,85 @@ fn embedding_is_deterministic_and_ranks_the_obvious_pair() {
     "the factorial snippet must outrank the unrelated one ({hit:.4} vs {miss:.4})"
   );
 }
+
+#[test]
+fn f16_conversion_round_trips_and_embeds_close_to_f32() {
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  // Build a temporary f16 model directory from the f32 one.
+  let f16_dir = std::env::temp_dir().join("vorpal-coderank-f16-test");
+  let _ = std::fs::remove_dir_all(&f16_dir);
+  std::fs::create_dir_all(&f16_dir).unwrap();
+  for small in ["tokenizer.json", "config.json"] {
+    std::fs::copy(dir.join(small), f16_dir.join(small)).unwrap();
+  }
+  vorpal_ann::encoder::convert_safetensors_f32_to_f16(
+    &dir.join("model.safetensors"),
+    &f16_dir.join("model.safetensors"),
+  )
+  .unwrap();
+  assert!(
+    vorpal_ann::encoder::safetensors_is_f16(&f16_dir.join("model.safetensors")).unwrap(),
+    "converted file must read back as F16"
+  );
+  let halved = std::fs::metadata(f16_dir.join("model.safetensors")).unwrap().len();
+  let original = std::fs::metadata(dir.join("model.safetensors")).unwrap().len();
+  assert!(
+    halved < original * 6 / 10,
+    "f16 file must be about half the size ({halved} vs {original})"
+  );
+
+  let f32_encoder = CodeEncoder::open(&dir).unwrap();
+  let f16_encoder = CodeEncoder::open(&f16_dir).unwrap();
+  let texts = [
+    "Represent this query for searching relevant code: Calculate the n-th factorial",
+    "vx_socket_send buffer flush",
+  ];
+  for text in texts {
+    let full = f32_encoder.embed(text).unwrap();
+    let half = f16_encoder.embed(text).unwrap();
+    let cosine: f64 = full
+      .iter()
+      .zip(&half)
+      .map(|(a, b)| *a as f64 * *b as f64)
+      .sum();
+    eprintln!("f16-vs-f32 embedding cosine for {text:?}: {cosine:.6}");
+    assert!(
+      cosine >= 0.99,
+      "f16 weights drifted too far from f32 on {text:?}: cosine {cosine:.6}"
+    );
+    // And the f16 path itself is bitwise reproducible.
+    let again = f16_encoder.embed(text).unwrap();
+    assert_eq!(
+      half.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+      again.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+  }
+  let _ = std::fs::remove_dir_all(&f16_dir);
+}
+
+#[test]
+fn batched_embeddings_equal_individual_ones_bitwise() {
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  let encoder = CodeEncoder::open(&dir).unwrap();
+  let texts = [
+    "Represent this query for searching relevant code: Calculate the n-th factorial",
+    "def factorial(n): return 1 if n <= 1 else n * factorial(n - 1)",
+    "vx_socket_send buffer flush",
+  ];
+  let batched = encoder.embed_batch(&texts).unwrap();
+  assert_eq!(batched.len(), texts.len());
+  for (text, batch_row) in texts.iter().zip(&batched) {
+    let solo = encoder.embed(text).unwrap();
+    assert_eq!(
+      solo.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+      batch_row.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+      "batched embedding diverged from the solo one for {text:?}"
+    );
+  }
+}

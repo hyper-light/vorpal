@@ -1295,12 +1295,48 @@ fn coherent_persisted_embedder(index_dir: &Path, current_stamp: u64) -> Option<A
 /// Build-side freshness: coherent artifacts AND the persisted tier matches the
 /// selection (a tier flip is staleness — the next warm rebuilds under the selected
 /// model). The learned check verifies the model file's checksum without loading it.
+/// Optional-model packaging (semantic-tier Stage 6): global install/enable paths
+/// (always available — every consumer honors a global enable) and the
+/// checksum-pinned installer (behind the `model-install` feature) backing
+/// `vorpal enable` and the SDK install APIs.
+pub mod models;
+
+/// Reranker embedding-cache bound: ~12 MB of rows at the encoder's 768 dims. A
+/// shipped cap in the `cached_searcher` LRU-8 precedent (a small documented bound,
+/// not a derived law) — revisit under a recorded sweep if the reranker becomes a
+/// hot path.
+const ENCODER_CACHE_ROWS: usize = 4096;
+
+/// FIFO-bounded map of node id → L2-normalized candidate-surface embedding.
+#[derive(Default)]
+struct EncoderCache {
+  map: HashMap<u64, Vec<f32>>,
+  order: std::collections::VecDeque<u64>,
+}
+
+impl EncoderCache {
+  fn insert(&mut self, id: u64, row: Vec<f32>) {
+    if self.map.contains_key(&id) {
+      return;
+    }
+    if self.map.len() == ENCODER_CACHE_ROWS
+      && let Some(evicted) = self.order.pop_front()
+    {
+      self.map.remove(&evicted);
+    }
+    self.order.push_back(id);
+    self.map.insert(id, row);
+  }
+}
+
 /// Open the root's selected encoder, if any — shared by both `Searcher` opens.
+/// Selection precedence: the index root's `encoder.dir`, else the GLOBAL enable
+/// written by `vorpal enable` / the SDK APIs (see [`models`]).
 /// A failed open is a STATED degradation, never a failed search.
 fn open_selected_encoder(
   index_root: &Path,
 ) -> (Option<Box<vorpal_ann::encoder::CodeEncoder>>, Option<String>) {
-  match encoder_selection(index_root) {
+  match encoder_selection(index_root).or_else(models::global_encoder_selection) {
     None => (None, None),
     Some(model_dir) => match vorpal_ann::encoder::CodeEncoder::open(&model_dir) {
       Ok(encoder) => (Some(Box::new(encoder)), None),
@@ -2841,6 +2877,10 @@ pub struct Searcher {
   /// Present exactly when an encoder SELECTION could not be honored (stated
   /// degradation — surfaced by [`Searcher::encoder_status`]).
   encoder_note: Option<String>,
+  /// Session cache of candidate-surface embeddings for the reranker — node
+  /// surfaces are immutable per pinned generation, so rows never go stale within
+  /// a handle. FIFO-bounded at [`ENCODER_CACHE_ROWS`].
+  encoder_cache: Mutex<EncoderCache>,
   /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
   /// effect (autowarm) so queries take the exact reference paths only. Set by
   /// [`Searcher::open_exact`]; never used in serving.
@@ -2891,6 +2931,7 @@ impl Searcher {
       bm25_enabled,
       encoder,
       encoder_note,
+      encoder_cache: Mutex::new(EncoderCache::default()),
       exact_only: false,
     })
   }
@@ -2929,6 +2970,7 @@ impl Searcher {
       bm25_enabled,
       encoder,
       encoder_note,
+      encoder_cache: Mutex::new(EncoderCache::default()),
       exact_only: true,
     })
   }
@@ -3251,26 +3293,65 @@ impl Searcher {
     if fused.len() <= 1 {
       return fused;
     }
-    let Ok(query_vec) = encoder.embed_query(query) else {
-      return fused;
+    // ONE batched forward serves the whole query: the prefixed query plus every
+    // cache-missed candidate surface concatenate into a single token matrix
+    // (`embed_batch` — bitwise equal to solo embeds by the batch oracle), and the
+    // per-generation-immutable candidate rows persist in the FIFO session cache.
+    let prefixed = format!("{}{query}", vorpal_ann::encoder::QUERY_PREFIX);
+    let tail_ids: Vec<u64> = fused.iter().skip(1).map(|hit| hit.0).collect();
+    let mut rows: HashMap<u64, Vec<f32>> = HashMap::with_capacity(tail_ids.len());
+    {
+      let cache = self
+        .encoder_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+      for &id in &tail_ids {
+        if let Some(row) = cache.map.get(&id) {
+          rows.insert(id, row.clone());
+        }
+      }
+    }
+    let mut miss_ids: Vec<u64> = Vec::new();
+    let mut miss_surfaces: Vec<String> = Vec::new();
+    for &id in &tail_ids {
+      if rows.contains_key(&id) {
+        continue;
+      }
+      if let Some(view) = self.kg.node(NodeId::new(id)) {
+        let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+        miss_ids.push(id);
+        miss_surfaces.push(format!("{} {} {basename}", view.name, view.signature));
+      }
+    }
+    let mut sequences: Vec<&str> = Vec::with_capacity(1 + miss_surfaces.len());
+    sequences.push(&prefixed);
+    sequences.extend(miss_surfaces.iter().map(String::as_str));
+    let query_vec = match encoder.embed_batch(&sequences) {
+      Ok(mut embedded) => {
+        let query_vec = embedded.remove(0);
+        let mut cache = self
+          .encoder_cache
+          .lock()
+          .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (id, row) in miss_ids.iter().zip(embedded) {
+          cache.insert(*id, row.clone());
+          rows.insert(*id, row);
+        }
+        query_vec
+      }
+      // open() validated the model; a runtime failure degrades one query, never
+      // fails the search.
+      Err(_) => return fused,
     };
     let mut keyed: Vec<(f64, usize)> = Vec::with_capacity(fused.len().saturating_sub(1));
     for (position, hit) in fused.iter().enumerate().skip(1) {
-      let cosine = self
-        .kg
-        .node(NodeId::new(hit.0))
-        .and_then(|view| {
-          let basename = view.path.rsplit('/').next().unwrap_or(view.path);
-          let surface = format!("{} {} {basename}", view.name, view.signature);
-          encoder.embed(&surface).ok()
-        })
-        .map_or(f64::NEG_INFINITY, |row| {
-          query_vec
-            .iter()
-            .zip(&row)
-            .map(|(a, b)| *a as f64 * *b as f64)
-            .sum()
-        });
+      let cosine = rows.get(&hit.0).map_or(f64::NEG_INFINITY, |row| {
+        query_vec
+          .iter()
+          .zip(row)
+          .map(|(a, b)| *a as f64 * *b as f64)
+          .sum()
+      });
       keyed.push((cosine, position));
     }
     keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));

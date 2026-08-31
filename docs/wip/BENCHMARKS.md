@@ -877,12 +877,44 @@ k=25 on the correctness-first f64 pass; the f32 GEMM round (hidden state f32,
 six GEMMs in eight fixed f32 lanes reduced in fixed order — LN moments, rotary,
 attention dots/softmax/A·V sums stay f64) brings it to **1.29 s mean / 2.49 s
 max** with the parity oracle still ≤ 1e-4 and the kernel quality table
-BIT-IDENTICAL (0.223 / 0.313). Remaining latency leads: per-node embedding
-cache, batched candidate GEMM. The release-size decision (547 MB f32 / ~274 MB
-f16 vs npm+PyPI budgets) is an owner call, surfaced separately. The opt-in is
-also configurable: `encoderDir` in vorpalconfig.yml (relative to the project
-dir, must exist locally) writes the selection at `vorpal kg index` time, the
-`semanticTier` discipline.
+BIT-IDENTICAL (0.223 / 0.313). The batching round finishes the ladder:
+`forward_batch` concatenates the prefixed query and every cache-missed
+candidate surface into ONE token matrix (block-diagonal attention, rotary over
+LOCAL positions — batched embeddings are BITWISE equal to solo ones, pinned by
+a gated oracle), and candidate rows persist in a FIFO session cache (4096 rows
+≈ 12 MB, the `cached_searcher` LRU-8 shipped-cap precedent) —
+**0.887 s mean / 1.24 s max**, quality bit-identical again. Ladder:
+3.62 → 1.29 → 0.887 s mean (4.1×); the f16-native GEMM kernel remains the
+recorded lead. The opt-in is also configurable per index: `encoderDir` in
+vorpalconfig.yml (relative to the project dir, must exist locally) writes the
+selection at `vorpal kg index` time, the `semanticTier` discipline.
+
+### Stage 6 packaging (owner decision 2026-08-31): both precisions, optional everywhere
+
+Weights never ship inside release artifacts and are never fetched implicitly —
+the ONE explicit download path is `vorpal_index::models` (installer behind the
+`model-install` feature; the enable/read half is in every build, so any
+consumer honors an enable a feature-full tool wrote). `vorpal enable
+semantic-f32 | semantic-f16 | off` installs under `$VORPAL_HOME/models`
+(defaults `~/.vorpal/models`; `$VORPAL_MODELS_DIR` overrides) with streaming
+sha256 verification against the pinned checksums (model `827529bc…`, tokenizer
+`91f1def9…`, config `5ff856a4…`; `.part` + atomic rename; idempotent), then
+writes the GLOBAL `~/.vorpal/encoder.dir` — the `Searcher` fallback when an
+index root has no selection; per-index selections always win, and internal
+generation-dir opens (the BM25 gate's probes) keep measuring un-reranked
+fusion. Python (`semantic_install/semantic_enable/semantic_disable`) and Node
+(`semanticInstall/semanticEnable/semanticDisable`) expose the same verbs with a
+`root` placement parameter.
+
+The f16 variant converts the VERIFIED f32 bytes locally: owned IEEE 754
+binary16 round-to-nearest-even (`encoder::f16`, EXHAUSTIVE oracle — all 65 536
+half patterns round-trip), deterministic safetensors rewrite (names sorted,
+offsets repacked, 8-aligned header), and an all-F16 loader path that upconverts
+once at open into an owned f32 arena. Measured: 273.5 MB on disk (vs 546.9),
+end-to-end embedding drift **cosine 1.000000** on both probe texts (the
+inter-layer LayerNorms absorb the weight rounding), f16 path bitwise
+reproducible. The stated trade: full-size RSS while a handle is live, until the
+f16-native kernel lands.
 
 ## History (earlier passes, kept for the record)
 

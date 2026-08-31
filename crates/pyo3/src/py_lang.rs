@@ -36,6 +36,10 @@ impl From<CustomPyLang> for CustomLang {
       expando_char: c.expando_char,
       extensions: c.extensions,
       outline_rules: None,
+      // Not yet exposed on the Python registration surface: the language indexes
+      // best-effort (reported unverified) with no reference-extraction spec.
+      ref_spec: None,
+      canary: None,
     }
   }
 }

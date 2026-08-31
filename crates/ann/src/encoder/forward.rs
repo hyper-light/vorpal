@@ -109,9 +109,25 @@ fn gemm(x: &[f32], dim_in: usize, w: &[f32], rows_out: usize, out: &mut [f32]) {
     });
 }
 
-/// CLS embedding (pre-normalization) for one token sequence. `ids` must be within
-/// the embedding table; the sequence length is the caller's truncation decision.
+/// CLS embedding (pre-normalization) for one token sequence — the batch form with
+/// one sequence; bitwise identical by construction (the batch oracle pins it).
 pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, String> {
+  let mut batch = forward_batch(weights, &[ids])?;
+  batch
+    .pop()
+    .ok_or_else(|| "encoder: batch of one produced no row (invariant)".to_string())
+}
+
+/// CLS embeddings (pre-normalization) for a BATCH of token sequences — the rerank
+/// path's shape: all sequences concatenate into ONE token matrix so every GEMM and
+/// LayerNorm runs at full width (rows are per-token and never mix), while attention
+/// and rotary positions stay strictly per-sequence (block-diagonal by the offset
+/// table). Per-row math is IDENTICAL to the single-sequence form — batched and
+/// individual embeddings are bitwise equal, pinned by the gated batch oracle.
+pub fn forward_batch(
+  weights: &ModelWeights<'_>,
+  sequences: &[&[u32]],
+) -> Result<Vec<Vec<f32>>, String> {
   let (dim, heads) = (weights.dim, weights.heads);
   if dim == 0 || heads == 0 || dim % heads != 0 {
     return Err("encoder: degenerate architecture constants".to_string());
@@ -120,46 +136,70 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
   if head_dim % 2 != 0 {
     return Err("encoder: rotary needs an even head dim".to_string());
   }
-  let seq = ids.len();
-  if seq == 0 {
-    return Err("encoder: empty token sequence".to_string());
+  if sequences.is_empty() {
+    return Ok(Vec::new());
   }
-  for &id in ids {
-    if id as usize >= weights.vocab_rows {
-      return Err(format!("encoder: token id {id} outside the embedding table"));
+  let mut offsets = Vec::with_capacity(sequences.len() + 1);
+  offsets.push(0usize);
+  let mut longest = 0usize;
+  for ids in sequences {
+    if ids.is_empty() {
+      return Err("encoder: empty token sequence".to_string());
+    }
+    for &id in *ids {
+      if id as usize >= weights.vocab_rows {
+        return Err(format!("encoder: token id {id} outside the embedding table"));
+      }
+    }
+    longest = longest.max(ids.len());
+    offsets.push(offsets[offsets.len() - 1] + ids.len());
+  }
+  let total = offsets[offsets.len() - 1];
+  // Per global row: (sequence start, sequence end) — attention's block bounds.
+  let mut bounds = vec![(0u32, 0u32); total];
+  for window in offsets.windows(2) {
+    let (start, end) = (window[0], window[1]);
+    for bound in &mut bounds[start..end] {
+      *bound = (start as u32, end as u32);
     }
   }
 
-  // Embeddings + emb_ln.
-  let mut x = vec![0.0f32; seq * dim];
-  for (s, &id) in ids.iter().enumerate() {
-    let word = &weights.word_embeddings[id as usize * dim..(id as usize + 1) * dim];
-    let row = &mut x[s * dim..(s + 1) * dim];
-    for ((slot, w), t) in row.iter_mut().zip(word).zip(weights.token_type_row0) {
-      *slot = w + t;
+  // Embeddings + emb_ln (per token; sequence-independent).
+  let mut x = vec![0.0f32; total * dim];
+  for (sequence, ids) in sequences.iter().enumerate() {
+    for (local, &id) in ids.iter().enumerate() {
+      let global = offsets[sequence] + local;
+      let word = &weights.word_embeddings[id as usize * dim..(id as usize + 1) * dim];
+      let row = &mut x[global * dim..(global + 1) * dim];
+      for ((slot, w), t) in row.iter_mut().zip(word).zip(weights.token_type_row0) {
+        *slot = w + t;
+      }
     }
   }
   layer_norm(&mut x, dim, weights.emb_ln_weight, weights.emb_ln_bias, weights.layer_norm_eps);
 
-  // Rotary tables: [seq][head_dim/2], f64.
+  // Rotary tables over LOCAL positions, sized by the longest sequence; every
+  // sequence indexes them by its own position (identical to its solo run).
   let half = head_dim / 2;
-  let mut cos = vec![0.0f64; seq * half];
-  let mut sin = vec![0.0f64; seq * half];
-  for s in 0..seq {
+  let mut cos = vec![0.0f64; longest * half];
+  let mut sin = vec![0.0f64; longest * half];
+  for position in 0..longest {
     for f in 0..half {
       let inv_freq = 1.0 / weights.rotary_base.powf((2 * f) as f64 / head_dim as f64);
-      let angle = s as f64 * inv_freq;
-      cos[s * half + f] = angle.cos();
-      sin[s * half + f] = angle.sin();
+      let angle = position as f64 * inv_freq;
+      cos[position * half + f] = angle.cos();
+      sin[position * half + f] = angle.sin();
     }
   }
-  let rotate = |vectors: &mut [f32]| {
-    // vectors: [seq][heads][head_dim], rotate-half non-interleaved, f64 mid-math.
-    for s in 0..seq {
+  let rotate = |vectors: &mut [f32], bounds: &[(u32, u32)]| {
+    // vectors: [total][heads][head_dim], rotate-half non-interleaved, f64 mid-math,
+    // positions LOCAL to each sequence.
+    for (global, &(start, _)) in bounds.iter().enumerate() {
+      let position = global - start as usize;
       for h in 0..heads {
-        let base = (s * heads + h) * head_dim;
+        let base = (global * heads + h) * head_dim;
         for f in 0..half {
-          let (c, n) = (cos[s * half + f], sin[s * half + f]);
+          let (c, n) = (cos[position * half + f], sin[position * half + f]);
           let (a, b) = (vectors[base + f] as f64, vectors[base + half + f] as f64);
           vectors[base + f] = (a * c - b * n) as f32;
           vectors[base + half + f] = (b * c + a * n) as f32;
@@ -168,41 +208,45 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
     }
   };
 
-  let mut qkv = vec![0.0f32; seq * 3 * dim];
-  let mut attn_out = vec![0.0f32; seq * dim];
-  let mut context = vec![0.0f32; seq * dim];
-  let mut mlp_y = vec![0.0f32; seq * weights.inner];
-  let mut mlp_gate = vec![0.0f32; seq * weights.inner];
-  let mut mlp_out = vec![0.0f32; seq * dim];
+  let mut qkv = vec![0.0f32; total * 3 * dim];
+  let mut attn_out = vec![0.0f32; total * dim];
+  let mut context = vec![0.0f32; total * dim];
+  let mut mlp_y = vec![0.0f32; total * weights.inner];
+  let mut mlp_gate = vec![0.0f32; total * weights.inner];
+  let mut mlp_out = vec![0.0f32; total * dim];
   let scale = 1.0 / (head_dim as f64).sqrt();
 
   for layer in &weights.layers {
-    // qkv: [seq][3*dim] rows (t-major, then head, then component); unpack into
-    // contiguous q/k/v matrices [seq][heads][head_dim] for the attention walk.
+    // qkv: [total][3*dim] rows (t-major, then head, then component); unpack into
+    // contiguous q/k/v matrices [total][heads][head_dim] for the attention walk.
     gemm(&x, dim, layer.wqkv, 3 * dim, &mut qkv);
-    let mut q = vec![0.0f32; seq * dim];
-    let mut k = vec![0.0f32; seq * dim];
-    let mut v = vec![0.0f32; seq * dim];
-    for s in 0..seq {
+    let mut q = vec![0.0f32; total * dim];
+    let mut k = vec![0.0f32; total * dim];
+    let mut v = vec![0.0f32; total * dim];
+    for s in 0..total {
       let row = &qkv[s * 3 * dim..(s + 1) * 3 * dim];
       q[s * dim..(s + 1) * dim].copy_from_slice(&row[0..dim]);
       k[s * dim..(s + 1) * dim].copy_from_slice(&row[dim..2 * dim]);
       v[s * dim..(s + 1) * dim].copy_from_slice(&row[2 * dim..3 * dim]);
     }
-    rotate(&mut q);
-    rotate(&mut k);
-    // Attention per (query-row, head): independent outputs; f64 dots, stable
-    // softmax, f64 A·V accumulation in ascending key order.
+    rotate(&mut q, &bounds);
+    rotate(&mut k, &bounds);
+    // Attention per (query-row, head), keys bounded to the row's OWN sequence
+    // (block-diagonal): independent outputs; f64 dots, stable softmax, f64 A·V
+    // accumulation in ascending key order — per-row identical to the solo run.
     context
       .par_chunks_mut(dim)
       .enumerate()
       .for_each(|(s, out_row)| {
-        let mut weights_buffer = vec![0.0f64; seq];
+        let (start, end) = (bounds[s].0 as usize, bounds[s].1 as usize);
+        let keys = end - start;
+        let mut weights_buffer = vec![0.0f64; keys];
         let mut head_accumulator = vec![0.0f64; head_dim];
         for h in 0..heads {
           let q_row = &q[(s * heads + h) * head_dim..(s * heads + h + 1) * head_dim];
           let mut max_score = f64::NEG_INFINITY;
-          for (t, slot) in weights_buffer.iter_mut().enumerate() {
+          for (local, slot) in weights_buffer.iter_mut().enumerate() {
+            let t = start + local;
             let k_row = &k[(t * heads + h) * head_dim..(t * heads + h + 1) * head_dim];
             let mut dot = 0.0f64;
             for (a, b) in q_row.iter().zip(k_row) {
@@ -214,14 +258,15 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
               max_score = score;
             }
           }
-          let mut total = 0.0f64;
+          let mut total_weight = 0.0f64;
           for slot in weights_buffer.iter_mut() {
             *slot = (*slot - max_score).exp();
-            total += *slot;
+            total_weight += *slot;
           }
           head_accumulator.fill(0.0);
-          for (t, weight) in weights_buffer.iter().enumerate() {
-            let value = weight / total;
+          for (local, weight) in weights_buffer.iter().enumerate() {
+            let t = start + local;
+            let value = weight / total_weight;
             let v_row = &v[(t * heads + h) * head_dim..(t * heads + h + 1) * head_dim];
             for (slot, component) in head_accumulator.iter_mut().zip(v_row) {
               *slot += value * *component as f64;
@@ -250,7 +295,12 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
     }
     layer_norm(&mut x, dim, layer.norm2_weight, layer.norm2_bias, weights.layer_norm_eps);
   }
-  Ok(x[..dim].to_vec())
+  Ok(
+    offsets[..sequences.len()]
+      .iter()
+      .map(|&start| x[start * dim..(start + 1) * dim].to_vec())
+      .collect(),
+  )
 }
 
 /// L2-normalize in place; a zero vector stays zero (stated by the caller's report).

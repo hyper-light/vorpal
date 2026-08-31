@@ -15,6 +15,7 @@
 //! QUERY-TIME RERANKER: one prefixed query plus the fused top-K candidate
 //! surfaces per search, nothing precomputed.
 
+mod f16;
 mod forward;
 mod safetensors;
 mod tokenizer;
@@ -23,6 +24,7 @@ use std::path::Path;
 
 use forward::{LayerWeights, ModelWeights};
 pub use forward::l2_normalize;
+pub use safetensors::{convert_safetensors_f32_to_f16, safetensors_is_f16};
 
 /// The task instruction the model card requires on every QUERY (verbatim;
 /// documents embed without it).
@@ -176,17 +178,36 @@ impl CodeEncoder {
     self.tokenizer.encode(text)
   }
 
-  /// CLS embedding BEFORE normalization — the reference-parity surface.
-  pub fn embed_raw(&self, text: &str) -> Result<Vec<f32>, String> {
+  /// Token ids clamped to the trained position budget: tail-truncate but keep
+  /// the `[SEP]` terminator the template requires — a safety clamp far above the
+  /// reranker's working regime.
+  fn clamped_ids(&self, text: &str) -> Vec<u32> {
     let mut ids = self.tokenizer.encode(text);
     if ids.len() > self.max_positions {
-      // Safety clamp far above the reranker's working regime: tail-truncate but
-      // keep the [SEP] terminator the template requires.
       let sep = ids.last().copied().unwrap_or(0);
       ids.truncate(self.max_positions - 1);
       ids.push(sep);
     }
-    forward::forward(&self.model_weights()?, &ids)
+    ids
+  }
+
+  /// CLS embedding BEFORE normalization — the reference-parity surface.
+  pub fn embed_raw(&self, text: &str) -> Result<Vec<f32>, String> {
+    forward::forward(&self.model_weights()?, &self.clamped_ids(text))
+  }
+
+  /// L2-normalized embeddings for a BATCH of texts in ONE forward pass (the
+  /// reranker's shape — every GEMM runs at full width over the concatenated token
+  /// matrix). Per-text results are bitwise identical to [`Self::embed`], pinned
+  /// by the gated batch oracle.
+  pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+    let sequences: Vec<Vec<u32>> = texts.iter().map(|text| self.clamped_ids(text)).collect();
+    let borrowed: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
+    let mut rows = forward::forward_batch(&self.model_weights()?, &borrowed)?;
+    for row in &mut rows {
+      l2_normalize(row);
+    }
+    Ok(rows)
   }
 
   /// L2-normalized document embedding (cosine-ready).

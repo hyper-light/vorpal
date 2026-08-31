@@ -406,6 +406,8 @@ impl Index {
       kind,
       lang,
       exported_only: exported,
+      // Not yet exposed on this surface; false preserves the API's behavior.
+      exclude_tests: false,
     };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
