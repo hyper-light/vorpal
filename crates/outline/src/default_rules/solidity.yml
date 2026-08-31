@@ -147,3 +147,122 @@ rule:
         field: name
         pattern: $NAME
 name: '$NAME'
+---
+id: solidity-constructor
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract]
+symbolType: constructor
+rule:
+  kind: constructor_definition
+name: constructor
+isPublic: true
+---
+id: solidity-modifier
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract, solidity-library]
+symbolType: method
+rule:
+  all:
+    - kind: modifier_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: solidity-fallback-receive
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract]
+symbolType: method
+rule:
+  kind: fallback_receive_definition
+  pattern: $DECL
+transform:
+  KIND:
+    replace:
+      source: $DECL
+      replace: '\W[\s\S]*$'
+      by: ''
+name: '$KIND'
+isPublic: true
+---
+id: solidity-error
+language: Solidity
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: error_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: solidity-contract-error
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract, solidity-interface, solidity-library]
+symbolType: struct
+rule:
+  all:
+    - kind: error_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: solidity-udt
+language: Solidity
+role: item
+symbolType: typeAlias
+rule:
+  all:
+    - kind: user_defined_type_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: solidity-contract-udt
+language: Solidity
+role: member
+parentRuleIds: [solidity-contract, solidity-interface, solidity-library]
+symbolType: typeAlias
+rule:
+  all:
+    - kind: user_defined_type_definition
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: solidity-constant
+language: Solidity
+role: item
+symbolType: constant
+rule:
+  all:
+    - kind: constant_variable_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isExported: true
+---
+id: solidity-yul-function
+language: Solidity
+role: item
+symbolType: function
+nested: true
+rule:
+  kind: yul_function_definition
+  has:
+    stopBy: end
+    kind: yul_identifier
+    pattern: $NAME
+name: '$NAME'

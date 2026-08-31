@@ -35,3 +35,37 @@ rule:
         field: name
         pattern: $NAME
 name: '$NAME'
+---
+id: erlang-macro
+language: Erlang
+role: item
+symbolType: macro
+# `-define(NAME, …)` / `-define(NAME(Args), …)` — the lhs text carries the
+# parameter list for function-like macros; strip it for the entity name.
+rule:
+  all:
+    - kind: pp_define
+    - has:
+        field: lhs
+        pattern: $LHS
+transform:
+  SYM:
+    replace:
+      source: $LHS
+      replace: '\(.*$'
+      by: ''
+name: '$SYM'
+isExported: true
+---
+id: erlang-type
+language: Erlang
+role: item
+symbolType: typeAlias
+rule:
+  all:
+    - kind: type_alias
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isExported: true

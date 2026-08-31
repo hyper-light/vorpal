@@ -88,3 +88,51 @@ rule:
               pattern: $NAME
 name: '$NAME'
 isPublic: false
+---
+id: elixir-protocol
+language: Elixir
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: call
+    - has:
+        field: target
+        regex: '^defprotocol$'
+    - has:
+        kind: arguments
+        has:
+          kind: alias
+          pattern: $NAME
+name: '$NAME'
+---
+id: elixir-impl
+language: Elixir
+role: item
+symbolType: class
+rule:
+  all:
+    - kind: call
+    - has:
+        field: target
+        regex: '^defimpl$'
+    - has:
+        kind: arguments
+        has:
+          kind: alias
+          pattern: $NAME
+name: '$NAME'
+---
+id: elixir-struct
+language: Elixir
+role: member
+parentRuleIds: [elixir-module]
+symbolType: struct
+rule:
+  all:
+    - kind: call
+    - has:
+        field: target
+        regex: '^(defstruct|defexception)$'
+name: struct
+isPublic: true

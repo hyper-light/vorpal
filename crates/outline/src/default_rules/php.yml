@@ -131,3 +131,55 @@ rule:
     pattern: $NAME
 name: $NAME
 isPublic: true
+---
+id: php-namespace
+language: Php
+role: item
+symbolType: module
+rule:
+  kind: namespace_definition
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+transparent: true
+---
+id: php-const
+language: Php
+role: item
+symbolType: constant
+# File-level `const X = …;` — class constants extract through the member twin.
+rule:
+  all:
+    - kind: const_declaration
+    - not:
+        inside:
+          kind: declaration_list
+          stopBy: end
+    - has:
+        kind: const_element
+        has:
+          kind: name
+          pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: php-class-const
+language: Php
+role: member
+parentRuleIds: [php-class, php-trait, php-interface, php-enum]
+symbolType: constant
+rule:
+  kind: const_declaration
+  has:
+    kind: const_element
+    has:
+      kind: name
+      pattern: $NAME
+name: $NAME
+isPublic:
+  not:
+    has:
+      kind: visibility_modifier
+      regex: 'private|protected'

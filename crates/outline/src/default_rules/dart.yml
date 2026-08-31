@@ -88,10 +88,148 @@ transform:
 name: '$NAME'
 signature: '$SIG'
 ---
+id: dart-typealias
+language: Dart
+role: item
+symbolType: typeAlias
+rule:
+  kind: type_alias
+  has:
+    kind: type_identifier
+    pattern: $NAME
+name: '$NAME'
+---
+id: dart-extension-type
+language: Dart
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: extension_type_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: dart-top-level-variable
+language: Dart
+role: item
+symbolType: variable
+rule:
+  kind: top_level_variable_declaration
+  has:
+    stopBy: end
+    kind: identifier
+    pattern: $NAME
+name: '$NAME'
+---
+id: dart-external-function
+language: Dart
+role: item
+symbolType: function
+rule:
+  kind: external_function_declaration
+  has:
+    stopBy: end
+    kind: function_signature
+    has:
+      field: name
+      pattern: $NAME
+name: '$NAME'
+---
+id: dart-getter
+language: Dart
+role: member
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension, dart-extension-type]
+symbolType: property
+rule:
+  kind: getter_signature
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic:
+  not:
+    has:
+      field: name
+      regex: '^_'
+---
+id: dart-setter
+language: Dart
+role: member
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension, dart-extension-type]
+symbolType: property
+rule:
+  kind: setter_signature
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic:
+  not:
+    has:
+      field: name
+      regex: '^_'
+---
+id: dart-constructor
+language: Dart
+role: member
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension-type]
+symbolType: constructor
+rule:
+  kind: constructor_signature
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: dart-factory-constructor
+language: Dart
+role: member
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension-type]
+symbolType: constructor
+rule:
+  kind: factory_constructor_signature
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: dart-operator
+language: Dart
+role: member
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension, dart-extension-type]
+symbolType: method
+# The operator token can be anonymous (`[]`, `~`) — literal name, distinct by
+# signature.
+rule:
+  kind: operator_signature
+name: operator
+isPublic: true
+---
+id: dart-static-final-field
+language: Dart
+role: member
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension, dart-extension-type]
+symbolType: field
+rule:
+  kind: static_final_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic:
+  not:
+    has:
+      field: name
+      regex: '^_'
+---
 id: dart-method
 language: Dart
 role: member
-parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension]
+parentRuleIds: [dart-class, dart-mixin, dart-enum, dart-extension, dart-extension-type]
 symbolType: method
 rule:
   all:

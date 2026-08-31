@@ -101,7 +101,7 @@ signature: '$SIG'
 id: scala-type
 language: Scala
 role: item
-symbolType: struct
+symbolType: typeAlias
 rule:
   all:
     - kind: type_definition
@@ -173,5 +173,73 @@ rule:
         - kind: var_definition
     - has:
         field: pattern
+        pattern: $NAME
+name: '$NAME'
+---
+id: scala-field-decl
+language: Scala
+role: member
+parentRuleIds: [scala-class, scala-object, scala-trait, scala-enum]
+symbolType: field
+rule:
+  all:
+    - any:
+        - kind: val_declaration
+        - kind: var_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: scala-enum-case
+language: Scala
+role: member
+parentRuleIds: [scala-enum]
+symbolType: enumMember
+rule:
+  all:
+    - any:
+        - kind: full_enum_case
+        - kind: simple_enum_case
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: scala-val
+language: Scala
+role: item
+symbolType: constant
+rule:
+  all:
+    - kind: val_definition
+    - has:
+        field: pattern
+        pattern: $NAME
+name: '$NAME'
+---
+id: scala-var
+language: Scala
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: var_definition
+    - has:
+        field: pattern
+        pattern: $NAME
+name: '$NAME'
+---
+id: scala-given
+language: Scala
+role: item
+symbolType: constant
+rule:
+  all:
+    - kind: given_definition
+    - has:
+        field: name
         pattern: $NAME
 name: '$NAME'

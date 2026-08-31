@@ -662,3 +662,64 @@ isExported:
   has:
     kind: visibility_modifier
     regex: '^pub'
+---
+id: rust-const
+language: Rust
+role: item
+symbolType: constant
+# Top-level `const X: T = …;` — associated consts (impl/trait) and
+# function-local ones are out of item scope.
+rule:
+  all:
+    - kind: const_item
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          stopBy: end
+          any:
+            - kind: trait_item
+            - kind: impl_item
+            - kind: function_item
+name: '$NAME'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-static
+language: Rust
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: static_item
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          stopBy: end
+          any:
+            - kind: trait_item
+            - kind: impl_item
+            - kind: function_item
+name: '$NAME'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-extern-crate
+language: Rust
+role: item
+symbolType: module
+rule:
+  kind: extern_crate_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isImport: true
+isExported: false

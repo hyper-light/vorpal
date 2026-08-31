@@ -39,7 +39,19 @@ rule:
     - any:
         - kind: data_type
         - kind: newtype
-        - kind: type_synomym
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+---
+id: haskell-type-synonym
+language: Haskell
+role: item
+symbolType: typeAlias
+# `type X = Y` (the grammar spells the node `type_synomym`).
+rule:
+  all:
+    - kind: type_synomym
     - has:
         field: name
         pattern: $NAME
@@ -56,3 +68,16 @@ rule:
         field: name
         pattern: $NAME
 name: '$NAME'
+---
+id: haskell-class-method
+language: Haskell
+role: member
+parentRuleIds: [haskell-class]
+symbolType: method
+rule:
+  kind: signature
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true

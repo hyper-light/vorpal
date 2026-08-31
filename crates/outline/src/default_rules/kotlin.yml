@@ -258,6 +258,23 @@ isPublic:
       kind: modifiers
       regex: 'private|internal|protected'
 ---
+id: kotlin-typealias
+language: Kotlin
+role: item
+symbolType: typeAlias
+rule:
+  all:
+    - kind: type_alias
+    - has:
+        kind: type_identifier
+        pattern: $NAME
+name: $NAME
+isExported:
+  not:
+    has:
+      kind: modifiers
+      regex: 'private|internal|protected'
+---
 id: kotlin-member-property
 language: Kotlin
 role: member

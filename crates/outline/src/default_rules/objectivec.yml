@@ -7,7 +7,18 @@ rule:
     - any:
         - kind: class_interface
         - kind: class_implementation
-        - kind: protocol_declaration
+    - has:
+        kind: identifier
+        pattern: $NAME
+name: '$NAME'
+---
+id: objc-protocol
+language: ObjectiveC
+role: item
+symbolType: interface
+rule:
+  all:
+    - kind: protocol_declaration
     - has:
         kind: identifier
         pattern: $NAME
@@ -16,7 +27,7 @@ name: '$NAME'
 id: objc-method
 language: ObjectiveC
 role: member
-parentRuleIds: [objc-interface]
+parentRuleIds: [objc-interface, objc-protocol]
 symbolType: method
 rule:
   all:
@@ -41,3 +52,160 @@ rule:
         kind: identifier
         pattern: $NAME
 name: '$NAME'
+---
+id: objc-property
+language: ObjectiveC
+role: member
+parentRuleIds: [objc-interface, objc-protocol]
+symbolType: property
+rule:
+  kind: property_declaration
+  has:
+    stopBy: end
+    kind: identifier
+    pattern: $NAME
+    # `(nonatomic, strong)` attribute identifiers are not the property's name.
+    not:
+      inside:
+        kind: property_attributes_declaration
+        stopBy: end
+name: '$NAME'
+isPublic: true
+---
+id: objc-struct
+language: ObjectiveC
+role: item
+symbolType: struct
+rule:
+  kind: struct_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: '$NAME'
+---
+id: objc-union
+language: ObjectiveC
+role: item
+symbolType: union
+rule:
+  kind: union_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: '$NAME'
+---
+id: objc-enum
+language: ObjectiveC
+role: item
+symbolType: enum
+rule:
+  kind: enum_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: enumerator_list
+name: '$NAME'
+---
+id: objc-struct-field
+language: ObjectiveC
+role: member
+parentRuleIds: [objc-struct, objc-union]
+symbolType: field
+rule:
+  kind: field_declaration
+  has:
+    field: declarator
+    any:
+      - kind: field_identifier
+        pattern: $NAME
+      - has:
+          kind: field_identifier
+          stopBy: end
+          pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: objc-enum-member
+language: ObjectiveC
+role: member
+parentRuleIds: [objc-enum]
+symbolType: enumMember
+rule:
+  kind: enumerator
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: objc-macro
+language: ObjectiveC
+role: item
+symbolType: macro
+rule:
+  kind: preproc_def
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isExported: true
+---
+id: objc-macro-function
+language: ObjectiveC
+role: item
+symbolType: macro
+rule:
+  kind: preproc_function_def
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isExported: true
+---
+id: objc-typedef
+language: ObjectiveC
+role: item
+symbolType: typeAlias
+rule:
+  kind: type_definition
+  all:
+    - has:
+        field: declarator
+        any:
+          - kind: type_identifier
+            pattern: $NAME
+          - has:
+              kind: type_identifier
+              stopBy: end
+              pattern: $NAME
+    # Body-bearing records under typedef are the record's DEFINITION — the
+    # struct/union/enum rules extract them once this rule declines.
+    - not:
+        has:
+          field: type
+          any:
+            - kind: struct_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: union_specifier
+              has:
+                field: body
+                kind: field_declaration_list
+            - kind: enum_specifier
+              has:
+                field: body
+                kind: enumerator_list
+name: '$NAME'
+isExported: true

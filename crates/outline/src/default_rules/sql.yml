@@ -25,3 +25,42 @@ rule:
         kind: object_reference
         pattern: $NAME
 name: '$NAME'
+---
+id: sql-column
+language: Sql
+role: member
+parentRuleIds: [sql-create-table]
+symbolType: field
+rule:
+  kind: column_definition
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: sql-create-type
+language: Sql
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: create_type
+    - has:
+        stopBy: end
+        kind: object_reference
+        pattern: $NAME
+name: '$NAME'
+---
+id: sql-create-trigger
+language: Sql
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: create_trigger
+    - has:
+        stopBy: end
+        kind: object_reference
+        pattern: $NAME
+name: '$NAME'

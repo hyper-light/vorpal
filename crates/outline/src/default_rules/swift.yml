@@ -131,7 +131,7 @@ isExported:
 id: swift-member-init
 language: Swift
 role: member
-parentRuleIds: [swift-class, swift-struct, swift-enum, swift-actor]
+parentRuleIds: [swift-class, swift-struct, swift-enum, swift-actor, swift-extension]
 symbolType: constructor
 rule:
   kind: init_declaration
@@ -144,7 +144,7 @@ isPublic:
 id: swift-member-function
 language: Swift
 role: member
-parentRuleIds: [swift-class, swift-struct, swift-enum, swift-actor]
+parentRuleIds: [swift-class, swift-struct, swift-enum, swift-actor, swift-extension]
 symbolType: method
 rule:
   all:
@@ -167,6 +167,163 @@ rule:
   all:
     - kind: protocol_function_declaration
     - has:
+        kind: simple_identifier
+        pattern: $NAME
+name: $NAME
+isPublic: true
+---
+id: swift-member-property
+language: Swift
+role: member
+parentRuleIds: [swift-class, swift-struct, swift-enum, swift-actor, swift-extension]
+symbolType: property
+rule:
+  all:
+    - kind: property_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: $NAME
+isPublic:
+  has:
+    kind: modifiers
+    regex: 'public|open'
+---
+id: swift-top-level-property
+language: Swift
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: property_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: $NAME
+isExported:
+  has:
+    kind: modifiers
+    regex: 'public|open'
+---
+id: swift-extension
+language: Swift
+role: item
+symbolType: class
+# Extensions are class_declaration nodes with declaration_kind `extension`
+# (the bare `extension` kind is an anonymous token — not matchable); the
+# extended type nests as user_type > type_identifier, hence the descent.
+rule:
+  all:
+    - kind: class_declaration
+    - has:
+        field: declaration_kind
+        pattern: extension
+    - has:
+        stopBy: end
+        kind: type_identifier
+        pattern: $NAME
+name: $NAME
+isExported:
+  has:
+    kind: modifiers
+    regex: 'public|open'
+---
+id: swift-typealias
+language: Swift
+role: item
+symbolType: typeAlias
+rule:
+  all:
+    - kind: typealias_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: $NAME
+isExported:
+  has:
+    kind: modifiers
+    regex: public
+---
+id: swift-macro
+language: Swift
+role: item
+symbolType: macro
+rule:
+  all:
+    - kind: macro_declaration
+    - has:
+        stopBy: end
+        kind: simple_identifier
+        pattern: $NAME
+name: $NAME
+isExported:
+  has:
+    kind: modifiers
+    regex: public
+---
+id: swift-operator
+language: Swift
+role: item
+symbolType: function
+rule:
+  all:
+    - kind: operator_declaration
+    - has:
+        stopBy: end
+        any:
+          - kind: custom_operator
+          - kind: simple_identifier
+        pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: swift-member-deinit
+language: Swift
+role: member
+parentRuleIds: [swift-class, swift-actor, swift-extension]
+symbolType: method
+rule:
+  kind: deinit_declaration
+name: deinit
+isPublic: true
+---
+id: swift-member-subscript
+language: Swift
+role: member
+parentRuleIds: [swift-class, swift-struct, swift-enum, swift-actor, swift-extension, swift-protocol]
+symbolType: property
+rule:
+  kind: subscript_declaration
+name: subscript
+isPublic:
+  has:
+    kind: modifiers
+    regex: 'public|open'
+---
+id: swift-member-associatedtype
+language: Swift
+role: member
+parentRuleIds: [swift-protocol]
+symbolType: typeParameter
+rule:
+  all:
+    - kind: associatedtype_declaration
+    - has:
+        field: name
+        pattern: $NAME
+name: $NAME
+isPublic: true
+---
+id: swift-member-protocol-property
+language: Swift
+role: member
+parentRuleIds: [swift-protocol]
+symbolType: property
+rule:
+  all:
+    - kind: protocol_property_declaration
+    - has:
+        stopBy: end
         kind: simple_identifier
         pattern: $NAME
 name: $NAME

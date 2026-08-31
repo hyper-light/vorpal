@@ -28,13 +28,183 @@ name: '$NAME'
 id: ocaml-type
 language: OCaml
 role: item
+# Fallback for abstract/nominal types — records, variants, and synonyms carry
+# their real kinds through the dedicated rules below.
 symbolType: class
 rule:
   all:
     - kind: type_definition
     - has:
         kind: type_binding
-        has:
-          field: name
-          pattern: $NAME
+        all:
+          - has:
+              field: name
+              pattern: $NAME
+          - not:
+              has:
+                field: body
+                kind: record_declaration
+          - not:
+              has:
+                field: body
+                kind: variant_declaration
+          - not:
+              has:
+                field: synonym
+                pattern: $SYN
 name: '$NAME'
+---
+id: ocaml-record
+language: OCaml
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: type_definition
+    - has:
+        kind: type_binding
+        all:
+          - has:
+              field: name
+              pattern: $NAME
+          - has:
+              field: body
+              kind: record_declaration
+name: '$NAME'
+---
+id: ocaml-variant
+language: OCaml
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: type_definition
+    - has:
+        kind: type_binding
+        all:
+          - has:
+              field: name
+              pattern: $NAME
+          - has:
+              field: body
+              kind: variant_declaration
+name: '$NAME'
+---
+id: ocaml-type-synonym
+language: OCaml
+role: item
+symbolType: typeAlias
+rule:
+  all:
+    - kind: type_definition
+    - has:
+        kind: type_binding
+        all:
+          - has:
+              field: name
+              pattern: $NAME
+          - has:
+              field: synonym
+              pattern: $SYN
+name: '$NAME'
+---
+id: ocaml-record-field
+language: OCaml
+role: member
+parentRuleIds: [ocaml-record]
+symbolType: field
+rule:
+  kind: field_declaration
+  has:
+    kind: field_name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: ocaml-variant-constructor
+language: OCaml
+role: member
+parentRuleIds: [ocaml-variant]
+symbolType: enumMember
+rule:
+  kind: constructor_declaration
+  has:
+    kind: constructor_name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: ocaml-module-type
+language: OCaml
+role: item
+symbolType: interface
+rule:
+  kind: module_type_definition
+  has:
+    kind: module_type_name
+    pattern: $NAME
+name: '$NAME'
+---
+id: ocaml-exception
+language: OCaml
+role: item
+symbolType: struct
+rule:
+  kind: exception_definition
+  has:
+    stopBy: end
+    kind: constructor_name
+    pattern: $NAME
+name: '$NAME'
+---
+id: ocaml-external
+language: OCaml
+role: item
+symbolType: function
+# The implementation grammar names the node `external` (the interface grammar
+# uses `external_declaration`).
+rule:
+  kind: external
+  has:
+    stopBy: end
+    kind: value_name
+    pattern: $NAME
+name: '$NAME'
+isExported: true
+---
+id: ocaml-class
+language: OCaml
+role: item
+symbolType: class
+rule:
+  kind: class_binding
+  has:
+    kind: class_name
+    pattern: $NAME
+name: '$NAME'
+---
+id: ocaml-method
+language: OCaml
+role: member
+parentRuleIds: [ocaml-class]
+symbolType: method
+rule:
+  kind: method_definition
+  has:
+    kind: method_name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: ocaml-instance-variable
+language: OCaml
+role: member
+parentRuleIds: [ocaml-class]
+symbolType: field
+rule:
+  kind: instance_variable_definition
+  has:
+    kind: instance_variable_name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true

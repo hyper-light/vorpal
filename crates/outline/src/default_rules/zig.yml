@@ -24,4 +24,203 @@ rule:
     - has:
         kind: identifier
         pattern: $NAME
+    # Container definitions (`const Foo = struct {…}`) extract through the
+    # dedicated rules below with their real kinds; `var` globals are variables.
+    - not:
+        has:
+          stopBy: end
+          any:
+            - kind: struct_declaration
+            - kind: enum_declaration
+            - kind: union_declaration
+            - kind: error_set_declaration
+            - kind: opaque_declaration
+    - not:
+        regex: '^\s*(pub\s+|export\s+|extern\s+("[^"]*"\s+)?|threadlocal\s+)*var\b'
 name: '$NAME'
+---
+id: zig-var
+language: Zig
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: function_declaration
+          stopBy: end
+    - has:
+        kind: identifier
+        pattern: $NAME
+    - not:
+        has:
+          stopBy: end
+          any:
+            - kind: struct_declaration
+            - kind: enum_declaration
+            - kind: union_declaration
+            - kind: error_set_declaration
+            - kind: opaque_declaration
+    - regex: '^\s*(pub\s+|export\s+|extern\s+("[^"]*"\s+)?|threadlocal\s+)*var\b'
+name: '$NAME'
+---
+id: zig-struct
+language: Zig
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: function_declaration
+          stopBy: end
+    - has:
+        kind: identifier
+        pattern: $NAME
+    - has:
+        stopBy: end
+        kind: struct_declaration
+name: '$NAME'
+---
+id: zig-enum
+language: Zig
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: function_declaration
+          stopBy: end
+    - has:
+        kind: identifier
+        pattern: $NAME
+    - has:
+        stopBy: end
+        kind: enum_declaration
+name: '$NAME'
+---
+id: zig-union
+language: Zig
+role: item
+symbolType: union
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: function_declaration
+          stopBy: end
+    - has:
+        kind: identifier
+        pattern: $NAME
+    - has:
+        stopBy: end
+        kind: union_declaration
+name: '$NAME'
+---
+id: zig-error-set
+language: Zig
+role: item
+symbolType: enum
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: function_declaration
+          stopBy: end
+    - has:
+        kind: identifier
+        pattern: $NAME
+    - has:
+        stopBy: end
+        kind: error_set_declaration
+name: '$NAME'
+---
+id: zig-opaque
+language: Zig
+role: item
+symbolType: struct
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: function_declaration
+          stopBy: end
+    - has:
+        kind: identifier
+        pattern: $NAME
+    - has:
+        stopBy: end
+        kind: opaque_declaration
+name: '$NAME'
+---
+id: zig-container-field
+language: Zig
+role: member
+parentRuleIds: [zig-struct, zig-union]
+symbolType: field
+rule:
+  kind: container_field
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: zig-enum-member
+language: Zig
+role: member
+parentRuleIds: [zig-enum]
+symbolType: enumMember
+rule:
+  kind: container_field
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: zig-error-member
+language: Zig
+role: member
+parentRuleIds: [zig-error-set]
+symbolType: enumMember
+rule:
+  kind: identifier
+  pattern: $NAME
+  inside:
+    kind: error_set_declaration
+    stopBy: end
+name: '$NAME'
+isPublic: true
+---
+id: zig-test
+language: Zig
+role: item
+symbolType: function
+rule:
+  kind: test_declaration
+  has:
+    any:
+      - kind: string
+      - kind: identifier
+    pattern: $NAME
+name: '$NAME'
+---
+id: zig-extern-function
+language: Zig
+role: item
+symbolType: function
+rule:
+  kind: function_signature
+  has:
+    field: name
+    pattern: $NAME
+name: '$NAME'
+isExported: true

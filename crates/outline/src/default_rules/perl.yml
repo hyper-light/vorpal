@@ -21,3 +21,22 @@ rule:
         kind: package_name
         pattern: $NAME
 name: '$NAME'
+---
+id: perl-variable
+language: Perl
+role: item
+symbolType: variable
+# File-scope `my`/`our` declarations; sub-local ones are excluded by the
+# block guard.
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          kind: block
+          stopBy: end
+    - has:
+        field: variable_name
+        pattern: $NAME
+name: '$NAME'
+isExported: false

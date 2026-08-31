@@ -22,3 +22,50 @@ transform:
       by: ''
 name: '$NAME'
 signature: '$SIG'
+---
+id: bash-declared-variable
+language: Bash
+role: item
+symbolType: variable
+# `declare`/`readonly`/`export`/`local`-style declarations at script scope.
+rule:
+  all:
+    - kind: declaration_command
+    - not:
+        inside:
+          kind: function_definition
+          stopBy: end
+    - has:
+        stopBy: end
+        any:
+          - kind: variable_name
+          - kind: variable_assignment
+            has:
+              field: name
+              pattern: $NAME
+        pattern: $NAME
+name: '$NAME'
+isExported: true
+---
+id: bash-variable
+language: Bash
+role: item
+symbolType: variable
+# Top-level `NAME=value` — the dominant shell variable form. Environment
+# prefixes (`FOO=1 cmd`) live inside command nodes and are excluded, as are
+# function-local assignments and declare-wrapped ones (the rule above).
+rule:
+  all:
+    - kind: variable_assignment
+    - not:
+        inside:
+          stopBy: end
+          any:
+            - kind: function_definition
+            - kind: command
+            - kind: declaration_command
+    - has:
+        field: name
+        pattern: $NAME
+name: '$NAME'
+isExported: true

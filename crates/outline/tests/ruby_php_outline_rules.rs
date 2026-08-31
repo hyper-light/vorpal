@@ -51,6 +51,7 @@ enum Mode { case Fast; case Slow; }
 function helper(int $value): int { return $value; }
 "#,
     r#"
+- Module item exported Demo
 - Module import private Vendor\Package
 - Interface item exported Service
   - Method public run

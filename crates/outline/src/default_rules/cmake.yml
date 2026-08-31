@@ -14,7 +14,7 @@ name: '$NAME'
 id: cmake-macro
 language: CMake
 role: item
-symbolType: function
+symbolType: macro
 rule:
   all:
     - kind: macro_def

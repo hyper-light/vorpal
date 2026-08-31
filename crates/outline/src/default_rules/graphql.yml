@@ -65,6 +65,57 @@ rule:
         pattern: $NAME
 name: '$NAME'
 ---
+id: graphql-schema
+language: GraphQL
+role: item
+symbolType: module
+rule:
+  kind: schema_definition
+name: schema
+---
+id: graphql-directive
+language: GraphQL
+role: item
+symbolType: function
+rule:
+  kind: directive_definition
+  has:
+    kind: name
+    pattern: $NAME
+name: '@$NAME'
+---
+id: graphql-enum-value
+language: GraphQL
+role: member
+parentRuleIds: [graphql-enum]
+symbolType: enumMember
+rule:
+  kind: enum_value_definition
+  has:
+    stopBy: end
+    kind: enum_value
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
+id: graphql-input-value
+language: GraphQL
+role: member
+parentRuleIds: [graphql-type]
+symbolType: field
+# Input-object fields only — argument definitions inside field signatures are
+# parameters, not members.
+rule:
+  kind: input_value_definition
+  inside:
+    kind: input_fields_definition
+    stopBy: end
+  has:
+    kind: name
+    pattern: $NAME
+name: '$NAME'
+isPublic: true
+---
 id: graphql-operation
 language: GraphQL
 role: item

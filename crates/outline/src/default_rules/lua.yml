@@ -22,3 +22,49 @@ transform:
       by: ''
 name: '$NAME'
 signature: '$SIG'
+---
+id: lua-local-variable
+language: Lua
+role: item
+symbolType: variable
+rule:
+  all:
+    - kind: variable_declaration
+    - not:
+        inside:
+          stopBy: end
+          any:
+            - kind: function_declaration
+            - kind: function_definition
+    - has:
+        stopBy: end
+        kind: variable_list
+        has:
+          field: name
+          pattern: $NAME
+name: '$NAME'
+isExported: false
+---
+id: lua-global-variable
+language: Lua
+role: item
+symbolType: variable
+# Top-level `x = 1` parses as a bare assignment_statement (no declaration
+# wrapper); local declarations wrap the assignment and are handled above.
+rule:
+  all:
+    - kind: assignment_statement
+    - not:
+        inside:
+          stopBy: end
+          any:
+            - kind: function_declaration
+            - kind: function_definition
+            - kind: variable_declaration
+    - has:
+        kind: variable_list
+        has:
+          field: name
+          pattern: $NAME
+name: '$NAME'
+isExported: true
