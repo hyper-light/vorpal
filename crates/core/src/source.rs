@@ -29,6 +29,14 @@ pub trait SgNode<'r>: Clone {
   fn parent(&self) -> Option<Self>;
   fn children(&self) -> impl ExactSizeIterator<Item = Self>;
   fn kind(&self) -> Cow<'_, str>;
+  /// The node's kind name with `'static` storage, where the backend can prove
+  /// it (tree-sitter kind names live in the compiled grammar). `None` falls
+  /// back to [`Self::kind`] — callers use this to avoid a per-node `String`
+  /// when detaching entries from the tree (measured: one allocation per
+  /// extracted definition, ~8.8M per kernel-scale index).
+  fn kind_static(&self) -> Option<&'static str> {
+    None
+  }
   fn kind_id(&self) -> KindId;
   fn node_id(&self) -> usize;
   fn range(&self) -> std::ops::Range<usize>;

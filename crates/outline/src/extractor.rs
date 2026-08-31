@@ -444,7 +444,12 @@ impl<L: Language> ExtractorCommon<L> {
       name: self.name.render(node_match),
       range: source_range(node),
       signature: self.render_signature(node_match),
-      ast_kind: node.kind().into_owned().into(),
+      ast_kind: match node.kind_static() {
+        // tree-sitter kinds are 'static — borrow instead of building a String
+        // per extracted definition (8.8M at kernel scale).
+        Some(kind) => Cow::Borrowed(kind),
+        None => Cow::Owned(node.kind().into_owned()),
+      },
     }
   }
 

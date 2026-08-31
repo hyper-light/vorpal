@@ -203,6 +203,11 @@ impl<'r> SgNode<'r> for Node<'r> {
   fn kind(&self) -> Cow<'_, str> {
     Cow::Borrowed(Node::kind(self))
   }
+  fn kind_static(&self) -> Option<&'static str> {
+    // tree-sitter kind names are interned in the compiled grammar — 'static
+    // by construction; the trait's Cow signature merely erases that.
+    Some(Node::kind(self))
+  }
   fn kind_id(&self) -> KindId {
     Node::kind_id(self)
   }

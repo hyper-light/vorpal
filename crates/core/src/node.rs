@@ -148,6 +148,11 @@ impl<'r, D: Doc> Node<'r, D> {
   pub fn kind(&self) -> Cow<'_, str> {
     self.inner.kind()
   }
+  /// See `SgNode::kind_static`: the kind name with `'static` storage when the
+  /// backend can prove it (tree-sitter grammars), else `None`.
+  pub fn kind_static(&self) -> Option<&'static str> {
+    self.inner.kind_static()
+  }
   pub fn kind_id(&self) -> KindId {
     self.inner.kind_id()
   }
