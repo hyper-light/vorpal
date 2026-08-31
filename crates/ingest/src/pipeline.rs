@@ -792,7 +792,42 @@ pub fn phase_trace(label: &str) {
 /// makes the footprint track the live set instead. Elsewhere this is a no-op — the peak
 /// figures we publish are honest live-set peaks, not allocator accidents.
 pub fn release_freed_pages() {
-  #[cfg(target_os = "macos")]
+  // Every call site marks the death of a large allocation profile (stream scratch, the
+  // symbol table, link transients, seal buffers) — once per run each, never per shard.
+  //
+  // Under the shipped allocator this purges jemalloc's dirty pages via
+  // `arena.<MALLCTL_ARENAS_ALL>.purge`: an explicit bulk madvise that works regardless of
+  // decay settings — which matters because batch index runs disable decay for fault
+  // economics (2.25 M soft faults → ~0.48 M), and decay-based releasing is a no-op there.
+  // The macOS `malloc_zone_pressure_relief` below addresses the SYSTEM allocator, which a
+  // jemalloc-global binary no longer routes through — it silently released nothing for
+  // years of jemalloc builds; only non-jemalloc (embedder) builds keep it.
+  #[cfg(all(
+    feature = "jemalloc",
+    not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+  ))]
+  {
+    // Action node: no old/new value. The ALL sentinel is genuinely supported for purge
+    // (`arena_i_purge` handles it explicitly — see vendor/tikv-jemalloc-sys). A refused
+    // call only means pages return later; never a correctness input.
+    let name = b"arena.4096.purge\0";
+    unsafe {
+      let _ = tikv_jemalloc_sys::mallctl(
+        name.as_ptr() as *const std::ffi::c_char,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+      );
+    }
+  }
+  #[cfg(all(
+    target_os = "macos",
+    not(all(
+      feature = "jemalloc",
+      not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+    ))
+  ))]
   {
     unsafe extern "C" {
       fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;

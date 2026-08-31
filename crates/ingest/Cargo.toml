@@ -28,6 +28,9 @@ rayon.workspace = true
 vorpal-mem.workspace = true
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
+[target.'cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))'.dependencies]
+tikv-jemalloc-sys = { version = "0.7.1", optional = true }
+
 [features]
 # Every vorpal artifact ships EVERY grammar — that is product policy, not a default to
 # slim down. These forwards exist only so the language feature graph stays composable for
@@ -38,3 +41,8 @@ napi-langs = ["vorpal-language/napi-lang", "vorpal-lang-registry/napi-langs"]
 # Contention probes for the hyper-optimization ledger (byte-budget parks,
 # full-channel stalls, interner locks via vorpal-resolve). Never a default.
 alloc-ledger = ["vorpal-kg/alloc-ledger", "vorpal-resolve/alloc-ledger"]
+# The vorpal-index binary links jemalloc as its global allocator (see that crate); with this
+# on, phase-boundary page release purges jemalloc's dirty pages (`arena.<ALL>.purge`) —
+# decay-independent, which matters because batch index runs disable decay for fault
+# economics. Embedders without it keep the macOS zone-pressure call.
+jemalloc = ["dep:tikv-jemalloc-sys"]

@@ -49,6 +49,7 @@ jemalloc = [
   "dep:tikv-jemalloc-sys",
   "dep:tikv-jemalloc-ctl",
   "vorpal-kg/alloc-stats",
+  "vorpal-ingest/jemalloc",
 ]
 # Every vorpal artifact ships EVERY grammar (product policy); these forwards keep the
 # feature graph composable for non-vorpal embedders only.
