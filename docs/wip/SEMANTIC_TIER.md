@@ -254,6 +254,21 @@ positives from typed, grade-weighted edges; fixed batch order; deterministic red
 CHECKS: byte-identity (seeded); eval must beat Stage-2 output on the target splits
 without regressing others — else recorded as measured-and-rejected in this document.
 
+> **DISPOSITION (2026-08-31): MEASURED-AND-REJECTED.** Implemented as one
+> constrained direct step in Stage-2 space (`vorpal_ann::retrofit::nudge_into`,
+> NUDGE-N adapted to L2: out = ‖x₂‖·normalize(x₂ + γ·ĝ), ĝ the grade-weighted
+> neighbor direction over the retrofit's own edge CSR; γ = scale × the retrofit's
+> median displacement, content-derived; norm-ball/norm-preservation/determinism
+> oracles in-crate). The two-corpus scale sweep (0.5/1/2, bench-internals seam)
+> failed the gate at every point: 0.5 is a no-op at eval granularity; 1 and 2
+> regress BOTH corpora (kernel all 0.298 → 0.267, short-keyword 0.206 → 0.170;
+> cpython all 0.308 → 0.261, descriptive 0.316 → 0.246; 2 saturates identical to
+> 1). Mechanism: Stage 2 already converges to the Ψ-optimum over exactly these
+> edges — NUDGE's published gains ride held-out QUERY labels, an independent
+> signal, and graph positives are not one. The algebra ships pinned off
+> (`NUDGE_STAGE = None`), a measured seam like the functional form. Table in
+> docs/wip/BENCHMARKS.md "Stage 5".
+
 **Stage 6 (owner-gated) — vendored code-specialized encoder.** Per D5.
 
 **Ready-when-licensed:** multi-phrase semantic AND becomes real per-phrase semantics at

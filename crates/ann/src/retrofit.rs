@@ -249,6 +249,271 @@ pub fn retrofit_in_ram(
 }
 
 // ---------------------------------------------------------------------------------
+// Stage 2.5 (conditional): NUDGE-style constrained direct step (Zeighami et al.
+// 2024 adapted to graph positives and an L2 row space). NUDGE's insight: optimize
+// the STORED vectors directly toward their positives, but only inside a bounded
+// region of their pre-trained positions — unconstrained direct optimization
+// degenerates. Their closed-form solution moves each vector exactly γ along its
+// aggregated positive direction (NUDGE-M), with a normalization constraint against
+// degeneracy (NUDGE-N). Here the positives are the SAME typed, grade-weighted,
+// hub-pruned edges the retrofit uses, the step happens once in Stage-2 space, and
+// the non-degeneracy constraint becomes NORM PRESERVATION: this crate's rows live
+// under exact-L2 rerank, so each row keeps its Stage-2 length and only its
+// DIRECTION moves — out = ‖x₂‖ · normalize(x₂ + γ·ĝ), a pure rotation toward the
+// weighted neighbor direction, bounded by γ before re-projection.
+// ---------------------------------------------------------------------------------
+
+/// What one nudge pass did, for provenance and phase stamps.
+pub struct NudgeReport {
+  /// Rows that actually moved (had edges and a nonzero aggregated direction).
+  pub moved: usize,
+  /// The ball radius applied (pre-projection step length for every moved row).
+  pub gamma: f64,
+}
+
+/// The median L2 displacement the retrofit itself produced, over rows it MOVED
+/// (displacement > 0; edgeless rows sit exactly at their anchors and carry no
+/// scale information). This is the content-derived scale for the nudge ball
+/// radius — "a step comparable to what the retrofit already did" — so γ needs no
+/// hand-picked magnitude. Zero when the retrofit moved nothing (callers skip the
+/// stage and say so). Deterministic: per-row f64 sums in component order, one
+/// ascending sort by total order.
+pub fn median_displacement(anchors: &[f32], x: &[f32], dim: usize) -> Result<f64, String> {
+  if dim == 0 {
+    return Err("median displacement: zero dimension".to_string());
+  }
+  if anchors.len() % dim != 0 || x.len() != anchors.len() {
+    return Err("median displacement: matrices must be row-shaped and equal-sized".to_string());
+  }
+  use rayon::prelude::*;
+  let mut moved: Vec<f64> = anchors
+    .par_chunks(dim)
+    .zip(x.par_chunks(dim))
+    .map(|(anchor, row)| {
+      let mut total = 0.0f64;
+      for (a, b) in anchor.iter().zip(row) {
+        let diff = *a as f64 - *b as f64;
+        total += diff * diff;
+      }
+      total.sqrt()
+    })
+    .filter(|displacement| *displacement > 0.0)
+    .collect();
+  if moved.is_empty() {
+    return Ok(0.0);
+  }
+  moved.sort_unstable_by(|a, b| a.total_cmp(b));
+  Ok(moved[moved.len() / 2])
+}
+
+/// One constrained direct step over the whole matrix: for each row with edges,
+/// aggregate the weighted neighbor direction g (f64, slot order), take the bounded
+/// step x₂ + γ·ĝ, and re-project to the row's OWN Stage-2 norm. Rows without edges,
+/// with a zero aggregated direction, or with zero norm copy through untouched — the
+/// nudge may move a row's direction, never invent one. Rows are write-disjoint and
+/// read only `x2`, so parallelism cannot change a bit.
+pub fn nudge_into(
+  x2: &[f32],
+  out: &mut [f32],
+  dim: usize,
+  edges: &RetroEdges,
+  gamma: f64,
+) -> Result<NudgeReport, String> {
+  if dim == 0 {
+    return Err("nudge: zero dimension".to_string());
+  }
+  if x2.len() % dim != 0 || out.len() != x2.len() {
+    return Err("nudge: working buffers must be row-shaped and equal-sized".to_string());
+  }
+  if !gamma.is_finite() || gamma < 0.0 {
+    return Err(format!("nudge: ball radius must be finite and non-negative, got {gamma}"));
+  }
+  let n = x2.len() / dim;
+  edges.validate(n)?;
+  if x2.iter().any(|v| !v.is_finite()) {
+    return Err("nudge: non-finite input row".to_string());
+  }
+  use rayon::prelude::*;
+  let moved = std::sync::atomic::AtomicUsize::new(0);
+  out
+    .par_chunks_mut(dim)
+    .enumerate()
+    .for_each(|(i, row_out)| {
+      let row = &x2[i * dim..(i + 1) * dim];
+      let (start, end) = (edges.offsets[i] as usize, edges.offsets[i + 1] as usize);
+      if start == end || gamma == 0.0 {
+        row_out.copy_from_slice(row);
+        return;
+      }
+      let mut norm2 = 0.0f64;
+      for value in row {
+        norm2 += *value as f64 * *value as f64;
+      }
+      let radius = norm2.sqrt();
+      if radius == 0.0 {
+        // A zero-signal row stays zero — the retrofit's own anchoring law.
+        row_out.copy_from_slice(row);
+        return;
+      }
+      // Aggregated positive direction, slot order (deterministic).
+      let mut direction = vec![0.0f64; dim];
+      for slot in start..end {
+        let neighbor = edges.targets[slot] as usize;
+        let weight = edges.weights[slot] as f64;
+        let other = &x2[neighbor * dim..(neighbor + 1) * dim];
+        for (component, value) in direction.iter_mut().zip(other) {
+          *component += weight * *value as f64;
+        }
+      }
+      let mut direction_norm2 = 0.0f64;
+      for component in &direction {
+        direction_norm2 += component * component;
+      }
+      let direction_norm = direction_norm2.sqrt();
+      if direction_norm == 0.0 {
+        row_out.copy_from_slice(row);
+        return;
+      }
+      // Bounded step, then re-projection to the row's own Stage-2 norm.
+      let mut candidate = vec![0.0f64; dim];
+      let step = gamma / direction_norm;
+      for ((slot, value), component) in candidate.iter_mut().zip(row).zip(&direction) {
+        *slot = *value as f64 + step * component;
+      }
+      let mut candidate_norm2 = 0.0f64;
+      for slot in &candidate {
+        candidate_norm2 += slot * slot;
+      }
+      let candidate_norm = candidate_norm2.sqrt();
+      if candidate_norm == 0.0 {
+        row_out.copy_from_slice(row);
+        return;
+      }
+      let rescale = radius / candidate_norm;
+      for (slot_out, slot) in row_out.iter_mut().zip(&candidate) {
+        *slot_out = (slot * rescale) as f32;
+      }
+      moved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+  Ok(NudgeReport {
+    moved: moved.into_inner(),
+    gamma,
+  })
+}
+
+#[cfg(test)]
+mod nudge_tests {
+  use super::*;
+
+  fn unit(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+    v.iter().map(|x| (*x as f64 / norm) as f32).collect()
+  }
+
+  fn two_row_edges() -> RetroEdges {
+    RetroEdges {
+      offsets: vec![0, 1, 2, 2],
+      targets: vec![1, 0],
+      weights: vec![1.0, 1.0],
+    }
+  }
+
+  fn norm_of(row: &[f32]) -> f64 {
+    row.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt()
+  }
+
+  #[test]
+  fn gamma_zero_and_edgeless_rows_are_bitwise_identity() {
+    let dim = 3;
+    let mut x2 = unit(&[1.0, 0.2, 0.0]);
+    x2.extend(unit(&[0.0, 1.0, 0.3]));
+    x2.extend(unit(&[0.5, 0.5, 0.5]));
+    let edges = two_row_edges();
+    let mut out = vec![0.0f32; x2.len()];
+    let report = nudge_into(&x2, &mut out, dim, &edges, 0.0).unwrap();
+    assert_eq!(report.moved, 0);
+    assert_eq!(out, x2, "γ=0 must be the identity, bit for bit");
+    let report = nudge_into(&x2, &mut out, dim, &edges, 0.1).unwrap();
+    assert_eq!(report.moved, 2);
+    assert_eq!(&out[2 * dim..], &x2[2 * dim..], "edgeless row must copy through untouched");
+    assert_ne!(&out[..dim], &x2[..dim], "an edged row must move");
+  }
+
+  #[test]
+  fn nudge_preserves_each_rows_norm_and_respects_the_ball() {
+    let dim = 4;
+    let mut x2 = unit(&[1.0, 0.1, 0.0, 0.0]);
+    x2.extend(unit(&[0.0, 1.0, 0.2, 0.0]));
+    // A deliberately sub-unit row (retrofit output norms are ≤ 1): scaled by 0.6.
+    let sub: Vec<f32> = unit(&[0.3, 0.0, 1.0, 0.4]).iter().map(|v| v * 0.6).collect();
+    x2.extend(sub);
+    let edges = RetroEdges {
+      offsets: vec![0, 2, 3, 4],
+      targets: vec![1, 2, 0, 1],
+      weights: vec![0.7, 0.3, 1.0, 0.5],
+    };
+    let gamma = 0.05;
+    let mut out = vec![0.0f32; x2.len()];
+    let report = nudge_into(&x2, &mut out, dim, &edges, gamma).unwrap();
+    assert_eq!(report.moved, 3);
+    for i in 0..3 {
+      let before = &x2[i * dim..(i + 1) * dim];
+      let after = &out[i * dim..(i + 1) * dim];
+      let (nb, na) = (norm_of(before), norm_of(after));
+      assert!((nb - na).abs() < 1e-6 * nb.max(1.0), "row {i}: norm {nb} → {na} must be preserved");
+      // Pre-projection step is exactly γ; projection back to the sphere of radius
+      // ‖x₂‖ at most doubles it for γ < ‖x₂‖ — the loose ball bound.
+      let mut dist2 = 0.0f64;
+      for (a, b) in before.iter().zip(after) {
+        dist2 += (*a as f64 - *b as f64).powi(2);
+      }
+      assert!(dist2.sqrt() <= 2.0 * gamma + 1e-6, "row {i} left the ball: {}", dist2.sqrt());
+    }
+  }
+
+  #[test]
+  fn nudge_is_deterministic_across_runs() {
+    let dim = 8;
+    let mut x2 = Vec::new();
+    for row in 0..64 {
+      let mut base = vec![0.0f32; dim];
+      for (component, slot) in base.iter_mut().enumerate() {
+        *slot = ((row * 31 + component * 7) % 13) as f32 - 6.0;
+      }
+      x2.extend(unit(&base));
+    }
+    let mut offsets = vec![0u64];
+    let mut targets = Vec::new();
+    let mut weights = Vec::new();
+    for row in 0..64u32 {
+      targets.push((row + 1) % 64);
+      weights.push(0.5 + (row % 3) as f32 * 0.25);
+      targets.push((row + 7) % 64);
+      weights.push(0.25);
+      offsets.push(targets.len() as u64);
+    }
+    let edges = RetroEdges { offsets, targets, weights };
+    let mut first = vec![0.0f32; x2.len()];
+    let mut second = vec![0.0f32; x2.len()];
+    nudge_into(&x2, &mut first, dim, &edges, 0.07).unwrap();
+    nudge_into(&x2, &mut second, dim, &edges, 0.07).unwrap();
+    assert_eq!(first, second, "nudge must be bitwise reproducible");
+  }
+
+  #[test]
+  fn median_displacement_is_the_middle_moved_row() {
+    let dim = 2;
+    let anchors = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 0.0];
+    // Displacements: 0 (unmoved), 0.5, 1.0, 2.0 → moved = [0.5, 1.0, 2.0], median 1.0.
+    let x = vec![1.0f32, 0.0, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0];
+    let median = median_displacement(&anchors, &x, dim).unwrap();
+    assert!((median - 1.0).abs() < 1e-12, "median {median}");
+    let untouched = median_displacement(&anchors, &anchors, dim).unwrap();
+    assert_eq!(untouched, 0.0, "no moved rows → zero scale");
+  }
+}
+
+// ---------------------------------------------------------------------------------
 // The plan's SECOND penalty form: per-relation linear maps (functional retrofitting,
 // Lengerich et al. 2018), restricted to DIAGONAL A_r. Dense d×d maps cost d² per
 // edge per pass — ~5.5×10¹¹ flops at kernel scale, two orders past the stage budget

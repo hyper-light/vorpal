@@ -772,6 +772,37 @@ heal pattern is the designed substrate for a retrofit-quality auto-disable
 (retrofitted vs unretrofitted rows); unimplemented — it needs a second ANN build per
 warm, a cost question deferred with the design.
 
+## Stage 5 (NUDGE-style constrained step): measured-and-rejected
+
+Implemented in full and swept, per the plan's conditional license: one constrained
+direct step after the Stage-2 solve — per row, out = ‖x₂‖ · normalize(x₂ + γ·ĝ)
+with ĝ the grade-weighted neighbor direction over the retrofit's OWN edge CSR
+(NUDGE-N's bounded step + non-degeneracy constraint, adapted to this crate's exact-L2
+row space as norm preservation), γ = scale × the retrofit's median displacement
+(content-derived — kernel median 0.0882, all 2.35M edged rows moved). Norm-ball,
+norm-preservation, γ=0-identity, edgeless-copy, and bitwise-determinism oracles ship
+in `vorpal_ann::retrofit`. Sweep (bench-internals `VORPAL_NUDGE_SCALE` seam,
+full retrain per point, `xtask searcheval`, NDCG@10 / MRR / recall@5):
+
+| scale (γ) | kernel short-kw | kernel all | cpython descriptive | cpython all |
+|---|---|---|---|---|
+| Stage-2 baseline | **0.206** / 0.298 / 0.095 | **0.298** / 0.386 / 0.208 | **0.316** / 0.229 / 0.500 | **0.308** / 0.319 / 0.417 |
+| 0.5 (0.0441) | 0.206 / 0.299 / 0.095 | 0.298 / 0.386 / 0.208 | 0.316 / 0.229 / 0.500 | 0.308 / 0.319 / 0.417 |
+| 1 (0.0882) | 0.170 / 0.227 / 0.095 | 0.267 / 0.324 / 0.208 | 0.246 / 0.188 / 0.500 | 0.261 / 0.292 / 0.417 |
+| 2 (0.1764) | 0.170 / 0.227 / 0.095 | 0.267 / 0.324 / 0.208 | 0.246 / 0.188 / 0.500 | 0.261 / 0.292 / 0.417 |
+
+The gate ("beats Stage 2 on the target splits, regresses nothing") fails at every
+scale: 0.5 is a no-op at eval granularity (one MRR digit +0.001), 1 regresses BOTH
+corpora on BOTH target splits, and 2 saturates to the same ranks as 1. The mechanism
+is the honest headline: the Stage-2 retrofit CONVERGES (Ψ-descent to the ε₃₂ floor)
+over exactly these grade-weighted edges, so the weighted-neighbor direction carries
+no signal the optimum has not already priced in — a further step toward it is a step
+off the optimum. NUDGE's published wins come from held-out QUERY-relevance labels,
+an independent signal that graph positives are not. Rejected and pinned off
+(`NUDGE_STAGE = None`); the algebra + oracles ship as a measured seam (the
+functional-form precedent) for any future INDEPENDENT positive source (e.g. labeled
+or interaction data).
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

@@ -1336,7 +1336,7 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -
       // retrains old tiers. A record of "none" WITH a stated disable is a valid
       // outcome under any form (a rebuild under the same pressure would produce it
       // again — the fallback-note law, so a persistent disable never rebuild-loops).
-      let retrofit_ok = record.retrofit == RETROFIT_FORM.label()
+      let retrofit_ok = record.retrofit == active_retrofit_label()
         || (record.retrofit == "none"
           && record
             .note
@@ -1495,9 +1495,9 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
     (a, b) => a.or(b),
   };
   let retrofit_label = if retrofitted.is_some() {
-    RETROFIT_FORM.label()
+    active_retrofit_label()
   } else {
-    "none"
+    "none".to_string()
   };
   build_ann(&kg, index_dir, current, &embedder, retrofitted.as_ref())
     .map_err(|err| err as Box<dyn Error>)?;
@@ -1535,7 +1535,7 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
     &embedder.provenance(),
     embedder.tier_label(),
     weights_hash,
-    retrofit_label,
+    &retrofit_label,
     // The BM25 verdict gates AFTER the stamp commits (the gate probes a fully
     // servable generation); `None` = not yet gated — filled below, healed on
     // later warms if a crash lands between.
@@ -1909,6 +1909,42 @@ impl RetrofitForm {
 /// implementation ships measured, not speculative.
 const RETROFIT_FORM: RetrofitForm = RetrofitForm::Identity;
 
+/// Stage 2.5 (conditional, semantic-tier Stage 5): NUDGE-style constrained direct
+/// step after the retrofit — ball radius = this scale × the retrofit's own median
+/// displacement (content-derived; see `vorpal_ann::retrofit::nudge_into`).
+///
+/// MEASURED-AND-REJECTED (2026-08-31, scale sweep 0.5/1/2 at kernel + cpython,
+/// recorded in BENCHMARKS "Stage 5"): 0.5 changed nothing at eval granularity;
+/// 1 and 2 regressed BOTH corpora (kernel all 0.298 → 0.267, cpython 0.308 →
+/// 0.261). Mechanism: the retrofit already CONVERGES to the Ψ-optimum over these
+/// same grade-weighted edges — NUDGE's gains come from held-out query labels, an
+/// independent signal; graph positives are the signal Stage 2 already absorbed,
+/// so the extra step can only leave the optimum. The stage ships pinned off as a
+/// measured seam (the functional-form precedent), not dead design.
+const NUDGE_STAGE: Option<f64> = None;
+
+/// The ACTIVE nudge scale: the pinned const, overridable only in measurement builds
+/// (`bench-internals`) via `VORPAL_NUDGE_SCALE` — the same sweep seam as the BM25
+/// gate's probe count; production binaries carry no knob.
+fn active_nudge_scale() -> Option<f64> {
+  #[cfg(feature = "bench-internals")]
+  if let Ok(value) = std::env::var("VORPAL_NUDGE_SCALE") {
+    return value.parse().ok().filter(|scale: &f64| *scale > 0.0);
+  }
+  NUDGE_STAGE
+}
+
+/// The retrofit-form label the ACTIVE configuration produces — what the tier record
+/// carries and the freshness gate compares. With the nudge enabled the label carries
+/// the stage and its scale, so flipping it (a code change) retrains old tiers
+/// instead of ever serving mixed row semantics.
+fn active_retrofit_label() -> String {
+  match active_nudge_scale() {
+    Some(scale) => format!("{}+nudge@{scale}", RETROFIT_FORM.label()),
+    None => RETROFIT_FORM.label().to_string(),
+  }
+}
+
 /// Learned-tier Stage 2: refine the Tier-1 rows over the graph before the tier
 /// builds. Any problem is a typed reason for the AUTO-DISABLE seam — the caller
 /// states it in provenance and builds unrefined; a retrofit issue may never fail a
@@ -2006,6 +2042,40 @@ fn retrofit_learned_rows(
     report.final_psi,
     edges.targets.len()
   ));
+  // Stage 2.5 (conditional): one NUDGE step in Stage-2 space — γ scaled by the
+  // retrofit's own median displacement, refined → spare, then adopted back. A zero
+  // median (retrofit moved nothing) skips the stage and says so.
+  if let Some(scale) = active_nudge_scale() {
+    let (median, gamma, moved) = {
+      let anchor_rows: &[f32] = bytemuck::try_cast_slice(anchors.as_bytes())
+        .map_err(|e| format!("scratch alignment: {e}"))?;
+      let x2: &[f32] = bytemuck::try_cast_slice(refined.as_bytes())
+        .map_err(|e| format!("scratch alignment: {e}"))?;
+      let median = vorpal_ann::retrofit::median_displacement(anchor_rows, x2, dim)?;
+      if median > 0.0 {
+        let gamma = scale * median;
+        let out: &mut [f32] = bytemuck::try_cast_slice_mut(spare.as_mut_bytes())
+          .map_err(|e| format!("scratch alignment: {e}"))?;
+        let nudge_edges = vorpal_ann::retrofit::RetroEdges {
+          offsets: edges.offsets.clone(),
+          targets: edges.targets.clone(),
+          weights: edges.weights.clone(),
+        };
+        let nudge = vorpal_ann::retrofit::nudge_into(x2, out, dim, &nudge_edges, gamma)?;
+        (median, gamma, nudge.moved)
+      } else {
+        (0.0, 0.0, 0)
+      }
+    };
+    if median > 0.0 {
+      refined.as_mut_bytes().copy_from_slice(spare.as_bytes());
+      vorpal_kg::phase_stamp(&format!(
+        "retrofit: nudge@{scale} γ={gamma:.6e} moved {moved} rows (median displacement {median:.6e})"
+      ));
+    } else {
+      vorpal_kg::phase_stamp("retrofit: nudge skipped (zero median displacement)");
+    }
+  }
   Ok(RetrofittedRows {
     anchors,
     refined,
