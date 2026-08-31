@@ -18,6 +18,7 @@ mod embed;
 mod index;
 mod kernels;
 pub mod learned;
+pub mod retrofit;
 mod qmatrix;
 mod quant;
 mod scan;

@@ -552,6 +552,53 @@ the mapped open removes the per-open allocation of the full table set (467 MB of
 plus term/frequency hash maps) — the daemon-fleet and one-shot CLI cost the plan
 flagged.
 
+## Relation-aware retrofit (semantic-tier Stage 2, identity form)
+
+The learned tier's rows refine over the knowledge graph before the tier builds:
+Faruqui et al. 2015's convex objective verbatim (α = 1, cited), solved by JACOBI
+sweeps (rows read only X_t — thread-count invariance is structural) with descent
+PROVEN for our symmetric weights (2D−A = 2(I+Deg+W), a signless-Laplacian form, so a
+measured Ψ increase is a typed defect, and the auto-disable seam states it in
+provenance). Termination is ΔΨ ≤ Ψ₀·ε₃₂ — sweep count is an output. Every edge
+weight is structural or learned from the corpus: grade gate (structural confidence-0
+edges + grades ≥ Constrained; Heuristic/Unresolved are the measured-harmful noise),
+√(2m) hub hold-out (the communities null-model scale), relation weight = mean anchor
+cosine per base edge type clamped at 0, the resolver's own confidence/100, and
+symmetric 1/√(dᵢ·dⱼ) normalization (normalized-Laplacian form — symmetry is what the
+descent proof requires; the paper's 1/deg(i) is a Gauss–Seidel prescription). The
+three n×dim working regions live on `ScratchMmap` files in `<gen>/retrofit.scratch/`
+(statvfs precheck → typed insufficient-space error; swept on entry, deleted on
+success), so anonymous RSS stays bounded.
+
+2026-08-31, phase-stamped (`VORPAL_PHASE_TRACE=1 vorpal-index __warm-ann <idx>`):
+
+| corpus | edges kept | sweeps | Ψ descent | retrofit wall | peak resident |
+|---|---:|---:|---:|---:|---:|
+| linux (2.35M rows) | 8,889,742 | 7 | 2.654e5 → 1.618e5 (−39%) | **5.2 s** (budget ≤10 s) | 600 MB (gate <1 GB) |
+| cpython | 766,600 | 6 | 1.636e4 → 1.119e4 (−32%) | 0.7 s | 96 MB |
+
+Retrieval A/B against the plain learned tier (same day, same corpora commits;
+`xtask searcheval`, NDCG@10 / MRR / recall@5):
+
+| set · class | learned | learned + retrofit |
+|---|---|---|
+| linux · short-keyword (protected) | 0.170 / 0.227 / 0.095 | **0.206 / 0.298 / 0.095** |
+| linux · descriptive | 0.947 / 1.000 / 1.000 | 0.947 / 1.000 / 1.000 |
+| linux · **all** | 0.267 / 0.324 / 0.208 | **0.298 / 0.386 / 0.208** |
+| cpython · short-keyword (protected) | 0.293 / 0.500 / 0.250 | 0.293 / 0.500 / 0.250 |
+| cpython · descriptive | 0.333 / 0.250 / 0.500 | 0.316 / 0.229 / 0.500 |
+| cpython · **all** | 0.320 / 0.333 / 0.417 | 0.308 / 0.319 / 0.417 |
+
+The plan's regression rule (short-keyword / exact-name may not degrade, else the
+retrofit disables itself for that corpus): NO corpus trips it — the kernel's
+protected class IMPROVES (+21% NDCG, +31% MRR; retrofitted-learned now +43% NDCG over
+the lexical baseline overall) and cpython's is bit-for-bit unchanged. cpython pays a
+small descriptive NDCG dip (0.333 → 0.316 over 4 queries, recall@5 held) — recorded,
+unprotected, and the class remains ~7.5× the lexical floor (0.042). Query latency
+unchanged (4.09 ms / 2.91 ms mean at k=25). Total kernel learned warm with retrofit:
+84.0 s (78.4 s without). Double-warm byte-identity holds with retrofit in the loop
+(fixture-pinned in `learned_tier.rs`; kernel run recorded alongside this table).
+
 **Freshness law hardened by an incident**: the v3 layout initially landed WITHOUT its
 version bump, so v2-layout files passed the cheap prefix gate (magic+version) yet
 misparsed past the header — warms no-op'd "fresh" while queries fell back to lexical.

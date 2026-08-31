@@ -931,6 +931,9 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
     ] {
       let _ = fs::remove_file(root.join(scratch));
     }
+    for scratch_dir in ["train.scratch", "retrofit.scratch"] {
+      let _ = fs::remove_dir_all(root.join(scratch_dir));
+    }
   }
   Ok(id)
 }
@@ -1390,7 +1393,30 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
       ),
     },
   };
-  build_ann(&kg, index_dir, current, &embedder).map_err(|err| err as Box<dyn Error>)?;
+  // Stage 2: relation-aware retrofit of the learned rows over the graph's typed,
+  // grade-passed, hub-pruned edges — learned tier only. ANY problem states itself in
+  // the provenance note and the build proceeds unrefined (the auto-disable law).
+  let (retrofitted, retrofit_note) = match &embedder {
+    ActiveEmbedder::Learned(_) => match retrofit_learned_rows(&kg, index_dir, &embedder) {
+      Ok(rows) => (Some(rows), None),
+      Err(reason) => (None, Some(format!("retrofit disabled: {reason}"))),
+    },
+    ActiveEmbedder::Lexical(_) => (None, None),
+  };
+  let note = match (note, retrofit_note) {
+    (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+    (a, b) => a.or(b),
+  };
+  build_ann(&kg, index_dir, current, &embedder, retrofitted.as_ref())
+    .map_err(|err| err as Box<dyn Error>)?;
+  if let Some(rows) = retrofitted {
+    // The tier has consumed the refined rows; scratch is done (crash residue is
+    // swept at the next retrofit entry).
+    rows
+      .delete()
+      .map_err(|e| format!("removing retrofit scratch: {e}"))?;
+    let _ = fs::remove_dir_all(index_dir.join("retrofit.scratch"));
+  }
   // Commit order: ann.bin → ann.files (both inside build_ann) → ann.model.bin →
   // ann.model.json → ann.stamp. The stamp is the commit point (a committed tier always
   // has a readable record); a crash anywhere earlier leaves a mismatch that routes
@@ -1516,11 +1542,320 @@ fn ensure_communities(kg: &Kg, index_dir: &Path, current: u64) -> Result<(), Box
   Ok(())
 }
 
+/// The Stage-2 retrofit working set: three scratch-backed n×dim f32 regions (anchors
+/// Q, the X double-buffer) in `<gen>/retrofit.scratch/` — the OS pager carries the
+/// multi-GB matrices, anonymous RSS stays bounded. Held open until `build_ann` has
+/// consumed the refined rows; deleted on success (a crash leaves only dead scratch,
+/// swept at the next retrofit's entry).
+struct RetrofittedRows {
+  anchors: vorpal_mem::ScratchMmap,
+  refined: vorpal_mem::ScratchMmap,
+  spare: vorpal_mem::ScratchMmap,
+  dim: usize,
+}
+
+impl RetrofittedRows {
+  /// Row `i` of the refined matrix. An empty slice is unreachable by construction
+  /// (page-aligned mapping, sized at creation); the fill treats it as a zero row
+  /// rather than ever panicking.
+  fn row(&self, i: usize) -> &[f32] {
+    bytemuck::try_cast_slice(self.refined.as_bytes())
+      .ok()
+      .and_then(|rows: &[f32]| rows.get(i * self.dim..(i + 1) * self.dim))
+      .unwrap_or(&[])
+  }
+
+  fn delete(self) -> std::io::Result<()> {
+    self.anchors.delete()?;
+    self.refined.delete()?;
+    self.spare.delete()
+  }
+}
+
+/// Assemble the retrofit adjacency over the semantic ROW space from the graph's
+/// typed, confidence-graded edges — everything edge-specific folds into the weights
+/// here, so the solver (`vorpal_ann::retrofit`) stays pure algebra with no graph
+/// dependency. Every inclusion rule is structural or learned from this corpus:
+///
+/// - both endpoints must own semantic rows AND carry signal (unit anchors; a
+///   zero-signal row must stay anchored, never invent a vector from neighbors);
+/// - resolution grade: structural edges (confidence 0 — containment, certain by
+///   construction) and grades ≥ Constrained pass; Heuristic/Unresolved are exactly
+///   the noisy edges the retrofitting literature measures as harmful;
+/// - hubs: rows whose included degree exceeds √(2m) hold out entirely — the same
+///   null-model hub scale the communities builder derives (crates/kg/src/communities.rs);
+/// - relation weight: LEARNED — the mean anchor cosine over each base edge type's
+///   included directed edges, clamped at 0 (anchors are unit-or-zero, so cosine =
+///   dot; a relation whose endpoints do not agree in the trained space contributes
+///   nothing);
+/// - grade factor: the resolver's own scale (confidence/100; structural = 1);
+/// - degree normalization: SYMMETRIC 1/√(dᵢ·dⱼ) over final degrees — the normalized
+///   graph-Laplacian form. Symmetry is load-bearing: the solver's Jacobi-descent
+///   proof needs a symmetric weight matrix (Faruqui's 1/deg(i) is a Gauss–Seidel
+///   prescription).
+fn build_retro_edges(
+  kg: &Kg,
+  ids: &[u64],
+  anchors: &[f32],
+  dim: usize,
+) -> Result<vorpal_ann::retrofit::RetroEdges, String> {
+  use rayon::prelude::*;
+  let n = ids.len();
+  let graph = kg.graph();
+  let mut row_of = vec![u32::MAX; kg.node_count()];
+  for (row, &id) in ids.iter().enumerate() {
+    row_of[id as usize] = row as u32;
+  }
+  let graded = |raw: u16| -> Option<f32> {
+    let edge = vorpal_kg::EdgeType(raw);
+    let confidence = edge.confidence();
+    if confidence == 0 {
+      return Some(1.0); // structural: certain by construction
+    }
+    let grade =
+      vorpal_ingest::ResolutionGrade::from_confidence(vorpal_ingest::Confidence(confidence));
+    (grade >= vorpal_ingest::ResolutionGrade::Constrained).then_some(confidence as f32 / 100.0)
+  };
+  let live: Vec<bool> = anchors
+    .par_chunks(dim)
+    .map(|row| row.iter().any(|v| *v != 0.0))
+    .collect();
+  // Enumerate row `i`'s included edges: both directions of every directed edge, each
+  // undirected edge seen exactly once per endpoint (out view + in view), so degrees
+  // and CSR slices are entirely ROW-LOCAL — no cross-row writes, determinism by
+  // construction. `out_view` marks the out direction so per-type stats count each
+  // DIRECTED edge exactly once.
+  let each_included = |row: usize, f: &mut dyn FnMut(u32, u8, f32, bool)| {
+    if !live[row] {
+      return;
+    }
+    let node = ids[row] as u32;
+    for (slot, &target) in graph.out_targets(node).iter().enumerate() {
+      let neighbor = row_of[target as usize];
+      if neighbor == u32::MAX || !live[neighbor as usize] {
+        continue;
+      }
+      let raw = graph.out_edge_types(node)[slot];
+      if let Some(grade) = graded(raw) {
+        f(neighbor, vorpal_kg::EdgeType(raw).base().0 as u8, grade, true);
+      }
+    }
+    for (slot, &source) in graph.in_targets(node).iter().enumerate() {
+      let neighbor = row_of[source as usize];
+      if neighbor == u32::MAX || !live[neighbor as usize] {
+        continue;
+      }
+      let raw = graph.in_edge_types(node)[slot];
+      if let Some(grade) = graded(raw) {
+        f(neighbor, vorpal_kg::EdgeType(raw).base().0 as u8, grade, false);
+      }
+    }
+  };
+
+  // Pass 1 — preliminary degrees + per-base-type anchor-cosine sums, in fixed
+  // 4096-row chunks folded in chunk order (the crate-standard deterministic shape).
+  const CHUNK_ROWS: usize = 4096;
+  let chunk_count = n.div_ceil(CHUNK_ROWS).max(1);
+  let partials: Vec<(Vec<u32>, [f64; 256], [u64; 256])> = (0..chunk_count)
+    .into_par_iter()
+    .map(|chunk| {
+      let start = chunk * CHUNK_ROWS;
+      let end = ((chunk + 1) * CHUNK_ROWS).min(n);
+      let mut degrees = vec![0u32; end.saturating_sub(start)];
+      let mut dots = [0.0f64; 256];
+      let mut counts = [0u64; 256];
+      for row in start..end {
+        let own = &anchors[row * dim..(row + 1) * dim];
+        each_included(row, &mut |neighbor, base, _grade, out_view| {
+          degrees[row - start] += 1;
+          if out_view {
+            let other = &anchors[neighbor as usize * dim..(neighbor as usize + 1) * dim];
+            let mut dot = 0.0f64;
+            for (a, b) in own.iter().zip(other) {
+              dot += *a as f64 * *b as f64;
+            }
+            dots[base as usize] += dot;
+            counts[base as usize] += 1;
+          }
+        });
+      }
+      (degrees, dots, counts)
+    })
+    .collect();
+  let mut degree = Vec::with_capacity(n);
+  let mut type_dot = [0.0f64; 256];
+  let mut type_count = [0u64; 256];
+  for (chunk_degrees, dots, counts) in &partials {
+    degree.extend_from_slice(chunk_degrees);
+    for slot in 0..256 {
+      type_dot[slot] += dots[slot];
+      type_count[slot] += counts[slot];
+    }
+  }
+  // √(2m): each undirected edge contributed one degree per endpoint above.
+  let two_m: u64 = degree.iter().map(|&d| d as u64).sum();
+  if two_m == 0 {
+    return Ok(vorpal_ann::retrofit::RetroEdges::empty(n));
+  }
+  let hub_threshold = two_m.isqrt();
+  let hub: Vec<bool> = degree.iter().map(|&d| d as u64 > hub_threshold).collect();
+  let mut type_weight = [0.0f32; 256];
+  for slot in 0..256 {
+    if type_count[slot] > 0 {
+      type_weight[slot] = (type_dot[slot] / type_count[slot] as f64).max(0.0) as f32;
+    }
+  }
+
+  // Pass 2 — final degrees under the full rule set (hub endpoints and zero-weight
+  // relations drop), same deterministic chunk shape.
+  let final_partials: Vec<Vec<u32>> = (0..chunk_count)
+    .into_par_iter()
+    .map(|chunk| {
+      let start = chunk * CHUNK_ROWS;
+      let end = ((chunk + 1) * CHUNK_ROWS).min(n);
+      let mut degrees = vec![0u32; end.saturating_sub(start)];
+      for row in start..end {
+        if hub[row] {
+          continue;
+        }
+        each_included(row, &mut |neighbor, base, _grade, _| {
+          if !hub[neighbor as usize] && type_weight[base as usize] > 0.0 {
+            degrees[row - start] += 1;
+          }
+        });
+      }
+      degrees
+    })
+    .collect();
+  let mut final_degree = Vec::with_capacity(n);
+  for chunk_degrees in &final_partials {
+    final_degree.extend_from_slice(chunk_degrees);
+  }
+
+  let mut offsets = Vec::with_capacity(n + 1);
+  let mut total = 0u64;
+  offsets.push(0);
+  for &d in &final_degree {
+    total += d as u64;
+    offsets.push(total);
+  }
+  let mut targets = Vec::with_capacity(total as usize);
+  let mut weights = Vec::with_capacity(total as usize);
+  // Fill — serial (row-local slices are irregular; one linear pass over the edges is
+  // a small fraction of the sweeps that follow).
+  for row in 0..n {
+    if hub[row] {
+      continue;
+    }
+    let own_degree = final_degree[row] as f64;
+    each_included(row, &mut |neighbor, base, grade, _| {
+      let relation = type_weight[base as usize];
+      if hub[neighbor as usize] || relation <= 0.0 {
+        return;
+      }
+      let neighbor_degree = final_degree[neighbor as usize] as f64;
+      targets.push(neighbor);
+      weights.push(relation * grade / ((own_degree * neighbor_degree).sqrt() as f32));
+    });
+  }
+  Ok(vorpal_ann::retrofit::RetroEdges {
+    offsets,
+    targets,
+    weights,
+  })
+}
+
+/// Learned-tier Stage 2: refine the Tier-1 rows over the graph before the tier
+/// builds. Any problem is a typed reason for the AUTO-DISABLE seam — the caller
+/// states it in provenance and builds unrefined; a retrofit issue may never fail a
+/// build or bend a result silently.
+fn retrofit_learned_rows(
+  kg: &Kg,
+  index_dir: &Path,
+  embedder: &ActiveEmbedder,
+) -> Result<RetrofittedRows, String> {
+  use rayon::prelude::*;
+  let dim = embedder.dim();
+  let ids = semantic_row_ids(kg);
+  let n = ids.len();
+  if n == 0 || dim == 0 {
+    return Err("no semantic rows to refine".to_string());
+  }
+  let region_bytes = n
+    .checked_mul(dim)
+    .and_then(|cells| cells.checked_mul(4))
+    .ok_or_else(|| "region size overflow".to_string())?;
+  // Typed insufficient-space error BEFORE creating multi-GB scratch (the scratch
+  // law); platforms without statvfs proceed and rely on create() failing cleanly.
+  #[cfg(unix)]
+  {
+    let needed = (region_bytes as u64).saturating_mul(3);
+    let available = vorpal_mem::available_disk_bytes(index_dir)
+      .map_err(|e| format!("scratch space probe: {e}"))?;
+    if available < needed {
+      return Err(format!(
+        "insufficient scratch space: 3 retrofit regions need {needed} bytes, {available} available"
+      ));
+    }
+  }
+  let scratch_dir = index_dir.join("retrofit.scratch");
+  let _ = fs::remove_dir_all(&scratch_dir);
+  fs::create_dir_all(&scratch_dir).map_err(|e| format!("creating {}: {e}", scratch_dir.display()))?;
+  let region = |name: &str, access: vorpal_mem::AccessPattern| {
+    vorpal_mem::ScratchMmap::create(&scratch_dir.join(name), region_bytes, access)
+      .map_err(|e| format!("scratch region {name}: {e}"))
+  };
+  // Q is swept sequentially every sweep; the X double-buffer is read by NEIGHBOR
+  // index — random — in alternating roles.
+  let mut anchors = region("q.f32", vorpal_mem::AccessPattern::Sequential)?;
+  let mut refined = region("a.f32", vorpal_mem::AccessPattern::Random)?;
+  let mut spare = region("b.f32", vorpal_mem::AccessPattern::Random)?;
+  {
+    let rows: &mut [f32] = bytemuck::try_cast_slice_mut(anchors.as_mut_bytes())
+      .map_err(|e| format!("scratch alignment: {e}"))?;
+    rows
+      .par_chunks_mut(dim)
+      .enumerate()
+      .for_each(|(i, row)| embed_node_into(kg, embedder, ids[i], row));
+  }
+  vorpal_kg::phase_stamp("retrofit: anchors embedded");
+  let edges = {
+    let anchor_rows: &[f32] =
+      bytemuck::try_cast_slice(anchors.as_bytes()).map_err(|e| format!("scratch alignment: {e}"))?;
+    build_retro_edges(kg, &ids, anchor_rows, dim)?
+  };
+  vorpal_kg::phase_stamp("retrofit: edges assembled");
+  refined.as_mut_bytes().copy_from_slice(anchors.as_bytes());
+  let report = {
+    let anchor_rows: &[f32] =
+      bytemuck::try_cast_slice(anchors.as_bytes()).map_err(|e| format!("scratch alignment: {e}"))?;
+    let x: &mut [f32] = bytemuck::try_cast_slice_mut(refined.as_mut_bytes())
+      .map_err(|e| format!("scratch alignment: {e}"))?;
+    let next: &mut [f32] =
+      bytemuck::try_cast_slice_mut(spare.as_mut_bytes()).map_err(|e| format!("scratch alignment: {e}"))?;
+    vorpal_ann::retrofit::retrofit_into(anchor_rows, x, next, dim, &edges)?
+  };
+  vorpal_kg::phase_stamp(&format!(
+    "retrofit: {} sweeps, Ψ {:.6e} → {:.6e}, {} edges",
+    report.sweeps,
+    report.initial_psi,
+    report.final_psi,
+    edges.targets.len()
+  ));
+  Ok(RetrofittedRows {
+    anchors,
+    refined,
+    spare,
+    dim,
+  })
+}
+
 fn build_ann(
   kg: &Kg,
   out: &Path,
   base_stamp: u64,
   embedder: &ActiveEmbedder,
+  retrofitted: Option<&RetrofittedRows>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
   vorpal_kg::phase_stamp("ann: build start");
   let dim = embedder.dim();
@@ -1528,9 +1863,21 @@ fn build_ann(
   let row_ids = ids.clone();
   // Rows embed straight into the index's storage (i8 codes at scale, in parallel): the
   // full-precision matrix never materializes — 2.9 GB of pure transient at kernel scale.
-  let index = AnnIndex::build_rows(dim, ids, |i, row| {
-    embed_node_into(kg, embedder, row_ids[i], row)
-  });
+  // Under Stage 2 the rows come from the retrofit's refined scratch matrix instead of a
+  // re-embed (same row universe by construction).
+  let index = match retrofitted {
+    Some(rows) => AnnIndex::build_rows(dim, ids, |i, row| {
+      let source = rows.row(i);
+      if source.len() == row.len() {
+        row.copy_from_slice(source);
+      } else {
+        row.fill(0.0);
+      }
+    }),
+    None => AnnIndex::build_rows(dim, ids, |i, row| {
+      embed_node_into(kg, embedder, row_ids[i], row)
+    }),
+  };
   vorpal_kg::phase_stamp("ann: save start");
   index
     .with_base_stamp(base_stamp)

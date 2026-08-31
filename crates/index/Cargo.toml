@@ -24,6 +24,7 @@ vorpal-language.workspace = true
 vorpal-core.workspace = true
 vorpal-kg.workspace = true
 vorpal-mem.workspace = true
+bytemuck = "1"
 tree-sitter.workspace = true
 fd-lock = "4.0.4"
 

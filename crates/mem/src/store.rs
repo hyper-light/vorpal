@@ -134,6 +134,25 @@ pub struct ScratchMmap {
   path: std::path::PathBuf,
 }
 
+/// Free bytes available to unprivileged writes on the filesystem holding `path`
+/// (POSIX `statvfs`: `f_bavail × f_frsize`). The scratch-planning precheck: callers
+/// turn "not enough space for the working set" into a typed error BEFORE creating
+/// multi-GB scratch files, instead of faulting mid-build.
+#[cfg(unix)]
+pub fn available_disk_bytes(path: &Path) -> io::Result<u64> {
+  use std::os::unix::ffi::OsStrExt;
+  let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+    .map_err(|_| io::Error::other("path contains an interior NUL byte"))?;
+  // SAFETY: statvfs only writes the out-struct on success; c_path stays alive and
+  // NUL-terminated for the duration of the call.
+  let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+  let code = unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) };
+  if code != 0 {
+    return Err(io::Error::last_os_error());
+  }
+  Ok(stats.f_bavail as u64 * stats.f_frsize as u64)
+}
+
 impl ScratchMmap {
   /// Create (or truncate) `path`, size it to `len` bytes, and map it writable with
   /// `access` advice. `len` must be nonzero.

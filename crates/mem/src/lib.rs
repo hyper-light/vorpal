@@ -31,3 +31,5 @@ pub use policy::{AccessPattern, Hotness, PagePolicy, ResourcePolicy, StorePolicy
 pub use prefetch::{prefetch_read, prefetch_read_nta, prefetch_slice_ahead};
 pub use probe::{CorpusProbe, HardwareProbe, StoreKind};
 pub use store::{AnonStore, MappedStore, ScratchMmap};
+#[cfg(unix)]
+pub use store::available_disk_bytes;
