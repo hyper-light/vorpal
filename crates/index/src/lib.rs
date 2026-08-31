@@ -790,14 +790,33 @@ pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
         chunk_file.seek(SeekFrom::Start(offset))?;
         chunk_file.read_exact(buf)
       };
-      (0..chunk_count)
+      (0..chunk_count as usize)
         .into_par_iter()
-        .map(|index| {
-          let offset = index * HASH_CHUNK;
-          let mut buf = vec![0u8; HASH_CHUNK.min(len - offset) as usize];
-          read_chunk(&mut buf, offset)?;
-          Ok(xxhash_rust::xxh3::xxh3_128(&buf))
-        })
+        // Without a split floor, rayon's adaptive splitting reaches single-chunk
+        // jobs under work-stealing and `map_init` runs its init per job — the
+        // reused buffer degenerated back to one allocation per chunk (measured:
+        // the 3.9 GB stood). Floor the split length the same way shards derive.
+        // (usize indices: an artifact past usize chunks is unindexable long
+        // before this point on any supported target.)
+        .with_min_len(
+          (chunk_count as usize)
+            .div_ceil(rayon::current_num_threads().max(1) * 2)
+            .max(1),
+        )
+        .map_init(
+          // One reusable buffer per worker split: the per-chunk `vec![0; 8 MiB]`
+          // this replaces churned ~4 GB of allocations through the commit
+          // hash at kernel scale (ledger-attributed) for identical digests.
+          || Vec::<u8>::new(),
+          |buf, index| {
+            let offset = index as u64 * HASH_CHUNK;
+            let want = HASH_CHUNK.min(len - offset) as usize;
+            buf.clear();
+            buf.resize(want, 0);
+            read_chunk(buf, offset)?;
+            Ok(xxhash_rust::xxh3::xxh3_128(buf))
+          },
+        )
         .collect()
     };
     for digest in chunk_digests? {

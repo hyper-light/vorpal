@@ -1351,10 +1351,13 @@ fn apply_parts<'a, 'i>(
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
   writer.forget_identity_scope();
-  writer.ingest_file(path, items);
-  // References carry entity *indices* into the file's local layout; resolve them through the
-  // recomputed layout (an out-of-range index — a corrupt product — simply drops the ref).
+  // ONE layout per file: these entity paths feed both the writer's node identities and the
+  // reference-index lookups below. The writer recomputing its own copy was a duplicate
+  // per-entity String build (~5 % of stream-phase allocation samples at kernel scale).
+  // References carry entity *indices* into the file's local layout; resolve them through
+  // this layout (an out-of-range index — a corrupt product — simply drops the ref).
   let (entities, _spans) = crate::outline_extractor::local_layout(items);
+  writer.ingest_file_with_layout(path, items, &entities);
   // Intern the file's path once; every reference carries the 4-byte id.
   let path_id = interner.intern(path);
   // Callee parameter ledgers (G-M5): Python entities only — the one language whose call

@@ -159,10 +159,17 @@ mod ts_ledger_shims {
 fn main() -> ExitCode {
   #[cfg(all(feature = "jemalloc", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
   unify_parser_allocator();
+  // Arm callsite sampling from the environment before real work — env reads
+  // allocate, so this must happen outside allocator context (ledger builds).
+  #[cfg(all(feature = "alloc-ledger", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
+  vorpal_kg::ledger::init_sampling_from_env();
   // Detached-warm re-entry + spawn permission — before any argument handling.
   vorpal_index::autowarm::run_if_sentinel();
   vorpal_index::autowarm::register();
-  match run() {
+  let outcome = run();
+  #[cfg(all(feature = "alloc-ledger", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
+  vorpal_kg::ledger::dump_samples();
+  match outcome {
     Ok(()) => ExitCode::SUCCESS,
     Err(err) => {
       eprintln!("vorpal-index: {err}");

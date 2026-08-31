@@ -33,6 +33,9 @@ struct Slot {
   ts_reallocs: AtomicU64,
   ts_frees: AtomicU64,
   ts_alloc_bytes: AtomicU64,
+  /// Reentrancy guard for backtrace sampling — capture/format/store all
+  /// allocate, and those allocations must not re-enter the sampler.
+  sampling: std::sync::atomic::AtomicBool,
 }
 
 impl Slot {
@@ -46,6 +49,7 @@ impl Slot {
       ts_reallocs: AtomicU64::new(0),
       ts_frees: AtomicU64::new(0),
       ts_alloc_bytes: AtomicU64::new(0),
+      sampling: std::sync::atomic::AtomicBool::new(false),
     }
   }
 }
@@ -69,8 +73,12 @@ fn slot() -> &'static Slot {
 #[inline]
 pub fn note_alloc(bytes: usize) {
   let s = slot();
-  s.allocs.fetch_add(1, Ordering::Relaxed);
+  let n = s.allocs.fetch_add(1, Ordering::Relaxed);
   s.alloc_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+  let mask = SAMPLE_MASK.load(Ordering::Relaxed);
+  if mask != 0 && (n & mask) == 0 {
+    sample_backtrace(s, bytes);
+  }
 }
 
 /// Note one deallocation.
@@ -125,6 +133,98 @@ pub static INTERN_WRITES: AtomicU64 = AtomicU64::new(0);
 pub static BUDGET_PARKS: AtomicU64 = AtomicU64::new(0);
 /// Bounded-channel sends that found the channel full and blocked.
 pub static CHAN_FULL: AtomicU64 = AtomicU64::new(0);
+
+// --- callsite attribution sampling (`VORPAL_ALLOC_SAMPLE=<shift>`): every
+// 2^shift-th Rust allocation (per slot) captures a symbolized backtrace into a
+// bounded site table, dumped at process end. At shift 16 a kernel-scale build
+// takes ~2,400 samples for ~0.3 s of guarded capture cost — enough to rank the
+// stream phase's 155 M allocations by callsite without distorting them.
+
+/// `2^shift − 1`, or 0 when sampling is off. Written ONCE from
+/// [`init_sampling_from_env`] before any allocator activity worth sampling —
+/// never lazily from allocator context (env reads allocate).
+static SAMPLE_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Read `VORPAL_ALLOC_SAMPLE` and arm sampling. Call from `main`, never from
+/// allocator context.
+pub fn init_sampling_from_env() {
+  if let Some(shift) = std::env::var("VORPAL_ALLOC_SAMPLE")
+    .ok()
+    .and_then(|v| v.parse::<u32>().ok())
+  {
+    SAMPLE_MASK.store((1u64 << shift.min(40)) - 1, Ordering::Relaxed);
+  }
+}
+
+/// Distinct callsites retained; one overflow bucket keeps the count honest
+/// beyond it. Linear-scanned — sampling is rare and the table small.
+const MAX_SITES: usize = 512;
+
+/// (site hash, samples, bytes, symbolized trace)
+static SAMPLES: std::sync::Mutex<Vec<(u64, u64, u64, String)>> = std::sync::Mutex::new(Vec::new());
+static SAMPLE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+#[cold]
+fn sample_backtrace(slot: &Slot, bytes: usize) {
+  use std::sync::atomic::AtomicBool;
+  let _ = AtomicBool::new(false); // keep the import local to the cold path
+  if slot.sampling.swap(true, Ordering::Acquire) {
+    return; // a sample (or its allocations) is already in flight on this slot
+  }
+  let text = format!("{}", std::backtrace::Backtrace::force_capture());
+  // FNV-1a over the trace text — no hasher allocation, stable within a run.
+  let mut hash: u64 = 0xcbf29ce484222325;
+  for byte in text.bytes() {
+    hash ^= byte as u64;
+    hash = hash.wrapping_mul(0x100000001b3);
+  }
+  if let Ok(mut samples) = SAMPLES.lock() {
+    if let Some(entry) = samples.iter_mut().find(|(h, ..)| *h == hash) {
+      entry.1 += 1;
+      entry.2 += bytes as u64;
+    } else if samples.len() < MAX_SITES {
+      samples.push((hash, 1, bytes as u64, text));
+    } else {
+      SAMPLE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+  slot.sampling.store(false, Ordering::Release);
+}
+
+/// Print the sampled-callsite histogram (top sites by sample count) to stderr.
+/// A no-op when sampling never armed or nothing was captured.
+pub fn dump_samples() {
+  let Ok(mut samples) = SAMPLES.lock() else {
+    return;
+  };
+  if samples.is_empty() {
+    return;
+  }
+  samples.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+  let total: u64 = samples.iter().map(|(_, n, ..)| n).sum();
+  let overflow = SAMPLE_OVERFLOW.load(Ordering::Relaxed);
+  eprintln!(
+    "[alloc-sample] {total} samples across {} sites (overflow {overflow}); top sites:",
+    samples.len()
+  );
+  for (rank, (_, count, bytes, trace)) in samples.iter().take(24).enumerate() {
+    eprintln!(
+      "[alloc-sample] #{rank}: {count} samples ({:.1}%), ~{}MB sampled",
+      *count as f64 * 100.0 / total.max(1) as f64,
+      bytes / 1048576
+    );
+    // Trim allocator/ledger scaffolding; keep the meaningful application frames.
+    for line in trace
+      .lines()
+      .filter(|l| {
+        !l.contains("ledger::") && !l.contains("::alloc::") && !l.contains("backtrace::")
+      })
+      .take(16)
+    {
+      eprintln!("[alloc-sample]   {line}");
+    }
+  }
+}
 
 /// One cumulative reading of every ledger dimension.
 #[derive(Debug, Clone, Copy, Default)]

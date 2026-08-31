@@ -183,11 +183,30 @@ impl KgWriter {
     path: &str,
     items: &[OutlineItem<'_>],
   ) -> Vec<(Range<usize>, NodeId)> {
-    let mut spans = Vec::new();
     // Entity paths in layout order (index 0 = file), disambiguated so overloads and same-name
-    // different-kind siblings stay distinct. `ingest_file_with_spans` and `local_layout` both
-    // source identity from this one function, so their conventions can never drift apart.
+    // different-kind siblings stay distinct. Every ingest path sources identity from
+    // `layout_entity_paths`, so the conventions can never drift apart.
     let entity_paths = layout_entity_paths(items);
+    self.ingest_file_with_layout(path, items, &entity_paths)
+  }
+
+  /// [`KgWriter::ingest_file_with_spans`] with the entity-path layout supplied by the caller —
+  /// for callers that already computed it (the committer's apply path builds the same layout
+  /// for reference attribution; recomputing it here was a per-entity `String` build measured
+  /// at ~5 % of stream-phase allocations). `entity_paths` MUST be
+  /// [`layout_entity_paths`]`(items)` — the debug assertion pins the lockstep.
+  pub fn ingest_file_with_layout(
+    &mut self,
+    path: &str,
+    items: &[OutlineItem<'_>],
+    entity_paths: &[String],
+  ) -> Vec<(Range<usize>, NodeId)> {
+    let mut spans = Vec::new();
+    debug_assert_eq!(
+      entity_paths.len(),
+      1 + items.iter().map(|i| 1 + i.members.len()).sum::<usize>(),
+      "entity_paths must be layout_entity_paths(items)"
+    );
     // Intern the path bytes once for this whole file: every node of the file shares one heap
     // copy via identical (offset, len) column entries — reader-compatible, and it removes the
     // dominant heap duplication (at kernel scale, ~130 MB of repeated path strings for
