@@ -782,6 +782,30 @@ its disk twin, landed in three certified sub-slices:
     (257 members, ~2.6% of generation), cold 7.56–8.28 s (band unchanged — the save
     overlaps evidence), determinism ×2 PASS, edit/revert/respan/cutoff convergence PASS,
     respan 0.86 s + 257/257 sig slabs linked, cutoff 0.49 s + 257/257 linked.
+  - **c-2 slice i — the resolution-equality core: SHIPPED (2026-08-31).**
+    `vorpal_ingest::scoped_resolve_file` re-resolves ONE defs-stable-edited file against
+    the prior sealed generation: partial symbol table over the file's name closure
+    (candidates via `nodes_named`, File registrations for every file, peek-or-sentinel
+    owners — rule-for-rule with `build_symbol_table_over`), file-scoped import bindings
+    (bindings key on `from_path`), bounded product-decode closure for the rets chain and
+    param ledgers (files defining any called name; capped, escalate past the cap), and
+    the pipeline's OWN kernels end to end: `reference_from_view` (extracted, shared),
+    `resolve_batch` (the chunk kernel, published), `join_call_edge`, `match_requests`.
+    The defs-stable ladder (`views_defs_stable_reject`): grammar, error accounting,
+    definition set sans ranges, entity params, returns — refs/sketches/requests free.
+    GATE (crates/index/tests/scoped_oracle.rs): scoped outcomes == a scratch build of
+    the edited tree for the edited file — evidence multiset (edge AND no-edge rows,
+    external pinned), per-source ORDERED edge sequences (confidence-labeled, DATA_FLOWS
+    spliced at first-pair positions, request tail), dataflow rows (kw + positional
+    binding through the closure's ledgers), sketch rows — field for field; the rets
+    chain lane pinned non-vacuously (maker().render() resolves through the decoded
+    ledger). Two drift bugs the oracle caught at birth: edges must carry
+    `with_confidence` labels (base-only diverged), and literal args are untraceable
+    (fixture, not code). Costs measured at kernel scale for the coming slices: table
+    build 70 ms, resolve 258 ms full-corpus (F-only: µs), scc 74 ms, pairing 370 ms
+    solo at 638 k rows (the c2-ii driver; ceiling truncation makes pairing
+    order-dependent — SigStore's (bucket, key, ordinal) sort IS the canonical feed
+    order).
   - **c-2 — defs-stable scoped resolve (single-file semantic edits).** Ground truths
     verified in-code (2026-08-31): a file's node rows are exactly [File][item][member…]
     in outline order (`ingest_file_with_spans`), so a defs-stable edit (same items,

@@ -1091,6 +1091,21 @@ fn resolve_chunks_into<'i, T: Send>(
 }
 
 /// The serial kernel: resolve one contiguous run of references in order.
+/// One in-RAM batch resolved on the calling thread: the (edges, unresolved, stats) triple
+/// the spilled drain hands its chunk callback, for callers whose reference set is small and
+/// already materialized — the scoped compose (SUBSECOND.md P4.5c-2) re-resolving ONE file's
+/// references against a prior generation. Same code path as every chunk (`resolve_chunk`),
+/// so outcomes cannot drift from the pipeline's.
+pub fn resolve_batch<'i>(
+  interner: &'i Interner,
+  table: &SymbolTable<'i>,
+  references: &[Reference<'i>],
+  resolver: &Resolver,
+  chain: Option<&ChainReturns<'i>>,
+) -> (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats) {
+  resolve_chunk(interner, table, references, resolver, chain)
+}
+
 fn resolve_chunk<'i>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,

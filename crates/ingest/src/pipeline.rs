@@ -783,7 +783,7 @@ fn absorb_shard<'i>(
 
 /// Routes exactly like extraction: the parameter ledger is collected for files the registry
 /// hands to the Python grammar (kwarg call-site binding is a Python-shaped semantic).
-fn is_python_path(path: &str) -> bool {
+pub(crate) fn is_python_path(path: &str) -> bool {
   matches!(
     vorpal_lang_registry::from_path(std::path::Path::new(path)),
     Some(vorpal_lang_registry::SgLang::Builtin(vorpal_language::SupportLang::Python))
@@ -1547,21 +1547,31 @@ fn apply_parts<'a, 'i>(
         }
       }
     }
-    references.push(
-      Reference::with_interned_path(
-        interner,
-        from,
-        path_id,
-        r.name,
-        crate::product::tag_refkind(r.kind),
-      )
-      .with_evidence(r.start, r.end)
-      .with_qualifier_ref(interner, r.qualifier)
-      .with_alias_ref(interner, r.alias)
-      .with_form(crate::product::tag_refform(r.form))
-      .with_receiver_type_ref(interner, r.receiver_type, r.receiver_type_origin),
-    );
+    references.push(reference_from_view(interner, from, path_id, &r));
   }
+}
+
+/// The ONE Reference construction from a product ref view — shared by the bulk/retained
+/// application kernel above and the scoped compose (P4.5c-2), so the two feeds cannot
+/// drift field by field.
+pub(crate) fn reference_from_view<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  from: NodeId,
+  path_id: vorpal_resolve::NameId<'i>,
+  r: &crate::product::RefView<'_>,
+) -> Reference<'i> {
+  Reference::with_interned_path(
+    interner,
+    from,
+    path_id,
+    r.name,
+    crate::product::tag_refkind(r.kind),
+  )
+  .with_evidence(r.start, r.end)
+  .with_qualifier_ref(interner, r.qualifier)
+  .with_alias_ref(interner, r.alias)
+  .with_form(crate::product::tag_refform(r.form))
+  .with_receiver_type_ref(interner, r.receiver_type, r.receiver_type_origin)
 }
 
 /// Below this many definitions the table builds serially — fan-out costs more than it saves.

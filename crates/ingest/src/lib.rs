@@ -26,6 +26,8 @@ pub use requests::RequestReport;
 pub mod signature;
 pub mod similar;
 pub use similar::{SigRow, SimilarReport};
+mod scoped;
+pub use scoped::{ProductSource, ScopedOutcome, scoped_resolve_file, views_defs_stable_reject};
 pub mod typefacts;
 
 pub use manifest::{FileStat, Manifest};
