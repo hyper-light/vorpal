@@ -839,12 +839,43 @@ activations, BLAS cross-checked against einsum at 2.8e-14):
 
 The scale law that shaped the integration: doc-side encoding at kernel scale is
 ~10¹² FLOPs (hours of CPU) — this encoder can never be the warm-time row
-embedder. Its shape is the opt-in QUERY-TIME RERANKER: one prefixed query + the
-fused top-K candidate surfaces per search (~1+25 short sequences ≈ 1–2 s at the
-current pass; f32/SIMD kernel work is the recorded optimization lead). Reranker
-wiring, latency gates, and the NL-split eval follow; the release-size decision
-(547 MB f32 / ~274 MB f16 vs npm+PyPI budgets) is an owner call, surfaced
-separately.
+embedder. Its shape is the opt-in QUERY-TIME RERANKER, shipped as
+`<root>/encoder.dir` (a local model directory; missing = off; an unopenable
+selection states itself via `Searcher::encoder_status` and searches keep
+serving): the fused top-k stable-reorders by encoder cosine between the prefixed
+query and each hit's name/signature/basename surface, RRF scores and channel
+ranks untouched, conjunctions un-reranked. Plumbing oracles: a bad selection
+degrades stated and still serves (ungated); the live rerank is bitwise
+deterministic and only ever REORDERS (gated).
+
+**Three rerank variants measured, one survives** (searcheval, both corpora,
+NDCG@10 / MRR / recall@5; baseline = learned+retrofit fusion):
+
+| variant | kernel short-kw (prot.) | kernel all | cpython descriptive | cpython short-kw (prot.) | cpython all |
+|---|---|---|---|---|---|
+| baseline | 0.206 / 0.298 / 0.095 | 0.298 / 0.386 / 0.208 | 0.316 / 0.229 / 0.500 | 0.293 / 0.500 / 0.250 | 0.308 / 0.319 / 0.417 |
+| rerank, unpinned | 0.091 ✗ | 0.198 ✗ | 0.441 | 0.169 ✗ | 0.350 |
+| rerank, ≤3-token guard | 0.206 = | 0.298 = | 0.298 ✗ | 0.293 = | 0.296 ✗ |
+| **rerank, fused-winner pin** | **0.223 / 0.330 / 0.143** | **0.313 / 0.414 / 0.250** | 0.343 / 0.244 / 0.375 | 0.169 ✗ (MRR/recall hold) | 0.285 |
+
+Mechanisms, measured: unpinned reranking demotes the consensus winners the
+channels already agreed on — the 2026 "neural embedders collapse on short
+keywords" finding reproduced in-house. The token-length guard fails because
+length does not separate NL-intent from keyword queries (cpython's best rerank
+win, "dictionary insert entry", is a 3-token NL query; its ≥4-token reranks are
+a slight net negative). The FUSED-WINNER PIN — the encoder arbitrates only the
+uncertain tail, never the rank-0 consensus — is the variant with a real win:
+**the kernel gates GREEN** (all-NDCG +5%, and the protected short-keyword class
+itself improves +8% with recall@5 0.095 → 0.143: the encoder FIXES deep hits it
+can no longer break), while cpython stays mixed (descriptive +8.5%, short-kw
+NDCG down with MRR/recall held). Pin+guard combined is derivably dominated (it
+trades the kernel's gain for cpython's protection). DISPOSITION: the pinned
+rerank ships; enabling is PER-CORPUS by construction (`encoder.dir`) and should
+follow a measured gate on the target corpus — green at kernel scale, red on
+cpython, recorded here. Query cost with the encoder live: ~3.2–3.6 s mean at
+k=25 (the correctness-first f64 pass; the f32/SIMD GEMM lead stands, est.
+20–50×). The release-size decision (547 MB f32 / ~274 MB f16 vs npm+PyPI
+budgets) is an owner call, surfaced separately.
 
 ## History (earlier passes, kept for the record)
 

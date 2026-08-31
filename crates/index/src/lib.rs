@@ -1295,6 +1295,39 @@ fn coherent_persisted_embedder(index_dir: &Path, current_stamp: u64) -> Option<A
 /// Build-side freshness: coherent artifacts AND the persisted tier matches the
 /// selection (a tier flip is staleness — the next warm rebuilds under the selected
 /// model). The learned check verifies the model file's checksum without loading it.
+/// Open the root's selected encoder, if any — shared by both `Searcher` opens.
+/// A failed open is a STATED degradation, never a failed search.
+fn open_selected_encoder(
+  index_root: &Path,
+) -> (Option<Box<vorpal_ann::encoder::CodeEncoder>>, Option<String>) {
+  match encoder_selection(index_root) {
+    None => (None, None),
+    Some(model_dir) => match vorpal_ann::encoder::CodeEncoder::open(&model_dir) {
+      Ok(encoder) => (Some(Box::new(encoder)), None),
+      Err(reason) => (
+        None,
+        Some(format!("encoder disabled: {reason} ({})", model_dir.display())),
+      ),
+    },
+  }
+}
+
+/// The per-index vendored-encoder selection (semantic-tier Stage 6): `<root>/encoder.dir`
+/// names a LOCAL model directory and turns the opt-in query-time reranker on;
+/// missing/empty = off. Like `semantic.tier`, this is a ROOT artifact — generation
+/// dirs never carry one, so internal opens of a pinned generation (the BM25 gate's
+/// probes, overlay assembly) always measure the UN-reranked fusion their records
+/// describe. Never a download: the directory must already exist locally.
+fn encoder_selection(index_root: &Path) -> Option<PathBuf> {
+  let text = fs::read_to_string(index_root.join("encoder.dir")).ok()?;
+  let path = text.trim();
+  if path.is_empty() {
+    None
+  } else {
+    Some(PathBuf::from(path))
+  }
+}
+
 fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -> bool {
   let stamp_ok = fs::read(index_dir.join("ann.stamp"))
     .ok()
@@ -2790,6 +2823,14 @@ pub struct Searcher {
   /// Per-corpus BM25 fourth-list verdict from the persisted record's warm-time gate
   /// (`None` verdict or absent record → off): whether fusion appends the BM25 list.
   bm25_enabled: bool,
+  /// Stage-6 opt-in reranker: the vendored code encoder, opened from the root's
+  /// `encoder.dir` selection. `None` = unconfigured, or the open failed — then the
+  /// reason is stated in `encoder_note` and searches keep serving the fused
+  /// ranking (an optional tier may degrade, never fail a search).
+  encoder: Option<Box<vorpal_ann::encoder::CodeEncoder>>,
+  /// Present exactly when an encoder SELECTION could not be honored (stated
+  /// degradation — surfaced by [`Searcher::encoder_status`]).
+  encoder_note: Option<String>,
   /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
   /// effect (autowarm) so queries take the exact reference paths only. Set by
   /// [`Searcher::open_exact`]; never used in serving.
@@ -2829,6 +2870,7 @@ impl Searcher {
     let bm25_enabled = persisted_tier_record(&generation_dir)
       .and_then(|record| record.bm25)
       .unwrap_or(false);
+    let (encoder, encoder_note) = open_selected_encoder(index_dir);
     Ok(Searcher {
       generation_dir,
       kg,
@@ -2837,6 +2879,8 @@ impl Searcher {
       embedder,
       semantic_cutover,
       bm25_enabled,
+      encoder,
+      encoder_note,
       exact_only: false,
     })
   }
@@ -2862,6 +2906,9 @@ impl Searcher {
     let bm25_enabled = persisted_tier_record(&generation_dir)
       .and_then(|record| record.bm25)
       .unwrap_or(false);
+    // Same reranker semantics as serving: exact-vs-tier comparisons measure the
+    // pipeline the index actually answers with.
+    let (encoder, encoder_note) = open_selected_encoder(index_dir);
     Ok(Searcher {
       generation_dir,
       kg,
@@ -2870,6 +2917,8 @@ impl Searcher {
       embedder,
       semantic_cutover,
       bm25_enabled,
+      encoder,
+      encoder_note,
       exact_only: true,
     })
   }
@@ -3160,7 +3209,67 @@ impl Searcher {
     if self.bm25_enabled {
       lists.push(channels.bm25);
     }
-    Ok(rrf_fuse_explained(&lists, k))
+    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k)))
+  }
+
+  /// The stated reason a configured encoder is NOT active (`None` = active, or no
+  /// selection exists).
+  pub fn encoder_status(&self) -> Option<&str> {
+    self.encoder_note.as_deref()
+  }
+
+  /// Stage-6 opt-in rerank: stable-reorder the fused top-k by encoder cosine
+  /// between the PREFIXED query and each hit's embedded surface — the same
+  /// name/signature/basename recipe the tiers hash, as text. RRF scores and
+  /// per-channel ranks in the records stay UNTOUCHED (the ORDER is the reranker's
+  /// verdict); encoder off, an un-viewable node, or a runtime embed failure leave
+  /// the fused order exactly (open() already validated the model — a runtime
+  /// failure degrades one query, never fails a search). Conjunctions
+  /// (`run_multi`) keep their own min-RRF contract un-reranked.
+  fn rerank_with_encoder(&self, query: &str, mut fused: Vec<FusedHit>) -> Vec<FusedHit> {
+    let Some(encoder) = &self.encoder else {
+      return fused;
+    };
+    // The FUSED-WINNER PIN, structural: RRF's rank-0 consensus is the fusion's
+    // strongest evidence, so the encoder arbitrates only the uncertain TAIL
+    // (positions 1..k) and can never demote a hit the channels already agreed on
+    // — measured: unpinned reranking collapsed the protected short-keyword class
+    // on both bench corpora by demoting exactly those consensus winners. With the
+    // pin, the kernel gates GREEN (all-NDCG +5%, the protected class itself +8%)
+    // while cpython measures mixed — the per-corpus tables live in BENCHMARKS
+    // "Stage 6", and `encoder.dir` is the per-corpus opt-in that expresses them.
+    if fused.len() <= 1 {
+      return fused;
+    }
+    let Ok(query_vec) = encoder.embed_query(query) else {
+      return fused;
+    };
+    let mut keyed: Vec<(f64, usize)> = Vec::with_capacity(fused.len().saturating_sub(1));
+    for (position, hit) in fused.iter().enumerate().skip(1) {
+      let cosine = self
+        .kg
+        .node(NodeId::new(hit.0))
+        .and_then(|view| {
+          let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+          let surface = format!("{} {} {basename}", view.name, view.signature);
+          encoder.embed(&surface).ok()
+        })
+        .map_or(f64::NEG_INFINITY, |row| {
+          query_vec
+            .iter()
+            .zip(&row)
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum()
+        });
+      keyed.push((cosine, position));
+    }
+    keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut reordered = Vec::with_capacity(fused.len());
+    reordered.push(std::mem::replace(&mut fused[0], (0, 0.0, Vec::new())));
+    for &(_, position) in &keyed {
+      reordered.push(std::mem::replace(&mut fused[position], (0, 0.0, Vec::new())));
+    }
+    reordered
   }
 
   /// Label-free per-corpus BM25 gate (semantic-tier directive 4): known-item

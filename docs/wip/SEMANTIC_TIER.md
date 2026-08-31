@@ -286,10 +286,17 @@ without regressing others — else recorded as measured-and-rejected in this doc
 > SCALE LAW: doc-side encoding at kernel scale is ~10¹² FLOPs — the encoder can
 > NEVER be the warm-time row embedder; its shape is the opt-in QUERY-TIME
 > RERANKER (prefixed query + fused top-K surfaces, nothing precomputed).
-> REMAINING: reranker wiring behind a per-index model-dir selection + latency and
-> NL-split eval gates; and the release-size decision (547 MB f32 / ~274 MB f16 vs
-> npm+PyPI budgets: optional model package vs LFS vs release asset) — an owner
-> call, surfaced.
+> RERANKER SHIPPED (fused-winner pin): `<root>/encoder.dir` opt-in; stable
+> cosine reorder of the fused tail only — the rank-0 consensus is never demoted.
+> Three variants measured (tables in BENCHMARKS "Stage 6"): unpinned collapses
+> the protected class on both corpora; a ≤3-token guard protects but forfeits
+> the gains (length ≠ intent); the pin gates GREEN at kernel scale (all-NDCG
+> 0.298 → 0.313, protected short-keyword 0.206 → 0.223, recall up) and mixed on
+> cpython (descriptive +8.5%, short-kw NDCG down) — so enabling is a PER-CORPUS
+> measured decision, exactly what the selection file expresses. ~3.5 s/query at
+> the correctness-first pass (f32/SIMD lead recorded). STILL OPEN (owner): the
+> release-size decision (547 MB f32 / ~274 MB f16 vs npm+PyPI budgets: optional
+> model package vs LFS vs release asset).
 
 **Ready-when-licensed:** multi-phrase semantic AND becomes real per-phrase semantics at
 Stage 1+; it remains separately unlicensed and is not scheduled here.
