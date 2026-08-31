@@ -501,6 +501,33 @@ improves. Query latency (k=25, tier path): linux mean 2.05 ms lexical → 4.06 m
 learned; cpython 0.75 → 2.83 ms — the learned query embed + 249-dim rerank, well
 inside budget.
 
+### Conjunction support under the learned tier: measured, unchanged
+
+Stage AND vetoed vector-space sign as a conjunction MATCH criterion twice in the
+hashed lexical space (collisions made nonsense phrases near-globally "positive").
+Third measurement, now in the TRAINED space over the kernel's 2,354,838 rows
+(`cargo run --release -p vorpal-index --features bench-internals --example
+sweep_semantic -- <idx> --positivity <phrase>…`, dist² < 2 ⇔ cos > 0 on the
+persisted codes):
+
+| phrase | positive rows | lexical support |
+|---|---:|---:|
+| "socket buffer" | 1,101,592 (46.8%) | 16,733 (0.71%) |
+| "mutex lock" | 1,218,818 (51.8%) | 20,755 (0.88%) |
+| "packet" | 1,160,701 (49.3%) | 4,820 (0.21%) |
+| "zzyzxqv nonexistent" | 1,310,255 (55.6%) | 11 |
+| "qqq zzz vvv" | 1,335,101 (56.7%) | 4 |
+
+Nonsense phrases are MORE "positive" than real ones — OOV gram composition lands
+near the corpus's central direction, and a 249-dim unit space keeps a broadly
+positive hemisphere even after ABTT + sentence-PC removal. Verdict: positivity can
+never gate a conjunction in ANY tier; lexical token-overlap support stays the match
+criterion (embedder-independent by design, now by measurement three times). The
+learned tier changes conjunction RANKING only — its deep rung now rides the code
+walk: `"socket buffer" AND "alloc" AND "packet"` eliminates honestly (pools
+15,767 / 13,523 / 4,942 at depth 2,763,928) in 0.54 s, from 1.08 s lexical;
+`"mutex lock" AND "interruptible"` keeps `mutex_lock_interruptible` at rank 0.
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

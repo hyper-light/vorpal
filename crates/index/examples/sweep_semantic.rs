@@ -47,6 +47,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
   };
   let index = Path::new(index);
+  // Positivity probe (conjunction-support evaluation): counts per phrase, no timing.
+  if args.get(1).map(String::as_str) == Some("--positivity") {
+    if args.len() < 3 {
+      return Err("usage: sweep_semantic <index-dir> --positivity <phrase> [...]".into());
+    }
+    for phrase in &args[2..] {
+      let (positive, lexical, total) = bench::positivity(index, phrase)?;
+      println!(
+        "{phrase:?}: positive {positive} ({:.3}%)  lexical-support {lexical} ({:.3}%)  of {total}",
+        positive as f64 * 100.0 / total.max(1) as f64,
+        lexical as f64 * 100.0 / total.max(1) as f64,
+      );
+    }
+    return Ok(());
+  }
   let takes: Vec<usize> = if args.len() > 1 {
     args[1..]
       .iter()

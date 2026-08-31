@@ -1701,7 +1701,12 @@ struct Channels {
 /// phrase's semantic RANK list here: rows past the boundary are the no-signal tie
 /// region Stage 0 diagnosed and carry no rank information worth fusing. (What counts as
 /// a conjunction MATCH is decided lexically — see `node_lexical_support_bits` — because
-/// hashed-bucket collisions make vector-space sign meaningless as a match criterion.)
+/// hashed-bucket collisions make vector-space sign meaningless as a match criterion.
+/// Measured a THIRD time in the TRAINED space (bench `positivity`, kernel scale):
+/// real phrases are "positive" to 46–52% of all rows and NONSENSE phrases to 55–57% —
+/// OOV gram composition lands near the corpus's central direction — so sign can never
+/// gate a match under any tier; see docs/wip/BENCHMARKS.md "Conjunction support under
+/// the learned tier".)
 const POSITIVE_BOUNDARY: f32 = 2.0;
 
 /// The single-phrase rerank/fusion pool for a requested k — ONE source of truth shared
@@ -3011,6 +3016,47 @@ pub mod bench {
     let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
     let kg = Kg::load(&generation_dir)?;
     Ok(super::coherent_persisted_embedder(&generation_dir, super::stamp_of(&kg)).is_some())
+  }
+
+  /// Positivity probe for the conjunction-support question: for one phrase, how many
+  /// rows sit strictly inside [`super::POSITIVE_BOUNDARY`] (dist² < 2 ⇔ cos > 0)
+  /// under the index's PERSISTED tier, versus how many rows the lexical token-overlap
+  /// support admits. The Stage-AND veto of vector-sign support was measured against
+  /// the hashed lexical space (collisions made nonsense phrases near-globally
+  /// "positive"); this measures the TRAINED space before any support re-derivation.
+  /// Returns (positive rows, lexical-support rows, total rows).
+  pub fn positivity(index_dir: &Path, phrase: &str) -> Result<(usize, usize, usize), Box<dyn Error>> {
+    let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
+    let kg = Kg::load(&generation_dir)?;
+    let stamp = super::stamp_of(&kg);
+    let Some(embedder) = super::coherent_persisted_embedder(&generation_dir, stamp) else {
+      return Err("no coherent persisted tier — warm first".into());
+    };
+    let query = embedder.embed(phrase);
+    let rows = super::semantic_row_ids(&kg);
+    let ann = vorpal_ann::AnnIndex::load(&generation_dir.join("ann.bin"))?;
+    let positive = match ann.scan_codes(&query, rows.len(), |_| true) {
+      Some(scored) => scored
+        .iter()
+        .filter(|(_, dist)| *dist < super::POSITIVE_BOUNDARY)
+        .count(),
+      None => vorpal_ann::exhaustive_semantic(
+        embedder.dim(),
+        &rows,
+        |i, row| super::embed_node_into(&kg, &embedder, rows[i], row),
+        &query,
+        rows.len(),
+      )
+      .iter()
+      .filter(|(_, dist)| *dist < super::POSITIVE_BOUNDARY)
+      .count(),
+    };
+    let token_sets = vec![super::tokenize(phrase)];
+    let lexical = rows
+      .iter()
+      .filter(|&&id| super::node_lexical_support_bits(&kg, id, &token_sets) != 0)
+      .count();
+    Ok((positive, lexical, rows.len()))
   }
 }
 
