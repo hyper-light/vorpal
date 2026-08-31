@@ -60,7 +60,7 @@ def audit(report_path: str) -> int:
     lines: list[str] = ["# Grammar supply-chain audit", ""]
 
     for name, entry in sorted(provenance.items()):
-        org_repo = entry["repository"].rstrip("/").removeprefix("https://github.com/")
+        org_repo = entry["repository"].rstrip("/").removeprefix("https://github.com/").removesuffix(".git")
         commit = entry["commit"]
         patched = bool(entry.get("patches"))
         tarball = fetch(f"https://codeload.github.com/{org_repo}/tar.gz/{commit}")
