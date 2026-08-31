@@ -30,4 +30,4 @@ pub use pod::PodColumn;
 pub use policy::{AccessPattern, Hotness, PagePolicy, ResourcePolicy, StorePolicy};
 pub use prefetch::{prefetch_read, prefetch_read_nta, prefetch_slice_ahead};
 pub use probe::{CorpusProbe, HardwareProbe, StoreKind};
-pub use store::{AnonStore, MappedStore};
+pub use store::{AnonStore, MappedStore, ScratchMmap};

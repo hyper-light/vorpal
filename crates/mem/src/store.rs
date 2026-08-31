@@ -118,6 +118,81 @@ impl AnonStore {
   }
 }
 
+/// A writable, file-backed scratch mapping: multi-GB working sets (factorization
+/// blocks, streamed CSR arrays) ride the OS pager instead of anonymous RSS — the
+/// kernel writes cold pages back to the scratch file under pressure and refaults them
+/// on demand, so peak anonymous memory stays bounded no matter the corpus (the §8
+/// one-code-path law at the 10⁹-LOC end).
+///
+/// Scratch is DEFINITIONALLY cold storage: native pages + the caller's access advice
+/// (huge-page policies target hot anonymous/persistent stores; file-backed THP is not
+/// generally applicable). Lifecycle: callers name the file inside their own scratch
+/// area, call [`ScratchMmap::delete`] on success, and sweep leftovers at start-up —
+/// a crash can only leave a dead file, never a wrong artifact.
+pub struct ScratchMmap {
+  mmap: MmapMut,
+  path: std::path::PathBuf,
+}
+
+impl ScratchMmap {
+  /// Create (or truncate) `path`, size it to `len` bytes, and map it writable with
+  /// `access` advice. `len` must be nonzero.
+  pub fn create(path: &Path, len: usize, access: AccessPattern) -> io::Result<Self> {
+    if len == 0 {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "zero-length scratch mapping",
+      ));
+    }
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(path)?;
+    file.set_len(len as u64)?;
+    // SAFETY: the file was just created and sized by this handle; it is owned by this
+    // process's scratch lifecycle and never truncated externally while mapped.
+    let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+    #[cfg(unix)]
+    {
+      let _ = mmap.advise(access_advice(access));
+    }
+    #[cfg(not(unix))]
+    let _ = access;
+    Ok(Self {
+      mmap,
+      path: path.to_path_buf(),
+    })
+  }
+
+  pub fn as_bytes(&self) -> &[u8] {
+    &self.mmap
+  }
+
+  pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+    &mut self.mmap
+  }
+
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Flush dirty pages to the backing file (needed only if the caller intends to
+  /// reopen the scratch by path; pure scratch never calls this).
+  pub fn flush(&self) -> io::Result<()> {
+    self.mmap.flush()
+  }
+
+  /// Unmap and remove the backing file — the success path. (On crash the file
+  /// survives; owners sweep their scratch area at start-up.)
+  pub fn delete(self) -> io::Result<()> {
+    let path = self.path.clone();
+    drop(self);
+    std::fs::remove_file(path)
+  }
+}
+
 #[cfg(unix)]
 fn access_advice(access: AccessPattern) -> memmap2::Advice {
   match access {
@@ -174,6 +249,23 @@ mod tests {
     store.as_mut_bytes()[4095] = 0xCD;
     assert_eq!(store.as_bytes()[0], 0xAB);
     assert_eq!(store.as_bytes()[4095], 0xCD);
+  }
+
+  #[test]
+  fn scratch_mmap_roundtrips_and_deletes() {
+    let mut path = std::env::temp_dir();
+    path.push(format!("vorpal-mem-scratch-{}.bin", std::process::id()));
+    let mut scratch = ScratchMmap::create(&path, 1 << 16, AccessPattern::Sequential).unwrap();
+    assert_eq!(scratch.as_bytes().len(), 1 << 16);
+    scratch.as_mut_bytes()[0] = 0x5A;
+    scratch.as_mut_bytes()[(1 << 16) - 1] = 0xA5;
+    assert_eq!(scratch.as_bytes()[0], 0x5A);
+    assert_eq!(scratch.as_bytes()[(1 << 16) - 1], 0xA5);
+    assert!(path.exists());
+    scratch.delete().unwrap();
+    assert!(!path.exists(), "delete must remove the backing file");
+    assert!(ScratchMmap::create(&path, 0, AccessPattern::Random).is_err());
+    let _ = std::fs::remove_file(&path);
   }
 
   #[test]

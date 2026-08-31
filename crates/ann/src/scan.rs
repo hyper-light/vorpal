@@ -17,6 +17,27 @@ use rayon::prelude::*;
 
 use crate::l2_sq;
 
+/// (distance, id) under the crate's total order — the bounded-selection heap key. `Ord`
+/// is `total_cmp` then id: the same total order the final merge sorts by, so the kept
+/// set is the UNIQUE top-`take` prefix regardless of heap internals — output bytes
+/// cannot depend on the selection structure.
+#[derive(PartialEq)]
+struct HeapEntry(f32, u64);
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for HeapEntry {
+  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    self.0.total_cmp(&other.0).then(self.1.cmp(&other.1))
+  }
+}
+
 /// Exhaustively score `ids` against `query` (a `dim`-length, normalized embedding — the
 /// output of [`crate::Embedder::embed`]) and return the closest `take` as
 /// `(id, squared L2)`, ascending. `fill(i, row)` writes row `i`'s embedding (the same
@@ -44,34 +65,48 @@ where
     .map(|(chunk_index, chunk_ids)| {
       let mut row = vec![0.0f32; dim];
       // Bounded local top set: sorted ascending by (dist, id), capped at `take`.
-      let mut top: Vec<(f32, u64)> = Vec::with_capacity(chunk_ids.len().min(take + 1));
-      // Degenerate case — the cap cannot bind inside this chunk (`take` admits every
-      // row), so the sorted-insert discipline below would only buy O(len²) memmove:
-      // collect unordered and let the final merge sort order everything. Output is
-      // identical (the merge sorts and truncates either way); this keeps full-population
-      // fetches (e.g. the multi-phrase exhaustive rung) linear instead of quadratic.
+      // Bounded selection by max-heap on the (dist, id) total order: push, and past
+      // `take`, evict the current worst — O(log take) per row with NO quadratic regime
+      // anywhere (a sorted-insert top set degrades as take approaches the chunk length:
+      // each insert memmoves O(take); measured as a 3× hump at take ≈ chunk size). When
+      // the cap cannot bind at all (`take` admits the whole chunk), plain collection is
+      // exact and cheapest. Either way the final merge sorts and truncates, and the
+      // kept set is the unique top-`take` under the total order — output bytes are
+      // independent of the selection structure.
       let unbounded = take >= chunk_ids.len();
+      let mut heap: std::collections::BinaryHeap<HeapEntry> = if unbounded {
+        std::collections::BinaryHeap::new()
+      } else {
+        std::collections::BinaryHeap::with_capacity(take + 1)
+      };
+      let mut all: Vec<(f32, u64)> =
+        Vec::with_capacity(if unbounded { chunk_ids.len() } else { 0 });
       for (j, &id) in chunk_ids.iter().enumerate() {
         fill(chunk_index * chunk + j, &mut row);
         let dist = l2_sq(&row, query);
         if unbounded {
-          top.push((dist, id));
+          all.push((dist, id));
           continue;
         }
-        if top.len() == take {
-          let &(worst, worst_id) = top.last().expect("take > 0");
-          // Full, and this candidate is not strictly closer than the worst kept → skip.
-          if worst.total_cmp(&dist).then(worst_id.cmp(&id)) != std::cmp::Ordering::Greater {
+        if heap.len() == take {
+          // Full: admit only candidates strictly better than the current worst.
+          if let Some(worst) = heap.peek()
+            && HeapEntry(dist, id).cmp(worst) != std::cmp::Ordering::Less
+          {
             continue;
           }
+          heap.pop();
         }
-        let at = top.partition_point(|&(d, v)| {
-          d.total_cmp(&dist).then(v.cmp(&id)) == std::cmp::Ordering::Less
-        });
-        top.insert(at, (dist, id));
-        top.truncate(take);
+        heap.push(HeapEntry(dist, id));
       }
-      top
+      if unbounded {
+        all
+      } else {
+        heap
+          .into_iter()
+          .map(|HeapEntry(dist, id)| (dist, id))
+          .collect()
+      }
     })
     .reduce(Vec::new, |mut a, b| {
       a.extend(b);

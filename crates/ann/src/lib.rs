@@ -16,6 +16,8 @@
 
 mod embed;
 mod index;
+mod kernels;
+pub mod learned;
 mod qmatrix;
 mod quant;
 mod scan;
@@ -26,20 +28,19 @@ pub use index::{AnnConfig, AnnIndex};
 pub use quant::SignQuantizer;
 pub use scan::exhaustive_semantic;
 
-/// Squared L2 distance. On unit-normalized vectors this orders identically to cosine distance.
-pub(crate) fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-  a.iter()
-    .zip(b)
-    .map(|(x, y)| {
-      let d = x - y;
-      d * d
-    })
-    .sum()
+/// Squared L2 distance. On unit-normalized vectors this orders identically to cosine
+/// distance. Explicit SIMD with one fixed rounding tree on every architecture (see
+/// `kernels`) — and deliberately the ONE distance tree every caller shares: the
+/// exhaustive scan and the search rerank must agree bit-for-bit (the rerank-skip on
+/// exhaustive candidates is sound only because both sides call this same function).
+pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+  kernels::l2_sq(a, b)
 }
 
-/// L2-normalize in place (no-op for the zero vector).
+/// L2-normalize in place (no-op for the zero vector). Same fixed-tree kernel
+/// discipline — embedding bytes are part of persisted tiers.
 pub(crate) fn normalize(v: &mut [f32]) {
-  let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+  let norm = kernels::sum_sq(v).sqrt();
   if norm > 0.0 {
     for x in v.iter_mut() {
       *x /= norm;

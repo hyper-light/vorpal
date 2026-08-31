@@ -2288,12 +2288,10 @@ impl Searcher {
           .map(|id| {
             let mut row = vec![0.0f32; embedder.dim()];
             embed_node_into(kg, &embedder, id, &mut row);
-            let exact = row
-              .iter()
-              .zip(&query_vec)
-              .map(|(x, y)| (x - y) * (x - y))
-              .sum::<f32>();
-            (exact, id)
+            // The ONE shared distance tree (vorpal_ann::l2_sq — lane-decomposed SIMD,
+            // bit-deterministic): the exhaustive arm's rerank-skip is sound only
+            // because scan and rerank distances agree bit-for-bit.
+            (vorpal_ann::l2_sq(&row, &query_vec), id)
           })
           .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));

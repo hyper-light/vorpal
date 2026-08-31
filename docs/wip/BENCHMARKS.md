@@ -368,6 +368,44 @@ milliseconds frozen into source). The shipped design:
   pinned by `crates/index/tests/calibration.rs` (forged crossovers leave rankings
   bit-identical).
 
+#### 2026-08-30 second pass: explicit SIMD kernels + heap-bounded selection
+
+Two exact-preserving engine changes after the table above was recorded (same command,
+same tree, load < 3):
+
+- The crate's hot float reductions became explicit SIMD with ONE fixed rounding tree on
+  every architecture (`crates/ann/src/kernels.rs`: stable `core::arch` — NEON on
+  aarch64, AVX2 behind runtime detection on x86_64, the scalar 8-lane loop as the
+  executable specification and fallback; multiply-then-add only, never FMA, so every
+  path is bit-identical — pinned by parity tests across sizes). `l2_sq` is now also the
+  ONE public distance function the scan and the rerank both call, making their
+  bit-agreement (which the rerank-skip relies on) structural. `std::simd` /
+  `portable_simd` remains nightly-only; the workspace pins stable 1.98.0.
+- The scan's bounded top-set (a sorted-insert Vec) degraded quadratically as `take`
+  approached the per-chunk length — measured as a 3× hump at take = 25,600 (317 ms vs
+  106 ms one row later). Replaced by a max-heap on the same `(dist, id)` total order:
+  O(log take) per row, no regime anywhere, kept set provably identical (the unique
+  top-take under a total order).
+
+| take | linux beam ms | linux scan ms |
+|---:|---:|---:|
+| 400 | 1.06 | 52.83 |
+| 800 | 2.15 | 53.17 |
+| 1600 | 4.78 | 55.38 |
+| 3200 | 12.90 | 58.13 |
+| 6400 | 41.23 | 65.23 |
+| 12800 | 150.21 | 79.59 |
+| 25600 | 560.87 | 104.43 |
+| 51200 | 2101.40 | 105.25 |
+
+Scan floor 90 → 53 ms (−41%), the 25.6k hump 317 → 104 ms, curve now monotone. The
+warm-time calibration RE-LEARNED the crossover on its own — 16,384 → 8,192, because the
+scan got cheaper — which is precisely why the crossover is measured on the running
+machine instead of shipped. Conjunctions: 2-phrase 0.66 s, 3-phrase 0.94 s, garbage
+0.63 s (from 0.77 / 1.08 / 0.72); mid-range single k=2000 rides the re-learned scan
+route at 0.40 s; single k=10 unchanged (0.03 s). Distance BITS changed (a different
+fixed tree), yet every pinned fixture baseline held — no rank flipped at fixture scale.
+
 ### Conjunction latency and behavior (linux index, warm + calibrated, best-of-3)
 
 ```
