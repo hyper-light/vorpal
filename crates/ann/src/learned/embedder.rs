@@ -5,8 +5,11 @@
 //! ever route queries to the exact fallback until a re-warm rebuilds — never mix
 //! embedders in one pool.
 
+use std::path::Path;
+
 use crate::embed::{Embedder, ModelProvenance};
 use crate::learned::model::LearnedModel;
+use crate::learned::persist::ModelView;
 
 /// Semantics version of the learned-static pipeline (tokenization, gram scheme, PPMI
 /// knobs, factorization, ABTT/uSIF post-processing). Bumped on ANY semantic change so
@@ -14,18 +17,59 @@ use crate::learned::model::LearnedModel;
 /// vectors — the same contract `LEXICAL_EMBED_VERSION` carries for the default.
 pub const LEARNED_EMBED_VERSION: u32 = 1;
 
+/// The two backings of one embedder: the owned in-RAM model (the BUILD side — training
+/// just produced it and still has to persist it) and the zero-copy mapped view (the
+/// QUERY side — bulk tables stay on the page cache; a kernel-scale model never
+/// materializes per open). Both run the SAME generic pipeline, so their bits agree.
+enum ModelBacking {
+  Owned(LearnedModel),
+  Mapped(ModelView),
+}
+
 /// A trained corpus-derived static embedder (docs/wip/SEMANTIC_TIER.md Tier 1).
 pub struct LearnedStaticEmbedder {
-  model: LearnedModel,
+  backing: ModelBacking,
+  dim: usize,
 }
 
 impl LearnedStaticEmbedder {
   pub fn new(model: LearnedModel) -> Self {
-    Self { model }
+    Self {
+      dim: model.dim,
+      backing: ModelBacking::Owned(model),
+    }
   }
 
-  pub fn model(&self) -> &LearnedModel {
-    &self.model
+  /// Open the persisted model as a checksum-verified, zero-copy mapped view. Returns
+  /// the embedder and the file's sealed checksum (the tier's `weights_hash`).
+  pub fn open_mapped(path: &Path) -> Result<(Self, u128), String> {
+    let (view, checksum) = ModelView::open(path)?;
+    Ok((
+      Self {
+        dim: view.dim(),
+        backing: ModelBacking::Mapped(view),
+      },
+      checksum,
+    ))
+  }
+
+  /// Embed into a caller-provided buffer — the allocation-free form the tier build's
+  /// per-row fill loop uses (millions of rows; a `Vec` per row would be pure churn).
+  /// Same pipeline as [`Embedder::embed`], either backing.
+  pub fn embed_into(&self, text: &str, out: &mut [f32]) {
+    match &self.backing {
+      ModelBacking::Owned(model) => model.embed_text(text, out),
+      ModelBacking::Mapped(view) => view.embed_text(text, out),
+    }
+  }
+
+  /// The owned model — present only on the build side (constructed via [`Self::new`]
+  /// straight from training); a mapped query-side embedder has no owned model.
+  pub fn model(&self) -> Option<&LearnedModel> {
+    match &self.backing {
+      ModelBacking::Owned(model) => Some(model),
+      ModelBacking::Mapped(_) => None,
+    }
   }
 
   /// This model's complete provenance. `dim` is the PIP-chosen dimension — adaptive
@@ -33,7 +77,7 @@ impl LearnedStaticEmbedder {
   pub fn provenance(&self) -> ModelProvenance {
     ModelProvenance {
       model_id: "learned-static".to_string(),
-      dim: self.model.dim,
+      dim: self.dim,
       normalization: "l2".to_string(),
       version: LEARNED_EMBED_VERSION,
       learned: true,
@@ -43,12 +87,15 @@ impl LearnedStaticEmbedder {
 
 impl Embedder for LearnedStaticEmbedder {
   fn dim(&self) -> usize {
-    self.model.dim
+    self.dim
   }
 
   fn embed(&self, text: &str) -> Vec<f32> {
-    let mut out = vec![0.0f32; self.model.dim];
-    self.model.embed_text(text, &mut out);
+    let mut out = vec![0.0f32; self.dim];
+    match &self.backing {
+      ModelBacking::Owned(model) => model.embed_text(text, &mut out),
+      ModelBacking::Mapped(view) => view.embed_text(text, &mut out),
+    }
     out
   }
 }
@@ -75,7 +122,10 @@ mod tests {
 
     let via_trait = embedder.embed("socket buffer alloc");
     let mut direct = vec![0.0f32; dim];
-    embedder.model().embed_text("socket buffer alloc", &mut direct);
+    embedder
+      .model()
+      .expect("freshly built embedder owns its model")
+      .embed_text("socket buffer alloc", &mut direct);
     assert_eq!(
       via_trait.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
       direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>()

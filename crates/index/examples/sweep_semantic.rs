@@ -62,6 +62,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     return Ok(());
   }
+  // Model-open probe: the materialized owned load vs the zero-copy mapped view, on the
+  // SAME persisted bytes — the query-side open cost the view exists to remove.
+  if args.get(1).map(String::as_str) == Some("--model-open") {
+    let model_path = Path::new(args.first().ok_or("usage: sweep_semantic <model-path> --model-open")?);
+    let mut owned = Vec::new();
+    let mut mapped = Vec::new();
+    for _ in 0..3 {
+      let started = std::time::Instant::now();
+      std::hint::black_box(vorpal_ann::learned::load_model(model_path).map_err(|e| e.to_string())?);
+      owned.push(started.elapsed().as_secs_f64() * 1e3);
+      let started = std::time::Instant::now();
+      std::hint::black_box(vorpal_ann::learned::ModelView::open(model_path).map_err(|e| e.to_string())?);
+      mapped.push(started.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+      "model open (median of 3): owned load {:.1} ms, mapped view {:.1} ms",
+      median(&mut owned),
+      median(&mut mapped)
+    );
+    return Ok(());
+  }
   let takes: Vec<usize> = if args.len() > 1 {
     args[1..]
       .iter()

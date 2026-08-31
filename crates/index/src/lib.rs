@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-use vorpal_ann::learned::{LearnedModel, LearnedStaticEmbedder, TrainResources, load_model, save_model};
+use vorpal_ann::learned::{LearnedModel, LearnedStaticEmbedder, TrainResources, save_model};
 use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, ModelProvenance, tokenize};
 use vorpal_ingest::{
   ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
@@ -1059,7 +1059,7 @@ impl ActiveEmbedder {
       ActiveEmbedder::Lexical(lexical) => lexical.embed_parts_into(parts, out),
       ActiveEmbedder::Learned(learned) => {
         let joined = parts.join(" ");
-        learned.model().embed_text(&joined, out);
+        learned.embed_into(&joined, out);
       }
     }
   }
@@ -1209,30 +1209,6 @@ fn write_model_provenance(
   fs::rename(tmp, index_dir.join("ann.model.json"))
 }
 
-/// Verify `ann.model.bin`'s sealed checksum equals both its own trailer and the
-/// recorded hash — WITHOUT constructing the model (the freshness-gate path).
-fn model_file_checksum_ok(path: &Path, expected: u128) -> bool {
-  let Ok(bytes) = fs::read(path) else {
-    return false;
-  };
-  if bytes.len() < 16 {
-    return false;
-  }
-  // Header compatibility FIRST (magic + format version, no deserialization): a
-  // checksum-intact file of an older format version must read as stale — otherwise a
-  // version bump wedges the tier ("fresh" to the builder, unloadable to every query,
-  // so no warm ever retrains it).
-  if !vorpal_ann::learned::model_bytes_compatible(&bytes) {
-    return false;
-  }
-  let body = bytes.len() - 16;
-  let Ok(trailer) = <[u8; 16]>::try_from(&bytes[body..]) else {
-    return false;
-  };
-  let stored = u128::from_le_bytes(trailer);
-  stored == expected && xxhash_rust::xxh3::xxh3_128(&bytes[..body]) == stored
-}
-
 /// Query-side coherence: are the persisted vector artifacts internally consistent for
 /// `current_stamp` — stamp file, bin header, tier record, and (learned) the model file
 /// verified against the recorded checksum? Returns the embedder the tier was BUILT
@@ -1262,11 +1238,13 @@ fn coherent_persisted_embedder(index_dir: &Path, current_stamp: u64) -> Option<A
     "learned" => {
       let expected = record.weights_hash?;
       let path = index_dir.join("ann.model.bin");
-      let (model, stored) = load_model(&path).ok()?;
-      if stored != expected || model.dim != record.provenance.dim {
+      // Zero-copy mapped open: header + sealed checksum validated, bulk tables stay
+      // on the page cache — a kernel-scale model (hundreds of MB) never materializes
+      // per Searcher open.
+      let (learned, stored) = LearnedStaticEmbedder::open_mapped(&path).ok()?;
+      if stored != expected || learned.dim() != record.provenance.dim {
         return None;
       }
-      let learned = LearnedStaticEmbedder::new(model);
       (record.provenance == learned.provenance())
         .then(|| ActiveEmbedder::Learned(Box::new(learned)))
     }
@@ -1308,11 +1286,18 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -
         }
     }
     "learned" => {
+      // The freshness gate IS the query-side open: a model counts as fresh only if
+      // the mapped view opens (magic, version, layout, checksum) with the recorded
+      // hash. A cheaper prefix check drifted from the reader once — version-accepted
+      // bytes that misparsed past the header wedged the tier ("fresh" to the builder,
+      // unloadable to every query) — so build and query share ONE criterion forever.
+      // Cost: one checksum pass per freshness check (~30 ms at kernel scale).
       selection == SemanticTier::Learned
         && record.provenance.learned
-        && record
-          .weights_hash
-          .is_some_and(|expected| model_file_checksum_ok(&index_dir.join("ann.model.bin"), expected))
+        && record.weights_hash.is_some_and(|expected| {
+          LearnedStaticEmbedder::open_mapped(&index_dir.join("ann.model.bin"))
+            .is_ok_and(|(_, stored)| stored == expected)
+        })
     }
     _ => false,
   }
@@ -1412,7 +1397,13 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
   // searches to the exhaustive fallback until the next warm heals it.
   let weights_hash = match &embedder {
     ActiveEmbedder::Learned(learned) => {
-      Some(save_model(learned.model(), &index_dir.join("ann.model.bin"))?)
+      // The build side always constructs its embedder from the freshly trained OWNED
+      // model (`LearnedStaticEmbedder::new`); a mapped backing here is impossible by
+      // construction, but the error stays typed — never a panic.
+      let Some(model) = learned.model() else {
+        return Err("freshly trained learned embedder lost its owned model (invariant)".into());
+      };
+      Some(save_model(model, &index_dir.join("ann.model.bin"))?)
     }
     ActiveEmbedder::Lexical(_) => {
       // A lexical build leaves no model file behind: a stale ann.model.bin beside a

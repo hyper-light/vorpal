@@ -48,7 +48,7 @@ pub(super) enum GramTable {
 }
 
 impl GramTable {
-  fn slot(&self, gram: &str) -> Option<u32> {
+  pub(super) fn slot(&self, gram: &str) -> Option<u32> {
     match self {
       GramTable::Exact(map) => map.get(gram).copied(),
       GramTable::Bucketed(buckets) => Some((fnv1a64(gram) % *buckets as u64) as u32),
@@ -121,6 +121,152 @@ pub struct TrainResources {
   /// training sub-step so kernel-scale runs attribute their time without a profiler.
   /// A plain fn pointer — no captures, no new dependency; pass `|_| {}` to silence.
   pub progress: fn(&str),
+}
+
+/// The lookup surface the embedding pipeline needs from a model — implemented by the
+/// OWNED [`LearnedModel`] (training, tests) and by the zero-copy mapped view
+/// (`persist::ModelView`, the query side). The pipeline itself
+/// ([`compose_raw_via`] → [`token_vector_via`] → [`pooled_document_via`] →
+/// [`embed_text_via`]) exists ONCE, generic over this trait, so the two backings can
+/// never drift — the one-formula-source law.
+pub(super) trait TokenLexicon {
+  fn dim(&self) -> usize;
+  /// The stored (COMPOSED) row for an in-vocabulary word.
+  fn word_row(&self, token: &str) -> Option<&[f32]>;
+  fn gram_slot(&self, gram: &str) -> Option<u32>;
+  fn gram_row(&self, slot: u32) -> Option<&[f32]>;
+  /// Unigram probability over the FULL corpus vocabulary (0.0 for unseen).
+  fn frequency(&self, token: &str) -> f64;
+  fn usif(&self) -> &UsifWeighting;
+  fn abtt(&self) -> &Abtt;
+  fn sentence(&self) -> &SentenceComponents;
+}
+
+impl TokenLexicon for LearnedModel {
+  fn dim(&self) -> usize {
+    self.dim
+  }
+  fn word_row(&self, token: &str) -> Option<&[f32]> {
+    let &id = self.word_ids.get(token)?;
+    self
+      .word_rows
+      .get(id as usize * self.dim..(id as usize + 1) * self.dim)
+  }
+  fn gram_slot(&self, gram: &str) -> Option<u32> {
+    self.gram_table.slot(gram)
+  }
+  fn gram_row(&self, slot: u32) -> Option<&[f32]> {
+    let start = slot as usize * self.dim;
+    self.gram_rows.get(start..start + self.dim)
+  }
+  fn frequency(&self, token: &str) -> f64 {
+    self.frequencies.get(token).copied().unwrap_or(0.0)
+  }
+  fn usif(&self) -> &UsifWeighting {
+    &self.usif
+  }
+  fn abtt(&self) -> &Abtt {
+    &self.abtt
+  }
+  fn sentence(&self) -> &SentenceComponents {
+    &self.sentence
+  }
+}
+
+/// Raw factor-space composition (fastText: word row + its gram rows; OOV = gram rows
+/// alone) over any [`TokenLexicon`]. A known word's stored row already carries its
+/// gram sum (composed at train time) — the vocabulary path is a straight copy and the
+/// gram walk runs only for OOV tokens. No ABTT, no normalization.
+pub(super) fn compose_raw_via<L: TokenLexicon + ?Sized>(lex: &L, token: &str, out: &mut [f32]) {
+  if let Some(row) = lex.word_row(token) {
+    out.copy_from_slice(row);
+    return;
+  }
+  out.fill(0.0);
+  let mut any = false;
+  for gram in SubwordTokenizer::grams(token) {
+    if let Some(slot) = lex.gram_slot(&gram) {
+      if let Some(row) = lex.gram_row(slot) {
+        any = true;
+        for (slot, value) in out.iter_mut().zip(row) {
+          *slot += value;
+        }
+      }
+    }
+  }
+  if !any {
+    out.fill(0.0);
+  }
+}
+
+/// One token's finished vector: compose → ABTT → unit-normalize (uSIF normalizes word
+/// vectors before weighting — the paper's own §1 estimator description).
+pub(super) fn token_vector_via<L: TokenLexicon + ?Sized>(lex: &L, token: &str, out: &mut [f32]) -> bool {
+  compose_raw_via(lex, token, out);
+  if out.iter().all(|v| *v == 0.0) {
+    return false;
+  }
+  lex.abtt().apply(out);
+  let norm = out.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
+  if norm <= 0.0 || !norm.is_finite() {
+    return false;
+  }
+  let inverse = (1.0 / norm) as f32;
+  for value in out.iter_mut() {
+    *value *= inverse;
+  }
+  true
+}
+
+/// uSIF pooling WITHOUT sentence-component removal (training fits the components from
+/// exactly this): c̃ = (1/|s|) Σ w(p) · v(token).
+pub(super) fn pooled_document_via<L: TokenLexicon + ?Sized>(
+  lex: &L,
+  doc: &[String],
+  out: &mut [f32],
+) -> Result<(), ()> {
+  out.fill(0.0);
+  let mut token_vec = vec![0.0f32; lex.dim()];
+  let mut used = 0usize;
+  for token in doc {
+    if token_vector_via(lex, token, &mut token_vec) {
+      let weight = lex.usif().weight(lex.frequency(token)) as f32;
+      for (slot, value) in out.iter_mut().zip(&token_vec) {
+        *slot += weight * value;
+      }
+      used += 1;
+    }
+  }
+  if used == 0 {
+    return Err(());
+  }
+  let inverse = 1.0 / doc.len().max(1) as f32;
+  for value in out.iter_mut() {
+    *value *= inverse;
+  }
+  Ok(())
+}
+
+/// Embed arbitrary text: tokenize (the system-wide rules) → uSIF pooling → piecewise
+/// sentence-component removal → final L2 normalization. No representable token = the
+/// zero vector ("no semantic signal", exactly like the lexical embedder's empty case).
+pub(super) fn embed_text_via<L: TokenLexicon + ?Sized>(lex: &L, text: &str, out: &mut [f32]) {
+  debug_assert_eq!(out.len(), lex.dim());
+  let tokens = SubwordTokenizer::words(text);
+  if tokens.is_empty() || pooled_document_via(lex, &tokens, out).is_err() {
+    out.fill(0.0);
+    return;
+  }
+  lex.sentence().remove(out);
+  let norm = out.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
+  if norm > 0.0 && norm.is_finite() {
+    let inverse = (1.0 / norm) as f32;
+    for value in out.iter_mut() {
+      *value *= inverse;
+    }
+  } else {
+    out.fill(0.0);
+  }
 }
 
 /// The PPMI stream of one spilled count set (pull-based; re-streamable).
@@ -464,32 +610,12 @@ impl LearnedModel {
     Ok((prototype, report))
   }
 
-  /// Raw factor-space composition (fastText: word row + its gram rows; OOV = gram rows
-  /// alone). No ABTT, no normalization — callers post-process. A known word's stored
-  /// row already carries its gram sum (composed at train time), so the vocabulary path
-  /// is a straight copy — the gram walk runs only for OOV tokens.
+  /// [`compose_raw_via`] over this owned model — the pipeline exists once, generic
+  /// over [`TokenLexicon`]. Production goes through the generic pipeline directly;
+  /// this named surface serves the distributional diagnostics.
+  #[cfg(test)]
   fn compose_raw(&self, token: &str, out: &mut [f32]) {
-    if let Some(&word_id) = self.word_ids.get(token) {
-      let row = &self.word_rows[word_id as usize * self.dim..(word_id as usize + 1) * self.dim];
-      out.copy_from_slice(row);
-      return;
-    }
-    out.fill(0.0);
-    let mut any = false;
-    for gram in SubwordTokenizer::grams(token) {
-      if let Some(slot_id) = self.gram_table.slot(&gram) {
-        let start = slot_id as usize * self.dim;
-        if let Some(row) = self.gram_rows.get(start..start + self.dim) {
-          any = true;
-          for (slot, value) in out.iter_mut().zip(row) {
-            *slot += value;
-          }
-        }
-      }
-    }
-    if !any {
-      out.fill(0.0);
-    }
+    compose_raw_via(self, token, out);
   }
 
   /// Training-time composition of one vocabulary word from the RAW factor tables (word
@@ -514,49 +640,15 @@ impl LearnedModel {
     }
   }
 
-  /// One token's finished vector: compose → ABTT → unit-normalize (uSIF normalizes
-  /// word vectors before weighting — the paper's own §1 estimator description).
+  /// [`token_vector_via`] over this owned model (test/diagnostic surface, as above).
+  #[cfg(test)]
   fn token_vector(&self, token: &str, out: &mut [f32]) -> bool {
-    self.compose_raw(token, out);
-    if out.iter().all(|v| *v == 0.0) {
-      return false;
-    }
-    self.abtt.apply(out);
-    let norm = out.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
-    if norm <= 0.0 || !norm.is_finite() {
-      return false;
-    }
-    let inverse = (1.0 / norm) as f32;
-    for value in out.iter_mut() {
-      *value *= inverse;
-    }
-    true
+    token_vector_via(self, token, out)
   }
 
-  /// uSIF pooling WITHOUT sentence-component removal (used during training to fit the
-  /// components themselves): c̃ = (1/|s|) Σ w(p) · v(token).
+  /// [`pooled_document_via`] over this owned model.
   fn pooled_document(&self, doc: &[String], out: &mut [f32]) -> Result<(), ()> {
-    out.fill(0.0);
-    let mut token_vec = vec![0.0f32; self.dim];
-    let mut used = 0usize;
-    for token in doc {
-      if self.token_vector(token, &mut token_vec) {
-        let p = self.frequencies.get(token).copied().unwrap_or(0.0);
-        let weight = self.usif.weight(p) as f32;
-        for (slot, value) in out.iter_mut().zip(&token_vec) {
-          *slot += weight * value;
-        }
-        used += 1;
-      }
-    }
-    if used == 0 {
-      return Err(());
-    }
-    let inverse = 1.0 / doc.len().max(1) as f32;
-    for value in out.iter_mut() {
-      *value *= inverse;
-    }
-    Ok(())
+    pooled_document_via(self, doc, out)
   }
 
   /// Embed arbitrary text: tokenize (the system-wide rules) → uSIF pooling → piecewise
@@ -565,22 +657,7 @@ impl LearnedModel {
   /// A text with no representable token embeds as the zero vector — callers treat that
   /// as "no semantic signal", exactly like the lexical embedder's empty case.
   pub fn embed_text(&self, text: &str, out: &mut [f32]) {
-    debug_assert_eq!(out.len(), self.dim);
-    let tokens = SubwordTokenizer::words(text);
-    if tokens.is_empty() || self.pooled_document(&tokens, out).is_err() {
-      out.fill(0.0);
-      return;
-    }
-    self.sentence.remove(out);
-    let norm = out.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
-    if norm > 0.0 && norm.is_finite() {
-      let inverse = (1.0 / norm) as f32;
-      for value in out.iter_mut() {
-        *value *= inverse;
-      }
-    } else {
-      out.fill(0.0);
-    }
+    embed_text_via(self, text, out);
   }
 }
 

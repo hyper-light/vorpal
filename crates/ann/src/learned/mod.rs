@@ -33,9 +33,7 @@ pub use model::{
   COOC_WINDOW, DIMENSION_CLAMP, GRAM_BUCKET_BOUND, LearnedModel, MIN_COUNT, TrainReport,
   TrainResources,
 };
-pub use persist::{
-  LEARNED_MODEL_VERSION, load_model, model_bytes_compatible, model_to_bytes, save_model,
-};
+pub use persist::{LEARNED_MODEL_VERSION, ModelView, load_model, model_to_bytes, save_model};
 pub use pip::{
   PIP_ALPHA_EXPONENT, PipSelection, estimate_noise_sigma, select_dimension, soft_threshold,
 };

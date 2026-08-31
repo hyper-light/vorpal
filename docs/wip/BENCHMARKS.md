@@ -528,6 +528,41 @@ walk: `"socket buffer" AND "alloc" AND "packet"` eliminates honestly (pools
 15,767 / 13,523 / 4,942 at depth 2,763,928) in 0.54 s, from 1.08 s lexical;
 `"mutex lock" AND "interruptible"` keeps `mutex_lock_interruptible` at rank 0.
 
+### Zero-copy model open (VMD v3): the query side never materializes the model
+
+`ann.model.bin` moved to the v3 layout (`LEARNED_MODEL_VERSION` 3): fixed 56-byte
+header, 8-aligned numeric sections, u64 prefix-offset + u32 sorted-permutation tables,
+raw term blobs — every boundary header-derivable. `Searcher::open` now maps the file
+(`ModelView`: full-checksum verify, checked section arithmetic, typed refusal of any
+malformed byte) and looks tokens up by in-place binary search; only ABTT/sentence/uSIF
+materialize (~KB). The owned loader remains the training/test form, and BOTH backings
+run the one generic pipeline (`TokenLexicon`), pinned bit-identical by test.
+
+`sweep_semantic -- <model> --model-open` (median of 3, page-cache warm):
+
+| model | owned load | mapped view |
+|---|---:|---:|
+| linux, 467 MB (dim 249) | 107.1 ms | **32.2 ms** (≈ the xxh3 pass) |
+| cpython, 69 MB (dim 238) | 17.3 ms | **4.7 ms** |
+
+One-shot CLI searches on the learned tier, open included (`VORPAL_NO_AUTOWARM=1`,
+best-of-3): linux `socket buffer alloc` k=10 **0.06 s** (top hit `socket_alloc`, the
+learned signature), k=2000 mid-range 0.08 s; cpython 0.01–0.02 s. Beyond wall time,
+the mapped open removes the per-open allocation of the full table set (467 MB of rows
+plus term/frequency hash maps) — the daemon-fleet and one-shot CLI cost the plan
+flagged.
+
+**Freshness law hardened by an incident**: the v3 layout initially landed WITHOUT its
+version bump, so v2-layout files passed the cheap prefix gate (magic+version) yet
+misparsed past the header — warms no-op'd "fresh" while queries fell back to lexical.
+Degradation was safe by construction (typed errors → lexical answers; a detached
+autowarm even self-healed the kernel index in the background), but the wedge class is
+real, so the gate is now structural: **the build-side freshness check IS the
+query-side open** — `ann_is_fresh` (learned) runs `ModelView::open` and compares the
+sealed checksum, ~32 ms per kernel-scale freshness check. Prefix gates and readers can
+drift; one shared criterion cannot. Regression-proved: v2-layout files under the fixed
+binary read stale and retrain (cpython 7.0 s, linux 79.9 s, files re-stamp v3).
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal
