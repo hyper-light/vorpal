@@ -9,6 +9,14 @@
 //! re-marks dirty so the next query retries. Filtering only ever *keeps* the flag clean for
 //! provably irrelevant events: reads, hidden trees (`.vorpal`, `.git` — which also breaks the
 //! rebuild→index-write→event cycle), and gitignored paths (`target/` build churn).
+//!
+//! One doubt no callback can observe: SILENT non-delivery. FSEvents may defer events past
+//! any deadline with no error and no overflow flag (event-trace-proven on a loaded APFS
+//! box — the full history arrived in one coalesced burst tens of seconds late), so a clean
+//! flag certifies freshness only while the channel is live. The daemon's liveness backstop
+//! (server.rs `refresh`, `BACKSTOP_OVERHEAD_INVERSE`) closes that hole by re-verifying
+//! against the retained manifest on an amortized budget. `VORPAL_WATCH_TRACE=1` dumps every
+//! callback delivery (timestamped, pre-filter) — the diagnostic that proved the burst.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -59,6 +67,9 @@ impl SourceWatch {
     let capture = Arc::clone(&changed);
     let root = src.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+      if std::env::var_os("VORPAL_WATCH_TRACE").is_some() {
+        eprintln!("[watch {:?}] {:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default(), result);
+      }
       match result {
         Ok(event) => {
           if event_is_relevant(&root, &ignore, &event) {
@@ -92,7 +103,11 @@ impl SourceWatch {
       }
     })
     .ok()?;
-    watcher.watch(&src, RecursiveMode::Recursive).ok()?;
+    let armed = watcher.watch(&src, RecursiveMode::Recursive);
+    if std::env::var_os("VORPAL_WATCH_TRACE").is_some() {
+      eprintln!("[watch] armed on {}: {:?}", src.display(), armed.as_ref().err());
+    }
+    armed.ok()?;
     Some(SourceWatch {
       src,
       dirty,

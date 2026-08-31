@@ -146,12 +146,25 @@ pub struct Server {
   /// committed tier) and per-edit updates — the tier travels INTO the task and back, so
   /// the serve path never blocks on O(n) id refreshes.
   live_ann: Option<vorpal_index::live_ann::LiveAnnTier>,
-  live_ann_task: Option<std::thread::JoinHandle<Option<vorpal_index::live_ann::LiveAnnTier>>>,
+  live_ann_task: Option<
+    std::thread::JoinHandle<
+      Result<vorpal_index::live_ann::LiveAnnTier, vorpal_index::live_ann::AdoptDecline>,
+    >,
+  >,
   /// Edit churn that arrived while a tier task was in flight — applied at reap.
   pending_churn: Vec<(Vec<u64>, Vec<u64>)>,
-  /// The generation an adopt already failed against — never retry the same one (the next
-  /// commit changes the generation and clears the latch).
-  live_ann_failed_gen: Option<PathBuf>,
+  /// Adoption latch: the generation adoption last declined against, how many attempts
+  /// it has consumed there, and whether a completed warm re-armed one retry. Bounds
+  /// EVERY decline class — known or future — to at most
+  /// [`LIVE_ANN_ATTEMPTS_PER_GENERATION`] attempts per generation: a curable decline
+  /// gets exactly one warm-mediated retry; an incurable one (flat tier for this corpus
+  /// size) consumes the whole budget at once. The next commit changes the generation
+  /// and naturally re-opens the question.
+  live_ann_latch: Option<LiveAnnLatch>,
+  /// Liveness backstop clocks (see `refresh`): when the last manifest stat sweep ran and
+  /// what it cost. `None` cost = never measured; the first eligible quiet query measures.
+  last_sweep_at: Option<std::time::Instant>,
+  last_sweep_cost: Option<std::time::Duration>,
   /// Set when the served graph advances past an in-flight live-ANN task: the reap
   /// drops that task's result instead of installing a tier keyed to a retired graph.
   live_ann_discard_task: bool,
@@ -181,6 +194,29 @@ fn overlay_enabled() -> bool {
 /// Eager ANN warming is on by default; `VORPAL_NO_AUTOWARM=1` (or `true`/`yes`) switches the
 /// daemon to fully lazy vector-tier builds — the first semantic search pays instead. For
 /// benchmarking, constrained machines, and operators who never use semantic search.
+/// Adoption attempts a single generation may consume: the artifacts have exactly two
+/// observable states per generation — as committed, and as rewritten by the one classic
+/// warm a failed adopt requests — so two judgments exhaust the information available.
+/// A structural count, not a tuning value; anything still declining past it is
+/// generation-inherent and waits for the next commit.
+const LIVE_ANN_ATTEMPTS_PER_GENERATION: u8 = 2;
+
+/// See `Server::live_ann_latch`.
+struct LiveAnnLatch {
+  generation: PathBuf,
+  attempts: u8,
+  /// A warm landed since the last attempt — the one signal that may justify a retry
+  /// (the warm rewrote the artifacts the last judgment saw). Consumed by the retry.
+  rearmed: bool,
+}
+
+/// Wall-time share the liveness-backstop sweep may consume on the quiet query path
+/// (`refresh`): the sweep re-runs only after 100× its own measured duration has elapsed,
+/// i.e. a stated <=1% overhead budget. The PERIOD is therefore data-derived per corpus —
+/// microseconds-scale trees re-check within milliseconds, kernel-scale trees every few
+/// seconds — and the constant is the policy share, not a tuned interval.
+const BACKSTOP_OVERHEAD_INVERSE: u32 = 100;
+
 fn autowarm_enabled() -> bool {
   !matches!(
     std::env::var("VORPAL_NO_AUTOWARM").ok().as_deref(),
@@ -270,7 +306,9 @@ impl Server {
       live_ann: None,
       live_ann_task: None,
       pending_churn: Vec::new(),
-      live_ann_failed_gen: None,
+      live_ann_latch: None,
+      last_sweep_at: None,
+      last_sweep_cost: None,
       live_ann_discard_task: false,
       watch,
     };
@@ -305,24 +343,44 @@ impl Server {
       return;
     }
     if let Some(handle) = self.live_ann_task.take() {
-      let joined = handle.join().ok().flatten();
+      // A panicked task is a curable decline: nothing about the generation was judged.
+      let joined = handle
+        .join()
+        .unwrap_or(Err(vorpal_index::live_ann::AdoptDecline { curable: true }));
       if std::mem::take(&mut self.live_ann_discard_task) {
         // The graph this task computed against is no longer the served one — drop the
         // result; the commit that retired the tier already queued a fresh adoption.
         vorpal_kg::phase_stamp("live-ann: discarded stale task result");
         return;
       }
-      self.live_ann = joined;
-      if self.live_ann.is_some() {
-        vorpal_kg::phase_stamp("live-ann: tier ready");
-        self.live_ann_failed_gen = None;
-      } else {
-        vorpal_kg::phase_stamp("live-ann: adoption failed for this generation");
-        self.live_ann_failed_gen = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
-        // The tier is gone (failed adopt, or an update task died) and its presence was
-        // suppressing warms: hand the generation to the classic warm now. The failed-gen
-        // latch keeps this bounded to one rebuild per generation.
-        self.request_warm();
+      match joined {
+        Ok(tier) => {
+          vorpal_kg::phase_stamp("live-ann: tier ready");
+          self.live_ann = Some(tier);
+          self.live_ann_latch = None;
+        }
+        Err(decline) => {
+          let generation = vorpal_kg::resolve_index_dir(&self.index_dir);
+          let attempts = match &self.live_ann_latch {
+            Some(latch) if latch.generation == generation => latch.attempts,
+            _ => 0,
+          };
+          let attempts = if decline.curable {
+            attempts.saturating_add(1)
+          } else {
+            // Generation-inherent: no warm can change the verdict — spend the budget.
+            LIVE_ANN_ATTEMPTS_PER_GENERATION
+          };
+          vorpal_kg::phase_stamp(&format!(
+            "live-ann: declined for this generation ({}, attempt {attempts}/{LIVE_ANN_ATTEMPTS_PER_GENERATION})",
+            if decline.curable { "curable" } else { "incurable" },
+          ));
+          self.live_ann_latch = Some(LiveAnnLatch { generation, attempts, rearmed: false });
+          // The tier is absent and its presence was suppressing warms: hand the
+          // generation to the classic warm (stamp-guarded — a fresh sidecar no-ops).
+          // The attempts budget above keeps the warm→retry cycle bounded.
+          self.request_warm();
+        }
       }
     }
     if self.live_ann.is_some() && !self.pending_churn.is_empty() {
@@ -345,16 +403,39 @@ impl Server {
     {
       return;
     }
-    // One attempt per generation: a failed adopt (no tier, foreign model, churn ceiling)
-    // waits for the next commit — or the next warm — instead of spinning.
-    if self
-      .live_ann_failed_gen
-      .as_ref()
-      .is_some_and(|failed| *failed == vorpal_kg::resolve_index_dir(&self.index_dir))
-    {
+    let Some(kg) = self.kg.clone() else { return };
+    // Structural gate: below the quantized-graph floor the committed tier is provably
+    // flat and adoption can never succeed — decide with one integer compare instead of
+    // a thread spawn + a tier load whose verdict is predetermined (the sub-floor case
+    // is every small repo). While ANY latch stands the hot path is compare + Option
+    // check, no CURRENT resolve; the stamp fires on the transition, not per query.
+    if !vorpal_index::live_ann::quantized_tier_possible(kg.node_count()) {
+      if self.live_ann_latch.is_none() {
+        vorpal_kg::phase_stamp(&format!(
+          "live-ann: inapplicable (n={} at or below the quantized-graph floor)",
+          kg.node_count(),
+        ));
+        self.live_ann_latch = Some(LiveAnnLatch {
+          generation: vorpal_kg::resolve_index_dir(&self.index_dir),
+          attempts: LIVE_ANN_ATTEMPTS_PER_GENERATION,
+          rearmed: false,
+        });
+      }
       return;
     }
-    let Some(kg) = self.kg.clone() else { return };
+    // Budgeted latch: a declined generation is retried only while budget remains AND a
+    // warm re-armed the question by rewriting the artifacts the last judgment saw.
+    if let Some(latch) = &mut self.live_ann_latch {
+      if latch.generation == vorpal_kg::resolve_index_dir(&self.index_dir) {
+        if latch.attempts >= LIVE_ANN_ATTEMPTS_PER_GENERATION || !latch.rearmed {
+          return;
+        }
+        latch.rearmed = false; // consume the retry
+      } else {
+        // New generation: the question re-opens from scratch.
+        self.live_ann_latch = None;
+      }
+    }
     let index_dir = self.index_dir.clone();
     vorpal_kg::phase_stamp("live-ann: adopt spawned");
     self.live_ann_task = Some(std::thread::spawn(move || {
@@ -367,7 +448,16 @@ impl Server {
   /// against the newly served graph, tombstone removed eids, insert added ones (~ms each).
   fn spawn_live_ann_update(&mut self, churn: Vec<(Vec<u64>, Vec<u64>)>) {
     let Some(mut tier) = self.live_ann.take() else {
-      self.pending_churn.extend(churn);
+      // No tier to maintain. Queue only if one can ever exist for this corpus size:
+      // sub-floor corpora previously accumulated churn here UNBOUNDED (the tier never
+      // adopts, and only an adopted tier drains the queue).
+      if self
+        .kg
+        .as_ref()
+        .is_some_and(|kg| vorpal_index::live_ann::quantized_tier_possible(kg.node_count()))
+      {
+        self.pending_churn.extend(churn);
+      }
       return;
     };
     let Some(kg) = self.kg.clone() else {
@@ -391,7 +481,7 @@ impl Server {
       // Quality is measured, not assumed: anchor the baseline on the first update, then
       // re-probe per churn step; a degraded probe latches the compaction trigger.
       tier.probe_if_due();
-      Some(tier)
+      Ok(tier)
     }));
   }
 
@@ -492,12 +582,16 @@ impl Server {
   }
 
   /// Reap a finished warm (non-blocking). A completed warm rewrote this generation's ANN
-  /// artifacts IN PLACE, so the per-generation adoption latch must not outlive the
-  /// artifacts it judged — clearing it lets the next pass adopt the rebuilt tier.
+  /// artifacts IN PLACE, so a CURABLE decline's judgment is stale — re-arm one retry.
+  /// The latch itself survives (its attempts budget is the spin fence: adopt → fail →
+  /// warm → retry forever was exactly the loop that buried this daemon's watcher in its
+  /// own artifact churn on every sub-floor corpus).
   fn reap_warm(&mut self) {
     if self.warm.as_ref().is_some_and(|h| h.is_finished()) {
       let _ = self.warm.take().map(std::thread::JoinHandle::join);
-      self.live_ann_failed_gen = None;
+      if let Some(latch) = &mut self.live_ann_latch {
+        latch.rearmed = true;
+      }
     }
   }
 
@@ -699,18 +793,43 @@ impl Server {
     let Some(watch) = &self.watch else {
       return Ok(());
     };
+    let mut backstop = false;
     if self.kg.is_some() && !watch.take_dirty() {
-      return Ok(());
+      // Liveness backstop: a clean flag is necessary-condition evidence ONLY while the
+      // OS channel is actually delivering — and FSEvents can defer delivery beyond any
+      // deadline with no error and no overflow flag (event-trace-proven on a loaded
+      // APFS box: the full event history arrived in one coalesced burst, tens of
+      // seconds late). So when the stat-sweep lane is available and the amortized
+      // budget allows (see BACKSTOP_OVERHEAD_INVERSE — period = 100× the sweep's own
+      // measured cost), re-verify the tree against the retained manifest instead of
+      // trusting silence. Worst-case staleness under a wedged watcher drops from
+      // unbounded to one period, self-scaled per corpus; the common quiet query stays
+      // one atomic load + one clock read.
+      let lane_ready = overlay_enabled() && self.env.is_default() && self.overlay.is_some();
+      let due = match (self.last_sweep_at, self.last_sweep_cost) {
+        (Some(at), Some(cost)) => at.elapsed() >= cost * BACKSTOP_OVERHEAD_INVERSE,
+        // Never swept or never timed: the first eligible quiet query bootstraps the
+        // measurement the period derives from.
+        _ => true,
+      };
+      if !(lane_ready && due) {
+        return Ok(());
+      }
+      backstop = true;
     }
     // Hinted revalidation: a COMPLETE captured change set patches the prior manifest in
     // place of the stat sweep (SUBSECOND.md 1c). Certainty gaps (`None`) and every 64th
     // hinted rebuild (belt-and-braces reconciliation) take the full sweep; the committed
     // generation is identical either way (pinned by crates/index/tests/hinted_scan.rs).
-    let hints = watch.take_changes();
+    // Backstop entries deliberately IGNORE the capture set: the flag was clean, so a
+    // complete capture is empty — and an empty hint set would route to the probe
+    // short-circuit, not the sweep this entry exists to run.
+    let hints = if backstop { None } else { watch.take_changes() };
     // Decision telemetry (VORPAL_PHASE_TRACE): which freshness tier a dirty pass takes is
     // the first question every daemon-latency investigation asks — stamp the input.
     match &hints {
       Some(paths) => vorpal_kg::phase_stamp(&format!("refresh: captured {} path(s)", paths.len())),
+      None if backstop => vorpal_kg::phase_stamp("refresh: backstop sweep (watcher quiet)"),
       None => vorpal_kg::phase_stamp("refresh: capture lost"),
     }
     let src = watch.src().to_path_buf();
@@ -723,21 +842,37 @@ impl Server {
       Some(paths) => Some(paths.clone()),
       None => {
         if overlay_enabled() && self.kg.is_some() && self.env.is_default() {
-          match self.overlay.as_ref().map(|overlay| overlay.stat_changes(&src)) {
+          let sweep_started = std::time::Instant::now();
+          let swept = self.overlay.as_ref().map(|overlay| overlay.stat_changes(&src));
+          if swept.is_some() {
+            // Both outcomes measure: the period the backstop derives must reflect what
+            // a sweep costs HERE, on this corpus, on this filesystem — success or not.
+            self.last_sweep_cost = Some(sweep_started.elapsed());
+            self.last_sweep_at = Some(std::time::Instant::now());
+          }
+          match swept {
             Some(Ok(paths)) => {
               vorpal_kg::phase_stamp(&format!(
-                "refresh: stat sweep recovered {} path(s)",
-                paths.len()
+                "refresh: stat sweep recovered {} path(s) in {:?}",
+                paths.len(),
+                self.last_sweep_cost.unwrap_or_default(),
               ));
               if paths.is_empty() {
-                // Spurious wake: the tree stat-matches the retained manifest exactly —
-                // nothing to rebuild, nothing to serve differently.
+                // Spurious wake (or a quiet backstop pass): the tree stat-matches the
+                // retained manifest exactly — nothing to rebuild, nothing to serve
+                // differently.
                 return Ok(());
               }
               Some(paths)
             }
             Some(Err(err)) => {
               vorpal_kg::phase_stamp(&format!("refresh: stat sweep failed ({err})"));
+              if backstop {
+                // The flag never fired — nothing asserted the tree changed. Serving on
+                // is the stock behavior; the next period retries the sweep. Falling
+                // through would run the FULL pipeline on a quiet daemon.
+                return Ok(());
+              }
               None
             }
             None => None,

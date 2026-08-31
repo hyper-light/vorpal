@@ -392,6 +392,15 @@ impl AnnIndex {
     self.ids[row]
   }
 
+  /// Whether this tier carries the quantized traversal graph the live daemon overlay
+  /// wraps (Vamana builds only). Flat tiers — every corpus at or below the
+  /// [`AnnConfig::for_n`] floor, and the opt-in FlatQuantized config — have none: the
+  /// live tier declines them by design and search serves through the committed flat
+  /// scan, which is already exact at those sizes.
+  pub fn has_quantized_graph(&self) -> bool {
+    self.quant.is_some()
+  }
+
   pub fn len(&self) -> usize {
     self.ids.len()
   }

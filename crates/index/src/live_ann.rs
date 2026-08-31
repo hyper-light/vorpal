@@ -56,6 +56,30 @@ pub struct LiveAnnTier {
   degraded: bool,
 }
 
+/// Whether a corpus of `node_count` nodes can EVER have an adoptable live tier: the
+/// builder quantizes only above the [`vorpal_ann::AnnConfig::for_n`] floor, and it embeds
+/// a strict subset of nodes (`semantic_row_ids` filters Imports), so
+/// `node_count <= floor  ⇒  rows <= floor  ⇒  the committed tier is flat  ⇒  adoption
+/// declines`. The daemon consults this BEFORE spawning any adoption work — the common
+/// small-repo case costs one integer compare instead of a thread + a tier load whose
+/// verdict is predetermined. Above the floor the artifact itself stays the authority
+/// (Import subtraction can still land the row count under the floor; the adopt's
+/// quantized-graph check catches that band).
+pub fn quantized_tier_possible(node_count: usize) -> bool {
+  vorpal_ann::AnnConfig::for_n(node_count) == vorpal_ann::AnnConfig::Vamana
+}
+
+/// Why an adoption produced no tier — and whether a classic warm could change the
+/// verdict. `curable: false` declines are properties of the GENERATION itself (a flat
+/// base tier for this corpus size class): rebuilding the same artifacts can never cure
+/// them, so the daemon's latch must survive warms until the next commit changes the
+/// generation. Every decline is phase-stamped where it is decided — a silent decline is
+/// what let the adopt→warm→re-adopt spin hide inside "environmental" test noise.
+#[derive(Clone, Copy, Debug)]
+pub struct AdoptDecline {
+  pub curable: bool,
+}
+
 impl LiveAnnTier {
   /// Adopt the committed generation's tier, re-keyed by eids — **stale-tolerant**: on an
   /// actively edited tree the classic warm can never land a tier that is still fresh by
@@ -67,21 +91,38 @@ impl LiveAnnTier {
   /// behind the persisted tier is (bounded by the overlay ceiling — past that, `None` and
   /// the classic warm rebuilds densely).
   ///
-  /// `None` when: no/foreign-model tier, flat tier, pre-eid segment, or churn beyond the
-  /// reconciliation ceiling — callers keep the classic path.
-  pub fn adopt(generation_dir: &Path, kg: &Kg) -> Option<Self> {
+  /// Declines (typed, every one stamped): no/foreign-model tier, unreadable tier, or churn
+  /// beyond the reconciliation ceiling — curable, the classic warm may retry once; a flat
+  /// base tier — incurable for this generation, the caller latches until the next commit.
+  pub fn adopt(generation_dir: &Path, kg: &Kg) -> Result<Self, AdoptDecline> {
     let embedder = active_embedder();
     let dim = embedder.dim();
-    // Model-provenance gate: reconciliation can bridge GENERATION drift, never MODEL drift.
+    // Model-provenance gate: reconciliation can bridge GENERATION drift, never MODEL
+    // drift. Curable: a warm with the ACTIVE embedder rewrites provenance.
     if persisted_model_provenance(generation_dir).as_ref() != Some(&embedder.provenance()) {
       vorpal_kg::phase_stamp("live-ann: adopt declined (model provenance missing/foreign)");
-      return None;
+      return Err(AdoptDecline { curable: true });
     }
+    // Curable: the warm builds exactly these artifacts.
     let Some(view) = annfiles::OverlayView::assemble(generation_dir, kg, dim) else {
       vorpal_kg::phase_stamp("live-ann: adopt declined (no reconcilable tier artifacts)");
-      return None;
+      return Err(AdoptDecline { curable: true });
     };
-    let ann = AnnIndex::load(&generation_dir.join("ann.bin")).ok()?;
+    let ann = match AnnIndex::load(&generation_dir.join("ann.bin")) {
+      Ok(ann) => ann,
+      Err(err) => {
+        // Curable: an unreadable/corrupt tier file is what the warm rewrites.
+        vorpal_kg::phase_stamp(&format!("live-ann: adopt declined (ann.bin unreadable: {err})"));
+        return Err(AdoptDecline { curable: true });
+      }
+    };
+    // INCURABLE: a flat base tier is a property of the generation's size class — the
+    // warm rebuilds the same flat tier forever. Latching this (instead of re-warming)
+    // is what broke the adopt→fail→warm→re-adopt spin every small-repo daemon ran.
+    if !ann.has_quantized_graph() {
+      vorpal_kg::phase_stamp("live-ann: adopt declined (flat base tier — below the quantized-graph floor)");
+      return Err(AdoptDecline { curable: false });
+    }
     let mut eids = Vec::with_capacity(ann.len());
     let mut dead_sentinels: Vec<u64> = Vec::new();
     for row in 0..ann.len() {
@@ -98,7 +139,12 @@ impl LiveAnnTier {
         }
       }
     }
-    let overlay = AnnOverlay::adopt_with_ids(ann, eids)?;
+    let Some(overlay) = AnnOverlay::adopt_with_ids(ann, eids) else {
+      // Post-quant-check this is unexpected; stamped and curable so ONE warm-mediated
+      // retry happens — the server's attempts cap bounds anything persistent.
+      vorpal_kg::phase_stamp("live-ann: adopt declined (overlay refused the base tier)");
+      return Err(AdoptDecline { curable: true });
+    };
     let mut tier = Self {
       overlay,
       eid_to_id: HashMap::new(),
@@ -126,7 +172,7 @@ impl LiveAnnTier {
       tier.overlay.dead_len(),
       view.overlay_ids.len(),
     ));
-    Some(tier)
+    Ok(tier)
   }
 
   /// Rebuild the eid → node-id translation for a newly served generation. O(n); the daemon
@@ -218,5 +264,19 @@ impl LiveAnnTier {
 
   pub fn live_len(&self) -> usize {
     self.overlay.live_len()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  /// The floor law the daemon's structural gate leans on: `semantic_row_ids` embeds a
+  /// strict subset of nodes, so `node_count <= floor` PROVES the committed tier is flat.
+  /// This pins the predicate to the builder's own config law — if `AnnConfig::for_n`
+  /// ever moves, this fails instead of silently re-opening the adopt spin.
+  #[test]
+  fn quantized_floor_matches_the_builder_law() {
+    assert!(!super::quantized_tier_possible(0));
+    assert!(!super::quantized_tier_possible(65_536));
+    assert!(super::quantized_tier_possible(65_537));
   }
 }
