@@ -695,14 +695,18 @@ impl OutlineExtractor {
 }
 
 /// Local definition layout for reference attribution: index 0 = the file, then items and their
-/// members in the same order as the graph writer. Entity paths come from
-/// [`vorpal_kg::layout_entity_paths`] — the single identity authority — so a reference resolves
-/// to exactly the node the writer created, overloads included. Spans are built in lockstep so
-/// each entity index maps to its byte range.
-pub(crate) fn local_layout(
-  items: &[OutlineItem<'_>],
-) -> (Vec<String>, Vec<(std::ops::Range<usize>, NodeId)>) {
-  let entities = vorpal_kg::layout_entity_paths(items);
+/// members in the same order as the graph writer. Entity identities come from
+/// [`vorpal_kg::layout_entity_identities`] — borrowed views of the single identity authority
+/// (the [`vorpal_kg::layout_entity_paths`] convention) — so a reference resolves to exactly
+/// the node the writer created, overloads included, without a rendered `String` per entity.
+/// Spans are built in lockstep so each entity index maps to its byte range.
+pub(crate) fn local_layout<'a>(
+  items: &'a [OutlineItem<'_>],
+) -> (
+  Vec<vorpal_kg::EntityIdentity<'a>>,
+  Vec<(std::ops::Range<usize>, NodeId)>,
+) {
+  let entities = vorpal_kg::layout_entity_identities(items);
   let mut spans: Vec<(std::ops::Range<usize>, NodeId)> = vec![(0..usize::MAX, NodeId::new(0))];
   let mut idx = 1u64;
   for item in items {

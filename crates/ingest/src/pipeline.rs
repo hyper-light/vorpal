@@ -1351,14 +1351,14 @@ fn apply_parts<'a, 'i>(
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
   writer.forget_identity_scope();
-  // ONE layout per file, and the writer hands back each layout position's NodeId in the
-  // same order (spans[0] = the file node, then items and members in walk order — the
-  // exact order product entity indices use). Attribution below is therefore ARRAY
-  // INDEXING; the per-reference canonical lookup this replaces hashed (blake3) the
-  // path+entity strings ~5.8M times per kernel link. An out-of-range index — a corrupt
-  // product — still simply drops the row.
-  let entity_paths = vorpal_kg::layout_entity_paths(items);
-  let spans = writer.ingest_file_with_layout(path, items, &entity_paths);
+  // The writer hands back each layout position's NodeId in walk order (spans[0] = the file
+  // node, then items and members — the exact order product entity indices use), rendering
+  // each identity path into one reused buffer as it walks. Attribution below is therefore
+  // ARRAY INDEXING; the per-reference canonical lookup this replaces hashed (blake3) the
+  // path+entity strings ~5.8M times per kernel link, and the per-file layout `Vec<String>`
+  // it once consumed was ~9 % of stream-phase allocation samples. An out-of-range index —
+  // a corrupt product — still simply drops the row.
+  let spans = writer.ingest_file_with_spans(path, items);
   let id_at = |index: u32| spans.get(index as usize).map(|(_, id)| *id);
   // Intern the file's path once; every reference carries the 4-byte id.
   let path_id = interner.intern(path);

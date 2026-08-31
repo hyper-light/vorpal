@@ -26,7 +26,7 @@ pub mod communities;
 pub mod ledger;
 pub mod observed;
 mod scc;
-pub use writer::{KgWriter, NodeDef, layout_entity_paths};
+pub use writer::{EntityIdentity, KgWriter, NodeDef, layout_entity_identities, layout_entity_paths};
 
 pub use vorpal_graph::{Direction, EdgeLog, EdgeType, ReachStep};
 pub use vorpal_segment::NodeId;

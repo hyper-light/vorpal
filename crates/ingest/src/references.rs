@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 
 use vorpal_core::tree_sitter::StrDoc;
 use vorpal_core::{Language, Node};
-use vorpal_kg::NodeId;
+use vorpal_kg::{EntityIdentity, NodeId};
 use vorpal_lang_registry::SgLang;
 use vorpal_language::SupportLang;
 use vorpal_resolve::{RefForm, RefKind};
@@ -1737,13 +1737,13 @@ enum Pending<'t> {
 /// each node costs a single dense kind-id table lookup that dispatches import / type /
 /// implements / call handling, and type-parameter binder collection rides the same walk
 /// instead of a second full pass. `entities` maps each local definition id in `def_spans` to
-/// its entity path — the source of enclosing-owner names for `self.`/`Self::` attribution.
+/// its borrowed identity — the source of enclosing-owner names for `self.`/`Self::` attribution.
 #[cfg_attr(not(test), allow(dead_code))] // the thin no-facts wrapper is the test harness's surface
 pub(crate) fn extract_references<'t>(
   root: SgNode<'t>,
   resolved: &ResolvedRefSpec,
   def_spans: &[(Range<usize>, NodeId)],
-  entities: &[String],
+  entities: &[EntityIdentity<'_>],
   out: &mut Vec<RawRef<'t>>,
 ) {
   extract_references_with_facts(
@@ -1768,7 +1768,7 @@ pub(crate) fn extract_references_with_facts<'t>(
   resolved: &ResolvedRefSpec,
   typefacts: Option<&crate::typefacts::ResolvedTypeFacts>,
   def_spans: &[(Range<usize>, NodeId)],
-  entities: &[String],
+  entities: &[EntityIdentity<'_>],
   out: &mut Vec<RawRef<'t>>,
   bindings: &mut Vec<crate::typefacts::RawBinding<'t>>,
   requests_out: &mut Vec<RawRequest<'t>>,
@@ -1961,7 +1961,7 @@ fn classify_call<'t>(
   cspec: &CallSpecData,
   callee: &SgNode<'t>,
   spec: &RefSpecData,
-  entities: &[String],
+  entities: &[EntityIdentity<'_>],
   from: NodeId,
 ) -> (RefForm, Option<Cow<'t, str>>, Option<Cow<'t, str>>) {
   let owner = || owner_of_entity(entities, from).map(Cow::Owned);
@@ -2135,11 +2135,12 @@ fn classify_receiver<'t>(
 }
 
 
-/// The top-level item owning an already-resolved enclosing definition (`Kg.load` → `Kg`).
-fn owner_of_entity(entities: &[String], from: NodeId) -> Option<String> {
-  let entity = entities.get(from.raw() as usize)?;
-  let owner = entity.split('.').next().unwrap_or(entity);
-  (!owner.is_empty()).then(|| owner.to_string())
+/// The top-level item owning an already-resolved enclosing definition (`Kg.load` → `Kg`):
+/// exactly the rendered entity path's `split('.').next()` (non-empty-filtered), reconstructed
+/// from the borrowed identity by [`EntityIdentity::owner_segment`] so no per-entity path
+/// `String` is ever built.
+fn owner_of_entity(entities: &[EntityIdentity<'_>], from: NodeId) -> Option<String> {
+  entities.get(from.raw() as usize)?.owner_segment()
 }
 
 /// Leaf kinds a type-parameter binder name can be.
@@ -2840,7 +2841,7 @@ mod tests {
     let spec = resolved_ref_spec(lang).expect("language has a ref spec");
     let grep = lang.grep(src);
     let spans = vec![(0..usize::MAX, NodeId::new(0))];
-    let entities = vec![String::new()];
+    let entities = vec![EntityIdentity::FILE];
     let mut out = Vec::new();
     extract_references(grep.root(), spec, &spans, &entities, &mut out);
     out
@@ -2968,7 +2969,10 @@ mod tests {
       (0..usize::MAX, NodeId::new(0)),
       (0..src.len(), NodeId::new(1)),
     ];
-    let entities = vec![String::new(), "Kg".to_string()];
+    let entities = vec![
+      EntityIdentity::FILE,
+      EntityIdentity::new(None, "Kg", vorpal_kg::SymbolKind::Struct, ""),
+    ];
     let mut out = Vec::new();
     extract_references(grep.root(), spec, &spans, &entities, &mut out);
 
@@ -3105,7 +3109,7 @@ mod tests {
     root: SgNode<'t>,
     resolved: &ResolvedRefSpec,
     def_spans: &[(Range<usize>, NodeId)],
-    entities: &[String],
+    entities: &[EntityIdentity<'_>],
     out: &mut Vec<RawRef<'t>>,
   ) {
     let spec = &*resolved.spec;
@@ -3326,7 +3330,7 @@ mod tests {
     lang: SupportLang,
     src: &str,
     def_spans: &[(Range<usize>, NodeId)],
-    entities: &[String],
+    entities: &[EntityIdentity<'_>],
     context: &str,
   ) {
     let lang = SgLang::from(lang);
@@ -3388,7 +3392,7 @@ mod tests {
       (L::Hcl, "locals {\n  a = upper(\"x\")\n}\n"),
     ];
     let spans = vec![(0..usize::MAX, NodeId::new(0))];
-    let entities = vec![String::new()];
+    let entities = vec![EntityIdentity::FILE];
     for (lang, src) in battery {
       assert_fused_matches_reference(*lang, src, &spans, &entities, &format!("{lang:?} snippet"));
     }

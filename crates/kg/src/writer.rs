@@ -183,30 +183,7 @@ impl KgWriter {
     path: &str,
     items: &[OutlineItem<'_>],
   ) -> Vec<(Range<usize>, NodeId)> {
-    // Entity paths in layout order (index 0 = file), disambiguated so overloads and same-name
-    // different-kind siblings stay distinct. Every ingest path sources identity from
-    // `layout_entity_paths`, so the conventions can never drift apart.
-    let entity_paths = layout_entity_paths(items);
-    self.ingest_file_with_layout(path, items, &entity_paths)
-  }
-
-  /// [`KgWriter::ingest_file_with_spans`] with the entity-path layout supplied by the caller —
-  /// for callers that already computed it (the committer's apply path builds the same layout
-  /// for reference attribution; recomputing it here was a per-entity `String` build measured
-  /// at ~5 % of stream-phase allocations). `entity_paths` MUST be
-  /// [`layout_entity_paths`]`(items)` — the debug assertion pins the lockstep.
-  pub fn ingest_file_with_layout(
-    &mut self,
-    path: &str,
-    items: &[OutlineItem<'_>],
-    entity_paths: &[String],
-  ) -> Vec<(Range<usize>, NodeId)> {
     let mut spans = Vec::new();
-    debug_assert_eq!(
-      entity_paths.len(),
-      1 + items.iter().map(|i| 1 + i.members.len()).sum::<usize>(),
-      "entity_paths must be layout_entity_paths(items)"
-    );
     // Intern the path bytes once for this whole file: every node of the file shares one heap
     // copy via identical (offset, len) column entries — reader-compatible, and it removes the
     // dominant heap duplication (at kernel scale, ~130 MB of repeated path strings for
@@ -226,13 +203,17 @@ impl KgWriter {
     // attribute to it when no smaller item/member span contains them.
     spans.push((0..usize::MAX, file_id));
 
-    let mut next = 1usize; // walks `entity_paths` in lockstep with the item/member traversal
+    // Each entity's identity path is rendered into ONE reused buffer by the same
+    // `write_entity_path_into` that backs `layout_entity_paths` — the conventions are shared
+    // by construction (no lockstep to assert), and the per-file layout `Vec<String>` this
+    // replaces was ~9 % of stream-phase allocation samples at kernel scale.
+    let mut entity_buf = String::new();
     for item in items {
       let name = item.entry.name.as_ref();
       let signature = item.entry.signature.as_ref();
       let kind = SymbolKind::from_symbol_type(item.entry.symbol_type, item.is_import);
-      let item_entity = entity_paths[next].as_str();
-      next += 1;
+      write_entity_path_into(None, name, kind, signature, &mut entity_buf);
+      let item_entity = entity_buf.as_str();
       let item_id = self.define(NodeDef {
         kind,
         name,
@@ -250,8 +231,8 @@ impl KgWriter {
         let mname = member.entry.name.as_ref();
         let msig = member.entry.signature.as_ref();
         let mkind = SymbolKind::from_symbol_type(member.entry.symbol_type, false);
-        let member_entity = entity_paths[next].as_str();
-        next += 1;
+        write_entity_path_into(Some(name), mname, mkind, msig, &mut entity_buf);
+        let member_entity = entity_buf.as_str();
         let member_id = self.define(NodeDef {
           kind: mkind,
           name: mname,
@@ -595,15 +576,113 @@ fn disambiguated_entity_path(
   kind: SymbolKind,
   signature: &str,
 ) -> String {
-  let base = match owner {
-    Some(o) => format!("{o}.{name}"),
-    None => name.to_string(),
-  };
-  if kind.is_overloadable() && !signature.is_empty() {
-    format!("{base}\u{1f}{signature}")
-  } else {
-    base
+  let mut out = String::new();
+  write_entity_path_into(owner, name, kind, signature, &mut out);
+  out
+}
+
+/// Render one entity path into a reused buffer (cleared first) — the SINGLE writer of the
+/// identity convention: `[owner.]name`, plus the `\u{1f}` signature discriminator only for
+/// overloadable kinds with a non-empty signature (see [`disambiguated_entity_path`] for the
+/// why). Everything that names an entity — [`layout_entity_paths`], the ingest walk's inline
+/// rendering, [`EntityIdentity`] — routes through here, so the conventions cannot drift.
+fn write_entity_path_into(
+  owner: Option<&str>,
+  name: &str,
+  kind: SymbolKind,
+  signature: &str,
+  out: &mut String,
+) {
+  out.clear();
+  if let Some(o) = owner {
+    out.push_str(o);
+    out.push('.');
   }
+  out.push_str(name);
+  if kind.is_overloadable() && !signature.is_empty() {
+    out.push('\u{1f}');
+    out.push_str(signature);
+  }
+}
+
+/// One layout position's identity, **borrowed** from the outline items — the same data
+/// [`layout_entity_paths`] renders, without the `String`. Reference attribution needs only the
+/// *owner segment* of an entity path (its first `.`-segment, for `self.`/`Self::` receiver
+/// classification), so the extraction worker keeps a `Vec<EntityIdentity>` (one allocation per
+/// file) instead of a rendered path per entity and reconstructs the segment on demand.
+#[derive(Clone, Copy, Debug)]
+pub struct EntityIdentity<'a> {
+  owner: Option<&'a str>,
+  name: &'a str,
+  /// The signature **iff the discriminator would be appended** (overloadable kind, non-empty
+  /// signature) — empty otherwise, so reconstruction never re-decides the condition.
+  sig: &'a str,
+}
+
+impl<'a> EntityIdentity<'a> {
+  /// The file node's identity (layout index 0, entity path `""`).
+  pub const FILE: EntityIdentity<'static> = EntityIdentity { owner: None, name: "", sig: "" };
+
+  pub fn new(owner: Option<&'a str>, name: &'a str, kind: SymbolKind, signature: &'a str) -> Self {
+    let sig = if kind.is_overloadable() && !signature.is_empty() {
+      signature
+    } else {
+      ""
+    };
+    EntityIdentity { owner, name, sig }
+  }
+
+  /// Exactly `path.split('.').next()` filtered to non-empty — where `path` is what
+  /// [`disambiguated_entity_path`] would render for this identity — computed without building
+  /// the path (pinned against the rendered form by `entity_identity_tests`). Only the rare
+  /// `name\u{1f}signature` composite (top-level overloadable, dot-free name) must allocate.
+  pub fn owner_segment(&self) -> Option<String> {
+    if let Some(owner) = self.owner {
+      // `owner.name…`: the first `.`-segment ends inside (or exactly at the end of) `owner`.
+      let segment = &owner[..owner.find('.').unwrap_or(owner.len())];
+      return (!segment.is_empty()).then(|| segment.to_string());
+    }
+    if let Some(dot) = self.name.find('.') {
+      let segment = &self.name[..dot];
+      return (!segment.is_empty()).then(|| segment.to_string());
+    }
+    if !self.sig.is_empty() {
+      // `name\u{1f}sig…`: the segment crosses the separator — the one case that must build.
+      let sig_head = &self.sig[..self.sig.find('.').unwrap_or(self.sig.len())];
+      let mut segment = String::with_capacity(self.name.len() + 1 + sig_head.len());
+      segment.push_str(self.name);
+      segment.push('\u{1f}');
+      segment.push_str(sig_head);
+      return Some(segment); // contains `\u{1f}`, so never empty
+    }
+    (!self.name.is_empty()).then(|| self.name.to_string())
+  }
+}
+
+/// [`layout_entity_paths`], borrowed: the same layout order (file, then each item immediately
+/// followed by its members) carrying [`EntityIdentity`] views instead of rendered `String`s.
+pub fn layout_entity_identities<'a>(items: &'a [OutlineItem<'_>]) -> Vec<EntityIdentity<'a>> {
+  let mut out = Vec::with_capacity(1 + items.iter().map(|i| 1 + i.members.len()).sum::<usize>());
+  out.push(EntityIdentity::FILE);
+  for item in items {
+    let kind = SymbolKind::from_symbol_type(item.entry.symbol_type, item.is_import);
+    out.push(EntityIdentity::new(
+      None,
+      item.entry.name.as_ref(),
+      kind,
+      item.entry.signature.as_ref(),
+    ));
+    for member in &item.members {
+      let mkind = SymbolKind::from_symbol_type(member.entry.symbol_type, false);
+      out.push(EntityIdentity::new(
+        Some(item.entry.name.as_ref()),
+        member.entry.name.as_ref(),
+        mkind,
+        member.entry.signature.as_ref(),
+      ));
+    }
+  }
+  out
 }
 
 /// Clamp a byte range to the u32 column space (files past 4 GiB store a saturated span).
@@ -620,4 +699,42 @@ fn content_hash(parts: &[&str]) -> u64 {
     part.hash(&mut hasher);
   }
   hasher.finish()
+}
+
+#[cfg(test)]
+mod entity_identity_tests {
+  use super::*;
+
+  /// `owner_segment` reconstructs `rendered_path.split('.').next()` (non-empty-filtered)
+  /// without building the path. One case per branch of the reconstruction, expected segment
+  /// written literally — the drift anchor between the borrowed identity and the rendered
+  /// convention.
+  #[test]
+  fn owner_segment_matches_rendered_path_split() {
+    // (owner, name, kind, signature, expected segment)
+    let cases: &[(Option<&str>, &str, SymbolKind, &str, Option<&str>)] = &[
+      // Layout index 0: the file node — empty path, no owner.
+      (None, "", SymbolKind::File, "", None),
+      // Member of a plain-named item: segment = the owner.
+      (Some("Kg"), "load", SymbolKind::Method, "(x)", Some("Kg")),
+      // Member of a dotted item name (Lua `function M.sub.f()` shapes): the owner's head.
+      (Some("M.sub"), "f", SymbolKind::Method, "", Some("M")),
+      // Top-level dotted name: the name's head.
+      (None, "Foo.bar", SymbolKind::Function, "", Some("Foo")),
+      // Non-overloadable kind: bare name, signature never appended.
+      (None, "Reader", SymbolKind::Struct, "(ignored)", Some("Reader")),
+      // Top-level overloadable with a signature: the segment crosses the `\u{1f}` separator
+      // and swallows the signature up to ITS first dot — the one case that must build.
+      (None, "f", SymbolKind::Function, "(int)", Some("f\u{1f}(int)")),
+      (None, "f", SymbolKind::Function, "(a.b)", Some("f\u{1f}(a")),
+    ];
+    for &(owner, name, kind, sig, want) in cases {
+      let path = disambiguated_entity_path(owner, name, kind, sig);
+      let split = path.split('.').next().unwrap_or(path.as_str());
+      let rendered = (!split.is_empty()).then(|| split.to_string());
+      let got = EntityIdentity::new(owner, name, kind, sig).owner_segment();
+      assert_eq!(got, rendered, "reconstruction drifted from the rendered path {path:?}");
+      assert_eq!(got.as_deref(), want, "segment spec changed for path {path:?}");
+    }
+  }
 }
