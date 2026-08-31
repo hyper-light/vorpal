@@ -1167,6 +1167,7 @@ pub(crate) fn is_generation_artifact_name(name: &str) -> bool {
     || vorpal_kg::is_nodes_member(name)
     || vorpal_kg::is_evidence_member(name)
     || vorpal_kg::is_edges_member(name)
+    || vorpal_kg::is_usage_member(name)
 }
 
 /// Every artifact name this generation actually carries, in fixed order: the flat list
@@ -1188,6 +1189,7 @@ pub(crate) fn generation_artifact_names(dir: &Path) -> Vec<String> {
     vorpal_kg::NODES_DIR,
     vorpal_kg::EVIDENCE_DIR,
     vorpal_kg::EDGES_DIR,
+    vorpal_kg::USAGE_DIR,
   ] {
     if let Ok(dirents) = fs::read_dir(dir.join(family)) {
       let mut members: Vec<String> = dirents
@@ -1266,6 +1268,7 @@ fn merkle_artifact_names() -> Vec<String> {
     "manifest.bin",
     "nodes/toc.bin",
     "products/toc.bin",
+    "usage/toc.bin",
   ]
   .into_iter()
   .map(str::to_string)
@@ -1454,7 +1457,9 @@ fn try_stamp_only_cutoff(
   // bucketed ones (linked when present, never required).
   let nodes_bucketed = prior.join(vorpal_kg::NODES_TOC).is_file();
   if nodes_bucketed {
-    if !prior.join(vorpal_kg::EVIDENCE_TOC).is_file() || !prior.join(vorpal_kg::EDGES_TOC).is_file()
+    if !prior.join(vorpal_kg::EVIDENCE_TOC).is_file()
+      || !prior.join(vorpal_kg::EDGES_TOC).is_file()
+      || !prior.join(vorpal_kg::USAGE_TOC).is_file()
     {
       return Ok(None);
     }
@@ -1560,6 +1565,7 @@ fn try_stamp_only_cutoff(
       (vorpal_kg::NODES_DIR, vorpal_kg::is_nodes_member as fn(&str) -> bool),
       (vorpal_kg::EVIDENCE_DIR, vorpal_kg::is_evidence_member),
       (vorpal_kg::EDGES_DIR, vorpal_kg::is_edges_member),
+      (vorpal_kg::USAGE_DIR, vorpal_kg::is_usage_member),
     ] {
       fs::create_dir_all(staging.join(family))?;
       for entry in fs::read_dir(prior.join(family))?.flatten() {
@@ -1697,6 +1703,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       || name.as_os_str() == vorpal_kg::NODES_DIR
       || name.as_os_str() == vorpal_kg::EVIDENCE_DIR
       || name.as_os_str() == vorpal_kg::EDGES_DIR
+      || name.as_os_str() == vorpal_kg::USAGE_DIR
       || name.as_os_str() == "graph.stamp"
       || GENERATION_ARTIFACTS
         .iter()
@@ -1715,6 +1722,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
     vorpal_kg::NODES_DIR,
     vorpal_kg::EVIDENCE_DIR,
     vorpal_kg::EDGES_DIR,
+    vorpal_kg::USAGE_DIR,
   ] {
     if let Ok(dirents) = fs::read_dir(staging.join(family)) {
       for entry in dirents.flatten() {

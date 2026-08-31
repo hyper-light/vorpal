@@ -106,6 +106,7 @@ fn bucketed_pack_end_to_end() {
   assert!(gen_a.join("evidence/toc.bin").is_file(), "v2 evidence TOC missing");
   assert!(!gen_a.join("evidence.bin").exists(), "flat evidence must not ride along");
   assert!(gen_a.join("edges/toc.bin").is_file(), "v2 edge-store TOC missing");
+  assert!(gen_a.join("usage/toc.bin").is_file(), "v2 usage TOC missing");
   assert!(
     gen_a.join("graph.bin").is_file() && gen_a.join("graph.stamp").is_file(),
     "the derived CSR cache is written eagerly"
@@ -201,6 +202,28 @@ fn bucketed_pack_end_to_end() {
     relation_universe(&out_a),
     "flat and bucketed generations must describe the identical relation/evidence universe"
   );
+  // Usage oracle (P4.5a): the postings equal EXACTLY the deduped
+  // (referenced-name-hash → from-file-key) pairs the evidence rows imply.
+  {
+    let kg = vorpal_kg::Kg::load(&out_a).unwrap();
+    let map = vorpal_kg::NodeIdMap::from_dir(&gen_a).unwrap();
+    let usage = vorpal_kg::UsageStore::open(&gen_a).unwrap();
+    let mut expected: std::collections::BTreeMap<u32, std::collections::BTreeSet<u64>> =
+      std::collections::BTreeMap::new();
+    for id in 0..kg.node_count() as u64 {
+      for row in kg.evidence_from(vorpal_kg::NodeId::new(id)) {
+        let (file_key, _) = map.locate(row.from).unwrap();
+        expected.entry(row.name_hash).or_default().insert(file_key);
+      }
+    }
+    for (name_hash, files) in &expected {
+      let got = usage.files_referencing(*name_hash);
+      let want: Vec<u64> = files.iter().copied().collect();
+      assert_eq!(got, want, "usage postings for name hash {name_hash:x}");
+    }
+    assert!(!expected.is_empty(), "the fixture references names");
+  }
+
   // The derived CSR cache is never load-bearing: delete it, load again (forces the
   // slab rebuild), answers hold, and the lazy write-back restores the cache files.
   fs::remove_file(gen_a.join("graph.bin")).unwrap();
@@ -312,6 +335,18 @@ fn bucketed_pack_end_to_end() {
       vec![format!("{expected_bucket:04}.bin")],
       "an edit must rewrite exactly the edited file's evidence slab"
     );
+    // The USAGE slabs all hard-link: the edit changes no referenced names.
+    for entry in fs::read_dir(gen_a.join("usage")).unwrap().flatten() {
+      let name = entry.file_name().into_string().unwrap();
+      if !name.ends_with(".idx") {
+        continue;
+      }
+      assert_eq!(
+        entry.metadata().unwrap().ino(),
+        fs::metadata(gen_a2.join("usage").join(&name)).unwrap().ino(),
+        "usage slab {name} must hard-link across a name-preserving edit"
+      );
+    }
     // …and the EDGE slabs rewrite AT MOST the edited file's bucket (this edit changes the
     // call-argument shape, so its DATA_FLOWS rows legitimately move); every other bucket's
     // endpoints are position-independent (bucket, local) coordinates and must hard-link.
@@ -377,7 +412,7 @@ fn bucketed_pack_end_to_end() {
     );
     // The node store, evidence, and edge families never carry stamps: the cutoff
     // hard-links EVERY member + TOC of all three.
-    for family in ["nodes", "evidence", "edges"] {
+    for family in ["nodes", "evidence", "edges", "usage"] {
       for entry in fs::read_dir(gen_a2.join(family)).unwrap().flatten() {
         let name = entry.file_name().into_string().unwrap();
         assert_eq!(

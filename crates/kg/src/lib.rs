@@ -15,6 +15,7 @@ mod dataflow;
 mod edgestore;
 mod evidence;
 mod kg;
+mod usagestore;
 mod model;
 mod writer;
 
@@ -24,6 +25,7 @@ pub use kg::{
 };
 pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
 pub use edgestore::{EDGES_DIR, EDGES_TOC, is_edges_member};
+pub use usagestore::{USAGE_DIR, USAGE_TOC, UsageStore, is_usage_member};
 pub use evidence::{
   EVIDENCE_DIR, EVIDENCE_TOC, EvidenceLayout, EvidenceOutcome, EvidenceRow, EvidenceStore,
   NO_EDGE, is_evidence_member, save as save_evidence, save_with as save_evidence_with,

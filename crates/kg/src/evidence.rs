@@ -423,6 +423,16 @@ fn save_bucketed(
   }
   drop(out);
   fs::rename(&toc_tmp, dir.join(EVIDENCE_TOC))?;
+  // The usage family (P4.5a) derives from the same occurrence set: one
+  // (referenced-name-hash, from-file-key) posting per row, deduped in its own saver.
+  // Same bucket count, same prior, same carry law.
+  let mut usage_pairs: Vec<(u32, u64)> = Vec::with_capacity(rows.len());
+  for row in rows {
+    if let Some((file_key, _)) = nodes.locate_bulk(row.from) {
+      usage_pairs.push((row.name_hash, file_key));
+    }
+  }
+  crate::usagestore::save(dir, usage_pairs, buckets as u32, prior)?;
   crate::phase_stamp("evidence: save done");
   // One truth per directory: retire the flat file and stale members.
   let _ = fs::remove_file(dir.join("evidence.bin"));
