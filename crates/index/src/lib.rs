@@ -507,6 +507,19 @@ fn build_index_inner(
     vorpal_ingest::global_grammar_stamp(),
     rules_digest,
   ));
+  // Phase-4 identity gate (P4.0): every file's tree-relative path must map to a unique
+  // 64-bit file key — the bucketed format keys storage by it. O(files) on every build,
+  // same posture as the u32 ceilings: loud and actionable, never a silent degradation.
+  {
+    let root = src.to_string_lossy();
+    vorpal_kg::identity::verify_file_keys(
+      manifest
+        .entries()
+        .iter()
+        .map(|entry| vorpal_kg::identity::tree_relative(&entry.path, &root)),
+    )
+    .map_err(io::Error::other)?;
+  }
   vorpal_kg::phase_stamp("build: grammar stamp done");
   // Generation layout (IMPROVEMENTS §4): `out` is the index *root*. The live artifacts sit in
   // an immutable, content-addressed generation dir named by `out/CURRENT`; this run reads the

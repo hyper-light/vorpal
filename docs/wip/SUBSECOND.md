@@ -437,6 +437,42 @@ Standing rules for every slice: the nightly golden (scratch id == incremental id
 never regresses; v-1 readers stay supported for one release per format-bearing slice; no
 slice ships with a constant that wasn't swept at two scales and recorded here.
 
+#### P4.1 resolved design (recon 2026-08-31, from code facts)
+
+- **File-per-bucket, not regions in one file.** A single bucket-major file still rewrites
+  everything after the first changed bucket (≈half the pack on average) and can never
+  hard-link unchanged bytes across generations. `products/<k>.pack` (k = `file_key & (B-1)`,
+  zero-padded name) + `products/toc.bin` gives O(changed buckets) writes, and unchanged
+  bucket files HARD-LINK into the next generation (immutable once sealed; rename-over never
+  writes through a link; GC of old generations is refcount-safe). The one-file v1 pack is
+  exactly the degenerate B=1 case, which is how the shared code paths treat it.
+- **toc.bin is the v2 `products.idx`.** `VPPT` header, B, per-bucket {entry count, byte
+  length, xxh3 digest} (the digest column is P4.4's Merkle spine, landed now because the
+  writer is already streaming the bytes), then the slot table (path, bucket, body span) —
+  the existing `PathSrc::Sidecar` machinery IS this design; slots grow a bucket index.
+  Buckets land tmp+rename, toc last; on toc/bucket mismatch (killed legacy-mode run) the
+  reader rebuilds slots by scanning the self-describing records — v1's recovery posture.
+- **Pack keys become tree-relative (the P4.0 spelling law applied to storage).** v1 embeds
+  absolute canonical paths, so today's pack bytes — and therefore generation content-ids —
+  are mount-dependent, and a moved tree cannot reuse its own product cache. v2 stores
+  tree-relative spellings; `PackReader::open_rooted(dir, root)` strips incoming absolute
+  paths at the API boundary (every production site has the canonical src in scope; the
+  `embedding_root` derivation covers the debug commands that don't). Senders are untouched.
+- **B is a pure function of the tree** (`clamp(next_pow2(files / TARGET), B_MIN, B_MAX)`,
+  constants from the two-scale sweep below): stamping B at creation would make an
+  incremental that grows past a threshold diverge byte-wise from scratch, violating the
+  convergence law. Crossings are log-spaced and cost one v1-style full rewrite — the price
+  v1 pays on EVERY edit.
+- **Stamp-only cutoff stops copying the pack.** Today it `fs::copy`s the whole pack and
+  patches 24-byte stamp windows. v2: buckets with no patched files hard-link; buckets with
+  patches copy-then-patch (never patch through a link — prior-generation bytes are
+  immutable, and the inode oracle asserts it).
+- **Enumeration sites** (`GENERATION_ARTIFACTS` is a flat 9-name list): content-id, export,
+  import validation, commit keep-list, cutoff staging all learn one predicate — flat name
+  OR `products/` member, walked in sorted name order so ids stay deterministic.
+- **Migration cliff is one pack write, not a re-extract:** the first `VORPAL_FORMAT=next`
+  build reuses v1 bodies through the format-sniffing reader and emits v2.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

@@ -22,6 +22,7 @@ pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
 pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
 pub use model::SymbolKind;
 pub mod communities;
+pub mod identity;
 pub mod observed;
 mod scc;
 pub use writer::{FileBlock, KgWriter, NodeDef, layout_entity_paths};
