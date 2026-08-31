@@ -1517,10 +1517,52 @@ pub(crate) fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
 
 /// Embed node `id`'s parts into `row` — the one embedding recipe (name double-weighted,
 /// signature, file basename) shared by the index build, the cold fallback, and the rerank.
-pub(crate) fn embed_node_into(kg: &Kg, embedder: &LexicalEmbedder, id: u64, row: &mut [f32]) {
+/// The canonical tree prefix every stored path shares (up to and including its trailing
+/// `/`), from the File nodes. Embeddings strip it so vectors are a function of the TREE,
+/// never its mount point: the same corpus indexed from two directories, machines, or OS
+/// temp layouts must rank identically — the cross-platform pinned retrieval baselines
+/// exist because of this invariance. Empty when the graph holds no File nodes.
+pub(crate) fn embedding_root(kg: &Kg) -> String {
+  let mut root: Option<String> = None;
+  for raw in 0..kg.node_count() as u64 {
+    let id = NodeId::new(raw);
+    if kg.node_kind(id) != Some(vorpal_kg::SymbolKind::File) {
+      continue;
+    }
+    let Some(path) = kg.node_path(id) else { continue };
+    match &mut root {
+      None => root = Some(path.to_string()),
+      Some(prefix) => {
+        let common = prefix
+          .bytes()
+          .zip(path.bytes())
+          .take_while(|(a, b)| a == b)
+          .count();
+        prefix.truncate(common);
+      }
+    }
+  }
+  let mut root = root.unwrap_or_default();
+  match root.rfind('/') {
+    Some(at) => root.truncate(at + 1),
+    None => root.clear(),
+  }
+  root
+}
+
+pub(crate) fn embed_node_into(
+  kg: &Kg,
+  embedder: &LexicalEmbedder,
+  id: u64,
+  row: &mut [f32],
+  root: &str,
+) {
   if let Some(view) = kg.node(NodeId::new(id)) {
+    // File nodes are NAMED by their stored (canonical, absolute) path — strip the tree
+    // root so only tree-relative tokens reach the vector (see `embedding_root`).
+    let name = view.name.strip_prefix(root).unwrap_or(view.name);
     let basename = view.path.rsplit('/').next().unwrap_or(view.path);
-    let parts = [view.name, view.name, view.signature, basename];
+    let parts = [name, name, view.signature, basename];
     embedder.embed_parts_into(&parts, row);
   } else {
     row.fill(0.0);
@@ -1712,12 +1754,13 @@ fn build_ann(kg: &Kg, out: &Path, base_stamp: u64) -> Result<(), Box<dyn Error +
   vorpal_kg::phase_stamp("ann: build start");
   let embedder = active_embedder();
   let dim = embedder.dim();
+  let root = embedding_root(kg);
   let ids = semantic_row_ids(kg);
   let row_ids = ids.clone();
   // Rows embed straight into the index's storage (i8 codes at scale, in parallel): the
   // full-precision matrix never materializes — 2.9 GB of pure transient at kernel scale.
   let index = AnnIndex::build_rows(dim, ids, |i, row| {
-    embed_node_into(kg, &embedder, row_ids[i], row)
+    embed_node_into(kg, &embedder, row_ids[i], row, &root)
   });
   let calibration = index.calibration();
   vorpal_kg::phase_stamp("ann: save start");
@@ -2329,6 +2372,9 @@ impl Searcher {
     let embedder = active_embedder();
     let pool = (k * 4).max(50);
     let query_vec = embedder.embed(query);
+    // One root per query session: every node vector this search computes strips the same
+    // canonical tree prefix (see `embedding_root`).
+    let embed_root = embedding_root(kg);
 
   // Semantic candidate pool, by tier — a search NEVER waits on an ANN build:
   // 1. **Base-fresh**: the persisted tier matches this KG generation → beam search.
@@ -2366,7 +2412,7 @@ impl Searcher {
     let overlay_hits = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &overlay.overlay_ids,
-      |i, row| embed_node_into(kg, &embedder, overlay.overlay_ids[i], row),
+      |i, row| embed_node_into(kg, &embedder, overlay.overlay_ids[i], row, &embed_root),
       &query_vec,
       take,
     );
@@ -2390,7 +2436,7 @@ impl Searcher {
     let scored = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &ids,
-      |i, row| embed_node_into(kg, &embedder, ids[i], row),
+      |i, row| embed_node_into(kg, &embedder, ids[i], row, &embed_root),
       &query_vec,
       take,
     );
@@ -2415,7 +2461,7 @@ impl Searcher {
       .into_iter()
       .map(|id| {
         let mut row = vec![0.0f32; embedder.dim()];
-        embed_node_into(kg, &embedder, id, &mut row);
+        embed_node_into(kg, &embedder, id, &mut row, &embed_root);
         let exact = row
           .iter()
           .zip(&query_vec)

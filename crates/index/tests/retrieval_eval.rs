@@ -223,6 +223,10 @@ const PINNED_BASELINES: &[(Class, usize, u32)] = &[
   // Baselines below are the honest lexical-fusion floor, measured 2026-08-30 (Stage 0).
   // Stage 1 must raise `paraphrase`; Stage 2 targets `sparse-name`; Stage AND targets
   // `conjunctive`.
+  // 2026-08-31: the fixture went path-invariant (relative "src/…" via chdir above) after
+  // CI and macOS split one Paraphrase rank apart — absolute temp-prefix TOKENS were
+  // entering File-node embeddings and nudging near-ties (CI read 9, macOS 8, a scratch
+  // variant 10). On the invariant corpus the original Stage-0 floor holds exactly.
   (Class::Paraphrase, 0, 8),
   (Class::SparseName, 0, 6),
   (Class::Conjunctive, 2, 66),
@@ -248,8 +252,10 @@ fn labelled_queries_meet_recall_and_mrr_gates_with_ablations() {
   // (name = path for File rows), so a pid-bearing temp dir shuffles File rows through the
   // exact-tie region of zero-overlap queries (distance 2.0 for disjoint token buckets)
   // and makes deep-pool baselines wobble ACROSS invocations while each index stays
-  // internally deterministic. A fixed path pins the whole fixture. (Cross-machine rank
-  // variance from absolute paths is inherent to the machine-local tier and documented.)
+  // internally deterministic. A fixed path pins the whole fixture; embeddings are
+  // ROOT-INVARIANT by construction (embedder v2 strips the canonical tree prefix —
+  // File-node vectors once tokenized the OS temp layout, splitting macOS and CI pinned
+  // ranks one position apart), so the pins below hold on every machine and OS.
   let base = std::env::temp_dir().join("vorpal-retrieval-eval");
   let src = base.join("src");
   let out = base.join("index");
@@ -425,5 +431,9 @@ fn labelled_queries_meet_recall_and_mrr_gates_with_ablations() {
     "graph channel should put the heavily-called definition first: {names:?}"
   );
 
-  let _ = fs::remove_dir_all(&base);
+  // RETRIEVAL_EVAL_KEEP=1 leaves the fixture for artifact-level forensics (cross-platform
+  // rank investigations need the exact bytes both sides built).
+  if std::env::var_os("RETRIEVAL_EVAL_KEEP").is_none() {
+    let _ = fs::remove_dir_all(&base);
+  }
 }

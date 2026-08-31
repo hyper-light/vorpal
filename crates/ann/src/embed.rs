@@ -12,7 +12,11 @@ pub trait Embedder {
 /// Embedding-semantics version of the lexical hasher: bumped whenever tokenization, hashing,
 /// weighting, or normalization changes, so vectors persisted under older semantics never
 /// silently compare against fresh query vectors.
-pub const LEXICAL_EMBED_VERSION: u32 = 1;
+// v2 (2026-08-31): node embeddings tokenize TREE-RELATIVE names — the canonicalized
+// mount prefix used to enter File-node vectors, making near-tie rankings a function of
+// WHERE the tree was checked out (macOS vs CI temp layouts split pinned retrieval
+// baselines one rank apart). Vectors are now a pure function of the tree's content.
+pub const LEXICAL_EMBED_VERSION: u32 = 2;
 
 /// The complete provenance of an embedding model — the public configuration contract
 /// (IMPROVEMENTS #9): everything a consumer needs to decide whether two vector sets are

@@ -114,9 +114,10 @@ impl LiveAnnTier {
     // Rows the base never embedded (changed + new files since the tier was built): insert
     // through the same per-edit path, so reconciliation and steady-state are one code path.
     let mut row_buf = vec![0.0f32; dim];
+    let embed_root = crate::embedding_root(kg);
     for &id in &view.overlay_ids {
       let Some(eid) = eid_lo_of(kg, id) else { continue };
-      embed_node_into(kg, &embedder, id, &mut row_buf);
+      embed_node_into(kg, &embedder, id, &mut row_buf, &embed_root);
       tier.overlay.insert(eid, &row_buf);
     }
     vorpal_kg::phase_stamp(&format!(
@@ -149,11 +150,12 @@ impl LiveAnnTier {
     }
     let embedder = active_embedder();
     let mut row = vec![0.0f32; embedder.dim()];
+    let embed_root = crate::embedding_root(kg);
     for &eid in added_eids {
       let Some(&id) = self.eid_to_id.get(&eid) else {
         continue; // not in the served graph (import node, vanished mid-burst) — skip
       };
-      embed_node_into(kg, &embedder, id, &mut row);
+      embed_node_into(kg, &embedder, id, &mut row, &embed_root);
       self.overlay.insert(eid, &row);
     }
     self.rows_since_probe += removed_eids.len() + added_eids.len();

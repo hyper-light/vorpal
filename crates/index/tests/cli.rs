@@ -1595,8 +1595,12 @@ fn model_provenance_is_persisted_and_gates_the_tier() {
   let before = vorpal_index::search_index_explained(&out, "gadget maker", 5).unwrap();
 
   // A model change (simulated: bump the persisted semantics version) invalidates the tier;
-  // search still answers — the exact fallback — with identical results.
-  let tampered = raw.replace("\"version\":1", "\"version\":999");
+  // search still answers — the exact fallback — with identical results. The tamper targets
+  // whatever version is CURRENTLY persisted, so bumping LEXICAL_EMBED_VERSION can never
+  // silently turn this into a no-op (the guard below proved that the hard-coded form did).
+  let at = raw.find("\"version\":").expect("provenance carries a version") + "\"version\":".len();
+  let digits = raw[at..].chars().take_while(char::is_ascii_digit).count();
+  let tampered = format!("{}999{}", &raw[..at], &raw[at + digits..]);
   assert_ne!(raw, tampered, "test must actually change the version");
   fs::write(gen_dir.join("ann.model.json"), &tampered).unwrap();
   let stale = vorpal_index::search_index_explained(&out, "gadget maker", 5).unwrap();
