@@ -15,23 +15,40 @@ pub type Underlying<D> = Vec<<<D as Doc>::Source as Content>::Underlying>;
 /// const a = 123 matched with const a = $A will produce env: $A => 123
 #[derive(Clone)]
 pub struct MetaVarEnv<'tree, D: Doc> {
-  single_matched: HashMap<MetaVariableID, Node<'tree, D>>,
-  multi_matched: HashMap<MetaVariableID, Vec<Node<'tree, D>>>,
-  transformed_var: HashMap<MetaVariableID, Underlying<D>>,
+  // Insertion-ordered association vectors, not HashMaps: an env holds a
+  // handful of variables, and the matcher clones it copy-on-write PER
+  // CANDIDATE — the map form spent ~29 % of kernel-scale ingest allocations
+  // on String keys, table allocations, and rehashes (ledger-sampled). Linear
+  // scans over ≤~8 entries beat hashing String keys, a clone is three Vec
+  // memcpys, and iteration order becomes deterministic (insertion order).
+  single_matched: Vec<(MetaVariableID, Node<'tree, D>)>,
+  multi_matched: Vec<(MetaVariableID, Vec<Node<'tree, D>>)>,
+  transformed_var: Vec<(MetaVariableID, Underlying<D>)>,
+}
+
+fn assoc_get<'a, V>(list: &'a [(MetaVariableID, V)], key: &str) -> Option<&'a V> {
+  list.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn assoc_set<V>(list: &mut Vec<(MetaVariableID, V)>, key: &str, value: V) {
+  match list.iter_mut().find(|(k, _)| k == key) {
+    Some((_, slot)) => *slot = value,
+    None => list.push((key.to_string(), value)),
+  }
 }
 
 impl<'t, D: Doc> MetaVarEnv<'t, D> {
   pub fn new() -> Self {
     Self {
-      single_matched: HashMap::new(),
-      multi_matched: HashMap::new(),
-      transformed_var: HashMap::new(),
+      single_matched: Vec::new(),
+      multi_matched: Vec::new(),
+      transformed_var: Vec::new(),
     }
   }
 
   pub fn insert(&mut self, id: &str, ret: Node<'t, D>) -> Option<&mut Self> {
     if self.match_variable(id, &ret) {
-      self.single_matched.insert(id.to_string(), ret);
+      assoc_set(&mut self.single_matched, id, ret);
       Some(self)
     } else {
       None
@@ -40,7 +57,7 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
 
   pub fn insert_multi(&mut self, id: &str, ret: Vec<Node<'t, D>>) -> Option<&mut Self> {
     if self.match_multi_var(id, &ret) {
-      self.multi_matched.insert(id.to_string(), ret);
+      assoc_set(&mut self.multi_matched, id, ret);
       Some(self)
     } else {
       None
@@ -48,52 +65,48 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
   }
 
   pub fn get_match(&self, var: &str) -> Option<&'_ Node<'t, D>> {
-    self.single_matched.get(var)
+    assoc_get(&self.single_matched, var)
   }
 
   pub fn get_multiple_matches(&self, var: &str) -> Vec<Node<'t, D>> {
-    self.multi_matched.get(var).cloned().unwrap_or_default()
+    assoc_get(&self.multi_matched, var).cloned().unwrap_or_default()
   }
 
   pub fn add_label(&mut self, label: &str, node: Node<'t, D>) {
-    self
-      .multi_matched
-      .entry(label.into())
-      .or_default()
-      .push(node);
+    match self.multi_matched.iter_mut().find(|(k, _)| k == label) {
+      Some((_, nodes)) => nodes.push(node),
+      None => self.multi_matched.push((label.to_string(), vec![node])),
+    }
   }
 
   pub fn get_labels(&self, label: &str) -> Option<&Vec<Node<'t, D>>> {
-    self.multi_matched.get(label)
+    assoc_get(&self.multi_matched, label)
   }
 
   pub fn get_matched_variables(&self) -> impl Iterator<Item = MetaVariable> + use<'_, 't, D> {
     let single = self
       .single_matched
-      .keys()
-      .cloned()
-      .map(|n| MetaVariable::Capture(n, false));
+      .iter()
+      .map(|(n, _)| MetaVariable::Capture(n.clone(), false));
     let transformed = self
       .transformed_var
-      .keys()
-      .cloned()
-      .map(|n| MetaVariable::Capture(n, false));
+      .iter()
+      .map(|(n, _)| MetaVariable::Capture(n.clone(), false));
     let multi = self
       .multi_matched
-      .keys()
-      .cloned()
-      .map(MetaVariable::MultiCapture);
+      .iter()
+      .map(|(n, _)| MetaVariable::MultiCapture(n.clone()));
     single.chain(multi).chain(transformed)
   }
 
   fn match_variable(&self, id: &str, candidate: &Node<'t, D>) -> bool {
-    if let Some(m) = self.single_matched.get(id) {
+    if let Some(m) = assoc_get(&self.single_matched, id) {
       return does_node_match_exactly(m, candidate);
     }
     true
   }
   fn match_multi_var(&self, id: &str, cands: &[Node<'t, D>]) -> bool {
-    let Some(nodes) = self.multi_matched.get(id) else {
+    let Some(nodes) = assoc_get(&self.multi_matched, id) else {
       return true;
     };
     let mut named_nodes = nodes.iter().filter(|n| n.is_named());
@@ -137,8 +150,10 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
 
   pub fn insert_transformation(&mut self, var: &MetaVariable, name: &str, slice: Underlying<D>) {
     let node = match var {
-      MetaVariable::Capture(v, _) => self.single_matched.get(v),
-      MetaVariable::MultiCapture(vs) => self.multi_matched.get(vs).and_then(|vs| vs.first()),
+      MetaVariable::Capture(v, _) => assoc_get(&self.single_matched, v),
+      MetaVariable::MultiCapture(vs) => {
+        assoc_get(&self.multi_matched, vs).and_then(|vs| vs.first())
+      }
       _ => None,
     };
     let deindented = if let Some(v) = node {
@@ -146,11 +161,11 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
     } else {
       slice
     };
-    self.transformed_var.insert(name.to_string(), deindented);
+    assoc_set(&mut self.transformed_var, name, deindented);
   }
 
   pub fn get_transformed(&self, var: &str) -> Option<&Underlying<D>> {
-    self.transformed_var.get(var)
+    assoc_get(&self.transformed_var, var)
   }
   pub fn get_var_bytes<'s>(
     &'s self,
@@ -167,10 +182,10 @@ impl<D: Doc> MetaVarEnv<'_, D> {
   where
     F: FnMut(&mut Node<'_, D>),
   {
-    for n in self.single_matched.values_mut() {
+    for (_, n) in self.single_matched.iter_mut() {
       f(n)
     }
-    for ns in self.multi_matched.values_mut() {
+    for (_, ns) in self.multi_matched.iter_mut() {
       for n in ns {
         f(n)
       }
