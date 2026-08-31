@@ -782,17 +782,42 @@ its disk twin, landed in three certified sub-slices:
     (257 members, ~2.6% of generation), cold 7.56–8.28 s (band unchanged — the save
     overlaps evidence), determinism ×2 PASS, edit/revert/respan/cutoff convergence PASS,
     respan 0.86 s + 257/257 sig slabs linked, cutoff 0.49 s + 257/257 linked.
-  - **c-2 — defs-stable scoped resolve (single-file semantic edits):** prior kg + bounded
-    product-decode closure for chains/DF/requests + sigs-family scoped re-pairing;
-    byte-convergence gates per edit class.
+  - **c-2 — defs-stable scoped resolve (single-file semantic edits).** Ground truths
+    verified in-code (2026-08-31): a file's node rows are exactly [File][item][member…]
+    in outline order (`ingest_file_with_spans`), so a defs-stable edit (same items,
+    members, imports, signatures — bodies changed) keeps the file's node COUNT and ORDER
+    ⇒ ordinals stable ⇒ every incoming `(dst_key, dst_ord)` reference row in OTHER
+    buckets is byte-stable; item `content_hash = hash(entity_path, signature)` is
+    body-invariant (only File-node hashes and spans move). The resolver's candidate
+    table builds straight from the prior graph (`SymbolTable::from_kg`), import bindings
+    for the edited files decode from their own products, and re-resolution runs for the
+    EDITED files' references only. Sketch changes re-pair over prior sigs rows
+    (unchanged files) + fresh rows (edited) — the family's purpose. Costs to engineer,
+    not assume: scc_size is a node column over the CALLS graph, so a body edit that
+    forms/breaks a cycle legitimately rewrites other buckets' node slabs (digest-carry
+    already handles it — the fixture's "no scc ripple" note is fixture-specific, not a
+    law); eligibility must reject returns-ledger changes (rets are global name-keyed
+    chain inputs) and request-span drift exactly like the respan ladder; and the edge
+    stream's global order (pre-link, per-bucket resolution, similar, requests) must be
+    recomposed, not approximated. Gate: byte convergence per edit class on the fixture,
+    the kernel, AND the battery repos.
   - **c-3 — defs-changed closure via the usage family** + measured escalation threshold
     (the retained tier's `within_absorb_budget` shape); then default-format flip and v1
     read retirement.
-  Standing gate for c-2/c-3 (the generic-tool law): a real-repo convergence battery —
-  scripts/-level, ≥3 diverse modest repos, real edit shapes (comment insert, body change,
-  import add, function append), scoped-vs-full BYTE compare per class — beyond the kernel
-  and the fixture. Escalation stays LOUD: any under-approximated closure falls back to
-  the full pipeline, never to a wrong generation.
+  Standing gate for c-2/c-3 (the generic-tool law): **scripts/convergence_battery.sh**
+  (shipped with c-1) — real repos, real edit shapes, scoped-vs-full BYTE compare per
+  class, beyond the kernel and the fixture. Per repo copy × format lane: scratch
+  determinism ×2, then touch / top-comment / body-comment / literal-flip / fn-append,
+  each demanding incremental id == scratch id of the same tree. First run (2026-08-31,
+  ast-grep=Rust, nats.go=Go, ProxyBroker=Python, pierre=TypeScript; lanes next+flat):
+  **48/48 PASS**.
+  Honest path notes from the run: ast-grep + ProxyBroker span-only edits took the respan
+  compose (names.idx linked); nats.go's did NOT — its probe file is dense with request
+  sites (nats:// URLs) and request-span exactness is a stated conservative eligibility
+  premise, so the compose declined and the full pipeline converged instead. That is the
+  designed fallback, and the battery's gate is convergence, not path choice. Escalation
+  stays LOUD: any under-approximated closure falls back to the full pipeline, never to a
+  wrong generation.
 
 ## Execution order & gates
 
