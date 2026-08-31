@@ -49,6 +49,12 @@ pub enum SymbolType {
   Route,
   /// An event/message listener registration (`EVENT user.created`).
   Channel,
+  /// A macro definition (`#define`, `macro_rules!`, Swift macros, `-define`, …).
+  Macro,
+  /// A union type definition (C/C++/Rust/Zig `union`).
+  Union,
+  /// A type alias (`typedef`, `using X = Y`, `type X = Y`, `typealias`).
+  TypeAlias,
 }
 
 /// Entry placement in the outline tree.

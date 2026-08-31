@@ -824,9 +824,20 @@ pub fn link_writer<'i>(
     })
     .copied()
     .collect();
+  // Root-relative imports (`<linux/export.h>`) resolve by suffix with corpus-learned
+  // include roots — learn them before anything consults the path prober.
+  phase_trace("link: include-roots learn");
+  table.learn_include_roots(interner, &references);
+  phase_trace("link: import-binding seed");
   vorpal_resolve::seed_import_bindings(interner, &mut table, &qualified, resolver);
   drop(qualified);
-  let (edges, stats) = resolve_all(interner, &table, &references, resolver);
+  // Include-reachability pre-pass (the candidate law's macro gate): file→file
+  // edges from every resolved path-form import, closed transitively — macro
+  // candidates then bind by inclusion, exactly like the preprocessor.
+  phase_trace("link: include-reach build");
+  let reach = vorpal_resolve::build_include_reach(interner, &table, &references);
+  phase_trace("link: resolve refs");
+  let (edges, stats) = resolve_all(interner, &table, &references, resolver, Some(&reach));
   phase_trace("link: resolve done");
   drop(table);
   drop(references);
@@ -1035,9 +1046,17 @@ fn link_resolve<'i>(
   let mut table = build_symbol_table(interner, writer);
   release_freed_pages();
   phase_trace("link: resolve start");
-  // Import-binding pre-pass (§3.3 scope step): the spill retained the qualifier-carrying
-  // imports in RAM, so bare uses in an importing file inherit its import-proven targets.
-  vorpal_resolve::seed_import_bindings(interner, &mut table, spill.qualified_imports(), resolver);
+  // Import-binding pre-pass (§3.3 scope step): the spill retained the import references
+  // in RAM, so bare uses in an importing file inherit its import-proven targets. The
+  // same retained slice feeds the include-reachability oracle (the candidate law's
+  // macro gate) — path-form imports build the file→file graph, closed transitively.
+  phase_trace("link: include-roots learn");
+  table.learn_include_roots(interner, spill.imports());
+  phase_trace("link: import-binding seed");
+  vorpal_resolve::seed_import_bindings(interner, &mut table, spill.imports(), resolver);
+  phase_trace("link: include-reach build");
+  let reach = vorpal_resolve::build_include_reach(interner, &table, spill.imports());
+  phase_trace("link: include-reach done");
   // Edges stream straight into the writer's edge log, in resolution order — the collected
   // edge vector was ~90 MB alive under the seal at kernel scale. Evidence rows are collected
   // alongside (24 bytes per emitted edge; they must all exist before the canonical sort that
@@ -1051,6 +1070,7 @@ fn link_resolve<'i>(
       spill,
       resolver,
       chain.as_ref(),
+      Some(&reach),
       |edge| {
         writer.add_edge(
           edge.from,
@@ -1482,9 +1502,10 @@ fn build_symbol_table<'i>(
       if kind == SymbolKind::File {
         // File nodes are the targets of path-form imports (`import "./util"`).
         table.insert_file(interner, path, id);
-      } else if kind != SymbolKind::Import {
-        // Import/alias nodes are wiring, not definitions: offering them as resolution targets
-        // let a `use foo` in one file steal call edges meant for the real `foo`.
+      } else if kind.is_resolution_candidate() {
+        // The candidate law lives on SymbolKind (ONE definition for every table
+        // feed): imports are wiring, macros are visibility-gated — see
+        // `SymbolKind::is_resolution_candidate`.
         // Owners resolve by `peek`: an owner name no reference ever interned can never match
         // a qualifier, but member-ness must survive — the unmatchable sentinel keeps such
         // members out of the top-level (module-stem) matching path.
@@ -1567,7 +1588,7 @@ mod sharded_table_tests {
     writer.for_each_definition(|id, name, path, kind, exported| {
       if kind == SymbolKind::File {
         table.insert_file(itn(), path, id);
-      } else if kind != SymbolKind::Import {
+      } else if kind.is_resolution_candidate() {
         let owner = owner_of[id.raw() as usize].map(|src| {
           itn()
             .peek(&names[src as usize])

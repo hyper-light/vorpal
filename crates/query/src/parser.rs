@@ -127,6 +127,21 @@ impl Parser {
     }
   }
 
+  /// A label identifier: label position (after `:` or `|`) is unambiguous, so
+  /// keyword-spelled kind names are accepted here — `Union` is both a Cypher
+  /// clause keyword and a symbol kind (extraction-coverage campaign), and
+  /// `MATCH (n:Union)` must parse.
+  fn label_ident(&mut self, what: &str) -> Result<String, QueryError> {
+    match self.peek() {
+      Some(Tok::Ident(w)) => {
+        let w = w.clone();
+        self.at += 1;
+        Ok(w)
+      }
+      _ => Err(QueryError::parse(self.offset(), format!("expected {what}"))),
+    }
+  }
+
   fn int(&mut self, what: &str) -> Result<u64, QueryError> {
     match self.peek() {
       Some(Tok::Int(n)) => {
@@ -301,13 +316,13 @@ impl Parser {
     }
     if self.peek() == Some(&Tok::Colon) {
       self.at += 1;
-      node.kinds.push(self.ident("kind label after ':'")?);
+      node.kinds.push(self.label_ident("kind label after ':'")?);
       while self.peek() == Some(&Tok::Pipe) {
         self.at += 1;
         if self.peek() == Some(&Tok::Colon) {
           self.at += 1;
         }
-        node.kinds.push(self.ident("kind label after '|'")?);
+        node.kinds.push(self.label_ident("kind label after '|'")?);
       }
     }
     if self.peek() == Some(&Tok::LBrace) {
@@ -568,13 +583,13 @@ impl Parser {
     // `n:Label`
     if let (Expr::Var { var }, Some(Tok::Colon)) = (&left, self.peek()) {
       self.at += 1;
-      let mut kinds = vec![self.ident("kind label after ':'")?];
+      let mut kinds = vec![self.label_ident("kind label after ':'")?];
       while self.peek() == Some(&Tok::Pipe) {
         self.at += 1;
         if self.peek() == Some(&Tok::Colon) {
           self.at += 1;
         }
-        kinds.push(self.ident("kind label after '|'")?);
+        kinds.push(self.label_ident("kind label after '|'")?);
       }
       return Ok(PredExpr::HasLabel {
         var: var.clone(),

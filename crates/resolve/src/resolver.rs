@@ -1,8 +1,9 @@
 //! The resolution algorithm (§3.3): scope-aware, confidence-scored, never faking edges.
 
-use vorpal_kg::{EdgeType, NodeId};
+use vorpal_kg::{EdgeType, NodeId, SymbolKind};
 
 use crate::intern::{Interner, NameId};
+use crate::reach::IncludeReach;
 use crate::reference::{RefForm, RefKind, Reference};
 use crate::table::{Symbol, SymbolTable};
 
@@ -317,8 +318,16 @@ impl Resolver {
     interner: &'i Interner,
     table: &SymbolTable<'i>,
     reference: &Reference<'i>,
+    reach: Option<&IncludeReach<'i>>,
   ) -> Resolution {
-    self.resolve_with(interner, table, reference, &mut ResolveScratch::default(), None)
+    self.resolve_with(
+      interner,
+      table,
+      reference,
+      &mut ResolveScratch::default(),
+      None,
+      reach,
+    )
   }
 
   /// [`Resolver::resolve`] with caller-owned scratch buffers — batch resolution reuses one
@@ -331,10 +340,17 @@ impl Resolver {
     reference: &Reference<'i>,
     scratch: &mut ResolveScratch<'i>,
     chain: Option<&ChainReturns<'i>>,
+    reach: Option<&IncludeReach<'i>>,
   ) -> Resolution {
+    let ResolveScratch {
+      reachable,
+      refined,
+      local,
+      visible,
+    } = scratch;
     let edge = reference.kind.edge();
     if reference.kind == RefKind::Import {
-      if let Some(target) = resolve_import_path(interner, table, reference) {
+      if let Some((target, _)) = resolve_import_path(interner, table, reference) {
         return Resolution {
           target: Some(target),
           edge,
@@ -345,7 +361,36 @@ impl Resolver {
         };
       }
     }
-    let candidates = table.candidates(reference.name);
+    let unfiltered = table.candidates(reference.name);
+    // The candidate law's macro gate (see `SymbolKind::is_resolution_candidate`):
+    // macros bind by INCLUSION, not name-globality — a macro candidate survives
+    // only when its defining file is the reference's own file or include-reachable
+    // from it. Same-named per-arch/vendored duplicates thereby resolve to exactly
+    // the copy the includer reaches instead of minting global ambiguity.
+    let candidates: &[Symbol<'i>] =
+      if unfiltered.iter().any(|s| s.kind == SymbolKind::Macro) {
+        reachable.clear();
+        reachable.extend(unfiltered.iter().copied().filter(|s| {
+          s.kind != SymbolKind::Macro
+            || s.path == reference.from_path
+            || reach.is_some_and(|r| r.reaches(reference.from_path, s.path))
+        }));
+        if reachable.is_empty() {
+          // Macro definitions exist but none is include-visible here — the same
+          // masked outcome as private-to-other-files, never a fake binding.
+          return Resolution {
+            target: None,
+            edge,
+            confidence: Confidence::NONE,
+            candidates: unfiltered.len(),
+            reason: ResolveReason::None,
+            alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
+          };
+        }
+        reachable
+      } else {
+        unfiltered
+      };
     // A bare name in a file whose own import provably bound it (the qualified import
     // resolved to a single corroborated target — ties never seed bindings, so ambiguity
     // cannot launder through here) resolves to that import's target, unless a local
@@ -356,11 +401,12 @@ impl Resolver {
     if reference.form == RefForm::Bare {
       if let Some(target) = table.import_binding(reference.from_path, reference.name) {
         if !candidates.iter().any(|s| s.path == reference.from_path) {
+          let candidates = candidates.len();
           return Resolution {
             target: Some(target),
             edge,
             confidence: Confidence::CROSS_FILE,
-            candidates: candidates.len(),
+            candidates,
             reason: ResolveReason::ImportBound,
             alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
           };
@@ -379,26 +425,26 @@ impl Resolver {
     }
 
     if let Some(qualifier) = reference.qualifier {
-      scratch.refined.clear();
-      scratch.refined.extend(
+      refined.clear();
+      refined.extend(
         candidates
           .iter()
           .filter(|s| qualifier_matches(interner, s, qualifier, reference.form))
           .copied(),
       );
-      if !scratch.refined.is_empty() {
+      if !refined.is_empty() {
         // The qualifier corroborates these candidates; among them, a multi-way tie (e.g. two
         // `impl Kg` blocks defining `load`) is genuine ambiguity — labeled, tolerated.
         return finish(
           interner,
-          &scratch.refined,
+          refined,
           reference,
           edge,
           candidates.len(),
           true,
           true,
-          &mut scratch.local,
-          &mut scratch.visible,
+          local,
+          visible,
         );
       }
       if reference.form == RefForm::MethodHinted {
@@ -425,25 +471,25 @@ impl Resolver {
     // in-tree owner (external type, spelling drift) falls through to untyped semantics.
     if matches!(reference.form, RefForm::Method | RefForm::MethodHinted) {
       if let Some(receiver_type) = reference.receiver_type {
-        scratch.refined.clear();
-        scratch.refined.extend(
+        refined.clear();
+        refined.extend(
           candidates
             .iter()
             .filter(|s| s.owner == Some(receiver_type))
             .copied(),
         );
-        match scratch.refined.len() {
+        match refined.len() {
           0 => {
             // Chained-call fallback (G-M5): the "type" may really be a CALLEE NAME
             // (`let x = make()` records `make`). If the corpus-wide return ledger maps it
             // to exactly one return type that uniquely narrows, that is the edge; any
             // ambiguity refuses (inference on inference earns no tie picks).
             if let Some(ret) = chain.and_then(|c| c.get(receiver_type)) {
-              scratch.refined.extend(
+              refined.extend(
                 candidates.iter().filter(|s| s.owner == Some(ret)).copied(),
               );
-              if scratch.refined.len() == 1 {
-                let target = scratch.refined[0];
+              if refined.len() == 1 {
+                let target = refined[0];
                 return Resolution {
                   target: Some(target.id),
                   edge,
@@ -453,11 +499,11 @@ impl Resolver {
                   alternatives: ([0; MAX_RETAINED_ALTERNATIVES], 0),
                 };
               }
-              scratch.refined.clear();
+              refined.clear();
             }
           }
           1 => {
-            let target = scratch.refined[0];
+            let target = refined[0];
             return Resolution {
               target: Some(target.id),
               edge,
@@ -475,10 +521,10 @@ impl Resolver {
             // Several methods on the SAME type (e.g. duplicate impl blocks): genuinely
             // ambiguous, but the type narrowed the field — a labeled deterministic pick
             // with the beaten set retained, exactly the QualifiedTie discipline.
-            let target = scratch.refined.iter().min_by_key(|s| s.id.raw()).map(|s| s.id);
+            let target = refined.iter().min_by_key(|s| s.id.raw()).map(|s| s.id);
             let mut alts = [0u32; MAX_RETAINED_ALTERNATIVES];
             let mut alt_count = 0u8;
-            for symbol in scratch.refined.iter() {
+            for symbol in refined.iter() {
               if Some(symbol.id) == target || (alt_count as usize) >= MAX_RETAINED_ALTERNATIVES {
                 continue;
               }
@@ -509,8 +555,8 @@ impl Resolver {
       candidates.len(),
       guess_on_tie,
       false,
-      &mut scratch.local,
-      &mut scratch.visible,
+      local,
+      visible,
     )
   }
 }
@@ -519,6 +565,8 @@ impl Resolver {
 /// by the largest candidate set a chunk encounters.
 #[derive(Default)]
 struct ResolveScratch<'i> {
+  /// Include-gated candidate list (the macro gate's output).
+  reachable: Vec<Symbol<'i>>,
   refined: Vec<Symbol<'i>>,
   local: Vec<Symbol<'i>>,
   visible: Vec<Symbol<'i>>,
@@ -683,21 +731,51 @@ fn resolve_import_path<'i>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   reference: &Reference<'i>,
-) -> Option<NodeId> {
+) -> Option<(NodeId, NameId<'i>)> {
   let name = interner.text_of(reference.name);
   if !name.contains(['/', '.']) {
     return None;
   }
   if let Some(id) = table.file(interner, name) {
-    return Some(id);
+    return Some((id, reference.name));
   }
   let from_path = interner.text_of(reference.from_path);
   let joined = join_normalize(parent_dir(from_path), name);
   if let Some(id) = table.file(interner, &joined) {
-    return Some(id);
+    return Some((id, interner.intern(&joined)));
   }
-  let ext = extension(from_path)?;
-  table.file(interner, &format!("{joined}.{ext}"))
+  if let Some(ext) = extension(from_path) {
+    let with_ext = format!("{joined}.{ext}");
+    if let Some(id) = table.file(interner, &with_ext) {
+      return Some((id, interner.intern(&with_ext)));
+    }
+  }
+  // Root-relative includes (`#include <linux/export.h>`, absolute-style module paths):
+  // the exact and importer-relative probes cannot see them, so fall through to the
+  // suffix map with nearest-prefix + corpus-support disambiguation (the `-I` set
+  // inferred from the corpus itself — see `SymbolTable::file_by_suffix`).
+  table.file_by_suffix(interner, name, reference.from_path)
+}
+
+/// Build the include-reachability oracle from the import references: every
+/// path-form import that resolves to an indexed file contributes a file→file
+/// edge. Language-agnostic — C/C++ `#include`, JS/TS path imports, anything the
+/// path resolver matches; symbol-form imports contribute nothing here.
+pub fn build_include_reach<'i>(
+  interner: &'i Interner,
+  table: &SymbolTable<'i>,
+  imports: &[Reference<'i>],
+) -> IncludeReach<'i> {
+  let mut edges = Vec::new();
+  for reference in imports {
+    if reference.kind != RefKind::Import {
+      continue;
+    }
+    if let Some((_, target_path)) = resolve_import_path(interner, table, reference) {
+      edges.push((reference.from_path, target_path));
+    }
+  }
+  IncludeReach::from_edges(&edges)
 }
 
 fn parent_dir(path: &str) -> &str {
@@ -825,7 +903,7 @@ pub fn seed_import_bindings<'i>(
     std::collections::HashMap::new();
   let mut scratch = ResolveScratch::default();
   for reference in qualified_imports {
-    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, None);
+    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, None, None);
     let Some(target) = resolution.target else {
       continue;
     };
@@ -863,9 +941,11 @@ pub fn resolve_all<'i>(
   table: &SymbolTable<'i>,
   references: &[Reference<'i>],
   resolver: &Resolver,
+  reach: Option<&IncludeReach<'i>>,
 ) -> (Vec<ResolvedEdge>, ResolveStats) {
   if references.len() <= MIN_REFS_PER_SHARD {
-    let (edges, _unresolved, stats) = resolve_chunk(interner, table, references, resolver, None);
+    let (edges, _unresolved, stats) =
+      resolve_chunk(interner, table, references, resolver, None, reach);
     return (edges, stats);
   }
   use rayon::prelude::*;
@@ -876,7 +956,7 @@ pub fn resolve_all<'i>(
     .max(MIN_REFS_PER_SHARD);
   let shards: Vec<(Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats)> = references
     .par_chunks(chunk_size)
-    .map(|chunk| resolve_chunk(interner, table, chunk, resolver, None))
+    .map(|chunk| resolve_chunk(interner, table, chunk, resolver, None, reach))
     .collect();
   // Reserve what actually resolved, not one slot per reference — at kernel scale roughly
   // half of all references yield edges, and the difference is ~80 MB of dead reservation.
@@ -900,6 +980,7 @@ pub fn resolve_all_spilled<'i>(
   table: &SymbolTable<'i>,
   spill: &crate::RefSpill<'i>,
   resolver: &Resolver,
+  reach: Option<&IncludeReach<'i>>,
 ) -> std::io::Result<(Vec<ResolvedEdge>, ResolveStats)> {
   let mut edges = Vec::new();
   let stats = resolve_all_spilled_into(
@@ -908,6 +989,7 @@ pub fn resolve_all_spilled<'i>(
     spill,
     resolver,
     None,
+    reach,
     |edge| edges.push(*edge),
     |_| {},
   )?;
@@ -919,12 +1001,14 @@ pub fn resolve_all_spilled<'i>(
 /// alive under the seal at kernel scale). Chunks stream to a worker pool through a bounded
 /// channel; the sink runs on the calling thread, fed by a rolling in-order drain of
 /// finished chunks (the absorb-holdback pattern).
+#[allow(clippy::too_many_arguments)] // streaming-sink API: two sinks plus two optional oracles.
 pub fn resolve_all_spilled_into<'i>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   spill: &crate::RefSpill<'i>,
   resolver: &Resolver,
   chain: Option<&ChainReturns<'i>>,
+  reach: Option<&IncludeReach<'i>>,
   mut sink: impl FnMut(&ResolvedEdge),
   mut unresolved_sink: impl FnMut(&UnresolvedEvidence),
 ) -> std::io::Result<ResolveStats> {
@@ -951,7 +1035,8 @@ pub fn resolve_all_spilled_into<'i>(
         let out_tx = out_tx.clone();
         scope.spawn(move || {
           while let Ok((index, chunk)) = work_rx.recv() {
-            let (edges, unresolved, stats) = resolve_chunk(interner, table, &chunk, resolver, chain);
+            let (edges, unresolved, stats) =
+              resolve_chunk(interner, table, &chunk, resolver, chain, reach);
             if out_tx.send((index, edges, unresolved, stats)).is_err() {
               break;
             }
@@ -1018,13 +1103,15 @@ fn resolve_chunk<'i>(
   references: &[Reference<'i>],
   resolver: &Resolver,
   chain: Option<&ChainReturns<'i>>,
+  reach: Option<&IncludeReach<'i>>,
 ) -> (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats) {
   let mut edges = Vec::new();
   let mut unresolved = Vec::new();
   let mut stats = ResolveStats::default();
   let mut scratch = ResolveScratch::default();
   for reference in references {
-    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, chain);
+    let resolution =
+      resolver.resolve_with(interner, table, reference, &mut scratch, chain, reach);
     let name_hash =
       xxhash_rust::xxh3::xxh3_64(interner.text_of(reference.name).as_bytes()) as u32;
     match resolution.target {
@@ -1110,6 +1197,7 @@ mod tests {
       &call("new", "c.rs")
         .with_qualifier(itn(), Some("Kg".into()))
         .with_form(RefForm::Static),
+      None,
     );
     assert_eq!(r.target, Some(NodeId::new(1)));
     assert_eq!(r.confidence, Confidence::CROSS_FILE);
@@ -1121,6 +1209,7 @@ mod tests {
       &call("new", "c.rs")
         .with_qualifier(itn(), Some("Vec".into()))
         .with_form(RefForm::Static),
+      None,
     );
     assert_eq!(r.target, None);
     assert_eq!(r.candidates, 2, "candidates reported for transparency");
@@ -1139,6 +1228,7 @@ mod tests {
       &call("helper", "src/a.rs")
         .with_qualifier(itn(), Some("util".into()))
         .with_form(RefForm::Static),
+      None,
     );
     assert_eq!(r.target, Some(NodeId::new(1)));
 
@@ -1149,6 +1239,7 @@ mod tests {
       &call("helper", "src/a.rs")
         .with_qualifier(itn(), Some("util".into()))
         .with_form(RefForm::Method),
+      None,
     );
     assert_eq!(r.target, None, "receiver text is not namespace evidence");
   }
@@ -1176,12 +1267,12 @@ mod tests {
     assert_eq!(seeded, 1);
 
     // The bare call in the importing file inherits the import-proven target...
-    let r = Resolver::new().resolve(itn(), &table, &call("helper", "src/a.rs"));
+    let r = Resolver::new().resolve(itn(), &table, &call("helper", "src/a.rs"), None);
     assert_eq!(r.target, Some(NodeId::new(1)));
     assert_eq!(r.confidence, Confidence::CROSS_FILE);
     assert_eq!(r.reason, ResolveReason::ImportBound);
     // ...while the same call in a file with no import stays a labelled blind tie.
-    let r = Resolver::new().resolve(itn(), &table, &call("helper", "src/b.rs"));
+    let r = Resolver::new().resolve(itn(), &table, &call("helper", "src/b.rs"), None);
     assert_eq!(r.reason, ResolveReason::VisibleTie);
     assert_eq!(r.confidence, Confidence::AMBIGUOUS);
 
@@ -1191,7 +1282,7 @@ mod tests {
     shadowed.insert(itn(), "helper", symbol(3, "src/a.rs", false, None));
     shadowed.finalize();
     seed_import_bindings(itn(), &mut shadowed, &[import("src/a.rs", "util")], &Resolver::new());
-    let r = Resolver::new().resolve(itn(), &shadowed, &call("helper", "src/a.rs"));
+    let r = Resolver::new().resolve(itn(), &shadowed, &call("helper", "src/a.rs"), None);
     assert_eq!(r.target, Some(NodeId::new(3)));
     assert_eq!(r.reason, ResolveReason::Local);
 
@@ -1207,13 +1298,13 @@ mod tests {
       .with_alias_ref(itn(), Some("h"));
     let seeded = seed_import_bindings(itn(), &mut aliased, &[aliased_import], &Resolver::new());
     assert_eq!(seeded, 1);
-    let r = Resolver::new().resolve(itn(), &aliased, &call("h", "src/a.rs"));
+    let r = Resolver::new().resolve(itn(), &aliased, &call("h", "src/a.rs"), None);
     assert_eq!(r.target, Some(NodeId::new(1)), "alias call binds the original");
     assert_eq!(r.reason, ResolveReason::ImportBound);
     assert_eq!(r.candidates, 0, "the alias itself is defined nowhere");
     // The ORIGINAL name did not get a binding in the aliased form — `helper()` in that file
     // resolves through normal visibility, not the alias binding.
-    let r = Resolver::new().resolve(itn(), &aliased, &call("helper", "src/a.rs"));
+    let r = Resolver::new().resolve(itn(), &aliased, &call("helper", "src/a.rs"), None);
     assert_eq!(r.reason, ResolveReason::VisibleExport);
 
     // Two module files share the qualifier's stem: the import itself is a qualifier TIE, and
@@ -1224,7 +1315,7 @@ mod tests {
     tied.finalize();
     let seeded = seed_import_bindings(itn(), &mut tied, &[import("src/a.rs", "util")], &Resolver::new());
     assert_eq!(seeded, 0, "a tied import proves nothing");
-    let r = Resolver::new().resolve(itn(), &tied, &call("helper", "src/a.rs"));
+    let r = Resolver::new().resolve(itn(), &tied, &call("helper", "src/a.rs"), None);
     assert_eq!(r.reason, ResolveReason::VisibleTie, "no binding, so the tie stays labelled");
   }
 
@@ -1244,6 +1335,7 @@ mod tests {
       &call("draw", "c.rs")
         .with_qualifier(itn(), Some("Grid".into()))
         .with_form(RefForm::MethodHinted),
+      None,
     );
     assert_eq!(r.target, Some(NodeId::new(2)));
     assert_eq!(r.reason, ResolveReason::Qualified);
@@ -1256,6 +1348,7 @@ mod tests {
       &call("render", "c.rs")
         .with_qualifier(itn(), Some("mystery".into()))
         .with_form(RefForm::MethodHinted),
+      None,
     );
     assert_eq!(r.target, Some(NodeId::new(3)), "hint must not veto the unique member");
     assert_eq!(r.reason, ResolveReason::VisibleExport);
@@ -1267,6 +1360,7 @@ mod tests {
       &call("draw", "c.rs")
         .with_qualifier(itn(), Some("mystery".into()))
         .with_form(RefForm::MethodHinted),
+      None,
     );
     assert_eq!(r.target, None);
 
@@ -1281,6 +1375,7 @@ mod tests {
       &call("helper", "c.rs")
         .with_qualifier(itn(), Some("util".into()))
         .with_form(RefForm::MethodHinted),
+      None,
     );
     assert_eq!(r.target, None, "hinted receivers get owner matching only");
   }
@@ -1293,11 +1388,12 @@ mod tests {
 
     // `x.map()` with two visible candidates: no edge, counted as masked.
     table.finalize();
-    let r = Resolver::new().resolve(itn(), &table, &call("map", "c.rs").with_form(RefForm::Method));
+    let r =
+      Resolver::new().resolve(itn(), &table, &call("map", "c.rs").with_form(RefForm::Method), None);
     assert_eq!(r.target, None);
 
     // Bare `map()` keeps the labeled approximate pick.
-    let r = Resolver::new().resolve(itn(), &table, &call("map", "c.rs"));
+    let r = Resolver::new().resolve(itn(), &table, &call("map", "c.rs"), None);
     assert_eq!(r.target, Some(NodeId::new(1)));
     assert_eq!(r.confidence, Confidence::AMBIGUOUS);
 
@@ -1305,7 +1401,12 @@ mod tests {
     let mut unique = SymbolTable::new();
     unique.insert(itn(), "map", symbol(7, "a.rs", true, Some("Chart")));
     unique.finalize();
-    let r = Resolver::new().resolve(itn(), &unique, &call("map", "c.rs").with_form(RefForm::Method));
+    let r = Resolver::new().resolve(
+      itn(),
+      &unique,
+      &call("map", "c.rs").with_form(RefForm::Method),
+      None,
+    );
     assert_eq!(r.target, Some(NodeId::new(7)));
   }
 
@@ -1324,22 +1425,25 @@ mod tests {
       itn(),
       &table,
       &call("print_text_to", "src/outline/output/tests.rs"),
+      None,
     );
     assert_eq!(r.target, Some(NodeId::new(1)));
     assert_eq!(r.confidence, Confidence::CROSS_FILE);
 
     // A sibling file is not.
     table.finalize();
-    let r = Resolver::new().resolve(itn(), &table, &call("print_text_to", "src/outline/other.rs"));
+    let r =
+      Resolver::new().resolve(itn(), &table, &call("print_text_to", "src/outline/other.rs"), None);
     assert_eq!(r.target, None);
 
     // Carrier files own their directory subtree.
     let mut lib = SymbolTable::new();
     lib.insert(itn(), "internal", symbol(2, "crates/x/src/lib.rs", false, None));
     lib.finalize();
-    let r = Resolver::new().resolve(itn(), &lib, &call("internal", "crates/x/src/deep/nested.rs"));
+    let r =
+      Resolver::new().resolve(itn(), &lib, &call("internal", "crates/x/src/deep/nested.rs"), None);
     assert_eq!(r.target, Some(NodeId::new(2)));
-    let r = Resolver::new().resolve(itn(), &lib, &call("internal", "crates/y/src/a.rs"));
+    let r = Resolver::new().resolve(itn(), &lib, &call("internal", "crates/y/src/a.rs"), None);
     assert_eq!(r.target, None);
   }
 
@@ -1350,15 +1454,15 @@ mod tests {
 
     // Same package (directory) → visible.
     table.finalize();
-    let r = Resolver::new().resolve(itn(), &table, &call("Helper", "src/com/x/Main.java"));
+    let r = Resolver::new().resolve(itn(), &table, &call("Helper", "src/com/x/Main.java"), None);
     assert_eq!(r.target, Some(NodeId::new(1)));
 
     // Another package → package-private stays masked.
-    let r = Resolver::new().resolve(itn(), &table, &call("Helper", "src/com/y/Main.java"));
+    let r = Resolver::new().resolve(itn(), &table, &call("Helper", "src/com/y/Main.java"), None);
     assert_eq!(r.target, None);
 
     // Directory scoping never leaks across languages.
-    let r = Resolver::new().resolve(itn(), &table, &call("Helper", "src/com/x/main.rs"));
+    let r = Resolver::new().resolve(itn(), &table, &call("Helper", "src/com/x/main.rs"), None);
     assert_eq!(r.target, None);
   }
 
@@ -1401,13 +1505,13 @@ mod tests {
 
     let resolver = Resolver::new();
     table.finalize();
-    let (sharded_edges, sharded_stats) = resolve_all(itn(), &table, &references, &resolver);
+    let (sharded_edges, sharded_stats) = resolve_all(itn(), &table, &references, &resolver, None);
 
     // The serial specification: one resolver call per reference, in order.
     let mut serial_edges = Vec::new();
     let mut serial_stats = ResolveStats::default();
     for reference in &references {
-      let resolution = resolver.resolve(itn(), &table, reference);
+      let resolution = resolver.resolve(itn(), &table, reference, None);
       match resolution.target {
         Some(to) => {
           if resolution.confidence <= Confidence::AMBIGUOUS {
@@ -1452,7 +1556,7 @@ mod tests {
       call("hidden", "a.rs"),  // same file → resolved
     ];
     table.finalize();
-    let (edges, stats) = resolve_all(itn(), &table, &refs, &Resolver::new());
+    let (edges, stats) = resolve_all(itn(), &table, &refs, &Resolver::new(), None);
     assert_eq!(edges.len(), 1);
     assert_eq!(stats.resolved, 1);
     assert_eq!(stats.external, 1);

@@ -76,7 +76,7 @@ name: $NAME
 id: c-union
 language: C
 role: item
-symbolType: struct
+symbolType: union
 rule:
   kind: union_specifier
   all:
@@ -181,3 +181,53 @@ rule:
     pattern: $NAME
 name: $NAME
 isPublic: true
+---
+id: c-macro
+language: C
+role: item
+symbolType: macro
+# Object-like macro: `#define NAME …` — the preprocessor layer is definition
+# surface too (extraction-coverage campaign: the kernel alone holds ~6.1M of
+# these). Header macros are the C API contract; hiding them hid real symbols.
+rule:
+  kind: preproc_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: c-macro-function
+language: C
+role: item
+symbolType: macro
+# Function-like macro: `#define MAX(a, b) …` — callable surface (`container_of`,
+# `list_for_each_entry`, …); call resolution treats its invocations like calls.
+rule:
+  kind: preproc_function_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+id: c-typedef
+language: C
+role: item
+symbolType: typeAlias
+# `typedef … name;` — the name is the type identifier reached by descending the
+# declarator chain (pointer/array/function-pointer wrappers), the c-function
+# discipline.
+rule:
+  kind: type_definition
+  has:
+    field: declarator
+    any:
+      - kind: type_identifier
+        pattern: $NAME
+      - has:
+          kind: type_identifier
+          stopBy: end
+          pattern: $NAME
+name: $NAME
+isExported: true

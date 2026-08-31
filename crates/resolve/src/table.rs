@@ -47,6 +47,15 @@ pub struct SymbolTable<'i> {
   /// local definitions (which shadow imports) and before global visibility. Probed, never
   /// iterated, so map order is never observed.
   import_bindings: HashMap<(NameId<'i>, NameId<'i>), NodeId>,
+  /// Basename → every indexed file carrying it, as `(full path text, node)`, sorted by
+  /// path at finalize — the candidate pool for root-relative import suffix matching
+  /// ([`SymbolTable::file_by_suffix`]).
+  file_suffixes: HashMap<&'i str, Vec<(&'i str, NodeId)>>,
+  /// Include-root support learned from the corpus's own import stream
+  /// ([`SymbolTable::learn_include_roots`]): directory prefix → how many import
+  /// occurrences it satisfies. The `-I` set inferred from data — probed for suffix
+  /// tie-breaking, never iterated.
+  root_support: HashMap<&'i str, u32>,
 }
 
 impl<'i> SymbolTable<'i> {
@@ -86,7 +95,11 @@ impl<'i> SymbolTable<'i> {
 
   /// Register a file node by its exact ingested path (the target of path-form imports).
   pub fn insert_file(&mut self, interner: &'i Interner, path: &str, id: NodeId) {
-    self.files.insert(interner.intern(path), id);
+    let interned = interner.intern(path);
+    let text = interner.text_of(interned);
+    let basename = text.rsplit('/').next().unwrap_or(text);
+    self.file_suffixes.entry(basename).or_default().push((text, id));
+    self.files.insert(interned, id);
   }
 
   /// The file node at exactly `path`, if indexed. Probes never grow the interner: a joined
@@ -106,6 +119,97 @@ impl<'i> SymbolTable<'i> {
     self.import_bindings.get(&(path, name)).copied()
   }
 
+  /// Learn include-root support from the corpus's own import stream: for every
+  /// path-form import, each directory prefix `R` such that `R/name` is an indexed
+  /// file earns one occurrence. The result is the `-I` set inferred from data —
+  /// the roots that explain the corpus's import vocabulary (a kernel's `include/`
+  /// dwarfs `tools/include/` exactly because it satisfies far more of the stream).
+  /// Call after `finalize`, before resolution; both link drivers do.
+  pub fn learn_include_roots(
+    &mut self,
+    interner: &'i Interner,
+    imports: &[crate::reference::Reference<'i>],
+  ) {
+    for reference in imports {
+      if reference.kind != crate::reference::RefKind::Import {
+        continue;
+      }
+      let name = interner.text_of(reference.name);
+      let Some((dir, basename)) = name.rsplit_once('/') else {
+        continue;
+      };
+      if dir.is_empty() {
+        continue;
+      }
+      let Some(bucket) = self.file_suffixes.get(basename) else {
+        continue;
+      };
+      for &(path, _) in bucket {
+        if let Some(at) = suffix_boundary(path, name) {
+          if let Some(root) = path.get(..at) {
+            let entry = self.root_support.entry(root).or_insert(0);
+            *entry = entry.saturating_add(1);
+          }
+        }
+      }
+    }
+  }
+
+  /// Resolve a root-relative import (`linux/export.h`-shaped: at least one directory
+  /// component) to the indexed file it names, by path suffix. Disambiguation is an
+  /// evidence hierarchy, every rung corpus-derived:
+  ///
+  /// 1. **Nearest prefix** — the candidate sharing the most leading path components
+  ///    with the importer wins (`tools/` files bind `tools/include/`, an arch tree
+  ///    binds its own headers) — locality trumps popularity.
+  /// 2. **Root support** — among prefix-ties, the candidate under the root that
+  ///    satisfies more of the corpus's import stream ([`Self::learn_include_roots`])
+  ///    wins: a main-tree file's `<linux/export.h>` binds `include/`, not the
+  ///    `tools/include/` shadow copy.
+  /// 3. **Still tied → `None`** — approximate edges are labeled, never faked.
+  ///
+  /// Bare basenames (no directory component) carry no structural evidence and are
+  /// never suffix-matched: the relative probes either already resolved them or the
+  /// file genuinely is not where the include convention says.
+  pub fn file_by_suffix(
+    &self,
+    interner: &'i Interner,
+    name: &str,
+    from_path: NameId<'i>,
+  ) -> Option<(NodeId, NameId<'i>)> {
+    let (dir, basename) = name.rsplit_once('/')?;
+    if dir.is_empty() {
+      return None;
+    }
+    let bucket = self.file_suffixes.get(basename)?;
+    let from_text = interner.text_of(from_path);
+    let mut best: Option<(usize, u32, &'i str, NodeId)> = None;
+    let mut tied = false;
+    for &(path, id) in bucket {
+      let Some(at) = suffix_boundary(path, name) else {
+        continue;
+      };
+      let shared = shared_components(from_text, path);
+      let support = path
+        .get(..at)
+        .and_then(|root| self.root_support.get(root))
+        .copied()
+        .unwrap_or(0);
+      match best {
+        Some((s, p, _, _)) if (shared, support) < (s, p) => {}
+        Some((s, p, _, _)) if (shared, support) == (s, p) => tied = true,
+        _ => {
+          best = Some((shared, support, path, id));
+          tied = false;
+        }
+      }
+    }
+    if tied {
+      return None;
+    }
+    best.map(|(_, _, path, id)| (id, interner.intern(path)))
+  }
+
   /// Merge another table's entries after this one's — the ordered-absorption step of a §7.5
   /// sharded table build, a plain append of the flat pair vector. Absorbing row-range shards
   /// in row order reproduces the serial insertion order exactly. (File paths and canonical
@@ -117,6 +221,9 @@ impl<'i> SymbolTable<'i> {
     );
     self.pending.extend(other.pending);
     self.files.extend(other.files);
+    for (basename, entries) in other.file_suffixes {
+      self.file_suffixes.entry(basename).or_default().extend(entries);
+    }
   }
 
   /// Group the inserted pairs by name — counting scatter, no sort: count per name, assign
@@ -128,6 +235,16 @@ impl<'i> SymbolTable<'i> {
   pub fn finalize(&mut self) {
     let pending = std::mem::take(&mut self.pending);
     Self::group(pending.iter().copied(), pending.len(), self);
+    self.seal_file_suffixes();
+  }
+
+  /// Sort every suffix bucket by path text — candidate scan order becomes a pure
+  /// function of the file set (hash-map iteration order is never observed).
+  fn seal_file_suffixes(&mut self) {
+    for bucket in self.file_suffixes.values_mut() {
+      bucket.sort_unstable_by(|a, b| a.0.cmp(b.0));
+      bucket.dedup_by(|a, b| a.0 == b.0);
+    }
   }
 
   /// Shared grouping kernel: `pairs` yielded in insertion order, twice-iterable via clone.
@@ -183,7 +300,11 @@ impl<'i> SymbolTable<'i> {
         "from_shards takes unfinalized shards"
       );
       table.files.extend(shard.files);
+      for (basename, entries) in shard.file_suffixes {
+        table.file_suffixes.entry(basename).or_default().extend(entries);
+      }
     }
+    table.seal_file_suffixes();
     table
   }
 
@@ -200,7 +321,9 @@ impl<'i> SymbolTable<'i> {
           table.insert_file(interner, node.path, id);
           continue;
         }
-        if node.kind == SymbolKind::Import {
+        if !node.kind.is_resolution_candidate() {
+          // The candidate law lives on SymbolKind (one definition for every
+          // table feed) — see `SymbolKind::is_resolution_candidate`.
           continue;
         }
         let owner = kg.container_of(id).and_then(|cid| {
@@ -240,4 +363,21 @@ impl<'i> SymbolTable<'i> {
   pub fn names(&self) -> usize {
     self.ranges.len()
   }
+}
+
+/// Where `path` ends with `/name`: the byte offset of that `/`, else `None`.
+/// Pure byte comparison — never a char-boundary panic (`/` is ASCII, so a match
+/// proves the boundary).
+fn suffix_boundary(path: &str, name: &str) -> Option<usize> {
+  let at = path.len().checked_sub(name.len() + 1)?;
+  let bytes = path.as_bytes();
+  (bytes[at] == b'/' && &bytes[at + 1..] == name.as_bytes()).then_some(at)
+}
+
+/// Leading path components two paths share (`a/b/x.c` vs `a/b/y/z.h` → 2).
+fn shared_components(a: &str, b: &str) -> usize {
+  a.split('/')
+    .zip(b.split('/'))
+    .take_while(|(x, y)| x == y)
+    .count()
 }

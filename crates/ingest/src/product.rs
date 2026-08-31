@@ -34,7 +34,10 @@ use vorpal_resolve::{RefForm, RefKind};
 /// v14 (G-M1): refs carry receiver/receiver-type/args; products carry per-entity params.
 /// The version check itself is this bump's invalidation — v13 bytes never decode, so every
 /// file re-extracts exactly once.
-pub const PRODUCT_FORMAT_VERSION: u32 = 17;
+// 18: SymbolType tags 28–30 (Macro/Union/TypeAlias — extraction-coverage campaign);
+// older caches re-parse under the new rules rather than replaying pre-campaign
+// products that lack the new symbol classes.
+pub const PRODUCT_FORMAT_VERSION: u32 = 18;
 
 /// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
 pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
@@ -321,6 +324,9 @@ fn symbol_type_tag(sym: SymbolType) -> u8 {
     SymbolType::TypeParameter => 25,
     SymbolType::Route => 26,
     SymbolType::Channel => 27,
+    SymbolType::Macro => 28,
+    SymbolType::Union => 29,
+    SymbolType::TypeAlias => 30,
   }
 }
 
@@ -354,6 +360,9 @@ fn tag_symbol_type(tag: u8) -> io::Result<SymbolType> {
     25 => SymbolType::TypeParameter,
     26 => SymbolType::Route,
     27 => SymbolType::Channel,
+    28 => SymbolType::Macro,
+    29 => SymbolType::Union,
+    30 => SymbolType::TypeAlias,
     other => return Err(corrupt(format!("unknown symbol type tag {other}"))),
   })
 }

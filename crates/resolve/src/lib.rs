@@ -16,17 +16,20 @@
 //! [`vorpal_kg::Kg`] via [`SymbolTable::from_kg`]) plus [`Reference`]s to [`resolve_all`].
 
 pub mod intern;
+mod reach;
 mod reference;
 mod resolver;
 pub mod spill;
 mod table;
 
 pub use intern::{Interner, NameId};
+pub use reach::IncludeReach;
 pub use reference::{RefForm, RefKind, Reference};
 pub use resolver::{
   ChainReturns, Confidence, MAX_RETAINED_ALTERNATIVES, Resolution, ResolutionGrade, ResolveReason, ResolveStats,
   ResolvedEdge, Resolver, UnresolvedEvidence,
-  resolve_all, resolve_all_spilled, resolve_all_spilled_into, seed_import_bindings,
+  build_include_reach, resolve_all, resolve_all_spilled, resolve_all_spilled_into,
+  seed_import_bindings,
 };
 pub use spill::{RefSpill, RefSpillWriter};
 pub use table::{Symbol, SymbolTable};

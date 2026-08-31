@@ -583,3 +583,82 @@ transform:
       source: $VERB0
       toCase: upperCase
 name: $VERB $ROUTE
+---
+id: rust-macro
+language: Rust
+role: item
+symbolType: macro
+# `macro_rules! name { … }` — declarative macros are definition surface
+# (extraction-coverage campaign 2026-08-31: Rust APIs lean on them; `vec!`,
+# `println!`, this repo's own phase/oracle helpers). Proc-macro fns are already
+# Functions via rust-function.
+rule:
+  all:
+    - kind: macro_definition
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  SIG:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported: true
+---
+id: rust-type-alias
+language: Rust
+role: item
+symbolType: typeAlias
+# `type Name = …;` — alias definitions (not trait associated-type declarations,
+# which live under trait items).
+rule:
+  all:
+    - kind: type_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+    - not:
+        inside:
+          kind: trait_item
+          stopBy: end
+transform:
+  SIG:
+    replace:
+      source: $DECL
+      replace: '\s*=[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'
+---
+id: rust-union
+language: Rust
+role: item
+symbolType: union
+rule:
+  all:
+    - kind: union_item
+    - pattern: $DECL
+    - has:
+        field: name
+        pattern: $NAME
+transform:
+  SIG:
+    replace:
+      source: $DECL
+      replace: '\s*\{[\s\S]*$'
+      by: ''
+name: '$NAME'
+signature: '$SIG'
+isExported:
+  has:
+    kind: visibility_modifier
+    regex: '^pub'

@@ -127,12 +127,15 @@ impl<'i> RefSpillWriter<'i> {
   }
 
   pub fn push(&mut self, reference: &Reference<'i>) -> io::Result<()> {
-    // Qualifier-carrying imports are additionally retained in RAM: the link phase resolves
-    // them *first* to seed per-file import bindings (§3.3 scope step), and re-decoding the
-    // whole spill for a pre-pass would cost a second full stream. They are rare — ~0.1% of
-    // references at kernel scale — so the retained vector is a few hundred KB, not the
-    // ~220 MB the spill exists to avoid.
-    if reference.kind == RefKind::Import && reference.form == RefForm::Static {
+    // Import references are additionally retained in RAM: the link phase resolves them
+    // *first* — qualifier-carrying ones seed per-file import bindings (§3.3 scope step),
+    // and path-form ones build the include-reachability oracle that gates macro
+    // candidates — and re-decoding the whole spill for a pre-pass would cost a second
+    // full stream. Imports are a small fraction of references (~1–2M of ~40M at kernel
+    // scale, ~80 MB retained), not the multi-hundred-MB stream the spill exists to
+    // avoid; the binding pre-pass provably ignores path-form entries (only symbol-form
+    // resolutions seed bindings), so one retained slice serves both pre-passes.
+    if reference.kind == RefKind::Import {
       self.qualified_imports.push(*reference);
     }
     let mut buf = [0u8; RECORD];
@@ -166,10 +169,11 @@ impl<'i> RefSpill<'i> {
     self.count
   }
 
-  /// The qualifier-carrying import references, in write order — the input of the link
-  /// phase's import-binding pre-pass. Also present in the spilled stream itself (this is a
-  /// retained copy, not a diversion), so chunked resolution still sees every reference.
-  pub fn qualified_imports(&self) -> &[Reference<'i>] {
+  /// Every import reference, in write order — the input of the link phase's two
+  /// pre-passes (import bindings; the include-reachability oracle). Also present in
+  /// the spilled stream itself (this is a retained copy, not a diversion), so chunked
+  /// resolution still sees every reference.
+  pub fn imports(&self) -> &[Reference<'i>] {
     &self.qualified_imports
   }
 

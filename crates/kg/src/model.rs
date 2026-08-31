@@ -29,6 +29,15 @@ pub enum SymbolKind {
   /// An event/message listener registration — `EVENT user.created`; edges to its handler
   /// are `calls`, and emitters reach it through `notifies`.
   Channel = 18,
+  /// A macro definition — C/C++/ObjC `#define`, Rust `macro_rules!`, Swift macros,
+  /// Erlang `-define`, CMake `macro()`, … (extraction-coverage campaign 2026-08-31:
+  /// the kernel alone holds 6.1M `#define`s; "sees everything" includes them).
+  Macro = 19,
+  /// A union type definition (C/C++ `union`, Rust `union`, Zig `union`).
+  Union = 20,
+  /// A type alias — C/C++ `typedef`/`using X = Y`, Rust `type`, Go/Kotlin/Swift/
+  /// Dart aliases.
+  TypeAlias = 21,
   Other = 255,
 }
 
@@ -57,6 +66,9 @@ impl SymbolKind {
       Self::TypeParameter,
       Self::Route,
       Self::Channel,
+      Self::Macro,
+      Self::Union,
+      Self::TypeAlias,
       Self::Other,
     ]
     .into_iter()
@@ -76,6 +88,25 @@ impl SymbolKind {
       self,
       SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor
     )
+  }
+
+  /// THE candidate law: whether definitions of this kind enter the symbol table as
+  /// name-resolution candidates. One definition, consulted by every table feed —
+  /// never hand-spelled at call sites (a new feed that forgets a special case is
+  /// the silent-gap failure class).
+  ///
+  /// * `File` — path map, not a name candidate (targets of path-form imports).
+  /// * `Import` — wiring, not a definition: offering it as a target let a
+  ///   `use foo` steal edges meant for the real `foo`.
+  ///
+  /// Macros ARE candidates — but they bind by INCLUSION, not name-globality: the
+  /// resolver's include-reachability gate admits a macro candidate only when its
+  /// defining file is the reference's own file or transitively included by it
+  /// (`vorpal_resolve::IncludeReach`). Name-global macro candidacy measured as
+  /// 8.1M ambiguous call edges from 48 vendored parser.c copies; the gate turns
+  /// those same-named duplicates into unique, correct resolutions.
+  pub fn is_resolution_candidate(self) -> bool {
+    !matches!(self, SymbolKind::File | SymbolKind::Import)
   }
 
   pub fn from_tag(tag: u8) -> Self {
@@ -99,6 +130,9 @@ impl SymbolKind {
       16 => SymbolKind::TypeParameter,
       17 => SymbolKind::Route,
       18 => SymbolKind::Channel,
+      19 => SymbolKind::Macro,
+      20 => SymbolKind::Union,
+      21 => SymbolKind::TypeAlias,
       _ => SymbolKind::Other,
     }
   }
@@ -127,6 +161,9 @@ impl SymbolKind {
       SymbolType::TypeParameter => SymbolKind::TypeParameter,
       SymbolType::Route => SymbolKind::Route,
       SymbolType::Channel => SymbolKind::Channel,
+      SymbolType::Macro => SymbolKind::Macro,
+      SymbolType::Union => SymbolKind::Union,
+      SymbolType::TypeAlias => SymbolKind::TypeAlias,
       // Structural-language keys (JSON/YAML pairs, Nix bindings) read as properties.
       SymbolType::Key => SymbolKind::Property,
       _ => SymbolKind::Other,

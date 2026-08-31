@@ -110,7 +110,7 @@ name: $NAME
 id: cpp-member-method
 language: Cpp
 role: member
-parentRuleIds: [cpp-class, cpp-struct]
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
 symbolType: method
 # A method's function declarator names a *field identifier directly* (possibly under
 # pointer/reference wrappers for pointer-returning methods). A function-pointer member
@@ -140,7 +140,7 @@ isPublic: false
 id: cpp-member-constructor
 language: Cpp
 role: member
-parentRuleIds: [cpp-class, cpp-struct]
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
 symbolType: constructor
 rule:
   kind: declaration
@@ -157,7 +157,7 @@ isPublic: false
 id: cpp-member-field
 language: Cpp
 role: member
-parentRuleIds: [cpp-class, cpp-struct]
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
 symbolType: field
 # The name is the field identifier inside the declarator (pointer fields were `*cursor`).
 # The exclusion mirrors the method rule exactly: anything the method rule claims — a
@@ -195,7 +195,7 @@ isPublic: false
 id: cpp-nested-class
 language: Cpp
 role: member
-parentRuleIds: [cpp-class, cpp-struct]
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
 symbolType: class
 rule:
   kind: class_specifier
@@ -209,7 +209,7 @@ isPublic: false
 id: cpp-nested-struct
 language: Cpp
 role: member
-parentRuleIds: [cpp-class, cpp-struct]
+parentRuleIds: [cpp-class, cpp-struct, cpp-union]
 symbolType: struct
 rule:
   kind: struct_specifier
@@ -232,3 +232,100 @@ rule:
     pattern: $NAME
 name: $NAME
 isPublic: true
+---
+
+id: cpp-union
+language: Cpp
+role: item
+symbolType: union
+# Type references and forward declarations are not definitions: require the body.
+rule:
+  kind: union_specifier
+  all:
+    - has:
+        field: name
+        pattern: $NAME
+    - has:
+        field: body
+        kind: field_declaration_list
+name: $NAME
+---
+
+id: cpp-namespace
+language: Cpp
+role: item
+symbolType: module
+# `namespace foo { … }` — the C++ module surface (extraction-coverage campaign);
+# anonymous namespaces have no name field and stay un-minted (their members are
+# extracted through the ordinary item rules).
+rule:
+  kind: namespace_definition
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+
+id: cpp-macro
+language: Cpp
+role: item
+symbolType: macro
+# Object-like macro: `#define NAME …` — the preprocessor layer is definition
+# surface (extraction-coverage campaign 2026-08-31).
+rule:
+  kind: preproc_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+
+id: cpp-macro-function
+language: Cpp
+role: item
+symbolType: macro
+# Function-like macro: `#define CHECK(x) …` — callable surface.
+rule:
+  kind: preproc_function_def
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true
+---
+
+id: cpp-typedef
+language: Cpp
+role: item
+symbolType: typeAlias
+# `typedef … name;` — name = the type identifier reached by descending the
+# declarator chain, the cpp-function discipline.
+rule:
+  kind: type_definition
+  has:
+    field: declarator
+    any:
+      - kind: type_identifier
+        pattern: $NAME
+      - has:
+          kind: type_identifier
+          stopBy: end
+          pattern: $NAME
+name: $NAME
+isExported: true
+---
+
+id: cpp-using-alias
+language: Cpp
+role: item
+symbolType: typeAlias
+# `using Name = …;` — the modern alias form.
+rule:
+  kind: alias_declaration
+  has:
+    field: name
+    pattern: $NAME
+name: $NAME
+isExported: true

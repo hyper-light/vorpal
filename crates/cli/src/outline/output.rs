@@ -459,6 +459,9 @@ fn symbol_type_name(symbol_type: SymbolType) -> &'static str {
     SymbolType::TypeParameter => "typeParameter",
     SymbolType::Route => "route",
     SymbolType::Channel => "channel",
+    SymbolType::Macro => "macro",
+    SymbolType::Union => "union",
+    SymbolType::TypeAlias => "typeAlias",
   }
 }
 
@@ -469,9 +472,12 @@ const SYMBOL_TYPE_ORDER: &[SymbolType] = &[
   SymbolType::Package,
   SymbolType::Class,
   SymbolType::Struct,
+  SymbolType::Union,
   SymbolType::Enum,
   SymbolType::Interface,
+  SymbolType::TypeAlias,
   SymbolType::Function,
+  SymbolType::Macro,
   SymbolType::Method,
   SymbolType::Constructor,
   SymbolType::Property,
@@ -625,14 +631,15 @@ fn symbol_type_style(symbol_type: SymbolType) -> ansi_term::Style {
     SymbolType::File | SymbolType::Module | SymbolType::Namespace | SymbolType::Package => {
       Color::Cyan
     }
-    SymbolType::Class | SymbolType::Struct | SymbolType::Object => Color::Blue,
+    SymbolType::Class | SymbolType::Struct | SymbolType::Union | SymbolType::Object => Color::Blue,
     SymbolType::Enum | SymbolType::EnumMember => Color::Purple,
-    SymbolType::Interface | SymbolType::TypeParameter => Color::Red,
+    SymbolType::Interface | SymbolType::TypeParameter | SymbolType::TypeAlias => Color::Red,
     SymbolType::Function
     | SymbolType::Method
     | SymbolType::Constructor
     | SymbolType::Route
-    | SymbolType::Channel => Color::Green,
+    | SymbolType::Channel
+    | SymbolType::Macro => Color::Green,
     SymbolType::Property | SymbolType::Field | SymbolType::Key => Color::Yellow,
     SymbolType::Variable | SymbolType::Constant => Color::Fixed(214),
     SymbolType::String
