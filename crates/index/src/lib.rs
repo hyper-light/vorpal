@@ -1301,6 +1301,10 @@ fn coherent_persisted_embedder(index_dir: &Path, current_stamp: u64) -> Option<A
 /// `vorpal enable` and the SDK install APIs.
 pub mod models;
 
+/// Programmatic tune — the `vorpal tune` core shared by the CLI and the SDK
+/// bindings: paired one-search measurements, the verdict rule, the switch writes.
+pub mod tune;
+
 /// Reranker embedding-cache bound: ~12 MB of rows at the encoder's 768 dims. A
 /// shipped cap in the `cached_searcher` LRU-8 precedent (a small documented bound,
 /// not a derived law) — revisit under a recorded sweep if the reranker becomes a

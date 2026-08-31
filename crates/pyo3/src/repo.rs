@@ -443,3 +443,67 @@ pub fn index_build_report(py: Python<'_>, src: &str, out: Option<&str>) -> PyRes
   });
   result.map_err(PyRuntimeError::new_err)
 }
+
+/// `vorpal search --ranked`'s core: ONE search, two orderings — the fused ranking
+/// and, when an encoder serves this index (per-index `encoder.dir` or the global
+/// enable), the reranked ordering derived from the SAME fusion. Returns
+/// `{"fused": [hits], "reranked": [hits] | None, "encoderStatus": str | None}`;
+/// `encoderStatus` states why a configured encoder is inactive.
+#[pyfunction]
+#[pyo3(signature = (index_dir, query, k=10))]
+pub fn index_search_ranked(
+  py: Python<'_>,
+  index_dir: &str,
+  query: &str,
+  k: usize,
+) -> PyResult<Py<PyAny>> {
+  #[derive(serde::Serialize)]
+  #[serde(rename_all = "camelCase")]
+  struct RankedAnswer {
+    fused: Vec<vorpal_index::records::SearchHitRecord>,
+    reranked: Option<Vec<vorpal_index::records::SearchHitRecord>>,
+    encoder_status: Option<String>,
+  }
+  let index_dir = index_dir.to_string();
+  let query = query.to_string();
+  let result: Result<RankedAnswer, String> = py.detach(move || {
+    let searcher =
+      vorpal_index::open_searcher(std::path::Path::new(&index_dir)).map_err(|e| e.to_string())?;
+    let (fused, reranked) = searcher
+      .records_ranked(&query, k, &vorpal_index::SearchFilter::default())
+      .map_err(|e| e.to_string())?;
+    Ok(RankedAnswer {
+      fused,
+      reranked,
+      encoder_status: searcher.encoder_status().map(str::to_string),
+    })
+  });
+  record_to_py(py, &result.map_err(PyRuntimeError::new_err)?)
+}
+
+/// The `vorpal tune` core: measure the optional ranking features on YOUR queries
+/// and, with `apply=True`, write this index's switches from the verdicts.
+/// `queries` is a list of `(query, expected_substring_or_None)` pairs — only
+/// labelled entries score (reciprocal rank of the expected hit; both comparisons
+/// paired from one search each). Returns the tune report: per-feature tallies and
+/// verdicts, plus `wroteEncoder`/`wroteBm25` describing any switch written (the
+/// BM25 override holds until the index content retrains).
+#[pyfunction]
+#[pyo3(signature = (index_dir, queries, k=10, apply=false))]
+pub fn index_tune(
+  py: Python<'_>,
+  index_dir: &str,
+  queries: Vec<(String, Option<String>)>,
+  k: usize,
+  apply: bool,
+) -> PyResult<Py<PyAny>> {
+  let index_dir = index_dir.to_string();
+  let result: Result<vorpal_index::tune::TuneReport, String> = py.detach(move || {
+    let queries: Vec<vorpal_index::tune::TuneQuery> = queries
+      .into_iter()
+      .map(|(query, expected)| vorpal_index::tune::TuneQuery { query, expected })
+      .collect();
+    vorpal_index::tune::tune_index(std::path::Path::new(&index_dir), &queries, k, apply)
+  });
+  record_to_py(py, &result.map_err(PyRuntimeError::new_err)?)
+}

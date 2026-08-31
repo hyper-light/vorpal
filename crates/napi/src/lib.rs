@@ -20,7 +20,10 @@ use sg_node::{SgNode, SgRoot};
 
 pub use find_files::parse_files;
 pub use models::{semantic_disable, semantic_enable, semantic_install};
-pub use repo::{index_build, index_graph, index_node, index_search};
+pub use repo::{
+  TuneQueryInput, index_build, index_graph, index_node, index_search, index_search_ranked,
+  index_tune,
+};
 
 macro_rules! impl_lang_mod {
   ($name: ident, $lang: ident) => {

@@ -6,19 +6,14 @@
 //! Queries file: one query per line; blank lines and `#` comments skipped. A
 //! line may carry an expectation — `query => expected` — where `expected` is a
 //! case-insensitive substring of the hit you wanted (its name or its path). With
-//! expectations, tune scores each feature by reciprocal rank over your queries,
-//! prints the verdict table, and WRITES the per-index switches (`--dry-run`
-//! reports without writing): the encoder reranker via `encoder.dir` (a model
-//! path to pin it on, the `off` sentinel to shadow a global enable) and the
-//! BM25 channel via a manual record override (which holds until the index's
-//! content changes and retrains — re-run tune after big changes). Without
-//! expectations, tune prints per-query before/after summaries for eyeballing
-//! and writes nothing.
+//! expectations, tune scores each feature by reciprocal rank, prints the verdict
+//! table, and WRITES the per-index switches (`--dry-run` reports without
+//! writing). Without expectations, tune prints per-query before/after summaries
+//! for eyeballing and writes nothing.
 //!
-//! Both comparisons come from ONE search per query per feature — never serial
-//! duplicate runs: the reranked ordering derives from the same fusion
-//! (`records_ranked`), and the BM25 pair from the same channel pass
-//! (`records_bm25_pair`).
+//! The measurement/verdict/write core is [`vorpal_index::tune::tune_index`] —
+//! ONE implementation shared with the SDK bindings; this file is parsing and
+//! rendering.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -28,6 +23,7 @@ use clap::Parser;
 
 use crate::kg::{index_dir, missing_index_hint};
 use vorpal_index::records::SearchHitRecord;
+use vorpal_index::tune::{FeatureTally, TuneQuery, tune_index};
 
 #[derive(Parser)]
 pub struct TuneArg {
@@ -45,11 +41,6 @@ pub struct TuneArg {
   index: Option<PathBuf>,
 }
 
-struct TuneQuery {
-  query: String,
-  expected: Option<String>,
-}
-
 fn parse_queries(text: &str) -> Vec<TuneQuery> {
   text
     .lines()
@@ -58,7 +49,7 @@ fn parse_queries(text: &str) -> Vec<TuneQuery> {
     .map(|line| match line.split_once("=>") {
       Some((query, expected)) => TuneQuery {
         query: query.trim().to_string(),
-        expected: Some(expected.trim().to_lowercase()),
+        expected: Some(expected.trim().to_string()),
       },
       None => TuneQuery {
         query: line.to_string(),
@@ -66,63 +57,6 @@ fn parse_queries(text: &str) -> Vec<TuneQuery> {
       },
     })
     .collect()
-}
-
-/// Reciprocal rank of the first hit whose name or path contains `expected`.
-fn reciprocal_rank(hits: &[SearchHitRecord], expected: &str) -> f64 {
-  hits
-    .iter()
-    .position(|hit| {
-      hit.node.name.to_lowercase().contains(expected)
-        || hit.node.path.to_lowercase().contains(expected)
-    })
-    .map_or(0.0, |position| 1.0 / (position as f64 + 1.0))
-}
-
-/// Paired per-feature tally over the expectation queries.
-#[derive(Default)]
-struct Tally {
-  mean_off: f64,
-  mean_on: f64,
-  wins: usize,
-  losses: usize,
-  queries: usize,
-}
-
-impl Tally {
-  fn measure(&mut self, off: f64, on: f64) {
-    self.mean_off += off;
-    self.mean_on += on;
-    if on > off {
-      self.wins += 1;
-    } else if on < off {
-      self.losses += 1;
-    }
-    self.queries += 1;
-  }
-
-  fn finish(&mut self) {
-    if self.queries > 0 {
-      self.mean_off /= self.queries as f64;
-      self.mean_on /= self.queries as f64;
-    }
-  }
-
-  /// The verdict rule, printed with the table: ON iff the mean strictly improves
-  /// and wins are not outnumbered.
-  fn verdict_on(&self) -> Option<bool> {
-    if self.queries == 0 || (self.mean_on == self.mean_off && self.wins == self.losses) {
-      return None; // no signal — leave the switch alone
-    }
-    Some(self.mean_on > self.mean_off && self.wins >= self.losses)
-  }
-
-  fn evidence(&self, feature: &str) -> String {
-    format!(
-      "manual: vorpal tune ({feature}: {} queries, mean RR {:.3}→{:.3}, {}W/{}L)",
-      self.queries, self.mean_off, self.mean_on, self.wins, self.losses
-    )
-  }
 }
 
 fn top_line(hits: &[SearchHitRecord]) -> String {
@@ -140,63 +74,50 @@ pub fn run_tune(arg: TuneArg) -> Result<ExitCode> {
   if queries.is_empty() {
     anyhow::bail!("{} holds no queries", arg.queries.display());
   }
+  let k = arg.k.max(1);
+  // Eyeball summaries for the unlabelled lines (presentation only — the scored
+  // path lives in the shared core).
   let searcher = vorpal_index::open_searcher(&dir)
     .map_err(|e| anyhow::anyhow!("{e}"))
     .with_context(|| missing_index_hint(&dir))?;
   let filter = vorpal_index::SearchFilter::default();
-  let k = arg.k.max(1);
-  let encoder_active = searcher.encoder_status().is_none();
-  // encoder_status None = active OR unconfigured; distinguish via a probe rerank.
-  let labelled = queries.iter().filter(|q| q.expected.is_some()).count();
-
-  let mut rerank_tally = Tally::default();
-  let mut bm25_tally = Tally::default();
-  let mut encoder_present = false;
-
-  for entry in &queries {
+  for entry in queries.iter().filter(|entry| entry.expected.is_none()) {
     let (base, reranked) = searcher
       .records_ranked(&entry.query, k, &filter)
       .map_err(|e| anyhow::anyhow!("query {:?}: {e}", entry.query))?;
     let (bm25_off, bm25_on) = searcher
       .records_bm25_pair(&entry.query, k, &filter)
       .map_err(|e| anyhow::anyhow!("query {:?}: {e}", entry.query))?;
-    encoder_present |= reranked.is_some();
-    match &entry.expected {
-      Some(expected) => {
-        if let Some(reranked) = &reranked {
-          rerank_tally.measure(reciprocal_rank(&base, expected), reciprocal_rank(reranked, expected));
-        }
-        bm25_tally.measure(
-          reciprocal_rank(&bm25_off, expected),
-          reciprocal_rank(&bm25_on, expected),
-        );
-      }
-      None => {
-        let line = format!(
-          "{:?}: top fused = {}; reranked = {}; bm25 flips top = {}",
-          entry.query,
-          top_line(&base),
-          reranked.as_deref().map(top_line).unwrap_or_else(|| "(no encoder)".to_string()),
-          if top_line(&bm25_off) == top_line(&bm25_on) { "no" } else { "yes" },
-        );
-        println!("{line}");
-      }
-    }
+    let line = format!(
+      "{:?}: top fused = {}; reranked = {}; bm25 flips top = {}",
+      entry.query,
+      top_line(&base),
+      reranked
+        .as_deref()
+        .map(top_line)
+        .unwrap_or_else(|| "(no encoder)".to_string()),
+      if top_line(&bm25_off) == top_line(&bm25_on) { "no" } else { "yes" },
+    );
+    println!("{line}");
   }
 
-  if labelled == 0 {
+  let report = tune_index(&dir, &queries, k, !arg.dry_run)
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .with_context(|| missing_index_hint(&dir))?;
+  if report.labelled == 0 {
     println!(
       "\n(no `query => expected` lines — eyeball summaries only; add expectations to \
        get verdicts and switch writes)"
     );
     return Ok(ExitCode::SUCCESS);
   }
-  rerank_tally.finish();
-  bm25_tally.finish();
 
-  println!("\nverdicts over {labelled} labelled queries (reciprocal rank of the expected hit, top {k}):");
-  let row = |name: &str, tally: &Tally, note: &str| {
-    let verdict = match tally.verdict_on() {
+  println!(
+    "\nverdicts over {} labelled queries (reciprocal rank of the expected hit, top {k}):",
+    report.labelled
+  );
+  let row = |name: &str, tally: &FeatureTally, note: &str| {
+    let verdict = match tally.verdict {
       Some(true) => "ON (improves)",
       Some(false) => "OFF (regresses)",
       None => "no signal — unchanged",
@@ -207,62 +128,40 @@ pub fn run_tune(arg: TuneArg) -> Result<ExitCode> {
     );
     println!("{line}");
   };
-  if encoder_present {
-    row("encoder reranker", &rerank_tally, "");
+  if report.encoder_present {
+    row("encoder reranker", &report.reranker, "");
   } else {
-    let hint = if encoder_active { " (no encoder enabled — `vorpal enable`)" } else { "" };
+    let hint = match searcher.encoder_status() {
+      Some(status) => format!(" ({status})"),
+      None => " (no encoder enabled — `vorpal enable`)".to_string(),
+    };
     println!("  encoder reranker   untested{hint}");
   }
-  row("bm25 channel", &bm25_tally, " (override holds until the index retrains)");
+  row("bm25 channel", &report.bm25, " (override holds until the index retrains)");
 
   if arg.dry_run {
     println!("\n--dry-run: no switches written");
     return Ok(ExitCode::SUCCESS);
   }
-  // Write the switches the verdicts license.
-  if encoder_present {
-    match rerank_tally.verdict_on() {
-      Some(true) => {
-        // Pin the reranker per-index with the model dir actually serving this
-        // handle: the per-index file if it named one, else the global enable.
-        let pinned = std::fs::read_to_string(dir.join("encoder.dir"))
-          .ok()
-          .map(|text| text.trim().to_string())
-          .filter(|text| !text.is_empty() && text != "off")
-          .or_else(|| {
-            let path = vorpal_index::models::global_selection_path().ok()?;
-            std::fs::read_to_string(path).ok().map(|text| text.trim().to_string())
-          });
-        match pinned {
-          Some(model_dir) => {
-            vorpal_index::write_encoder_selection(&dir, std::path::Path::new(&model_dir))
-              .with_context(|| "writing encoder.dir")?;
-            println!("wrote {} → reranker PINNED ON for this index", dir.join("encoder.dir").display());
-          }
-          None => println!("(reranker won but no enable to pin — unexpected; nothing written)"),
-        }
-      }
-      Some(false) => {
-        vorpal_index::write_encoder_opt_out(&dir).with_context(|| "writing encoder.dir")?;
-        println!(
-          "wrote {} = off → reranker OPTED OUT for this index (shadows any global enable; \
-           delete the file to revert)",
-          dir.join("encoder.dir").display()
-        );
-      }
-      None => println!("reranker: no signal — switch unchanged"),
-    }
+  match &report.wrote_encoder {
+    Some(sentinel) if sentinel == "off" => println!(
+      "wrote {} = off → reranker OPTED OUT for this index (shadows any global enable; \
+       delete the file to revert)",
+      dir.join("encoder.dir").display()
+    ),
+    Some(_) => println!(
+      "wrote {} → reranker PINNED ON for this index",
+      dir.join("encoder.dir").display()
+    ),
+    None if report.encoder_present => println!("reranker: no signal — switch unchanged"),
+    None => {}
   }
-  match bm25_tally.verdict_on() {
-    Some(enabled) => {
-      vorpal_index::set_bm25_override(&dir, enabled, &bm25_tally.evidence("bm25"))
-        .map_err(|e| anyhow::anyhow!("bm25 override: {e}"))?;
-      println!(
-        "bm25 channel override written: {} (holds until the index content retrains — \
-         re-run tune after big changes)",
-        if enabled { "ON" } else { "OFF" }
-      );
-    }
+  match report.wrote_bm25 {
+    Some(enabled) => println!(
+      "bm25 channel override written: {} (holds until the index content retrains — \
+       re-run tune after big changes)",
+      if enabled { "ON" } else { "OFF" }
+    ),
     None => println!("bm25: no signal — verdict unchanged"),
   }
   Ok(ExitCode::SUCCESS)

@@ -58,6 +58,9 @@ fn vorpal_py(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
   m.add_function(wrap_pyfunction!(models::semantic_install, m)?)?;
   m.add_function(wrap_pyfunction!(models::semantic_enable, m)?)?;
   m.add_function(wrap_pyfunction!(models::semantic_disable, m)?)?;
+  // The per-corpus decision loop (`--ranked` / `vorpal tune` cores) — see `repo`.
+  m.add_function(wrap_pyfunction!(repo::index_search_ranked, m)?)?;
+  m.add_function(wrap_pyfunction!(repo::index_tune, m)?)?;
   Ok(())
 }
 

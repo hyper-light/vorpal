@@ -427,3 +427,68 @@ pub struct SearchOptions {
   /// Exclude definitions in test files from results.
   pub exclude_tests: Option<bool>,
 }
+
+/// `vorpal search --ranked`'s core: ONE search, two orderings — the fused ranking
+/// and, when an encoder serves this index (per-index `encoder.dir` or the global
+/// enable), the reranked ordering derived from the SAME fusion. Returns
+/// `{ fused, reranked | null, encoderStatus | null }`; `encoderStatus` states why
+/// a configured encoder is inactive.
+#[napi]
+pub fn index_search_ranked(
+  index_dir: String,
+  query: String,
+  k: Option<u32>,
+) -> Result<serde_json::Value> {
+  let searcher =
+    vorpal_index::open_searcher(std::path::Path::new(&index_dir)).map_err(to_napi_err)?;
+  let (fused, reranked) = searcher
+    .records_ranked(
+      &query,
+      k.unwrap_or(10) as usize,
+      &vorpal_index::SearchFilter::default(),
+    )
+    .map_err(to_napi_err)?;
+  Ok(serde_json::json!({
+    "fused": fused,
+    "reranked": reranked,
+    "encoderStatus": searcher.encoder_status(),
+  }))
+}
+
+/// One tune query for `indexTune`.
+#[napi(object)]
+pub struct TuneQueryInput {
+  pub query: String,
+  /// Case-insensitive substring of the expected hit's name or path.
+  pub expected: Option<String>,
+}
+
+/// The `vorpal tune` core: measure the optional ranking features on YOUR queries
+/// and, with `apply: true`, write this index's switches from the verdicts. Only
+/// entries with `expected` score (reciprocal rank; both comparisons paired from
+/// one search each). Returns the tune report: per-feature tallies and verdicts,
+/// plus `wroteEncoder`/`wroteBm25` for any switch written (the BM25 override
+/// holds until the index content retrains).
+#[napi]
+pub fn index_tune(
+  index_dir: String,
+  queries: Vec<TuneQueryInput>,
+  k: Option<u32>,
+  apply: Option<bool>,
+) -> Result<serde_json::Value> {
+  let queries: Vec<vorpal_index::tune::TuneQuery> = queries
+    .into_iter()
+    .map(|input| vorpal_index::tune::TuneQuery {
+      query: input.query,
+      expected: input.expected,
+    })
+    .collect();
+  let report = vorpal_index::tune::tune_index(
+    std::path::Path::new(&index_dir),
+    &queries,
+    k.unwrap_or(10) as usize,
+    apply.unwrap_or(false),
+  )
+  .map_err(Error::from_reason)?;
+  serde_json::to_value(report).map_err(|e| Error::from_reason(e.to_string()))
+}
