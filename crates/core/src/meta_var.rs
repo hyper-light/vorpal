@@ -13,7 +13,6 @@ pub type Underlying<D> = Vec<<<D as Doc>::Source as Content>::Underlying>;
 
 /// a dictionary that stores metavariable instantiation
 /// const a = 123 matched with const a = $A will produce env: $A => 123
-#[derive(Clone)]
 pub struct MetaVarEnv<'tree, D: Doc> {
   // Insertion-ordered association vectors, not HashMaps: an env holds a
   // handful of variables, and the matcher clones it copy-on-write PER
@@ -21,9 +20,13 @@ pub struct MetaVarEnv<'tree, D: Doc> {
   // on String keys, table allocations, and rehashes (ledger-sampled). Linear
   // scans over ≤~8 entries beat hashing String keys, a clone is three Vec
   // memcpys, and iteration order becomes deterministic (insertion order).
-  single_matched: Vec<(MetaVariableID, Node<'tree, D>)>,
-  multi_matched: Vec<(MetaVariableID, Vec<Node<'tree, D>>)>,
-  transformed_var: Vec<(MetaVariableID, Underlying<D>)>,
+  // Keys are INTERNED (`intern_var`): the name universe is compile-bounded
+  // (rule meta-vars and labels), so rows carry `&'static str` — no key
+  // `String` per capture (was 16 % of post-pass-10 stream allocation
+  // samples) and clones copy flat rows.
+  single_matched: Vec<(&'static str, Node<'tree, D>)>,
+  multi_matched: Vec<(&'static str, Vec<Node<'tree, D>>)>,
+  transformed_var: Vec<(&'static str, Underlying<D>)>,
   /// The `"secondary"` diagnostic label — the ONLY label the workspace ever
   /// adds (every relational rule match pushes one). A dedicated field costs
   /// no key `String` per env and clones as a plain Vec; the read paths below
@@ -32,14 +35,75 @@ pub struct MetaVarEnv<'tree, D: Doc> {
   secondary: Vec<Node<'tree, D>>,
 }
 
-fn assoc_get<'a, V>(list: &'a [(MetaVariableID, V)], key: &str) -> Option<&'a V> {
-  list.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+/// The copy-on-write clone preserves each vector's CAPACITY, not just its
+/// length: `derive(Clone)` produced exact-capacity vectors, so the very next
+/// push after every clone reallocated — relational sub-matches clone per
+/// candidate and immediately push, which sampled at ~30 % of post-pass-10
+/// stream allocations across the `secondary`/assoc growth sites. Capacity is
+/// the source's own high-water mark — data-derived slack, no constants.
+impl<D: Doc> Clone for MetaVarEnv<'_, D> {
+  fn clone(&self) -> Self {
+    fn keep_high_water<T: Clone>(src: &[T], capacity: usize) -> Vec<T> {
+      let mut out = Vec::with_capacity(capacity.max(src.len()));
+      out.extend_from_slice(src);
+      out
+    }
+    Self {
+      single_matched: keep_high_water(&self.single_matched, self.single_matched.capacity()),
+      multi_matched: keep_high_water(&self.multi_matched, self.multi_matched.capacity()),
+      transformed_var: keep_high_water(&self.transformed_var, self.transformed_var.capacity()),
+      secondary: keep_high_water(&self.secondary, self.secondary.capacity()),
+    }
+  }
 }
 
-fn assoc_set<V>(list: &mut Vec<(MetaVariableID, V)>, key: &str, value: V) {
-  match list.iter_mut().find(|(k, _)| k == key) {
+/// Intern a meta-variable name. The universe is compile-bounded — rule
+/// pattern meta-vars and rule labels, a few hundred short strings across all
+/// rulesets — leaked once each. The per-thread cache makes the hot path (one
+/// probe per fresh capture) a thread-local hash lookup with zero shared-memory
+/// traffic; the global set is consulted only the first time a thread meets a
+/// name. Locks recover from poisoning instead of panicking (no-panics law).
+fn intern_var(name: &str) -> &'static str {
+  use std::cell::RefCell;
+  use std::collections::HashSet;
+  use std::sync::{OnceLock, RwLock};
+  thread_local! {
+    static LOCAL: RefCell<HashMap<String, &'static str>> = RefCell::new(HashMap::new());
+  }
+  static GLOBAL: OnceLock<RwLock<HashSet<&'static str>>> = OnceLock::new();
+  LOCAL.with(|cache| {
+    if let Some(interned) = cache.borrow().get(name) {
+      return *interned;
+    }
+    let global = GLOBAL.get_or_init(|| RwLock::new(HashSet::new()));
+    let interned = {
+      let readable = global.read().unwrap_or_else(|e| e.into_inner());
+      readable.get(name).copied()
+    };
+    let interned = interned.unwrap_or_else(|| {
+      let mut writable = global.write().unwrap_or_else(|e| e.into_inner());
+      match writable.get(name) {
+        Some(&found) => found,
+        None => {
+          let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+          writable.insert(leaked);
+          leaked
+        }
+      }
+    });
+    cache.borrow_mut().insert(name.to_string(), interned);
+    interned
+  })
+}
+
+fn assoc_get<'a, V>(list: &'a [(&'static str, V)], key: &str) -> Option<&'a V> {
+  list.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+fn assoc_set<V>(list: &mut Vec<(&'static str, V)>, key: &str, value: V) {
+  match list.iter_mut().find(|(k, _)| *k == key) {
     Some((_, slot)) => *slot = value,
-    None => list.push((key.to_string(), value)),
+    None => list.push((intern_var(key), value)),
   }
 }
 
@@ -86,9 +150,9 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
       self.secondary.push(node);
       return;
     }
-    match self.multi_matched.iter_mut().find(|(k, _)| k == label) {
+    match self.multi_matched.iter_mut().find(|(k, _)| *k == label) {
       Some((_, nodes)) => nodes.push(node),
-      None => self.multi_matched.push((label.to_string(), vec![node])),
+      None => self.multi_matched.push((intern_var(label), vec![node])),
     }
   }
 
@@ -103,15 +167,15 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
     let single = self
       .single_matched
       .iter()
-      .map(|(n, _)| MetaVariable::Capture(n.clone(), false));
+      .map(|(n, _)| MetaVariable::Capture((*n).to_string(), false));
     let transformed = self
       .transformed_var
       .iter()
-      .map(|(n, _)| MetaVariable::Capture(n.clone(), false));
+      .map(|(n, _)| MetaVariable::Capture((*n).to_string(), false));
     let multi = self
       .multi_matched
       .iter()
-      .map(|(n, _)| MetaVariable::MultiCapture(n.clone()))
+      .map(|(n, _)| MetaVariable::MultiCapture((*n).to_string()))
       .chain(
         // Parity with the map storage: a labeled env used to surface
         // "secondary" as a multi capture here.
@@ -158,7 +222,7 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
   ) -> bool {
     let mut env = Cow::Borrowed(self);
     for (var_id, candidate) in &self.single_matched {
-      if let Some(m) = var_matchers.get(var_id)
+      if let Some(m) = var_matchers.get(*var_id)
         && m.match_node_with_env(candidate.clone(), &mut env).is_none()
       {
         return false;
@@ -326,15 +390,15 @@ impl<'tree, D: Doc> From<MetaVarEnv<'tree, D>> for HashMap<String, String> {
   fn from(env: MetaVarEnv<'tree, D>) -> Self {
     let mut ret = HashMap::new();
     for (id, node) in env.single_matched {
-      ret.insert(id, node.text().into());
+      ret.insert(id.to_string(), node.text().into());
     }
     for (id, bytes) in env.transformed_var {
-      ret.insert(id, <D::Source as Content>::encode_bytes(&bytes).to_string());
+      ret.insert(id.to_string(), <D::Source as Content>::encode_bytes(&bytes).to_string());
     }
     for (id, nodes) in env.multi_matched {
       let s: Vec<_> = nodes.iter().map(|n| n.text()).collect();
       let s = s.join(", ");
-      ret.insert(id, format!("[{s}]"));
+      ret.insert(id.to_string(), format!("[{s}]"));
     }
     if !env.secondary.is_empty() {
       let s: Vec<_> = env.secondary.iter().map(|n| n.text()).collect();

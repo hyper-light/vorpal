@@ -1895,6 +1895,7 @@ where
 /// RAM — the bulk-build configuration. Resolve the result with
 /// [`vorpal_resolve::resolve_all_spilled`] (or [`link_writer_spilled`]), which streams the
 /// file back in bounded chunks and deletes it.
+#[allow(clippy::too_many_arguments)] // the bulk-build entry: spill, heap-stream, and pack read/write sides are each load-bearing
 pub fn stream_apply_spilled<'i, F>(
   interner: &'i vorpal_resolve::Interner,
   entries: &[crate::FileStat],
@@ -1963,6 +1964,7 @@ pub struct FlowSpill {
   pub(crate) requests: (std::path::PathBuf, u64),
 }
 
+#[allow(clippy::too_many_arguments)] // the one streaming engine behind both public entries
 fn stream_apply_impl<'i, F>(
   interner: &'i vorpal_resolve::Interner,
   entries: &[crate::FileStat],

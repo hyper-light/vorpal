@@ -818,7 +818,7 @@ pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
           // One reusable buffer per worker split: the per-chunk `vec![0; 8 MiB]`
           // this replaces churned ~4 GB of allocations through the commit
           // hash at kernel scale (ledger-attributed) for identical digests.
-          || Vec::<u8>::new(),
+          Vec::<u8>::new,
           |buf, index| {
             let offset = index as u64 * HASH_CHUNK;
             let want = HASH_CHUNK.min(len - offset) as usize;

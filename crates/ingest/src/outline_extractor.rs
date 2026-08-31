@@ -709,7 +709,7 @@ impl OutlineExtractor {
     // Per-entity parameter lists: every Param binding attributed to its innermost enclosing
     // definition span, in file order (dfs order is file order). Borrowed — the finish
     // decides whether the strings are copied (owned product) or encoded in place.
-    let mut entity_params: Vec<(u32, Vec<(&str, Option<&str>)>)> = Vec::new();
+    let mut entity_params: product::EntityParamsView<'_> = Vec::new();
     {
       let mut cursor = crate::references::SpanCursor::new(&spans);
       let mut by_entity: std::collections::BTreeMap<u32, Vec<(&str, Option<&str>)>> =
@@ -780,18 +780,20 @@ impl OutlineExtractor {
   }
 }
 
+/// [`local_layout`]'s product: borrowed entity identities plus `(byte range, id)` spans, both
+/// in layout order.
+pub(crate) type LocalLayout<'a> = (
+  Vec<vorpal_kg::EntityIdentity<'a>>,
+  Vec<(std::ops::Range<usize>, NodeId)>,
+);
+
 /// Local definition layout for reference attribution: index 0 = the file, then items and their
 /// members in the same order as the graph writer. Entity identities come from
 /// [`vorpal_kg::layout_entity_identities`] — borrowed views of the single identity authority
 /// (the [`vorpal_kg::layout_entity_paths`] convention) — so a reference resolves to exactly
 /// the node the writer created, overloads included, without a rendered `String` per entity.
 /// Spans are built in lockstep so each entity index maps to its byte range.
-pub(crate) fn local_layout<'a>(
-  items: &'a [OutlineItem<'_>],
-) -> (
-  Vec<vorpal_kg::EntityIdentity<'a>>,
-  Vec<(std::ops::Range<usize>, NodeId)>,
-) {
+pub(crate) fn local_layout<'a>(items: &'a [OutlineItem<'_>]) -> LocalLayout<'a> {
   let entities = vorpal_kg::layout_entity_identities(items);
   let mut spans: Vec<(std::ops::Range<usize>, NodeId)> = vec![(0..usize::MAX, NodeId::new(0))];
   let mut idx = 1u64;

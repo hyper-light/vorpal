@@ -302,7 +302,7 @@ pub(crate) struct ExtractedParts<'a> {
   pub(crate) error_spans: Vec<(u32, u32)>,
   pub(crate) items: Vec<OutlineItem<'a>>,
   pub(crate) refs: Vec<RefParts<'a>>,
-  pub(crate) entity_params: Vec<(u32, Vec<(&'a str, Option<&'a str>)>)>,
+  pub(crate) entity_params: EntityParamsView<'a>,
   pub(crate) returns: Vec<(&'a str, &'a str)>,
   pub(crate) signatures: Vec<ProductSignature>,
   pub(crate) requests: Vec<crate::references::RawRequest<'a>>,
