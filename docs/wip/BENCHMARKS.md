@@ -460,6 +460,23 @@ attribution, each pinned by the existing bit-identity oracles:
 | cooc merge | 55.9 s | 0.02 s | spill buffer = the one-merge-pass balance M ≥ √(N·page/pair) (Knuth §5.4) — the plain √N missed the page factor and forced two rewrite levels over ~4,200 runs |
 | σ + CSR streaming | 176 s (after the balance fix left ~700 live runs) | 29.4 s | k-way run merge via a min-heap of (pair, cursor) heads — O(log k)/record instead of two O(k) scans; integer sums, bytes unchanged |
 
+A second optimization round (2026-08-31, same protocol) took the kernel warm 84.0 s →
+62.4 s WITH retrofit (cpython ~6.2 s → 5.1 s): the serial event feed became a parallel
+one and the σ/CSR consumers overlapped — output bits pinned unchanged by the
+serial-vs-parallel spill oracle and the searcheval reproduction recorded with the
+retrofit table below.
+
+| kernel train phase | before | after | fix |
+|---|---:|---:|---|
+| cooc event feed | 16.4 s (serial doc walk) | 5.5 s (1.4 materialize + 4.1 generate/spill) | token-id docs materialized ONCE to sequential scratch, then `count_ranges`: fixed doc ranges generate pre-aggregated runs in parallel through a small writer pool — bit-equal by aggregation invariance (`parallel_ranges_match_the_serial_feed_bitwise`); per-SPLIT worker state (marginals pre-sized by `id_bound`, buffers reused) after `sample(1)` caught per-range exact-growth marginal resizes as the dominant cost |
+| run compaction | 26 s when triggered | 0 s (never fires on the balanced path) | range count capped at `merge_fan_in` — the Knuth balance puts ceil(events/buffer) AT the fan-in, so one run per range per counter stays single-level mergeable; the compaction pass (parallel groups, retained for degenerate shapes) measured NET-NEGATIVE: ~26 s of read+rewrite to save ~17 s of consumer heap depth |
+| σ + CSR streaming | 29.4 s sequential | 20.3 s joint | `rayon::join`: σ (half-counter streams) hides under the CSR build (full-counter streams) — disjoint data, deterministic reductions, unchanged bytes |
+
+Remaining leads (recorded, not taken this round): the four PPMI stream passes recompute
+ln() per record each pass — caching the CSR size pass's filtered output for the fill
+pass would kill one ~730-cursor merge plus one PPMI recompute (~5 s); the ~5.3 s
+train-done → build-start gap (model persist); eigen 12.5 s.
+
 Peak training RSS 2.26 GB (CSR + eigen + composed tables at the kernel's 464K matrix
 rows); double-warm byte-identity of `ann.bin` + `ann.model.bin` is a standing test
 (`crates/index/tests/learned_tier.rs`), and the starved-vs-roomy spill oracle keeps the
@@ -596,8 +613,10 @@ the lexical baseline overall) and cpython's is bit-for-bit unchanged. cpython pa
 small descriptive NDCG dip (0.333 → 0.316 over 4 queries, recall@5 held) — recorded,
 unprotected, and the class remains ~7.5× the lexical floor (0.042). Query latency
 unchanged (4.09 ms / 2.91 ms mean at k=25). Total kernel learned warm with retrofit:
-84.0 s (78.4 s without). Double-warm byte-identity holds with retrofit in the loop
-(fixture-pinned in `learned_tier.rs`; kernel run recorded alongside this table).
+84.0 s (78.4 s without); the second optimization round (parallel event feed + σ/CSR
+overlap, table in the training section) brings it to 62.4 s with retrofit. Double-warm
+byte-identity holds with retrofit in the loop (fixture-pinned in `learned_tier.rs`;
+kernel run recorded alongside this table).
 
 ### Penalty-form A/B: identity vs per-relation diagonal maps
 

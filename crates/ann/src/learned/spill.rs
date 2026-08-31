@@ -8,17 +8,22 @@
 //! never to the event volume (measured elsewhere: joint-gram events reach ~10 GB at
 //! kernel scale and ~20× that at Meta scale if materialized).
 //!
-//! Every size here is derived, not tuned: the buffer follows the classical external-
-//! sort balance `B = √N` (minimizing max(buffer, runs) — the textbook optimum) with a
-//! floor from the EXISTING policy clamp (`ResourcePolicy::arena_chunk_bytes`), and the
-//! merge fan-in comes from the probed page size (one page of read-ahead per cursor).
-//! Determinism: runs are sorted, the merge is ordered by (pair, run index), and the
-//! output stream is byte-equal to the in-memory reference (`CoocCounts::from_events`)
-//! — pinned by the oracle tests.
+//! Every size here is derived, not tuned: the buffer follows the classical ONE-pass
+//! external-merge balance `M ≥ √(N·page/pair)` (Knuth §5.4) with a floor from the
+//! EXISTING policy clamp (`ResourcePolicy::arena_chunk_bytes`), and the merge fan-in
+//! comes from the probed page size (one page of read-ahead per cursor).
+//! Determinism: runs are sorted and pre-aggregated, the k-way merge re-aggregates
+//! under a total order, and the output stream is a pure function of the aggregated
+//! MULTISET — run partitioning, file layout, and feed parallelism are invisible to
+//! it (`CoocCounts::from_events` byte-equality, pinned by the oracle tests). That
+//! invariance is what lets [`count_ranges`] feed events in PARALLEL: each fixed
+//! document range sorts and aggregates locally into one run per counter, appended
+//! through a small writer pool, and the merged stream cannot tell the difference.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// One aggregated record on disk: (min id, max id, count), little-endian, 16 bytes.
 const RECORD_BYTES: usize = 16;
@@ -170,19 +175,27 @@ impl SpillCounter {
       .flush()
       .map_err(|e| format!("flushing spill runs: {e}"))?;
     drop(writer);
-    // Multi-level merge until one bounded k-way pass can stream everything.
-    let mut path = self.scratch_path.clone();
-    let mut runs = self.run_records.clone();
-    let mut generation = 0usize;
-    while runs.len() > self.fan_in {
-      let next_path = path.with_extension(format!("merge{generation}"));
-      runs = merge_level(&path, &runs, &next_path, self.fan_in, self.page_bytes)?;
-      let _ = std::fs::remove_file(&path);
-      path = next_path;
-      generation += 1;
+    // Convert the back-to-back run lengths into segment runs, then merge levels until
+    // one bounded k-way pass can stream everything.
+    let mut runs = Vec::with_capacity(self.run_records.len());
+    let mut offset_records = 0u64;
+    for &records in &self.run_records {
+      runs.push(SegmentRun {
+        file: 0,
+        offset_records,
+        records,
+      });
+      offset_records += records;
     }
+    let (files, runs) = compact_to_fan_in(
+      vec![self.scratch_path.clone()],
+      runs,
+      self.fan_in,
+      self.page_bytes,
+      &self.scratch_path,
+    )?;
     Ok(SpilledCounts {
-      source: CountSource::Runs { path, runs },
+      source: CountSource::Runs { files, runs },
       marginals: self.marginals,
       total_events: self.total_events,
       fan_in: self.fan_in,
@@ -191,9 +204,91 @@ impl SpillCounter {
   }
 }
 
+/// One sorted, pre-aggregated run: which scratch file holds it, its first record's
+/// offset (in RECORDS), and its record count. Runs may spread across several files
+/// (the parallel feed writes through a writer pool); only the SET of runs determines
+/// the merged stream — file layout never affects a bit.
+#[derive(Clone, Copy)]
+struct SegmentRun {
+  file: u32,
+  offset_records: u64,
+  records: u64,
+}
+
 enum CountSource {
   Memory(Vec<(u32, u32, u64)>),
-  Runs { path: PathBuf, runs: Vec<u64> },
+  Runs {
+    files: Vec<PathBuf>,
+    runs: Vec<SegmentRun>,
+  },
+}
+
+/// Compact to at most `fan_in` runs in ONE parallel level: the runs split into
+/// `min(threads, fan_in)` contiguous groups, each k-way merged to its own segment
+/// file CONCURRENTLY (groups are independent; the immutable inputs tolerate
+/// concurrent readers). Output runs ≤ groups ≤ fan_in by construction, so a single
+/// level always suffices; group count shapes wall time and file layout only — the
+/// merged stream is partition-invariant. Shared by the serial and parallel feeds.
+fn compact_to_fan_in(
+  files: Vec<PathBuf>,
+  runs: Vec<SegmentRun>,
+  fan_in: usize,
+  page_bytes: usize,
+  name_base: &Path,
+) -> Result<(Vec<PathBuf>, Vec<SegmentRun>), String> {
+  if runs.len() <= fan_in {
+    return Ok((files, runs));
+  }
+  use rayon::prelude::*;
+  let group_count = rayon::current_num_threads().max(1).min(fan_in).max(1);
+  let per_group = runs.len().div_ceil(group_count).max(1);
+  let merged: Vec<Result<(PathBuf, u64), String>> = runs
+    .par_chunks(per_group)
+    .enumerate()
+    .map(|(group_index, group)| {
+      let path = name_base.with_extension(format!("merge{group_index}"));
+      let file = File::create(&path)
+        .map_err(|e| format!("creating merge level {}: {e}", path.display()))?;
+      let mut writer = BufWriter::new(file);
+      let mut cursors = Vec::with_capacity(group.len());
+      for run in group {
+        let source = files
+          .get(run.file as usize)
+          .ok_or("run references a missing scratch file (invariant)")?;
+        cursors.push(RunCursor::open(
+          source,
+          run.offset_records * RECORD_BYTES as u64,
+          run.records,
+          page_bytes,
+        )?);
+      }
+      let mut records = 0u64;
+      merge_cursors(cursors, &mut |a, b, count| {
+        write_record(&mut writer, a, b, count)?;
+        records += 1;
+        Ok(())
+      })?;
+      writer
+        .flush()
+        .map_err(|e| format!("flushing merge level: {e}"))?;
+      Ok((path, records))
+    })
+    .collect();
+  let mut new_files = Vec::with_capacity(merged.len());
+  let mut new_runs = Vec::with_capacity(merged.len());
+  for outcome in merged {
+    let (path, records) = outcome?;
+    new_runs.push(SegmentRun {
+      file: new_files.len() as u32,
+      offset_records: 0,
+      records,
+    });
+    new_files.push(path);
+  }
+  for file in &files {
+    let _ = std::fs::remove_file(file);
+  }
+  Ok((new_files, new_runs))
 }
 
 /// Finished counts: marginals + a re-streamable, ascending, fully aggregated pair
@@ -228,13 +323,19 @@ impl SpilledCounts {
       CountSource::Memory(records) => Ok(PairIter {
         inner: PairIterInner::Memory(records.iter()),
       }),
-      CountSource::Runs { path, runs } => {
+      CountSource::Runs { files, runs } => {
         debug_assert!(runs.len() <= self.fan_in);
-        let mut offset = 0u64;
         let mut cursors = Vec::with_capacity(runs.len());
-        for &records in runs {
-          cursors.push(RunCursor::open(path, offset, records, self.page_bytes)?);
-          offset += records * RECORD_BYTES as u64;
+        for run in runs {
+          let path = files
+            .get(run.file as usize)
+            .ok_or("run references a missing scratch file (invariant)")?;
+          cursors.push(RunCursor::open(
+            path,
+            run.offset_records * RECORD_BYTES as u64,
+            run.records,
+            self.page_bytes,
+          )?);
         }
         Ok(PairIter {
           inner: PairIterInner::Runs {
@@ -256,8 +357,10 @@ impl SpilledCounts {
 
   /// Remove any scratch backing (the success path; absent for in-memory counts).
   pub fn delete(self) -> Result<(), String> {
-    if let CountSource::Runs { path, .. } = self.source {
-      std::fs::remove_file(&path).map_err(|e| format!("removing {}: {e}", path.display()))?;
+    if let CountSource::Runs { files, .. } = self.source {
+      for path in files {
+        std::fs::remove_file(&path).map_err(|e| format!("removing {}: {e}", path.display()))?;
+      }
     }
     Ok(())
   }
@@ -398,43 +501,228 @@ fn merge_cursors(
   Ok(())
 }
 
-/// One merge level: combine groups of `fan_in` runs from `input` into aggregated runs
-/// in `output`; returns the new run table.
-fn merge_level(
-  input: &std::path::Path,
-  runs: &[u64],
-  output: &std::path::Path,
-  fan_in: usize,
+/// The k-way merge fan-in the spill law affords: how many run cursors (one page
+/// each) fit inside the balanced buffer. The Knuth balance makes
+/// ceil(events/buffer) land AT this fan-in, so a parallel feed that caps its range
+/// count here produces one run per range per counter and consumers merge them in a
+/// single level — no compaction pass (measured NET-NEGATIVE at kernel scale: ~26 s
+/// of read+rewrite to save ~17 s of consumer heap depth).
+pub fn merge_fan_in(buffer_events: usize, page_bytes: usize) -> usize {
+  let page_bytes = page_bytes.max(RECORD_BYTES);
+  ((buffer_events.max(1) * std::mem::size_of::<(u32, u32)>()) / page_bytes).max(2)
+}
+
+/// PARALLEL event feed for the three training counters (full + the two σ halves):
+/// `emit(range, push)` generates document range `range`'s events — `push(a, b, half)`
+/// counts the pair in the FULL counter and in half `half` — with ranges processed in
+/// parallel. Each range sorts + pre-aggregates its events locally (exactly the
+/// serial spill's per-buffer step) into ONE run per counter, appended through a
+/// small writer pool; marginals and totals are integer sums (order-free). The merged
+/// streams are bit-equal to the serial [`SpillCounter`] feed over the same events —
+/// aggregation makes run partitioning, file layout, and scheduling invisible — and
+/// the equality oracle pins it. `id_bound` is an exclusive upper bound on every
+/// pushed id: marginals pre-size ONCE per worker split (per-range exact growth was
+/// measured as the dominant parallel-feed cost at kernel scale) and an out-of-bound
+/// id is a typed error. Returns `[full, half0, half1]`.
+pub fn count_ranges<F>(
+  scratch_dir: &Path,
+  range_count: usize,
+  id_bound: usize,
+  buffer_events: usize,
   page_bytes: usize,
-) -> Result<Vec<u64>, String> {
-  let file =
-    File::create(output).map_err(|e| format!("creating merge level {}: {e}", output.display()))?;
-  let mut writer = BufWriter::new(file);
-  let mut new_runs = Vec::new();
-  let mut index = 0usize;
-  while index < runs.len() {
-    let group = &runs[index..(index + fan_in).min(runs.len())];
-    // The byte offset of this group's first run inside the concatenated input.
-    let group_offset: u64 = runs[..index].iter().sum::<u64>() * RECORD_BYTES as u64;
-    let mut cursors = Vec::with_capacity(group.len());
-    let mut offset = group_offset;
-    for &records in group {
-      cursors.push(RunCursor::open(input, offset, records, page_bytes)?);
-      offset += records * RECORD_BYTES as u64;
-    }
-    let mut records = 0u64;
-    merge_cursors(cursors, &mut |a, b, count| {
-      write_record(&mut writer, a, b, count)?;
-      records += 1;
-      Ok(())
-    })?;
-    new_runs.push(records);
-    index += group.len();
+  emit: F,
+) -> Result<[SpilledCounts; 3], String>
+where
+  F: Fn(usize, &mut dyn FnMut(u32, u32, u8)) + Sync,
+{
+  use rayon::prelude::*;
+  let page_bytes = page_bytes.max(RECORD_BYTES);
+  let fan_in = merge_fan_in(buffer_events, page_bytes);
+  let pool_size = rayon::current_num_threads().max(1);
+  // Per counter: a fixed pool of scratch files with lock-guarded writers. Which file
+  // a range's run lands in is scheduling-shaped only; the run SET is deterministic.
+  struct CounterPool {
+    files: Vec<PathBuf>,
+    writers: Vec<Mutex<(BufWriter<File>, u64)>>,
   }
-  writer
-    .flush()
-    .map_err(|e| format!("flushing merge level: {e}"))?;
-  Ok(new_runs)
+  let make_pool = |name: &str| -> Result<CounterPool, String> {
+    let mut files = Vec::with_capacity(pool_size);
+    let mut writers = Vec::with_capacity(pool_size);
+    for slot in 0..pool_size {
+      let path = scratch_dir.join(format!("train-cooc-{name}-{slot}.spill"));
+      let file = File::create(&path)
+        .map_err(|e| format!("creating spill scratch {}: {e}", path.display()))?;
+      files.push(path);
+      writers.push(Mutex::new((BufWriter::new(file), 0u64)));
+    }
+    Ok(CounterPool { files, writers })
+  };
+  let pools = [make_pool("full")?, make_pool("half0")?, make_pool("half1")?];
+
+  /// Per rayon SPLIT (bounded ≈ 2×threads by `with_min_len`), reused across every
+  /// range that split processes: pre-sized marginals (the per-range exact-growth
+  /// resize was measured as the parallel feed's dominant cost — quadratic-ish memcpy
+  /// 700× over), cleared-and-reused event buffers, and the split's accumulated runs.
+  struct WorkerState {
+    buffers: [Vec<(u32, u32)>; 3],
+    marginals: [Vec<u64>; 3],
+    totals: [u64; 3],
+    runs: [Vec<SegmentRun>; 3],
+    error: Option<String>,
+  }
+  let flush_run = |pool: &CounterPool, range: usize, events: &mut Vec<(u32, u32)>| -> Result<Option<SegmentRun>, String> {
+    if events.is_empty() {
+      return Ok(None);
+    }
+    events.sort_unstable();
+    // Serialize the aggregated records locally, then append under the writer lock in
+    // one bounded write (the lock never covers sorting or aggregation).
+    let mut bytes = Vec::with_capacity(events.len().min(1 << 20) * RECORD_BYTES);
+    let mut records = 0u64;
+    let mut index = 0usize;
+    while index < events.len() {
+      let key = events[index];
+      let mut run = 0u64;
+      while index < events.len() && events[index] == key {
+        run += 1;
+        index += 1;
+      }
+      bytes.extend_from_slice(&key.0.to_le_bytes());
+      bytes.extend_from_slice(&key.1.to_le_bytes());
+      bytes.extend_from_slice(&run.to_le_bytes());
+      records += 1;
+    }
+    let slot = range % pool.writers.len();
+    let mut guard = pool.writers[slot]
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let offset_records = guard.1;
+    guard
+      .0
+      .write_all(&bytes)
+      .map_err(|e| format!("writing spill run: {e}"))?;
+    guard.1 += records;
+    Ok(Some(SegmentRun {
+      file: slot as u32,
+      offset_records,
+      records,
+    }))
+  };
+
+  let min_ranges_per_split = range_count
+    .div_ceil(pool_size.saturating_mul(2).max(1))
+    .max(1);
+  let workers: Vec<WorkerState> = (0..range_count)
+    .into_par_iter()
+    .with_min_len(min_ranges_per_split)
+    .fold(
+      || WorkerState {
+        buffers: std::array::from_fn(|_| Vec::new()),
+        marginals: std::array::from_fn(|_| vec![0u64; id_bound]),
+        totals: [0u64; 3],
+        runs: std::array::from_fn(|_| Vec::new()),
+        error: None,
+      },
+      |mut state, range| {
+        if state.error.is_some() {
+          return state;
+        }
+        for buffer in &mut state.buffers {
+          buffer.clear();
+        }
+        let mut out_of_bound = false;
+        {
+          let buffers = &mut state.buffers;
+          let marginals = &mut state.marginals;
+          let totals = &mut state.totals;
+          emit(range, &mut |a: u32, b: u32, half: u8| {
+            let key = (a.min(b), a.max(b));
+            if key.1 as usize >= id_bound {
+              out_of_bound = true;
+              return;
+            }
+            let half_counter = 1 + (half as usize & 1);
+            for counter in [0usize, half_counter] {
+              marginals[counter][key.0 as usize] += 1;
+              marginals[counter][key.1 as usize] += 1;
+              totals[counter] += 1;
+              buffers[counter].push(key);
+            }
+          });
+        }
+        if out_of_bound {
+          state.error = Some(format!("event id outside bound {id_bound} (caller invariant)"));
+          return state;
+        }
+        let mut flush_error: Option<String> = None;
+        for ((pool, buffer), runs) in pools
+          .iter()
+          .zip(&mut state.buffers)
+          .zip(&mut state.runs)
+        {
+          match flush_run(pool, range, buffer) {
+            Ok(Some(run)) => runs.push(run),
+            Ok(None) => {}
+            Err(reason) => {
+              flush_error = Some(reason);
+              break;
+            }
+          }
+        }
+        if let Some(reason) = flush_error {
+          state.error = Some(reason);
+        }
+        state
+      },
+    )
+    .collect();
+
+  let mut counters: Vec<SpilledCounts> = Vec::with_capacity(3);
+  for (counter, pool) in pools.into_iter().enumerate() {
+    for writer in &pool.writers {
+      writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .0
+        .flush()
+        .map_err(|e| format!("flushing spill runs: {e}"))?;
+    }
+    let mut marginals: Vec<u64> = vec![0; id_bound];
+    let mut total_events = 0u64;
+    let mut runs = Vec::new();
+    for worker in &workers {
+      if let Some(reason) = &worker.error {
+        return Err(reason.clone());
+      }
+      runs.extend_from_slice(&worker.runs[counter]);
+      total_events += worker.totals[counter];
+      for (total, part) in marginals.iter_mut().zip(&worker.marginals[counter]) {
+        *total += part;
+      }
+    }
+    // Bit parity with the serial marginal length: SpillCounter's vec ends at the
+    // highest seen id, whose marginal is necessarily nonzero — trailing zeros trim
+    // to exactly that length.
+    while marginals.last() == Some(&0) {
+      marginals.pop();
+    }
+    let name_base = pool.files.first().cloned().unwrap_or_else(|| {
+      scratch_dir.join(format!("train-cooc-{counter}.spill"))
+    });
+    let (files, runs) =
+      compact_to_fan_in(pool.files, runs, fan_in, page_bytes, &name_base)?;
+    counters.push(SpilledCounts {
+      source: CountSource::Runs { files, runs },
+      marginals,
+      total_events,
+      fan_in,
+      page_bytes,
+    });
+  }
+  let [full, half0, half1]: [SpilledCounts; 3] = counters
+    .try_into()
+    .map_err(|_| "counter assembly (invariant)".to_string())?;
+  Ok([full, half0, half1])
 }
 
 #[cfg(test)]
@@ -533,6 +821,62 @@ mod tests {
     }
     // …and the arena-clamp floor below it (64 KiB / 8 B per event = 8192 events).
     assert_eq!(buffer_events_for(100, 16384, 64 * 1024), 8192);
+  }
+
+  #[test]
+  fn parallel_ranges_match_the_serial_feed_bitwise() {
+    // The invariance the parallel feed rests on, asserted end to end: the SAME
+    // (a, b, half) event stream through the serial SpillCounter trio (tiny buffer —
+    // real runs, real merges) and through `count_ranges` (parallel ranges, writer
+    // pool, per-range runs) yields BIT-EQUAL aggregated streams, marginals, and
+    // totals for all three counters.
+    let events = random_events(50_000, 700, 33);
+    let docs: Vec<&[(u32, u32)]> = events.chunks(5).collect();
+    let dir = std::env::temp_dir().join(format!("vorpal-spill-par-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut full = SpillCounter::new(dir.join("s-full.spill"), 64, 64);
+    let mut half0 = SpillCounter::new(dir.join("s-half0.spill"), 64, 64);
+    let mut half1 = SpillCounter::new(dir.join("s-half1.spill"), 64, 64);
+    for (doc_index, doc) in docs.iter().enumerate() {
+      for &(a, b) in *doc {
+        full.push(a, b).unwrap();
+        if doc_index % 2 == 0 {
+          half0.push(a, b).unwrap();
+        } else {
+          half1.push(a, b).unwrap();
+        }
+      }
+    }
+    let serial = [
+      full.finish().unwrap(),
+      half0.finish().unwrap(),
+      half1.finish().unwrap(),
+    ];
+
+    // Uneven ranges (13 docs — deliberately misaligned with the doc-parity period).
+    let ranges_dir = dir.join("ranges");
+    std::fs::create_dir_all(&ranges_dir).unwrap();
+    let docs_per_range = 13usize;
+    let range_count = docs.len().div_ceil(docs_per_range);
+    let parallel = count_ranges(&ranges_dir, range_count, 700, 64, 64, |range, push| {
+      let start = range * docs_per_range;
+      let end = ((range + 1) * docs_per_range).min(docs.len());
+      for doc_index in start..end {
+        for &(a, b) in docs[doc_index] {
+          push(a, b, (doc_index % 2) as u8);
+        }
+      }
+    })
+    .unwrap();
+
+    for (serial_counts, parallel_counts) in serial.iter().zip(&parallel) {
+      assert_eq!(serial_counts.total_events(), parallel_counts.total_events());
+      assert_eq!(serial_counts.marginals(), parallel_counts.marginals());
+      assert_eq!(collect(serial_counts), collect(parallel_counts));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[test]

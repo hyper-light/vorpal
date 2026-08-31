@@ -19,7 +19,9 @@ use crate::learned::cooc::{PpmiStream, Vocab, ppmi_stream};
 use crate::learned::pip::{estimate_noise_sigma_streams, select_dimension, soft_threshold};
 use crate::learned::pool::{Abtt, SentenceComponents, UsifWeighting};
 use crate::learned::rsvd::{FactorWorkspace, SymmetricCsr, top_symmetric_eigen};
-use crate::learned::spill::{PairIter, SpillCounter, SpilledCounts, buffer_events_for};
+use crate::learned::spill::{
+  PairIter, SpillCounter, SpilledCounts, buffer_events_for, count_ranges, merge_fan_in,
+};
 use crate::learned::subword::SubwordTokenizer;
 
 /// fastText's vocabulary floor (Bojanowski et al. 2017, `-minCount 5` default): tokens
@@ -390,80 +392,185 @@ impl LearnedModel {
       resources.page_bytes,
       resources.arena_chunk_bytes,
     );
-    let spill_path = |name: &str| resources.scratch_dir.join(format!("train-cooc-{name}.spill"));
-    let mut full = SpillCounter::new(spill_path("full"), buffer, resources.page_bytes);
-    let mut half_counters = [
-      SpillCounter::new(spill_path("half0"), half_buffer, resources.page_bytes),
-      SpillCounter::new(spill_path("half1"), half_buffer, resources.page_bytes),
-    ];
-    let mut doc_index = 0usize;
     let gram_base = matrix_words as u32;
-    let mut spill_error: Option<String> = None;
-    corpus(&mut |doc: &[String]| {
-      if spill_error.is_some() {
-        return;
-      }
-      let ids: Vec<u32> = doc.iter().filter_map(|t| vocab.get(t)).collect();
-      let half_index = doc_index % 2;
-      doc_index += 1;
-      let mut push = |a: u32, b: u32| -> Result<(), String> {
-        full.push(a, b)?;
-        half_counters[half_index].push(a, b)
-      };
-      let mut feed = || -> Result<(), String> {
-        for (position, &center) in ids.iter().enumerate() {
-          let end = (position + COOC_WINDOW + 1).min(ids.len());
-          for &context in ids.get(position + 1..end).unwrap_or(&[]) {
-            push(center, context)?;
-            for &gram in &word_grams[center as usize] {
-              push(gram_base + gram, context)?;
-            }
-            for &gram in &word_grams[context as usize] {
-              push(gram_base + gram, center)?;
-            }
+    // ONE event generator serves both feeds below (the streams cannot drift): window
+    // pairs plus fastText joint-gram credits for one document's in-vocabulary ids.
+    let feed_doc = |ids: &[u32], push: &mut dyn FnMut(u32, u32)| {
+      for (position, &center) in ids.iter().enumerate() {
+        let end = (position + COOC_WINDOW + 1).min(ids.len());
+        for &context in ids.get(position + 1..end).unwrap_or(&[]) {
+          push(center, context);
+          for &gram in &word_grams[center as usize] {
+            push(gram_base + gram, context);
+          }
+          for &gram in &word_grams[context as usize] {
+            push(gram_base + gram, center);
           }
         }
-        Ok(())
-      };
-      if let Err(error) = feed() {
-        spill_error = Some(error);
       }
-    });
-    if let Some(error) = spill_error {
-      return Err(format!("co-occurrence spill failed: {error}"));
-    }
-    (resources.progress)("learned: cooc events fed");
-    let counts = full.finish()?;
+    };
+    // One range's events ≈ one buffer — the same external-merge balance as the
+    // serial path, so run counts and per-range memory match it. A single range keeps
+    // the serial in-buffer fast path (small corpora never touch disk); at scale the
+    // feed runs PARALLEL over fixed document ranges — bit-equal to the serial feed
+    // by aggregation invariance (`parallel_ranges_match_the_serial_feed_bitwise`;
+    // measured serial at kernel scale: 16.4 s of a 65.6 s train).
+    // Capped at the merge fan-in: the balance law puts ceil(events/buffer) AT the
+    // fan-in, so this cap only absorbs the estimate's rounding overshoot — and with
+    // one run per range per counter, runs ≤ fan_in means consumers single-level
+    // merge every counter and the compaction pass never fires (measured net loss).
+    let range_count = (expected_events.div_ceil(buffer.max(1) as u64).max(1) as usize)
+      .min(merge_fan_in(buffer, resources.page_bytes));
+    let (counts, half_a, half_b) = if range_count <= 1 {
+      let spill_path = |name: &str| resources.scratch_dir.join(format!("train-cooc-{name}.spill"));
+      let mut full = SpillCounter::new(spill_path("full"), buffer, resources.page_bytes);
+      let mut half_counters = [
+        SpillCounter::new(spill_path("half0"), half_buffer, resources.page_bytes),
+        SpillCounter::new(spill_path("half1"), half_buffer, resources.page_bytes),
+      ];
+      let mut doc_index = 0usize;
+      let mut spill_error: Option<String> = None;
+      corpus(&mut |doc: &[String]| {
+        if spill_error.is_some() {
+          return;
+        }
+        let ids: Vec<u32> = doc.iter().filter_map(|t| vocab.get(t)).collect();
+        let half_index = doc_index % 2;
+        doc_index += 1;
+        feed_doc(&ids, &mut |a, b| {
+          if spill_error.is_some() {
+            return;
+          }
+          if let Err(error) = full
+            .push(a, b)
+            .and_then(|()| half_counters[half_index].push(a, b))
+          {
+            spill_error = Some(error);
+          }
+        });
+      });
+      if let Some(error) = spill_error {
+        return Err(format!("co-occurrence spill failed: {error}"));
+      }
+      (resources.progress)("learned: cooc events fed");
+      let counts = full.finish()?;
+      let [half_a, half_b] = half_counters;
+      (counts, half_a.finish()?, half_b.finish()?)
+    } else {
+      // Materialize each document's in-vocabulary ids ONCE into scratch-backed flat
+      // arrays (sequential writes; the pager bounds RAM at Meta scale), so ranges
+      // re-read their documents without another serial corpus walk.
+      let offsets_scratch_path = resources.scratch_dir.join("train-doc-offsets.scratch");
+      let ids_scratch_path = resources.scratch_dir.join("train-doc-ids.scratch");
+      let mut offsets_scratch = vorpal_mem::ScratchMmap::create(
+        &offsets_scratch_path,
+        (documents + 1) * 8,
+        vorpal_mem::AccessPattern::Sequential,
+      )
+      .map_err(|e| format!("doc-offset scratch: {e}"))?;
+      let mut ids_scratch = vorpal_mem::ScratchMmap::create(
+        &ids_scratch_path,
+        (token_events as usize).max(1) * 4,
+        vorpal_mem::AccessPattern::Sequential,
+      )
+      .map_err(|e| format!("doc-id scratch: {e}"))?;
+      {
+        let offsets: &mut [u64] = bytemuck::try_cast_slice_mut(offsets_scratch.as_mut_bytes())
+          .map_err(|e| format!("scratch alignment: {e}"))?;
+        let ids: &mut [u32] = bytemuck::try_cast_slice_mut(ids_scratch.as_mut_bytes())
+          .map_err(|e| format!("scratch alignment: {e}"))?;
+        let mut doc = 0usize;
+        let mut filled = 0usize;
+        let mut overflow = false;
+        offsets[0] = 0;
+        corpus(&mut |tokens: &[String]| {
+          for token in tokens {
+            if let Some(id) = vocab.get(token) {
+              if filled < ids.len() {
+                ids[filled] = id;
+                filled += 1;
+              } else {
+                overflow = true;
+              }
+            }
+          }
+          doc += 1;
+          if doc < offsets.len() {
+            offsets[doc] = filled as u64;
+          } else {
+            overflow = true;
+          }
+        });
+        if overflow || doc != documents {
+          return Err("corpus changed between passes (not re-streamable)".to_string());
+        }
+      }
+      (resources.progress)("learned: cooc events fed");
+      let docs_per_range = documents.div_ceil(range_count).max(1);
+      let range_count = documents.div_ceil(docs_per_range).max(1);
+      let [counts, half_a, half_b] = {
+        let offsets: &[u64] = bytemuck::try_cast_slice(offsets_scratch.as_bytes())
+          .map_err(|e| format!("scratch alignment: {e}"))?;
+        let all_ids: &[u32] = bytemuck::try_cast_slice(ids_scratch.as_bytes())
+          .map_err(|e| format!("scratch alignment: {e}"))?;
+        count_ranges(
+          &resources.scratch_dir,
+          range_count,
+          matrix_rows,
+          buffer,
+          resources.page_bytes,
+          |range, push| {
+            let start_doc = range * docs_per_range;
+            let end_doc = ((range + 1) * docs_per_range).min(documents);
+            for doc in start_doc..end_doc {
+              let (start, end) = (offsets[doc] as usize, offsets[doc + 1] as usize);
+              let half = (doc % 2) as u8;
+              feed_doc(&all_ids[start..end], &mut |a, b| push(a, b, half));
+            }
+          },
+        )?
+      };
+      offsets_scratch
+        .delete()
+        .map_err(|e| format!("removing doc-offset scratch: {e}"))?;
+      ids_scratch
+        .delete()
+        .map_err(|e| format!("removing doc-id scratch: {e}"))?;
+      (counts, half_a, half_b)
+    };
     if counts.total_events() == 0 {
       return Err("no co-occurrence events — documents too short (lexical fallback)".to_string());
     }
-    let [half_a, half_b] = half_counters;
-    let half_a = half_a.finish()?;
-    let half_b = half_b.finish()?;
     (resources.progress)("learned: cooc spilled+merged");
 
-    // σ from the streamed half-split difference — the halves never materialize either.
-    let sigma = {
-      let stream_a = counts_ppmi(&half_a);
-      let stream_b = counts_ppmi(&half_b);
-      match (stream_a, stream_b) {
-        (Ok(a), Ok(b)) => estimate_noise_sigma_streams(a, b, matrix_rows)?,
-        // A half too sparse for PPMI means the corpus is at its floor; σ then comes
-        // from the fuller side against nothing (conservatively large).
-        (Ok(a), Err(_)) | (Err(_), Ok(a)) => {
-          estimate_noise_sigma_streams(a, std::iter::empty(), matrix_rows)?
+    // σ (streamed half-split difference — the halves never materialize) and the CSR
+    // build (PPMI streamed twice: size, then fill — triples never exist as a vector)
+    // read DIFFERENT counters, so the two reductions are independent and OVERLAP:
+    // σ hides under the longer CSR pass. Each side is internally deterministic and
+    // they share no state, so outputs are unchanged. Phase stamps fire after the
+    // join — "noise sigma" carries the joint wall time, "ppmi csr" reads ~0.
+    let (sigma_result, matrix_result) = rayon::join(
+      || {
+        let stream_a = counts_ppmi(&half_a);
+        let stream_b = counts_ppmi(&half_b);
+        match (stream_a, stream_b) {
+          (Ok(a), Ok(b)) => estimate_noise_sigma_streams(a, b, matrix_rows),
+          // A half too sparse for PPMI means the corpus is at its floor; σ then comes
+          // from the fuller side against nothing (conservatively large).
+          (Ok(a), Err(_)) | (Err(_), Ok(a)) => {
+            estimate_noise_sigma_streams(a, std::iter::empty(), matrix_rows)
+          }
+          (Err(a), Err(b)) => Err(format!("both σ halves untrainable: {a}; {b}")),
         }
-        (Err(a), Err(b)) => return Err(format!("both σ halves untrainable: {a}; {b}")),
-      }
-    };
+      },
+      || SymmetricCsr::from_pair_stream(matrix_rows, || counts_ppmi(&counts)),
+    );
+    let sigma = sigma_result?;
     half_a.delete()?;
     half_b.delete()?;
     (resources.progress)("learned: noise sigma");
 
-    // Factorize and pick d by PIP on the corpus's own (thresholded) spectrum. The CSR
-    // builds by streaming the PPMI twice (size, then fill) — triples never exist as a
-    // vector.
-    let matrix = SymmetricCsr::from_pair_stream(matrix_rows, || counts_ppmi(&counts))?;
+    let matrix = matrix_result?;
     let cooc_pairs = matrix.nnz();
     counts.delete()?;
     (resources.progress)("learned: ppmi csr");
