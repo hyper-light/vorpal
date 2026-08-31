@@ -904,7 +904,18 @@ index root has no selection; per-index selections always win, and internal
 generation-dir opens (the BM25 gate's probes) keep measuring un-reranked
 fusion. `vorpal disable semantic-f32 | semantic-f16` is the symmetric partner:
 variant-checked (a mismatch states what IS enabled and touches nothing),
-weights kept on disk so re-enabling is instant. Python (`semantic_install/semantic_enable/semantic_disable`) and Node
+weights kept on disk so re-enabling is instant. The per-corpus decision loop
+ships as commands: `vorpal search "q" --ranked` renders the fused and
+encoder-reranked orderings side by side with movement markers — ONE search,
+both views from the same fusion; `vorpal tune --queries file` scores both
+optional features on the user's own queries (`query => expected-substring`
+lines, reciprocal rank, paired one-search views — the BM25 pair reuses the
+warm gate's single-channel-pass trick with the encoder reranking both sides)
+and writes this index's switches from the verdicts: the reranker via
+`encoder.dir` (a model path, or the `off` SENTINEL — a per-index opt-out that
+shadows a global enable), BM25 via a manual record override
+(`set_bm25_override`) that holds until the index content retrains. No signal →
+no write, stated. Python (`semantic_install/semantic_enable/semantic_disable`) and Node
 (`semanticInstall/semanticEnable/semanticDisable`) expose the same verbs with a
 `root` placement parameter.
 

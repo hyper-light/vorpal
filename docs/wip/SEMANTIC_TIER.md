@@ -308,10 +308,13 @@ without regressing others — else recorded as measured-and-rejected in this doc
 > verified f32 bytes (IEEE RNE, exhaustive 65 536-pattern round-trip oracle;
 > end-to-end embedding drift asserted ≤ 1% cosine; ~half the disk) — the loader
 > upconverts at open (full-size RSS while live; f16-native kernel is the
-> recorded lead). Weights never ship inside release artifacts. STILL OPEN
-> (owner): none — the
-> release-size decision (547 MB f32 / ~274 MB f16 vs npm+PyPI budgets: optional
-> model package vs LFS vs release asset).
+> recorded lead). Weights never ship inside release artifacts — the release-size
+> question (547 MB f32 / ~274 MB f16 vs npm+PyPI budgets) was RESOLVED by the
+> owner's decision: both precisions, optional install everywhere, never bundled.
+> The per-corpus decision loop is also shipped as commands (`vorpal search
+> --ranked`; `vorpal tune` with verdict-driven switch writes, incl. the
+> `encoder.dir` `off` sentinel and the manual BM25 record override). No Stage-6
+> decisions remain open.
 
 **Ready-when-licensed:** multi-phrase semantic AND becomes real per-phrase semantics at
 Stage 1+; it remains separately unlicensed and is not scheduled here.
