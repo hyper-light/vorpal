@@ -13,6 +13,7 @@ mod print;
 mod remote;
 mod run;
 mod scan;
+mod tune;
 mod utils;
 mod verify;
 
@@ -32,6 +33,7 @@ use new::{NewArg, run_create_new};
 use outline::{OutlineArg, run_outline};
 use run::{RunArg, run_with_pattern};
 use scan::{ScanArg, run_with_config};
+use tune::{TuneArg, run_tune};
 use utils::exit_with_error;
 use verify::{TestArg, run_test_rule};
 
@@ -87,6 +89,9 @@ enum Commands {
   /// Disable the advanced semantic embedder (weights stay installed;
   /// semantic-f32 | semantic-f16).
   Disable(DisableArg),
+  /// Measure the optional ranking features on YOUR queries and write this
+  /// index's switches from the verdicts (see --queries).
+  Tune(TuneArg),
   /// List the tree-sitter grammars compiled into this binary (versions, generation digests).
   Grammars(GrammarsArg),
   /// Serve knowledge-graph queries to agents over MCP (stdio).
@@ -190,6 +195,7 @@ pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<ExitCode> {
     Commands::Search(arg) => run_search(arg),
     Commands::Enable(arg) => run_enable(arg),
     Commands::Disable(arg) => run_disable(arg),
+    Commands::Tune(arg) => run_tune(arg),
     Commands::Grammars(arg) => run_grammars(arg),
     Commands::Mcp(arg) => run_mcp(arg, project),
     Commands::Completions(arg) => run_shell_completion::<App>(arg),

@@ -1336,7 +1336,12 @@ impl EncoderCache {
 fn open_selected_encoder(
   index_root: &Path,
 ) -> (Option<Box<vorpal_ann::encoder::CodeEncoder>>, Option<String>) {
-  match encoder_selection(index_root).or_else(models::global_encoder_selection) {
+  let selection = match encoder_selection(index_root) {
+    Some(EncoderSelection::Off) => None, // deliberate per-index opt-out
+    Some(EncoderSelection::Model(model_dir)) => Some(model_dir),
+    None => models::global_encoder_selection(),
+  };
+  match selection {
     None => (None, None),
     Some(model_dir) => match vorpal_ann::encoder::CodeEncoder::open(&model_dir) {
       Ok(encoder) => (Some(Box::new(encoder)), None),
@@ -1354,13 +1359,23 @@ fn open_selected_encoder(
 /// dirs never carry one, so internal opens of a pinned generation (the BM25 gate's
 /// probes, overlay assembly) always measure the UN-reranked fusion their records
 /// describe. Never a download: the directory must already exist locally.
-fn encoder_selection(index_root: &Path) -> Option<PathBuf> {
+/// A root's explicit selection: a model directory, or the literal sentinel `off`
+/// — a per-index OPT-OUT that shadows the global enable (what `vorpal tune`
+/// writes when the reranker measures worse on that index).
+enum EncoderSelection {
+  Off,
+  Model(PathBuf),
+}
+
+fn encoder_selection(index_root: &Path) -> Option<EncoderSelection> {
   let text = fs::read_to_string(index_root.join("encoder.dir")).ok()?;
-  let path = text.trim();
-  if path.is_empty() {
+  let trimmed = text.trim();
+  if trimmed.is_empty() {
     None
+  } else if trimmed == "off" {
+    Some(EncoderSelection::Off)
   } else {
-    Some(PathBuf::from(path))
+    Some(EncoderSelection::Model(PathBuf::from(trimmed)))
   }
 }
 
@@ -1371,6 +1386,15 @@ fn encoder_selection(index_root: &Path) -> Option<PathBuf> {
 pub fn write_encoder_selection(index_root: &Path, model_dir: &Path) -> io::Result<()> {
   let tmp = index_root.join("encoder.dir.tmp");
   fs::write(&tmp, format!("{}\n", model_dir.display()))?;
+  fs::rename(tmp, index_root.join("encoder.dir"))
+}
+
+/// Persist the per-index OPT-OUT sentinel (`encoder.dir` = `off`): this index
+/// deliberately shadows any global enable — `vorpal tune`'s verdict when the
+/// reranker measures worse here. Remove the file to fall back to the global.
+pub fn write_encoder_opt_out(index_root: &Path) -> io::Result<()> {
+  let tmp = index_root.join("encoder.dir.tmp");
+  fs::write(&tmp, "off\n")?;
   fs::rename(tmp, index_root.join("encoder.dir"))
 }
 
@@ -1501,6 +1525,27 @@ fn ensure_bm25_gate(index_dir: &Path, current_stamp: u64) -> Result<(), Box<dyn 
     record.note.as_deref(),
   )?;
   Ok(())
+}
+
+/// Manually override the per-corpus BM25 verdict (`vorpal tune`'s write path):
+/// rewrite the committed tier record with the given verdict and a stated
+/// manual-evidence line, through the same canonical writer as the warm gate.
+/// The override holds until the index content changes and retrains (the warm
+/// gate then re-derives its own verdict) — callers state that.
+pub fn set_bm25_override(index_dir: &Path, enabled: bool, evidence: &str) -> Result<(), String> {
+  let index_dir = vorpal_kg::resolve_index_dir(index_dir);
+  let record = persisted_tier_record(&index_dir)
+    .ok_or("no committed tier record — build/warm the index first")?;
+  write_model_provenance(
+    &index_dir,
+    &record.provenance,
+    &record.tier,
+    record.weights_hash,
+    &record.retrofit,
+    Some((enabled, evidence)),
+    record.note.as_deref(),
+  )
+  .map_err(|e| format!("rewriting tier record: {e}"))
 }
 
 fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn Error>> {
@@ -3025,6 +3070,42 @@ impl Searcher {
       .is_some()
       .then(|| self.hits_from_ranked(self.rerank_with_encoder(query, fused.clone()), None));
     Ok((self.hits_from_ranked(fused, None), reranked))
+  }
+
+  /// ONE search, BM25 off/on — `vorpal tune`'s paired view, the warm gate's own
+  /// trick surfaced: a single channel pass computes the BM25 list regardless of
+  /// the record's verdict, then the 3-list and 4-list fusions rank side by side.
+  /// The active encoder (if any) reranks BOTH, so this isolates exactly the
+  /// fourth list's effect. Conjunctions keep their contract: both sides equal.
+  #[allow(clippy::type_complexity)]
+  pub fn records_bm25_pair(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<(Vec<records::SearchHitRecord>, Vec<records::SearchHitRecord>), Box<dyn Error>> {
+    if parse_and_phrases(query).is_some() {
+      // Both sides equal by the conjunction contract; two calls only materialize
+      // the two vecs (record types are deliberately Clone-free).
+      return Ok((self.records(query, k, filter)?, self.records(query, k, filter)?));
+    }
+    let channels = self.channel_lists_with_bm25(query, rerank_pool(k), filter, true)?;
+    let without = vec![
+      channels.named.clone(),
+      channels.semantic.clone(),
+      channels.by_degree.clone(),
+    ];
+    let with_bm25 = {
+      let mut lists = without.clone();
+      lists.push(channels.bm25);
+      lists
+    };
+    let off = self.rerank_with_encoder(query, rrf_fuse_explained(&without, k));
+    let on = self.rerank_with_encoder(query, rrf_fuse_explained(&with_bm25, k));
+    Ok((
+      self.hits_from_ranked(off, None),
+      self.hits_from_ranked(on, None),
+    ))
   }
 
   /// The full typed search answer — the ONE dispatch point below every surface (CLI, MCP,

@@ -392,7 +392,7 @@ pub enum McpAction {
   },
 }
 
-fn index_dir(explicit: Option<PathBuf>) -> PathBuf {
+pub(crate) fn index_dir(explicit: Option<PathBuf>) -> PathBuf {
   explicit.unwrap_or_else(|| PathBuf::from(DEFAULT_INDEX_DIR))
 }
 
@@ -1394,7 +1394,7 @@ fn run_mcp_action(action: McpAction) -> Result<ExitCode> {
   Ok(ExitCode::SUCCESS)
 }
 
-fn missing_index_hint(dir: &Path) -> String {
+pub(crate) fn missing_index_hint(dir: &Path) -> String {
   format!(
     "querying index at {} (build one first: `vorpal index <src>`)",
     dir.display()
