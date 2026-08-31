@@ -53,7 +53,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use vorpal_kg::identity::{FileKey, tree_relative};
+use vorpal_kg::identity::tree_relative;
 use vorpal_mem::{AccessPattern, CorpusProbe, Hotness, MappedStore, ResourcePolicy, StoreKind};
 
 pub const PACK_FILE: &str = "products.pack";
@@ -98,24 +98,9 @@ impl PackFormat {
   }
 }
 
-// Bucket-count law (P4.1): B = clamp(next_pow2(files / BUCKET_TARGET_FILES), MIN, MAX),
-// a pure function of the live file count — see the module docs for why purity is load-
-// bearing. Constants from the recorded two-scale sweep (docs/wip/SUBSECOND.md §P4.1,
-// `bucket-sweep` — linux kernel 76 868 files and vorpal repo ~2k): the kernel edit-one
-// wall was 0.43 s at B=256, 0.54 s at B=1024, and 1.24 s at B=4096 (per-bucket link/mmap
-// overhead beats byte savings once buckets shrink past ~100 files), so the target lands
-// the kernel exactly on its measured optimum: 76 868 / 512 → next_pow2(150) = 256.
-const BUCKET_TARGET_FILES: usize = 512;
-const BUCKET_MIN: u32 = 16;
-/// Also the naming bound: `{:04}` bucket file names sort numerically only below 10 000.
-const BUCKET_MAX: u32 = 4096;
-
-/// The bucket count for a corpus of `files` live files. Pure, monotonic, power-of-two.
-pub fn bucket_count_for(files: usize) -> u32 {
-  let want = files.div_ceil(BUCKET_TARGET_FILES).max(1) as u64;
-  let pow2 = want.next_power_of_two().min(u64::from(BUCKET_MAX)) as u32;
-  pow2.clamp(BUCKET_MIN, BUCKET_MAX)
-}
+// The bucket law (count + assignment) lives in `vorpal_kg::identity` — ONE home shared by
+// the pack and the node/heap slabs (P4.2), with the recorded sweep cited there.
+pub use vorpal_kg::identity::{BUCKET_MAX, bucket_count_for};
 
 /// [`bucket_count_for`] with the measurement override applied. `VORPAL_PACK_BUCKETS` exists
 /// for the recorded sweeps and for tests that need a fixed B; setting it in production
@@ -127,10 +112,7 @@ fn bucket_count_effective(files: usize) -> u32 {
   }
 }
 
-/// The bucket a tree-relative path lands in, for a power-of-two bucket count.
-fn bucket_of(tree_relative_path: &str, buckets: u32) -> u32 {
-  (FileKey::of(tree_relative_path).0 & u64::from(buckets - 1)) as u32
-}
+use vorpal_kg::identity::bucket_of;
 
 /// The generation-relative file name of bucket `k` (`products/0007.pack`).
 pub fn bucket_file_name(bucket: u32) -> String {
@@ -1570,26 +1552,6 @@ mod tests {
     assert_eq!(reader.get(&format!("{ROOT}/src/a.rs")), Some(&b"alpha-v1"[..]));
 
     let _ = fs::remove_dir_all(&dir);
-  }
-
-  #[test]
-  fn bucket_count_law_is_pure_pow2_clamped() {
-    assert_eq!(bucket_count_for(0), BUCKET_MIN);
-    assert_eq!(bucket_count_for(1), BUCKET_MIN);
-    assert_eq!(bucket_count_for(BUCKET_TARGET_FILES * BUCKET_MIN as usize), BUCKET_MIN);
-    let kernel_scale = 76_000usize;
-    let b = bucket_count_for(kernel_scale);
-    assert!(b.is_power_of_two() && (BUCKET_MIN..=BUCKET_MAX).contains(&b));
-    // Monotonic in file count.
-    let mut prev = 0;
-    for files in [0usize, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000] {
-      let b = bucket_count_for(files);
-      assert!(b >= prev, "bucket law not monotonic at {files}");
-      prev = b;
-    }
-    assert_eq!(bucket_count_for(usize::MAX), BUCKET_MAX);
-    // The naming bound holds: {:04} names sort numerically for every legal bucket index.
-    assert_eq!(format!("{:04}", BUCKET_MAX - 1).len(), 4);
   }
 
   #[test]

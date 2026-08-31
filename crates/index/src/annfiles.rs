@@ -61,7 +61,7 @@ pub fn file_runs_of(kg: &Kg) -> Vec<FileRun> {
         }
     })
     .collect();
-  let (kind_tags, content_hashes) = (kg.kind_tags(), kg.content_hashes());
+  let (kind_tags, content_hashes) = (kg.kind_tag_lookup(), kg.content_hash_lookup());
   starts
     .par_iter()
     .enumerate()
@@ -69,12 +69,15 @@ pub fn file_runs_of(kg: &Kg) -> Vec<FileRun> {
       let end = starts.get(run_index + 1).copied().unwrap_or(n);
       let mut hasher = xxhash_rust::xxh3::Xxh3::new();
       for at in start..end {
-        let striped = match (kind_tags, content_hashes) {
-          (Some(kinds), Some(hashes)) => {
-            hasher.update(&[kinds[at as usize]]);
-            hasher.update(&hashes[at as usize].to_le_bytes());
-            true
-          }
+        let striped = match (&kind_tags, &content_hashes) {
+          (Some(kinds), Some(hashes)) => match (kinds.get(at), hashes.get(at)) {
+            (Some(kind), Some(hash)) => {
+              hasher.update(&[kind]);
+              hasher.update(&hash.to_le_bytes());
+              true
+            }
+            _ => false,
+          },
           _ => false,
         };
         if !striped {

@@ -505,13 +505,13 @@ pub fn dead_records_page(
     || filter.path_prefix.is_some()
     || filter.path_suffix.is_some();
   let node_count = kg.node_count() as u64;
-  let kind_tags = kg.kind_tags();
+  let kind_tags = kg.kind_tag_lookup();
   let candidates: Vec<u64> = (0..node_count)
     .into_par_iter()
     .filter(|&row| {
       let id = NodeId::new(row);
-      let tag = match kind_tags {
-        Some(tags) => tags.get(row as usize).copied(),
+      let tag = match &kind_tags {
+        Some(tags) => tags.get(row),
         None => kg.node_kind(id).map(|kind| kind.tag()),
       };
       let Some(tag) = tag else { return false };
@@ -1673,7 +1673,7 @@ pub fn architecture_report(
     mask
   };
   let n = kg.node_count() as u64;
-  let kind_tags = kg.kind_tags();
+  let kind_tags = kg.kind_tag_lookup();
 
   // Per-node semantic in-degree (u32; saturating — a >4B-edge node is already a hub).
   let in_semantic: Vec<u32> = (0..n)
@@ -1772,8 +1772,8 @@ pub fn architecture_report(
       continue;
     }
     let id = NodeId::new(row);
-    let tag = match kind_tags {
-      Some(tags) => tags.get(row as usize).copied(),
+    let tag = match &kind_tags {
+      Some(tags) => tags.get(row),
       None => kg.node_kind(id).map(|kind| kind.tag()),
     };
     if !tag.is_some_and(|tag| callable.contains(&tag)) {
@@ -1801,8 +1801,8 @@ pub fn architecture_report(
       ),
     ),
     Some(table) => {
-      let is_file = |row: usize| match kind_tags {
-        Some(tags) => tags.get(row) == Some(&vorpal_kg::SymbolKind::File.tag()),
+      let is_file = |row: usize| match &kind_tags {
+        Some(tags) => tags.get(row as u64) == Some(vorpal_kg::SymbolKind::File.tag()),
         None => kg.node_kind(NodeId::new(row as u64)) == Some(vorpal_kg::SymbolKind::File),
       };
       let community_count = table.iter().copied().max().map_or(0, |m| m as usize + 1);
@@ -2364,17 +2364,20 @@ mod dead_bench {
       mask
     };
     let n = kg.node_count() as u64;
-    let tags = kg.kind_tags().unwrap();
+    let tags = kg.kind_tag_lookup().unwrap();
 
     let t = std::time::Instant::now();
-    let kind_only: u64 = (0..n).into_par_iter().filter(|&r| allowed[tags[r as usize] as usize]).count() as u64;
+    let kind_only: u64 = (0..n)
+      .into_par_iter()
+      .filter(|&r| tags.get(r).is_some_and(|tag| allowed[tag as usize]))
+      .count() as u64;
     println!("kind gate only: {:?} ({kind_only} pass)", t.elapsed());
 
     let t = std::time::Instant::now();
     let survivors: Vec<u64> = (0..n)
       .into_par_iter()
       .filter(|&r| {
-        allowed[tags[r as usize] as usize]
+        tags.get(r).is_some_and(|tag| allowed[tag as usize])
           && !kg
             .in_edge_types_of(NodeId::new(r))
             .iter()

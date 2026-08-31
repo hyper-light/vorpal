@@ -90,17 +90,62 @@ fn bucketed_pack_end_to_end() {
   // Process-global by design: this file is its own test binary with exactly one test.
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
 
-  // 1+2: scratch determinism and the artifact set.
+  // 1+2: scratch determinism and the artifact set — the pack family (P4.1) AND the node
+  // store family (P4.2).
   let out_a = base.join("index-a");
   let report = build_index(&src, &out_a).unwrap();
   assert!(!report.reused);
   assert_eq!(report.indexed, 25, "12 rs + 12 py + 1 go");
   let gen_a = live(&out_a);
-  assert!(gen_a.join("products/toc.bin").is_file(), "v2 TOC missing");
+  assert!(gen_a.join("products/toc.bin").is_file(), "v2 pack TOC missing");
   assert!(!gen_a.join("products.pack").exists(), "flat pack must not ride along");
   assert!(!gen_a.join("products.idx").exists(), "flat sidecar must not ride along");
+  assert!(gen_a.join("nodes/toc.bin").is_file(), "v2 node-store TOC missing");
+  assert!(!gen_a.join("nodes.vseg").exists(), "flat node segment must not ride along");
+  assert!(!gen_a.join("strings.heap").exists(), "flat heap must not ride along");
   let buckets = bucket_stats(&gen_a);
   assert_eq!(buckets.len(), 16, "25 files land in the clamped minimum bucket count");
+  let node_slabs = fs::read_dir(gen_a.join("nodes"))
+    .unwrap()
+    .flatten()
+    .filter(|e| e.file_name().to_string_lossy().ends_with(".vseg"))
+    .count();
+  assert_eq!(node_slabs, 16, "one node slab per bucket");
+
+  // Cross-format truth oracle: a flat and a bucketed generation of the SAME tree describe
+  // the same graph — every node's every field, compared as canonical sets (dense ids
+  // legitimately differ: bucket-major vs path order).
+  unsafe { std::env::set_var("VORPAL_FORMAT", "") };
+  let out_flat = base.join("index-flat");
+  build_index(&src, &out_flat).unwrap();
+  unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
+  let node_universe = |root: &std::path::Path| -> Vec<String> {
+    let kg = vorpal_kg::Kg::load(root).unwrap();
+    let mut rows: Vec<String> = (0..kg.node_count() as u64)
+      .map(|id| {
+        let view = kg.node(vorpal_kg::NodeId::new(id)).expect("dense id resolves");
+        format!(
+          "{:?}|{}|{}|{}|{:?}|{}|{}|{:?}|{:?}",
+          view.kind,
+          view.name,
+          view.path,
+          view.signature,
+          view.span,
+          view.content_hash,
+          view.exported,
+          view.external_id,
+          kg.scc_size(vorpal_kg::NodeId::new(id)),
+        )
+      })
+      .collect();
+    rows.sort_unstable();
+    rows
+  };
+  assert_eq!(
+    node_universe(&out_flat),
+    node_universe(&out_a),
+    "flat and bucketed generations must describe the identical node universe"
+  );
   let out_b = base.join("index-b");
   build_index(&src, &out_b).unwrap();
   assert_eq!(
@@ -147,6 +192,34 @@ fn bucketed_pack_end_to_end() {
     vec![format!("{expected_bucket:04}.pack")],
     "an edit must rewrite exactly the edited file's bucket and hard-link the rest"
   );
+  // The node store obeys the same law (P4.2): exactly the edited file's node/heap slabs
+  // rewrite; every other bucket's slabs hard-link (this fixture has no cross-file cycles,
+  // so no scc_size ripple).
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    let mut node_rewritten: Vec<String> = Vec::new();
+    for entry in fs::read_dir(gen_a.join("nodes")).unwrap().flatten() {
+      let name = entry.file_name().into_string().unwrap();
+      if !(name.ends_with(".vseg") || name.ends_with(".heap")) {
+        continue;
+      }
+      let prior_ino = entry.metadata().unwrap().ino();
+      let new_ino = fs::metadata(gen_a2.join("nodes").join(&name)).unwrap().ino();
+      if prior_ino != new_ino {
+        node_rewritten.push(name);
+      }
+    }
+    node_rewritten.sort();
+    assert_eq!(
+      node_rewritten,
+      vec![
+        format!("{expected_bucket:04}.heap"),
+        format!("{expected_bucket:04}.vseg"),
+      ],
+      "an edit must rewrite exactly the edited file's node slabs and hard-link the rest"
+    );
+  }
   let out_c = base.join("index-c");
   build_index(&src, &out_c).unwrap();
   assert_eq!(
@@ -169,6 +242,7 @@ fn bucketed_pack_end_to_end() {
     (vorpal_kg::identity::FileKey::of(touched_rel).0 & (before.len() as u64 - 1)) as u32;
   #[cfg(unix)]
   {
+    use std::os::unix::fs::MetadataExt;
     let after_edit: std::collections::HashMap<String, (u64, u64)> = bucket_stats(&gen_a2)
       .into_iter()
       .map(|(name, ino, len)| (name, (ino, len)))
@@ -184,6 +258,15 @@ fn bucketed_pack_end_to_end() {
       vec![format!("{touched_bucket:04}.pack")],
       "the cutoff must copy-patch exactly the touched file's bucket and link the rest"
     );
+    // The node store never carries stamps: the cutoff hard-links EVERY node slab + TOC.
+    for entry in fs::read_dir(gen_a2.join("nodes")).unwrap().flatten() {
+      let name = entry.file_name().into_string().unwrap();
+      assert_eq!(
+        entry.metadata().unwrap().ino(),
+        fs::metadata(gen_a3.join("nodes").join(&name)).unwrap().ino(),
+        "cutoff must hard-link node-store member {name}"
+      );
+    }
   }
   let out_d = base.join("index-d");
   build_index(&src, &out_d).unwrap();
@@ -200,6 +283,8 @@ fn bucketed_pack_end_to_end() {
   let gen_e = live(&out_e);
   assert!(gen_e.join("products.pack").is_file(), "flat build still writes v1");
   assert!(!gen_e.join("products").exists(), "no bucketed members in a flat generation");
+  assert!(gen_e.join("nodes.vseg").is_file(), "flat build still writes the flat node store");
+  assert!(!gen_e.join("nodes").exists(), "no bucketed node members in a flat generation");
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
   // A structural edit (span-shifting), so the stamp-only cutoff — which correctly carries
   // the PRIOR's pack format byte-for-byte — cannot swallow the migration build.
@@ -217,6 +302,8 @@ fn bucketed_pack_end_to_end() {
   let gen_e2 = live(&out_e);
   assert!(gen_e2.join("products/toc.bin").is_file(), "migration publishes v2");
   assert!(!gen_e2.join("products.pack").exists());
+  assert!(gen_e2.join("nodes/toc.bin").is_file(), "migration publishes the v2 node store");
+  assert!(!gen_e2.join("nodes.vseg").exists());
   let out_f = base.join("index-f");
   build_index(&src, &out_f).unwrap();
   assert_eq!(

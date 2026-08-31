@@ -348,6 +348,9 @@ pub struct PendingPersist {
   flows: Vec<vorpal_kg::DataflowRow>,
   manifest: Manifest,
   kg: Arc<Kg>,
+  /// The node-store layout this generation persists under (P4.2) — decided by the build
+  /// that deferred here, carried so the background tail writes the same format.
+  layout: vorpal_kg::SegmentLayout,
   /// The still-running pack consolidation from the build that deferred here — joined
   /// before the manifest/commit, so the deferred tail overlaps it exactly like the
   /// synchronous tail does.
@@ -367,12 +370,13 @@ impl PendingPersist {
       flows,
       manifest,
       kg,
+      layout,
       pack,
     } = self;
     let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
       let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
       let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
-      let kg_result = kg.save(&staging);
+      let kg_result = kg.save_with(&staging, &layout);
       (
         evidence_task.join().expect("evidence saver panicked"),
         dataflow_task.join().expect("dataflow saver panicked"),
@@ -713,14 +717,17 @@ fn build_index_inner(
   let loose: HashSet<OsString> = fs::read_dir(&products_dir)
     .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
     .unwrap_or_default();
+  // The generation's storage format, decided once: flat until the flip, bucketed under
+  // VORPAL_FORMAT=next (the Phase-4 compat posture). It governs the pack layout, the node
+  // store layout, AND the canonical ingest order below — one decision, never re-read.
+  let format = vorpal_ingest::PackFormat::from_env();
   // The writer builds the new generation's pack in staging, copying reused bodies out of the
-  // prior generation's mapping — the prior pack is never touched. Format per the Phase-4
-  // compat posture: flat until the flip, bucketed under VORPAL_FORMAT=next.
+  // prior generation's mapping — the prior pack is never touched.
   let pack_writer = PackWriter::new(
     &staging,
     pack_reader.clone(),
     Some(tree_root.clone()),
-    vorpal_ingest::PackFormat::from_env(),
+    format,
   );
   let pack_sink = pack_writer.sink();
   let live_paths: Vec<String> = manifest.entries().iter().map(|e| e.path.clone()).collect();
@@ -743,10 +750,35 @@ fn build_index_inner(
   };
   let spill_path = staging.join(".refs.spill");
   let heap_stream = staging.join("strings.heap.tmp");
+  // P4.2: under the bucketed format the canonical order is BUCKET-MAJOR — and the batch
+  // pipeline's canonical order IS its ingest order, so the stream walks a permuted view of
+  // the entries. The manifest FILE stays path-sorted: every diff (two-pointer, racy-window,
+  // whole-tree fast path) keeps its sort invariant.
+  let bucket_major: Option<Vec<vorpal_ingest::FileStat>> = match format {
+    vorpal_ingest::PackFormat::Bucketed => {
+      let buckets = vorpal_kg::identity::bucket_count_for(manifest.entries().len());
+      let mut entries = manifest.entries().to_vec();
+      entries.sort_by(|a, b| {
+        let ka = vorpal_kg::identity::bucket_of(
+          vorpal_kg::identity::tree_relative(&a.path, &tree_root),
+          buckets,
+        );
+        let kb = vorpal_kg::identity::bucket_of(
+          vorpal_kg::identity::tree_relative(&b.path, &tree_root),
+          buckets,
+        );
+        ka.cmp(&kb).then_with(|| a.path.cmp(&b.path))
+      });
+      Some(entries)
+    }
+    vorpal_ingest::PackFormat::Flat => None,
+  };
+  let stream_entries: &[vorpal_ingest::FileStat] =
+    bucket_major.as_deref().unwrap_or(manifest.entries());
   vorpal_kg::phase_stamp("stream: start");
   let stream_result = stream_apply_spilled(
     &interner,
-    manifest.entries(),
+    stream_entries,
     stream_budget_bytes(),
     &spill_path,
     Some(&heap_stream),
@@ -1025,6 +1057,16 @@ fn build_index_inner(
     request_edges: request_report.edges,
     request_note: request_report.note,
   };
+  // The node-store layout this generation persists under — same format decision as the
+  // pack, with the bucket law's one input (live file count) pinned from the manifest.
+  let layout = match format {
+    vorpal_ingest::PackFormat::Flat => vorpal_kg::SegmentLayout::Flat,
+    vorpal_ingest::PackFormat::Bucketed => vorpal_kg::SegmentLayout::Bucketed {
+      tree_root: tree_root.clone(),
+      prior: Some(prior.clone()),
+      live_files: manifest.entries().len(),
+    },
+  };
   if let Some(slots) = live {
     // Deferred persistence: the sealed graph is answer-complete NOW — hand it to the daemon
     // and move the artifact writes + content-addressed commit onto its background thread.
@@ -1044,6 +1086,7 @@ fn build_index_inner(
       flows,
       manifest,
       kg,
+      layout,
       pack: Some(pack_thread),
     });
     return Ok(report);
@@ -1061,7 +1104,7 @@ fn build_index_inner(
   let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
     let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
     let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
-    let kg_result = kg.save(&staging);
+    let kg_result = kg.save_with(&staging, &layout);
     (
       evidence_task.join().map_err(|_| io::Error::other("evidence saver panicked")),
       dataflow_task.join().map_err(|_| io::Error::other("dataflow saver panicked")),
@@ -1093,27 +1136,32 @@ pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
   "strings.heap",
 ];
 
-/// Whether `name` is a legal generation-artifact name: the fixed flat set, or a bucketed
-/// pack member. The import allowlist and every sweep share this single predicate.
+/// Whether `name` is a legal generation-artifact name: the fixed flat set, a bucketed
+/// pack member (P4.1), or a bucketed node-store member (P4.2). The import allowlist and
+/// every sweep share this single predicate.
 pub(crate) fn is_generation_artifact_name(name: &str) -> bool {
-  GENERATION_ARTIFACTS.contains(&name) || vorpal_ingest::is_pack_member(name)
+  GENERATION_ARTIFACTS.contains(&name)
+    || vorpal_ingest::is_pack_member(name)
+    || vorpal_kg::is_nodes_member(name)
 }
 
 /// Every artifact name this generation actually carries, in fixed order: the flat list
-/// (missing members skipped by callers that open them), then the bucketed pack's members
-/// (`products/<k>.pack` + `products/toc.bin`) sorted by name. The bucketed pack (P4.1) has
-/// a corpus-dependent file count, so identity and staging walk THIS, never the const alone.
+/// (missing members skipped by callers that open them), then each bucketed family's
+/// members sorted by name (`products/…`, then `nodes/…`). The bucketed families have
+/// corpus-dependent file counts, so identity and staging walk THIS, never the const alone.
 pub(crate) fn generation_artifact_names(dir: &Path) -> Vec<String> {
   let mut names: Vec<String> = GENERATION_ARTIFACTS.iter().map(|s| s.to_string()).collect();
-  if let Ok(dirents) = fs::read_dir(dir.join(vorpal_ingest::PACK_DIR)) {
-    let mut members: Vec<String> = dirents
-      .flatten()
-      .filter_map(|e| e.file_name().into_string().ok())
-      .map(|file| format!("{}/{file}", vorpal_ingest::PACK_DIR))
-      .filter(|name| vorpal_ingest::is_pack_member(name))
-      .collect();
-    members.sort_unstable();
-    names.extend(members);
+  for family in [vorpal_ingest::PACK_DIR, vorpal_kg::NODES_DIR] {
+    if let Ok(dirents) = fs::read_dir(dir.join(family)) {
+      let mut members: Vec<String> = dirents
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .map(|file| format!("{family}/{file}"))
+        .filter(|name| is_generation_artifact_name(name))
+        .collect();
+      members.sort_unstable();
+      names.extend(members);
+    }
   }
   names
 }
@@ -1320,18 +1368,20 @@ fn try_stamp_only_cutoff(
   {
     return Ok(None);
   }
-  const CARRIED: [&str; 6] = [
-    "nodes.vseg",
-    "strings.heap",
-    "graph.bin",
-    "evidence.bin",
-    "dataflow.bin",
-    "names.idx",
-  ];
+  const CARRIED: [&str; 4] = ["graph.bin", "evidence.bin", "dataflow.bin", "names.idx"];
   for artifact in CARRIED.iter().chain(&["manifest.bin"]) {
     if !prior.join(artifact).exists() {
       return Ok(None);
     }
+  }
+  // The node store is a format-dependent family: the flat pair, or the bucketed members
+  // (nodes/toc.bin present ⇒ every member it names is verified by the loader; the cutoff
+  // links the whole directory verbatim — stamps never live in the node store).
+  let nodes_bucketed = prior.join(vorpal_kg::NODES_TOC).is_file();
+  if !nodes_bucketed
+    && (!prior.join("nodes.vseg").exists() || !prior.join("strings.heap").exists())
+  {
+    return Ok(None);
   }
   let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
     return Ok(None);
@@ -1405,6 +1455,32 @@ fn try_stamp_only_cutoff(
     let (from, to) = (prior.join(artifact), staging.join(artifact));
     if fs::hard_link(&from, &to).is_err() {
       fs::copy(&from, &to)?;
+    }
+  }
+  // Carry the node store byte-identically: the flat pair, or every bucketed member
+  // (hard-links — the cutoff never patches node bytes, stamps live in the manifest and
+  // the pack).
+  if nodes_bucketed {
+    fs::create_dir_all(staging.join(vorpal_kg::NODES_DIR))?;
+    for entry in fs::read_dir(prior.join(vorpal_kg::NODES_DIR))?.flatten() {
+      let Ok(file) = entry.file_name().into_string() else {
+        continue;
+      };
+      let member = format!("{}/{file}", vorpal_kg::NODES_DIR);
+      if !vorpal_kg::is_nodes_member(&member) {
+        continue;
+      }
+      let (from, to) = (prior.join(&member), staging.join(&member));
+      if fs::hard_link(&from, &to).is_err() {
+        fs::copy(&from, &to)?;
+      }
+    }
+  } else {
+    for artifact in ["nodes.vseg", "strings.heap"] {
+      let (from, to) = (prior.join(artifact), staging.join(artifact));
+      if fs::hard_link(&from, &to).is_err() {
+        fs::copy(&from, &to)?;
+      }
     }
   }
   if bucketed {
@@ -1521,9 +1597,10 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // so the generation holds exactly its artifacts.
   for entry in fs::read_dir(&staging)?.flatten() {
     let name = entry.file_name();
-    // The bucketed pack (P4.1) is the one artifact that is a directory; its members are
-    // swept by the predicate below.
+    // The bucketed families (pack, node store) are the artifacts that are directories;
+    // their members are swept by the predicate below.
     let keep = name.as_os_str() == vorpal_ingest::PACK_DIR
+      || name.as_os_str() == vorpal_kg::NODES_DIR
       || GENERATION_ARTIFACTS
         .iter()
         .any(|artifact| name.as_os_str() == *artifact);
@@ -1536,14 +1613,16 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       };
     }
   }
-  if let Ok(dirents) = fs::read_dir(staging.join(vorpal_ingest::PACK_DIR)) {
-    for entry in dirents.flatten() {
-      let member = entry
-        .file_name()
-        .into_string()
-        .map(|file| format!("{}/{file}", vorpal_ingest::PACK_DIR));
-      if !member.as_deref().is_ok_and(vorpal_ingest::is_pack_member) {
-        let _ = fs::remove_file(entry.path());
+  for family in [vorpal_ingest::PACK_DIR, vorpal_kg::NODES_DIR] {
+    if let Ok(dirents) = fs::read_dir(staging.join(family)) {
+      for entry in dirents.flatten() {
+        let member = entry
+          .file_name()
+          .into_string()
+          .map(|file| format!("{family}/{file}"));
+        if !member.as_deref().is_ok_and(is_generation_artifact_name) {
+          let _ = fs::remove_file(entry.path());
+        }
       }
     }
   }
@@ -1672,7 +1751,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
 /// loaded mapping (never re-reading `nodes.vseg`) pins every freshness decision to the
 /// generation actually in hand.
 pub(crate) fn stamp_of(kg: &Kg) -> u64 {
-  xxhash_rust::xxh3::xxh3_64(kg.node_segment_bytes())
+  kg.node_segment_stamp()
 }
 
 /// The vector tier's row set: every non-Import node id, ascending. Import nodes are wiring,

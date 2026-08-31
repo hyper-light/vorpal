@@ -72,11 +72,28 @@ enum PendingScope {
 }
 
 /// Retained pipeline state: everything an incremental re-link needs, minus the interner.
+/// The canonical block order the seal renumbers by — path-sorted (the flat format) or
+/// bucket-major (P4.2, `VORPAL_FORMAT=next`). ONE comparator drives blocks, the interned
+/// order, every ledger join, and the edge-log law, so scratch ≡ incremental holds within
+/// each format; the two formats legitimately differ (ids are format-internal).
+#[derive(Debug, Clone, Default)]
+pub enum CanonicalOrder {
+  #[default]
+  Path,
+  BucketMajor {
+    /// Canonical tree root — bucket membership hashes tree-relative spellings.
+    tree_root: String,
+  },
+}
+
 pub struct RetainedIndex {
   writer: KgWriter,
   store: RefStore,
-  /// Path → footprint, iterated in path order — the canonical block order every link uses.
+  /// Path → footprint. Point lookups only; every order-sensitive consumer goes through
+  /// [`RetainedIndex::canonical_files`] (the format-aware comparator).
   files: BTreeMap<String, FileBlock>,
+  /// The canonical order this tier seals in — set at boot from the generation's format.
+  canonical: CanonicalOrder,
   /// Path bits → that file's resolution bucket (see [`FileResolution`]).
   resolution: HashMap<u32, FileResolution>,
   /// Name bits → files whose references mention that name (resolved or not). Stale entries
@@ -137,6 +154,7 @@ impl RetainedIndex {
       writer: KgWriter::new(),
       store: RefStore::create(store_path)?,
       files: BTreeMap::new(),
+      canonical: CanonicalOrder::default(),
       resolution: HashMap::new(),
       postings: HashMap::new(),
       repair: HashMap::new(),
@@ -165,6 +183,7 @@ impl RetainedIndex {
       writer: KgWriter::new(),
       store: RefStore::create(store_path)?,
       files: BTreeMap::new(),
+      canonical: CanonicalOrder::default(),
       resolution: HashMap::new(),
       postings: HashMap::new(),
       repair: HashMap::new(),
@@ -568,6 +587,29 @@ impl RetainedIndex {
     self.files.len()
   }
 
+  /// Adopt the canonical order this tier seals in — the daemon sets it at boot from the
+  /// generation's format, BEFORE the first link.
+  pub fn set_canonical_order(&mut self, canonical: CanonicalOrder) {
+    self.canonical = canonical;
+  }
+
+  /// The live files in canonical order: the BTreeMap's path order, re-sorted stably by
+  /// bucket under the bucket-major format ((bucket, path) exactly — stable sort keeps the
+  /// path order within each bucket).
+  fn canonical_files(&self) -> Vec<(&String, &FileBlock)> {
+    let mut out: Vec<(&String, &FileBlock)> = self.files.iter().collect();
+    if let CanonicalOrder::BucketMajor { tree_root } = &self.canonical {
+      let buckets = vorpal_kg::identity::bucket_count_for(out.len());
+      out.sort_by_key(|(path, _)| {
+        vorpal_kg::identity::bucket_of(
+          vorpal_kg::identity::tree_relative(path, tree_root),
+          buckets,
+        )
+      });
+    }
+    out
+  }
+
   /// Dead fraction of the writer's rows — the caller's compaction (full-rebuild) trigger.
   pub fn dead_row_fraction(&self) -> f64 {
     let total = self.writer.node_count();
@@ -627,14 +669,16 @@ impl RetainedIndex {
     Vec<vorpal_kg::DataflowRow>,
   )> {
     self.writer.truncate_edges(self.watermark);
-    let blocks: Vec<FileBlock> = self.files.values().cloned().collect();
-    // Canonical file order for every order-sensitive consumer below: the same path-sorted
-    // sequence a from-scratch build processes.
-    let order: Vec<u32> = self
-      .files
-      .keys()
-      .map(|path| interner.intern(path).to_bits())
+    // Canonical file order for every order-sensitive consumer below: the same sequence a
+    // from-scratch build under the same format processes (path-sorted, or bucket-major
+    // under the bucketed format).
+    let ordered = self.canonical_files();
+    let blocks: Vec<FileBlock> = ordered.iter().map(|(_, block)| (*block).clone()).collect();
+    let order: Vec<u32> = ordered
+      .iter()
+      .map(|(path, _)| interner.intern(path).to_bits())
       .collect();
+    drop(ordered);
     // Scope decision (SUBSECOND.md dirty-bucket rederive): the applies since the last link
     // recorded which candidate sets changed; expand through the reference postings to every
     // file whose resolution could differ, and re-resolve ONLY those buckets. Everything

@@ -143,15 +143,22 @@ impl SidePlan {
     }
     use rayon::prelude::*;
     let count = kg.node_count() as u32;
-    // Kind-column prefilter when the segment carries the dense tag column.
-    if let (false, Some(tags)) = (self.kinds.is_empty(), kg.kind_tags()) {
+    // Kind-column prefilter when the slabs carry the dense tag column: contiguous stripes
+    // in id order (one for flat graphs, one per bucket for bucketed generations).
+    if let (false, Some(stripes)) = (self.kinds.is_empty(), kg.kind_tag_stripes()) {
       let wanted: Vec<u8> = self.kinds.iter().map(|k| k.tag()).collect();
-      return (0..count)
+      let wanted = &wanted;
+      // Nested parallel iterators flatten without materializing candidates; indexed
+      // combinators keep ascending-id order, same as the flat scan this replaces.
+      return stripes
         .into_par_iter()
-        .filter(|&id| {
-          tags.get(id as usize).is_some_and(|t| wanted.contains(t))
-            && kg.node(NodeId::new(id as u64)).is_some_and(|v| self.matches(id, &v))
+        .flat_map(|(base, tags)| {
+          (0..tags.len())
+            .into_par_iter()
+            .filter(move |&row| wanted.contains(&tags[row]))
+            .map(move |row| (base + row as u64) as u32)
         })
+        .filter(|&id| kg.node(NodeId::new(id as u64)).is_some_and(|v| self.matches(id, &v)))
         .collect();
     }
     (0..count)

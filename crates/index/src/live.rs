@@ -192,6 +192,17 @@ impl LiveOverlay {
     let store_path = index_dir.join(format!(".overlay-{}.refs", std::process::id()));
     let mut index = RetainedIndex::empty(&store_path)
       .map_err(|err| format!("overlay: ref store create failed: {err}"))?;
+    // The tier seals in the generation's canonical order: bucket-major under the bucketed
+    // format, path order otherwise — set BEFORE the first link so the retained-persist pin
+    // (daemon generation == scratch generation) holds under either format.
+    if matches!(
+      vorpal_ingest::PackFormat::from_env(),
+      vorpal_ingest::PackFormat::Bucketed
+    ) {
+      index.set_canonical_order(vorpal_ingest::CanonicalOrder::BucketMajor {
+        tree_root: overlay_root.clone(),
+      });
+    }
     // Batched parallel replay: decode+ingest fan out per batch, absorbs run serially in
     // manifest order — the same bytes a serial pass produces, minutes faster at scale.
     const BATCH: usize = 1024;
@@ -585,6 +596,17 @@ impl ServedPersist {
       crate::staging_nonce()
     ));
     fs::create_dir_all(&staging).map_err(|err| format!("served persist: staging: {err}"))?;
+    // One format decision for the whole persisted generation: pack layout, node-store
+    // layout, both from the same read.
+    let format = vorpal_ingest::PackFormat::from_env();
+    let layout = match format {
+      vorpal_ingest::PackFormat::Flat => vorpal_kg::SegmentLayout::Flat,
+      vorpal_ingest::PackFormat::Bucketed => vorpal_kg::SegmentLayout::Bucketed {
+        tree_root: tree_root.clone(),
+        prior: Some(prior.clone()),
+        live_files: manifest.entries().len(),
+      },
+    };
     // Three independent artifact groups write concurrently; the manifest stays last (the
     // commit point), exactly like the pipeline's tail.
     let (pack_result, evidence_result, dataflow_result, kg_result) =
@@ -595,7 +617,7 @@ impl ServedPersist {
             &staging,
             reader,
             Some(tree_root.clone()),
-            vorpal_ingest::PackFormat::from_env(),
+            format,
           );
           let sink = writer.sink();
           for (path, body) in new_products {
@@ -608,7 +630,7 @@ impl ServedPersist {
         });
         let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
         let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
-        let kg_result = kg.save(&staging);
+        let kg_result = kg.save_with(&staging, &layout);
         (
           pack_task.join().expect("pack writer panicked"),
           evidence_task.join().expect("evidence saver panicked"),

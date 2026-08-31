@@ -46,6 +46,33 @@ pub fn tree_relative<'a>(path: &'a str, canonical_root: &str) -> &'a str {
   stripped.strip_prefix('/').unwrap_or(stripped)
 }
 
+// Bucket-count law (P4.1/P4.2): B = clamp(next_pow2(files / BUCKET_TARGET_FILES), MIN,
+// MAX), a pure function of the live file count — stamping B at creation would make an
+// incremental build that grows past a threshold diverge byte-wise from a scratch build of
+// the same tree. ONE home for the law: the product pack and the node/heap slabs must
+// bucket identically or "one edit, one bucket" stops composing across artifacts.
+// Constants from the recorded two-scale sweep (docs/wip/SUBSECOND.md §P4.1 — linux kernel
+// 76 868 files and vorpal repo ~2k): kernel stamp-cutoff wall 0.43 s at B=256, 0.54 s at
+// B=1024, 1.24 s at B=4096 (past ~100 files/bucket the per-bucket link/mmap overhead
+// beats byte savings), so the target lands the kernel exactly on its measured optimum:
+// 76 868 / 512 → next_pow2(150) = 256.
+const BUCKET_TARGET_FILES: usize = 512;
+const BUCKET_MIN: u32 = 16;
+/// Also the naming bound: `{:04}` bucket file names sort numerically only below 10 000.
+pub const BUCKET_MAX: u32 = 4096;
+
+/// The bucket count for a corpus of `files` live files. Pure, monotonic, power-of-two.
+pub fn bucket_count_for(files: usize) -> u32 {
+  let want = files.div_ceil(BUCKET_TARGET_FILES).max(1) as u64;
+  let pow2 = want.next_power_of_two().min(u64::from(BUCKET_MAX)) as u32;
+  pow2.clamp(BUCKET_MIN, BUCKET_MAX)
+}
+
+/// The bucket a tree-relative path lands in, for a power-of-two bucket count.
+pub fn bucket_of(tree_relative_path: &str, buckets: u32) -> u32 {
+  (FileKey::of(tree_relative_path).0 & u64::from(buckets - 1)) as u32
+}
+
 /// Build-time collision gate over the manifest's file set: every file's key must be
 /// unique. O(files); runs on every build the way the u32 ceilings do — the bucketed
 /// format keys storage by these values, so a collision must stop the build with both
@@ -90,6 +117,29 @@ mod tests {
       FileKey::of(tree_relative("/other/mount/src/lib.rs", "/other/mount")),
       "identity is a function of the tree, never the mount point"
     );
+  }
+
+  #[test]
+  fn bucket_count_law_is_pure_pow2_clamped() {
+    assert_eq!(bucket_count_for(0), bucket_count_for(1), "clamped floor");
+    let kernel_scale = 76_868usize;
+    let b = bucket_count_for(kernel_scale);
+    assert_eq!(b, 256, "the kernel lands on its measured-optimum bucket count");
+    // Monotonic in file count, power-of-two, bounded.
+    let mut prev = 0;
+    for files in [0usize, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000] {
+      let b = bucket_count_for(files);
+      assert!(b.is_power_of_two(), "not a power of two at {files}");
+      assert!(b >= prev, "bucket law not monotonic at {files}");
+      prev = b;
+    }
+    assert_eq!(bucket_count_for(usize::MAX), BUCKET_MAX);
+    // The naming bound holds: {:04} names sort numerically for every legal bucket index.
+    assert_eq!(format!("{:04}", BUCKET_MAX - 1).len(), 4);
+    // Assignment stays inside the count.
+    for buckets in [16u32, 256, 4096] {
+      assert!(bucket_of("mm/slab_common.c", buckets) < buckets);
+    }
   }
 
   #[test]

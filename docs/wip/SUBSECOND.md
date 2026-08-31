@@ -583,6 +583,95 @@ all green; pack unit ladder, pack_v2 end-to-end, live_differential_v2 daemon pin
 identity A/B). The v1 read path retires after one release per the standing rule; the flip
 itself (default VORPAL_FORMAT) waits for P4.2+ so the whole revolution moves together.
 
+#### P4.2 resolved design (recon 2026-08-31, from code facts)
+
+Targets the next two monoliths: nodes.vseg (179 MB kernel) + strings.heap (154 MB),
+rewritten in full on every edit today. Under `VORPAL_FORMAT=next` they become
+`nodes/<k>.vseg` + `nodes/<k>.heap` + `nodes/toc.bin` (one TOC row per bucket: rows,
+vseg len/digest, heap len/digest — same bucket law and file_key as the pack).
+
+- **Node slab bytes are id-free.** The 14 node columns are per-file data plus one derived
+  size column (`scc_size`); dense ids live only in graph.bin/names.idx/evidence. So under
+  bucket-major canonical order, adding a file moves OTHER buckets' id bases (TOC prefix
+  sums) without touching their slab bytes — the property that makes per-bucket carry
+  possible at all. `scc_size` stays in-slab; carry eligibility hash-compares the built
+  bucket against the prior TOC digest, so a cross-file cycle change honestly rewrites the
+  buckets it touched (exactness over dirty-set assumptions).
+- **Bucket-major canonical order ships here** (locked P4 decision 3). The batch pipeline
+  gets it for free: ingest order IS canonical order, so the stream walks manifest entries
+  through a (bucket, tree-relative path) permutation under v2 — the manifest FILE stays
+  path-sorted (two-pointer diffs, racy windows untouched). The retained tier's canonical
+  order centralizes in one comparator (`canonical_blocks()`), which the ledgers, chains,
+  similar inverse, and edge-log law all follow — scratch ≡ incremental holds WITHIN each
+  format; ambiguous-pick winners may move once at the migration (the pick law is
+  run-order-relative by design; answer oracles adjudicate).
+- **Split-at-save, not split-at-seal.** The seal keeps building one global segment + heap
+  (zero change to the serve path); `Kg::save` under v2 derives bucket boundaries from the
+  sealed columns, slices per bucket, rebases the three heap-offset columns to LOCAL,
+  builds per-bucket segments in parallel (`SegmentBuilder::new(0)` — no id base in slab
+  bytes), hash-compares against the prior TOC, hard-links unchanged / writes changed.
+  Load maps every slab zero-copy with local offsets — NO rebasing at load — through the
+  already-multi-segment `SegmentDirectory` (§9.2 was built for this).
+- **Kg goes multi-segment uniformly**: `segments/cols/heaps` become parallel vectors
+  (length 1 for v1 and for sealed in-RAM graphs — the directory-routed accessors are
+  shared). The whole-graph stripe APIs (`kind_tags`, `content_hashes`) become per-segment
+  stripe iterators — scans stay contiguous within each slab; the six call sites convert.
+  The ANN/postings freshness stamp becomes the ordered xxh3 fold over slab bytes
+  (bit-identical to today's value for single-segment graphs).
+- Gate: NodeView/name-index equality oracle between a v1 and v2 generation of the same
+  tree (every id, every field), nodes/ single-bucket rewrite inode proof, determinism ×2,
+  cutoff links all node slabs, daemon pin (live_differential_v2), kernel identity A/B.
+
+#### P4.2 results (2026-08-31)
+
+All gates green. Kernel (76 868 files, B=256 → 513 node-store members):
+
+- **One-file edit: the node store rewrites 1.20 MB and hard-links 510 of 512 slabs**
+  (the edited bucket's vseg+heap pair) — 333 MB of per-edit writes become ~1.2 MB.
+  Cumulative with P4.1: real write bytes per full edit drop from ~1.6 GB (v1) to
+  ~530 MB (evidence 362 + graph 154 + names 46 + manifest — P4.3's lane) + ~8 MB of
+  bucketed slabs and TOCs.
+- Identity A/B PASS through edit + revert (`gen/32798d84…` from both lanes); the
+  cross-format truth oracle holds (flat and bucketed generations of the same tree
+  describe the identical node universe, every field + scc, as canonical sets).
+- Walls: full edit 1.76/1.85 s, cutoff 0.51/0.37 s — same classes as P4.1 (APFS;
+  the remaining monoliths and the content-id rehash dominate). Cold: tight alternating
+  pairs after settle read flat 7.44/7.43/7.41 s vs v2 7.52/7.60/7.53 s — the
+  split-at-save (256 parallel slab builds + digests) costs **+0.12 s (+1.6%)** at
+  kernel scale. (Two earlier lone samples at 8.7–15.7 s were ambient — the concurrent
+  editor session at 160% CPU; alternation bounds it.)
+- Both daemon differentials green: the retained tier seals in the SAME bucket-major
+  order through one comparator, and its background committer lands the scratch
+  generation id under either format.
+
+#### P4.3 resolved design (recon 2026-08-31 — the decomposition's tension, decided)
+
+Targets the remaining monoliths: evidence.bin (362 MB kernel), graph.bin (154 MB),
+dataflow.bin, names.idx (46 MB).
+
+- **Endpoint coding: explicit `(bucket u16, local u32)` — 6 bytes, no packing.** A packed
+  u32 (12-bit bucket | 20-bit ordinal) would put a silent 1M-ordinal ceiling under any
+  generated megafile; explicit fields never error and keep rows FIXED-WIDTH, which the
+  evidence binary-search lookup requires. Evidence rows grow 36 → 38 bytes; `from`
+  drops to a bucket-local ordinal (slabs are per-SOURCE-bucket, so the id base never
+  appears in slab bytes). The alternatives pool entries grow 4 → 6.
+- **Edge truth moves to `edges/<k>.bin`** (per-source-bucket, emission order): the CSR is
+  exactly reconstructible from per-src slab order (Graph::compact is an insertion-stable
+  per-src scatter — the interleaved global log order is not needed at runtime, only each
+  source's restriction of it, which is what a slab stores). 12 B/edge fixed:
+  `[src_local u32][dst_bucket u16][dst_local u32][etype u16]`.
+- **graph.bin becomes a DERIVED CACHE** (the ANN precedent): same bytes, same mmap load
+  when its stamp matches; excluded from the content id; rebuilt from the slabs when
+  stale/missing. Cold opens keep today's zero-cost path; the 154 MB leaves the edit path.
+- **Dirty-slab law = digest comparison, never dirty-set reasoning**: build every slab's
+  bytes (parallel, in-RAM), hash, link-or-write against the prior TOC — the P4.2 carry
+  law verbatim. Position-independence bounds the honest rewrite set: an edit in bucket k
+  rewrites bucket k's slabs plus exactly the buckets whose edges point at ordinals that
+  MOVED inside k (reverse-dependency locality), never everything.
+- names.idx: measured decision at implementation — demote to a stamped derived cache
+  (regeneration law shared with postings) or leave in-identity; 46 MB/edit rides on it.
+- dataflow.bin follows the evidence coding (same row surgery, tiny file).
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

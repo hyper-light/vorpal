@@ -17,7 +17,10 @@ mod kg;
 mod model;
 mod writer;
 
-pub use kg::{Kg, NodeView, SymbolSelector, resolve_index_dir};
+pub use kg::{
+  Kg, NODES_DIR, NODES_TOC, NodeView, SegmentLayout, SymbolSelector, is_nodes_member,
+  resolve_index_dir,
+};
 pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
 pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
 pub use model::SymbolKind;
