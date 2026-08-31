@@ -224,6 +224,13 @@ vorpal query '<text>' --index /tmp/bench-lk
   determinism gate (`cargo test -p vorpal-index --test retrieval_eval -- --nocapture`).
 - Incremental replay: one touched file → exactly one re-extract, N−1 replays
   (`cargo test -p vorpal-index --test incremental_replay`).
+- Multi-phrase AND: parser table (the conjunction syntax claims no ordinary query),
+  hits ⊆ every phrase's pool with the exact min-of-RRF score, phrase-tagged provenance,
+  lexical-support eliminators (nonsense phrase, disjoint families, empty filter), and a
+  double-run determinism gate (`cargo test -p vorpal-index --test multi_phrase`).
+- Engine calibration: `ann.calib` lifecycle (written by warm, stamp-gated, torn-tolerant)
+  and routing neutrality — forged crossovers leave rankings bit-identical
+  (`cargo test -p vorpal-index --test calibration`).
 
 ## Determinism
 
@@ -301,6 +308,86 @@ Findings these baselines pin:
   membership before RRF), not lost answers; only 5/80 were true beam misses. cpython:
   59/60 positions, 60/60 set. Exact-path mean wall: linux 365 ms, cpython 75 ms — the
   fallback cost a search pays when tiers are cold.
+
+## Multi-phrase AND + semantic engine routing (semantic-tier Stage AND)
+
+`"phrase one" AND "phrase two"` (two+ double-quoted phrases joined by literal uppercase
+AND — anything else flows byte-identically through the single-phrase path) runs every
+phrase through the full three-channel pass and intersects **lexical supports**: a phrase
+matches a row iff they share ≥1 real token over the exact embedded surface (name,
+signature, file basename). Vector-space sign cannot define a match — measured twice:
+hashed-bucket collisions hand unrelated rows positive dot products (universal tokens
+like `fn`/`u32` collide a nonsense phrase into near-global "positive support").
+Survivors score min-of-RRF (ties: sum, then id); two depth rungs, both computed —
+shallow = the single-phrase rerank pool, deep = the node count (structurally exhausts
+every channel, so an empty intersection means the FULL supports are disjoint); an empty
+result names its eliminator with per-phrase support sizes and the rung depth.
+
+### Semantic engine cost sweep (beam vs flat exact scan)
+
+```
+cargo run --release -p vorpal-index --features bench-internals --example sweep_semantic -- <idx>
+```
+
+2026-08-30, medians over 8 fixed queries × 3 reps, interleaved; load < 3:
+
+| take | linux beam ms | linux scan ms | cpython beam ms | cpython scan ms |
+|---:|---:|---:|---:|---:|
+| 400 | 1.02 | 90.02 | 0.91 | 7.87 |
+| 800 | 2.15 | 91.53 | 2.05 | 8.79 |
+| 1600 | 4.80 | 91.73 | 5.07 | 10.63 |
+| 3200 | 13.15 | 101.64 | 13.69 | 10.91 |
+| 6400 | 41.57 | 130.12 | 44.53 | 10.86 |
+| 12800 | 150.76 | 208.56 | 153.85 | 9.51 |
+| 25600 | 563.99 | 361.07 | 543.71 | 9.43 |
+| 51200 | 2156.06 | 420.01 | 1712.74 | 9.41 |
+
+(linux n = 2,354,838 semantic rows; cpython n = 133,098. Beam cost is n-independent —
+the two curves overlay; scan cost is ~linear in n. Observed crossovers: linux ~16–20k,
+cpython ~2.8k.)
+
+**No number from this table ships in the product.** Two earlier attempts were rejected
+as magic: a guessed cutover (4096), then sweep-fitted coefficients (machine-specific
+milliseconds frozen into source). The shipped design:
+
+- **Structural floor (proven property, no constants):** `take ≥ node_count` → exhaustive
+  scan — an ANN beam's reach is a graph traversal with no completeness guarantee over
+  the full population; the scan is exact by construction (and faster there, per the
+  table).
+- **Mid-range routing is LEARNED at warm time from the ingested index on the running
+  machine** and persisted as `ann.calib` (32 bytes: magic VCAL, version, node-segment
+  stamp, crossover, xxh3 self-checksum; machine-local like every warm sidecar, excluded
+  from byte-identity gates because it is a measurement; absent/stale/torn → the
+  structural floor). Protocol: 3 seeded probe vectors, median of 3 reps; scan reference
+  at take = 1 (the n-driven floor — real scans cost at least this, so the error
+  direction always prefers the exact engine); beam probes on the ×2 ladder stop at the
+  first width that loses. Learned values on this machine: **linux 16,384; cpython
+  2,048** — independently matching the offline sweep's observed crossovers. Calibration
+  cost, paid once per warm: linux 5.77 s (heal-only re-warm, includes the probes),
+  cpython 0.15 s. Routing is a latency decision only — the exact scan is never worse —
+  pinned by `crates/index/tests/calibration.rs` (forged crossovers leave rankings
+  bit-identical).
+
+### Conjunction latency and behavior (linux index, warm + calibrated, best-of-3)
+
+```
+vorpal search '"socket buffer" AND "alloc"' -k 10 --index <idx>
+```
+
+| Query | wall | note |
+|---|---|---|
+| `socket buffer alloc` (single, k=10) | 0.03 s | unchanged |
+| `socket buffer alloc` (single, k=2000) | 0.30 s | mid-range → calibrated exact-scan route |
+| `"socket buffer" AND "alloc"` | 0.77 s | deep rung (shallow supports disjoint at pool 50) |
+| `"socket buffer" AND "alloc" AND "packet"` | 1.08 s | eliminator: pools 16500, 13483, 4860 — no kernel row carries all three vocabularies (`skb` ≠ "socket buffer" lexically; that equivalence is Stage 1's job) |
+| `"socket buffer" AND "zzyzxqv nonexistent"` | 0.72 s | eliminator: pools 16500, 11 (11 rows genuinely contain "nonexistent") |
+| `"mutex lock" AND "interruptible"` | — | `mutex_lock_interruptible` at rank 0 |
+
+The deep rung's cost fell 4.0 s → 0.77 s (2-phrase) from two exact-preserving fixes,
+both output-identical by construction: the scan's per-chunk top-set skips its sorted
+insert when the cap cannot bind (`take ≥ chunk len` — O(len²) memmove → linear;
+crates/ann/src/scan.rs), and exhaustive candidates skip the rerank (the scan already
+returns the rerank's exact `(dist, id)` total order).
 
 ## History (earlier passes, kept for the record)
 

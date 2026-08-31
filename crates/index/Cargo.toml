@@ -41,8 +41,18 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "vorpal-kg/alloc-s
 # feature graph composable for non-vorpal embedders only.
 builtin-parser = ["vorpal-ingest/builtin-parser", "vorpal-language/builtin-parser"]
 napi-langs = ["vorpal-ingest/napi-langs", "vorpal-language/napi-lang"]
+# Benchmark-only internal seams (`Searcher::open_exact`, the `bench` module) for the
+# recorded sweeps and `cargo xtask searcheval`. NEVER a default: production builds carry
+# no measurement entry points; see examples/sweep_semantic.rs.
+bench-internals = []
 
 [dev-dependencies]
 vorpal-query.workspace = true
 fd-lock = "4.0.4"
 vorpal-dynamic.workspace = true
+
+# The recorded semantic-engine cost sweep (beam vs exact scan) behind the
+# `exhaustive_cutover` fit — dev-only, gated so plain builds never compile it.
+[[example]]
+name = "sweep_semantic"
+required-features = ["bench-internals"]

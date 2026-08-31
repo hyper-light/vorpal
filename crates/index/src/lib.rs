@@ -964,6 +964,30 @@ fn embed_node_into(kg: &Kg, embedder: &LexicalEmbedder, id: u64, row: &mut [f32]
   }
 }
 
+/// Which of `phrase_token_sets` share at least one real token with node `id`'s embedded
+/// surface — EXACTLY the parts [`embed_node_into`] hashes (name, signature, file
+/// basename), tokenized by the same [`tokenize`]. Bit `p` set ⇔ phrase `p` lexically
+/// matches the row. This is the multi-phrase support criterion at the lexical tier:
+/// exact token overlap, immune to the hashed-bucket collisions that make vector-space
+/// sign tests meaningless as match criteria (measured: universal tokens like `fn`/`u32`
+/// collide nonsense phrases into near-global "positive" dot products).
+fn node_lexical_support_bits(kg: &Kg, id: u64, phrase_token_sets: &[Vec<String>]) -> u64 {
+  let Some(view) = kg.node(NodeId::new(id)) else {
+    return 0;
+  };
+  let basename = view.path.rsplit('/').next().unwrap_or(view.path);
+  let mut row_tokens = tokenize(view.name);
+  row_tokens.extend(tokenize(view.signature));
+  row_tokens.extend(tokenize(basename));
+  let mut bits = 0u64;
+  for (phrase, tokens) in phrase_token_sets.iter().enumerate().take(u64::BITS as usize) {
+    if tokens.iter().any(|token| row_tokens.contains(token)) {
+      bits |= 1u64 << phrase;
+    }
+  }
+  bits
+}
+
 /// The `(dim, base_stamp)` of the persisted ann.bin header, if present and current-format —
 /// exposed for coherence tests and diagnostics.
 pub fn peek_ann_header(index_dir: &Path) -> Option<(usize, u64)> {
@@ -1093,6 +1117,13 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
       postings::build_postings(&kg, index_dir, current)?;
     }
     ensure_communities(&kg, index_dir, current)?;
+    // The engine calibration heals independently too (older warms never measured one).
+    if load_ann_calibration(index_dir, current, kg.node_count()).is_none()
+      && let Ok(ann) = AnnIndex::load(&index_dir.join("ann.bin"))
+    {
+      let crossover = calibrate_semantic_cutover(&kg, &ann, active_embedder().dim());
+      write_ann_calibration(index_dir, current, crossover)?;
+    }
     return Ok(());
   }
   build_ann(&kg, index_dir, current).map_err(|err| err as Box<dyn Error>)?;
@@ -1112,6 +1143,11 @@ fn ensure_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
     postings::build_postings(&kg, index_dir, current)?;
   }
   ensure_communities(&kg, index_dir, current)?;
+  // Calibrate the semantic-engine crossover on the just-built tier — measured on this
+  // machine over this index's rows (see `calibrate_semantic_cutover`).
+  let ann = AnnIndex::load(&index_dir.join("ann.bin"))?;
+  let crossover = calibrate_semantic_cutover(&kg, &ann, active_embedder().dim());
+  write_ann_calibration(index_dir, current, crossover)?;
   Ok(())
 }
 
@@ -1292,6 +1328,172 @@ fn build_warm_root(index_root: &Path) -> io::Result<Option<WarmRoot>> {
   Ok(None)
 }
 
+/// The fused ranking's channel names, in the order [`Searcher::run`] returns their ranks.
+const SEARCH_CHANNELS: [&str; 3] = ["name", "vector", "graph"];
+
+/// One fused-ranking row: `(node id, RRF score, per-channel 0-based ranks)` — the shape
+/// [`Searcher::run`] returns.
+type FusedHit = (u64, f32, Vec<Option<usize>>);
+
+/// One query's three ranked candidate channels at a pool depth, with the semantic
+/// channel's exact distances kept alongside (ascending, so positive-similarity rows are
+/// a prefix — see [`POSITIVE_BOUNDARY`]).
+struct Channels {
+  named: Vec<u64>,
+  semantic: Vec<u64>,
+  /// Squared L2 to the query, aligned with `semantic`.
+  semantic_dist2: Vec<f32>,
+  by_degree: Vec<u64>,
+}
+
+/// The orthogonality boundary of the semantic space: embeddings are L2-normalized, so
+/// for unit query q and unit row v, `‖q−v‖² = 2 − 2·(q·v)` — squared distance below 2.0
+/// means strictly positive similarity; at/above it, zero or negative. An algebraic
+/// identity of the normalization, not a tunable. The multi-phrase rungs trim each
+/// phrase's semantic RANK list here: rows past the boundary are the no-signal tie
+/// region Stage 0 diagnosed and carry no rank information worth fusing. (What counts as
+/// a conjunction MATCH is decided lexically — see `node_lexical_support_bits` — because
+/// hashed-bucket collisions make vector-space sign meaningless as a match criterion.)
+const POSITIVE_BOUNDARY: f32 = 2.0;
+
+/// The single-phrase rerank/fusion pool for a requested k — ONE source of truth shared
+/// by the single-phrase path and the conjunction's shallow rung (which therefore does,
+/// by construction, exactly the work a single-phrase query of the same k does). The
+/// values predate this seam (IMPROVEMENTS #9 era); re-deriving them is its own sweep
+/// item, not something to silently duplicate or adjust.
+fn rerank_pool(k: usize) -> usize {
+  (k * 4).max(50)
+}
+
+/// `ann.calib` format version — the warm-time semantic-engine calibration sidecar.
+const ANN_CALIB_VERSION: u32 = 1;
+/// `ann.calib` magic.
+const ANN_CALIB_MAGIC: &[u8; 4] = b"VCAL";
+
+/// Measure, on THIS machine over THIS index's rows, the fetch width where the beam
+/// stops being faster than the flat exact scan — the mid-range routing crossover,
+/// LEARNED from ingested data at warm time. The recorded sweep in docs/wip/BENCHMARKS.md
+/// motivates the design; its numbers stay out of the product.
+///
+/// Protocol (statistical methodology, not tuned quantities): 3 deterministic probe
+/// queries (seeded splitmix64 unit vectors — the seed is an identifier, any fixed value
+/// defines a valid protocol), median of 3 reps per point. The scan reference is
+/// `exhaustive_semantic` at take = 1 — the n-driven floor; real scans cost at least
+/// this, so the error direction always prefers the EXACT engine. Beam probes walk the
+/// geometric ×2 ladder 1, 2, 4, … and stop at the first width whose median exceeds the
+/// scan reference — early exit keeps probing cheap by construction, because every probe
+/// before the crossover is below the crossover. No crossing before `node_count` → the
+/// structural floor stands.
+fn calibrate_semantic_cutover(kg: &Kg, ann: &AnnIndex, dim: usize) -> usize {
+  let node_count = kg.node_count();
+  let rows = semantic_row_ids(kg);
+  if rows.is_empty() || node_count == 0 {
+    return node_count.max(1);
+  }
+  // Deterministic probe vectors: splitmix64 → uniform [-1, 1) components → L2-normalize.
+  let mut state = 0x5EEDu64;
+  let mut next = move || {
+    state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+  };
+  let mut queries: Vec<Vec<f32>> = Vec::with_capacity(3);
+  for _ in 0..3 {
+    let mut vector: Vec<f32> = Vec::with_capacity(dim);
+    for _ in 0..dim {
+      vector.push((next() >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0);
+    }
+    let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+      for x in &mut vector {
+        *x /= norm;
+      }
+    }
+    queries.push(vector);
+  }
+  let median = |samples: &mut Vec<f64>| -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples.get(samples.len() / 2).copied().unwrap_or(0.0)
+  };
+  let embedder = active_embedder();
+  let mut scan_samples = Vec::new();
+  for _ in 0..3 {
+    for query in &queries {
+      let started = std::time::Instant::now();
+      std::hint::black_box(vorpal_ann::exhaustive_semantic(
+        dim,
+        &rows,
+        |i, row| embed_node_into(kg, &embedder, rows[i], row),
+        query,
+        1,
+      ));
+      scan_samples.push(started.elapsed().as_secs_f64());
+    }
+  }
+  let scan_floor = median(&mut scan_samples);
+  let mut width = 1usize;
+  while width < node_count {
+    let mut beam_samples = Vec::new();
+    for _ in 0..3 {
+      for query in &queries {
+        let started = std::time::Instant::now();
+        std::hint::black_box(ann.search(query, width));
+        beam_samples.push(started.elapsed().as_secs_f64());
+      }
+    }
+    if median(&mut beam_samples) > scan_floor {
+      return width.clamp(1, node_count);
+    }
+    width = width.saturating_mul(2);
+  }
+  node_count
+}
+
+/// Persist the calibrated crossover beside the tier it was measured on: 32 bytes —
+/// magic, version, node-segment stamp, crossover — sealed by an xxh3 self-checksum.
+/// Machine-local like every warm sidecar and EXCLUDED from byte-identity determinism
+/// gates (it is a measurement); a stale or torn file reads as absent, never as a value.
+fn write_ann_calibration(
+  index_dir: &Path,
+  stamp: u64,
+  crossover: usize,
+) -> Result<(), Box<dyn Error>> {
+  let mut bytes = Vec::with_capacity(32);
+  bytes.extend_from_slice(ANN_CALIB_MAGIC);
+  bytes.extend_from_slice(&ANN_CALIB_VERSION.to_le_bytes());
+  bytes.extend_from_slice(&stamp.to_le_bytes());
+  bytes.extend_from_slice(&(crossover as u64).to_le_bytes());
+  let checksum = xxhash_rust::xxh3::xxh3_64(&bytes);
+  bytes.extend_from_slice(&checksum.to_le_bytes());
+  let tmp = index_dir.join("ann.calib.tmp");
+  fs::write(&tmp, &bytes)?;
+  fs::rename(tmp, index_dir.join("ann.calib"))?;
+  Ok(())
+}
+
+/// The calibrated crossover for `stamp`'s tier, if a valid one is persisted — clamped
+/// to `[1, node_count]`. Anything else (absent, torn, foreign stamp, bad checksum,
+/// wrong version) is None, and routing stands on the structural floor.
+fn load_ann_calibration(index_dir: &Path, stamp: u64, node_count: usize) -> Option<usize> {
+  let bytes = fs::read(index_dir.join("ann.calib")).ok()?;
+  if bytes.len() != 32 || bytes.get(0..4)? != ANN_CALIB_MAGIC {
+    return None;
+  }
+  let field = |range: std::ops::Range<usize>| -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(range)?.try_into().ok()?))
+  };
+  let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+  if version != ANN_CALIB_VERSION
+    || field(8..16)? != stamp
+    || field(24..32)? != xxhash_rust::xxh3::xxh3_64(bytes.get(0..24)?)
+  {
+    return None;
+  }
+  Some((field(16..24)? as usize).clamp(1, node_count.max(1)))
+}
+
 /// Reciprocal Rank Fusion constant (the standard K=60): dampens the head of each list so no
 /// single signal dominates, while rank-1 placements still carry the most weight.
 const RRF_K: f32 = 60.0;
@@ -1324,6 +1526,21 @@ fn rrf_fuse_explained(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32, Vec<Option
   });
   ranked.truncate(k);
   ranked
+}
+
+/// Accumulate RRF mass (`Σ 1/(K + rank)`, the identical formula
+/// [`rrf_fuse_explained`] applies, in the identical channel-then-rank order) into a
+/// dense id-indexed table — the multi-phrase rungs' fused view, O(n) memory with no
+/// per-hit allocation. A present id always ends up with a strictly positive score, so
+/// `> 0.0` is the presence test.
+fn rrf_accumulate_dense(lists: &[Vec<u64>], table: &mut [f32]) {
+  for list in lists {
+    for (rank, &id) in list.iter().enumerate() {
+      if let Some(slot) = table.get_mut(id as usize) {
+        *slot += 1.0 / (RRF_K + rank as f32);
+      }
+    }
+  }
 }
 
 /// Hybrid search (§3.5): three ranked lists fused by Reciprocal Rank Fusion —
@@ -1537,6 +1754,54 @@ pub fn search_records_filtered(
   cached_searcher(index_dir)?.records(query, k, filter)
 }
 
+/// The typed search answer with conjunction provenance: `hits` plus `multi_phrase` when
+/// the query used the `"…" AND "…"` syntax. [`search_records_filtered`] is its
+/// `hits`-only shim.
+pub fn search_report_filtered(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+  filter: &SearchFilter,
+) -> Result<records::SearchReport, Box<dyn Error>> {
+  cached_searcher(index_dir)?.report(query, k, filter)
+}
+
+/// Parse the conjunctive search syntax: the ENTIRE query must be two or more double-quoted
+/// phrases joined by whitespace-delimited literal `AND` (uppercase), with nothing but
+/// whitespace outside the quotes — `"retry logic" AND "connection pool"`. Anything else —
+/// unquoted terms, a single quoted phrase, lowercase `and`, missing whitespace, stray
+/// text, empty phrases, unterminated quotes — returns `None`, and callers route the
+/// ORIGINAL query bytes through the single-phrase path: the syntax claims no ordinary
+/// query (`tokenize` already treated `"` as a plain boundary, so quoted input never had
+/// distinct semantics to collide with).
+pub fn parse_and_phrases(query: &str) -> Option<Vec<String>> {
+  let mut phrases: Vec<String> = Vec::new();
+  let mut rest = query.trim();
+  loop {
+    rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let phrase = rest[..end].trim();
+    if phrase.is_empty() {
+      return None;
+    }
+    phrases.push(phrase.to_string());
+    rest = &rest[end + 1..];
+    if rest.is_empty() {
+      break;
+    }
+    // Separator: at least one whitespace, `AND`, at least one whitespace.
+    if !rest.starts_with(char::is_whitespace) {
+      return None;
+    }
+    rest = rest.trim_start().strip_prefix("AND")?;
+    if !rest.starts_with(char::is_whitespace) {
+      return None;
+    }
+    rest = rest.trim_start();
+  }
+  if phrases.len() < 2 { None } else { Some(phrases) }
+}
+
 fn search_index_impl(
   index_dir: &Path,
   query: &str,
@@ -1561,6 +1826,12 @@ pub struct Searcher {
   ann: Option<AnnIndex>,
   /// The persisted lexical posting tier — present only when its stamp matches this generation.
   postings: Option<postings::Postings>,
+  /// Fetch width at/above which the semantic channel takes the flat exact scan instead
+  /// of the beam. LEARNED at warm time from the ingested index on the running machine
+  /// (`ann.calib`); an absent/stale/torn calibration falls back to the structural floor
+  /// `node_count` (a beam has no completeness guarantee at take ≥ n). Never a shipped
+  /// constant.
+  semantic_cutover: usize,
   /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
   /// effect (autowarm) so queries take the exact reference paths only. Set by
   /// [`Searcher::open_exact`]; never used in serving.
@@ -1582,11 +1853,14 @@ impl Searcher {
       None
     };
     let postings = postings::Postings::load(&generation_dir).filter(|p| p.stamp() == stamp);
+    let semantic_cutover =
+      load_ann_calibration(&generation_dir, stamp, kg.node_count()).unwrap_or(kg.node_count());
     Ok(Searcher {
       generation_dir,
       kg,
       ann,
       postings,
+      semantic_cutover,
       exact_only: false,
     })
   }
@@ -1595,75 +1869,322 @@ impl Searcher {
   /// exact reference paths (exhaustive semantic scan + full name scan) no matter what
   /// sidecars exist on disk, and nothing is mutated (no autowarm). This is the measurement
   /// seam — `cargo xtask searcheval --overlap` compares tier answers against it — never a
-  /// serving path.
+  /// serving path, and compiled only under the non-default `bench-internals` feature so
+  /// production builds carry no measurement entry points.
+  #[cfg(feature = "bench-internals")]
   pub fn open_exact(index_dir: &Path) -> Result<Searcher, Box<dyn Error>> {
     let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
     let kg = Kg::load(&generation_dir)?;
+    let semantic_cutover = kg.node_count();
     Ok(Searcher {
       generation_dir,
       kg,
       ann: None,
       postings: None,
+      semantic_cutover,
       exact_only: true,
     })
   }
 
   /// Which warm tiers this handle holds, as `(ann, postings)` — fresh-and-open vs
   /// absent/stale. Lets measurement tools state which path served their numbers.
+  /// Bench-only, like [`Searcher::open_exact`].
+  #[cfg(feature = "bench-internals")]
   pub fn tiers(&self) -> (bool, bool) {
     (self.ann.is_some(), self.postings.is_some())
   }
 
   /// The typed-record surface over [`Searcher::run`]: one record per hit with the fused
   /// score and per-channel provenance ranks. Shared by [`search_records_filtered`] and bulk
-  /// callers holding a persistent handle.
+  /// callers holding a persistent handle. The `hits`-only shim over [`Searcher::report`].
   pub fn records(
     &self,
     query: &str,
     k: usize,
     filter: &SearchFilter,
   ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
-    let ranked = self.run(query, k, filter)?;
+    Ok(self.report(query, k, filter)?.hits)
+  }
+
+  /// The full typed search answer — the ONE dispatch point below every surface (CLI, MCP,
+  /// napi, pyo3, the async pool): parses the conjunction syntax (`"…" AND "…"`, see
+  /// [`parse_and_phrases`]) and routes. Anything that does not parse flows through the
+  /// single-phrase path with the ORIGINAL query bytes — byte-identity for ordinary
+  /// queries is structural, not behavioral.
+  pub fn report(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<records::SearchReport, Box<dyn Error>> {
+    match parse_and_phrases(query) {
+      None => Ok(records::SearchReport {
+        hits: self.hits_from_ranked(self.run(query, k, filter)?, None),
+        multi_phrase: None,
+      }),
+      Some(phrases) => self.report_multi(&phrases, k, filter),
+    }
+  }
+
+  /// Build hit records from one fused ranking; `phrase` tags every channel rank when the
+  /// ranking is one phrase of a conjunction.
+  fn hits_from_ranked(
+    &self,
+    ranked: Vec<FusedHit>,
+    phrase: Option<usize>,
+  ) -> Vec<records::SearchHitRecord> {
     let kg = &self.kg;
-    const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
-    Ok(
-      ranked
-        .into_iter()
-        .filter_map(|(row, score, ranks)| {
-          Some(records::SearchHitRecord {
-            node: records::node_record(kg, NodeId::new(row))?,
-            score,
-            channels: CHANNELS
-              .iter()
-              .zip(&ranks)
-              .filter_map(|(&channel, rank)| {
-                rank.map(|rank| records::ChannelRank {
-                  channel,
-                  rank: rank + 1,
-                })
+    ranked
+      .into_iter()
+      .filter_map(|(row, score, ranks)| {
+        Some(records::SearchHitRecord {
+          node: records::node_record(kg, NodeId::new(row))?,
+          score,
+          channels: SEARCH_CHANNELS
+            .iter()
+            .zip(&ranks)
+            .filter_map(|(&channel, rank)| {
+              rank.map(|rank| records::ChannelRank {
+                channel,
+                rank: rank + 1,
+                phrase,
               })
-              .collect(),
-          })
+            })
+            .collect(),
         })
-        .collect(),
-    )
+      })
+      .collect()
+  }
+
+  /// Conjunctive (multi-phrase AND) execution: every phrase runs the FULL three-channel
+  /// single-phrase pass, candidates are intersected left-to-right (recording the phrase
+  /// that emptied the set — the eliminator), and each survivor scores the MINIMUM of its
+  /// per-phrase RRF scores. Min is the exact fuzzy-AND: monotone in every phrase, and
+  /// invariant to per-phrase pool-size asymmetries — a product would double-count
+  /// correlated phrases and reorder under pool changes. Ties: score sum descending (a hit
+  /// strong on every phrase beats one merely not-weak), then id ascending.
+  ///
+  /// Depth has exactly two rungs, both computed from the data at hand: the shallow rung
+  /// uses the single-phrase rerank pool for this k, the deep rung uses the node count
+  /// itself. Truncated pools set a recall floor on intersections — at kernel scale a
+  /// depth-50 pool for a broad phrase holds none of the conjunctive answers (measured
+  /// 2026-08-30: `"socket buffer" AND "alloc"` came back empty) — so the deep rung
+  /// structurally exhausts every channel, and an empty intersection there means the
+  /// FULL supports are disjoint — support means sharing at least one real token with
+  /// the phrase over the exact embedded surface (see [`node_lexical_support_bits`]; the
+  /// learned tier re-derives the criterion with its embedder) — with no truncation
+  /// asterisk. It runs only when the shallow
+  /// rung is starved (< k survivors), and its fetch width covers the full population —
+  /// where a beam is categorically the wrong tool (no completeness guarantee at
+  /// take ≥ n) — so it rides the flat exact scan: exact by construction and, per the
+  /// recorded sweep, faster there. Per-phrase RRF
+  /// scores are depth-relative (the graph channel re-sorts the name pool, which is not
+  /// prefix-stable), so scores compare within one answer, never across rungs; rung
+  /// choice is a pure function of (query, k, index), so results stay deterministic.
+  fn report_multi(
+    &self,
+    phrases: &[String],
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<records::SearchReport, Box<dyn Error>> {
+    if phrases.len() > u64::BITS as usize {
+      return Err("conjunction supports at most 64 phrases (support-mask width)".into());
+    }
+    // One tokenization per phrase, shared by every rung's support tests.
+    let phrase_tokens: Vec<Vec<String>> = phrases.iter().map(|p| tokenize(p)).collect();
+    let node_count = self.kg.node_count();
+    let shallow = rerank_pool(k);
+    let rungs: Vec<usize> = if shallow >= node_count {
+      vec![node_count]
+    } else {
+      vec![shallow, node_count]
+    };
+    for (rung, &depth) in rungs.iter().enumerate() {
+      // Per phrase: the three channel lists at this depth, folded into a dense
+      // id-indexed RRF table — O(n) f32s, no per-hit allocation, so even the deep rung
+      // stays lean at kernel scale.
+      let mut per_phrase_lists: Vec<[Vec<u64>; 3]> = Vec::with_capacity(phrases.len());
+      let mut tables: Vec<Vec<f32>> = Vec::with_capacity(phrases.len());
+      for phrase in phrases {
+        let mut channels = self.channel_lists(phrase, depth, filter)?;
+        // Trim the semantic RANK list at the orthogonality boundary (an algebraic
+        // identity — see `POSITIVE_BOUNDARY`): rows past it are the no-signal tie
+        // region and carry no rank information worth fusing. Positive rows are a
+        // prefix of the ascending list, so the cut changes no surviving rank. (What
+        // counts as a MATCH is decided lexically below, never by vector sign.)
+        let positive = channels
+          .semantic_dist2
+          .partition_point(|&dist2| dist2 < POSITIVE_BOUNDARY);
+        channels.semantic.truncate(positive);
+        let lists = [channels.named, channels.semantic, channels.by_degree];
+        let mut table = vec![0.0f32; node_count];
+        rrf_accumulate_dense(&lists, &mut table);
+        per_phrase_lists.push(lists);
+        tables.push(table);
+      }
+      // Lexical support: a phrase MATCHES a row iff they share at least one real token
+      // over the exact surface the embedder hashes (see `node_lexical_support_bits`).
+      // Vector-space sign cannot define a match — hashed-bucket collisions hand
+      // unrelated rows positive dot products — so support is computed exactly, over the
+      // rows any channel scored at this rung.
+      let candidate_ids: Vec<u64> = (0..node_count as u64)
+        .filter(|&id| {
+          tables
+            .iter()
+            .any(|table| table.get(id as usize).copied().unwrap_or(0.0) > 0.0)
+        })
+        .collect();
+      let support_bits: Vec<(u64, u64)> = {
+        use rayon::prelude::*;
+        candidate_ids
+          .par_iter()
+          .map(|&id| (id, node_lexical_support_bits(&self.kg, id, &phrase_tokens)))
+          .collect()
+      };
+      let mut mask: Vec<u64> = vec![0; node_count];
+      for (id, bits) in support_bits {
+        if let Some(slot) = mask.get_mut(id as usize) {
+          *slot = bits;
+        }
+      }
+      let supported = |id: u64, phrase: usize, table: &[f32]| -> bool {
+        mask.get(id as usize).copied().unwrap_or(0) & (1u64 << phrase) != 0
+          && table.get(id as usize).copied().unwrap_or(0.0) > 0.0
+      };
+      let per_phrase_pool: Vec<usize> = tables
+        .iter()
+        .enumerate()
+        .map(|(phrase, table)| {
+          candidate_ids
+            .iter()
+            .filter(|&&id| supported(id, phrase, table))
+            .count()
+        })
+        .collect();
+
+      // Left-to-right intersection; the eliminator is the first phrase that emptied it.
+      let Some(first) = tables.first() else {
+        return Err("multi-phrase conjunction with no phrases (parser invariant)".into());
+      };
+      let mut survivors: Vec<u64> = candidate_ids
+        .iter()
+        .copied()
+        .filter(|&id| supported(id, 0, first))
+        .collect();
+      let mut eliminated_by = if survivors.is_empty() { Some(0) } else { None };
+      if eliminated_by.is_none() {
+        for (index, table) in tables.iter().enumerate().skip(1) {
+          survivors.retain(|&id| supported(id, index, table));
+          if survivors.is_empty() {
+            eliminated_by = Some(index);
+            break;
+          }
+        }
+      }
+
+      let last_rung = rung + 1 == rungs.len();
+      if survivors.len() < k && !last_rung {
+        continue; // starved at the shallow rung — take the exhaustive one
+      }
+
+      // Score survivors: min RRF desc (the exact fuzzy-AND), then sum desc, then id asc.
+      let mut scored: Vec<(u64, f32, f32)> = Vec::with_capacity(survivors.len());
+      for id in survivors {
+        let mut min = f32::INFINITY;
+        let mut sum = 0.0f32;
+        for table in &tables {
+          let score = table.get(id as usize).copied().unwrap_or(0.0);
+          if score <= 0.0 {
+            return Err(
+              "multi-phrase invariant violated: survivor missing from a phrase table".into(),
+            );
+          }
+          min = min.min(score);
+          sum += score;
+        }
+        scored.push((id, min, sum));
+      }
+      scored.sort_by(|a, b| {
+        b.1
+          .total_cmp(&a.1)
+          .then(b.2.total_cmp(&a.2))
+          .then(a.0.cmp(&b.0))
+      });
+      scored.truncate(k);
+
+      // Channel provenance for the winners only: one membership pass over each phrase's
+      // channel lists, collected phrase-major then channel-major (the record order).
+      let winners: std::collections::HashSet<u64> =
+        scored.iter().map(|&(id, _, _)| id).collect();
+      let mut provenance: std::collections::HashMap<u64, Vec<records::ChannelRank>> =
+        std::collections::HashMap::new();
+      for (phrase, lists) in per_phrase_lists.iter().enumerate() {
+        for (channel, list) in lists.iter().enumerate() {
+          let Some(&name) = SEARCH_CHANNELS.get(channel) else {
+            continue;
+          };
+          for (rank, id) in list.iter().enumerate() {
+            if winners.contains(id) {
+              provenance.entry(*id).or_default().push(records::ChannelRank {
+                channel: name,
+                rank: rank + 1,
+                phrase: Some(phrase),
+              });
+            }
+          }
+        }
+      }
+
+      let kg = &self.kg;
+      let mut hits = Vec::with_capacity(scored.len());
+      for (id, min, _) in scored {
+        let Some(node) = records::node_record(kg, NodeId::new(id)) else {
+          continue;
+        };
+        hits.push(records::SearchHitRecord {
+          node,
+          score: min,
+          channels: provenance.remove(&id).unwrap_or_default(),
+        });
+      }
+      return Ok(records::SearchReport {
+        hits,
+        multi_phrase: Some(records::MultiPhraseReport {
+          phrases: phrases.to_vec(),
+          per_phrase_pool,
+          intersection_depth: depth,
+          eliminated_by,
+        }),
+      });
+    }
+    Err("multi-phrase rung loop ended without answering (invariant violation)".into())
   }
 
   /// The pinned-generation hybrid ranking shared by the rendered and typed search surfaces:
   /// name/semantic/in-degree channels fused by RRF, each hit carrying its per-channel ranks.
   /// Reads only the handle's already-open mappings — no `Kg::load`/`AnnIndex::load` per call.
-  #[allow(clippy::type_complexity)]
-  pub fn run(
+  pub fn run(&self, query: &str, k: usize, filter: &SearchFilter) -> Result<Vec<FusedHit>, Box<dyn Error>> {
+    let channels = self.channel_lists(query, rerank_pool(k), filter)?;
+    Ok(rrf_fuse_explained(
+      &[channels.named, channels.semantic, channels.by_degree],
+      k,
+    ))
+  }
+
+  /// The three ranked candidate channels (name, semantic, graph) at one pool depth —
+  /// the shared body behind [`Searcher::run`] (which RRF-fuses them at k) and the
+  /// multi-phrase rungs (which accumulate them into dense per-phrase score tables
+  /// without materializing a fused list per phrase).
+  fn channel_lists(
     &self,
     query: &str,
-    k: usize,
+    pool: usize,
     filter: &SearchFilter,
-  ) -> Result<Vec<(u64, f32, Vec<Option<usize>>)>, Box<dyn Error>> {
+  ) -> Result<Channels, Box<dyn Error>> {
     let kg = &self.kg;
     let index_dir = self.generation_dir.as_path();
     let compiled_filter = CompiledSearchFilter::compile(filter)?;
     let embedder = active_embedder();
-    let pool = (k * 4).max(50);
     let query_vec = embedder.embed(query);
 
   // Semantic candidate pool, by tier — a search NEVER waits on an ANN build:
@@ -1679,13 +2200,31 @@ impl Searcher {
   // filtered query overfetches to keep its post-filter pool honest; the exhaustive fallback
   // filters BEFORE scoring and needs no slack.
   let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
-  let candidates: Vec<u64> = if let Some(ann) = &self.ann {
-    ann
-      .search(&query_vec, take)
-      .into_iter()
-      .map(|(id, _)| id)
-      .collect()
-  } else if let Some(overlay) = (!self.exact_only)
+  // Route between the two semantic engines by THIS index's warm-time calibration
+  // (`ann.calib`: the crossover measured on the running machine over the ingested rows —
+  // see `calibrate_semantic_cutover`). Without a calibration, the floor is the proven
+  // structural rule alone: a fetch covering the full population is categorically not
+  // ANN work (a beam's reach is a graph traversal with NO completeness guarantee at
+  // take ≥ n), while the flat scan is exact by construction. No frozen machine numbers
+  // exist on either path.
+  let take_exhaustive = take >= self.semantic_cutover;
+  enum SemanticCandidates {
+    /// From an approximate tier (beam / overlay): the exact rerank below orders them.
+    Approx(Vec<u64>),
+    /// From the exhaustive scan: already exactly scored, pre-filtered, and in the
+    /// `(dist, id)` total order the rerank would produce — re-embedding them would
+    /// re-derive byte-identical results, so the rerank is skipped.
+    Exact(Vec<(u64, f32)>),
+  }
+  let candidates: SemanticCandidates = if !take_exhaustive && let Some(ann) = &self.ann {
+    SemanticCandidates::Approx(
+      ann
+        .search(&query_vec, take)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect(),
+    )
+  } else if let Some(overlay) = (!take_exhaustive && !self.exact_only)
     .then(|| annfiles::OverlayView::assemble(index_dir, kg, embedder.dim()))
     .flatten()
   {
@@ -1707,12 +2246,13 @@ impl Searcher {
     // Disjoint by construction (remap targets are unchanged files; overlay ids are
     // changed/new files) — a plain union; the exact rerank below orders everything.
     ids.extend(overlay_hits.into_iter().map(|(id, _)| id));
-    ids
+    SemanticCandidates::Approx(ids)
   } else {
     // Kick a detached warm so the *next* search takes the fast tier — gated (registered
     // binaries only, opt-out, once per process) and best-effort; see `autowarm`. The
-    // exact-only seam measures the index as-is and must not mutate it.
-    if !self.exact_only {
+    // exact-only seam measures the index as-is and must not mutate it, and a deep-pool
+    // bypass over FRESH tiers (`ann` present) has nothing to warm.
+    if !self.exact_only && self.ann.is_none() {
       autowarm::maybe_spawn(index_dir);
     }
     let mut ids = semantic_row_ids(kg);
@@ -1721,46 +2261,47 @@ impl Searcher {
     if !filter.is_empty() {
       ids.retain(|&id| compiled_filter.admits(kg, id));
     }
-    let scored = vorpal_ann::exhaustive_semantic(
+    SemanticCandidates::Exact(vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &ids,
       |i, row| embed_node_into(kg, &embedder, ids[i], row),
       &query_vec,
       take,
-    );
-    scored.into_iter().map(|(id, _)| id).collect()
-  };
-  // Approximate tiers cannot pre-filter; drop non-matching candidates before the rerank so
-  // the fused pool holds only admitted definitions.
-  let candidates: Vec<u64> = if filter.is_empty() {
-    candidates
-  } else {
-    candidates
-      .into_iter()
-      .filter(|&id| compiled_filter.admits(kg, id))
-      .collect()
+    ))
   };
 
-  // Re-score every candidate at full precision by re-embedding its parts against the
-  // *current* KG — approximation chooses the pool, never the final semantic order (§10's
-  // rerank bar), and rendering can never serve stale content.
-  let semantic: Vec<u64> = {
-    let mut scored: Vec<(f32, u64)> = candidates
-      .into_iter()
-      .map(|id| {
-        let mut row = vec![0.0f32; embedder.dim()];
-        embed_node_into(kg, &embedder, id, &mut row);
-        let exact = row
-          .iter()
-          .zip(&query_vec)
-          .map(|(x, y)| (x - y) * (x - y))
-          .sum::<f32>();
-        (exact, id)
-      })
-      .collect();
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+  // Exactly order the pool as (distance, id). Approximate candidates are re-embedded at
+  // full precision — approximation chooses the pool, never the final semantic order
+  // (§10's rerank bar) — and, since the tiers cannot pre-filter, non-admitted rows drop
+  // here. Exhaustive candidates arrive already exact, pre-filtered, and in this precise
+  // total order (crates/ann/src/scan.rs sorts by `(dist, id)` under `total_cmp`), so
+  // re-deriving them would be pure duplicate work at full-population sizes.
+  let (semantic, semantic_dist2): (Vec<u64>, Vec<f32>) = {
+    let mut scored: Vec<(f32, u64)> = match candidates {
+      SemanticCandidates::Exact(scored) => {
+        scored.into_iter().map(|(id, dist)| (dist, id)).collect()
+      }
+      SemanticCandidates::Approx(ids) => {
+        let mut scored: Vec<(f32, u64)> = ids
+          .into_iter()
+          .filter(|&id| filter.is_empty() || compiled_filter.admits(kg, id))
+          .map(|id| {
+            let mut row = vec![0.0f32; embedder.dim()];
+            embed_node_into(kg, &embedder, id, &mut row);
+            let exact = row
+              .iter()
+              .zip(&query_vec)
+              .map(|(x, y)| (x - y) * (x - y))
+              .sum::<f32>();
+            (exact, id)
+          })
+          .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored
+      }
+    };
     scored.truncate(pool);
-    scored.into_iter().map(|(_, id)| id).collect()
+    scored.into_iter().map(|(dist, id)| (id, dist)).unzip()
   };
 
   let query_tokens = tokenize(query);
@@ -1834,7 +2375,12 @@ impl Searcher {
     )
   });
 
-    Ok(rrf_fuse_explained(&[named, semantic, by_degree], k))
+    Ok(Channels {
+      named,
+      semantic,
+      semantic_dist2,
+      by_degree,
+    })
   }
 
   /// Run a search and render it to the CLI's exact text format — shared by `search_index`
@@ -1857,6 +2403,9 @@ impl Searcher {
     explain: bool,
     filter: &SearchFilter,
   ) -> Result<String, Box<dyn Error>> {
+    if parse_and_phrases(query).is_some() {
+      return self.render_multi(query, k, explain, filter);
+    }
     let ranked = self.run(query, k, filter)?;
     let kg = &self.kg;
     let mut out = String::new();
@@ -1882,6 +2431,69 @@ impl Searcher {
             view.name, view.kind, view.path
           );
         }
+      }
+    }
+    Ok(out)
+  }
+
+  /// Render a conjunctive query: identical line format to the single-phrase renderer
+  /// (hit records carry the same `{:?}`-formatted kind), phrase-tagged provenance under
+  /// explain (`p1:name#3`), and an explicit eliminator line instead of silence when the
+  /// intersection is empty.
+  fn render_multi(
+    &self,
+    query: &str,
+    k: usize,
+    explain: bool,
+    filter: &SearchFilter,
+  ) -> Result<String, Box<dyn Error>> {
+    let report = self.report(query, k, filter)?;
+    let mut out = String::new();
+    if report.hits.is_empty()
+      && let Some(mp) = &report.multi_phrase
+      && let Some(index) = mp.eliminated_by
+    {
+      let pools = mp
+        .per_phrase_pool
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+      let _ = writeln!(
+        out,
+        "(no results: phrase {}/{} {:?} eliminated all candidates; per-phrase pools: {pools} \
+         at depth {})",
+        index + 1,
+        mp.phrases.len(),
+        mp.phrases.get(index).map(String::as_str).unwrap_or("?"),
+        mp.intersection_depth,
+      );
+      return Ok(out);
+    }
+    for hit in &report.hits {
+      if explain {
+        let mut provenance = format!("id {}", hit.node.id);
+        for rank in &hit.channels {
+          match rank.phrase {
+            Some(phrase) => {
+              let _ = write!(provenance, "; p{}:{}#{}", phrase + 1, rank.channel, rank.rank);
+            }
+            None => {
+              let _ = write!(provenance, "; {}#{}", rank.channel, rank.rank);
+            }
+          }
+        }
+        let _ = writeln!(
+          out,
+          "{:.4}  {} [{}] {}  ({provenance})",
+          hit.score, hit.node.name, hit.node.kind, hit.node.path
+        );
+      } else {
+        let _ = writeln!(
+          out,
+          "{:.4}  {} [{}] {}",
+          hit.score, hit.node.name, hit.node.kind, hit.node.path
+        );
       }
     }
     Ok(out)
@@ -1931,6 +2543,53 @@ fn cached_searcher(index_dir: &Path) -> Result<Arc<Searcher>, Box<dyn Error>> {
     guard.remove(0);
   }
   Ok(searcher)
+}
+
+/// Benchmark-only internal seams, compiled ONLY under the non-default `bench-internals`
+/// feature — release builds (`-p vorpal-index`, `-p vorpal`, crates.io consumers) carry
+/// none of this. Consumers: `examples/sweep_semantic.rs` (the recorded engine-cost
+/// sweep behind the `exhaustive_cutover` fit) and `cargo xtask searcheval`
+/// (tier-vs-exact reference mode via [`Searcher::open_exact`]).
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench {
+  use std::error::Error;
+  use std::path::Path;
+
+  use vorpal_ann::Embedder;
+  use vorpal_kg::Kg;
+
+  /// The semantic row population (every non-Import node), as production selects it.
+  pub fn semantic_rows(kg: &Kg) -> Vec<u64> {
+    super::semantic_row_ids(kg)
+  }
+
+  /// Embed one node exactly as production does (name ×2, signature, basename) — the
+  /// sweep must time the real fill cost, never a drifted replica.
+  pub fn embed_row(kg: &Kg, id: u64, row: &mut [f32]) {
+    super::embed_node_into(kg, &super::active_embedder(), id, row);
+  }
+
+  /// A query embedding, as production computes it.
+  pub fn embed_query(query: &str) -> Vec<f32> {
+    super::active_embedder().embed(query)
+  }
+
+  pub fn embed_dim() -> usize {
+    super::active_embedder().dim()
+  }
+
+  /// True iff the persisted ann tier is fresh for this index — the sweep refuses stale
+  /// tiers so it can never silently time the wrong engine.
+  pub fn ann_tier_fresh(index_dir: &Path) -> Result<bool, Box<dyn Error>> {
+    let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
+    let kg = Kg::load(&generation_dir)?;
+    Ok(super::ann_is_fresh(
+      &generation_dir,
+      super::stamp_of(&kg),
+      super::active_embedder().dim(),
+    ))
+  }
 }
 
 /// Run one graph query verb against a persisted index and render the results — the shared

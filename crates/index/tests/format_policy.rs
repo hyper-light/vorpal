@@ -93,6 +93,13 @@ fn version_table_matches_the_constants() {
       version_of("crates/kg/src/communities.rs", "VERSION"),
       "sidecar treated as absent → `community` answers `null`, `architecture` says not built → warm rebuilds",
     ),
+    (
+      "semantic engine calibration (`ann.calib`)",
+      "ANN_CALIB_VERSION",
+      "crates/index/src/lib.rs",
+      version_of("crates/index/src/lib.rs", "ANN_CALIB_VERSION"),
+      "calibration treated as absent → structural routing floor (full-population fetches scan; the beam keeps everything below) → next warm re-measures",
+    ),
   ];
 
   let mut table = String::from("| Artifact | Constant | Value | On mismatch |\n|---|---|---|---|\n");

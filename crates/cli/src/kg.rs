@@ -292,7 +292,9 @@ pub struct GraphArg {
 #[derive(Args)]
 pub struct SearchArg {
   /// Free-text query — hybrid retrieval fusing exact/token name matches, lexical-embedding
-  /// similarity, and graph in-degree (RRF). With --code, an ast-grep PATTERN instead.
+  /// similarity, and graph in-degree (RRF). Two or more double-quoted phrases joined by
+  /// literal AND (`'"retry logic" AND "connection pool"'`) intersect per-phrase results
+  /// (conjunction, min-of-scores). With --code, an ast-grep PATTERN instead.
   query: String,
   /// Structural mode: treat the query as an ast-grep pattern, run it over the generation's
   /// own (digest-verified) files, and rank enclosing definitions by semantic in-degree.
@@ -1171,16 +1173,19 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
       }
     }
     machine => {
-      let records = vorpal_index::search_records_filtered(&dir, &arg.query, arg.k, &filter)
+      let report = vorpal_index::search_report_filtered(&dir, &arg.query, arg.k, &filter)
         .map_err(boxed)
         .with_context(|| missing_index_hint(&dir))?;
-      let value = vorpal_index::records::paged_value(
-        &records,
+      let mut value = vorpal_index::records::paged_value(
+        &report.hits,
         arg.page.cursor.as_deref(),
         arg.page.limit,
         "hits",
       )
       .map_err(anyhow::Error::msg)?;
+      if let Some(mp) = &report.multi_phrase {
+        value["multiPhrase"] = serde_json::to_value(mp).map_err(anyhow::Error::msg)?;
+      }
       print!("{}", emit_machine(machine, &value)?);
     }
   }

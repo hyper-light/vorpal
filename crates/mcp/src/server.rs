@@ -622,14 +622,24 @@ impl Server {
         // One ranking serves both surfaces: records for machines, and the explained text
         // rendered from the same records (byte-compatible with `search_index_explained`) —
         // agents get ranking provenance by default (§11's "expose which rankers
-        // contributed").
-        let records = vorpal_index::search_records_filtered(&self.index_dir, &query, k, &filter)
+        // contributed"). Multi-phrase conjunctions (`"…" AND "…"`) ride the same report:
+        // phrase-tagged provenance, and an eliminator line instead of silent emptiness.
+        let report = vorpal_index::search_report_filtered(&self.index_dir, &query, k, &filter)
           .map_err(|err| err.to_string())?;
+        let vorpal_index::records::SearchReport { hits, multi_phrase } = report;
         let mut text = String::new();
-        for hit in &records {
+        for hit in &hits {
           let mut provenance = format!("id {}", hit.node.id);
           for channel in &hit.channels {
-            provenance.push_str(&format!("; {}#{}", channel.channel, channel.rank));
+            match channel.phrase {
+              Some(phrase) => provenance.push_str(&format!(
+                "; p{}:{}#{}",
+                phrase + 1,
+                channel.channel,
+                channel.rank
+              )),
+              None => provenance.push_str(&format!("; {}#{}", channel.channel, channel.rank)),
+            }
           }
           text.push_str(&format!(
             "{:.4}  {} [{}] {}  ({provenance})\n",
@@ -637,9 +647,27 @@ impl Server {
           ));
         }
         if text.is_empty() {
-          text = format!("(no results for '{query}')");
+          text = match multi_phrase.as_ref().and_then(|mp| Some((mp, mp.eliminated_by?))) {
+            Some((mp, index)) => format!(
+              "(no results: phrase {}/{} {:?} eliminated all candidates; per-phrase pools: {} \
+               at depth {})",
+              index + 1,
+              mp.phrases.len(),
+              mp.phrases.get(index).map(String::as_str).unwrap_or("?"),
+              mp.per_phrase_pool
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+              mp.intersection_depth,
+            ),
+            None => format!("(no results for '{query}')"),
+          };
         }
-        let data = paged(records, args, "hits")?;
+        let mut data = paged(hits, args, "hits")?;
+        if let Some(mp) = &multi_phrase {
+          data["multiPhrase"] = serde_json::to_value(mp).map_err(|err| err.to_string())?;
+        }
         Ok((text, data))
       }
       "structural_search" => {
@@ -1453,9 +1481,11 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
       "search",
       "Hybrid search over definitions: exact/token name matches, lexical-embedding similarity, \
        and graph in-degree fused by reciprocal rank fusion; returns the top-k matches with \
-       scores.",
+       scores. Two or more double-quoted phrases joined by literal AND (\"retry logic\" AND \
+       \"connection pool\") intersect per-phrase results (conjunction, min-of-scores) and \
+       report which phrase eliminated everything when the intersection is empty.",
       json!({
-        "query": {"type": "string", "description": "Free-text query"},
+        "query": {"type": "string", "description": "Free-text query, or a conjunction: \"phrase one\" AND \"phrase two\""},
         "k": {"type": "integer", "description": "Max results (default 10)"},
         "path": {"type": "string", "description": "Filter: definition file path must end with this suffix"},
         "prefix": {"type": "string", "description": "Filter: definition file path must start with this prefix (package/subtree scoping)"},

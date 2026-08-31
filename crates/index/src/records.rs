@@ -97,6 +97,38 @@ pub struct SearchHitRecord {
 pub struct ChannelRank {
   pub channel: &'static str,
   pub rank: usize,
+  /// Multi-phrase (`"…" AND "…"`) queries only: which phrase (0-based) this channel
+  /// placement came from. `None` on single-phrase queries — and serialization omits it,
+  /// so single-phrase JSON stays byte-identical to the pre-conjunction surface.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub phrase: Option<usize>,
+}
+
+/// Why a conjunctive (multi-phrase AND) query answered the way it did: the parsed phrases,
+/// each phrase's fused-pool size at the intersection depth, and — when the intersection
+/// emptied — which phrase (0-based, evaluated left-to-right) eliminated every remaining
+/// candidate. Absence of results is an answer with a stated reason, never silence.
+#[derive(Serialize, Debug)]
+pub struct MultiPhraseReport {
+  pub phrases: Vec<String>,
+  pub per_phrase_pool: Vec<usize>,
+  /// The fused-pool depth of the final round: intersection pools deepen iteratively
+  /// (`(k·4).max(50)`, ×4 per round, cap 3200) while the conjunction is starved, so a
+  /// shallow truncation can never fake an empty intersection.
+  pub intersection_depth: usize,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub eliminated_by: Option<usize>,
+}
+
+/// A search answer with its conjunction provenance: `hits` is the ranking every surface
+/// renders; `multi_phrase` is present iff the query parsed as the `"…" AND "…"` syntax
+/// (see `parse_and_phrases`). Single-phrase callers use the `hits`-only shim
+/// (`search_records_filtered`) and see no change.
+#[derive(Serialize, Debug)]
+pub struct SearchReport {
+  pub hits: Vec<SearchHitRecord>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub multi_phrase: Option<MultiPhraseReport>,
 }
 
 /// One definition's source text, sliced from its persisted byte span and digest-verified

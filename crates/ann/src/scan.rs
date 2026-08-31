@@ -44,10 +44,20 @@ where
     .map(|(chunk_index, chunk_ids)| {
       let mut row = vec![0.0f32; dim];
       // Bounded local top set: sorted ascending by (dist, id), capped at `take`.
-      let mut top: Vec<(f32, u64)> = Vec::with_capacity(take + 1);
+      let mut top: Vec<(f32, u64)> = Vec::with_capacity(chunk_ids.len().min(take + 1));
+      // Degenerate case — the cap cannot bind inside this chunk (`take` admits every
+      // row), so the sorted-insert discipline below would only buy O(len²) memmove:
+      // collect unordered and let the final merge sort order everything. Output is
+      // identical (the merge sorts and truncates either way); this keeps full-population
+      // fetches (e.g. the multi-phrase exhaustive rung) linear instead of quadratic.
+      let unbounded = take >= chunk_ids.len();
       for (j, &id) in chunk_ids.iter().enumerate() {
         fill(chunk_index * chunk + j, &mut row);
         let dist = l2_sq(&row, query);
+        if unbounded {
+          top.push((dist, id));
+          continue;
+        }
         if top.len() == take {
           let &(worst, worst_id) = top.last().expect("take > 0");
           // Full, and this candidate is not strictly closer than the worst kept → skip.
@@ -131,6 +141,31 @@ mod tests {
       25,
     );
     assert_eq!(got, again);
+  }
+
+  #[test]
+  fn full_population_take_matches_reference() {
+    let dim = 16;
+    let data = rows(3_000, dim);
+    let ids: Vec<u64> = (0..data.len() as u64).collect();
+    let mut query = vec![0.0f32; dim];
+    query[1] = 1.0;
+    // take ≥ n exercises the unbounded (collect-then-sort) chunk path.
+    let got = exhaustive_semantic(
+      dim,
+      &ids,
+      |i, row| row.copy_from_slice(&data[i]),
+      &query,
+      data.len() * 2,
+    );
+    let mut reference: Vec<(f32, u64)> = data
+      .iter()
+      .zip(&ids)
+      .map(|(row, &id)| (l2_sq(row, &query), id))
+      .collect();
+    reference.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let reference: Vec<(u64, f32)> = reference.into_iter().map(|(d, i)| (i, d)).collect();
+    assert_eq!(got, reference);
   }
 
   #[test]
