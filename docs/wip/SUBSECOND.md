@@ -456,8 +456,12 @@ slice ships with a constant that wasn't swept at two scales and recorded here.
   absolute canonical paths, so today's pack bytes — and therefore generation content-ids —
   are mount-dependent, and a moved tree cannot reuse its own product cache. v2 stores
   tree-relative spellings; `PackReader::open_rooted(dir, root)` strips incoming absolute
-  paths at the API boundary (every production site has the canonical src in scope; the
-  `embedding_root` derivation covers the debug commands that don't). Senders are untouched.
+  paths at the API boundary. Build/daemon sites pass the canonical src they already hold;
+  query surfaces handed only an index dir derive the root EXACTLY from the generation's
+  own manifest (`open_generation_pack`: every entry must strip to a pack hit and the
+  counts must match — acceptance is provably unique, and failure degrades to rootless
+  misses, never wrong bytes; suffix-guessing was rejected because a same-suffix twin can
+  byte-verify wrongly). Senders are untouched.
 - **B is a pure function of the tree** (`clamp(next_pow2(files / TARGET), B_MIN, B_MAX)`,
   constants from the two-scale sweep below): stamping B at creation would make an
   incremental that grows past a threshold diverge byte-wise from scratch, violating the
@@ -472,6 +476,112 @@ slice ships with a constant that wasn't swept at two scales and recorded here.
   OR `products/` member, walked in sorted name order so ids stay deterministic.
 - **Migration cliff is one pack write, not a re-extract:** the first `VORPAL_FORMAT=next`
   build reuses v1 bodies through the format-sniffing reader and emits v2.
+
+#### Recorded sweep — content-id fold chunk (`HASH_CHUNK`), 2026-08-31
+
+`HASH_CHUNK` is a fold-protocol constant (chunk boundaries shape the digests the id folds,
+so it must be machine-invariant; changing it re-keys every id, absorbed as one re-commit
+per tree). The inherited 8 MiB was never swept; this run froze **1 MiB**.
+
+Command: `cargo run --release -p vorpal-index --example content_id_sweep -- <gen-dir> 3`
+(M-series laptop, quiet, artifacts page-cache-hot — the production shape: the id is
+computed immediately after the artifacts are written). Best-of-3 wall:
+
+| chunk   | kernel v1 flat (1.56 GB) | vorpal v1 flat (517 MB) | vorpal v2 bucketed (517 MB) |
+|---------|--------------------------|--------------------------|------------------------------|
+| 256 KiB | 16.38 ms                 | 5.66 ms                  | 5.65 ms                      |
+| 512 KiB | 16.58 ms                 | 5.79 ms                  | 5.80 ms                      |
+| **1 MiB**   | **16.32 ms**         | **5.61 ms**              | 5.85 ms                      |
+| 2 MiB   | 19.76 ms                 | 6.63 ms                  | 6.65 ms                      |
+| 4 MiB   | 21.19 ms                 | 7.21 ms                  | 7.19 ms                      |
+| 8 MiB (old) | 24.01 ms             | 8.35 ms                  | 8.05 ms                      |
+| 16 MiB  | 24.78 ms                 | 8.61 ms                  | 8.61 ms                      |
+| 32 MiB  | 25.82 ms                 | 8.71 ms                  | 9.14 ms                      |
+
+256 KiB–1 MiB tie within noise on every shape; 1 MiB takes the plateau with 4× fewer
+per-chunk digests than 256 KiB. The 8 MiB rows reproduced the committed generation ids
+exactly (sweep tool ≡ production fold). The parallel fold itself is schedule-only: the
+serial fold consumes per-artifact digests in fixed name order, so ids are unchanged by the
+restructure — proven by the old-binary/new-binary A/B committing identical `f3d02ef3…` on
+the same tree.
+
+#### Recorded sweep — bucket-count law (`BUCKET_TARGET_FILES`), 2026-08-31
+
+Kernel tree (76 868 manifest files), release binary, `bucket-sweep.sh` (scratchpad; per B:
+scratch v2 build, one-file edit to `mm/slab_common.c`, incremental build, inode-diff of
+bucket files across the two generations). v1 baseline on the same tree and probe:
+edit-one **1.40 s** (whole-pack rewrite: 726 MB + sidecar).
+
+| B (forced) | edit-one wall | buckets rewritten | bucket bytes rewritten | toc bytes |
+|------------|---------------|-------------------|------------------------|-----------|
+| 256        | **0.43 s**    | 1                 | 2.60 MB                | 4.16 MB   |
+| 1024       | 0.54 s        | 1                 | 0.56 MB                | 4.17 MB   |
+| 4096       | 1.24 s        | 1                 | 0.11 MB                | 4.24 MB   |
+
+Two corrections discovered post-sweep, recorded because the numbers above must be read
+with them:
+- **The sweep's "edit-one" rows measured the STAMP-CUTOFF path**, not the full pipeline:
+  the probe was a comment append at EOF, which is extraction-identical outside the stamp
+  window. The per-B ORDERING stands (the pack cost — links + rewritten buckets + TOC — is
+  the same shape on both paths), and the cutoff is a real, common edit class; but the
+  labels here mean "cutoff wall".
+- The sweep ran with the data volume near-full (≤12 GiB free of 7.3 TiB — a later v2 cold
+  hit ENOSPC), which inflated v1's row (`fs::copy` is an APFS clonefile — near-free with
+  headroom, degraded at 100% full). Healthy-disk walls below supersede the absolute
+  values.
+
+The single-bucket law held at every B. Wall is not byte-dominated in this range: past
+~100 files/bucket the per-bucket costs (hard-links, opens, mmaps at reader open) beat the
+byte savings — B=4096 (19 files/bucket) loses to B=256 (300 files/bucket) by 0.8 s while
+writing 23× fewer bucket bytes. Frozen: `BUCKET_TARGET_FILES = 512`
+(kernel → next_pow2(76 868/512) = **256**, its measured optimum; vorpal repo → MIN-clamped
+16, healthy in the vorpal-scale runs), MIN = 16, MAX = 4096 (the `{:04}` naming bound and
+comfortably past the measured over-bucketing cliff).
+
+Cold A/B (interleaved v1/v2, same tree, after freeing the volume to ~27 GiB — the sweep's
+own cold columns were disk-pressure artifacts, 31.7–48.8 s with one ENOSPC):
+
+| rep | v1 cold | v2 cold (law B=256) |
+|-----|---------|----------------------|
+| 1   | 7.46 s  | 7.43 s               |
+| 2   | 7.38 s  | 7.58 s               |
+
+The bucketed publish is free at cold scale (≤2%, within rep noise): same spool, same
+bytes, 256 sequential bucket streams + a 4 MB TOC in place of one pack stream + sidecar.
+
+Healthy-disk kernel walls, both edit classes, interleaved (the honest P4.1 scoreboard):
+
+| class                        | v1          | v2 (law B=256) |
+|------------------------------|-------------|-----------------|
+| cold                         | 6.74 s      | 7.02 s          |
+| stamp-cutoff edit (comment)  | 0.24 s      | 0.32 s          |
+| full-pipeline edit (new fn)  | 1.66–2.05 s | 1.73–1.76 s     |
+
+Reading it straight: **on APFS, P4.1 is wall-neutral today** (±0.1–0.3 s, inside the rep
+noise) because (a) `fs::copy` clones — v1's cutoff "726 MB copy" was already a metadata
+op here, and (b) the full-edit pipeline's writes land in page cache without fsync, so the
+726 MB pack rewrite was only ~0.1 s of the 1.7 s wall, which is dominated by the ~900 MB
+of still-monolithic artifacts (evidence 362 MB, nodes 179 MB, heap 154 MB, graph 154 MB,
+names 46 MB) — P4.2/P4.3's lane — plus link/resolve.
+
+What P4.1 buys, measured and structural: real write bytes per edit drop 726 MB → ~2.6 MB
++ 4.2 MB TOC (SSD wear, battery, write contention); on NON-reflink filesystems (ext4 — CI
+and most Linux hosts) v1's cutoff and full edit pay the 726 MB in real bytes and v2's
+hard-links make both O(changed); pack bytes are mount-invariant (a moved tree reuses its
+own products); and the per-bucket digest columns are the spine P4.4's O(changed) Merkle
+commit and P4.5's scoped re-resolve stand on.
+
+Kernel identity A/B (the convergence law at scale, across the format flip): scratch v2 of
+the final tree == v2 reached incrementally through a v1 prior → migration build with an
+edit → revert build (hard-link carries throughout) — both committed
+`gen/7a2dd70ca166b3dcbfe103bd738f24cf`. And the flat lane never moved: the pre-P4.1 and
+post-P4.1 binaries commit the same id on the same tree (`f3d02ef3…`), so the default path
+is byte-preserved through the whole slice, content-id refactor included.
+
+P4.1 status: CERTIFIED (workspace clippy, python-feature clippy, 131-suite release run
+all green; pack unit ladder, pack_v2 end-to-end, live_differential_v2 daemon pin, kernel
+identity A/B). The v1 read path retires after one release per the standing rule; the flip
+itself (default VORPAL_FORMAT) waits for P4.2+ so the whole revolution moves together.
 
 ## Execution order & gates
 

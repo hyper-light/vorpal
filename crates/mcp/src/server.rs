@@ -764,8 +764,9 @@ impl Server {
       // the extraction is the same per-file work the absorb pays, done once and shared;
       // the absorb budget below is the routing bound.
       && self.env.is_default()
+      && let Some(watch_src) = self.watch.as_ref().map(|watch| watch.src().to_path_buf())
     {
-      vorpal_index::live::probe_extraction(&self.index_dir, paths).ok()
+      vorpal_index::live::probe_extraction(&self.index_dir, &watch_src, paths).ok()
     } else {
       None
     };

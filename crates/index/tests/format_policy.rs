@@ -45,10 +45,17 @@ fn version_table_matches_the_constants() {
       "cache miss → re-parse",
     ),
     (
-      "product pack (`products.pack`/`products.idx`)",
+      "product pack, flat layout (`products.pack`/`products.idx`)",
       "PACK_VERSION",
       "crates/ingest/src/pack.rs",
       version_of("crates/ingest/src/pack.rs", "PACK_VERSION"),
+      "pack ignored → rebuilt by next build",
+    ),
+    (
+      "product pack, bucketed layout (`products/<k>.pack` + `products/toc.bin`, written under `VORPAL_FORMAT=next`)",
+      "BUCKET_VERSION",
+      "crates/ingest/src/pack.rs",
+      version_of("crates/ingest/src/pack.rs", "BUCKET_VERSION"),
       "pack ignored → rebuilt by next build",
     ),
     (

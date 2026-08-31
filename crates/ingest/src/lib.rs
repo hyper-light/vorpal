@@ -99,7 +99,10 @@ impl ExtractionEnv {
   }
 }
 pub use selfcheck::{verify_default_extraction, verify_env_extraction, verify_extraction};
-pub use pack::{PackMsg, PackReader, PackWriter};
+pub use pack::{
+  BucketMeta, PACK_DIR, PACK_TOC, PackFormat, PackMsg, PackReader, PackWriter, bucket_count_for,
+  bucket_file_name, is_pack_member, splice_toc_digest,
+};
 pub use retained::RetainedIndex;
 pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,

@@ -3,7 +3,10 @@
 //! and against a fresh stat of the tree. Prints the first failing condition per sampled
 //! file plus aggregate counts — the tool that answers "why did 0 of 72k files replay?".
 //!
-//!   cargo run --release -p vorpal-index --example replay_probe -- <generation-dir>
+//!   cargo run --release -p vorpal-index --example replay_probe -- <generation-dir> [tree-root]
+//!
+//! `tree-root` (the canonical source root) is required to resolve manifest paths against a
+//! bucketed (P4.1) pack; flat packs ignore it.
 
 use std::path::Path;
 
@@ -13,10 +16,11 @@ use vorpal_ingest::{
 };
 
 fn main() {
-  let gen_dir = std::env::args().nth(1).expect("usage: replay_probe <generation-dir>");
+  let gen_dir = std::env::args().nth(1).expect("usage: replay_probe <generation-dir> [tree-root]");
   let gen_dir = Path::new(&gen_dir);
+  let tree_root = std::env::args().nth(2);
   let manifest = Manifest::load(&gen_dir.join("manifest.bin")).expect("manifest load");
-  let pack = PackReader::open(gen_dir);
+  let pack = PackReader::open_rooted(gen_dir, tree_root.as_deref());
   let Some(pack) = pack else {
     println!("FAIL: PackReader::open returned None — no pack at {}", gen_dir.display());
     return;

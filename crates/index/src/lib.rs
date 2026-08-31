@@ -510,16 +510,15 @@ fn build_index_inner(
   // Phase-4 identity gate (P4.0): every file's tree-relative path must map to a unique
   // 64-bit file key — the bucketed format keys storage by it. O(files) on every build,
   // same posture as the u32 ceilings: loud and actionable, never a silent degradation.
-  {
-    let root = src.to_string_lossy();
-    vorpal_kg::identity::verify_file_keys(
-      manifest
-        .entries()
-        .iter()
-        .map(|entry| vorpal_kg::identity::tree_relative(&entry.path, &root)),
-    )
-    .map_err(io::Error::other)?;
-  }
+  // `tree_root` is also the pack's absolute→tree-relative conversion root (P4.1).
+  let tree_root: String = src.to_string_lossy().into_owned();
+  vorpal_kg::identity::verify_file_keys(
+    manifest
+      .entries()
+      .iter()
+      .map(|entry| vorpal_kg::identity::tree_relative(&entry.path, &tree_root)),
+  )
+  .map_err(io::Error::other)?;
   vorpal_kg::phase_stamp("build: grammar stamp done");
   // Generation layout (IMPROVEMENTS §4): `out` is the index *root*. The live artifacts sit in
   // an immutable, content-addressed generation dir named by `out/CURRENT`; this run reads the
@@ -555,7 +554,7 @@ fn build_index_inner(
     if racy.is_empty() {
       return true;
     }
-    let Some(pack) = PackReader::open(&prior) else {
+    let Some(pack) = PackReader::open_rooted(&prior, Some(&tree_root)) else {
       return false;
     };
     racy.iter().all(|entry| {
@@ -640,11 +639,14 @@ fn build_index_inner(
       && let Some(mut report) = try_stamp_only_cutoff(
         out,
         &prior,
-        &manifest,
-        &prior_manifest,
+        CutoffContext {
+          manifest: &manifest,
+          prior_manifest: &prior_manifest,
+          prior_manifest_ns,
+          tree_root: &tree_root,
+        },
         &extractor,
         cache_mode.label(),
-        prior_manifest_ns,
       )?
     {
       // The cutoff re-extracts changed files with this environment's extractor — the
@@ -707,13 +709,19 @@ fn build_index_inner(
   // serializes the open path) plus **loose files**, still written by search banking (separate
   // processes must not contend on the pack) and consolidated — then deleted — here. Loose
   // wins over pack on lookup: it is only ever fresher.
-  let pack_reader = PackReader::open(&prior).map(Arc::new);
+  let pack_reader = PackReader::open_rooted(&prior, Some(&tree_root)).map(Arc::new);
   let loose: HashSet<OsString> = fs::read_dir(&products_dir)
     .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
     .unwrap_or_default();
   // The writer builds the new generation's pack in staging, copying reused bodies out of the
-  // prior generation's mapping — the prior pack is never touched.
-  let pack_writer = PackWriter::new(&staging, pack_reader.clone());
+  // prior generation's mapping — the prior pack is never touched. Format per the Phase-4
+  // compat posture: flat until the flip, bucketed under VORPAL_FORMAT=next.
+  let pack_writer = PackWriter::new(
+    &staging,
+    pack_reader.clone(),
+    Some(tree_root.clone()),
+    vorpal_ingest::PackFormat::from_env(),
+  );
   let pack_sink = pack_writer.sink();
   let live_paths: Vec<String> = manifest.entries().iter().map(|e| e.path.clone()).collect();
   let pack_thread = std::thread::spawn(move || pack_writer.finish(live_paths));
@@ -1085,6 +1093,31 @@ pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
   "strings.heap",
 ];
 
+/// Whether `name` is a legal generation-artifact name: the fixed flat set, or a bucketed
+/// pack member. The import allowlist and every sweep share this single predicate.
+pub(crate) fn is_generation_artifact_name(name: &str) -> bool {
+  GENERATION_ARTIFACTS.contains(&name) || vorpal_ingest::is_pack_member(name)
+}
+
+/// Every artifact name this generation actually carries, in fixed order: the flat list
+/// (missing members skipped by callers that open them), then the bucketed pack's members
+/// (`products/<k>.pack` + `products/toc.bin`) sorted by name. The bucketed pack (P4.1) has
+/// a corpus-dependent file count, so identity and staging walk THIS, never the const alone.
+pub(crate) fn generation_artifact_names(dir: &Path) -> Vec<String> {
+  let mut names: Vec<String> = GENERATION_ARTIFACTS.iter().map(|s| s.to_string()).collect();
+  if let Ok(dirents) = fs::read_dir(dir.join(vorpal_ingest::PACK_DIR)) {
+    let mut members: Vec<String> = dirents
+      .flatten()
+      .filter_map(|e| e.file_name().into_string().ok())
+      .map(|file| format!("{}/{file}", vorpal_ingest::PACK_DIR))
+      .filter(|name| vorpal_ingest::is_pack_member(name))
+      .collect();
+    members.sort_unstable();
+    names.extend(members);
+  }
+  names
+}
+
 /// Commit a staged generation (IMPROVEMENTS §4): name it by its **content**, atomically swap
 /// the `CURRENT` pointer, and garbage-collect superseded generations.
 ///
@@ -1107,19 +1140,45 @@ pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
 /// cross-version interchange format — see docs on the shareable-artifact import for how that
 /// is handled honestly).
 pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
-  const HASH_CHUNK: u64 = 8 << 20;
-  let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-  for artifact in GENERATION_ARTIFACTS {
-    let path = dir.join(artifact);
-    let Ok(file) = fs::File::open(&path) else {
-      continue; // an artifact a smaller index legitimately lacks still yields a stable id
-    };
-    let len = file.metadata()?.len();
-    hasher.update(artifact.as_bytes());
-    hasher.update(&len.to_le_bytes());
-    let chunk_count = len.div_ceil(HASH_CHUNK);
-    let chunk_digests: io::Result<Vec<u128>> = {
-      use rayon::prelude::*;
+  generation_content_id_folded(dir, HASH_CHUNK)
+}
+
+/// The content-id fold's chunk size. A **fold-protocol constant**, not a tuning knob: chunk
+/// boundaries shape the per-chunk digests the id folds, so the value must be identical on
+/// every machine (a runtime-derived size would make generation ids machine-dependent) —
+/// changing it re-keys every generation id, which the dedup guard absorbs as one re-commit
+/// per tree. 1 MiB sits mid-plateau in the recorded two-scale sweep (docs/wip/SUBSECOND.md
+/// §P4.1, `content_id_sweep` example — linux-kernel and vorpal-repo generations, flat and
+/// bucketed): 256 KiB–1 MiB tie at the optimum on every shape, and the 8 MiB this replaced
+/// measured ~47% slower (kernel flat 24.0 ms → 16.3 ms).
+const HASH_CHUNK: u64 = 1 << 20;
+
+/// [`generation_content_id`] with an explicit chunk size — the sweep tool's entry point
+/// (`examples/content_id_sweep.rs`). Not an API: ids from non-default chunk sizes name
+/// nothing.
+#[doc(hidden)]
+pub fn generation_content_id_folded(dir: &Path, chunk: u64) -> io::Result<String> {
+  use rayon::prelude::*;
+  let hash_chunk = chunk.max(1);
+  // Two axes of parallelism, one deterministic fold. The flat layout is one ~gigabyte pack
+  // — the win is chunk-parallel hashing WITHIN the file; the bucketed layout (P4.1) is ~10³
+  // megabyte-scale files — the win is hashing ACROSS them. Both run under one nested
+  // par_iter (rayon work-steals whichever axis has work), and the serial fold below
+  // consumes per-artifact digests in fixed name order, so the id is byte-for-byte the same
+  // fold as the sequential form — parallelism is a schedule, never a semantics.
+  // (artifact length, ordered per-chunk digests) — `None` for an absent artifact.
+  type ArtifactDigest = Option<(u64, Vec<u128>)>;
+  let names = generation_artifact_names(dir);
+  let digests: io::Result<Vec<ArtifactDigest>> = names
+    .par_iter()
+    .map(|artifact| {
+      let path = dir.join(artifact);
+      let Ok(file) = fs::File::open(&path) else {
+        // An artifact a smaller index legitimately lacks still yields a stable id.
+        return Ok(None);
+      };
+      let len = file.metadata()?.len();
+      let chunk_count = len.div_ceil(hash_chunk);
       // Positional reads per chunk: threads never share a cursor, and in-flight memory
       // stays at (pool width × 8 MiB) — the whole-artifact read would have re-materialized
       // a ~gigabyte pack this build just spent effort never holding at once. Unix pread's
@@ -1137,17 +1196,26 @@ pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
         chunk_file.seek(SeekFrom::Start(offset))?;
         chunk_file.read_exact(buf)
       };
-      (0..chunk_count)
+      let chunks: io::Result<Vec<u128>> = (0..chunk_count)
         .into_par_iter()
         .map(|index| {
-          let offset = index * HASH_CHUNK;
-          let mut buf = vec![0u8; HASH_CHUNK.min(len - offset) as usize];
+          let offset = index * hash_chunk;
+          let mut buf = vec![0u8; hash_chunk.min(len - offset) as usize];
           read_chunk(&mut buf, offset)?;
           Ok(xxhash_rust::xxh3::xxh3_128(&buf))
         })
-        .collect()
+        .collect();
+      Ok(Some((len, chunks?)))
+    })
+    .collect();
+  let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+  for (artifact, entry) in names.iter().zip(digests?) {
+    let Some((len, chunks)) = entry else {
+      continue;
     };
-    for digest in chunk_digests? {
+    hasher.update(artifact.as_bytes());
+    hasher.update(&len.to_le_bytes());
+    for digest in chunks {
       hasher.update(&digest.to_le_bytes());
     }
   }
@@ -1161,15 +1229,29 @@ pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
 /// (source size, mtime, content digest — magic/version before it and the grammar digest and
 /// entire extraction body after it must be equal), and adds/removes/loose-bank products all
 /// disqualify.
+/// The manifest-side context [`try_stamp_only_cutoff`] judges a build against: the fresh
+/// and prior manifests, the prior's write clock (racy-mtime window), and the canonical
+/// tree root (the pack's absolute→relative conversion point).
+struct CutoffContext<'a> {
+  manifest: &'a Manifest,
+  prior_manifest: &'a Manifest,
+  prior_manifest_ns: u64,
+  tree_root: &'a str,
+}
+
 fn try_stamp_only_cutoff(
   out: &Path,
   prior: &Path,
-  manifest: &Manifest,
-  prior_manifest: &Manifest,
+  ctx: CutoffContext<'_>,
   extractor: &OutlineExtractor,
   cache_mode_label: &'static str,
-  prior_manifest_ns: u64,
 ) -> io::Result<Option<IndexReport>> {
+  let CutoffContext {
+    manifest,
+    prior_manifest,
+    prior_manifest_ns,
+    tree_root,
+  } = ctx;
   /// Above this many changed files the full pipeline is competitive and the cutoff's
   /// serial re-extraction is not — a policy bound, not a correctness one.
   const MAX_RESTAMPED: usize = 64;
@@ -1214,7 +1296,7 @@ fn try_stamp_only_cutoff(
       })
       .collect();
     if !racy_unchanged.is_empty() {
-      let Some(pack) = PackReader::open(prior) else {
+      let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
         return Ok(None);
       };
       let all_match = racy_unchanged.iter().all(|entry| {
@@ -1238,28 +1320,38 @@ fn try_stamp_only_cutoff(
   {
     return Ok(None);
   }
-  const CARRIED: [&str; 7] = [
+  const CARRIED: [&str; 6] = [
     "nodes.vseg",
     "strings.heap",
     "graph.bin",
     "evidence.bin",
     "dataflow.bin",
     "names.idx",
-    "products.idx",
   ];
-  for artifact in CARRIED.iter().chain(&["products.pack", "manifest.bin"]) {
+  for artifact in CARRIED.iter().chain(&["manifest.bin"]) {
     if !prior.join(artifact).exists() {
       return Ok(None);
     }
   }
-  let Some(pack) = PackReader::open(prior) else {
+  let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
     return Ok(None);
   };
+  // Pack members are layout-specific. Flat: the staging below clones the one pack file and
+  // hard-links its sidecar, so both must exist. Bucketed: members come from the TOC — and a
+  // recovery-scanned pack (no trusted TOC) cannot prove per-bucket byte identity, so it
+  // falls to the full pipeline, which republishes a consistent TOC.
+  if pack.is_bucketed() {
+    if pack.bucket_meta().is_none() {
+      return Ok(None);
+    }
+  } else if !prior.join("products.pack").exists() || !prior.join("products.idx").exists() {
+    return Ok(None);
+  }
   // Re-extract each changed file and compare against its cached product. The stamp window
   // [8..32) (size u64, mtime u64, source-xxh3 u64 at fixed offsets after magic+version) is
   // the only region allowed to differ; it is patched into the pack clone below so the pack
   // equals what the pipeline would have written (fresh stamps, identical body).
-  let mut patches: Vec<(u64, [u8; 24])> = Vec::new();
+  let mut patches: Vec<(u32, u64, [u8; 24])> = Vec::new();
   let mut encode_buf: Vec<u8> = Vec::new();
   for entry in &changed {
     let Ok(source) = fs::read_to_string(&entry.path) else {
@@ -1284,12 +1376,15 @@ fn try_stamp_only_cutoff(
     }
     // (The daemon's `extraction_unchanged` probe shares this exact window contract via
     // `extraction_matches_cache`; the cutoff additionally needs the fresh stamps below.)
-    let Some((body_off, _)) = pack.body_span(&entry.path) else {
+    let Some((bucket, body_off, _)) = pack.body_locus(&entry.path) else {
       return Ok(None);
     };
     let stamp: [u8; 24] = encode_buf[8..32].try_into().expect("stamp window");
-    patches.push((body_off + 8, stamp));
+    patches.push((bucket, body_off + 8, stamp));
   }
+  let bucketed = pack.is_bucketed();
+  let bucket_total = pack.loaded_buckets();
+  let prior_meta: Option<Vec<vorpal_ingest::BucketMeta>> = pack.bucket_meta().map(<[_]>::to_vec);
   drop(pack);
 
   // Stage the generation: hardlink (copy fallback) the byte-identical artifacts, clone the
@@ -1312,13 +1407,63 @@ fn try_stamp_only_cutoff(
       fs::copy(&from, &to)?;
     }
   }
-  fs::copy(prior.join("products.pack"), staging.join("products.pack"))?;
-  {
+  if bucketed {
+    // Bucketed layout: untouched buckets hard-link (zero bytes moved); buckets holding a
+    // restamped product COPY-then-patch — never patch through a link, the prior
+    // generation's bytes are sealed. The TOC digest column is recomputed for exactly the
+    // patched buckets and spliced into the carried TOC.
+    use std::io::{Seek, SeekFrom, Write};
+    let Some(mut meta) = prior_meta else {
+      return Ok(None); // unreachable: gated above, kept as a fact not an assumption
+    };
+    let mut by_bucket: std::collections::HashMap<u32, Vec<(u64, [u8; 24])>> =
+      std::collections::HashMap::new();
+    for (bucket, offset, stamp) in patches {
+      by_bucket.entry(bucket).or_default().push((offset, stamp));
+    }
+    fs::create_dir_all(staging.join(vorpal_ingest::PACK_DIR))?;
+    for k in 0..bucket_total {
+      let name = vorpal_ingest::bucket_file_name(k);
+      let (from, to) = (prior.join(&name), staging.join(&name));
+      let Some(bucket_patches) = by_bucket.get(&k) else {
+        if fs::hard_link(&from, &to).is_err() {
+          fs::copy(&from, &to)?;
+        }
+        continue;
+      };
+      fs::copy(&from, &to)?;
+      let mut pack_file = fs::OpenOptions::new().write(true).open(&to)?;
+      for (offset, stamp) in bucket_patches {
+        pack_file.seek(SeekFrom::Start(*offset))?;
+        pack_file.write_all(stamp)?;
+      }
+      pack_file.sync_all()?;
+      let Some(row) = meta.get_mut(k as usize) else {
+        return Ok(None);
+      };
+      row.digest = xxhash_rust::xxh3::xxh3_64(&fs::read(&to)?);
+    }
+    let mut toc = fs::read(prior.join(vorpal_ingest::PACK_TOC))?;
+    for &k in by_bucket.keys() {
+      let Some(row) = meta.get(k as usize) else {
+        return Ok(None);
+      };
+      if !vorpal_ingest::splice_toc_digest(&mut toc, k, row.digest) {
+        return Ok(None);
+      }
+    }
+    fs::write(staging.join(vorpal_ingest::PACK_TOC), &toc)?;
+  } else {
+    let (from, to) = (prior.join("products.idx"), staging.join("products.idx"));
+    if fs::hard_link(&from, &to).is_err() {
+      fs::copy(&from, &to)?;
+    }
+    fs::copy(prior.join("products.pack"), staging.join("products.pack"))?;
     use std::io::{Seek, SeekFrom, Write};
     let mut pack_file = fs::OpenOptions::new()
       .write(true)
       .open(staging.join("products.pack"))?;
-    for (offset, stamp) in &patches {
+    for (_, offset, stamp) in &patches {
       pack_file.seek(SeekFrom::Start(*offset))?;
       pack_file.write_all(stamp)?;
     }
@@ -1376,9 +1521,12 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // so the generation holds exactly its artifacts.
   for entry in fs::read_dir(&staging)?.flatten() {
     let name = entry.file_name();
-    let keep = GENERATION_ARTIFACTS
-      .iter()
-      .any(|artifact| name.as_os_str() == *artifact);
+    // The bucketed pack (P4.1) is the one artifact that is a directory; its members are
+    // swept by the predicate below.
+    let keep = name.as_os_str() == vorpal_ingest::PACK_DIR
+      || GENERATION_ARTIFACTS
+        .iter()
+        .any(|artifact| name.as_os_str() == *artifact);
     if !keep {
       let path = entry.path();
       let _ = if path.is_dir() {
@@ -1386,6 +1534,17 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       } else {
         fs::remove_file(&path)
       };
+    }
+  }
+  if let Ok(dirents) = fs::read_dir(staging.join(vorpal_ingest::PACK_DIR)) {
+    for entry in dirents.flatten() {
+      let member = entry
+        .file_name()
+        .into_string()
+        .map(|file| format!("{}/{file}", vorpal_ingest::PACK_DIR));
+      if !member.as_deref().is_ok_and(vorpal_ingest::is_pack_member) {
+        let _ = fs::remove_file(entry.path());
+      }
     }
   }
   // Content id over every artifact in fixed order. Chunked-parallel: each artifact is read
@@ -1404,7 +1563,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // freshly staged one. Same-id ⇒ same artifact set, so presence-checking staging's artifacts
   // against it is a sufficient completeness test.
   let existing_is_complete = final_dir.exists()
-    && GENERATION_ARTIFACTS
+    && generation_artifact_names(&staging)
       .iter()
       .all(|artifact| !staging.join(artifact).exists() || final_dir.join(artifact).exists());
   if existing_is_complete {
@@ -2784,7 +2943,7 @@ pub fn explain_edge_on(
     // digest to check (older generation), the snippet is labeled as current-file contents.
     if let Ok(bytes) = fs::read(&from_path) {
       let indexed_digest = artifacts_dir
-        .and_then(PackReader::open)
+        .and_then(open_generation_pack)
         .and_then(|pack| {
           pack
             .get(&from_path)
@@ -2812,6 +2971,45 @@ pub fn explain_edge_on(
 
 pub use vorpal_kg::resolve_index_dir;
 
+/// Open the pack of a committed generation for QUERY surfaces that hold only the index
+/// directory (no src root in scope), deriving the bucketed layout's stripping root
+/// **exactly** from the generation's own manifest — never by guessing.
+///
+/// Derivation: take the first manifest entry's absolute path and try every `/` boundary as
+/// the root; a candidate is accepted only if stripping it maps EVERY manifest entry onto a
+/// pack hit and the pack's live-entry count equals the manifest's. That acceptance is
+/// unique: two accepting roots would compose into a length-shifting bijection of a finite
+/// key set (every key `k` would need `x/k` present too), which cannot exist — so a false
+/// root can never pass, and a pack that fails derivation is returned rootless (absolute
+/// lookups miss, callers degrade to "unverified", wrong bytes are impossible).
+pub(crate) fn open_generation_pack(dir: &Path) -> Option<PackReader> {
+  let pack = PackReader::open(dir)?;
+  if !pack.is_bucketed() {
+    return Some(pack);
+  }
+  let Ok(manifest) = Manifest::load(&dir.join("manifest.bin")) else {
+    return Some(pack);
+  };
+  let entries = manifest.entries();
+  if entries.is_empty() || entries.len() != pack.live_entries() {
+    return Some(pack);
+  }
+  let probe = entries[0].path.as_str();
+  let mut root: Option<String> = None;
+  for (at, _) in probe.match_indices('/') {
+    let candidate = &probe[..at];
+    let accepts = entries.iter().all(|entry| {
+      let key = vorpal_kg::identity::tree_relative(&entry.path, candidate);
+      key != entry.path && pack.get(key).is_some()
+    });
+    if accepts {
+      root = Some(candidate.to_string());
+      break;
+    }
+  }
+  Some(pack.with_root(root))
+}
+
 /// Process-wide cache of open [`PackReader`]s, keyed by the **immutable** generation dir —
 /// the read-few query surfaces (`snippet`, `fetch_span`, `why`) verify one or two files per
 /// call, and opening the pack (a full sidecar parse: one entry per indexed file) costs more
@@ -2833,7 +3031,7 @@ pub(crate) fn cached_pack(generation_dir: &Path) -> Option<Arc<PackReader>> {
     }
   }
   // Open (mmap + sidecar parse) outside the lock.
-  let pack = Arc::new(PackReader::open(generation_dir)?);
+  let pack = Arc::new(open_generation_pack(generation_dir)?);
   let mut guard = cache.lock().unwrap();
   if let Some(pos) = guard.iter().position(|(dir, _)| dir == generation_dir) {
     return Some(guard[pos].1.clone());
@@ -2923,7 +3121,7 @@ pub fn read_indexed_source_with(
 pub fn parse_health_report(index_dir: &Path) -> Result<String, Box<dyn Error>> {
   let dir = vorpal_kg::resolve_index_dir(index_dir);
   let kg = Kg::load(&dir)?;
-  let pack = PackReader::open(&dir).ok_or("no product pack in this generation")?;
+  let pack = open_generation_pack(&dir).ok_or("no product pack in this generation")?;
 
   // One pass over the nodes: file paths, and per-path entity lists for overlap checks.
   let mut files: Vec<(u64, String)> = Vec::new();

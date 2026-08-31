@@ -64,13 +64,20 @@ impl ExtractionProbe {
 
 /// Extract every hinted path once, comparing against the committed generation's cached
 /// products. The decision logic mirrors `vorpal_index::extraction_unchanged`; the extracted
-/// bytes ride along for [`LiveOverlay::apply_and_link_probed`].
+/// bytes ride along for [`LiveOverlay::apply_and_link_probed`]. `src` is the watched tree
+/// root — the bucketed pack's stripping root for the absolute paths probed here.
 pub fn probe_extraction(
   index_dir: &Path,
+  src: &Path,
   paths: &HashSet<PathBuf>,
 ) -> Result<ExtractionProbe, String> {
   let generation = vorpal_kg::resolve_index_dir(index_dir);
-  let pack = PackReader::open(&generation);
+  let tree_root = src
+    .canonicalize()
+    .unwrap_or_else(|_| src.to_path_buf())
+    .to_string_lossy()
+    .into_owned();
+  let pack = PackReader::open_rooted(&generation, Some(&tree_root));
   let extractor =
     OutlineExtractor::new().map_err(|err| format!("probe: extractor init failed: {err}"))?;
   let mut ordered: Vec<&PathBuf> = paths.iter().collect();
@@ -152,7 +159,12 @@ impl LiveOverlay {
     let generation = vorpal_kg::resolve_index_dir(index_dir);
     let manifest = Manifest::load(&generation.join("manifest.bin"))
       .map_err(|err| format!("overlay: manifest load failed: {err}"))?;
-    let pack = PackReader::open(&generation);
+    let overlay_root = src
+      .canonicalize()
+      .unwrap_or_else(|_| src.to_path_buf())
+      .to_string_lossy()
+      .into_owned();
+    let pack = PackReader::open_rooted(&generation, Some(&overlay_root));
     let products_dir = index_dir.join("products");
     let extractor =
       OutlineExtractor::new().map_err(|err| format!("overlay: extractor init failed: {err}"))?;
@@ -511,6 +523,14 @@ impl LiveOverlay {
       prior,
       out,
       new_products,
+      // Canonicalized so it matches the manifest's stored spellings whatever spelling the
+      // daemon was booted with.
+      tree_root: self
+        .src
+        .canonicalize()
+        .unwrap_or_else(|_| self.src.clone())
+        .to_string_lossy()
+        .into_owned(),
     };
     Ok((kg, persist))
   }
@@ -542,6 +562,8 @@ pub struct ServedPersist {
   prior: PathBuf,
   out: PathBuf,
   new_products: Vec<(String, Vec<u8>)>,
+  /// Canonical tree root — the pack's absolute→tree-relative conversion point (P4.1).
+  tree_root: String,
 }
 
 impl ServedPersist {
@@ -554,6 +576,7 @@ impl ServedPersist {
       prior,
       out,
       new_products,
+      tree_root,
     } = self;
     vorpal_kg::phase_stamp("served persist: start");
     let staging = out.join("gen").join(format!(
@@ -567,8 +590,13 @@ impl ServedPersist {
     let (pack_result, evidence_result, dataflow_result, kg_result) =
       std::thread::scope(|scope| {
         let pack_task = scope.spawn(|| -> std::io::Result<()> {
-          let reader = PackReader::open(&prior).map(Arc::new);
-          let writer = PackWriter::new(&staging, reader);
+          let reader = PackReader::open_rooted(&prior, Some(&tree_root)).map(Arc::new);
+          let writer = PackWriter::new(
+            &staging,
+            reader,
+            Some(tree_root.clone()),
+            vorpal_ingest::PackFormat::from_env(),
+          );
           let sink = writer.sink();
           for (path, body) in new_products {
             sink

@@ -23,7 +23,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::GENERATION_ARTIFACTS;
 
 const MANIFEST_NAME: &str = "VIDX-MANIFEST";
 const FORMAT_LINE: &str = "vidx 1";
@@ -70,9 +69,9 @@ pub fn export_generation(index_root: &Path, out_file: &Path) -> Result<ExportRep
 
   // Manifest first: names, lengths, and raw-byte digests (version-stable tamper checks).
   let mut manifest = format!("{FORMAT_LINE}\ncontent-id {content_id}\n");
-  let mut present: Vec<&str> = Vec::new();
-  for artifact in GENERATION_ARTIFACTS {
-    let path = dir.join(artifact);
+  let mut present: Vec<String> = Vec::new();
+  for artifact in crate::generation_artifact_names(&dir) {
+    let path = dir.join(&artifact);
     let Ok(bytes) = fs::read(&path) else {
       continue;
     };
@@ -197,8 +196,12 @@ pub fn import_generation(vidx: &Path, index_root: &Path) -> Result<ImportReport,
          corrupt or tampered; nothing was installed"
       ));
     }
-    fs::write(staging.join(&name), &bytes)
-      .map_err(|err| format!("staging artifact {name}: {err}"))?;
+    let dst = staging.join(&name);
+    if let Some(parent) = dst.parent().filter(|p| *p != staging.as_path()) {
+      fs::create_dir_all(parent)
+        .map_err(|err| format!("staging artifact {name}: {err}"))?;
+    }
+    fs::write(&dst, &bytes).map_err(|err| format!("staging artifact {name}: {err}"))?;
     seen += 1;
   }
   if seen != expected.len() {
@@ -229,9 +232,9 @@ pub fn import_generation(vidx: &Path, index_root: &Path) -> Result<ImportReport,
   })
 }
 
-/// `artifact name → (length, digest-hex)`, keyed by the canonical `GENERATION_ARTIFACTS`
-/// entries so lookups borrow statics.
-type ManifestArtifacts = BTreeMap<&'static str, (u64, String)>;
+/// `artifact name → (length, digest-hex)`. Owned keys: the bucketed pack's member names
+/// (`products/<k>.pack`) are corpus-dependent, not a fixed static set.
+type ManifestArtifacts = BTreeMap<String, (u64, String)>;
 
 /// Parse the manifest: `(content id, artifacts)`.
 fn parse_manifest(text: &str) -> Result<(String, ManifestArtifacts), String> {
@@ -252,20 +255,16 @@ fn parse_manifest(text: &str) -> Result<(String, ManifestArtifacts), String> {
     let mut parts = line.split(' ');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
       (Some("artifact"), Some(name), Some(len), Some(digest)) => {
-        // Only names from the fixed artifact set are ever accepted, however the manifest
-        // was produced.
-        if !GENERATION_ARTIFACTS.contains(&name) {
+        // Only legal artifact names are ever accepted, however the manifest was produced:
+        // the fixed flat set, or a bucketed pack member — the shared predicate admits no
+        // separators beyond the single `products/` prefix, so a name can never traverse.
+        if !crate::is_generation_artifact_name(name) {
           return Err(format!("manifest names unknown artifact '{name}'"));
         }
         let len: u64 = len
           .parse()
           .map_err(|_| format!("manifest length for {name} is not a number"))?;
-        let canonical = GENERATION_ARTIFACTS
-          .iter()
-          .find(|known| **known == name)
-          .copied()
-          .ok_or_else(|| format!("manifest names unknown artifact '{name}'"))?;
-        expected.insert(canonical, (len, digest.to_string()));
+        expected.insert(name.to_string(), (len, digest.to_string()));
       }
       _ => return Err(format!("malformed manifest line: '{line}'")),
     }

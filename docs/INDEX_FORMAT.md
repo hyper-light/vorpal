@@ -39,7 +39,8 @@ by its first rebuild (pinned by `legacy_flat_index_migrates_on_rebuild`).
 | Artifact | Constant | Value | On mismatch |
 |---|---|---|---|
 | extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 17 | cache miss → re-parse |
-| product pack (`products.pack`/`products.idx`) | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
+| product pack, flat layout (`products.pack`/`products.idx`) | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
+| product pack, bucketed layout (`products/<k>.pack` + `products/toc.bin`, written under `VORPAL_FORMAT=next`) | `BUCKET_VERSION` (crates/ingest/src/pack.rs) | 1 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
 | evidence sidecar (`evidence.bin`) | `VERSION` (crates/kg/src/evidence.rs) | 2 | sidecar treated as absent → `why` reports no evidence |
 | data-flow sidecar (`dataflow.bin`) | `VERSION` (crates/kg/src/dataflow.rs) | 1 | load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows) |
