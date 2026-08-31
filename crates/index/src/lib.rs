@@ -35,7 +35,7 @@ use vorpal_ann::learned::{LearnedModel, LearnedStaticEmbedder, TrainResources, s
 use vorpal_ann::{AnnIndex, Embedder, LexicalEmbedder, ModelProvenance, tokenize};
 use vorpal_ingest::{
   ExtractScratch, Manifest, OutlineExtractor, PackMsg, PackReader, PackWriter, Resolver,
-  StreamWork, cache_file_name, decode_product, encode_product_into,
+  StreamWork, cache_file_name, decode_product,
   load_product, peek_product_stamps, save_product, stream_apply_spilled,
   validate_product,
 };
@@ -455,6 +455,7 @@ pub fn build_index_env(
     &spill_path,
     Some(&heap_stream),
     pack_reader.as_deref(),
+    Some(&pack_sink),
     |entry, scratch: &mut ExtractScratch| {
       let cache_name = cache_file_name(&entry.path);
       if loose.contains(&OsString::from(&cache_name)) {
@@ -536,36 +537,46 @@ pub fn build_index_env(
       let Ok(source) = scratch.read_source(Path::new(&entry.path)) else {
         return Ok(StreamWork::Skipped);
       };
-      let Some(mut product) = extractor.extract_product(&entry.path, source) else {
+      // Extract-and-encode without materializing the owned product: borrowed parts serialize
+      // straight into this buffer, stamped with the entry's stat identity — byte-identical
+      // to encoding the stamped owned product (pinned by test). A fresh Vec per file is the
+      // old flow's cost too: mem::take surrendered the scratch buffer to the pack message
+      // every file, so there was never any capacity to reuse.
+      let mut body = Vec::new();
+      let Some(stats) = extractor.extract_product_encoded(
+        &entry.path,
+        source,
+        entry.size,
+        entry.mtime_ns,
+        &mut body,
+      ) else {
         return Ok(StreamWork::Skipped);
       };
-      if product.error_nodes > 0 {
+      if stats.error_nodes > 0 {
         error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        error_nodes.fetch_add(product.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
-        error_bytes.fetch_add(product.error_bytes, std::sync::atomic::Ordering::Relaxed);
+        error_nodes.fetch_add(stats.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
+        error_bytes.fetch_add(stats.error_bytes, std::sync::atomic::Ordering::Relaxed);
       }
-      let unhealthy = policy.is_unhealthy(product.error_bytes, entry.size);
+      let unhealthy = policy.is_unhealthy(stats.error_bytes, entry.size);
       if unhealthy && policy.mode == ParseHealthMode::Fail {
-        note_unhealthy(&entry.path, product.error_bytes, entry.size);
+        note_unhealthy(&entry.path, stats.error_bytes, entry.size);
       }
-      let excluded = unhealthy && policy.mode == ParseHealthMode::Exclude;
-      product.source_size = entry.size;
-      product.source_mtime_ns = entry.mtime_ns;
-      scratch.encode.clear();
-      encode_product_into(&product, &mut scratch.encode);
-      // Move the encoded bytes into the message — cloning re-copied every parsed product
-      // (half a gigabyte on a cold kernel build); the scratch buffer regrows on next use.
-      pack_sink
-        .send(PackMsg {
-          path: entry.path.clone(),
-          body: std::mem::take(&mut scratch.encode),
-        })
-        .map_err(send_fatal)?;
-      if excluded {
+      if unhealthy && policy.mode == ParseHealthMode::Exclude {
+        // Excluded from the graph but still banked (exclusion is a graph decision, not a
+        // cache one) — this entry never reaches a committer, so the worker packs it itself.
+        pack_sink
+          .send(PackMsg {
+            path: entry.path.clone(),
+            body,
+          })
+          .map_err(send_fatal)?;
         excluded_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(StreamWork::Skipped);
       }
-      Ok(StreamWork::Parsed(entry.path.clone(), product))
+      // Healthy fresh parse: the buffer MOVES to the committer, which applies its decoded
+      // views and forwards the same buffer into the pack sink — one owner end to end, no
+      // copy, no sharing (the pack's canonical sort makes arrival order irrelevant).
+      Ok(StreamWork::ParsedEncoded(entry.path.clone(), body))
     },
   );
   drop(pack_sink);

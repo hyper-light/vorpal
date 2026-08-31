@@ -375,9 +375,121 @@ impl OutlineExtractor {
 impl OutlineExtractor {
   /// Extract one file into a cacheable [`FileProduct`]: outline items plus references keyed by
   /// their enclosing definition's *entity path* (stable across runs, unlike `NodeId`s). This is
-  /// the single extraction path — live ingest applies the product immediately; incremental
-  /// re-index replays persisted products for unchanged files.
+  /// the owning finish over the single extraction body ([`OutlineExtractor::extract_with`]) —
+  /// batch ingest, tests, and single-file callers take it; the streaming pipeline uses
+  /// [`OutlineExtractor::extract_product_encoded`] and never materializes the owned product.
   pub fn extract_product(&self, path: &str, source: &str) -> Option<FileProduct> {
+    self.extract_with(path, source, |parts| FileProduct {
+      version: product::PRODUCT_FORMAT_VERSION,
+      // The never-matching default stamp: persisting callers stat the source and stamp the
+      // product; an unstamped product can never replay. The content digest is stamped from
+      // the exact bytes extraction saw — the identity staged validation trusts.
+      source_size: 0,
+      source_mtime_ns: 0,
+      source_xxh3: parts.source_xxh3,
+      grammar_digest: parts.grammar_digest,
+      error_nodes: parts.error_nodes,
+      error_bytes: parts.error_bytes,
+      error_spans: parts.error_spans,
+      items: parts.items.into_iter().map(product::own_item).collect(),
+      // The batch-path ownership point: names/qualifiers rode through extraction as borrows
+      // of `source`; they are copied exactly once, here, into the detachable product.
+      refs: parts
+        .refs
+        .into_iter()
+        .map(|r| ProductRef {
+          from_entity_index: r.from_entity_index,
+          name: r.name.into_owned(),
+          kind: r.kind,
+          start: r.start,
+          end: r.end,
+          qualifier: r.qualifier.map(Cow::into_owned),
+          form: r.form,
+          alias: r.alias.map(Cow::into_owned),
+          receiver_type: r.receiver_type.map(str::to_string),
+          receiver_type_origin: r.receiver_type_origin,
+          receiver: r.receiver.map(Cow::into_owned),
+          args: r
+            .args
+            .into_iter()
+            .map(|arg| product::ProductArg {
+              index: arg.index,
+              class: arg.class as u8,
+              kw_name: arg.kw_name.map(Cow::into_owned),
+              expr: arg.expr.map(Cow::into_owned),
+            })
+            .collect(),
+        })
+        .collect(),
+      entity_params: parts
+        .entity_params
+        .into_iter()
+        .map(|(entity, params)| {
+          (
+            entity,
+            params
+              .into_iter()
+              .map(|(name, ty)| (name.to_string(), ty.map(str::to_string)))
+              .collect(),
+          )
+        })
+        .collect(),
+      returns: parts
+        .returns
+        .into_iter()
+        .map(|(name, ret)| (name.to_string(), ret.to_string()))
+        .collect(),
+      signatures: parts.signatures,
+      requests: parts
+        .requests
+        .into_iter()
+        .map(|r| product::ProductRequest {
+          from_entity_index: r.from.raw() as u32,
+          method: r.method,
+          path: r.path.into_owned(),
+          start: r.start,
+          end: r.end,
+        })
+        .collect(),
+    })
+  }
+
+  /// [`OutlineExtractor::extract_product`] that never materializes the owned product: the
+  /// borrowed extraction is encoded straight into `buf` as stamped `.vpb` bytes —
+  /// byte-identical to `encode_product` of the stamped owned product (pinned by test). The
+  /// streaming pipeline ships these bytes to the pack writer AND the committer (which
+  /// applies them as decoded views), so the per-entity and per-reference `String` copies of
+  /// the owning path — ~25 % of stream allocation samples at kernel scale — never happen.
+  /// Returns the parse-health numbers the admission policy reads; `None` = not extractable
+  /// (`buf` left cleared-but-unfilled by the caller's convention).
+  pub fn extract_product_encoded(
+    &self,
+    path: &str,
+    source: &str,
+    source_size: u64,
+    source_mtime_ns: u64,
+    buf: &mut Vec<u8>,
+  ) -> Option<product::ProductStats> {
+    self.extract_with(path, source, |parts| {
+      let stats = product::ProductStats {
+        error_nodes: parts.error_nodes,
+        error_bytes: parts.error_bytes,
+      };
+      product::encode_parts_into(&parts, source_size, source_mtime_ns, buf);
+      stats
+    })
+  }
+
+  /// The single extraction body: parse, outline, references, typefacts — everything
+  /// BORROWED — then hand the assembled [`product::ExtractedParts`] to `finish` while the
+  /// parse tree is still alive. The two product finishes above are the only callers, so
+  /// extraction semantics can never fork between the owned and encoded forms.
+  fn extract_with<R>(
+    &self,
+    path: &str,
+    source: &str,
+    finish: impl FnOnce(product::ExtractedParts<'_>) -> R,
+  ) -> Option<R> {
     let lang = SgLang::from_path(path)?;
     let combined = self.by_lang.get(lang);
     // A data spec (dynamic language, or a user override) wins over the builtin const table.
@@ -595,11 +707,12 @@ impl OutlineExtractor {
     }
 
     // Per-entity parameter lists: every Param binding attributed to its innermost enclosing
-    // definition span, in file order (dfs order is file order).
-    let mut entity_params: product::EntityParams = Vec::new();
+    // definition span, in file order (dfs order is file order). Borrowed — the finish
+    // decides whether the strings are copied (owned product) or encoded in place.
+    let mut entity_params: Vec<(u32, Vec<(&str, Option<&str>)>)> = Vec::new();
     {
       let mut cursor = crate::references::SpanCursor::new(&spans);
-      let mut by_entity: std::collections::BTreeMap<u32, Vec<(String, Option<String>)>> =
+      let mut by_entity: std::collections::BTreeMap<u32, Vec<(&str, Option<&str>)>> =
         std::collections::BTreeMap::new();
       for binding in &bindings {
         if binding.origin != crate::typefacts::BindOrigin::Param {
@@ -609,10 +722,7 @@ impl OutlineExtractor {
           by_entity
             .entry(from.raw() as u32)
             .or_default()
-            .push((
-              binding.name.to_string(),
-              binding.ty.as_deref().map(str::to_string),
-            ));
+            .push((binding.name.as_ref(), binding.ty.as_deref()));
         }
       }
       entity_params.extend(by_entity);
@@ -620,54 +730,39 @@ impl OutlineExtractor {
 
     // The chained-call return ledger (v15): function name → declared return type, file-
     // local rows; the link-time map poisons cross-file disagreements.
-    let returns: Vec<(String, String)> = bindings
+    let returns: Vec<(&str, &str)> = bindings
       .iter()
       .filter(|b| b.origin == crate::typefacts::BindOrigin::Return)
-      .filter_map(|b| Some((b.name.to_string(), b.ty.as_deref()?.to_string())))
+      .filter_map(|b| Some((b.name.as_ref(), b.ty.as_deref()?)))
       .collect();
 
-    // The single ownership point: names/qualifiers rode through extraction as borrows of
-    // `source`; they are copied exactly once, here, into the detachable product.
-    let refs = raw
+    // References stay borrowed; receiver typing is resolved HERE, once, so the owning and
+    // encoding finishes see identical evidence.
+    let refs: Vec<product::RefParts<'_>> = raw
       .into_iter()
       .map(|r| {
         let receiver_typing = r
           .receiver
           .as_deref()
           .and_then(|name| typed.get(name).copied().flatten());
-        ProductRef {
+        product::RefParts {
           from_entity_index: r.from.raw() as u32,
-          name: r.name.into_owned(),
+          name: r.name,
           kind: product::refkind_tag(r.kind),
           start: r.start,
           end: r.end,
-          qualifier: r.qualifier.map(Cow::into_owned),
+          qualifier: r.qualifier,
           form: product::refform_tag(r.form),
-          alias: r.alias.map(Cow::into_owned),
-          receiver_type: receiver_typing.map(|(ty, _)| ty.to_string()),
+          alias: r.alias,
+          receiver_type: receiver_typing.map(|(ty, _)| ty),
           receiver_type_origin: receiver_typing.map(|(_, o)| o.tag()).unwrap_or(0xFF),
-          receiver: r.receiver.map(Cow::into_owned),
-          args: r
-            .args
-            .into_iter()
-            .map(|arg| product::ProductArg {
-              index: arg.index,
-              class: arg.class as u8,
-              kw_name: arg.kw_name.map(Cow::into_owned),
-              expr: arg.expr.map(Cow::into_owned),
-            })
-            .collect(),
+          receiver: r.receiver,
+          args: r.args,
         }
       })
       .collect();
 
-    Some(FileProduct {
-      version: product::PRODUCT_FORMAT_VERSION,
-      // The never-matching default stamp: persisting callers stat the source and stamp the
-      // product; an unstamped product can never replay. The content digest is stamped from
-      // the exact bytes extraction saw — the identity staged validation trusts.
-      source_size: 0,
-      source_mtime_ns: 0,
+    Some(finish(product::ExtractedParts {
       source_xxh3: xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
       // Extraction identity: the language's grammar generation folded with the outline-rule
       // digest, so the cache invalidates a product once either the parser or the rules change.
@@ -675,22 +770,13 @@ impl OutlineExtractor {
       error_nodes,
       error_bytes,
       error_spans,
-      items: items.into_iter().map(product::own_item).collect(),
+      items,
       refs,
       entity_params,
       returns,
       signatures,
-      requests: raw_requests
-        .into_iter()
-        .map(|r| product::ProductRequest {
-          from_entity_index: r.from.raw() as u32,
-          method: r.method,
-          path: r.path.into_owned(),
-          start: r.start,
-          end: r.end,
-        })
-        .collect(),
-    })
+      requests: raw_requests,
+    }))
   }
 }
 

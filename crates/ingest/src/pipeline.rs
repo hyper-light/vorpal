@@ -1797,6 +1797,13 @@ impl ExtractScratch {
 pub enum StreamWork {
   /// Freshly parsed this run.
   Parsed(String, crate::FileProduct),
+  /// Freshly parsed and already encoded to stamped `.vpb` bytes
+  /// (`OutlineExtractor::extract_product_encoded`): the committer decodes views straight off
+  /// the bytes and applies them — no owned product ever exists. Single-owner all the way:
+  /// the buffer MOVES worker → committer → pack thread (the committer forwards it into the
+  /// pack sink after applying; the pack's canonical path-sort makes arrival order
+  /// irrelevant), so nothing is shared and nothing is copied.
+  ParsedEncoded(String, Vec<u8>),
   /// Replayed from the incremental cache.
   Replayed(String, crate::FileProduct),
   /// Replayed from the products pack: only the path travels — the committer decodes views
@@ -1823,6 +1830,14 @@ enum Slot {
     path: String,
     product: Box<crate::FileProduct>,
     parsed: bool,
+    reserved: u64,
+  },
+  /// A fresh parse already encoded to `.vpb` bytes — applied as decoded views, like
+  /// [`Slot::Packed`] but off the in-flight buffer instead of the mapped pack; the buffer
+  /// then moves on into the pack sink.
+  ProductBytes {
+    path: String,
+    bytes: Vec<u8>,
     reserved: u64,
   },
   Packed {
@@ -1871,6 +1886,7 @@ where
     RefSink::Ram(&mut references, &mut flow),
     None,
     None,
+    None,
   )?;
   Ok((writer, references, stats))
 }
@@ -1886,6 +1902,7 @@ pub fn stream_apply_spilled<'i, F>(
   spill_path: &std::path::Path,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
+  pack_out: Option<&crossbeam_channel::Sender<crate::PackMsg>>,
   work: F,
 ) -> io::Result<(
   KgWriter,
@@ -1925,6 +1942,7 @@ where
     ),
     heap_stream_path,
     pack,
+    pack_out,
   )?;
   let flow_spill = FlowSpill {
     args: arg_writer.finish()?,
@@ -1953,6 +1971,7 @@ fn stream_apply_impl<'i, F>(
   mut sink: RefSink<'_, 'i>,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
+  pack_out: Option<&crossbeam_channel::Sender<crate::PackMsg>>,
 ) -> io::Result<(KgWriter, StreamStats)>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
@@ -1992,6 +2011,20 @@ where
         StreamWork::Parsed(path, product) => {
           parsed += 1;
           apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut flow));
+        }
+        StreamWork::ParsedEncoded(path, bytes) => {
+          {
+            let view = crate::product::decode_product_view(&bytes).map_err(|e| {
+              io::Error::other(format!("freshly encoded product failed to decode ({path}): {e}"))
+            })?;
+            apply_product_view_with_args(interner, &path, &view, &mut writer, &mut references, Some(&mut flow));
+            parsed += 1;
+          }
+          if let Some(pack_out) = pack_out {
+            pack_out
+              .send(crate::PackMsg { path, body: bytes })
+              .map_err(|_| io::Error::other("pack sink closed during streaming"))?;
+          }
         }
         StreamWork::Replayed(path, product) => {
           replayed += 1;
@@ -2067,6 +2100,7 @@ where
       .enumerate()
       .map(|(committer_index, slot_rx)| {
         let budget = &budget;
+        let fail = &fail;
         let done_tx = done_tx.clone();
         scope.spawn(move || {
           let owned_shards: Vec<usize> =
@@ -2109,6 +2143,33 @@ where
                   } else {
                     replayed += 1;
                   }
+                }
+                Slot::ProductBytes { path, bytes, reserved } => {
+                  // Bytes a worker encoded moments ago: decode views, apply, then MOVE the
+                  // buffer on into the pack sink — single owner end to end. A decode failure
+                  // is an internal bug, surfaced through the run's error path (never a
+                  // silent drop, never a panic), and its bytes are never banked.
+                  let decoded = match crate::product::decode_product_view(&bytes) {
+                    Ok(view) => {
+                      let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
+                      apply_product_view_with_args(interner, &path, &view, writer, references, Some(flow));
+                      parsed += 1;
+                      true
+                    }
+                    Err(e) => {
+                      fail(io::Error::other(format!(
+                        "freshly encoded product failed to decode ({path}): {e}"
+                      )));
+                      false
+                    }
+                  };
+                  if decoded
+                    && let Some(pack_out) = pack_out
+                    && pack_out.send(crate::PackMsg { path, body: bytes }).is_err()
+                  {
+                    fail(io::Error::other("pack sink closed during streaming"));
+                  }
+                  budget.release(reserved);
                 }
                 Slot::Packed { path, reserved } => {
                   // Decode views straight out of the mapped pack and apply — validated by
@@ -2167,6 +2228,11 @@ where
                 path,
                 product: Box::new(product),
                 parsed: true,
+                reserved,
+              },
+              Ok(StreamWork::ParsedEncoded(path, bytes)) => Slot::ProductBytes {
+                path,
+                bytes,
                 reserved,
               },
               Ok(StreamWork::Replayed(path, product)) => Slot::Product {

@@ -799,22 +799,13 @@ fn parent_dir(path: &str) -> &str {
   path.rfind('/').map(|i| &path[..i]).unwrap_or("")
 }
 
-/// Join a relative segment path onto a directory, resolving `.` and `..` textually. An absolute
-/// `rel` ignores `dir`; an absolute `dir` keeps its leading slash through the split/join.
-fn join_normalize(dir: &str, rel: &str) -> String {
-  let mut out = String::new();
-  join_normalize_into(dir, rel, &mut out);
-  out
-}
-
-/// Allocation-free core of [`join_normalize`]: writes the joined path into
-/// `out` (cleared first). Exactly the Vec-collect-and-join semantics —
-/// including empty segments inherited verbatim from `dir` (`a//b` stays
-/// `a//b`; `..` over an empty segment truncates to the previous `/`).
-/// [`join_normalize`] delegates here, so the two can never drift. The probe
-/// paths call this with a reused scratch `String`: the Vec<&str> + join +
-/// format chain it replaces allocated two-to-three times per import probe,
-/// ~a million times per kernel-scale link.
+/// Join a relative segment path onto a directory, resolving `.` and `..` textually, into
+/// `out` (cleared first). An absolute `rel` ignores `dir`; an absolute `dir` keeps its
+/// leading slash through the split/join. Exactly the historical Vec-collect-and-join
+/// semantics — including empty segments inherited verbatim from `dir` (`a//b` stays
+/// `a//b`; `..` over an empty segment truncates to the previous `/`). The probe paths call
+/// this with a reused scratch `String`: the Vec<&str> + join + format chain it replaced
+/// allocated two-to-three times per import probe, ~a million times per kernel-scale link.
 fn join_normalize_into(dir: &str, rel: &str, out: &mut String) {
   out.clear();
   let absolute = rel.starts_with('/');

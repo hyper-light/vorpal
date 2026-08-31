@@ -96,7 +96,7 @@ pub use pipeline::{
   stream_apply, stream_apply_spilled,
 };
 pub use product::{
-  FileProduct, ProductRef, ProductRequest, ProductSignature, ProductView, RefView,
+  FileProduct, ProductRef, ProductRequest, ProductSignature, ProductStats, ProductView, RefView,
   RequestView, SignatureView, cache_file_name, decode_product,
   decode_product_view, encode_product_into, load_product, peek_product_digest,
   peek_product_error_bytes, peek_product_error_nodes, peek_product_grammar_digest,

@@ -12,6 +12,7 @@
 //! decode is bounds-checked and versioned; any mismatch is an error the incremental path treats
 //! as a cache miss.
 
+use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -260,6 +261,183 @@ fn intern_kind(name: &str) -> &'static str {
   let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
   writable.insert(leaked);
   leaked
+}
+
+/// What the encoding finish reports back to the streaming work closure: the parse-health
+/// numbers the admission policy reads before the encoded bytes ship.
+#[derive(Clone, Copy, Debug)]
+pub struct ProductStats {
+  pub error_nodes: u32,
+  pub error_bytes: u64,
+}
+
+/// One reference while the parse tree is still alive — the borrowed twin of [`ProductRef`],
+/// with receiver typing already resolved so the two finishes cannot derive it differently.
+pub(crate) struct RefParts<'a> {
+  pub(crate) from_entity_index: u32,
+  pub(crate) name: Cow<'a, str>,
+  pub(crate) kind: u8,
+  pub(crate) start: u32,
+  pub(crate) end: u32,
+  pub(crate) qualifier: Option<Cow<'a, str>>,
+  pub(crate) form: u8,
+  pub(crate) alias: Option<Cow<'a, str>>,
+  pub(crate) receiver: Option<Cow<'a, str>>,
+  pub(crate) receiver_type: Option<&'a str>,
+  pub(crate) receiver_type_origin: u8,
+  pub(crate) args: Vec<crate::references::RawArg<'a>>,
+}
+
+/// Extraction output while the parse tree is still alive — every string borrowed. Both
+/// product finishes consume this one shape: the owning finish copies it into a
+/// [`FileProduct`] (batch path, tests, single-file callers); the encoding finish serializes
+/// it straight into `.vpb` bytes ([`encode_parts_into`]) without materializing an owned
+/// product — the streaming hot path. All field derivation (receiver typing, entity params,
+/// returns) happens once, upstream, so the finishes cannot disagree.
+pub(crate) struct ExtractedParts<'a> {
+  pub(crate) source_xxh3: u64,
+  pub(crate) grammar_digest: u64,
+  pub(crate) error_nodes: u32,
+  pub(crate) error_bytes: u64,
+  pub(crate) error_spans: Vec<(u32, u32)>,
+  pub(crate) items: Vec<OutlineItem<'a>>,
+  pub(crate) refs: Vec<RefParts<'a>>,
+  pub(crate) entity_params: Vec<(u32, Vec<(&'a str, Option<&'a str>)>)>,
+  pub(crate) returns: Vec<(&'a str, &'a str)>,
+  pub(crate) signatures: Vec<ProductSignature>,
+  pub(crate) requests: Vec<crate::references::RawRequest<'a>>,
+}
+
+/// Byte-for-byte twin of [`encode_product_into`] over borrowed [`ExtractedParts`] — the
+/// streaming path's encoder, stamped with the caller's stat identity (the owned path stamps
+/// after construction instead). `parts_encoding_is_byte_identical_to_owned_encoding` pins
+/// the two encoders equal on real extractions; a divergence is a red test, never a corrupt
+/// cache entry.
+pub(crate) fn encode_parts_into(
+  parts: &ExtractedParts<'_>,
+  source_size: u64,
+  source_mtime_ns: u64,
+  buf: &mut Vec<u8>,
+) {
+  let rollback = buf.len();
+  buf.extend_from_slice(PRODUCT_MAGIC);
+  push_u32(buf, PRODUCT_FORMAT_VERSION);
+  buf.extend_from_slice(&source_size.to_le_bytes());
+  buf.extend_from_slice(&source_mtime_ns.to_le_bytes());
+  buf.extend_from_slice(&parts.source_xxh3.to_le_bytes());
+  buf.extend_from_slice(&parts.grammar_digest.to_le_bytes());
+  push_u32(buf, parts.error_nodes);
+  buf.extend_from_slice(&parts.error_bytes.to_le_bytes());
+  push_u32(buf, parts.error_spans.len() as u32);
+  for &(start, end) in &parts.error_spans {
+    push_u32(buf, start);
+    push_u32(buf, end);
+  }
+  push_u32(buf, parts.items.len() as u32);
+  for item in &parts.items {
+    if push_entry(buf, &item.entry).is_err() {
+      buf.truncate(rollback);
+      return;
+    }
+    buf.push(u8::from(item.is_import) | (u8::from(item.is_exported) << 1));
+    push_u32(buf, item.members.len() as u32);
+    for member in &item.members {
+      if push_entry(buf, &member.entry).is_err() {
+        buf.truncate(rollback);
+        return;
+      }
+      buf.push(u8::from(member.is_public));
+    }
+  }
+  push_u32(buf, parts.refs.len() as u32);
+  for r in &parts.refs {
+    push_u32(buf, r.from_entity_index);
+    push_str(buf, &r.name);
+    buf.push(r.kind);
+    push_u32(buf, r.start);
+    push_u32(buf, r.end);
+    buf.push(r.form);
+    match &r.qualifier {
+      Some(q) => {
+        buf.push(1);
+        push_str(buf, q);
+      }
+      None => buf.push(0),
+    }
+    match &r.alias {
+      Some(a) => {
+        buf.push(1);
+        push_str(buf, a);
+      }
+      None => buf.push(0),
+    }
+    let flags = u8::from(r.receiver.is_some())
+      | (u8::from(r.receiver_type.is_some()) << 1)
+      | (u8::from(!r.args.is_empty()) << 2);
+    buf.push(flags);
+    if let Some(v) = &r.receiver {
+      push_str(buf, v);
+    }
+    if let Some(v) = r.receiver_type {
+      push_str(buf, v);
+      buf.push(r.receiver_type_origin);
+    }
+    if !r.args.is_empty() {
+      buf.extend_from_slice(&(r.args.len() as u16).to_le_bytes());
+    }
+    for arg in &r.args {
+      buf.extend_from_slice(&arg.index.to_le_bytes());
+      buf.push(arg.class as u8);
+      match &arg.kw_name {
+        Some(v) => {
+          buf.push(1);
+          push_str(buf, v);
+        }
+        None => buf.push(0),
+      }
+      match &arg.expr {
+        Some(v) => {
+          buf.push(1);
+          push_str(buf, v);
+        }
+        None => buf.push(0),
+      }
+    }
+  }
+  push_u32(buf, parts.entity_params.len() as u32);
+  for (entity, params) in &parts.entity_params {
+    push_u32(buf, *entity);
+    push_u32(buf, params.len() as u32);
+    for (name, ty) in params {
+      push_str(buf, name);
+      match ty {
+        Some(t) => {
+          buf.push(1);
+          push_str(buf, t);
+        }
+        None => buf.push(0),
+      }
+    }
+  }
+  push_u32(buf, parts.returns.len() as u32);
+  for (name, ret) in &parts.returns {
+    push_str(buf, name);
+    push_str(buf, ret);
+  }
+  push_u32(buf, parts.signatures.len() as u32);
+  for sig in &parts.signatures {
+    push_u32(buf, sig.entity_index);
+    push_u32(buf, sig.shingles);
+    buf.extend_from_slice(&sig.sketch);
+  }
+  push_u32(buf, parts.requests.len() as u32);
+  for req in &parts.requests {
+    push_u32(buf, req.from.raw() as u32);
+    push_u32(buf, req.start);
+    push_u32(buf, req.end);
+    push_str(buf, &req.method);
+    push_str(buf, &req.path);
+  }
 }
 
 /// Filename-safe cache key for a source path (`.vpb` = vorpal product binary; files with
@@ -1308,5 +1486,56 @@ mod tests {
     let mut huge_count = bytes.clone();
     huge_count[52..56].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(decode_product(&huge_count).is_err());
+  }
+
+  /// The two encoders — [`encode_product_into`] over the owned product and
+  /// [`encode_parts_into`] over borrowed parts — must produce IDENTICAL bytes for the same
+  /// extraction: the streaming path ships parts-encoded bytes as the cache/pack truth. The
+  /// battery covers every optional section: typed receivers, kwargs args, returns, entity
+  /// params (Python), a ≥32-token callable (near-clone signature section), parse errors
+  /// (error spans), unicode, and an empty file.
+  #[test]
+  fn parts_encoding_is_byte_identical_to_owned_encoding() {
+    let extractor = OutlineExtractor::new().expect("rules compile");
+    let sources: &[(&str, &str)] = &[
+      (
+        "a.rs",
+        "impl<T: Clone> Kg<T> {\n  pub fn löad(&self) -> Self {\n    self.hélper();\n    Vec::new()\n  }\n}\nuse std::fs;\n",
+      ),
+      (
+        "b.ts",
+        "import { x } from \"./util\";\nexport class Ünïcode extends Base { m() { this.n(); } }\n",
+      ),
+      (
+        "rich.py",
+        "def make(a: int, b: str) -> Widget:\n    w = Widget()\n    w.paint(color=a, depth=b)\n    return w\n\nclass Widget:\n    def paint(self, color, depth):\n        helper(color)\n",
+      ),
+      (
+        "sig.rs",
+        "pub fn long_one(a: u32, b: u32, c: u32) -> u32 {\n  let x = a + b + c;\n  let y = x * a + b;\n  let z = y - c + a * b;\n  let w = z + x + y + a + b + c;\n  w + x + y + z\n}\n",
+      ),
+      ("broken.rs", "fn broken( {{{ 111\n"),
+      ("d.json", "{\"key\": [1, 2]}\n"),
+      ("empty.rs", ""),
+    ];
+    let _ = SupportLang::Rust;
+    let mut checked = 0usize;
+    for (path, source) in sources {
+      let Some(mut owned) = extractor.extract_product(path, source) else {
+        continue;
+      };
+      owned.source_size = source.len() as u64;
+      owned.source_mtime_ns = 7;
+      let via_owned = encode_product(&owned);
+      let mut via_parts = Vec::new();
+      let stats = extractor
+        .extract_product_encoded(path, source, source.len() as u64, 7, &mut via_parts)
+        .expect("extractable above, so encodable here");
+      assert_eq!(via_parts, via_owned, "{path}: parts encoding diverged");
+      assert_eq!(stats.error_nodes, owned.error_nodes, "{path}");
+      assert_eq!(stats.error_bytes, owned.error_bytes, "{path}");
+      checked += 1;
+    }
+    assert!(checked >= 6, "battery shrank to {checked} — extraction broke?");
   }
 }
