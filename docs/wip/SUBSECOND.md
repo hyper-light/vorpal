@@ -706,6 +706,52 @@ slab-rebuilt graph is bit-identical to the sealed one and the daemon's in-RAM gr
 equals the loaded one. E2E: cache delete → identical answers → lazy re-cache, proven.
 dataflow.bin stays global and in-identity (0.8 MB; bucketing buys nothing measurable).
 
+#### P4.4 results (2026-08-31) — the Merkle commit
+
+For bucketed generations the content id folds the small fixed set {manifest.bin,
+dataflow.bin, the four family TOCs} — the TOCs pin every member's digest, so the id
+covers the same bytes transitively while the commit reads **~13 MB instead of ~1.5 GB**.
+Dedup-guard soundness holds by construction (writers compute TOCs from member bytes);
+adversarial member tampering is caught where trust is needed (import verifies raw
+digests per artifact; loaders verify lengths and family self-checks). The agreement
+oracle rides the e2e: generations equal under the Merkle id are equal under the
+full-rehash fold, and distinct ones are distinct under both.
+
+Kernel walls after P4.4: **stamp-cutoff edit 0.42/0.40 s** (the id rehash WAS its
+dominant cost), full edit 1.90/1.91 s, cold 8.43 s, identity A/B PASS through
+edit+revert under Merkle ids. The remaining full-edit costs, in order: link/resolve,
+the two derived-cache writes (graph.bin 146 MB + names.idx 46 MB), slab digest-compare
+builds — all P4.5's lane.
+
+#### P4.5 execution decomposition (planned 2026-08-31) — the scoped CLI edit
+
+The enabler is P4.3's identity coding: carried edge/evidence slabs stay VALID across
+dense-id shifts (`(file_key, ordinal)` never moves for unchanged files), so a scoped
+build can compose a generation from prior slabs + freshly derived dirty slabs without
+replaying the corpus. The retained daemon already proves the semantics in RAM; P4.5 is
+its disk twin, landed in three certified sub-slices:
+
+- **P4.5a — the usage family + dirty law on disk (behavior unchanged).**
+  `usage/<k>.idx` (name_hash-bucketed, TOC + digests like every family): the
+  `(referenced-name-hash, from-file-key)` pairs, derived from the evidence rows at save
+  (no new pipeline plumbing) and carried per bucket by digest — only buckets whose pairs
+  changed rewrite. Gate: usage answers equal the retained tier's postings over the same
+  corpus; the scoped path still ESCALATES ALWAYS (infrastructure lands, behavior holds).
+- **P4.5b — scoped compose for the local case.** When the dirty closure == the changed
+  files (usage says no external referrers of any changed definition — measured to be the
+  common edit), compose: splice node/evidence/edge slabs at FILE granularity (prior bytes
+  for unchanged files, fresh for changed), rebuild TOCs + Merkle id, commit. Everything
+  else falls back to the full pipeline. Gate: composed generation == full-pipeline
+  generation BYTE-FOR-BYTE at every scale (the differential harness's strongest form).
+- **P4.5c — the full dirty closure.** Cross-file impact (changed defs with external
+  referrers): re-resolve exactly the dirty files, decoding products (pack) for the dirty
+  closure to re-derive flow ledgers (chains/args/similar context) — products are the
+  persisted source of those, no new family needed. The escalation threshold stays the
+  measured shape (the retained tier's `within_absorb_budget`), and any closure the
+  reasoning under-approximates falls back LOUDLY to the full pipeline, never to a wrong
+  generation. Gate: scoped == full bytes across the differential ladder + kernel identity
+  A/B per edit class.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

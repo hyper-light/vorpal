@@ -1243,6 +1243,44 @@ const HASH_CHUNK: u64 = 1 << 20;
 /// nothing.
 #[doc(hidden)]
 pub fn generation_content_id_folded(dir: &Path, chunk: u64) -> io::Result<String> {
+  // P4.4 — the MERKLE commit: for bucketed generations the fold's input is the small
+  // fixed set {manifest.bin, dataflow.bin, each family's toc.bin} — the TOCs already pin
+  // every member's digest, so the id covers the same bytes transitively while the commit
+  // reads ~13 MB instead of ~1.5 GB at kernel scale. Dedup-guard soundness is preserved
+  // by construction: writers compute TOCs FROM member bytes, so equal TOCs from
+  // pipeline-produced directories mean equal members. (Adversarial member tampering
+  // without its TOC is caught where trust is needed — import verifies every exported
+  // artifact's raw digest, and loaders verify lengths and self-checks.)
+  if dir.join(vorpal_kg::NODES_TOC).is_file() {
+    return content_id_fold(dir, merkle_artifact_names(), chunk);
+  }
+  content_id_fold(dir, generation_artifact_names(dir), chunk)
+}
+
+/// The Merkle fold's fixed input set for bucketed generations, in sorted order.
+fn merkle_artifact_names() -> Vec<String> {
+  [
+    "dataflow.bin",
+    "edges/toc.bin",
+    "evidence/toc.bin",
+    "manifest.bin",
+    "nodes/toc.bin",
+    "products/toc.bin",
+  ]
+  .into_iter()
+  .map(str::to_string)
+  .collect()
+}
+
+/// The pre-Merkle full-rehash fold over every artifact byte — the agreement oracle's
+/// reference (`tests/pack_v2.rs`): two generations agree under the Merkle id exactly when
+/// they agree under this.
+#[doc(hidden)]
+pub fn generation_content_id_full(dir: &Path) -> io::Result<String> {
+  content_id_fold(dir, generation_artifact_names(dir), HASH_CHUNK)
+}
+
+fn content_id_fold(dir: &Path, names: Vec<String>, chunk: u64) -> io::Result<String> {
   use rayon::prelude::*;
   let hash_chunk = chunk.max(1);
   // Two axes of parallelism, one deterministic fold. The flat layout is one ~gigabyte pack
@@ -1253,7 +1291,6 @@ pub fn generation_content_id_folded(dir: &Path, chunk: u64) -> io::Result<String
   // fold as the sequential form — parallelism is a schedule, never a semantics.
   // (artifact length, ordered per-chunk digests) — `None` for an absent artifact.
   type ArtifactDigest = Option<(u64, Vec<u128>)>;
-  let names = generation_artifact_names(dir);
   let digests: io::Result<Vec<ArtifactDigest>> = names
     .par_iter()
     .map(|artifact| {

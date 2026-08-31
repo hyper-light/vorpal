@@ -221,6 +221,13 @@ fn bucketed_pack_end_to_end() {
     content_id(&live(&out_b)),
     "two scratch v2 builds must commit the same content id"
   );
+  // P4.4 agreement oracle, equal side: generations equal under the Merkle id are equal
+  // under the full-rehash fold too.
+  assert_eq!(
+    vorpal_index::generation_content_id_full(&gen_a).unwrap(),
+    vorpal_index::generation_content_id_full(&live(&out_b)).unwrap(),
+    "Merkle-equal generations must be full-rehash-equal"
+  );
 
   // 6: query surfaces resolve the bucketed pack from the index dir alone (exact
   // manifest-derived root — parse-health walks kg File paths, coverage sweeps the bank).
@@ -329,6 +336,13 @@ fn bucketed_pack_end_to_end() {
     content_id(&gen_a2),
     content_id(&live(&out_c)),
     "incremental v2 build must converge to the scratch id of the edited tree"
+  );
+  // P4.4 agreement oracle, unequal side: differing trees differ under BOTH folds.
+  assert_ne!(content_id(&gen_a), content_id(&gen_a2));
+  assert_ne!(
+    vorpal_index::generation_content_id_full(&gen_a).unwrap(),
+    vorpal_index::generation_content_id_full(&gen_a2).unwrap(),
+    "Merkle-distinct generations must be full-rehash-distinct"
   );
 
   // 4: stamp-only cutoff under v2 — same bytes, fresh mtime.
