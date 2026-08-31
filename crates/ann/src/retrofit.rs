@@ -248,6 +248,325 @@ pub fn retrofit_in_ram(
   Ok((x, report))
 }
 
+// ---------------------------------------------------------------------------------
+// The plan's SECOND penalty form: per-relation linear maps (functional retrofitting,
+// Lengerich et al. 2018), restricted to DIAGONAL A_r. Dense d×d maps cost d² per
+// edge per pass — ~5.5×10¹¹ flops at kernel scale, two orders past the stage budget
+// — while a diagonal map keeps the pairwise penalty ‖A_r xᵢ − xⱼ‖² component-
+// decoupled: the same Jacobi skeleton, the same termination law, and the SAME descent
+// proof shape. Per component with scale a, the edge Hessian off-diagonal is −w·a and
+// the descent form contributes w·(a·xᵢ + xⱼ)² ≥ 0 for ANY sign of a — the signless
+// argument verbatim. The fit is closed-form per relation per dimension (1-D least
+// squares over the relation's directed pairs), so no ridge constant exists: a
+// dimension whose normal-equation denominator sits below the relation's own
+// numerical floor (max-denominator × ε₃₂ — the crate's standard dependence
+// criterion) keeps a = 1, falling back to the identity form exactly where the data
+// cannot determine a map.
+// ---------------------------------------------------------------------------------
+
+/// DIRECTED, relation-annotated adjacency over the semantic row space: both views of
+/// every directed edge (out and in), each slot carrying the folded weight (relation
+/// weight × grade × symmetric degree normalization), the base relation id, and
+/// whether the slot is the OUT view (row is the edge's source). The out view of each
+/// edge appears exactly once — fits and Ψ walk it to count each directed edge once.
+pub struct FunctionalEdges {
+  /// Row `i`'s slots live at `[offsets[i]..offsets[i+1]]` (len n+1).
+  pub offsets: Vec<u64>,
+  pub targets: Vec<u32>,
+  pub weights: Vec<f32>,
+  /// Base relation id per slot (the EdgeType low byte, opaque here).
+  pub relation: Vec<u8>,
+  /// True where this slot is the edge's OUT view (row = source).
+  pub outgoing: Vec<bool>,
+}
+
+impl FunctionalEdges {
+  fn validate(&self, n: usize) -> Result<(), String> {
+    if self.offsets.len() != n + 1 {
+      return Err(format!(
+        "functional edges: {} offsets for {n} rows (want n+1)",
+        self.offsets.len()
+      ));
+    }
+    if self.offsets.first() != Some(&0) {
+      return Err("functional edges: offsets must start at 0".to_string());
+    }
+    for window in self.offsets.windows(2) {
+      if window[1] < window[0] {
+        return Err("functional edges: offsets not monotone".to_string());
+      }
+    }
+    let total = *self.offsets.last().unwrap_or(&0) as usize;
+    if self.targets.len() != total
+      || self.weights.len() != total
+      || self.relation.len() != total
+      || self.outgoing.len() != total
+    {
+      return Err("functional edges: column lengths disagree with the offsets".to_string());
+    }
+    if self.targets.iter().any(|&t| t as usize >= n) {
+      return Err("functional edges: target row out of range".to_string());
+    }
+    if self.weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+      return Err("functional edges: weights must be finite and non-negative".to_string());
+    }
+    Ok(())
+  }
+}
+
+/// Per-relation diagonal scales: index by relation id; `None` (or an id past the end)
+/// means the identity map. Produced by [`fit_diagonal_maps`].
+pub type DiagonalMaps = Vec<Option<Vec<f32>>>;
+
+#[inline]
+fn scale_of(scales: &DiagonalMaps, relation: u8, component: usize) -> f32 {
+  scales
+    .get(relation as usize)
+    .and_then(|map| map.as_ref())
+    .and_then(|map| map.get(component))
+    .copied()
+    .unwrap_or(1.0)
+}
+
+/// Closed-form diagonal fit: for each relation r and dimension c, the 1-D weighted
+/// least squares aᵣc = Σ w·xᵢc·xⱼc / Σ w·xᵢc² over r's directed pairs (i → j, the
+/// OUT view — each edge once). Deterministic (fixed 4096-row chunks folded in chunk
+/// order). Dimensions the data cannot determine — denominator at or below the
+/// relation's max-denominator × ε₃₂, the crate's dependence criterion — keep a = 1;
+/// relations with no pairs (or no determined dimension) map to `None` = identity.
+pub fn fit_diagonal_maps(
+  anchors: &[f32],
+  dim: usize,
+  edges: &FunctionalEdges,
+) -> Result<DiagonalMaps, String> {
+  if dim == 0 {
+    return Err("diagonal fit: zero dimension".to_string());
+  }
+  if anchors.len() % dim != 0 {
+    return Err("diagonal fit: anchor matrix not row-shaped".to_string());
+  }
+  let n = anchors.len() / dim;
+  edges.validate(n)?;
+  const CHUNK_ROWS: usize = 4096;
+  let chunk_count = n.div_ceil(CHUNK_ROWS).max(1);
+  type Partial = Vec<Option<(Vec<f64>, Vec<f64>)>>; // per relation: (Σ w·xi·xj, Σ w·xi²)
+  let partials: Vec<Partial> = (0..chunk_count)
+    .into_par_iter()
+    .map(|chunk| {
+      let start = chunk * CHUNK_ROWS;
+      let end = ((chunk + 1) * CHUNK_ROWS).min(n);
+      let mut local: Partial = vec![None; 256];
+      for row in start..end {
+        let own = &anchors[row * dim..(row + 1) * dim];
+        let (slot_start, slot_end) = (edges.offsets[row] as usize, edges.offsets[row + 1] as usize);
+        for slot in slot_start..slot_end {
+          if !edges.outgoing[slot] {
+            continue;
+          }
+          let weight = edges.weights[slot] as f64;
+          let neighbor = edges.targets[slot] as usize;
+          let other = &anchors[neighbor * dim..(neighbor + 1) * dim];
+          let entry = local[edges.relation[slot] as usize]
+            .get_or_insert_with(|| (vec![0.0f64; dim], vec![0.0f64; dim]));
+          for component in 0..dim {
+            let source = own[component] as f64;
+            entry.0[component] += weight * source * other[component] as f64;
+            entry.1[component] += weight * source * source;
+          }
+        }
+      }
+      local
+    })
+    .collect();
+  let mut numerator: Partial = vec![None; 256];
+  for partial in partials {
+    for (slot, local) in partial.into_iter().enumerate() {
+      if let Some((num, den)) = local {
+        let entry = numerator[slot].get_or_insert_with(|| (vec![0.0f64; dim], vec![0.0f64; dim]));
+        for component in 0..dim {
+          entry.0[component] += num[component];
+          entry.1[component] += den[component];
+        }
+      }
+    }
+  }
+  let mut maps: DiagonalMaps = vec![None; 256];
+  for (slot, sums) in numerator.into_iter().enumerate() {
+    let Some((num, den)) = sums else { continue };
+    let den_max = den.iter().cloned().fold(0.0f64, f64::max);
+    if den_max <= 0.0 {
+      continue; // relation carried no determinable signal at all
+    }
+    let floor = den_max * f32::EPSILON as f64;
+    let mut map = vec![1.0f32; dim];
+    let mut determined = false;
+    for component in 0..dim {
+      if den[component] > floor {
+        let scale = (num[component] / den[component]) as f32;
+        if scale.is_finite() {
+          map[component] = scale;
+          determined = true;
+        }
+      }
+    }
+    if determined {
+      maps[slot] = Some(map);
+    }
+  }
+  Ok(maps)
+}
+
+/// Fixed-order Ψ for the functional objective, evaluated ONCE per directed edge (the
+/// out view): Σᵢ‖xᵢ−qᵢ‖² + Σ_{i→j} w·‖a∘xᵢ − xⱼ‖². Same deterministic chunk shape as
+/// the identity evaluator.
+fn psi_functional(
+  x: &[f32],
+  anchors: &[f32],
+  dim: usize,
+  edges: &FunctionalEdges,
+  scales: &DiagonalMaps,
+) -> f64 {
+  const CHUNK_ROWS: usize = 4096;
+  let partials: Vec<f64> = x
+    .par_chunks(CHUNK_ROWS * dim)
+    .enumerate()
+    .map(|(chunk_index, rows)| {
+      let mut total = 0.0f64;
+      for (local, row) in rows.chunks_exact(dim).enumerate() {
+        let i = chunk_index * CHUNK_ROWS + local;
+        let anchor = &anchors[i * dim..(i + 1) * dim];
+        for (value, target) in row.iter().zip(anchor) {
+          let diff = *value as f64 - *target as f64;
+          total += diff * diff;
+        }
+        let (start, end) = (edges.offsets[i] as usize, edges.offsets[i + 1] as usize);
+        for slot in start..end {
+          if !edges.outgoing[slot] {
+            continue;
+          }
+          let weight = edges.weights[slot] as f64;
+          let relation = edges.relation[slot];
+          let neighbor = edges.targets[slot] as usize;
+          let other = &x[neighbor * dim..(neighbor + 1) * dim];
+          let mut distance = 0.0f64;
+          for component in 0..dim {
+            let mapped = scale_of(scales, relation, component) as f64 * row[component] as f64;
+            let diff = mapped - other[component] as f64;
+            distance += diff * diff;
+          }
+          total += weight * distance;
+        }
+      }
+      total
+    })
+    .collect();
+  partials.iter().sum()
+}
+
+/// One functional Jacobi sweep. Per component c the row minimizer is
+/// xᵢc = (qᵢc + Σ_out w·a·xⱼc + Σ_in w·a·xⱼc) / (1 + Σ_out w·a² + Σ_in w) — the
+/// numerator coefficient is w·a on BOTH views, the denominator addend is w·a² on the
+/// out view (the map applies to the source) and w on the in view.
+fn sweep_functional(
+  x: &[f32],
+  anchors: &[f32],
+  dim: usize,
+  edges: &FunctionalEdges,
+  scales: &DiagonalMaps,
+  next: &mut [f32],
+) {
+  next
+    .par_chunks_mut(dim)
+    .enumerate()
+    .for_each(|(i, row_out)| {
+      let (start, end) = (edges.offsets[i] as usize, edges.offsets[i + 1] as usize);
+      let anchor = &anchors[i * dim..(i + 1) * dim];
+      if start == end {
+        row_out.copy_from_slice(anchor);
+        return;
+      }
+      for (component, slot_out) in row_out.iter_mut().enumerate() {
+        let mut numerator = anchor[component] as f64;
+        let mut denominator = 1.0f64;
+        for slot in start..end {
+          let weight = edges.weights[slot] as f64;
+          let scale = scale_of(scales, edges.relation[slot], component) as f64;
+          let neighbor = edges.targets[slot] as usize;
+          numerator += weight * scale * x[neighbor * dim + component] as f64;
+          denominator += if edges.outgoing[slot] {
+            weight * scale * scale
+          } else {
+            weight
+          };
+        }
+        *slot_out = (numerator / denominator) as f32;
+      }
+    });
+}
+
+/// The functional-form solver: identical contract, termination law, and Ψ-increase
+/// error to [`retrofit_into`] — only the penalty differs (‖a_r∘xᵢ − xⱼ‖² per directed
+/// edge). With every map at identity this reaches the same fixed point as the
+/// identity form (the update algebra coincides at a ≡ 1).
+pub fn retrofit_functional_into(
+  anchors: &[f32],
+  x: &mut [f32],
+  next: &mut [f32],
+  dim: usize,
+  edges: &FunctionalEdges,
+  scales: &DiagonalMaps,
+) -> Result<RetrofitReport, String> {
+  if dim == 0 {
+    return Err("retrofit: zero dimension".to_string());
+  }
+  if anchors.len() % dim != 0 {
+    return Err("retrofit: anchor matrix not row-shaped".to_string());
+  }
+  if x.len() != anchors.len() || next.len() != anchors.len() {
+    return Err("retrofit: working buffers must be anchor-sized".to_string());
+  }
+  if anchors.iter().any(|v| !v.is_finite()) {
+    return Err("retrofit: non-finite anchor".to_string());
+  }
+  let n = anchors.len() / dim;
+  edges.validate(n)?;
+  if scales
+    .iter()
+    .flatten()
+    .any(|map| map.len() != dim || map.iter().any(|a| !a.is_finite()))
+  {
+    return Err("retrofit: diagonal maps must be dim-shaped and finite".to_string());
+  }
+
+  let initial_psi = psi_functional(x, anchors, dim, edges, scales);
+  let floor = initial_psi * f32::EPSILON as f64;
+  let mut previous_psi = initial_psi;
+  let mut sweeps = 0usize;
+  let (mut current, mut scratch) = (x, next);
+  loop {
+    sweep_functional(current, anchors, dim, edges, scales, scratch);
+    std::mem::swap(&mut current, &mut scratch);
+    sweeps += 1;
+    let current_psi = psi_functional(current, anchors, dim, edges, scales);
+    if current_psi > previous_psi {
+      return Err(format!(
+        "retrofit(functional): Ψ increased at sweep {sweeps} ({previous_psi} → {current_psi})"
+      ));
+    }
+    if previous_psi - current_psi <= floor {
+      if sweeps % 2 == 1 {
+        scratch.copy_from_slice(current);
+      }
+      return Ok(RetrofitReport {
+        sweeps,
+        initial_psi,
+        final_psi: current_psi,
+      });
+    }
+    previous_psi = current_psi;
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -362,5 +681,149 @@ mod tests {
     let mut bad_target = pair_edges(1.0);
     bad_target.targets[0] = 7;
     assert!(retrofit_in_ram(&[0.0, 1.0], 1, &bad_target).is_err());
+  }
+
+  /// Both views of each directed edge (src slot outgoing, dst slot incoming).
+  fn directed(n: usize, pairs: &[(u32, u32, f32, u8)]) -> FunctionalEdges {
+    let mut rows: Vec<Vec<(u32, f32, u8, bool)>> = vec![Vec::new(); n];
+    for &(source, target, weight, relation) in pairs {
+      rows[source as usize].push((target, weight, relation, true));
+      rows[target as usize].push((source, weight, relation, false));
+    }
+    let mut edges = FunctionalEdges {
+      offsets: vec![0],
+      targets: Vec::new(),
+      weights: Vec::new(),
+      relation: Vec::new(),
+      outgoing: Vec::new(),
+    };
+    for row in rows {
+      for (target, weight, relation, out) in row {
+        edges.targets.push(target);
+        edges.weights.push(weight);
+        edges.relation.push(relation);
+        edges.outgoing.push(out);
+      }
+      edges.offsets.push(edges.targets.len() as u64);
+    }
+    edges
+  }
+
+  #[test]
+  fn diagonal_fit_recovers_an_exact_map_and_falls_back_when_undetermined() {
+    // Relation 3: xⱼ = (2·xᵢ₀, 0.5·xᵢ₁) exactly, power-of-two values so the 1-D
+    // normal equations divide exactly. Relation 7: component 1 carries NO source
+    // signal (xᵢ₁ = 0) — undetermined, must stay at the identity scale 1.
+    let dim = 2;
+    let anchors = [
+      0.5f32, 1.0, /* 0 -> */ 1.0, 0.5, // 1 = (2·0.5, 0.5·1.0)
+      1.0, 0.25, /* 2 -> */ 2.0, 0.125, // 3
+      0.25, 0.5, /* 4 -> */ 0.5, 0.25, // 5
+      1.0, 0.0, /* 6 -> */ 4.0, 0.75, // 7 (relation 7; component 1 source = 0)
+    ];
+    let edges = directed(
+      8,
+      &[(0, 1, 1.0, 3), (2, 3, 1.0, 3), (4, 5, 1.0, 3), (6, 7, 1.0, 7)],
+    );
+    let maps = fit_diagonal_maps(&anchors, dim, &edges).unwrap();
+    let relation3 = maps[3].as_ref().expect("relation 3 fitted");
+    assert_eq!(relation3[0], 2.0);
+    assert_eq!(relation3[1], 0.5);
+    let relation7 = maps[7].as_ref().expect("relation 7 fitted on component 0");
+    assert_eq!(relation7[0], 4.0);
+    assert_eq!(relation7[1], 1.0, "undetermined dimension keeps identity");
+    assert!(maps[5].is_none(), "relation with no pairs = identity");
+  }
+
+  #[test]
+  fn functional_two_node_system_reaches_the_closed_form() {
+    // d=1, q=(1,0), one directed edge 0→1 with w=1 and a=2:
+    // Ψ = (x₀−1)² + x₁² + (2x₀−x₁)². Stationarity: 5x₀−2x₁=1 and x₁=x₀ ⇒ x=(⅓,⅓).
+    let edges = directed(2, &[(0, 1, 1.0, 0)]);
+    let mut maps: DiagonalMaps = vec![None; 256];
+    maps[0] = Some(vec![2.0]);
+    let anchors = [1.0f32, 0.0];
+    let mut x = anchors.to_vec();
+    let mut next = vec![0.0f32; 2];
+    let report = retrofit_functional_into(&anchors, &mut x, &mut next, 1, &edges, &maps).unwrap();
+    // Same tolerance derivation as the identity test: gap ≤ ΔΨ/(1−ρ²) with ρ² = 0.4
+    // here, curvature ≥ 1 ⇒ ‖x−x*‖ ≤ √(2·ε₃₂·Ψ₀).
+    let tolerance = (2.0 * f32::EPSILON as f64 * report.initial_psi).sqrt();
+    assert!((x[0] as f64 - 1.0 / 3.0).abs() < tolerance, "{x:?} tol {tolerance}");
+    assert!((x[1] as f64 - 1.0 / 3.0).abs() < tolerance, "{x:?} tol {tolerance}");
+    assert!(report.final_psi <= report.initial_psi);
+  }
+
+  #[test]
+  fn unit_scales_reach_the_identity_fixed_point() {
+    // With every map at identity the two forms share a fixed point; each solver stops
+    // within its own ε-floor of it (their Ψ evaluators round differently, so sweep
+    // counts may differ by one) — compare within the SUM of both derived bounds.
+    let (anchors, edges) = random_case(120, 8, 41);
+    let (identity_x, identity_report) = retrofit_in_ram(&anchors, 8, &edges).unwrap();
+    // Rebuild the same topology as functional edges: each undirected slot pair was
+    // symmetric, so mark the lower→higher direction as the out view once.
+    let mut pairs = Vec::new();
+    for row in 0..120u32 {
+      let (start, end) = (edges.offsets[row as usize] as usize, edges.offsets[row as usize + 1] as usize);
+      for slot in start..end {
+        let target = edges.targets[slot];
+        if row < target {
+          pairs.push((row, target, edges.weights[slot], 0u8));
+        }
+      }
+    }
+    let functional = directed(120, &pairs);
+    let maps: DiagonalMaps = vec![None; 256];
+    let mut x = anchors.to_vec();
+    let mut next = vec![0.0f32; anchors.len()];
+    let functional_report =
+      retrofit_functional_into(&anchors, &mut x, &mut next, 8, &functional, &maps).unwrap();
+    let tolerance = (2.0 * f32::EPSILON as f64 * identity_report.initial_psi).sqrt()
+      + (2.0 * f32::EPSILON as f64 * functional_report.initial_psi).sqrt();
+    for (a, b) in identity_x.iter().zip(&x) {
+      assert!(
+        (*a as f64 - *b as f64).abs() <= tolerance,
+        "{a} vs {b} (tol {tolerance})"
+      );
+    }
+  }
+
+  #[test]
+  fn functional_descent_terminates_and_is_bit_deterministic() {
+    let (anchors, _) = random_case(200, 8, 77);
+    let mut state = 77u64;
+    let mut next_random = move || {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state
+    };
+    let mut pairs = Vec::new();
+    for _ in 0..400 {
+      let a = (next_random() % 200) as u32;
+      let b = (next_random() % 200) as u32;
+      if a != b {
+        let w = ((next_random() % 1000) + 1) as f32 / 1000.0;
+        pairs.push((a, b, w, (next_random() % 4) as u8));
+      }
+    }
+    let edges = directed(200, &pairs);
+    let maps = fit_diagonal_maps(&anchors, 8, &edges).unwrap();
+    let run = || {
+      let mut x = anchors.to_vec();
+      let mut next = vec![0.0f32; anchors.len()];
+      let report =
+        retrofit_functional_into(&anchors, &mut x, &mut next, 8, &edges, &maps).unwrap();
+      (x, report)
+    };
+    let (x1, r1) = run();
+    let (x2, r2) = run();
+    assert!(r1.final_psi <= r1.initial_psi);
+    assert_eq!(r1.sweeps, r2.sweeps);
+    assert_eq!(
+      x1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+      x2.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
   }
 }

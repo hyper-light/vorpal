@@ -1134,6 +1134,10 @@ struct PersistedTierRecord {
   /// Present exactly when the build STATED a fallback (learned selection, lexical
   /// outcome) — the bit that distinguishes it from a deliberate lexical selection.
   note: Option<String>,
+  /// The retrofit penalty form the tier's rows were built under ("none" when
+  /// unretrofitted, and for every pre-retrofit file) — part of the tier's identity:
+  /// a form change in code must retrain, never serve mixed row semantics.
+  retrofit: String,
 }
 
 fn persisted_tier_record(index_dir: &Path) -> Option<PersistedTierRecord> {
@@ -1164,11 +1168,18 @@ fn persisted_tier_record(index_dir: &Path) -> Option<PersistedTierRecord> {
     Some(serde_json::Value::String(note)) => Some(note.clone()),
     Some(_) => return None,
   };
+  // Pre-retrofit files carry no field: they were built unretrofitted.
+  let retrofit = value
+    .get("retrofit")
+    .and_then(|form| form.as_str())
+    .unwrap_or("none")
+    .to_string();
   Some(PersistedTierRecord {
     provenance,
     tier,
     weights_hash,
     note,
+    retrofit,
   })
 }
 
@@ -1186,6 +1197,7 @@ fn write_model_provenance(
   provenance: &ModelProvenance,
   tier: &str,
   weights_hash: Option<u128>,
+  retrofit: &str,
   note: Option<&str>,
 ) -> io::Result<()> {
   let weights = match weights_hash {
@@ -1197,7 +1209,7 @@ fn write_model_provenance(
     None => String::new(),
   };
   let json = format!(
-    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{},\"tier\":{},\"weights_hash\":{}{}}}\n",
+    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{},\"tier\":{},\"weights_hash\":{},\"retrofit\":{}{}}}\n",
     serde_json::Value::String(provenance.model_id.clone()),
     provenance.dim,
     serde_json::Value::String(provenance.normalization.clone()),
@@ -1205,6 +1217,7 @@ fn write_model_provenance(
     provenance.learned,
     serde_json::Value::String(tier.to_string()),
     weights,
+    serde_json::Value::String(retrofit.to_string()),
     note_field,
   );
   let tmp = index_dir.join("ann.model.json.tmp");
@@ -1295,8 +1308,19 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -
       // bytes that misparsed past the header wedged the tier ("fresh" to the builder,
       // unloadable to every query) — so build and query share ONE criterion forever.
       // Cost: one checksum pass per freshness check (~30 ms at kernel scale).
+      // The retrofit form is part of the tier's identity: a form change in code
+      // retrains old tiers. A record of "none" WITH a stated disable is a valid
+      // outcome under any form (a rebuild under the same pressure would produce it
+      // again — the fallback-note law, so a persistent disable never rebuild-loops).
+      let retrofit_ok = record.retrofit == RETROFIT_FORM.label()
+        || (record.retrofit == "none"
+          && record
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("retrofit disabled")));
       selection == SemanticTier::Learned
         && record.provenance.learned
+        && retrofit_ok
         && record.weights_hash.is_some_and(|expected| {
           LearnedStaticEmbedder::open_mapped(&index_dir.join("ann.model.bin"))
             .is_ok_and(|(_, stored)| stored == expected)
@@ -1407,6 +1431,11 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
     (Some(a), Some(b)) => Some(format!("{a}; {b}")),
     (a, b) => a.or(b),
   };
+  let retrofit_label = if retrofitted.is_some() {
+    RETROFIT_FORM.label()
+  } else {
+    "none"
+  };
   build_ann(&kg, index_dir, current, &embedder, retrofitted.as_ref())
     .map_err(|err| err as Box<dyn Error>)?;
   if let Some(rows) = retrofitted {
@@ -1443,6 +1472,7 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
     &embedder.provenance(),
     embedder.tier_label(),
     weights_hash,
+    retrofit_label,
     note.as_deref(),
   )?;
   let stamp_path = index_dir.join("ann.stamp");
@@ -1598,7 +1628,7 @@ fn build_retro_edges(
   ids: &[u64],
   anchors: &[f32],
   dim: usize,
-) -> Result<vorpal_ann::retrofit::RetroEdges, String> {
+) -> Result<vorpal_ann::retrofit::FunctionalEdges, String> {
   use rayon::prelude::*;
   let n = ids.len();
   let graph = kg.graph();
@@ -1695,7 +1725,13 @@ fn build_retro_edges(
   // √(2m): each undirected edge contributed one degree per endpoint above.
   let two_m: u64 = degree.iter().map(|&d| d as u64).sum();
   if two_m == 0 {
-    return Ok(vorpal_ann::retrofit::RetroEdges::empty(n));
+    return Ok(vorpal_ann::retrofit::FunctionalEdges {
+      offsets: vec![0; n + 1],
+      targets: Vec::new(),
+      weights: Vec::new(),
+      relation: Vec::new(),
+      outgoing: Vec::new(),
+    });
   }
   let hub_threshold = two_m.isqrt();
   let hub: Vec<bool> = degree.iter().map(|&d| d as u64 > hub_threshold).collect();
@@ -1741,6 +1777,8 @@ fn build_retro_edges(
   }
   let mut targets = Vec::with_capacity(total as usize);
   let mut weights = Vec::with_capacity(total as usize);
+  let mut relation_column = Vec::with_capacity(total as usize);
+  let mut outgoing = Vec::with_capacity(total as usize);
   // Fill — serial (row-local slices are irregular; one linear pass over the edges is
   // a small fraction of the sweeps that follow).
   for row in 0..n {
@@ -1748,7 +1786,7 @@ fn build_retro_edges(
       continue;
     }
     let own_degree = final_degree[row] as f64;
-    each_included(row, &mut |neighbor, base, grade, _| {
+    each_included(row, &mut |neighbor, base, grade, out_view| {
       let relation = type_weight[base as usize];
       if hub[neighbor as usize] || relation <= 0.0 {
         return;
@@ -1756,14 +1794,50 @@ fn build_retro_edges(
       let neighbor_degree = final_degree[neighbor as usize] as f64;
       targets.push(neighbor);
       weights.push(relation * grade / ((own_degree * neighbor_degree).sqrt() as f32));
+      relation_column.push(base);
+      outgoing.push(out_view);
     });
   }
-  Ok(vorpal_ann::retrofit::RetroEdges {
+  Ok(vorpal_ann::retrofit::FunctionalEdges {
     offsets,
     targets,
     weights,
+    relation: relation_column,
+    outgoing,
   })
 }
+
+/// Which pairwise penalty the retrofit uses — BOTH forms ship (the plan's A/B
+/// requirement) and production pins the measured winner. Identity: ‖xᵢ−xⱼ‖².
+/// Functional: ‖a_r∘xᵢ−xⱼ‖² with per-relation DIAGONAL maps fitted closed-form from
+/// this corpus's own edges (vorpal_ann::retrofit::fit_diagonal_maps). Not a runtime
+/// knob: a form change is a code change, recorded in the persisted tier record so
+/// the freshness gate retrains old tiers instead of serving mixed semantics.
+// Both variants are shipped surface even though only the pinned one is constructed:
+// which arm is live depends solely on RETROFIT_FORM, and the A/B flips it — the
+// "unused" variant is the other measured form, not dead design.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetrofitForm {
+  Identity,
+  Functional,
+}
+
+impl RetrofitForm {
+  fn label(self) -> &'static str {
+    match self {
+      RetrofitForm::Identity => "identity",
+      RetrofitForm::Functional => "functional",
+    }
+  }
+}
+
+/// PINNED BY MEASUREMENT (2026-08-31, recorded in BENCHMARKS "penalty-form A/B"):
+/// identity beat the diagonal functional form — kernel all-classes NDCG 0.298 vs
+/// 0.267 (the fitted maps absorb the relation's systematic component and cancel the
+/// neighbor pull that produced the gains); cpython tied. The functional
+/// implementation ships measured, not speculative.
+const RETROFIT_FORM: RetrofitForm = RetrofitForm::Identity;
 
 /// Learned-tier Stage 2: refine the Tier-1 rows over the graph before the tier
 /// builds. Any problem is a typed reason for the AUTO-DISABLE seam — the caller
@@ -1833,10 +1907,30 @@ fn retrofit_learned_rows(
       .map_err(|e| format!("scratch alignment: {e}"))?;
     let next: &mut [f32] =
       bytemuck::try_cast_slice_mut(spare.as_mut_bytes()).map_err(|e| format!("scratch alignment: {e}"))?;
-    vorpal_ann::retrofit::retrofit_into(anchor_rows, x, next, dim, &edges)?
+    match RETROFIT_FORM {
+      RetrofitForm::Identity => {
+        // The identity penalty ignores direction and relation ids: fold to the
+        // plain weighted CSR (a column move, not a copy).
+        let identity_edges = vorpal_ann::retrofit::RetroEdges {
+          offsets: edges.offsets.clone(),
+          targets: edges.targets.clone(),
+          weights: edges.weights.clone(),
+        };
+        vorpal_ann::retrofit::retrofit_into(anchor_rows, x, next, dim, &identity_edges)?
+      }
+      RetrofitForm::Functional => {
+        let maps = vorpal_ann::retrofit::fit_diagonal_maps(anchor_rows, dim, &edges)?;
+        vorpal_kg::phase_stamp(&format!(
+          "retrofit: {} relations fitted diagonal maps",
+          maps.iter().flatten().count()
+        ));
+        vorpal_ann::retrofit::retrofit_functional_into(anchor_rows, x, next, dim, &edges, &maps)?
+      }
+    }
   };
   vorpal_kg::phase_stamp(&format!(
-    "retrofit: {} sweeps, Ψ {:.6e} → {:.6e}, {} edges",
+    "retrofit({}): {} sweeps, Ψ {:.6e} → {:.6e}, {} edges",
+    RETROFIT_FORM.label(),
     report.sweeps,
     report.initial_psi,
     report.final_psi,

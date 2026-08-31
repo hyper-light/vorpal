@@ -599,6 +599,38 @@ unchanged (4.09 ms / 2.91 ms mean at k=25). Total kernel learned warm with retro
 84.0 s (78.4 s without). Double-warm byte-identity holds with retrofit in the loop
 (fixture-pinned in `learned_tier.rs`; kernel run recorded alongside this table).
 
+### Penalty-form A/B: identity vs per-relation diagonal maps
+
+The plan's second form (functional retrofitting, Lengerich et al. 2018) ships
+restricted to DIAGONAL per-relation maps — dense d×d maps cost d² per edge per sweep
+(~5.5×10¹¹ flops at kernel scale, two orders past the stage budget) while diagonal
+keeps the penalty component-decoupled: the same Jacobi skeleton, the same ε₃₂
+termination, and the same signless descent proof for ANY sign of scale (per edge
+w(a·xᵢ+xⱼ)² ≥ 0). The fit is closed-form 1-D least squares per relation per
+dimension over the relation's directed pairs — NO ridge constant: dimensions below
+the relation's max-denominator × ε₃₂ floor keep a = 1. Both forms are selected by
+one code-level constant (`RETROFIT_FORM`), never a runtime knob, and the persisted
+record's new `retrofit` field makes a form change retrain old tiers (with a stated
+"retrofit disabled" outcome accepted as fresh so a persistent disable never
+rebuild-loops).
+
+Measured 2026-08-31 (10 relations fitted maps on both corpora; kernel functional
+retrofit 3.3 s / 6 sweeps / Ψ 2.082e5 → 1.545e5):
+
+| set · class | identity | functional (diagonal) |
+|---|---|---|
+| linux · short-keyword | **0.206 / 0.298 / 0.095** | 0.170 / 0.227 / 0.095 |
+| linux · **all** | **0.298 / 0.386 / 0.208** | 0.267 / 0.324 / 0.208 |
+| cpython · **all** | 0.308 / 0.319 / 0.417 | 0.308 / 0.319 / 0.417 |
+
+**Identity wins and is pinned.** The functional kernel numbers land exactly on the
+UNRETROFITTED tier's: fitting a_r per relation absorbs the systematic component of
+each edge (its Ψ₀ is already 22% below identity's before any sweep), which removes
+precisely the neighbor pull that produced identity's gains — a coherent mechanism,
+now measured rather than argued. The functional implementation remains in the tree
+as the plan requires: implemented, oracle-tested (exact-map recovery, hand-solved
+directed fixture, a≡1 equivalence), and measured.
+
 **Freshness law hardened by an incident**: the v3 layout initially landed WITHOUT its
 version bump, so v2-layout files passed the cheap prefix gate (magic+version) yet
 misparsed past the header — warms no-op'd "fresh" while queries fell back to lexical.
