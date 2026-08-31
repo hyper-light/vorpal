@@ -39,7 +39,7 @@ REPOS = {
     },
     "actix-web": {
         "git": "https://github.com/actix/actix-web",
-        "callers": "HttpResponse",
+        "callers": "init_service",
         "snippet": ("HttpServer", "Struct"),
         "search": ("websocket handshake upgrade", ["ws", "websocket", "upgrade"]),
     },
@@ -51,19 +51,19 @@ REPOS = {
     },
     "folly": {
         "git": "https://github.com/facebook/folly",
-        "callers": "checkUnixError",
+        "callers": "makeFuture",
         "snippet": ("EventBase", "Class"),
         "search": ("asynchronous executor thread pool", ["executor", "thread"]),
     },
     "kafka": {
         "git": "https://github.com/apache/kafka",
-        "callers": "maybeThrow",
+        "callers": "forCode",
         "snippet": ("KafkaProducer", "Class"),
         "search": ("consumer group rebalance protocol", ["rebalance", "consumer"]),
     },
     "terraform-provider-aws": {
         "git": "https://github.com/hashicorp/terraform-provider-aws",
-        "callers": "FindTags",
+        "callers": "FlattenStringValueSet",
         "snippet": (None, None),  # Go + a large HCL corpus in testdata
         "search": ("s3 bucket lifecycle configuration", ["s3", "lifecycle"]),
     },

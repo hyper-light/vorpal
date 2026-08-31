@@ -911,6 +911,41 @@ fn bind_param_index(rec: &ArgRec, callee_params: Option<&[Box<str>]>) -> u16 {
 /// stream order is part of the sealed bytes), and every traceable argument emits one
 /// data-flow sidecar row. Ids are whatever space the caller resolves in; rows are remapped
 /// by the caller when its space is not the sealed one.
+/// The traceable-argument rows for one resolved CALLS edge (empty when the site carried
+/// none) — pure, worker-safe; the DATA_FLOWS-edge dedup stays with the ordered consumer.
+pub(crate) fn call_arg_rows(
+  from: u64,
+  to: u64,
+  span: (u32, u32),
+  arg_join: &ArgJoin,
+  param_table: &ParamTable,
+) -> Vec<vorpal_kg::DataflowRow> {
+  if arg_join.is_empty() {
+    return Vec::new();
+  }
+  let records = arg_join.get(from, span);
+  if records.is_empty() {
+    return Vec::new();
+  }
+  let callee_params = if param_table.is_empty() {
+    None
+  } else {
+    param_table.get(to)
+  };
+  records
+    .iter()
+    .map(|rec| vorpal_kg::DataflowRow {
+      from: from as u32,
+      to: to as u32,
+      span,
+      arg_index: rec.index,
+      param_index: bind_param_index(rec, callee_params),
+      class: rec.class,
+      expr: rec.expr.as_deref().map(str::to_string),
+    })
+    .collect()
+}
+
 #[allow(clippy::too_many_arguments)] // one join, both linkers: every input is load-bearing
 pub(crate) fn join_call_edge(
   from: u64,
@@ -923,33 +958,15 @@ pub(crate) fn join_call_edge(
   flows: &mut Vec<vorpal_kg::DataflowRow>,
   mut push_edge: impl FnMut(vorpal_kg::EdgeType),
 ) {
-  if arg_join.is_empty() {
-    return;
-  }
-  let records = arg_join.get(from, span);
-  if records.is_empty() {
+  let rows = call_arg_rows(from, to, span, arg_join, param_table);
+  if rows.is_empty() {
     return;
   }
   // One DATA_FLOWS edge per (caller, callee) pair; one row per traceable arg.
   if flow_pairs.insert((from, to)) {
     push_edge(vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(confidence));
   }
-  let callee_params = if param_table.is_empty() {
-    None
-  } else {
-    param_table.get(to)
-  };
-  for rec in records {
-    flows.push(vorpal_kg::DataflowRow {
-      from: from as u32,
-      to: to as u32,
-      span,
-      arg_index: rec.index,
-      param_index: bind_param_index(rec, callee_params),
-      class: rec.class,
-      expr: rec.expr.as_deref().map(str::to_string),
-    });
-  }
+  flows.extend(rows);
 }
 
 /// What a spilled link yields: the sealed graph, resolution stats, evidence rows, data-flow
@@ -1127,68 +1144,104 @@ fn link_resolve<'i>(
   // scale this vector reaches ~6.8M rows, and growing it from empty cost ~23 doubling
   // reallocations — the last a full-vector memcpy — on the ordered-sink thread.
   let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::with_capacity(spill.count() as usize);
+  // Bulk drain: workers hand back whole prepared chunks — edge triples in emission order,
+  // evidence rows already constructed, traceable-arg candidates with their data-flow rows
+  // pre-built — and the ordered consumer only appends, segmented around the DATA_FLOWS
+  // interleave (whose first-pair dedup is inherently sequential). The previous per-edge
+  // sink built every row on the single drain thread: ~9M indirect calls at kernel scale,
+  // the link's serial floor.
+  struct LinkedChunk {
+    edges: Vec<(u32, u32, vorpal_kg::EdgeType)>,
+    evidence: Vec<vorpal_kg::EvidenceRow>,
+    /// `(index into edges of the CALLS edge, from, to, confidence, arg rows)`.
+    df: Vec<(usize, u64, u64, u8, Vec<vorpal_kg::DataflowRow>)>,
+  }
   let stats = {
-    let evidence = std::cell::RefCell::new(&mut evidence);
+    let arg_join = &arg_join;
+    let param_table = &param_table;
     vorpal_resolve::resolve_all_spilled_into(
       interner,
       &table,
       spill,
       resolver,
       chain.as_ref(),
-      |edge| {
-        writer.add_edge(
-          edge.from,
-          edge.to,
-          edge.edge.with_confidence(edge.confidence),
-        );
-        if edge.edge.base() == vorpal_kg::EdgeType::CALLS {
-          join_call_edge(
-            edge.from.raw(),
-            edge.to.raw(),
-            edge.span,
-            edge.confidence,
-            &arg_join,
-            &param_table,
-            &mut flow_pairs,
-            &mut flows,
-            |etype| writer.add_edge(edge.from, edge.to, etype),
-          );
+      |resolved, unresolved| {
+        let mut chunk = LinkedChunk {
+          edges: Vec::with_capacity(resolved.len()),
+          evidence: Vec::with_capacity(resolved.len() + unresolved.len()),
+          df: Vec::new(),
+        };
+        for edge in &resolved {
+          let at = chunk.edges.len();
+          chunk.edges.push((
+            edge.from.raw() as u32,
+            edge.to.raw() as u32,
+            edge.edge.with_confidence(edge.confidence),
+          ));
+          if edge.edge.base() == vorpal_kg::EdgeType::CALLS {
+            let rows =
+              call_arg_rows(edge.from.raw(), edge.to.raw(), edge.span, arg_join, param_table);
+            if !rows.is_empty() {
+              chunk
+                .df
+                .push((at, edge.from.raw(), edge.to.raw(), edge.confidence, rows));
+            }
+          }
+          let (alt_ids, alt_count) = edge.alternatives;
+          chunk.evidence.push(vorpal_kg::EvidenceRow {
+            from: edge.from.raw() as u32,
+            to: edge.to.raw() as u32,
+            name_hash: edge.name_hash,
+            etype: edge.edge.base().0,
+            reason: edge.reason as u8,
+            confidence: edge.confidence,
+            outcome: vorpal_kg::EvidenceOutcome::Edge,
+            candidates: edge.candidates,
+            span_start: edge.span.0,
+            span_end: edge.span.1,
+            alternatives: alt_ids[..alt_count as usize].to_vec(),
+          });
         }
-        let (alt_ids, alt_count) = edge.alternatives;
-        evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
-          from: edge.from.raw() as u32,
-          to: edge.to.raw() as u32,
-          name_hash: edge.name_hash,
-          etype: edge.edge.base().0,
-          reason: edge.reason as u8,
-          confidence: edge.confidence,
-          outcome: vorpal_kg::EvidenceOutcome::Edge,
-          candidates: edge.candidates,
-          span_start: edge.span.0,
-          span_end: edge.span.1,
-          alternatives: alt_ids[..alt_count as usize].to_vec(),
-        });
+        for unresolved in &unresolved {
+          // No-edge outcomes are evidence too (07-29 §4): "why is there no edge here?"
+          // is answerable from the sidecar instead of only aggregate counts.
+          chunk.evidence.push(vorpal_kg::EvidenceRow {
+            from: unresolved.from.raw() as u32,
+            to: vorpal_kg::NO_EDGE,
+            name_hash: unresolved.name_hash,
+            etype: unresolved.etype.base().0,
+            reason: 0,
+            confidence: 0,
+            outcome: if unresolved.external {
+              vorpal_kg::EvidenceOutcome::External
+            } else {
+              vorpal_kg::EvidenceOutcome::Masked
+            },
+            candidates: unresolved.candidates,
+            span_start: unresolved.span.0,
+            span_end: unresolved.span.1,
+            alternatives: Vec::new(),
+          });
+        }
+        chunk
       },
-      |unresolved| {
-        // No-edge outcomes are evidence too (07-29 §4): "why is there no edge here?" is
-        // answerable from the sidecar instead of only aggregate counts.
-        evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
-          from: unresolved.from.raw() as u32,
-          to: vorpal_kg::NO_EDGE,
-          name_hash: unresolved.name_hash,
-          etype: unresolved.etype.base().0,
-          reason: 0,
-          confidence: 0,
-          outcome: if unresolved.external {
-            vorpal_kg::EvidenceOutcome::External
-          } else {
-            vorpal_kg::EvidenceOutcome::Masked
-          },
-          candidates: unresolved.candidates,
-          span_start: unresolved.span.0,
-          span_end: unresolved.span.1,
-          alternatives: Vec::new(),
-        });
+      |mut chunk: LinkedChunk| {
+        let mut cursor = 0usize;
+        for (at, from, to, confidence, rows) in std::mem::take(&mut chunk.df) {
+          writer.extend_edges(&chunk.edges[cursor..=at]);
+          cursor = at + 1;
+          // One DATA_FLOWS edge per (caller, callee) pair, at the caller's stream position.
+          if flow_pairs.insert((from, to)) {
+            writer.add_edge(
+              vorpal_kg::NodeId::new(from),
+              vorpal_kg::NodeId::new(to),
+              vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(confidence),
+            );
+          }
+          flows.extend(rows);
+        }
+        writer.extend_edges(&chunk.edges[cursor..]);
+        evidence.append(&mut chunk.evidence);
       },
     )?
   };

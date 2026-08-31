@@ -171,7 +171,7 @@ vorpal index <source-tree> --out <index-dir>
 
 | Tree | Cold index | Edit one file, re-index | `touch` one file | Nothing changed |
 |---|---|---|---|---|
-| **Linux kernel** (75,954 files, ~30 M LOC → 2.85 M nodes, 8.9 M references) | **7.6 s** | **1.7 s** | 0.23 s | 0.13 s |
+| **Linux kernel** (75,954 files, ~30 M LOC → 2.85 M nodes, 8.9 M references) | **6.6 s** | **1.7 s** | 0.23 s | 0.13 s |
 | **CPython** (3,841 files → 151k nodes) | 0.94 s | — | — | — |
 | **This repository** (1,311 files → 64k nodes, incl. vendored tree-sitter runtime + 49 grammars) | 6.2 s¹ | 0.06 s | — | 0.06 s |
 

@@ -927,8 +927,8 @@ pub fn resolve_all_spilled<'i>(
     spill,
     resolver,
     None,
-    |edge| edges.push(*edge),
-    |_| {},
+    |resolved, _unresolved| resolved,
+    |mut chunk: Vec<ResolvedEdge>| edges.append(&mut chunk),
   )?;
   Ok((edges, stats))
 }
@@ -938,14 +938,19 @@ pub fn resolve_all_spilled<'i>(
 /// alive under the seal at kernel scale). Chunks stream to a worker pool through a bounded
 /// channel; the sink runs on the calling thread, fed by a rolling in-order drain of
 /// finished chunks (the absorb-holdback pattern).
-pub fn resolve_all_spilled_into<'i>(
+/// `map_chunk` runs ON THE WORKERS, right after resolution, turning each chunk's raw
+/// outcomes into whatever the caller's drain consumes (edge triples, evidence rows,
+/// per-file runs) — the ordered `consume` then does bulk appends only. The former
+/// per-edge sink pair made the single drain thread construct every row itself: ~9M
+/// indirect calls + row builds at kernel scale, the link's serial floor.
+pub fn resolve_all_spilled_into<'i, T: Send>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   spill: &crate::RefSpill<'i>,
   resolver: &Resolver,
   chain: Option<&ChainReturns<'i>>,
-  sink: impl FnMut(&ResolvedEdge),
-  unresolved_sink: impl FnMut(&UnresolvedEvidence),
+  map_chunk: impl Fn(Vec<ResolvedEdge>, Vec<UnresolvedEvidence>) -> T + Sync,
+  consume: impl FnMut(T),
 ) -> std::io::Result<ResolveStats> {
   let raw_chunks = spill.raw_chunks()?;
   resolve_chunks_into(
@@ -955,24 +960,24 @@ pub fn resolve_all_spilled_into<'i>(
     raw_chunks,
     |bytes| spill.decode_chunk(bytes),
     chain,
-    sink,
-    unresolved_sink,
+    map_chunk,
+    consume,
   )
 }
 
 /// [`resolve_all_spilled_into`] over a retained [`crate::RefStore`] — the memory-primary
 /// daemon's link path. Identical pump; only the chunk source differs (alive ranges instead
 /// of the whole file).
-#[allow(clippy::too_many_arguments)] // the retained-path resolve entry: chain ledger rides with the sinks
-pub fn resolve_all_store_into<'i>(
+#[allow(clippy::too_many_arguments)] // the retained-path resolve entry: chain ledger rides with the drains
+pub fn resolve_all_store_into<'i, T: Send>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   store: &mut crate::RefStore,
   order: impl IntoIterator<Item = u32>,
   resolver: &Resolver,
   chain: Option<&ChainReturns<'i>>,
-  sink: impl FnMut(&ResolvedEdge),
-  unresolved_sink: impl FnMut(&UnresolvedEvidence),
+  map_chunk: impl Fn(Vec<ResolvedEdge>, Vec<UnresolvedEvidence>) -> T + Sync,
+  consume: impl FnMut(T),
 ) -> std::io::Result<ResolveStats> {
   let raw_chunks = store.raw_chunks(order)?;
   let store = &*store;
@@ -983,8 +988,8 @@ pub fn resolve_all_store_into<'i>(
     raw_chunks,
     |bytes| store.decode_chunk(interner, bytes),
     chain,
-    sink,
-    unresolved_sink,
+    map_chunk,
+    consume,
   )
 }
 
@@ -992,24 +997,18 @@ pub fn resolve_all_store_into<'i>(
 /// paths. Chunk provenance is invisible to resolution (a pure per-reference read of the
 /// immutable table), so both sources produce output identical to an in-RAM `resolve_all`
 /// over the same reference sequence.
-#[allow(clippy::too_many_arguments)] // the shared chunk pump: decode hook + chain ledger + both sinks are load-bearing
-fn resolve_chunks_into<'i>(
+#[allow(clippy::too_many_arguments)] // the shared chunk pump: decode hook + chain ledger + map/consume are load-bearing
+fn resolve_chunks_into<'i, T: Send>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
   resolver: &Resolver,
   raw_chunks: impl Iterator<Item = std::io::Result<Vec<u8>>> + Send,
   decode: impl Fn(&[u8]) -> Vec<Reference<'i>> + Sync,
   chain: Option<&ChainReturns<'i>>,
-
-  mut sink: impl FnMut(&ResolvedEdge),
-  mut unresolved_sink: impl FnMut(&UnresolvedEvidence),
+  map_chunk: impl Fn(Vec<ResolvedEdge>, Vec<UnresolvedEvidence>) -> T + Sync,
+  mut consume: impl FnMut(T),
 ) -> std::io::Result<ResolveStats> {
-  type ChunkOut = (
-    usize,
-    Vec<ResolvedEdge>,
-    Vec<UnresolvedEvidence>,
-    ResolveStats,
-  );
+  type ChunkOut<T> = (usize, T, ResolveStats);
   let threads = std::thread::available_parallelism()
     .map(|n| n.get())
     .unwrap_or(1);
@@ -1018,16 +1017,16 @@ fn resolve_chunks_into<'i>(
   // nothing but the ordered drain into the sinks — three formerly-competing roles
   // (read+decode / drain / sink) on one thread become three threads.
   let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, Vec<u8>)>(threads * 2);
-  let (out_tx, out_rx) = crossbeam_channel::unbounded::<ChunkOut>();
+  let (out_tx, out_rx) = crossbeam_channel::unbounded::<ChunkOut<T>>();
 
   let mut stats = ResolveStats::default();
   let mut feed_error: Option<std::io::Error> = None;
   {
-    let sink = &mut sink;
-    let unresolved_sink = &mut unresolved_sink;
+    let consume = &mut consume;
     let stats = &mut stats;
     let feed_error = &mut feed_error;
     let decode = &decode;
+    let map_chunk = &map_chunk;
     std::thread::scope(|scope| {
       for _ in 0..threads {
         let work_rx = work_rx.clone();
@@ -1038,7 +1037,8 @@ fn resolve_chunks_into<'i>(
             drop(bytes);
             let (edges, unresolved, stats) =
               resolve_chunk(interner, table, &chunk, resolver, chain);
-            if out_tx.send((index, edges, unresolved, stats)).is_err() {
+            let mapped = map_chunk(edges, unresolved);
+            if out_tx.send((index, mapped, stats)).is_err() {
               break;
             }
           }
@@ -1064,22 +1064,17 @@ fn resolve_chunks_into<'i>(
         }
       });
 
-      type Held = (Vec<ResolvedEdge>, Vec<UnresolvedEvidence>, ResolveStats);
-      let mut holdback: std::collections::BTreeMap<usize, Held> = std::collections::BTreeMap::new();
+      let mut holdback: std::collections::BTreeMap<usize, (T, ResolveStats)> =
+        std::collections::BTreeMap::new();
       let mut next_out = 0usize;
       // Superlinearity probe over drained references (D7): chunk granularity, one tick
       // per drained chunk — far off the per-reference hot path.
       let mut scaling = vorpal_kg::ScalingProbe::new("link");
       let mut refs_done: u64 = 0;
-      while let Ok((index, chunk_edges, chunk_unresolved, chunk_stats)) = out_rx.recv() {
-        holdback.insert(index, (chunk_edges, chunk_unresolved, chunk_stats));
-        while let Some((chunk_edges, chunk_unresolved, chunk_stats)) = holdback.remove(&next_out) {
-          for edge in &chunk_edges {
-            sink(edge);
-          }
-          for row in &chunk_unresolved {
-            unresolved_sink(row);
-          }
+      while let Ok((index, mapped, chunk_stats)) = out_rx.recv() {
+        holdback.insert(index, (mapped, chunk_stats));
+        while let Some((mapped, chunk_stats)) = holdback.remove(&next_out) {
+          consume(mapped);
           refs_done += chunk_stats.total();
           scaling.tick(refs_done);
           *stats += chunk_stats;

@@ -120,6 +120,13 @@ impl EdgeLog {
     self.etypes.push(etype.0);
   }
 
+  /// Pre-size for a known batch (the bulk drain's per-chunk extend).
+  pub fn reserve(&mut self, additional: usize) {
+    self.srcs.reserve(additional);
+    self.dsts.reserve(additional);
+    self.etypes.reserve(additional);
+  }
+
   pub fn len(&self) -> usize {
     self.srcs.len()
   }

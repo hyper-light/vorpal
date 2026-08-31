@@ -881,8 +881,13 @@ impl RetainedIndex {
     let qualified = self.store.qualified_imports(interner, order.iter().copied());
     vorpal_resolve::seed_import_bindings(interner, table, &qualified, resolver);
     let _pump_stats = {
-      let resolution = std::cell::RefCell::new(&mut self.resolution);
+      let resolution = &mut self.resolution;
       let store = &mut self.store;
+      // Bulk drain (see the spilled twin in pipeline.rs): workers group each chunk into
+      // contiguous per-file runs — references arrive file-ordered, so grouping is a run
+      // scan, not a sort — and the ordered consumer extends the matching buckets. Run
+      // order within a chunk is emission order, so bucket contents are byte-identical to
+      // the per-edge form.
       vorpal_resolve::resolve_all_store_into(
         interner,
         table,
@@ -890,57 +895,75 @@ impl RetainedIndex {
         feed.iter().copied(),
         resolver,
         chain.as_ref(),
-        |edge| {
-          let mut resolution = resolution.borrow_mut();
-          let bucket = resolution.entry(edge.from_path_bits).or_default();
-          bucket
-            .edges
-            .push((edge.from.raw() as u32, edge.to.raw() as u32, edge.edge.with_confidence(edge.confidence)));
-          if Confidence(edge.confidence) <= Confidence::AMBIGUOUS {
-            bucket.stats.ambiguous += 1;
-          } else {
-            bucket.stats.resolved += 1;
-          }
-          let (alt_ids, alt_count) = edge.alternatives;
-          bucket.evidence.push(vorpal_kg::EvidenceRow {
-            from: edge.from.raw() as u32,
-            to: edge.to.raw() as u32,
-            name_hash: edge.name_hash,
-            etype: edge.edge.base().0,
-            reason: edge.reason as u8,
-            confidence: edge.confidence,
-            outcome: vorpal_kg::EvidenceOutcome::Edge,
-            candidates: edge.candidates,
-            span_start: edge.span.0,
-            span_end: edge.span.1,
-            alternatives: alt_ids[..alt_count as usize].to_vec(),
-          });
-        },
-        |unresolved| {
-          let mut resolution = resolution.borrow_mut();
-          let bucket = resolution.entry(unresolved.from_path_bits).or_default();
-          if unresolved.external {
-            bucket.stats.external += 1;
-          } else {
-            bucket.stats.masked += 1;
-          }
-          bucket.evidence.push(vorpal_kg::EvidenceRow {
-            from: unresolved.from.raw() as u32,
-            to: vorpal_kg::NO_EDGE,
-            name_hash: unresolved.name_hash,
-            etype: unresolved.etype.base().0,
-            reason: 0,
-            confidence: 0,
-            outcome: if unresolved.external {
-              vorpal_kg::EvidenceOutcome::External
+        |resolved, unresolved| {
+          let mut runs: Vec<(u32, FileResolution)> = Vec::new();
+          for edge in &resolved {
+            if runs.last().map(|(bits, _)| *bits) != Some(edge.from_path_bits) {
+              runs.push((edge.from_path_bits, FileResolution::default()));
+            }
+            let bucket = &mut runs.last_mut().expect("pushed above").1;
+            bucket.edges.push((
+              edge.from.raw() as u32,
+              edge.to.raw() as u32,
+              edge.edge.with_confidence(edge.confidence),
+            ));
+            if Confidence(edge.confidence) <= Confidence::AMBIGUOUS {
+              bucket.stats.ambiguous += 1;
             } else {
-              vorpal_kg::EvidenceOutcome::Masked
-            },
-            candidates: unresolved.candidates,
-            span_start: unresolved.span.0,
-            span_end: unresolved.span.1,
-            alternatives: Vec::new(),
-          });
+              bucket.stats.resolved += 1;
+            }
+            let (alt_ids, alt_count) = edge.alternatives;
+            bucket.evidence.push(vorpal_kg::EvidenceRow {
+              from: edge.from.raw() as u32,
+              to: edge.to.raw() as u32,
+              name_hash: edge.name_hash,
+              etype: edge.edge.base().0,
+              reason: edge.reason as u8,
+              confidence: edge.confidence,
+              outcome: vorpal_kg::EvidenceOutcome::Edge,
+              candidates: edge.candidates,
+              span_start: edge.span.0,
+              span_end: edge.span.1,
+              alternatives: alt_ids[..alt_count as usize].to_vec(),
+            });
+          }
+          for unresolved in &unresolved {
+            if runs.last().map(|(bits, _)| *bits) != Some(unresolved.from_path_bits) {
+              runs.push((unresolved.from_path_bits, FileResolution::default()));
+            }
+            let bucket = &mut runs.last_mut().expect("pushed above").1;
+            if unresolved.external {
+              bucket.stats.external += 1;
+            } else {
+              bucket.stats.masked += 1;
+            }
+            bucket.evidence.push(vorpal_kg::EvidenceRow {
+              from: unresolved.from.raw() as u32,
+              to: vorpal_kg::NO_EDGE,
+              name_hash: unresolved.name_hash,
+              etype: unresolved.etype.base().0,
+              reason: 0,
+              confidence: 0,
+              outcome: if unresolved.external {
+                vorpal_kg::EvidenceOutcome::External
+              } else {
+                vorpal_kg::EvidenceOutcome::Masked
+              },
+              candidates: unresolved.candidates,
+              span_start: unresolved.span.0,
+              span_end: unresolved.span.1,
+              alternatives: Vec::new(),
+            });
+          }
+          runs
+        },
+        |runs: Vec<(u32, FileResolution)>| {
+          for (bits, mut part) in runs {
+            let bucket = resolution.entry(bits).or_default();
+            bucket.edges.append(&mut part.edges);
+            bucket.evidence.append(&mut part.evidence);
+            bucket.stats += part.stats;
+          }
         },
       )?
     };

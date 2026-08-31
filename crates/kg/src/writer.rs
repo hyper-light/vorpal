@@ -169,6 +169,17 @@ impl KgWriter {
     self.edges.push(from.raw() as u32, to.raw() as u32, edge);
   }
 
+  /// Bulk-append pre-built edge triples in order — the resolve pump's drain hands whole
+  /// worker-built chunks here instead of one indirect call per edge (that per-edge sink
+  /// was the link's single-threaded bottleneck at ~9M edges). Order is preserved exactly:
+  /// the log after this call is byte-identical to the per-edge sequence.
+  pub fn extend_edges(&mut self, edges: &[(u32, u32, EdgeType)]) {
+    self.edges.reserve(edges.len());
+    for &(from, to, edge) in edges {
+      self.edges.push(from, to, edge);
+    }
+  }
+
   /// Ingest one file's extracted outline (see [`KgWriter::ingest_file_with_spans`]), discarding
   /// the returned spans.
   pub fn ingest_file(&mut self, path: &str, items: &[OutlineItem<'_>]) {

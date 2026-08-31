@@ -399,6 +399,44 @@ From-scratch and incremental builds emit identical bytes *by construction*. This
 makes the Phase-3 compactor itself O(changed buckets). Nightly CI keeps the golden check:
 scratch id == incremental id on the kernel tree.
 
+### Phase-4 execution decomposition (2026-08-31) — gated slices, each landing alone
+
+- **P4.0 — identity spike (no format change):** `FileKey = xxh3_64(tree-relative path)` +
+  `LocalOrdinal(u32)` types; a shadow map (file_key, ordinal) ⇄ dense id built at seal and
+  pinned bijective at kernel scale. Collisions are DETECTED at build and fail loudly with
+  the colliding paths (same posture as the u32 ceilings) — never probabilistically ignored.
+  Gate: shadow-map bijectivity + zero byte movement anywhere.
+- **P4.1 — bucketed `products.pack` (pack v2):** header + TOC + B buckets,
+  bucket = file_key mod B, files canonically ordered inside buckets. B derives from the
+  corpus at build (target bucket size from a recorded two-scale sweep — vorpal repo and
+  kernel — per the no-magic-constants law). One edited file rewrites one bucket + TOC.
+  Reader keeps v1 for one release; writer emits v2 behind `VORPAL_FORMAT=next` until the
+  flip. Gate: roundtrip, single-bucket rewrite proof, determinism ×2, kernel identity A/B.
+- **P4.2 — bucketed node segment + heap:** per-bucket `nodes.vseg`/`strings.heap` slabs
+  with a TOC; DENSE ids stay the runtime currency (prefix sums over bucket counts at load),
+  so every in-RAM consumer — CSR, ANN rows, evidence lookups, tools — is untouched. The
+  format stores locals; the runtime derives dense. Gate: v2 load ≡ v1 load in RAM,
+  byte-for-byte, plus artifact determinism.
+- **P4.3 — reference-bearing artifacts on (file_key, local):** THE open design tension,
+  decided by measurement not taste: naive 8-byte endpoints double edge storage
+  (~144 MB kernel); candidate layouts are (a) per-bucket edge slabs with src implicit and
+  dst as key+local varint, (b) a per-generation sorted file_key→slot table with slot-local
+  endpoints and TOC-driven slot repair on file add/remove. Prototype both on the kernel,
+  record size/load/query deltas, then commit. Evidence/dataflow follow the winner.
+- **P4.4 — Merkle commit:** per-bucket digests in each TOC; the generation id hashes the
+  TOCs. Commit cost becomes O(changed buckets); the stamp-only cutoff and retained persist
+  reuse unchanged digests. Gate: id equality against the full-rehash oracle on every path.
+- **P4.5 — scoped re-resolve on the CLI path:** `usage.idx` (name → file_key postings)
+  generalizes the daemon's dirty-name machinery to disk; a CLI edit re-resolves only dirty
+  buckets, with the derived escalation threshold falling back to the full re-link — both
+  paths land on identical bytes (the differential harness gates every scale). This is the
+  slice where the 100–250 ms edit lands; nothing before it changes user-visible latency,
+  everything before it removes the risk.
+
+Standing rules for every slice: the nightly golden (scratch id == incremental id, kernel)
+never regresses; v-1 readers stay supported for one release per format-bearing slice; no
+slice ships with a constant that wasn't swept at two scales and recorded here.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,
