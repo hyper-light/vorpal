@@ -885,7 +885,7 @@ mod tests {
       .collect();
     // Ring + random chords, symmetric, weight in (0, 1].
     let mut adjacency: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n];
-    let mut connect = |a: usize, b: usize, w: f32, adjacency: &mut Vec<Vec<(u32, f32)>>| {
+    let connect = |a: usize, b: usize, w: f32, adjacency: &mut Vec<Vec<(u32, f32)>>| {
       adjacency[a].push((b as u32, w));
       adjacency[b].push((a as u32, w));
     };

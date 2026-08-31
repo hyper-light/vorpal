@@ -271,6 +271,26 @@ without regressing others — else recorded as measured-and-rejected in this doc
 
 **Stage 6 (owner-gated) — vendored code-specialized encoder.** Per D5.
 
+> **PROGRESS (2026-08-31): owner waiver given; encoder core built and PROVEN.**
+> Candidate selected per D5's curation rule: **CodeRankEmbed** (cornstack/Nomic,
+> license verified **MIT**, 137M-param NomicBert, CoRNStack-trained). Weights
+> acquired and checksummed (sha256 `827529bc…`, 546,938,168 bytes). Owned
+> inference in `vorpal_ann::encoder`: strict zero-copy safetensors loader (typed
+> refusals for dtype/bounds/shape/alignment), owned WordPiece (BertNormalizer +
+> BertPreTokenizer + greedy longest-match, byte-exact against the reference
+> `tokenizers` library over a unicode battery), owned forward pass (f64
+> fixed-order accumulation, bitwise thread-stable; post-norm, non-interleaved
+> rotary base 1000, SwiGLU with the fc12 gate, CLS pool) matching an independent
+> numpy reference at ≤1e-4; config-semantics mismatches refuse at open. ~90 ms
+> per short sequence correctness-first — a 1+25-candidate rerank ≈ 1–2 s/query.
+> SCALE LAW: doc-side encoding at kernel scale is ~10¹² FLOPs — the encoder can
+> NEVER be the warm-time row embedder; its shape is the opt-in QUERY-TIME
+> RERANKER (prefixed query + fused top-K surfaces, nothing precomputed).
+> REMAINING: reranker wiring behind a per-index model-dir selection + latency and
+> NL-split eval gates; and the release-size decision (547 MB f32 / ~274 MB f16 vs
+> npm+PyPI budgets: optional model package vs LFS vs release asset) — an owner
+> call, surfaced.
+
 **Ready-when-licensed:** multi-phrase semantic AND becomes real per-phrase semantics at
 Stage 1+; it remains separately unlicensed and is not scheduled here.
 

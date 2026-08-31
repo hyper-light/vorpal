@@ -863,8 +863,8 @@ mod tests {
     let parallel = count_ranges(&ranges_dir, range_count, 700, 64, 64, |range, push| {
       let start = range * docs_per_range;
       let end = ((range + 1) * docs_per_range).min(docs.len());
-      for doc_index in start..end {
-        for &(a, b) in docs[doc_index] {
+      for (doc_index, doc) in docs.iter().enumerate().take(end).skip(start) {
+        for &(a, b) in *doc {
           push(a, b, (doc_index % 2) as u8);
         }
       }

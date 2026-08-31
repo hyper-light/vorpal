@@ -15,6 +15,7 @@
 //! RaBitQ-grade quantization and IVF sharding are the §10 successors behind the same seams.
 
 mod embed;
+pub mod encoder;
 mod index;
 mod kernels;
 pub mod learned;

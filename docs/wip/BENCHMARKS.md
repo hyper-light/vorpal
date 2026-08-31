@@ -803,6 +803,49 @@ an independent signal that graph positives are not. Rejected and pinned off
 functional-form precedent) for any future INDEPENDENT positive source (e.g. labeled
 or interaction data).
 
+## Stage 6 (vendored encoder): owned inference core, proven against references
+
+Owner waiver given; candidate = CodeRankEmbed (MIT verified, 137M NomicBert,
+CoRNStack-curated — D5's rule). Weights vendored-in-waiting at sha256
+`827529bcd58aef0d9082e66eeff7e7d53a02f62bd005f841a26b3d3e2fb17ebe` (546,938,168 B
+f32 safetensors); NEVER downloaded at runtime — the model directory is a local
+artifact validated at open.
+
+`vorpal_ann::encoder` is owned end to end: a strict zero-copy safetensors loader
+(F32-only; header/bounds/shape-product/4-alignment all typed refusals), an owned
+WordPiece pipeline (BertNormalizer order clean → CJK spacing → NFD accent-strip →
+lowercase; BERT's punctuation predicate = the four ASCII ranges ∪ Unicode P*;
+greedy longest-match with the `##` continuation), and an owned NomicBert forward
+(embeddings + emb_ln; post-norm blocks; biasless QKV/out_proj; non-interleaved
+rotate-half rotary, base 1000, full 64-dim head; softmax 1/√64 max-subtracted;
+SwiGLU with fc12 carrying the gate; CLS pool). Numerics are correctness-first:
+every reduction accumulates f64 in fixed order, parallelism only across
+independent output rows — bitwise identical at any thread count. A config asking
+for semantics not reproduced here (pre-norm, RMS norm, interleaved/partial
+rotary, biases, causal) refuses at open.
+
+Oracles (gated on `VORPAL_CODERANK_DIR` — the artifact cannot live in the repo;
+goldens regenerate via the reference generator `ref_forward.py`, which uses the
+real `tokenizers` library for ids and an independent numpy forward for
+activations, BLAS cross-checked against einsum at 2.8e-14):
+
+| oracle | result |
+|---|---|
+| tokenizer vs reference library (unicode/code/casing battery + 3 texts) | byte-exact |
+| forward CLS vs numpy reference, 3 texts | max rel err ≤ 1e-4 ✓ |
+| embed bitwise reproducibility | identical bits |
+| behavioral smoke (query vs factorial-def vs unrelated) | correct order |
+| 3 texts + 4 embeds, release, f64 correctness-first pass | 0.63 s (~90 ms/short seq) |
+
+The scale law that shaped the integration: doc-side encoding at kernel scale is
+~10¹² FLOPs (hours of CPU) — this encoder can never be the warm-time row
+embedder. Its shape is the opt-in QUERY-TIME RERANKER: one prefixed query + the
+fused top-K candidate surfaces per search (~1+25 short sequences ≈ 1–2 s at the
+current pass; f32/SIMD kernel work is the recorded optimization lead). Reranker
+wiring, latency gates, and the NL-split eval follow; the release-size decision
+(547 MB f32 / ~274 MB f16 vs npm+PyPI budgets) is an owner call, surfaced
+separately.
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal
