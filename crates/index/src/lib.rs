@@ -652,23 +652,32 @@ fn build_index_inner(
     if !verify_all
       && policy.mode == ParseHealthMode::Warn
       && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
-      && let Some(mut report) = try_stamp_only_cutoff(
-        out,
-        &prior,
-        CutoffContext {
-          manifest: &manifest,
-          prior_manifest: &prior_manifest,
-          prior_manifest_ns,
-          tree_root: &tree_root,
-        },
-        &extractor,
-        cache_mode.label(),
-      )?
     {
-      // The cutoff re-extracts changed files with this environment's extractor — the
-      // best-effort tier disclosure travels with every report, fast paths included.
-      report.unverified_langs = unverified_langs.clone();
-      return Ok(report);
+      let ctx = CutoffContext {
+        manifest: &manifest,
+        prior_manifest: &prior_manifest,
+        prior_manifest_ns,
+        tree_root: &tree_root,
+      };
+      if let Some(mut report) =
+        try_stamp_only_cutoff(out, &prior, &ctx, &extractor, cache_mode.label())?
+      {
+        // The cutoff re-extracts changed files with this environment's extractor — the
+        // best-effort tier disclosure travels with every report, fast paths included.
+        report.unverified_langs = unverified_langs.clone();
+        return Ok(report);
+      }
+      // Past the cutoff, the RESPAN compose (P4.5b): span-only edits — the class between
+      // "byte-identical products" and "semantic change" — compose the next generation
+      // mechanically from the prior one. Same trust gates, same fallback posture.
+      if env.is_default()
+        && std::env::var_os("VORPAL_NO_RESPAN").is_none()
+        && let Some(mut report) =
+          compose::try_respan_compose(out, &prior, &ctx, &extractor, cache_mode.label())?
+      {
+        report.unverified_langs = unverified_langs.clone();
+        return Ok(report);
+      }
     }
   }
 
@@ -1357,17 +1366,18 @@ fn content_id_fold(dir: &Path, names: Vec<String>, chunk: u64) -> io::Result<Str
 /// The manifest-side context [`try_stamp_only_cutoff`] judges a build against: the fresh
 /// and prior manifests, the prior's write clock (racy-mtime window), and the canonical
 /// tree root (the pack's absolute→relative conversion point).
-struct CutoffContext<'a> {
-  manifest: &'a Manifest,
-  prior_manifest: &'a Manifest,
-  prior_manifest_ns: u64,
-  tree_root: &'a str,
+#[derive(Clone, Copy)]
+pub(crate) struct CutoffContext<'a> {
+  pub(crate) manifest: &'a Manifest,
+  pub(crate) prior_manifest: &'a Manifest,
+  pub(crate) prior_manifest_ns: u64,
+  pub(crate) tree_root: &'a str,
 }
 
 fn try_stamp_only_cutoff(
   out: &Path,
   prior: &Path,
-  ctx: CutoffContext<'_>,
+  ctx: &CutoffContext<'_>,
   extractor: &OutlineExtractor,
   cache_mode_label: &'static str,
 ) -> io::Result<Option<IndexReport>> {
@@ -1376,7 +1386,7 @@ fn try_stamp_only_cutoff(
     prior_manifest,
     prior_manifest_ns,
     tree_root,
-  } = ctx;
+  } = *ctx;
   /// Above this many changed files the full pipeline is competitive and the cutoff's
   /// serial re-extraction is not — a policy bound, not a correctness one.
   const MAX_RESTAMPED: usize = 64;
@@ -3157,6 +3167,8 @@ pub fn explain_edge_on(
   }
   Ok(out)
 }
+
+mod compose;
 
 pub use vorpal_kg::resolve_index_dir;
 

@@ -269,6 +269,73 @@ fn locate(nodes: &crate::kg::NodeIdMap, id: u32) -> io::Result<(u64, u32)> {
     .ok_or_else(|| io::Error::other("evidence id outside the node universe"))
 }
 
+/// Build one evidence slab's bytes from its DENSE rows: stored-key sort (the same total
+/// tiebreak as the dense sort), fixed-width encode, digest. ONE encoder — the full save
+/// and the respan compose both call this, so their bytes agree by construction.
+pub(crate) fn build_slab(
+  bucket: usize,
+  base: u64,
+  slab_rows: &[EvidenceRow],
+  nodes: &crate::kg::NodeIdMap,
+) -> io::Result<BuiltSlab> {
+  let mut ordered: Vec<(u32, (u64, u32), &EvidenceRow)> = slab_rows
+    .iter()
+    .map(|row| {
+      let from_local = (u64::from(row.from) - base) as u32;
+      locate(nodes, row.to).map(|to| (from_local, to, row))
+    })
+    .collect::<io::Result<Vec<_>>>()?;
+  ordered.sort_by(|a, b| {
+    (a.0, a.1, a.2.etype, a.2.span_start, a.2.span_end)
+      .cmp(&(b.0, b.1, b.2.etype, b.2.span_start, b.2.span_end))
+      .then_with(|| a.2.name_hash.cmp(&b.2.name_hash))
+      .then_with(|| a.2.reason.cmp(&b.2.reason))
+      .then_with(|| a.2.confidence.cmp(&b.2.confidence))
+      .then_with(|| a.2.outcome.tag().cmp(&b.2.outcome.tag()))
+      .then_with(|| a.2.candidates.cmp(&b.2.candidates))
+      .then_with(|| a.2.alternatives.cmp(&b.2.alternatives))
+  });
+  let pool_entries: usize = ordered.iter().map(|(_, _, r)| r.alternatives.len()).sum();
+  let mut bytes =
+    Vec::with_capacity(SLAB_HEADER + ordered.len() * ROW_V3 + pool_entries * POOL_V3);
+  bytes.extend_from_slice(SLAB_MAGIC);
+  bytes.extend_from_slice(&V3.to_le_bytes());
+  bytes.extend_from_slice(&(bucket as u32).to_le_bytes());
+  bytes.extend_from_slice(&(ordered.len() as u64).to_le_bytes());
+  bytes.extend_from_slice(&(pool_entries as u64).to_le_bytes());
+  let mut alt_off = 0u32;
+  for (from_local, (to_key, to_ord), row) in &ordered {
+    bytes.extend_from_slice(&from_local.to_le_bytes());
+    bytes.extend_from_slice(&to_key.to_le_bytes());
+    bytes.extend_from_slice(&to_ord.to_le_bytes());
+    bytes.extend_from_slice(&row.name_hash.to_le_bytes());
+    bytes.extend_from_slice(&row.etype.to_le_bytes());
+    bytes.push(row.reason);
+    bytes.push(row.confidence);
+    bytes.push(row.outcome.tag());
+    bytes.push(row.alternatives.len().min(255) as u8);
+    bytes.extend_from_slice(&row.candidates.to_le_bytes());
+    bytes.extend_from_slice(&row.span_start.to_le_bytes());
+    bytes.extend_from_slice(&row.span_end.to_le_bytes());
+    bytes.extend_from_slice(&alt_off.to_le_bytes());
+    alt_off += row.alternatives.len() as u32;
+  }
+  for (_, _, row) in &ordered {
+    for &alt in &row.alternatives {
+      let (key, ord) = locate(nodes, alt)?;
+      bytes.extend_from_slice(&key.to_le_bytes());
+      bytes.extend_from_slice(&ord.to_le_bytes());
+    }
+  }
+  let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
+  Ok(BuiltSlab {
+    rows: ordered.len() as u64,
+    pool: pool_entries as u64,
+    bytes,
+    digest,
+  })
+}
+
 fn save_bucketed(
   dir: &Path,
   rows: &[EvidenceRow],
@@ -304,78 +371,9 @@ fn save_bucketed(
   let prior_toc = prior.and_then(|p| EvidenceToc::load(&p.join(EVIDENCE_TOC)));
   let prior_ok = prior_toc.as_ref().is_some_and(|toc| toc.rows.len() == buckets);
 
-  struct BuiltSlab {
-    rows: u64,
-    pool: u64,
-    bytes: Vec<u8>,
-    digest: u64,
-  }
   let built: io::Result<Vec<BuiltSlab>> = (0..buckets)
     .into_par_iter()
-    .map(|bucket| {
-      let slab_rows = &rows[starts[bucket]..starts[bucket + 1]];
-      let base = bases[bucket];
-      // Slab order is the STORED key order — (from_local, to_key, to_ordinal, …) with the
-      // same total tiebreak as the dense sort — so the binary search laws hold over the
-      // bytes as written. A pure function of the row set (dense ids break the final ties
-      // deterministically within one generation).
-      let mut ordered: Vec<(u32, (u64, u32), &EvidenceRow)> = slab_rows
-        .iter()
-        .map(|row| {
-          let from_local = (u64::from(row.from) - base) as u32;
-          locate(nodes, row.to).map(|to| (from_local, to, row))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-      ordered.sort_by(|a, b| {
-        (a.0, a.1, a.2.etype, a.2.span_start, a.2.span_end)
-          .cmp(&(b.0, b.1, b.2.etype, b.2.span_start, b.2.span_end))
-          .then_with(|| a.2.name_hash.cmp(&b.2.name_hash))
-          .then_with(|| a.2.reason.cmp(&b.2.reason))
-          .then_with(|| a.2.confidence.cmp(&b.2.confidence))
-          .then_with(|| a.2.outcome.tag().cmp(&b.2.outcome.tag()))
-          .then_with(|| a.2.candidates.cmp(&b.2.candidates))
-          .then_with(|| a.2.alternatives.cmp(&b.2.alternatives))
-      });
-      let pool_entries: usize = ordered.iter().map(|(_, _, r)| r.alternatives.len()).sum();
-      let mut bytes =
-        Vec::with_capacity(SLAB_HEADER + ordered.len() * ROW_V3 + pool_entries * POOL_V3);
-      bytes.extend_from_slice(SLAB_MAGIC);
-      bytes.extend_from_slice(&V3.to_le_bytes());
-      bytes.extend_from_slice(&(bucket as u32).to_le_bytes());
-      bytes.extend_from_slice(&(ordered.len() as u64).to_le_bytes());
-      bytes.extend_from_slice(&(pool_entries as u64).to_le_bytes());
-      let mut alt_off = 0u32;
-      for (from_local, (to_key, to_ord), row) in &ordered {
-        bytes.extend_from_slice(&from_local.to_le_bytes());
-        bytes.extend_from_slice(&to_key.to_le_bytes());
-        bytes.extend_from_slice(&to_ord.to_le_bytes());
-        bytes.extend_from_slice(&row.name_hash.to_le_bytes());
-        bytes.extend_from_slice(&row.etype.to_le_bytes());
-        bytes.push(row.reason);
-        bytes.push(row.confidence);
-        bytes.push(row.outcome.tag());
-        bytes.push(row.alternatives.len().min(255) as u8);
-        bytes.extend_from_slice(&row.candidates.to_le_bytes());
-        bytes.extend_from_slice(&row.span_start.to_le_bytes());
-        bytes.extend_from_slice(&row.span_end.to_le_bytes());
-        bytes.extend_from_slice(&alt_off.to_le_bytes());
-        alt_off += row.alternatives.len() as u32;
-      }
-      for (_, _, row) in &ordered {
-        for &alt in &row.alternatives {
-          let (key, ord) = locate(nodes, alt)?;
-          bytes.extend_from_slice(&key.to_le_bytes());
-          bytes.extend_from_slice(&ord.to_le_bytes());
-        }
-      }
-      let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
-      Ok(BuiltSlab {
-        rows: ordered.len() as u64,
-        pool: pool_entries as u64,
-        bytes,
-        digest,
-      })
-    })
+    .map(|bucket| build_slab(bucket, bases[bucket], &rows[starts[bucket]..starts[bucket + 1]], nodes))
     .collect();
   let built = built?;
   crate::phase_stamp("evidence: write start");
@@ -504,6 +502,14 @@ impl EvidenceToc {
     }
     Some(EvidenceToc { rows })
   }
+}
+
+/// One built v3 slab, ready to land or be carried.
+pub(crate) struct BuiltSlab {
+  pub(crate) rows: u64,
+  pub(crate) pool: u64,
+  pub(crate) bytes: Vec<u8>,
+  pub(crate) digest: u64,
 }
 
 /// One mapped v3 slab.
@@ -733,6 +739,21 @@ impl EvidenceStore {
 
   pub fn len(&self) -> usize {
     self.count
+  }
+
+  /// One bucket's rows in DENSE space (bucketed backing only) — the respan compose's read
+  /// side. Empty for the flat backing or an out-of-range bucket.
+  pub(crate) fn rows_of_bucket(&self, bucket: usize) -> Vec<EvidenceRow> {
+    match &self.backing {
+      Backing::Flat(_) => Vec::new(),
+      Backing::Bucketed { slabs, map } => {
+        let Some(Some(slab)) = slabs.get(bucket) else {
+          return Vec::new();
+        };
+        let base = map.bases()[bucket] as u32;
+        (0..slab.rows).map(|i| slab.row_with_base(i, base, map)).collect()
+      }
+    }
   }
 
   pub fn is_empty(&self) -> bool {

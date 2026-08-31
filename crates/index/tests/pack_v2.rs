@@ -431,6 +431,67 @@ fn bucketed_pack_end_to_end() {
     "cutoff generation must equal the scratch build of the touched tree (stamps included)"
   );
 
+  // P4.5b: the RESPAN compose — a comment inserted INSIDE a function body shifts spans
+  // without changing any name, signature, reference, sketch, or return: the compose must
+  // fire (graph carried, edges/usage/caches hard-linked) and the committed generation
+  // must equal a scratch build of the same tree BYTE-FOR-BYTE.
+  let respan_rel = "core/mod_03.rs";
+  fs::write(
+    src.join(respan_rel),
+    "pub fn helper_3(value: i32) -> i32 {
+    // p45b respan probe
+    value + 3
+}
+
+     pub fn entry_3(seed: i32) -> i32 {
+    helper_3(seed)
+}
+",
+  )
+  .unwrap();
+  let report = build_index(&src, &out_a).unwrap();
+  assert!(
+    report.graph_reused && !report.reused,
+    "span-only edit must take the respan compose: {report:?}"
+  );
+  let gen_a4 = live(&out_a);
+  assert_ne!(gen_a3.file_name(), gen_a4.file_name());
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    // The compose's signature: edges + usage fully linked; both derived caches linked.
+    for family in ["edges", "usage"] {
+      for entry in fs::read_dir(gen_a3.join(family)).unwrap().flatten() {
+        let name = entry.file_name().into_string().unwrap();
+        assert_eq!(
+          entry.metadata().unwrap().ino(),
+          fs::metadata(gen_a4.join(family).join(&name)).unwrap().ino(),
+          "respan must hard-link {family} member {name}"
+        );
+      }
+    }
+    for cache in ["names.idx", "graph.bin"] {
+      assert_eq!(
+        fs::metadata(gen_a3.join(cache)).unwrap().ino(),
+        fs::metadata(gen_a4.join(cache)).unwrap().ino(),
+        "respan must hard-link the {cache} cache"
+      );
+    }
+  }
+  // THE gate: the composed generation equals the full pipeline's, byte for byte.
+  let out_r = base.join("index-respan-scratch");
+  build_index(&src, &out_r).unwrap();
+  assert_eq!(
+    content_id(&gen_a4),
+    content_id(&live(&out_r)),
+    "respan-composed generation must equal the scratch build of the same tree"
+  );
+  assert_eq!(
+    vorpal_index::generation_content_id_full(&gen_a4).unwrap(),
+    vorpal_index::generation_content_id_full(&live(&out_r)).unwrap(),
+    "…under the full-rehash fold too"
+  );
+
   // 5: v1 → v2 migration — a flat prior migrates through body reuse on the next edit.
   unsafe { std::env::set_var("VORPAL_FORMAT", "") };
   let out_e = base.join("index-e");

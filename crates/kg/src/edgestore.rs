@@ -320,6 +320,12 @@ pub(crate) fn write_cache(dir: &Path, graph: &Graph, stamp: (u64, u64)) -> io::R
   out.flush()?;
   drop(out);
   fs::rename(&tmp, dir.join("graph.bin"))?;
+  write_stamp(dir, stamp)
+}
+
+/// Write just `graph.stamp` (the respan compose links `graph.bin` verbatim — edges are
+/// unchanged — and refreshes only the node half of the stamp).
+pub(crate) fn write_stamp(dir: &Path, stamp: (u64, u64)) -> io::Result<()> {
   let stamp_tmp = dir.join("graph.stamp.tmp");
   let mut out = fs::File::create(&stamp_tmp)?;
   out.write_all(STAMP_MAGIC)?;

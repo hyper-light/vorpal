@@ -743,6 +743,21 @@ its disk twin, landed in three certified sub-slices:
   for unchanged files, fresh for changed), rebuild TOCs + Merkle id, commit. Everything
   else falls back to the full pipeline. Gate: composed generation == full-pipeline
   generation BYTE-FOR-BYTE at every scale (the differential harness's strongest form).
+- **P4.5b SHIPPED (2026-08-31) as the RESPAN compose** — scoped to the span-only class
+  (comment insertions, blank lines, formatting: every non-span product field byte-equal),
+  where outcomes are a theorem, not a re-derivation. Eligibility is an explicit exactness
+  ladder (grammar identity, error accounting, params, returns, sketches, requests, items
+  sans ranges, refs sans spans — each rejection phase-stamped); fresh rows come from a
+  scratch single-file seal through the pipeline's own ingest and are VERIFIED field-by-
+  field against the prior generation; the surgery re-encodes only the edited buckets'
+  node/evidence slabs through the same builders the full save uses, hard-links edges,
+  usage, names.idx and graph.bin (stamp refreshed for the moved node fold), re-spans
+  dataflow, republishes the pack bucket, and Merkle-commits. Kernel: **comment-inside-
+  function edit 0.82 s** (vs 1.9–2.4 s full pipeline), edges+usage 257/257 linked, both
+  caches linked, **composed generation == scratch generation** (Merkle AND full-rehash
+  folds) — the convergence gate also self-proves the compose ran (a cutoff misfire would
+  carry stale spans and diverge). Falls back loudly on any proof failure; error-span
+  SHIFTS are eligible (they live only in the republished product), error COUNTS are not.
 - **P4.5c — the full dirty closure.** Cross-file impact (changed defs with external
   referrers): re-resolve exactly the dirty files, decoding products (pack) for the dirty
   closure to re-derive flow ledgers (chains/args/similar context) — products are the
