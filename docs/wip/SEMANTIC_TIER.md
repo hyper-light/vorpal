@@ -298,7 +298,8 @@ without regressing others — else recorded as measured-and-rejected in this doc
 > one token matrix per query, bitwise equal to solo embeds by oracle — plus a
 > FIFO-bounded per-node embedding cache), kernel table bit-identical throughout.
 > PACKAGING SHIPPED (owner decision 2026-08-31: both precisions, optional
-> everywhere): `vorpal enable semantic-f32|semantic-f16|off` — the ONE explicit,
+> everywhere): `vorpal enable semantic-f32|semantic-f16` (symmetric
+> `vorpal disable <option>`, variant-checked, weights kept) — the ONE explicit,
 > sha256-pinned download path — installs under `$VORPAL_HOME/models` and writes
 > the GLOBAL enable every Searcher honors when an index root has no selection
 > (per-index `encoder.dir`/`encoderDir` always wins); Python

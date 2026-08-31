@@ -895,14 +895,16 @@ Weights never ship inside release artifacts and are never fetched implicitly —
 the ONE explicit download path is `vorpal_index::models` (installer behind the
 `model-install` feature; the enable/read half is in every build, so any
 consumer honors an enable a feature-full tool wrote). `vorpal enable
-semantic-f32 | semantic-f16 | off` installs under `$VORPAL_HOME/models`
+semantic-f32 | semantic-f16` installs under `$VORPAL_HOME/models`
 (defaults `~/.vorpal/models`; `$VORPAL_MODELS_DIR` overrides) with streaming
 sha256 verification against the pinned checksums (model `827529bc…`, tokenizer
 `91f1def9…`, config `5ff856a4…`; `.part` + atomic rename; idempotent), then
 writes the GLOBAL `~/.vorpal/encoder.dir` — the `Searcher` fallback when an
 index root has no selection; per-index selections always win, and internal
 generation-dir opens (the BM25 gate's probes) keep measuring un-reranked
-fusion. Python (`semantic_install/semantic_enable/semantic_disable`) and Node
+fusion. `vorpal disable semantic-f32 | semantic-f16` is the symmetric partner:
+variant-checked (a mismatch states what IS enabled and touches nothing),
+weights kept on disk so re-enabling is instant. Python (`semantic_install/semantic_enable/semantic_disable`) and Node
 (`semanticInstall/semanticEnable/semanticDisable`) expose the same verbs with a
 `root` placement parameter.
 

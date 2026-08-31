@@ -2995,6 +2995,38 @@ impl Searcher {
     Ok(self.report(query, k, filter)?.hits)
   }
 
+  /// ONE search, two orderings — the `--ranked` surface: the base fused top-k and,
+  /// when this handle carries the encoder, the reranked ordering derived from the
+  /// SAME fusion (a single channel pass and fuse; the only extra cost is the
+  /// encoder step — never a second search). `None` reranked = no active encoder
+  /// (the caller can state why via [`Searcher::encoder_status`]). Conjunction
+  /// queries keep their min-RRF contract un-reranked and return `None` too.
+  #[allow(clippy::type_complexity)]
+  pub fn records_ranked(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<
+    (Vec<records::SearchHitRecord>, Option<Vec<records::SearchHitRecord>>),
+    Box<dyn Error>,
+  > {
+    if parse_and_phrases(query).is_some() {
+      return Ok((self.records(query, k, filter)?, None));
+    }
+    let channels = self.channel_lists(query, rerank_pool(k), filter)?;
+    let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
+    if self.bm25_enabled {
+      lists.push(channels.bm25);
+    }
+    let fused = rrf_fuse_explained(&lists, k);
+    let reranked = self
+      .encoder
+      .is_some()
+      .then(|| self.hits_from_ranked(self.rerank_with_encoder(query, fused.clone()), None));
+    Ok((self.hits_from_ranked(fused, None), reranked))
+  }
+
   /// The full typed search answer — the ONE dispatch point below every surface (CLI, MCP,
   /// napi, pyo3, the async pool): parses the conjunction syntax (`"…" AND "…"`, see
   /// [`parse_and_phrases`]) and routes. Anything that does not parse flows through the

@@ -323,6 +323,11 @@ pub struct SearchArg {
   /// Filter: exclude test-classified paths (tests/, __tests__/, *_test.*, test_*.py, …).
   #[clap(long)]
   no_tests: bool,
+  /// Show the base fused ordering and the encoder-reranked ordering side by side —
+  /// ONE search, two views (requires the advanced embedder: `vorpal enable` or
+  /// `encoderDir`). Text output only.
+  #[clap(long)]
+  ranked: bool,
   /// Output format: byte-stable text (default) or the paged records envelope.
   #[clap(long, value_enum, default_value_t)]
   format: OutputFormat,
@@ -1194,6 +1199,19 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     exported_only: arg.exported,
     exclude_tests: arg.no_tests,
   };
+  if arg.ranked {
+    if !matches!(arg.format, OutputFormat::Text) {
+      anyhow::bail!("--ranked is a side-by-side text view; drop --format");
+    }
+    let searcher = vorpal_index::open_searcher(&dir)
+      .map_err(boxed)
+      .with_context(|| missing_index_hint(&dir))?;
+    let (base, reranked) = searcher
+      .records_ranked(&arg.query, arg.k.max(1), &filter)
+      .map_err(boxed)?;
+    render_ranked_columns(&arg.query, &base, reranked.as_deref(), searcher.encoder_status());
+    return Ok(ExitCode::SUCCESS);
+  }
   match arg.format {
     OutputFormat::Text => {
       let rendered = if filter.is_empty() {
@@ -1227,6 +1245,64 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     }
   }
   Ok(ExitCode::SUCCESS)
+}
+
+/// The `--ranked` side-by-side view: the SAME search's fused ordering next to the
+/// encoder-reranked one, with per-hit movement markers (↑n moved up n places, ↓n
+/// down, · unchanged, + newly visible at this depth). Both views come from one
+/// channel pass — only the encoder step separates them.
+fn render_ranked_columns(
+  query: &str,
+  base: &[vorpal_index::records::SearchHitRecord],
+  reranked: Option<&[vorpal_index::records::SearchHitRecord]>,
+  encoder_status: Option<&str>,
+) {
+  let cell = |hit: &vorpal_index::records::SearchHitRecord| -> String {
+    let basename = hit.node.path.rsplit('/').next().unwrap_or(&hit.node.path);
+    let mut text = format!("{}  ({basename})", hit.node.name);
+    const WIDTH: usize = 46;
+    if text.chars().count() > WIDTH {
+      text = text.chars().take(WIDTH - 1).collect::<String>() + "…";
+    }
+    text
+  };
+  if base.is_empty() {
+    println!("(no results for '{query}')");
+    return;
+  }
+  let Some(reranked) = reranked else {
+    for (rank, hit) in base.iter().enumerate() {
+      println!("{:>2}  {}", rank + 1, cell(hit));
+    }
+    match encoder_status {
+      // A selection exists but could not be honored — the stated reason.
+      Some(status) => println!("\n(reranked view unavailable — {status})"),
+      None => println!(
+        "\n(reranked view unavailable: no encoder enabled — `vorpal enable semantic-f16` \
+         or `encoderDir` in vorpalconfig.yml — or the query is a conjunction, which \
+         keeps its own ranking)"
+      ),
+    }
+    return;
+  };
+  let header = format!("{:>2}  {:<48}{}", "#", "fused", "reranked (encoder)");
+  println!("{header}");
+  for rank in 0..base.len().max(reranked.len()) {
+    let left = base.get(rank).map(&cell).unwrap_or_default();
+    let right = match reranked.get(rank) {
+      Some(hit) => {
+        let marker = match base.iter().position(|b| b.node.id == hit.node.id) {
+          Some(was) if was > rank => format!("↑{}", was - rank),
+          Some(was) if was < rank => format!("↓{}", rank - was),
+          Some(_) => "·".to_string(),
+          None => "+".to_string(),
+        };
+        format!("{marker:<3} {}", cell(hit))
+      }
+      None => String::new(),
+    };
+    println!("{:>2}  {left:<48}{right}", rank + 1);
+  }
 }
 
 pub fn run_mcp(arg: McpArg, project: Result<ProjectConfig>) -> Result<ExitCode> {

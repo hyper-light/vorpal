@@ -146,7 +146,7 @@ mod install_impl {
       }
     }
 
-    fn directory(self) -> &'static str {
+    pub(super) fn directory(self) -> &'static str {
       match self {
         ModelVariant::F32 => "coderankembed-f32",
         ModelVariant::F16 => "coderankembed-f16",
@@ -292,6 +292,37 @@ mod install_impl {
     }
     Ok(dir)
   }
+}
+
+/// What `disable_variant` found and did.
+#[cfg(feature = "model-install")]
+pub enum DisableOutcome {
+  /// The global enable pointed at this variant's install and was removed
+  /// (weights stay on disk — re-enabling is instant).
+  Disabled(std::path::PathBuf),
+  /// Nothing is enabled globally.
+  NotEnabled,
+  /// The global enable points somewhere else — stated, untouched.
+  EnabledElsewhere(std::path::PathBuf),
+}
+
+/// Variant-checked disable: remove the global enable IFF it points at this
+/// variant's install directory. A mismatch is stated and left untouched — the
+/// symmetric partner of `vorpal enable <option>`.
+#[cfg(feature = "model-install")]
+pub fn disable_variant(variant: ModelVariant) -> Result<DisableOutcome, String> {
+  let Some(current) = global_encoder_selection() else {
+    return Ok(DisableOutcome::NotEnabled);
+  };
+  let matches = current
+    .file_name()
+    .and_then(|name| name.to_str())
+    .is_some_and(|name| name == variant.directory());
+  if !matches {
+    return Ok(DisableOutcome::EnabledElsewhere(current));
+  }
+  disable_global()?;
+  Ok(DisableOutcome::Disabled(current))
 }
 
 #[cfg(feature = "model-install")]
