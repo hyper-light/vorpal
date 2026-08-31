@@ -22,6 +22,8 @@ pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
 pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
 pub use model::SymbolKind;
 pub mod communities;
+#[cfg(feature = "alloc-ledger")]
+pub mod ledger;
 pub mod observed;
 mod scc;
 pub use writer::{KgWriter, NodeDef, layout_entity_paths};
@@ -145,8 +147,36 @@ pub fn phase_stamp(label: &str) {
     };
     #[cfg(not(feature = "alloc-stats"))]
     let stats = "";
+    #[cfg(feature = "alloc-ledger")]
+    let ledger = {
+      let snap = crate::ledger::snapshot();
+      format!(
+        " [ledger allocs={} frees={} reallocs={} abytes={}MB ts_allocs={} ts_reallocs={} ts_frees={} ts_abytes={}MB faults={} cow={} pageins={} user_us={} sys_us={} vcsw={} ivcsw={} icont={} iw={} parks={} chfull={}]",
+        snap.allocs,
+        snap.deallocs,
+        snap.reallocs,
+        snap.alloc_bytes / 1048576,
+        snap.ts_allocs,
+        snap.ts_reallocs,
+        snap.ts_frees,
+        snap.ts_alloc_bytes / 1048576,
+        snap.faults,
+        snap.cow_faults,
+        snap.pageins,
+        snap.user_us,
+        snap.sys_us,
+        snap.vcsw,
+        snap.ivcsw,
+        snap.intern_read_contended,
+        snap.intern_writes,
+        snap.budget_parks,
+        snap.chan_full
+      )
+    };
+    #[cfg(not(feature = "alloc-ledger"))]
+    let ledger = "";
     eprintln!(
-      "[phase {:.3}s] {label}{stats}",
+      "[phase {:.3}s] {label}{stats}{ledger}",
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

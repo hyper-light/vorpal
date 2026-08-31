@@ -17,8 +17,13 @@ vorpal-graph.workspace = true
 vorpal-canonical.workspace = true
 vorpal-outline.workspace = true
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"], optional = true }
+libc = { version = "0.2", optional = true }
 rayon.workspace = true
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [features]
 alloc-stats = ["dep:tikv-jemalloc-ctl"]
+# Exact allocation/fault ledger for the hyper-optimization campaign: global event
+# counters the binary's wrapping allocator bumps, printed at every phase stamp.
+# NEVER a default — profiling builds only (the bench-internals discipline).
+alloc-ledger = ["dep:libc"]

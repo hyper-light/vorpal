@@ -766,15 +766,25 @@ pub fn build_include_reach<'i>(
   table: &SymbolTable<'i>,
   imports: &[Reference<'i>],
 ) -> IncludeReach<'i> {
-  let mut edges = Vec::new();
-  for reference in imports {
-    if reference.kind != RefKind::Import {
-      continue;
-    }
-    if let Some((_, target_path)) = resolve_import_path(interner, table, reference) {
-      edges.push((reference.from_path, target_path));
-    }
-  }
+  // Edge collection resolves every path-form import — embarrassingly parallel
+  // (the ledger measured this loop 0.27 s single-threaded at kernel scale).
+  // `from_edges` is order-invariant (pinned by test), so chunked collection
+  // changes nothing about the oracle.
+  use rayon::prelude::*;
+  let threads = rayon::current_num_threads().max(1);
+  let chunk = imports.len().div_ceil(threads * 2).max(1);
+  let edges: Vec<(NameId<'i>, NameId<'i>)> = imports
+    .par_chunks(chunk)
+    .flat_map_iter(|chunk| {
+      chunk.iter().filter_map(|reference| {
+        if reference.kind != RefKind::Import {
+          return None;
+        }
+        resolve_import_path(interner, table, reference)
+          .map(|(_, target_path)| (reference.from_path, target_path))
+      })
+    })
+    .collect();
   IncludeReach::from_edges(&edges)
 }
 
@@ -899,27 +909,48 @@ pub fn seed_import_bindings<'i>(
   qualified_imports: &[Reference<'i>],
   resolver: &Resolver,
 ) -> usize {
+  // Per-import resolution is independent — parallel chunks (the ledger measured
+  // this loop 0.28 s single-threaded at kernel scale). The fold below applies
+  // results in original import order, so duplicate keys keep exactly the serial
+  // last-write-wins outcome.
+  use rayon::prelude::*;
+  let table_ref: &SymbolTable<'i> = table;
+  let threads = rayon::current_num_threads().max(1);
+  let chunk_size = qualified_imports.len().div_ceil(threads * 2).max(1);
+  let resolved: Vec<Vec<((NameId<'i>, NameId<'i>), NodeId)>> = qualified_imports
+    .par_chunks(chunk_size)
+    .map(|chunk| {
+      let mut scratch = ResolveScratch::default();
+      let mut out = Vec::new();
+      for reference in chunk {
+        let resolution =
+          resolver.resolve_with(interner, table_ref, reference, &mut scratch, None, None);
+        let Some(target) = resolution.target else {
+          continue;
+        };
+        if resolution.confidence < Confidence::CROSS_FILE {
+          continue;
+        }
+        if !matches!(
+          resolution.reason,
+          ResolveReason::Qualified | ResolveReason::Local | ResolveReason::VisibleExport
+        ) {
+          continue;
+        }
+        // An aliased import rebinds under its LOCAL name — that is what bare uses in the
+        // file say, so the binding keys on the alias when one exists.
+        let bound_name = reference.alias.unwrap_or(reference.name);
+        out.push(((reference.from_path, bound_name), target));
+      }
+      out
+    })
+    .collect();
   let mut bindings: std::collections::HashMap<(NameId<'i>, NameId<'i>), NodeId> =
     std::collections::HashMap::new();
-  let mut scratch = ResolveScratch::default();
-  for reference in qualified_imports {
-    let resolution = resolver.resolve_with(interner, table, reference, &mut scratch, None, None);
-    let Some(target) = resolution.target else {
-      continue;
-    };
-    if resolution.confidence < Confidence::CROSS_FILE {
-      continue;
+  for chunk in resolved {
+    for (key, target) in chunk {
+      bindings.insert(key, target);
     }
-    if !matches!(
-      resolution.reason,
-      ResolveReason::Qualified | ResolveReason::Local | ResolveReason::VisibleExport
-    ) {
-      continue;
-    }
-    // An aliased import rebinds under its LOCAL name — that is what bare uses in the file
-    // say, so the binding keys on the alias when one exists.
-    let bound_name = reference.alias.unwrap_or(reference.name);
-    bindings.insert((reference.from_path, bound_name), target);
   }
   let count = bindings.len();
   table.set_import_bindings(bindings);

@@ -87,18 +87,18 @@ pub(crate) fn scc_sizes(n: usize, edges: &EdgeLog) -> Vec<u32> {
         lowlink[pi] = lowlink[pi].min(lowlink[vi]);
       }
       if lowlink[vi] == index[vi] {
-        // v roots a component: pop members down to and including v.
-        let mut members: Vec<u32> = Vec::new();
-        while let Some(w) = stack.pop() {
-          on_stack[w as usize] = false;
-          members.push(w);
-          if w == v {
-            break;
+        // v roots a component: its members are exactly the stack's tail from v
+        // (each node is on the stack at most once). Assign sizes in place and
+        // truncate — the per-component collection Vec this replaces allocated
+        // ONCE PER NODE on acyclic-majority graphs (8.8M allocations at kernel
+        // scale for mostly `size == 1` answers), in every language's corpus.
+        if let Some(start) = stack.iter().rposition(|&w| w == v) {
+          let size = (stack.len() - start) as u32;
+          for &w in &stack[start..] {
+            on_stack[w as usize] = false;
+            sizes[w as usize] = size;
           }
-        }
-        let size = members.len() as u32;
-        for w in members {
-          sizes[w as usize] = size;
+          stack.truncate(start);
         }
       }
     }

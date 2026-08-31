@@ -55,6 +55,14 @@ bench-internals = []
 # The optional-model installer (models::install + ModelVariant) — enabled by the
 # CLI and the SDK crates; the enable/read half of `models` is always built.
 model-install = ["dep:ureq", "dep:sha2"]
+# Exact allocation/fault ledger (hyper-optimization campaign): wraps the binary's
+# jemalloc in event counters printed at every phase stamp. Profiling builds only —
+# never a default (the bench-internals discipline).
+alloc-ledger = [
+  "jemalloc",
+  "vorpal-kg/alloc-ledger",
+  "vorpal-ingest/alloc-ledger",
+]
 
 [dev-dependencies]
 vorpal-query.workspace = true

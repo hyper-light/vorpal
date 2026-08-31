@@ -35,3 +35,6 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 default = ["builtin-parser"]
 builtin-parser = ["vorpal-language/builtin-parser", "vorpal-lang-registry/builtin-parser"]
 napi-langs = ["vorpal-language/napi-lang", "vorpal-lang-registry/napi-langs"]
+# Contention probes for the hyper-optimization ledger (byte-budget parks,
+# full-channel stalls, interner locks via vorpal-resolve). Never a default.
+alloc-ledger = ["vorpal-kg/alloc-ledger", "vorpal-resolve/alloc-ledger"]

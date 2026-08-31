@@ -7,9 +7,55 @@ use std::process::ExitCode;
 /// allocator's peak footprint was freed-but-retained magazine pages (2.05 GB observed vs a
 /// ~0.95 GB live set). jemalloc's decay returns those pages while running, and its
 /// thread-local caches are also simply faster under the pipeline's multithreaded churn.
-#[cfg(all(feature = "jemalloc", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
+#[cfg(all(
+  feature = "jemalloc",
+  not(feature = "alloc-ledger"),
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Ledger builds (feature `alloc-ledger`): the same jemalloc, wrapped in exact
+/// event counters — every alloc/dealloc/realloc bumps the vorpal-kg ledger the
+/// phase stamps print. Two relaxed atomic adds per event; profiling builds only.
+#[cfg(all(
+  feature = "alloc-ledger",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+struct LedgerAlloc;
+
+#[cfg(all(
+  feature = "alloc-ledger",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+unsafe impl std::alloc::GlobalAlloc for LedgerAlloc {
+  unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+    vorpal_kg::ledger::note_alloc(layout.size());
+    unsafe { std::alloc::GlobalAlloc::alloc(&tikv_jemallocator::Jemalloc, layout) }
+  }
+
+  unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+    vorpal_kg::ledger::note_alloc(layout.size());
+    unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&tikv_jemallocator::Jemalloc, layout) }
+  }
+
+  unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+    vorpal_kg::ledger::note_dealloc(layout.size());
+    unsafe { std::alloc::GlobalAlloc::dealloc(&tikv_jemallocator::Jemalloc, ptr, layout) }
+  }
+
+  unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+    vorpal_kg::ledger::note_realloc(new_size);
+    unsafe { std::alloc::GlobalAlloc::realloc(&tikv_jemallocator::Jemalloc, ptr, layout, new_size) }
+  }
+}
+
+#[cfg(all(
+  feature = "alloc-ledger",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+#[global_allocator]
+static ALLOC: LedgerAlloc = LedgerAlloc;
 
 /// Compiled-in jemalloc tuning (overridable at runtime via `_RJEM_MALLOC_CONF`): zero decay
 /// returns freed pages to the OS immediately — a bulk pipeline's phases hand memory back
@@ -59,6 +105,7 @@ const USAGE: &str = "usage:
 /// peak. One allocator, one policy.
 #[cfg(all(feature = "jemalloc", not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))))]
 fn unify_parser_allocator() {
+  #[cfg(not(feature = "alloc-ledger"))]
   unsafe {
     tree_sitter::set_allocator(
       Some(tikv_jemalloc_sys::malloc),
@@ -66,6 +113,46 @@ fn unify_parser_allocator() {
       Some(tikv_jemalloc_sys::realloc),
       Some(tikv_jemalloc_sys::free),
     );
+  }
+  // Ledger builds route the parser through counting shims so parse churn gets
+  // its own attribution line — still jemalloc underneath, same policy.
+  #[cfg(feature = "alloc-ledger")]
+  unsafe {
+    tree_sitter::set_allocator(
+      Some(ts_ledger_shims::malloc),
+      Some(ts_ledger_shims::calloc),
+      Some(ts_ledger_shims::realloc),
+      Some(ts_ledger_shims::free),
+    );
+  }
+}
+
+/// Counting pass-throughs for tree-sitter's C allocator seam (ledger builds).
+#[cfg(all(
+  feature = "alloc-ledger",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+mod ts_ledger_shims {
+  use std::os::raw::c_void;
+
+  pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
+    vorpal_kg::ledger::note_ts_alloc(size);
+    unsafe { tikv_jemalloc_sys::malloc(size) }
+  }
+
+  pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
+    vorpal_kg::ledger::note_ts_alloc(count.saturating_mul(size));
+    unsafe { tikv_jemalloc_sys::calloc(count, size) }
+  }
+
+  pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+    vorpal_kg::ledger::note_ts_realloc(size);
+    unsafe { tikv_jemalloc_sys::realloc(ptr, size) }
+  }
+
+  pub unsafe extern "C" fn free(ptr: *mut c_void) {
+    vorpal_kg::ledger::note_ts_free();
+    unsafe { tikv_jemalloc_sys::free(ptr) }
   }
 }
 

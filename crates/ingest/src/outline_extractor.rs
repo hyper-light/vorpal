@@ -23,15 +23,118 @@ use crate::references::{extract_references_with_facts, ref_spec, resolved_ref_sp
 
 type LangExtractors = HashMap<SgLang, CombinedExtractors<SgLang>>;
 
-/// The compiled default rule set, shared process-wide: compiling ~20 languages' rules costs
-/// ~15 ms and every `OutlineExtractor::new` (CLI one-shots, MCP daemon re-indexes) was paying
-/// it; now only the first does.
-static DEFAULT_EXTRACTORS: OnceLock<Result<Arc<LangExtractors>, String>> = OnceLock::new();
+/// The rule set behind an extractor.
+///
+/// `Eager` compiles everything at construction — user-supplied sources keep it
+/// so validation fails loudly where the rules were provided. `Lazy` holds the
+/// BUNDLED docs bucketed per language (zero-copy `&'static` slices out of
+/// `DEFAULT_OUTLINE_RULES`) and serde-parses + matcher-compiles a language on
+/// FIRST USE: the ledger measured the eager all-49 compile at 158,737
+/// allocations / 44 MB per run — about half of a small repo's entire
+/// allocation bill — while a typical tree touches a handful of languages.
+/// Bundled-rule compilability is pinned by the outline crate's CI test, so
+/// deferring it loses no validation in practice; a (theoretically unreachable)
+/// lazy compile failure reports loudly and disables that language's outline
+/// rules for the run rather than faking anything.
+pub(crate) enum ExtractorSet {
+  Eager(LangExtractors),
+  Lazy {
+    docs: HashMap<SgLang, Vec<&'static str>>,
+    compiled: HashMap<SgLang, OnceLock<Option<CombinedExtractors<SgLang>>>>,
+  },
+}
+
+impl ExtractorSet {
+  fn get(&self, lang: SgLang) -> Option<&CombinedExtractors<SgLang>> {
+    match self {
+      ExtractorSet::Eager(map) => map.get(&lang),
+      ExtractorSet::Lazy { docs, compiled } => compiled
+        .get(&lang)?
+        .get_or_init(|| {
+          let mut rules: Vec<SerializableOutlineRule<SgLang>> = Vec::new();
+          for doc in docs.get(&lang)? {
+            match parse_outline_rules::<SgLang>(doc) {
+              Ok(parsed) => rules.extend(parsed),
+              Err(err) => {
+                eprintln!(
+                  "vorpal: bundled outline rules for {lang} failed to parse: {err} \
+                   (outline extraction for this language is disabled this run)"
+                );
+                return None;
+              }
+            }
+          }
+          match CombinedExtractors::try_from(rules, &Default::default()) {
+            Ok(combined) => Some(combined),
+            Err(err) => {
+              eprintln!(
+                "vorpal: bundled outline rules for {lang} failed to compile: {err} \
+                 (outline extraction for this language is disabled this run)"
+              );
+              None
+            }
+          }
+        })
+        .as_ref(),
+    }
+  }
+
+  fn contains(&self, lang: SgLang) -> bool {
+    match self {
+      ExtractorSet::Eager(map) => map.contains_key(&lang),
+      ExtractorSet::Lazy { docs, .. } => docs.contains_key(&lang),
+    }
+  }
+
+  fn count(&self) -> usize {
+    match self {
+      ExtractorSet::Eager(map) => map.len(),
+      ExtractorSet::Lazy { docs, .. } => docs.len(),
+    }
+  }
+
+  fn langs(&self) -> Vec<SgLang> {
+    match self {
+      ExtractorSet::Eager(map) => map.keys().copied().collect(),
+      ExtractorSet::Lazy { docs, .. } => docs.keys().copied().collect(),
+    }
+  }
+}
+
+/// Bucket the bundled rule docs per language by their top-level `language:`
+/// line — a raw string scan, no serde, no copies. `None` (a doc without a
+/// parseable language line — impossible for the shipped set, pinned by tests)
+/// sends the caller to the eager path, so laziness can never drop a rule.
+fn bucket_default_docs() -> Option<HashMap<SgLang, Vec<&'static str>>> {
+  let mut buckets: HashMap<SgLang, Vec<&'static str>> = HashMap::new();
+  for doc in DEFAULT_OUTLINE_RULES.split("\n---\n") {
+    if doc.trim().is_empty() {
+      continue;
+    }
+    let lang_text = doc
+      .lines()
+      .find_map(|line| line.strip_prefix("language:"))?
+      .trim();
+    let lang: SgLang = lang_text.parse().ok()?;
+    // Slim builds: rules for disabled grammars never compile (mirrors
+    // `compile_groups`' gate exactly).
+    if !lang.is_enabled() {
+      continue;
+    }
+    buckets.entry(lang).or_default().push(doc);
+  }
+  Some(buckets)
+}
+
+/// The default rule set, shared process-wide — lazily compiled per language
+/// (see [`ExtractorSet`]); falls back to one eager compile if bucketing cannot
+/// attribute every doc.
+static DEFAULT_EXTRACTORS: OnceLock<Result<Arc<ExtractorSet>, String>> = OnceLock::new();
 
 /// Compiles the bundled outline rules into one [`CombinedExtractors`] per language and runs them
 /// against parsed files. Language is chosen from the file extension (§3.1 "all languages").
 pub struct OutlineExtractor {
-  by_lang: Arc<LangExtractors>,
+  by_lang: Arc<ExtractorSet>,
   /// Reference-extraction specs supplied as data (F-M4): dynamic languages, or a user override
   /// for a builtin. Consulted before the builtin const table, so a data spec wins for its
   /// language — identity-correct because the spec source is folded into the rules digest.
@@ -46,7 +149,14 @@ impl OutlineExtractor {
   /// The built-in outline rule set (`DEFAULT_OUTLINE_RULES`), compiled once per process.
   pub fn new() -> Result<Self, String> {
     let by_lang = DEFAULT_EXTRACTORS
-      .get_or_init(|| compile_rules(DEFAULT_OUTLINE_RULES).map(Arc::new))
+      .get_or_init(|| match bucket_default_docs() {
+        Some(docs) => {
+          let compiled = docs.keys().map(|&lang| (lang, OnceLock::new())).collect();
+          Ok(Arc::new(ExtractorSet::Lazy { docs, compiled }))
+        }
+        None => compile_rules(DEFAULT_OUTLINE_RULES)
+          .map(|map| Arc::new(ExtractorSet::Eager(map))),
+      })
       .clone()?;
     Ok(Self {
       by_lang,
@@ -58,7 +168,7 @@ impl OutlineExtractor {
   /// Compile an arbitrary outline-rule YAML document (bundled or user-supplied).
   pub fn from_rules(rules_yaml: &str) -> Result<Self, String> {
     Ok(Self {
-      by_lang: Arc::new(compile_rules(rules_yaml)?),
+      by_lang: Arc::new(ExtractorSet::Eager(compile_rules(rules_yaml)?)),
       dynamic_specs: HashMap::new(),
       rules_digest: xxhash_rust::xxh3::xxh3_64(rules_yaml.as_bytes()),
     })
@@ -174,7 +284,7 @@ impl OutlineExtractor {
     }
 
     Ok(Self {
-      by_lang: Arc::new(compile_groups(rules)?),
+      by_lang: Arc::new(ExtractorSet::Eager(compile_groups(rules)?)),
       dynamic_specs,
       rules_digest: h.digest(),
     })
@@ -185,7 +295,8 @@ impl OutlineExtractor {
   pub fn dynamic_langs(&self) -> Vec<String> {
     let mut names: Vec<String> = self
       .by_lang
-      .keys()
+      .langs()
+      .iter()
       .chain(self.dynamic_specs.keys())
       .filter(|lang| matches!(lang, SgLang::Custom(_)))
       .map(|lang| lang.to_string())
@@ -195,9 +306,9 @@ impl OutlineExtractor {
     names
   }
 
-  /// How many languages have compiled extractors.
+  /// How many languages have outline rules (compiled or lazily compilable).
   pub fn languages(&self) -> usize {
-    self.by_lang.len()
+    self.by_lang.count()
   }
 
   /// The digest of the outline rules this extractor uses — a component of product identity.
@@ -254,7 +365,7 @@ impl OutlineExtractor {
   /// and/or a reference-extraction spec (a language may have either independently).
   pub fn handles(&self, path: &str) -> bool {
     SgLang::from_path(path).is_some_and(|lang| {
-      self.by_lang.contains_key(&lang)
+      self.by_lang.contains(lang)
         || self.dynamic_specs.contains_key(&lang)
         || ref_spec(lang).is_some()
     })
@@ -268,7 +379,7 @@ impl OutlineExtractor {
   /// re-index replays persisted products for unchanged files.
   pub fn extract_product(&self, path: &str, source: &str) -> Option<FileProduct> {
     let lang = SgLang::from_path(path)?;
-    let combined = self.by_lang.get(&lang);
+    let combined = self.by_lang.get(lang);
     // A data spec (dynamic language, or a user override) wins over the builtin const table.
     let spec = self.dynamic_specs.get(&lang).or_else(|| resolved_ref_spec(lang));
     if combined.is_none() && spec.is_none() {
@@ -340,7 +451,7 @@ impl OutlineExtractor {
       .unwrap_or_default();
     for sub in &injected {
       let sub_lang = *sub.root().lang();
-      if let Some(sub_combined) = self.by_lang.get(&sub_lang) {
+      if let Some(sub_combined) = self.by_lang.get(sub_lang) {
         items.extend(sub_combined.extract(sub.root()));
       }
     }

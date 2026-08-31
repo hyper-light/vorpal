@@ -16,5 +16,10 @@ crossbeam-channel.workspace = true
 rayon.workspace = true
 vorpal-kg.workspace = true
 
+[features]
+# Contention probes for the hyper-optimization ledger (interner shard locks).
+# Forwarded by the vorpal-index binary's `alloc-ledger`; never a default.
+alloc-ledger = ["vorpal-kg/alloc-ledger"]
+
 [dev-dependencies]
 vorpal-outline.workspace = true

@@ -1743,6 +1743,8 @@ impl ByteBudget {
       if self.used.load(Ordering::Acquire) + want <= self.capacity {
         continue; // Released between the check and the lock.
       }
+      #[cfg(feature = "alloc-ledger")]
+      vorpal_kg::ledger::BUDGET_PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       let _guard = self.room.wait(guard).unwrap();
     }
   }
@@ -2192,7 +2194,23 @@ where
               }
             };
             let shard = sequence / shard_size;
-            if slot_txs[shard % committers].send((sequence, slot)).is_err() {
+            let slot_tx = &slot_txs[shard % committers];
+            #[cfg(feature = "alloc-ledger")]
+            let sent = match slot_tx.try_send((sequence, slot)) {
+              Ok(()) => Ok(()),
+              Err(crossbeam_channel::TrySendError::Full(item)) => {
+                // A full committer channel blocks this worker — the exact
+                // chokepoint the parallelism audit counts.
+                vorpal_kg::ledger::CHAN_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                slot_tx.send(item)
+              }
+              Err(crossbeam_channel::TrySendError::Disconnected(item)) => {
+                Err(crossbeam_channel::SendError(item))
+              }
+            };
+            #[cfg(not(feature = "alloc-ledger"))]
+            let sent = slot_tx.send((sequence, slot));
+            if sent.is_err() {
               break; // committer gone: only happens on abort/teardown
             }
           }
@@ -2246,7 +2264,20 @@ where
         break;
       }
       budget.reserve(entry.size.max(1));
-      if work_tx.send((sequence, entry)).is_err() {
+      #[cfg(feature = "alloc-ledger")]
+      let admitted = match work_tx.try_send((sequence, entry)) {
+        Ok(()) => Ok(()),
+        Err(crossbeam_channel::TrySendError::Full(item)) => {
+          vorpal_kg::ledger::CHAN_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          work_tx.send(item)
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(item)) => {
+          Err(crossbeam_channel::SendError(item))
+        }
+      };
+      #[cfg(not(feature = "alloc-ledger"))]
+      let admitted = work_tx.send((sequence, entry));
+      if admitted.is_err() {
         break;
       }
       bytes_admitted += entry.size.max(1);

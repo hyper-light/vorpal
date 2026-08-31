@@ -85,7 +85,10 @@ impl ExtractionEnv {
       .collect()
   }
 }
-pub use selfcheck::{verify_default_extraction, verify_env_extraction, verify_extraction};
+pub use selfcheck::{
+  verify_default_extraction, verify_env_extraction, verify_extraction,
+  verify_extraction_for_manifest,
+};
 pub use pack::{PackMsg, PackReader, PackWriter};
 pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,

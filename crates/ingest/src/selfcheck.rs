@@ -403,18 +403,30 @@ pub fn verify_extraction(extractor: &OutlineExtractor) -> Result<(), String> {
     if !canary.lang.is_enabled() {
       continue;
     }
-    let product = extractor.extract_product(canary.path, canary.source);
-    let (items, refs) = product
-      .as_ref()
-      .map(|p| (p.items.len(), p.refs.len()))
-      .unwrap_or((0, 0));
-    if items < canary.min_items || refs < canary.min_refs {
-      broken.push(format!(
-        "{} (items {items}, expected ≥{}; refs {refs}, expected ≥{})",
-        canary.lang, canary.min_items, canary.min_refs
-      ));
+    if let Err(shortfall) = check_canary(extractor, canary) {
+      broken.push(shortfall);
     }
   }
+  failure_message(broken)
+}
+
+/// Extract one canary and compare against its floors.
+fn check_canary(extractor: &OutlineExtractor, canary: &Canary) -> Result<(), String> {
+  let product = extractor.extract_product(canary.path, canary.source);
+  let (items, refs) = product
+    .as_ref()
+    .map(|p| (p.items.len(), p.refs.len()))
+    .unwrap_or((0, 0));
+  if items < canary.min_items || refs < canary.min_refs {
+    return Err(format!(
+      "{} (items {items}, expected ≥{}; refs {refs}, expected ≥{})",
+      canary.lang, canary.min_items, canary.min_refs
+    ));
+  }
+  Ok(())
+}
+
+fn failure_message(broken: Vec<String>) -> Result<(), String> {
   if broken.is_empty() {
     return Ok(());
   }
@@ -430,6 +442,64 @@ pub fn verify_extraction(extractor: &OutlineExtractor) -> Result<(), String> {
     },
     broken.join("; ")
   ))
+}
+
+/// [`verify_extraction`] restricted to the languages a manifest actually contains, with
+/// per-language verdicts memoized process-wide.
+///
+/// The threat model is per-language: a gutted extractor for a language with zero files in
+/// this tree can poison nothing in this build's output or the product bank. Checking only
+/// present languages is therefore exactly as protective for THIS build — and it is what
+/// lets the lazy per-language rule compilation pay off (the full-table check compiled all
+/// 49 languages' rules on every cold index of a two-language repo; the ledger measured
+/// that at ~160 K allocations). A later build that adds a language checks it then, once.
+/// Honors `VORPAL_NO_SELFCHECK=1` with the same warning as the full check.
+pub fn verify_extraction_for_manifest(
+  extractor: &OutlineExtractor,
+  entries: &[crate::FileStat],
+) -> Result<(), String> {
+  if std::env::var_os("VORPAL_NO_SELFCHECK").is_some_and(|v| v == "1") {
+    eprintln!(
+      "warning: VORPAL_NO_SELFCHECK=1 — skipping the extraction self-check; a broken binary \
+       will index silently"
+    );
+    return Ok(());
+  }
+  // Probed, never iterated — hash order is never observed.
+  let present: std::collections::HashSet<SupportLang> = entries
+    .iter()
+    .filter_map(
+      |entry| match vorpal_lang_registry::from_path(std::path::Path::new(&entry.path)) {
+        Some(vorpal_lang_registry::SgLang::Builtin(lang)) => Some(lang),
+        _ => None,
+      },
+    )
+    .collect();
+  static VERDICTS: OnceLock<std::sync::Mutex<std::collections::HashMap<SupportLang, Result<(), String>>>> =
+    OnceLock::new();
+  let verdicts = VERDICTS.get_or_init(Default::default);
+  let mut broken: Vec<String> = Vec::new();
+  for canary in CANARIES {
+    if !canary.lang.is_enabled() || !present.contains(&canary.lang) {
+      continue;
+    }
+    let cached = verdicts.lock().unwrap().get(&canary.lang).cloned();
+    let verdict = match cached {
+      Some(verdict) => verdict,
+      None => {
+        let verdict = check_canary(extractor, canary);
+        verdicts
+          .lock()
+          .unwrap()
+          .insert(canary.lang, verdict.clone());
+        verdict
+      }
+    };
+    if let Err(shortfall) = verdict {
+      broken.push(shortfall);
+    }
+  }
+  failure_message(broken)
 }
 
 /// [`verify_extraction`] for the default (built-in rules) extractor, cached process-wide.

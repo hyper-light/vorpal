@@ -63,6 +63,26 @@ impl<'i> NameId<'i> {
   }
 }
 
+/// Shard read-lock acquisition with contention accounting (ledger builds): a
+/// failed `try_read` means this thread is about to block behind a writer — the
+/// exact event the parallelism audit counts. Plain builds compile to the bare
+/// `read()`.
+#[inline]
+fn read_shard(lock: &RwLock<Shard>) -> std::sync::RwLockReadGuard<'_, Shard> {
+  #[cfg(feature = "alloc-ledger")]
+  {
+    match lock.try_read() {
+      Ok(guard) => return guard,
+      Err(std::sync::TryLockError::WouldBlock) => {
+        vorpal_kg::ledger::INTERN_READ_CONTENDED
+          .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      }
+      Err(std::sync::TryLockError::Poisoned(_)) => {}
+    }
+  }
+  lock.read().unwrap()
+}
+
 const SHARD_BITS: u32 = 6;
 const SHARDS: usize = 1 << SHARD_BITS;
 const INDEX_BITS: u32 = 32 - SHARD_BITS;
@@ -121,9 +141,11 @@ impl Interner {
   pub fn intern<'i>(&'i self, text: &str) -> NameId<'i> {
     let shard_index = shard_of(text);
     let lock = &self.shards[shard_index];
-    if let Some(&index) = lock.read().unwrap().by_text.get(text) {
+    if let Some(&index) = read_shard(lock).by_text.get(text) {
       return NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index);
     }
+    #[cfg(feature = "alloc-ledger")]
+    vorpal_kg::ledger::INTERN_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut shard = lock.write().unwrap();
     if let Some(&index) = shard.by_text.get(text) {
       return NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index);
@@ -145,9 +167,7 @@ impl Interner {
   /// joins) that must not grow the table with strings nothing will ever look up again.
   pub fn peek<'i>(&'i self, text: &str) -> Option<NameId<'i>> {
     let shard_index = shard_of(text);
-    self.shards[shard_index]
-      .read()
-      .unwrap()
+    read_shard(&self.shards[shard_index])
       .by_text
       .get(text)
       .map(|&index| NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index))
@@ -157,7 +177,7 @@ impl Interner {
   pub fn text_of<'i>(&'i self, id: NameId<'i>) -> &'i str {
     let raw = id.raw();
     let shard_index = (raw >> INDEX_BITS) as usize;
-    self.shards[shard_index].read().unwrap().by_index[(raw & INDEX_MASK) as usize]
+    read_shard(&self.shards[shard_index]).by_index[(raw & INDEX_MASK) as usize]
   }
 
   /// Rebuild an id from [`NameId::to_bits`] output written by **this session** (the spill's

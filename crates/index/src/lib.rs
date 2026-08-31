@@ -371,8 +371,10 @@ pub fn build_index_env(
   // Past the fast path, this run will stage a new generation and write bank products —
   // prove the binary can extract before letting it (crates/ingest selfcheck: a stale or
   // internally inconsistent build otherwise seals a silently gutted graph with exit 0).
-  // Once per process; the unchanged-tree fast path above returns before this line.
-  vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
+  // Manifest-scoped: only languages this tree contains are checked (each memoized
+  // process-wide), so a small repo neither compiles nor canaries the other ~45 languages.
+  vorpal_ingest::verify_extraction_for_manifest(&extractor, manifest.entries())
+    .map_err(io::Error::other)?;
   // Dynamic-language canaries (F-M4): environment-scoped, so not memoized — the same refusal
   // gate builtin languages get, extended to grammars that arrived via dlopen.
   vorpal_ingest::verify_env_extraction(&extractor, &env.canaries).map_err(io::Error::other)?;
@@ -2307,8 +2309,15 @@ pub fn warm_product_cache(file: &Path) -> io::Result<bool> {
   };
   let extractor = OutlineExtractor::new().map_err(io::Error::other)?;
   // Bank products written by a broken binary replay into healthy runs (same digests, same
-  // source) — the self-check keeps a bad build from feeding the bank at all.
-  vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
+  // source) — the self-check keeps a bad build from feeding the bank at all. Scoped to the
+  // one language this product is for (memoized process-wide, like the index path).
+  let stat_for_lang = [vorpal_ingest::FileStat {
+    path: keyed.clone(),
+    size: 0,
+    mtime_ns: 0,
+  }];
+  vorpal_ingest::verify_extraction_for_manifest(&extractor, &stat_for_lang)
+    .map_err(io::Error::other)?;
   let Some(mut product) = extractor.extract_product(&keyed, &source) else {
     return Ok(false);
   };

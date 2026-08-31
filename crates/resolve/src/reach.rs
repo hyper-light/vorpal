@@ -25,9 +25,12 @@ use crate::intern::NameId;
 pub struct IncludeReach<'i> {
   /// file path → its SCC index.
   scc_of: HashMap<NameId<'i>, u32>,
-  /// SCC index → sorted, deduped closure of file paths (members + everything
-  /// transitively included).
-  closures: Vec<Vec<NameId<'i>>>,
+  /// SCC index → (start, len) into `closure_data` (CSR layout: one arena, one
+  /// span per SCC — replaces the per-SCC `Vec<Vec>` whose growth-and-copy
+  /// churn measured 2.1 GB single-threaded at kernel scale).
+  spans: Vec<(u32, u32)>,
+  /// Sorted, deduped closure members for every SCC, back to back.
+  closure_data: Vec<NameId<'i>>,
 }
 
 impl<'i> IncludeReach<'i> {
@@ -109,34 +112,93 @@ impl<'i> IncludeReach<'i> {
     }
 
     // Tarjan emits SCCs in reverse topological order: successors of an SCC always
-    // have SMALLER scc ids, so closures build in id order with successors ready.
+    // have SMALLER scc ids. Closures build LEVEL-PARALLEL over the condensation
+    // DAG — measured serial at kernel scale this was 1.58 s on one thread (12 %
+    // of the whole build): every SCC at the same depth merges its successors'
+    // finished spans independently, and each closure is ONE exact-capacity
+    // allocation merged then deduped in place (no growth-and-copy chains).
     let mut members: Vec<Vec<u32>> = vec![Vec::new(); scc_count as usize];
     for (node, &scc) in scc_id.iter().enumerate() {
       members[scc as usize].push(node as u32);
     }
-    let mut closures: Vec<Vec<NameId<'i>>> = Vec::with_capacity(scc_count as usize);
-    for (scc, scc_members) in members.iter().enumerate() {
-      let mut closure: Vec<NameId<'i>> = Vec::new();
-      for &member in scc_members {
-        closure.push(files[member as usize]);
-        for &child in &adjacency[member as usize] {
-          let child_scc = scc_id[child as usize] as usize;
-          if child_scc != scc {
-            debug_assert!(child_scc < scc, "successor SCC must already be closed");
-            closure.extend_from_slice(&closures[child_scc]);
-          }
+    // Per-SCC successor lists over the condensation, deduped.
+    let mut scc_succs: Vec<Vec<u32>> = vec![Vec::new(); scc_count as usize];
+    for (node, &scc) in scc_id.iter().enumerate() {
+      for &child in &adjacency[node] {
+        let child_scc = scc_id[child as usize];
+        if child_scc != scc {
+          debug_assert!(child_scc < scc, "successor SCC must precede in Tarjan order");
+          scc_succs[scc as usize].push(child_scc);
         }
       }
-      closure.sort_unstable();
-      closure.dedup();
-      closures.push(closure);
+    }
+    for succs in &mut scc_succs {
+      succs.sort_unstable();
+      succs.dedup();
+    }
+    // Depth levels: level(scc) = 1 + max level of its successors. Successor ids
+    // are smaller, so one ascending pass computes every level.
+    let mut level: Vec<u32> = vec![0; scc_count as usize];
+    let mut max_level = 0u32;
+    for scc in 0..scc_count as usize {
+      let l = scc_succs[scc]
+        .iter()
+        .map(|&s| level[s as usize] + 1)
+        .max()
+        .unwrap_or(0);
+      level[scc] = l;
+      max_level = max_level.max(l);
+    }
+    let mut by_level: Vec<Vec<u32>> = vec![Vec::new(); max_level as usize + 1];
+    for (scc, &l) in level.iter().enumerate() {
+      by_level[l as usize].push(scc as u32);
+    }
+
+    let mut spans: Vec<(u32, u32)> = vec![(0, 0); scc_count as usize];
+    let mut closure_data: Vec<NameId<'i>> = Vec::new();
+    for level_sccs in &by_level {
+      // Build every closure in this level in parallel; successors' spans are
+      // finished (strictly lower levels). Deterministic: rayon's collect
+      // preserves input order, and the serial append below walks that order.
+      use rayon::prelude::*;
+      let built: Vec<Vec<NameId<'i>>> = level_sccs
+        .par_iter()
+        .map(|&scc| {
+          let scc = scc as usize;
+          let cap = members[scc].len()
+            + scc_succs[scc]
+              .iter()
+              .map(|&s| spans[s as usize].1 as usize)
+              .sum::<usize>();
+          let mut closure: Vec<NameId<'i>> = Vec::with_capacity(cap);
+          for &member in &members[scc] {
+            closure.push(files[member as usize]);
+          }
+          for &succ in &scc_succs[scc] {
+            let (start, len) = spans[succ as usize];
+            closure.extend_from_slice(&closure_data[start as usize..(start + len) as usize]);
+          }
+          closure.sort_unstable();
+          closure.dedup();
+          closure
+        })
+        .collect();
+      for (&scc, closure) in level_sccs.iter().zip(&built) {
+        let start = closure_data.len() as u32;
+        spans[scc as usize] = (start, closure.len() as u32);
+        closure_data.extend_from_slice(closure);
+      }
     }
 
     let scc_of = files
       .iter()
       .map(|&file| (file, scc_id[index_of[&file] as usize]))
       .collect();
-    IncludeReach { scc_of, closures }
+    IncludeReach {
+      scc_of,
+      spans,
+      closure_data,
+    }
   }
 
   /// Whether a definition in `def` is include-visible from `from`: the same file,
@@ -145,10 +207,12 @@ impl<'i> IncludeReach<'i> {
     if from == def {
       return true;
     }
-    self
-      .scc_of
-      .get(&from)
-      .is_some_and(|&scc| self.closures[scc as usize].binary_search(&def).is_ok())
+    self.scc_of.get(&from).is_some_and(|&scc| {
+      let (start, len) = self.spans[scc as usize];
+      self.closure_data[start as usize..(start + len) as usize]
+        .binary_search(&def)
+        .is_ok()
+    })
   }
 
   /// Number of files with include edges (diagnostics/phase stamps).
