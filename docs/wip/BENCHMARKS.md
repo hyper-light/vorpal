@@ -631,6 +631,68 @@ now measured rather than argued. The functional implementation remains in the tr
 as the plan requires: implemented, oracle-tested (exact-map recovery, hand-solved
 directed fixture, a≡1 equivalence), and measured.
 
+## Stage 3 (int8 + rescore): closed by delta analysis — the shipped tier already is one
+
+Stage 3's spec predates the measured ANN decisions this campaign inherited; mapping
+each element to the shipped design (2026-08-31):
+
+| Stage-3 element | disposition |
+|---|---|
+| int8 storage, ~4× size | SHIPPED since ANN v5: per-row-scaled i8 codes, exact integer dots, distances pure functions of the codes |
+| oversampled beam + float rescore | SHIPPED: the beam overfetches and every pool re-scores at full precision (§10 — approximation picks pools, never final order) |
+| float originals retained | SUPERSEDED by a stronger form: originals re-derive from the mapped model (467 MB) instead of a 2.3 GB float matrix — the lexical tier's originals are the hash itself |
+| default flips only past the recall gate | int8 IS the measured default: recall 0.9937 (ann-frontier, closed do-not-reopen), and on TODAY'S learned+retrofitted tiers tier-vs-exact top-10 set agreement is 77/80 (linux) and 58/60 (cpython) — ≥ the 75/80 the lexical-era pure-quantization run recorded, even though this measurement also folds in retrofit displacement (the exact side re-embeds anchor-space) |
+| per-dim 0.99-quantile calibration | NOT ADOPTED: it targets ≤1% recall loss, and the shipped per-row max-abs scheme already measures 0.63% loss at kernel scale — switching would reopen a closed, measured design for no demonstrated headroom |
+| quantize∘dequantize / torn-bytes / format checks | standing: ann.bin round-trip + header/version gates + bit-identical build tests |
+
+No new machinery ships for Stage 3; the recall evidence above is its record. Exact
+path mean per overlap query: linux 2.82 s, cpython 135 ms (the mapped-model re-embed
+scan — the reference oracle's price, never the query path's).
+
+## Stage 4 (BM25 postings channel): infrastructure shipped, channel measured OFF
+
+Postings moved to **v2** (`VPST` version 2): saturating u8 term frequency per
+posting, a dense per-node doc-length section, doc count + avgdl in the header —
+exactly what BM25's length normalization needs, +30% postings size (linux 39.95 →
+51.89 MB, cpython 2.10 → 2.67 MB). v1 files read stale through the version gate and
+rebuilt from plain warms (linux 2.1 s). The scorer is exact Okapi BM25 (k1 = 1.2,
+b = 0.75 — Robertson's values, Lucene's defaults; IDF in Lucene's nonnegative form),
+with two bit-identical paths — the persisted walk (`bm25_ranked`, union semantics,
+sorted-token sums, rank by score desc then id) and a one-pass exhaustive twin —
+pinned by a hand-computed golden (a fixture at dl = avgdl makes the term component
+exactly 1, so scores are pure IDF sums; ln 2 asserted against the named constant)
+and a tier-parity + thread-invariance oracle. The search filter pre-applies inside
+both paths (an admit-nothing filter must empty every channel — the multi-phrase
+eliminator test caught the first wiring ignoring it), while df/IDF stay collection
+statistics.
+
+**The fourth-list eval gate failed at kernel scale, twice, and the channel ships
+OFF** (`BM25_CHANNEL = false`, pinned like the retrofit form). Same day, same
+corpora, `xtask searcheval` (NDCG@10 / MRR / recall@5):
+
+| set · class | learned+retrofit (baseline) | + bm25, plain | + bm25, ≥2-token floor |
+|---|---|---|---|
+| linux · short-keyword | **0.206 / 0.298 / 0.095** | 0.109 / 0.156 / 0.048 | 0.137 / 0.157 / 0.048 |
+| linux · descriptive | **0.947** / 1.000 / 1.000 | 0.790 / 1.000 / 1.000 | 0.790 / 1.000 / 1.000 |
+| linux · **all** | **0.298 / 0.386 / 0.208** | 0.194 / 0.261 / 0.167 | 0.219 / 0.263 / 0.167 |
+| cpython · short-keyword | 0.293 / 0.500 / 0.250 | 0.500 / 0.500 / 0.500 | 0.500 / 0.500 / 0.500 |
+| cpython · **all** | 0.308 / 0.319 / 0.417 | 0.315 / 0.354 / 0.333 | **0.392 / 0.403 / 0.500** |
+
+Mechanism, not mystery: RRF is scale-free — a rank list hands its top 1/(60+r)
+fusion mass however flat its scores — and at kernel scale BM25's top is literal-token
+pollution, because the true answers live in subwords exact-token matching cannot see
+(`sock_alloc` tokenizes to `sock`, not `socket`). The ≥2-distinct-token match floor
+(the smallest non-trivial partial — structural, replacing a tuned depth cap) removed
+the 1-of-n class and improved both corpora, but the kernel gate (no split regresses;
+short-keyword ≥ baseline) still fails: 2-of-3 literal matches at kernel df remain
+wrong evidence no fusion weight short of zero fixes. cpython's clean gain
+(all-classes 0.308 → 0.392, short-keyword 0.293 → 0.500 — literal tokens align
+there) is the recorded motivation for a future per-corpus, warm-time-gated enable;
+the machinery ships tested and deterministic for that day. Stage 0's original
+hypothesis is also revisited by measurement: the kernel short-keyword collapse BM25
+was drafted to fix (lexical 0.103) was already fixed by the learned+retrofit tier
+(0.206) through subword generalization — the road BM25's exact tokens cannot take.
+
 **Freshness law hardened by an incident**: the v3 layout initially landed WITHOUT its
 version bump, so v2-layout files passed the cheap prefix gate (magic+version) yet
 misparsed past the header — warms no-op'd "fresh" while queries fell back to lexical.

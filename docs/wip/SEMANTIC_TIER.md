@@ -203,12 +203,36 @@ CHECKS: quantize(dequantize) idempotence; calibration determinism; RECALL GATE �
 f32 fused NDCG on all splits at kernel scale (else f32 stays default); size verified
 (~4×); format-policy row + torn/foreign-bytes tests for the new region.
 
+> **DISPOSITION (2026-08-31): closed by delta analysis — no new machinery.** This
+> stage was drafted before the ann-frontier campaign's measured decisions; the shipped
+> tier already is the int8+rescore design (per-row-scaled i8 codes, exact integer
+> dots, overfetching beam, full-precision pool re-scoring), measured at recall 0.9937
+> and re-evidenced on the learned+retrofitted tiers (tier-vs-exact top-10 set
+> agreement 77/80 linux, 58/60 cpython). "Float originals retained" is superseded by
+> the mapped model as the f32 truth; the per-dim 0.99-quantile scheme targets a ≤1%
+> loss bar the shipped per-row max-abs scheme already meets (0.63%), so switching
+> would reopen a closed, measured design for no demonstrated headroom. Full table in
+> docs/wip/BENCHMARKS.md "Stage 3: closed by delta analysis".
+
 **Stage 4 — BM25 postings channel.**
 Exact Okapi BM25 (k1, b fixed and recorded) over the existing postings tier; fusion
 weights re-tuned on the eval harness.
 CHECKS: hand-computed BM25 scores on a toy corpus; determinism trivial but pinned;
 EVAL GATE: fused metrics ≥ current on every split, short-keyword split expected to
 improve.
+
+> **DISPOSITION (2026-08-31): infrastructure shipped; channel measured OFF.** The
+> postings v2 format (TF + doc lengths + avgdl), the exact scorer with its parity
+> twin, goldens, and the ≥2-distinct-token match floor all ship tested — but the
+> fourth fused list failed the kernel eval gate twice (short-keyword 0.206 → 0.109
+> plain / 0.137 floored; descriptive 0.947 → 0.790) and is pinned off
+> (`BM25_CHANNEL = false`). Root mechanism: the kernel's answers live in subwords
+> exact-token BM25 cannot see (sock ≠ socket), so its rank list is wrong evidence
+> that scale-free RRF rewards anyway; the stage's original target (the lexical
+> short-keyword collapse, 0.103) had already been fixed by Stages 1–2 via subword
+> generalization (0.206). cpython IMPROVED (all 0.308 → 0.392) — recorded as the
+> motivation for a future per-corpus, warm-time-gated enable. Tables in
+> docs/wip/BENCHMARKS.md "Stage 4".
 
 **Stage 5 (conditional) — Tier 2.5: constrained direct optimization (NUDGE-style).**
 Trigger: sparse-name or NL-intent splits show headroom after Stage 2. Deterministic

@@ -2109,7 +2109,20 @@ fn build_warm_root(index_root: &Path) -> io::Result<Option<WarmRoot>> {
 }
 
 /// The fused ranking's channel names, in the order [`Searcher::run`] returns their ranks.
-const SEARCH_CHANNELS: [&str; 3] = ["name", "vector", "graph"];
+/// The fused ranking's channel names, positional: the first three always fuse; the
+/// fourth exists only under [`BM25_CHANNEL`] (rank vectors zip against this list, so
+/// a 3-list fusion simply never reaches the fourth label).
+const SEARCH_CHANNELS: [&str; 4] = ["name", "vector", "graph", "bm25"];
+
+/// PINNED BY MEASUREMENT (2026-08-31, two rounds, recorded in BENCHMARKS "Stage 4"):
+/// the BM25 fourth list is OFF. At kernel scale it regressed every gate — the true
+/// answers tokenize to subwords exact-token BM25 cannot see (sock ≠ socket), so its
+/// rank list carries structurally wrong evidence that RRF's scale-free 1/(60+r) mass
+/// rewards regardless (short-keyword 0.206 → 0.109 plain, → 0.137 with the ≥2-token
+/// match floor; descriptive 0.947 → 0.790). cpython IMPROVED (all 0.308 → 0.392) —
+/// the recorded motivation for a future per-corpus, warm-time-gated enable; the
+/// tested machinery (postings v2, parity twins, the floor) ships for that day.
+const BM25_CHANNEL: bool = false;
 
 /// One fused-ranking row: `(node id, RRF score, per-channel 0-based ranks)` — the shape
 /// [`Searcher::run`] returns.
@@ -2124,6 +2137,11 @@ struct Channels {
   /// Squared L2 to the query, aligned with `semantic`.
   semantic_dist2: Vec<f32>,
   by_degree: Vec<u64>,
+  /// Okapi BM25 over name tokens (semantic-tier Stage 4): union semantics — partial
+  /// matches score — ranked (score desc, id asc). The fourth rank-only RRF list,
+  /// appended after graph so tier-0 name hits keep 1/(60+0): BM25 adds mass, never
+  /// demotes the short-query supremacy invariant.
+  bm25: Vec<u64>,
 }
 
 /// The orthogonality boundary of the semantic space: embeddings are L2-normalized, so
@@ -2826,7 +2844,7 @@ impl Searcher {
       // Per phrase: the three channel lists at this depth, folded into a dense
       // id-indexed RRF table — O(n) f32s, no per-hit allocation, so even the deep rung
       // stays lean at kernel scale.
-      let mut per_phrase_lists: Vec<[Vec<u64>; 3]> = Vec::with_capacity(phrases.len());
+      let mut per_phrase_lists: Vec<Vec<Vec<u64>>> = Vec::with_capacity(phrases.len());
       let mut tables: Vec<Vec<f32>> = Vec::with_capacity(phrases.len());
       for phrase in phrases {
         let mut channels = self.channel_lists(phrase, depth, filter)?;
@@ -2839,7 +2857,10 @@ impl Searcher {
           .semantic_dist2
           .partition_point(|&dist2| dist2 < POSITIVE_BOUNDARY);
         channels.semantic.truncate(positive);
-        let lists = [channels.named, channels.semantic, channels.by_degree];
+        let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
+        if BM25_CHANNEL {
+          lists.push(channels.bm25);
+        }
         let mut table = vec![0.0f32; node_count];
         rrf_accumulate_dense(&lists, &mut table);
         per_phrase_lists.push(lists);
@@ -2988,10 +3009,11 @@ impl Searcher {
   /// Reads only the handle's already-open mappings — no `Kg::load`/`AnnIndex::load` per call.
   pub fn run(&self, query: &str, k: usize, filter: &SearchFilter) -> Result<Vec<FusedHit>, Box<dyn Error>> {
     let channels = self.channel_lists(query, rerank_pool(k), filter)?;
-    Ok(rrf_fuse_explained(
-      &[channels.named, channels.semantic, channels.by_degree],
-      k,
-    ))
+    let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
+    if BM25_CHANNEL {
+      lists.push(channels.bm25);
+    }
+    Ok(rrf_fuse_explained(&lists, k))
   }
 
   /// The three ranked candidate channels (name, semantic, graph) at one pool depth —
@@ -3235,11 +3257,29 @@ impl Searcher {
     )
   });
 
+  // The BM25 channel (semantic-tier Stage 4): TF + length normalization discriminate
+  // the 2–6-token names that the token-subset tier and in-degree fusion drown at
+  // kernel scale (the measured short-keyword collapse this channel exists to fix).
+  // Postings fresh → the persisted walk; anything else → the bit-identical exhaustive
+  // pass, so results never depend on which tier answered.
+  let bm25 = if BM25_CHANNEL {
+    let bm25_admit = |id: u32| filter.is_empty() || compiled_filter.admits(kg, id as u64);
+    match &self.postings {
+      Some(postings) => postings
+        .bm25_ranked(&query_tokens, pool, bm25_admit)
+        .unwrap_or_else(|| postings::bm25_exhaustive(kg, &query_tokens, pool, bm25_admit)),
+      None => postings::bm25_exhaustive(kg, &query_tokens, pool, bm25_admit),
+    }
+  } else {
+    Vec::new()
+  };
+
     Ok(Channels {
       named,
       semantic,
       semantic_dist2,
       by_degree,
+      bm25,
     })
   }
 
