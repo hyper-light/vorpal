@@ -24,6 +24,12 @@ pub struct MetaVarEnv<'tree, D: Doc> {
   single_matched: Vec<(MetaVariableID, Node<'tree, D>)>,
   multi_matched: Vec<(MetaVariableID, Vec<Node<'tree, D>>)>,
   transformed_var: Vec<(MetaVariableID, Underlying<D>)>,
+  /// The `"secondary"` diagnostic label — the ONLY label the workspace ever
+  /// adds (every relational rule match pushes one). A dedicated field costs
+  /// no key `String` per env and clones as a plain Vec; the read paths below
+  /// reconstruct the exact old surface (labels listing, JSON export,
+  /// cross-thread re-adoption).
+  secondary: Vec<Node<'tree, D>>,
 }
 
 fn assoc_get<'a, V>(list: &'a [(MetaVariableID, V)], key: &str) -> Option<&'a V> {
@@ -43,6 +49,7 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
       single_matched: Vec::new(),
       multi_matched: Vec::new(),
       transformed_var: Vec::new(),
+      secondary: Vec::new(),
     }
   }
 
@@ -73,6 +80,12 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
   }
 
   pub fn add_label(&mut self, label: &str, node: Node<'t, D>) {
+    if label == "secondary" {
+      // The hot path: relational rules label every sub-match, tens of
+      // millions of times per large index — no key String, no assoc scan.
+      self.secondary.push(node);
+      return;
+    }
     match self.multi_matched.iter_mut().find(|(k, _)| k == label) {
       Some((_, nodes)) => nodes.push(node),
       None => self.multi_matched.push((label.to_string(), vec![node])),
@@ -80,6 +93,9 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
   }
 
   pub fn get_labels(&self, label: &str) -> Option<&Vec<Node<'t, D>>> {
+    if label == "secondary" {
+      return (!self.secondary.is_empty()).then_some(&self.secondary);
+    }
     assoc_get(&self.multi_matched, label)
   }
 
@@ -95,7 +111,13 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
     let multi = self
       .multi_matched
       .iter()
-      .map(|(n, _)| MetaVariable::MultiCapture(n.clone()));
+      .map(|(n, _)| MetaVariable::MultiCapture(n.clone()))
+      .chain(
+        // Parity with the map storage: a labeled env used to surface
+        // "secondary" as a multi capture here.
+        (!self.secondary.is_empty())
+          .then(|| MetaVariable::MultiCapture("secondary".to_string())),
+      );
     single.chain(multi).chain(transformed)
   }
 
@@ -189,6 +211,11 @@ impl<D: Doc> MetaVarEnv<'_, D> {
       for n in ns {
         f(n)
       }
+    }
+    // Secondary label nodes must re-adopt across threads exactly like every
+    // other captured node — missing them would leave dangling tree handles.
+    for n in self.secondary.iter_mut() {
+      f(n)
     }
   }
 }
@@ -308,6 +335,11 @@ impl<'tree, D: Doc> From<MetaVarEnv<'tree, D>> for HashMap<String, String> {
       let s: Vec<_> = nodes.iter().map(|n| n.text()).collect();
       let s = s.join(", ");
       ret.insert(id, format!("[{s}]"));
+    }
+    if !env.secondary.is_empty() {
+      let s: Vec<_> = env.secondary.iter().map(|n| n.text()).collect();
+      let s = s.join(", ");
+      ret.insert("secondary".to_string(), format!("[{s}]"));
     }
     ret
   }
