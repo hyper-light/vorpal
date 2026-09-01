@@ -1,6 +1,7 @@
-//! The DEFS-STABLE compose (P4.5c-2): artifact surgery for a single-file semantic edit
-//! whose definition set is unchanged — bodies, references, sketches, and request sites
-//! moved; names, kinds, signatures, imports, params, and returns did not.
+//! The DEFS-STABLE compose (P4.5c-2, multi-file since S2): artifact surgery for a
+//! session of semantic edits whose definition sets are unchanged — bodies, references,
+//! sketches, and request sites moved; names, kinds, signatures, imports, params, and
+//! returns did not, in ANY edited file.
 //!
 //! The theorem (verified in the ingest layer and held to scratch by the scoped oracle):
 //! defs-stability keeps every file's node count and order, hence every dense id, hence
@@ -24,9 +25,9 @@ use crate::EdgeType;
 use crate::kg::{NODES_DIR, NodeIdMap};
 use crate::respan::FileRespan;
 
-/// One defs-stable edit's full surgery plan, in dense-id space (the universe is shared
-/// with the prior generation by the defs-stable premise).
-pub struct DefsStablePlan {
+/// One edited file's slice of a defs-stable session plan, in dense-id space (the
+/// universe is shared with the prior generation by the defs-stable premise).
+pub struct DefsStableFilePlan {
   pub file_key: u64,
   /// Fresh `(span_start, span_end, content_hash)` per layout ordinal — pipeline-exact,
   /// from a scratch single-file seal, stable fields verified row-by-row by the caller.
@@ -37,14 +38,23 @@ pub struct DefsStablePlan {
   pub edges: Vec<(u32, u32, EdgeType)>,
   /// The file's request/notify tail segment.
   pub request_edges: Vec<(u32, u32, EdgeType)>,
+  /// The file's fresh dataflow rows.
+  pub flows: Vec<crate::DataflowRow>,
+}
+
+/// A defs-stable session's full surgery plan: per-file slices plus the GLOBAL
+/// derivations, which are session-wide by nature (pairing acts over the entire sketch
+/// ledger; the sigs family is one ledger).
+pub struct DefsStablePlan {
+  /// The edited files' slices. Dense ids never move under this compose, so the slices
+  /// are independent — order is irrelevant to the result (the savers canonicalize).
+  pub files: Vec<DefsStableFilePlan>,
   /// The repaired GLOBAL pair set (`a < b`, sorted — the pipeline's emission order).
   pub fresh_pairs: Vec<(u64, u64, u8)>,
   /// Endpoints of every added/removed/relabeled pair — their similar segments rewrite.
   pub changed_srcs: Vec<u32>,
   /// The sigs family's complete new row set (the swapped ledger the repair paired).
   pub sig_rows: Vec<crate::SigFamilyRow>,
-  /// The file's fresh dataflow rows.
-  pub flows: Vec<crate::DataflowRow>,
 }
 
 /// Edge-row class within a source's slab segment: the log emits them in this fixed phase
@@ -153,9 +163,17 @@ pub(crate) fn localize(
   })
 }
 
-/// Compose the bucketed generation for one defs-stable edit. The caller has verified
-/// eligibility and stable fields; this module re-verifies every structural premise it
-/// leans on and errors — never guesses — on any surprise.
+/// One edited file's dense-space coordinates, resolved once up front.
+struct FileCtx {
+  base: u64,
+  rows: u32,
+  bucket: usize,
+}
+
+/// Compose the bucketed generation for a defs-stable session (one or more edited
+/// files). The caller has verified eligibility and stable fields per file; this module
+/// re-verifies every structural premise it leans on and errors — never guesses — on any
+/// surprise.
 pub fn compose_defs_stable(
   staging: &Path,
   prior: &Path,
@@ -166,27 +184,54 @@ pub fn compose_defs_stable(
     .ok_or_else(|| io::Error::other("defs-stable: prior has no bucketed node store"))?;
   let bases = map.bases().to_vec();
   let buckets = bases.len() - 1;
-  let &(_, file_base, file_rows) = map
-    .files()
-    .iter()
-    .find(|&&(key, _, _)| key == plan.file_key)
-    .ok_or_else(|| io::Error::other("defs-stable: file outside the prior universe"))?;
-  if plan.node_rows.len() != file_rows as usize {
-    return Err(io::Error::other("defs-stable: node row count moved — not defs-stable"));
+  if plan.files.is_empty() {
+    return Err(io::Error::other("defs-stable: empty session"));
   }
-  let file_range = file_base..file_base + u64::from(file_rows);
-  let file_bucket = bases.partition_point(|&b| b <= file_base) - 1;
+  let mut ctxs: Vec<FileCtx> = Vec::with_capacity(plan.files.len());
+  for file in &plan.files {
+    let &(_, base, rows) = map
+      .files()
+      .iter()
+      .find(|&&(key, _, _)| key == file.file_key)
+      .ok_or_else(|| io::Error::other("defs-stable: file outside the prior universe"))?;
+    if file.node_rows.len() != rows as usize {
+      return Err(io::Error::other("defs-stable: node row count moved — not defs-stable"));
+    }
+    ctxs.push(FileCtx {
+      base,
+      rows,
+      bucket: bases.partition_point(|&b| b <= base) - 1,
+    });
+  }
+  // Ranges are disjoint (one manifest entry per key); sorted for the owner lookup.
+  let mut ranges: Vec<(u64, u64, usize)> = ctxs
+    .iter()
+    .enumerate()
+    .map(|(i, ctx)| (ctx.base, ctx.base + u64::from(ctx.rows), i))
+    .collect();
+  ranges.sort_unstable();
+  let owner_of = |dense: u64| -> Option<usize> {
+    let at = ranges.partition_point(|&(start, _, _)| start <= dense);
+    (at > 0 && dense < ranges[at - 1].1).then(|| ranges[at - 1].2)
+  };
+  let in_any_range = |dense: u64| owner_of(dense).is_some();
 
-  // ---- scc: recompute ONLY when the edited file's call set moved ----
+  // ---- scc: recompute ONLY when an edited file's call set moved ----
   // The condensation reads the (src, dst) CALLS pair set; parallel edges and every other
-  // etype are invisible to it. Compare the file's prior and fresh call sets first — the
+  // etype are invisible to it. Compare each file's prior and fresh call sets first — the
   // common body edit keeps them, and then every scc_size byte is provably stable.
-  let prior_file_rows = read_edge_slab(
-    &prior.join(crate::EDGES_DIR).join(format!("{file_bucket:04}.bin")),
-    file_bucket,
-  )?;
-  let file_lo_local = (file_base - bases[file_bucket]) as u32;
-  let file_hi_local = file_lo_local + file_rows;
+  let mut slab_cache: HashMap<usize, Vec<SlabRow>> = HashMap::new();
+  let mut read_bucket = |bucket: usize| -> io::Result<Vec<SlabRow>> {
+    if let Some(rows) = slab_cache.get(&bucket) {
+      return Ok(rows.clone());
+    }
+    let rows = read_edge_slab(
+      &prior.join(crate::EDGES_DIR).join(format!("{bucket:04}.bin")),
+      bucket,
+    )?;
+    slab_cache.insert(bucket, rows.clone());
+    Ok(rows)
+  };
   let starts: HashMap<u64, u64> =
     map.files().iter().map(|&(key, start, _)| (key, start)).collect();
   let densify = |row: &SlabRow| -> io::Result<u32> {
@@ -195,32 +240,42 @@ pub fn compose_defs_stable(
       .map(|&start| (start + u64::from(row.dst_ord)) as u32)
       .ok_or_else(|| io::Error::other("defs-stable: edge destination outside the universe"))
   };
-  let mut prior_calls: HashSet<(u32, u32)> = HashSet::new();
-  for row in &prior_file_rows {
-    if row.src_local >= file_lo_local
-      && row.src_local < file_hi_local
-      && EdgeType(row.etype).base() == EdgeType::CALLS
-    {
-      prior_calls.insert((row.src_local - file_lo_local, densify(row)?));
+  let mut any_calls_moved = false;
+  for (file, ctx) in plan.files.iter().zip(&ctxs) {
+    let bucket_rows = read_bucket(ctx.bucket)?;
+    let lo_local = (ctx.base - bases[ctx.bucket]) as u32;
+    let hi_local = lo_local + ctx.rows;
+    let mut prior_calls: HashSet<(u32, u32)> = HashSet::new();
+    for row in &bucket_rows {
+      if row.src_local >= lo_local
+        && row.src_local < hi_local
+        && EdgeType(row.etype).base() == EdgeType::CALLS
+      {
+        prior_calls.insert((row.src_local - lo_local, densify(row)?));
+      }
+    }
+    let fresh_calls: HashSet<(u32, u32)> = file
+      .edges
+      .iter()
+      .filter(|(_, _, etype)| etype.base() == EdgeType::CALLS)
+      .map(|&(from, to, _)| ((u64::from(from) - ctx.base) as u32, to))
+      .collect();
+    if prior_calls != fresh_calls {
+      any_calls_moved = true;
+      break;
     }
   }
-  let fresh_calls: HashSet<(u32, u32)> = plan
-    .edges
-    .iter()
-    .filter(|(_, _, etype)| etype.base() == EdgeType::CALLS)
-    .map(|&(from, to, _)| ((u64::from(from) - file_base) as u32, to))
-    .collect();
-  let scc_new: Option<Vec<u32>> = if prior_calls == fresh_calls {
+  let scc_new: Option<Vec<u32>> = if !any_calls_moved {
     None
   } else {
     // The ripple can reach any bucket: the global CALLS list is the prior GRAPH's calls
-    // (zero slab decode — the CSR slices are the same truth) with the edited file's
-    // replaced by the plan's, through the seal's own condensation.
+    // (zero slab decode — the CSR slices are the same truth) with every edited file's
+    // replaced by its plan's, through the seal's own condensation.
     let node_count = bases[buckets] as usize;
     let mut log = vorpal_graph::EdgeLog::default();
     for u in 0..node_count as u32 {
-      if file_range.contains(&u64::from(u)) {
-        continue; // replaced by the plan's fresh calls below
+      if in_any_range(u64::from(u)) {
+        continue; // replaced by the plans' fresh calls below
       }
       for (&dst, &etype) in prior_kg
         .graph_out_targets(u)
@@ -232,41 +287,51 @@ pub fn compose_defs_stable(
         }
       }
     }
-    for &(from, to, etype) in &plan.edges {
-      if etype.base() == EdgeType::CALLS {
-        log.push(from, to, etype);
+    for file in &plan.files {
+      for &(from, to, etype) in &file.edges {
+        if etype.base() == EdgeType::CALLS {
+          log.push(from, to, etype);
+        }
       }
     }
     Some(crate::scc::scc_sizes(node_count, &log))
   };
 
-  // ---- node store: span/content patches for the file + scc patches wherever they land ----
-  let respan_plan = FileRespan {
-    file_key: plan.file_key,
-    rows: plan.node_rows.clone(),
-    ref_spans: HashMap::new(),
-    call_spans: HashMap::new(),
-  };
+  // ---- node store: span/content patches per file + scc patches wherever they land ----
+  let respan_plans: Vec<FileRespan> = plan
+    .files
+    .iter()
+    .map(|file| FileRespan {
+      file_key: file.file_key,
+      rows: file.node_rows.clone(),
+      ref_spans: HashMap::new(),
+      call_spans: HashMap::new(),
+    })
+    .collect();
+  let respan_refs: Vec<(u64, &FileRespan)> =
+    respan_plans.iter().map(|p| (p.file_key, p)).collect();
   let node_fold = crate::respan::rebuild_node_buckets(
     staging,
     prior,
     &map,
     &bases,
-    &[(plan.file_key, &respan_plan)],
+    &respan_refs,
     scc_new.as_deref(),
   )?;
 
-  // ---- evidence: the file's bucket swaps its rows; every other bucket links ----
+  // ---- evidence: every edited bucket swaps its edited files' rows; the rest link ----
+  let edited_buckets: HashSet<usize> = ctxs.iter().map(|ctx| ctx.bucket).collect();
   let store = crate::evidence::EvidenceStore::open(prior)
     .ok_or_else(|| io::Error::other("defs-stable: prior evidence unreadable"))?;
   let evidence_dir = staging.join(crate::EVIDENCE_DIR);
   fs::create_dir_all(&evidence_dir)?;
   let mut ev_toc = fs::read(prior.join(crate::EVIDENCE_TOC))
     .map_err(|_| io::Error::other("defs-stable: prior evidence TOC unreadable"))?;
-  let mut dropped_rows: Vec<crate::EvidenceRow> = Vec::new();
+  // Dropped rows keep their owning file for the usage delta ((name_hash, file_key)).
+  let mut dropped_rows: Vec<(usize, crate::EvidenceRow)> = Vec::new();
   for (bucket, window) in bases.windows(2).enumerate() {
     let name = format!("{bucket:04}.bin");
-    if bucket != file_bucket {
+    if !edited_buckets.contains(&bucket) {
       let (from, to) =
         (prior.join(crate::EVIDENCE_DIR).join(&name), evidence_dir.join(&name));
       let _ = fs::remove_file(&to);
@@ -276,14 +341,18 @@ pub fn compose_defs_stable(
       continue;
     }
     let mut rows = store.rows_of_bucket(bucket);
-    rows.retain(|row| {
-      let in_file = file_range.contains(&u64::from(row.from));
-      if in_file {
-        dropped_rows.push(row.clone());
+    rows.retain(|row| match owner_of(u64::from(row.from)) {
+      Some(owner) => {
+        dropped_rows.push((owner, row.clone()));
+        false
       }
-      !in_file
+      None => true,
     });
-    rows.extend(plan.evidence.iter().cloned());
+    for (file, ctx) in plan.files.iter().zip(&ctxs) {
+      if ctx.bucket == bucket {
+        rows.extend(file.evidence.iter().cloned());
+      }
+    }
     let built = crate::evidence::build_slab(bucket, window[0], &rows, &map)?;
     let tmp = evidence_dir.join(format!("{name}.tmp"));
     fs::write(&tmp, &built.bytes)?;
@@ -317,10 +386,12 @@ pub fn compose_defs_stable(
   fs::write(&toc_tmp, &ev_toc)?;
   fs::rename(&toc_tmp, staging.join(crate::EVIDENCE_TOC))?;
 
-  // ---- edges: rebuild the file's bucket + every changed similar endpoint's bucket ----
+  // ---- edges: rebuild every edited bucket + every changed similar endpoint's bucket ----
   let mut segment_srcs: HashMap<usize, HashSet<u32>> = HashMap::new(); // bucket -> dense srcs to rewrite
-  for src in file_range.clone() {
-    segment_srcs.entry(file_bucket).or_default().insert(src as u32);
+  for ctx in &ctxs {
+    for src in ctx.base..ctx.base + u64::from(ctx.rows) {
+      segment_srcs.entry(ctx.bucket).or_default().insert(src as u32);
+    }
   }
   for &src in &plan.changed_srcs {
     let bucket = bases.partition_point(|&b| b <= u64::from(src)) - 1;
@@ -364,12 +435,8 @@ pub fn compose_defs_stable(
       continue;
     };
     let bucket_base = bases[bucket];
-    let prior_rows = if bucket == file_bucket {
-      prior_file_rows.clone()
-    } else {
-      read_edge_slab(&prior.join(crate::EDGES_DIR).join(&name), bucket)?
-    };
-    let mut out: Vec<SlabRow> = Vec::with_capacity(prior_rows.len() + plan.edges.len());
+    let prior_rows = read_bucket(bucket)?;
+    let mut out: Vec<SlabRow> = Vec::with_capacity(prior_rows.len());
     let mut i = 0usize;
     let bucket_len = (bases[bucket + 1] - bucket_base) as u32;
     for src_local in 0..bucket_len {
@@ -397,8 +464,11 @@ pub fn compose_defs_stable(
       let keep = |class: EdgeClass| run.iter().filter(move |row| edge_class(EdgeType(row.etype)) == class);
       out.extend(keep(EdgeClass::Containment));
       out.extend(keep(EdgeClass::Cochange));
-      if file_range.contains(&u64::from(src_dense)) {
-        for &(from, to, etype) in plan.edges.iter().filter(|(from, _, _)| *from == src_dense) {
+      let owner = owner_of(u64::from(src_dense));
+      if let Some(owner) = owner {
+        let file = &plan.files[owner];
+        for &(from, to, etype) in file.edges.iter().filter(|(from, _, _)| *from == src_dense)
+        {
           debug_assert_eq!(from, src_dense);
           out.push(localize(&map, bucket_base, from, to, etype)?);
         }
@@ -408,9 +478,10 @@ pub fn compose_defs_stable(
       if let Some(similar) = similar_of.get(&src_dense) {
         out.extend_from_slice(similar);
       }
-      if file_range.contains(&u64::from(src_dense)) {
+      if let Some(owner) = owner {
+        let file = &plan.files[owner];
         for &(from, to, etype) in
-          plan.request_edges.iter().filter(|(from, _, _)| *from == src_dense)
+          file.request_edges.iter().filter(|(from, _, _)| *from == src_dense)
         {
           out.push(localize(&map, bucket_base, from, to, etype)?);
         }
@@ -486,15 +557,15 @@ pub fn compose_defs_stable(
     }
   }
 
-  // ---- usage: the file's postings delta, bucket-scoped (untouched buckets link) ----
+  // ---- usage: the session's postings delta, bucket-scoped (untouched buckets link) ----
   let removed: HashSet<(u32, u64)> = dropped_rows
     .iter()
-    .map(|row| (row.name_hash, plan.file_key))
+    .map(|&(owner, ref row)| (row.name_hash, plan.files[owner].file_key))
     .collect();
   let mut added: Vec<(u32, u64)> = plan
-    .evidence
+    .files
     .iter()
-    .map(|row| (row.name_hash, plan.file_key))
+    .flat_map(|file| file.evidence.iter().map(|row| (row.name_hash, file.file_key)))
     .collect();
   added.sort_unstable();
   added.dedup();
@@ -506,8 +577,10 @@ pub fn compose_defs_stable(
   // ---- dataflow: the canonical saver re-sorts; filter + extend is exact ----
   let mut flows = crate::dataflow::load_dataflow(prior)
     .ok_or_else(|| io::Error::other("defs-stable: prior dataflow unreadable"))?;
-  flows.retain(|row| !file_range.contains(&u64::from(row.from)));
-  flows.extend(plan.flows.iter().cloned());
+  flows.retain(|row| !in_any_range(u64::from(row.from)));
+  for file in &plan.files {
+    flows.extend(file.flows.iter().cloned());
+  }
   crate::dataflow::save_dataflow(staging, flows)?;
 
   // ---- names.idx: names are defs-stable ⇒ byte-identical ⇒ link. graph.bin/graph.stamp:

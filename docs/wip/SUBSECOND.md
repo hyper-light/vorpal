@@ -1053,6 +1053,40 @@ plus the constructive guarantee. The generation id is stat-sensitive by design (
 manifest rides the fold): re-appending the same bytes after a revert yields a NEW id —
 convergence comparisons are always within one tree state.
 
+#### S2-a (2026-09-01) — multi-file DEFS-STABLE sessions
+
+k body-edited files now ride ONE defs-stable compose (the respan lane was already
+k-capable from P4.5b — MAX_RESPANNED — so span-only multi-edits were composing all
+along; this closes the semantic class). What generalized, and why it was mechanical:
+defs-stability means NO dense id moves anywhere, so per-file slices are independent by
+construction — `DefsStablePlan` became `files: Vec<DefsStableFilePlan>` + the global
+fields (pair set, changed endpoints, sigs ledger, which are session-wide by nature).
+The session core was ALREADY multi-file (`resolve_session` — c-3 built it that way);
+`scoped_resolve_files` is the new plural entry (one shared table, all import bindings
+seeded together; `scoped_resolve_file` delegates), and `scoped_similar_repair` now takes
+`swaps: &[(file_key, fresh run)]` — k runs spliced at their canonical positions, each
+canonicalized under the order law. Surgery per family: evidence/edges retain-and-extend
+per OWNING file (an `owner_of` range lookup replaces the single file_range test; two
+edited files may share a bucket), scc recomputes when ANY file's call set moved (all
+ranges excluded, all plans' calls pushed), usage removes/adds per (name_hash, owning
+key), dataflow filters any range, names still hard-link (defs stable session-wide).
+Previously-silent per-file declines (universe miss, row-count move, stable-field move)
+now stamp loudly — found when a STALE BINARY (libs rebuilt, CLI not) silently declined a
+kernel k=2 probe: the diff-shape bails stay quiet by design (every >1-file edit hits
+them), but premise violations speak.
+
+Gates: `a_multi_file_defs_stable_session_composes_and_converges` (THREE files — two
+Python forming the cross-file scc cycle + the Rust neighbor — one session, indexed==3,
+names.idx hard-linked, byte-converged) first-run green; kernel k=2 literal flips
+(mm/slab_common.c + kernel/fork.c): **1.20 s forward / 1.07 s reverse**, byte-converged
+both directions — barely above the single-file 1.03 s because the session amortizes the
+table build and the single global pairing pass; battery gained **S6 two-file** (top
+comments in the two largest files, one build) — **28/28 PASS** across
+ast-grep/nats.go/ProxyBroker/pierre, S6 composing on every repo; suite green; clippy 0/0
+both lanes. Mixed sessions (defs-stable + defs-changed members) still decline to the
+full pipeline — S2-b routes them through the changed lane (stable members = delta-0
+blocks) with the multi-block shift law.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

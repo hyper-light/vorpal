@@ -698,12 +698,55 @@ fn resolve_session(
   Ok(outcomes)
 }
 
-/// Re-resolve one defs-stable file against the prior generation — a one-file session
-/// over [`PriorUniverse`]. `products` serves the bounded chain/param closure;
-/// `decode_cap` bounds it (past it the caller escalates to the full pipeline, loudly).
-/// The caller must hand a `kg` whose name index is present (`Kg::load` picks up
-/// `names.idx`; `build_names_index` otherwise) — `nodes_named` is the candidate source.
-#[allow(clippy::too_many_arguments)] // the one scoped entry: every input is load-bearing
+/// One defs-stable session member, by reference (the caller owns views and bridges).
+pub struct ScopedFileInput<'a> {
+  pub path: String,
+  pub file_key: u64,
+  pub view: &'a ProductView<'a>,
+  pub layout_ords: &'a [u64],
+}
+
+/// Re-resolve a defs-stable session (one or more edited files) against the prior
+/// generation — a k-file session over [`PriorUniverse`], one shared symbol table, all
+/// files' import bindings seeded together (the bulk's own shape). `products` serves the
+/// bounded chain/param closure; `decode_cap` bounds it (past it the caller escalates to
+/// the full pipeline, loudly). The caller must hand a `kg` whose name index is present
+/// (`Kg::load` picks up `names.idx`; `build_names_index` otherwise) — `nodes_named` is
+/// the candidate source. Outcomes return in input order.
+pub fn scoped_resolve_files(
+  interner: &Interner,
+  kg: &Kg,
+  map: &vorpal_kg::NodeIdMap,
+  resolver: &Resolver,
+  products: &dyn ProductSource,
+  inputs: &[ScopedFileInput<'_>],
+  decode_cap: usize,
+) -> io::Result<Vec<ScopedOutcome>> {
+  let universe = PriorUniverse { kg, map };
+  let mut files: Vec<SessionFile<'_>> = Vec::with_capacity(inputs.len());
+  for input in inputs {
+    let Some(&(_, base, rows)) =
+      map.files().iter().find(|&&(key, _, _)| key == input.file_key)
+    else {
+      return Err(io::Error::other("scoped: file outside the prior universe"));
+    };
+    files.push(SessionFile {
+      path: input.path.clone(),
+      base,
+      rows,
+      view: input.view,
+      layout_ords: input.layout_ords,
+    });
+  }
+  let outcomes = resolve_session(interner, &universe, resolver, products, &files, decode_cap)?;
+  if outcomes.len() != inputs.len() {
+    return Err(io::Error::other("scoped: session outcome count mismatch"));
+  }
+  Ok(outcomes)
+}
+
+/// The one-file convenience over [`scoped_resolve_files`] (the c-2 oracle's entry).
+#[allow(clippy::too_many_arguments)] // the scoped entry: every input is load-bearing
 pub fn scoped_resolve_file(
   interner: &Interner,
   kg: &Kg,
@@ -716,19 +759,14 @@ pub fn scoped_resolve_file(
   layout_ords: &[u64],
   decode_cap: usize,
 ) -> io::Result<ScopedOutcome> {
-  let Some(&(_, base, rows)) = map.files().iter().find(|&&(key, _, _)| key == file_key)
-  else {
-    return Err(io::Error::other("scoped: file outside the prior universe"));
-  };
-  let universe = PriorUniverse { kg, map };
-  let files = [SessionFile {
+  let inputs = [ScopedFileInput {
     path: path.to_string(),
-    base,
-    rows,
+    file_key,
     view,
     layout_ords,
   }];
-  let mut outcomes = resolve_session(interner, &universe, resolver, products, &files, decode_cap)?;
+  let mut outcomes =
+    scoped_resolve_files(interner, kg, map, resolver, products, &inputs, decode_cap)?;
   outcomes
     .pop()
     .ok_or_else(|| io::Error::other("scoped: session produced no outcome"))
@@ -764,31 +802,41 @@ pub struct SimilarRepair {
 
 /// `live_files` is the MANIFEST's live entry count — the bucket law's one input
 /// (never derived from node-bearing files, which drift under parse-health Exclude).
+/// `swaps` is the session's edited files: each `(file_key, fresh run)` replaces that
+/// file's prior run wholesale (multi-file since S2 — the splice law is per file and the
+/// files' canonical positions are disjoint, so k swaps compose).
 pub fn scoped_similar_repair(
   map: &vorpal_kg::NodeIdMap,
   live_files: usize,
   prior_rows: &[SigRow],
   prior_pairs: &[(u64, u64, u8)],
-  file_key: u64,
-  fresh_file_sigs: &[SigRow],
+  swaps: &[(u64, &[SigRow])],
 ) -> io::Result<SimilarRepair> {
-  // Canonicalize the fresh run to the family's own law before splicing: content-total
+  // Canonicalize each fresh run to the family's own law before splicing: content-total
   // sort, one row per node, survivor = smallest (shingles, sketch) — exactly what
-  // `similar_pairs` produces and the sigs family persists. The raw run arrives in
+  // `similar_pairs` produces and the sigs family persists. The raw runs arrive in
   // PRODUCT LAYOUT order, which is non-monotone on duplicate-collapsed files (a signed
   // definition collapsing onto an earlier declaration's ordinal lands out of order) and
   // can carry two rows for one node; without this, the short-circuit below missed on
   // every such file even when no sketch changed.
-  let mut fresh: Vec<SigRow> = fresh_file_sigs.to_vec();
-  fresh.sort_unstable_by(|a, b| {
-    (a.node, a.shingles, &a.sketch).cmp(&(b.node, b.shingles, &b.sketch))
-  });
-  fresh.dedup_by_key(|r| r.node);
-  // Swap the edited file's run in place: prior rows are canonically sorted and a file's
-  // rows are contiguous at its (bucket, key) position, so splicing the fresh run at the
+  let mut fresh_of: std::collections::HashMap<u64, Vec<SigRow>> =
+    std::collections::HashMap::with_capacity(swaps.len());
+  for &(key, run) in swaps {
+    let mut fresh: Vec<SigRow> = run.to_vec();
+    fresh.sort_unstable_by(|a, b| {
+      (a.node, a.shingles, &a.sketch).cmp(&(b.node, b.shingles, &b.sketch))
+    });
+    fresh.dedup_by_key(|r| r.node);
+    if fresh_of.insert(key, fresh).is_some() {
+      return Err(io::Error::other("scoped: duplicate file in the pairing swap set"));
+    }
+  }
+  // Swap each edited file's run in place: prior rows are canonically sorted and a file's
+  // rows are contiguous at its (bucket, key) position, so splicing a fresh run at the
   // old run's position preserves the global feed order the ceiling depends on.
-  let mut rows: Vec<SigRow> = Vec::with_capacity(prior_rows.len() + fresh.len());
-  let mut spliced = false;
+  let mut rows: Vec<SigRow> =
+    Vec::with_capacity(prior_rows.len() + fresh_of.values().map(Vec::len).sum::<usize>());
+  let mut spliced: HashSet<u64> = HashSet::with_capacity(swaps.len());
   for row in prior_rows {
     let Some((key, _)) = map.locate(
       u32::try_from(row.node)
@@ -796,30 +844,36 @@ pub fn scoped_similar_repair(
     ) else {
       return Err(io::Error::other("scoped: sig row outside the prior universe"));
     };
-    if key == file_key {
-      if !spliced {
+    if let Some(fresh) = fresh_of.get(&key) {
+      if spliced.insert(key) {
         rows.extend(fresh.iter().cloned());
-        spliced = true;
       }
       continue; // the old run is replaced wholesale
     }
     rows.push(row.clone());
   }
-  if !spliced {
-    // The file had no signed definitions before: its fresh run enters at its canonical
-    // (bucket, key) position among the survivors.
-    let position = rows
-      .partition_point(|row| {
-        map
-          .locate(row.node as u32)
-          .map(|(key, _)| {
-            let buckets = u64::from(vorpal_kg::identity::bucket_count_for(live_files));
-            let row_bucket = key & (buckets - 1);
-            let file_bucket = file_key & (buckets - 1);
-            (row_bucket, key) < (file_bucket, file_key)
-          })
-          .unwrap_or(false)
-      });
+  // Files with no signed definitions before: their fresh runs enter at their canonical
+  // (bucket, key) positions among the survivors — ascending key order so earlier
+  // insertions never disturb later positions' comparisons (the order is total).
+  let mut missing: Vec<u64> =
+    fresh_of.keys().copied().filter(|key| !spliced.contains(key)).collect();
+  missing.sort_unstable();
+  for file_key in missing {
+    let fresh = &fresh_of[&file_key];
+    if fresh.is_empty() {
+      continue; // nothing signed before or after — no run either way
+    }
+    let buckets = u64::from(vorpal_kg::identity::bucket_count_for(live_files));
+    let position = rows.partition_point(|row| {
+      map
+        .locate(row.node as u32)
+        .map(|(key, _)| {
+          let row_bucket = key & (buckets - 1);
+          let file_bucket = file_key & (buckets - 1);
+          (row_bucket, key) < (file_bucket, file_key)
+        })
+        .unwrap_or(false)
+    });
     let tail = rows.split_off(position);
     rows.extend(fresh.iter().cloned());
     rows.extend(tail);

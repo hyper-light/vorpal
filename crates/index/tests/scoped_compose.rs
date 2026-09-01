@@ -155,6 +155,64 @@ fn defs_stable_compose_converges_with_an_scc_ripple() {
 }
 
 #[test]
+fn a_multi_file_defs_stable_session_composes_and_converges() {
+  // S2: THREE files body-edited in one build — two Python (the cross-file cycle forms
+  // exactly as in the single-file gate) plus the Rust neighbor — must ride ONE
+  // defs-stable session: one shared table, every edited run swapped in the pairing
+  // repair, every family spliced per source, and the result byte-equal to scratch.
+  unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
+  let base = std::env::temp_dir().join(format!("vorpal-ds-multi-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&base);
+  let src = base.join("repo");
+  fs::create_dir_all(&src).unwrap();
+  write_fixture(&src);
+  let src = src.canonicalize().unwrap();
+
+  let out = base.join("index");
+  vorpal_index::build_index(&src, &out).expect("initial build");
+  let gen_prior = live(&out);
+  #[cfg(unix)]
+  let names_ino = {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(gen_prior.join("names.idx")).unwrap().ino()
+  };
+
+  fs::write(src.join("a.py"), a_py(true)).unwrap();
+  fs::write(
+    src.join("b.py"),
+    "from a import helper_from_a\n\ndef beta(x, k=None):\n    return helper_from_a() if k else x\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("lib.rs"),
+    "pub fn helper(value: i32) -> i32 {\n    value * 3 - 1\n}\n\npub fn entry(seed: i32) -> i32 {\n    helper(seed)\n}\n",
+  )
+  .unwrap();
+  let report = vorpal_index::build_index(&src, &out).expect("incremental build");
+  assert!(
+    report
+      .cochange_note
+      .as_deref()
+      .is_some_and(|note| note.contains("defs-stable compose")),
+    "the three-file body edit must take ONE defs-stable session, got: {report:?}"
+  );
+  assert_eq!(report.indexed, 3, "exactly the edited files re-resolve");
+  let gen_new = live(&out);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+      names_ino,
+      fs::metadata(gen_new.join("names.idx")).unwrap().ino(),
+      "names are defs-stable across the whole session — names.idx must hard-link"
+    );
+  }
+  assert_converged(&out, &src, &base, "multi-file");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn defs_stable_compose_converges_when_a_pair_appears() {
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
   let base = std::env::temp_dir().join(format!("vorpal-ds-pairs-{}", std::process::id()));

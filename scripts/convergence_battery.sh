@@ -101,6 +101,11 @@ for repo in "${REPOS[@]}"; do
   esac
   echo "== $name (probe: ${probe#"$src"/}, $(wc -l < "$probe" | tr -d ' ') lines)"
   cp "$probe" "$WORK/probe.orig"
+  # Second probe (S6 two-file shape): the second-largest source file, same filter.
+  probe2=$(find "$src" -type f \( -name '*.rs' -o -name '*.py' -o -name '*.go' \
+    -o -name '*.ts' -o -name '*.js' -o -name '*.java' -o -name '*.c' \) \
+    -exec stat -f '%z %N' {} + | sort -rn | sed -n '2p' | cut -d' ' -f2-)
+  [ -n "$probe2" ] && cp "$probe2" "$WORK/probe2.orig"
 
   for fmt in $FORMATS; do
     echo "  -- format=${fmt:-flat}"
@@ -156,6 +161,22 @@ for repo in "${REPOS[@]}"; do
       java) : ;; # no legal top-level function — S1–S4 cover this probe
     esac
     converge "$fmt" "$src" "$out" "S5 fn-append"
+
+    # S6: TWO files edited at once (S2 multi-file sessions) — a top comment in the probe
+    # AND in the second-largest source file, one build. The compose class depends on the
+    # repo (respan when span-only per file; defs-stable otherwise); the gate is, as
+    # always, convergence.
+    if [ -n "$probe2" ]; then
+      printf '%s vorpal battery: two-file A\n' "$C" | cat - "$probe" > "$probe.tmp" && mv "$probe.tmp" "$probe"
+      ext2="${probe2##*.}"
+      case "$ext2" in
+        py) C2='#' ;;
+        *) C2='//' ;;
+      esac
+      printf '%s vorpal battery: two-file B\n' "$C2" | cat - "$probe2" > "$probe2.tmp" && mv "$probe2.tmp" "$probe2"
+      converge "$fmt" "$src" "$out" "S6 two-file"
+      cp "$WORK/probe2.orig" "$probe2"
+    fi
   done
   cp "$WORK/probe.orig" "$probe"
 done
