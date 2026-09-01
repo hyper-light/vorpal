@@ -1223,6 +1223,32 @@ the six families' link loops can run on six threads (~400 → ~80 ms), and the d
 `remove_file` before each link (staging is always fresh) is a free halving of the
 syscall count. Both preserve warm chains.
 
+#### The link floor is APFS's, not ours (2026-09-01) — two more falsifications, one consolidation
+
+Both halves of the surviving lead FELL to their isolating experiments (same box,
+interleaved rounds ×3): six families' links across six threads ran **1.8× SLOWER**
+than one thread (405–426 ms serial vs 730–768 ms parallel for 6×256 links into six
+distinct directories) — hard-link creation serializes ABOVE the directory, at the
+APFS volume catalog/journal, and thread fan-out only adds contention; and dropping the
+defensive per-entry `remove_file` was free-of-benefit (0.263 vs 0.270 ms/link — the
+cost is the link itself, not the extra miss). With the restructure forced SERIAL, the
+end-to-end walls confirm neutrality: cutoff 0.47 s, chained toggles 1.05–1.08 s,
+converged — baseline noise. THE LAW: the ~0.27 ms/entry carry cost is the
+filesystem's, unmovable by clones (vnode cache poisoning), threads (volume-lock
+contention), or syscall dieting; it simply does not exist on ext4/CI (~10–20 µs
+links). Sub-second-on-APFS work must come from elsewhere (graph-cache emit, session
+costs) — the carry fan-out is closed as a lead, three ways.
+
+What ships from the episode is the CONSOLIDATION: one documented primitive
+(`vorpal_kg::carry_family_dir` + serial `carry_families`) now performs every family
+carry — the cutoff's five-family loop + pack (patched buckets replaced with private
+copies before patching, never written through their links; the carried pack TOC
+replaced, never truncated through), the composes' hoisted batches with the per-loop
+link branches reduced to skips, and dir-exists pre-carry detection in
+`apply_delta`/`save_sigs` — with all three falsification laws recorded AT the
+primitive, where the next optimizer will look first. Perf-neutral by measurement;
+~150 lines of repeated link boilerplate gone; every inode-carry oracle intact.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

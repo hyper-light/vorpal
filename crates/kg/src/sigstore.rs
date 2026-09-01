@@ -118,7 +118,12 @@ pub fn save_sigs(
   }
   let buckets = bases.len() - 1;
   let sigs_dir = dir.join(SIGS_DIR);
-  fs::create_dir_all(&sigs_dir)?;
+  // An existing staging sigs/ means the caller already link-carried the family (the
+  // composes' hoisted parallel batch); carried buckets then skip their links here.
+  let pre_carried = sigs_dir.is_dir();
+  if !pre_carried {
+    fs::create_dir_all(&sigs_dir)?;
+  }
   // Identity-code and bucket every row, then sort per bucket by (file_key, ordinal) —
   // position-independent and a pure function of the row set.
   let mut coded: Vec<(usize, u64, u32, u32, [u8; SIG_SKETCH_LEN])> = Vec::with_capacity(rows.len());
@@ -183,6 +188,9 @@ pub fn save_sigs(
         row.rows == slab.rows && row.len == slab.bytes.len() as u64 && row.digest == slab.digest
       });
     if carried {
+      if pre_carried {
+        continue; // link-carried by the caller's family batch
+      }
       let from = prior
         .map(|p| p.join(SIGS_DIR).join(&name))
         .expect("carried implies a prior");

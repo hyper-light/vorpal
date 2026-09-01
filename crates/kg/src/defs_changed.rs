@@ -127,6 +127,22 @@ pub fn compose_defs_changed(
     return Err(io::Error::other("defs-changed: seal set disagrees with the edited set"));
   }
 
+  // ---- family carries, hoisted and PARALLEL (independent destination dir locks;
+  // hard links on purpose — inode identity keeps chained builds warm, clonefile
+  // measured-and-rejected). Rewritten members rename over their linked entries;
+  // untouched members are done the moment this returns. ----
+  crate::carry_families(
+    prior,
+    staging,
+    &[
+      (crate::kg::NODES_DIR, crate::kg::is_nodes_member as fn(&str) -> bool),
+      (crate::evidence::EVIDENCE_DIR, crate::evidence::is_evidence_member),
+      (crate::edgestore::EDGES_DIR, crate::edgestore::is_edges_member),
+      (crate::usagestore::USAGE_DIR, crate::usagestore::is_usage_member),
+      (crate::sigstore::SIGS_DIR, crate::sigstore::is_sigs_member),
+    ],
+  )?;
+
   // ---- the shift law's blocks, ascending, with cumulative deltas ----
   let mut blocks: Vec<ShiftBlock<'_>> = Vec::with_capacity(plan.edited.len());
   for (key, unmoved) in &plan.edited {
@@ -289,7 +305,6 @@ pub fn compose_defs_changed(
   // ---- node store: the edited bucket splices around the fresh seal; every other bucket
   // links unless its scc column moved ----
   let nodes_dir = staging.join(NODES_DIR);
-  fs::create_dir_all(&nodes_dir)?;
   let mut node_toc = fs::read(prior.join(crate::NODES_TOC))
     .map_err(|_| io::Error::other("defs-changed: prior node TOC unreadable"))?;
   for bucket in 0..buckets {
@@ -300,14 +315,7 @@ pub fn compose_defs_changed(
       // Content is positionally identical (locals cancel); only the scc column can move.
       // Under the carry law it provably did NOT — link blind, no read, no compare.
       let Some(scc_new) = scc_new.as_deref() else {
-        for name in [&vseg_name, &heap_name] {
-          let (from, to) = (prior.join(NODES_DIR).join(name), nodes_dir.join(name));
-          let _ = fs::remove_file(&to);
-          if fs::hard_link(&from, &to).is_err() {
-            fs::copy(&from, &to)?;
-          }
-        }
-        continue;
+        continue; // link-carried by the hoisted family batch (the carry law)
       };
       let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
       let segment = Segment::open_owned(prior_bytes)
@@ -322,14 +330,7 @@ pub fn compose_defs_changed(
         .and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))
         .ok_or_else(|| io::Error::other("defs-changed: scc column not sliceable"))?;
       if scc_col.as_slice() == &scc_new[new_lo..new_hi] {
-        for name in [&vseg_name, &heap_name] {
-          let (from, to) = (prior.join(NODES_DIR).join(name), nodes_dir.join(name));
-          let _ = fs::remove_file(&to);
-          if fs::hard_link(&from, &to).is_err() {
-            fs::copy(&from, &to)?;
-          }
-        }
-        continue;
+        continue; // link-carried by the hoisted family batch
       }
       // scc ripple: rebuild the vseg with the new column; the heap links (strings did
       // not move for this bucket).
@@ -338,11 +339,7 @@ pub fn compose_defs_changed(
       let tmp = nodes_dir.join(format!("{vseg_name}.tmp"));
       fs::write(&tmp, &bytes)?;
       fs::rename(&tmp, nodes_dir.join(&vseg_name))?;
-      let (from, to) = (prior.join(NODES_DIR).join(&heap_name), nodes_dir.join(&heap_name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
-      }
+      // The heap is already link-carried by the hoisted batch; only the vseg moved.
       let at = 20 + bucket * 36 + 4;
       node_toc
         .get_mut(at..at + 8)
@@ -475,20 +472,13 @@ pub fn compose_defs_changed(
     })
     .collect();
   let evidence_dir = staging.join(crate::EVIDENCE_DIR);
-  fs::create_dir_all(&evidence_dir)?;
   let mut ev_toc = fs::read(prior.join(crate::EVIDENCE_TOC))
     .map_err(|_| io::Error::other("defs-changed: prior evidence TOC unreadable"))?;
   let mut dropped_by_file: HashMap<u64, Vec<crate::EvidenceRow>> = HashMap::new();
   for bucket in 0..buckets {
     let name = format!("{bucket:04}.bin");
     if !session_buckets.contains(&bucket) {
-      let (from, to) =
-        (prior.join(crate::EVIDENCE_DIR).join(&name), evidence_dir.join(&name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
-      }
-      continue;
+      continue; // link-carried by the hoisted family batch
     }
     let mut rows: Vec<crate::EvidenceRow> = Vec::new();
     for row in store.rows_of_bucket(bucket) {
@@ -580,7 +570,6 @@ pub fn compose_defs_changed(
     }
   }
   let edges_dir = staging.join(crate::EDGES_DIR);
-  fs::create_dir_all(&edges_dir)?;
   let mut edge_toc = fs::read(prior.join(crate::EDGES_TOC))
     .map_err(|_| io::Error::other("defs-changed: prior edge TOC unreadable"))?;
   let mut rebuilt_rows: HashMap<usize, Vec<SlabRow>> = HashMap::new();
@@ -588,12 +577,7 @@ pub fn compose_defs_changed(
     let name = format!("{bucket:04}.bin");
     let needs_rebuild = rewrite_srcs.contains_key(&bucket) || edited_buckets.contains(&bucket);
     if !needs_rebuild {
-      let (from, to) = (prior.join(crate::EDGES_DIR).join(&name), edges_dir.join(&name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
-      }
-      continue;
+      continue; // link-carried by the hoisted family batch
     }
     let prior_rows = read_edge_slab(&prior.join(crate::EDGES_DIR).join(&name), bucket)?;
     let bucket_base_new = new_bases[bucket];

@@ -130,7 +130,12 @@ pub(crate) fn apply_delta(
     added_by[(hash & (buckets - 1)) as usize].push((hash, key));
   }
   let usage_dir = staging.join(USAGE_DIR);
-  fs::create_dir_all(&usage_dir)?;
+  // An existing staging usage/ means the caller already link-carried the family (the
+  // composes' hoisted parallel batch); untouched buckets then skip their links here.
+  let pre_carried = usage_dir.is_dir();
+  if !pre_carried {
+    fs::create_dir_all(&usage_dir)?;
+  }
   let mut toc = fs::read(prior.join(USAGE_TOC))
     .map_err(|_| io::Error::other("usage delta: prior TOC unreadable"))?;
   let toc_snapshot = toc.clone();
@@ -156,6 +161,9 @@ pub(crate) fn apply_delta(
     .map(|bucket| -> io::Result<BucketOut> {
       let name = format!("{bucket:04}.idx");
       let link = || -> io::Result<BucketOut> {
+        if pre_carried {
+          return Ok(BucketOut::Linked); // link-carried by the caller's family batch
+        }
         let (from, to) = (prior.join(USAGE_DIR).join(&name), usage_dir.join(&name));
         let _ = fs::remove_file(&to);
         if fs::hard_link(&from, &to).is_err() {

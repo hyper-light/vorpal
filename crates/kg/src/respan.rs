@@ -77,6 +77,24 @@ pub fn respan_generation(
     ));
   }
 
+  // ---- family carries, hoisted and PARALLEL: destination directory locks are
+  // independent, so five families' link fan-out costs roughly one family's worth of
+  // wall (~0.27 ms/entry serialized per dir on APFS). Hard links on purpose — inode
+  // identity keeps chained builds' reads warm (clonefile measured-and-rejected,
+  // SUBSECOND.md 2026-09-01). The loops below rename rewritten members over their
+  // linked entries and skip everything else. ----
+  crate::carry_families(
+    prior,
+    staging,
+    &[
+      (crate::kg::NODES_DIR, crate::kg::is_nodes_member as fn(&str) -> bool),
+      (crate::evidence::EVIDENCE_DIR, crate::evidence::is_evidence_member),
+      (crate::edgestore::EDGES_DIR, crate::edgestore::is_edges_member),
+      (crate::usagestore::USAGE_DIR, crate::usagestore::is_usage_member),
+      (crate::sigstore::SIGS_DIR, crate::sigstore::is_sigs_member),
+    ],
+  )?;
+
   // ---- node store (shared with the defs-stable compose) ----
   let plan_refs: Vec<(u64, &FileRespan)> = plans.iter().map(|p| (p.file_key, p)).collect();
   let node_fold = rebuild_node_buckets(staging, prior, &map, &bases, &plan_refs, None)?;
@@ -85,22 +103,13 @@ pub fn respan_generation(
   let store = crate::evidence::EvidenceStore::open(prior)
     .ok_or_else(|| io::Error::other("respan: prior evidence unreadable"))?;
   let evidence_dir = staging.join(crate::evidence::EVIDENCE_DIR);
-  fs::create_dir_all(&evidence_dir)?;
   let prior_ev_toc = fs::read(prior.join(crate::evidence::EVIDENCE_TOC))
     .map_err(|_| io::Error::other("respan: prior evidence TOC unreadable"))?;
   let mut ev_toc = prior_ev_toc;
   for bucket in 0..buckets {
     let name = format!("{bucket:04}.bin");
     if planned_in_bucket[bucket].is_empty() {
-      let (from, to) = (
-        prior.join(crate::evidence::EVIDENCE_DIR).join(&name),
-        evidence_dir.join(&name),
-      );
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
-      }
-      continue;
+      continue; // link-carried by the hoisted family batch
     }
     let mut rows = store.rows_of_bucket(bucket);
     for row in &mut rows {
@@ -144,24 +153,13 @@ pub fn respan_generation(
   // ---- untouched families: edges, usage, sigs — link members + TOCs verbatim ----
   // (sigs carry: the compose eligibility ladder proves every sketch and shingle count
   // equal, and (file_key, ordinal) keys are span-free — the slabs are byte-identical.)
-  for (family, toc_rel) in [
-    (crate::edgestore::EDGES_DIR, crate::edgestore::EDGES_TOC),
-    (crate::usagestore::USAGE_DIR, crate::usagestore::USAGE_TOC),
-    (crate::sigstore::SIGS_DIR, crate::sigstore::SIGS_TOC),
+  for toc_rel in [
+    crate::edgestore::EDGES_TOC,
+    crate::usagestore::USAGE_TOC,
+    crate::sigstore::SIGS_TOC,
   ] {
-    fs::create_dir_all(staging.join(family))?;
-    for entry in fs::read_dir(prior.join(family))?.flatten() {
-      let Ok(name) = entry.file_name().into_string() else {
-        continue;
-      };
-      let (from, to) = (prior.join(family).join(&name), staging.join(family).join(&name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
-      }
-    }
     if !staging.join(toc_rel).is_file() {
-      return Err(io::Error::other("respan: family TOC missing after link"));
+      return Err(io::Error::other("respan: family TOC missing after carry"));
     }
   }
 
@@ -234,7 +232,12 @@ pub(crate) fn rebuild_node_buckets(
   }
 
   let nodes_dir = staging.join(NODES_DIR);
-  fs::create_dir_all(&nodes_dir)?;
+  // An existing staging nodes/ means the caller already link-carried the family (the
+  // hoisted parallel batch); untouched buckets then skip their per-pair links here.
+  let nodes_carried = nodes_dir.is_dir();
+  if !nodes_carried {
+    fs::create_dir_all(&nodes_dir)?;
+  }
   let prior_toc_bytes = fs::read(prior.join(NODES_TOC))
     .map_err(|_| io::Error::other("respan: prior node TOC unreadable"))?;
   let mut new_vseg_meta: Vec<Option<(u64, u64)>> = vec![None; buckets]; // (len, digest)
@@ -243,6 +246,9 @@ pub(crate) fn rebuild_node_buckets(
     let vseg_name = format!("{bucket:04}.vseg");
     let heap_name = format!("{bucket:04}.heap");
     let link_pair = |nodes_dir: &Path| -> io::Result<()> {
+      if nodes_carried {
+        return Ok(()); // link-carried by the caller's family batch
+      }
       for name in [&vseg_name, &heap_name] {
         let (from, to) = (prior.join(NODES_DIR).join(name), nodes_dir.join(name));
         let _ = fs::remove_file(&to);
@@ -361,10 +367,12 @@ pub(crate) fn rebuild_node_buckets(
     let tmp = nodes_dir.join(format!("{vseg_name}.tmp"));
     fs::write(&tmp, &bytes)?;
     fs::rename(&tmp, nodes_dir.join(&vseg_name))?;
-    let (from, to) = (prior.join(NODES_DIR).join(&heap_name), nodes_dir.join(&heap_name));
-    let _ = fs::remove_file(&to);
-    if fs::hard_link(&from, &to).is_err() {
-      fs::copy(&from, &to)?;
+    if !nodes_carried {
+      let (from, to) = (prior.join(NODES_DIR).join(&heap_name), nodes_dir.join(&heap_name));
+      let _ = fs::remove_file(&to);
+      if fs::hard_link(&from, &to).is_err() {
+        fs::copy(&from, &to)?;
+      }
     }
     new_vseg_meta[bucket] = Some((bytes.len() as u64, digest));
   }

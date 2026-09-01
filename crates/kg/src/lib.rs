@@ -147,6 +147,66 @@ pub fn phase_trace_enabled() -> bool {
   std::env::var_os("VORPAL_PHASE_TRACE").is_some()
 }
 
+/// A family's generation-relative membership predicate (`"usage/0001.idx"` → true).
+pub type FamilyMemberFn = fn(&str) -> bool;
+
+/// Carry one family directory from a prior generation into staging by per-entry HARD
+/// LINKS — inode identity preserved, deliberately: link-carried families keep the same
+/// inode and therefore the same page-cache pages, so chained incremental builds read
+/// them warm. (The whole-directory `clonefile` alternative was built, measured, and
+/// REJECTED 2026-09-01: clones are new vnodes, the page cache is vnode-keyed, and every
+/// chained compose re-faulted the prior's families cold — 1.04–1.10 s → 1.58–1.61 s at
+/// kernel scale. SUBSECOND.md carries the record; do not reopen with clones.)
+///
+/// `staging.join(family)` is created here and assumed FRESH: a link into a fresh
+/// directory cannot collide (per-entry `remove_file` dieting was measured
+/// free-of-benefit anyway — 0.263 vs 0.270 ms/link). Rewritten members are renamed
+/// over their linked entries afterwards, which replaces the directory entry and never
+/// writes through the shared inode.
+pub fn carry_family_dir(
+  prior: &std::path::Path,
+  staging: &std::path::Path,
+  family: &str,
+  member_ok: FamilyMemberFn,
+) -> std::io::Result<()> {
+  use std::fs;
+  let (src, dst) = (prior.join(family), staging.join(family));
+  fs::create_dir_all(&dst)?;
+  for entry in fs::read_dir(&src)?.flatten() {
+    let Ok(file) = entry.file_name().into_string() else {
+      continue;
+    };
+    if !member_ok(&format!("{family}/{file}")) {
+      continue;
+    }
+    let (from, to) = (entry.path(), dst.join(&file));
+    if fs::hard_link(&from, &to).is_err() {
+      // Cross-device staging or an unexpected existing entry: replace-copy, honestly.
+      let _ = fs::remove_file(&to);
+      fs::copy(&from, &to)?;
+    }
+  }
+  Ok(())
+}
+
+/// Carry several families, SERIALLY — measured law (2026-09-01, this box): hard-link
+/// creation on APFS serializes ABOVE the directory (volume catalog/journal), so six
+/// families' links across six threads ran 1.8× SLOWER than one thread (405 vs 740 ms
+/// for 6×256 links, three interleaved rounds), and dropping the defensive per-entry
+/// `remove_file` was ALSO measured free-of-benefit (0.263 vs 0.270 ms/link). The
+/// per-entry cost is the filesystem's, not ours; neither thread fan-out nor syscall
+/// dieting moves it. Do not reopen either without new measurements.
+pub fn carry_families(
+  prior: &std::path::Path,
+  staging: &std::path::Path,
+  families: &[(&str, FamilyMemberFn)],
+) -> std::io::Result<()> {
+  for &(family, member_ok) in families {
+    carry_family_dir(prior, staging, family, member_ok)?;
+  }
+  Ok(())
+}
+
 /// Phase stamp for RSS-timeline profiling, active only under `VORPAL_PHASE_TRACE`.
 pub fn phase_stamp(label: &str) {
   if phase_trace_enabled() {

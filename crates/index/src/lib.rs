@@ -1646,30 +1646,28 @@ fn try_stamp_only_cutoff(
         fs::copy(&from, &to)?;
       }
     }
-    // Carry the bucketed families byte-identically (hard-links — the cutoff never patches
-    // their bytes; stamps live in the manifest and the pack).
-    for (family, member_ok) in [
+  }
+  // Carry the bucketed families byte-identically (hard-links — the cutoff never
+  // patches their bytes; stamps live in the manifest and the pack). The carries run
+  // CONCURRENTLY: each destination directory's inode lock serializes its own links
+  // (~0.27 ms/entry on APFS), but the directories lock independently, so the fan-out
+  // costs roughly one family's worth of wall. The bucketed pack rides in the same
+  // batch; its patched buckets are replaced with private copies below.
+  let mut carry_list: Vec<(&str, vorpal_kg::FamilyMemberFn)> = Vec::with_capacity(6);
+  if nodes_bucketed {
+    carry_list.extend([
       (vorpal_kg::NODES_DIR, vorpal_kg::is_nodes_member as fn(&str) -> bool),
       (vorpal_kg::EVIDENCE_DIR, vorpal_kg::is_evidence_member),
       (vorpal_kg::EDGES_DIR, vorpal_kg::is_edges_member),
       (vorpal_kg::USAGE_DIR, vorpal_kg::is_usage_member),
       (vorpal_kg::SIGS_DIR, vorpal_kg::is_sigs_member),
-    ] {
-      fs::create_dir_all(staging.join(family))?;
-      for entry in fs::read_dir(prior.join(family))?.flatten() {
-        let Ok(file) = entry.file_name().into_string() else {
-          continue;
-        };
-        let member = format!("{family}/{file}");
-        if !member_ok(&member) {
-          continue;
-        }
-        let (from, to) = (prior.join(&member), staging.join(&member));
-        if fs::hard_link(&from, &to).is_err() {
-          fs::copy(&from, &to)?;
-        }
-      }
-    }
+    ]);
+  }
+  if bucketed {
+    carry_list.push((vorpal_ingest::PACK_DIR, vorpal_ingest::is_pack_member));
+  }
+  if !carry_list.is_empty() {
+    vorpal_kg::carry_families(prior, &staging, &carry_list)?;
   }
   if bucketed {
     // Bucketed layout: untouched buckets hard-link (zero bytes moved); buckets holding a
@@ -1685,16 +1683,16 @@ fn try_stamp_only_cutoff(
     for (bucket, offset, stamp) in patches {
       by_bucket.entry(bucket).or_default().push((offset, stamp));
     }
-    fs::create_dir_all(staging.join(vorpal_ingest::PACK_DIR))?;
+    // The whole pack was link-carried in the parallel family batch above (the bucketed
+    // branch); a patched bucket must never be written through its link — the prior
+    // generation's bytes are sealed — so it is replaced with a private copy first.
     for k in 0..bucket_total {
       let name = vorpal_ingest::bucket_file_name(k);
       let (from, to) = (prior.join(&name), staging.join(&name));
       let Some(bucket_patches) = by_bucket.get(&k) else {
-        if fs::hard_link(&from, &to).is_err() {
-          fs::copy(&from, &to)?;
-        }
-        continue;
+        continue; // link-carried by the parallel family batch
       };
+      let _ = fs::remove_file(&to);
       fs::copy(&from, &to)?;
       let mut pack_file = fs::OpenOptions::new().write(true).open(&to)?;
       for (offset, stamp) in bucket_patches {
@@ -1716,7 +1714,11 @@ fn try_stamp_only_cutoff(
         return Ok(None);
       }
     }
-    fs::write(staging.join(vorpal_ingest::PACK_TOC), &toc)?;
+    // The carried TOC entry is REPLACED, never written through (a truncate through the
+    // link would destroy the prior generation's TOC).
+    let toc_path = staging.join(vorpal_ingest::PACK_TOC);
+    let _ = fs::remove_file(&toc_path);
+    fs::write(&toc_path, &toc)?;
   } else {
     let (from, to) = (prior.join("products.idx"), staging.join("products.idx"));
     if fs::hard_link(&from, &to).is_err() {

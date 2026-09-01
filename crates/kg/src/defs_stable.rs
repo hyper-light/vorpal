@@ -216,6 +216,22 @@ pub fn compose_defs_stable(
   };
   let in_any_range = |dense: u64| owner_of(dense).is_some();
 
+  // ---- family carries, hoisted and PARALLEL (independent destination dir locks;
+  // hard links on purpose — inode identity keeps chained builds warm, clonefile
+  // measured-and-rejected). Rewritten members rename over their linked entries;
+  // untouched members are done the moment this returns. ----
+  crate::carry_families(
+    prior,
+    staging,
+    &[
+      (crate::kg::NODES_DIR, crate::kg::is_nodes_member as fn(&str) -> bool),
+      (crate::evidence::EVIDENCE_DIR, crate::evidence::is_evidence_member),
+      (crate::edgestore::EDGES_DIR, crate::edgestore::is_edges_member),
+      (crate::usagestore::USAGE_DIR, crate::usagestore::is_usage_member),
+      (crate::sigstore::SIGS_DIR, crate::sigstore::is_sigs_member),
+    ],
+  )?;
+
   // ---- scc: recompute ONLY when an edited file's call set moved ----
   // The condensation reads the (src, dst) CALLS pair set; parallel edges and every other
   // etype are invisible to it. Compare each file's prior and fresh call sets first — the
@@ -324,7 +340,6 @@ pub fn compose_defs_stable(
   let store = crate::evidence::EvidenceStore::open(prior)
     .ok_or_else(|| io::Error::other("defs-stable: prior evidence unreadable"))?;
   let evidence_dir = staging.join(crate::EVIDENCE_DIR);
-  fs::create_dir_all(&evidence_dir)?;
   let mut ev_toc = fs::read(prior.join(crate::EVIDENCE_TOC))
     .map_err(|_| io::Error::other("defs-stable: prior evidence TOC unreadable"))?;
   // Dropped rows keep their owning file for the usage delta ((name_hash, file_key)).
@@ -332,13 +347,7 @@ pub fn compose_defs_stable(
   for (bucket, window) in bases.windows(2).enumerate() {
     let name = format!("{bucket:04}.bin");
     if !edited_buckets.contains(&bucket) {
-      let (from, to) =
-        (prior.join(crate::EVIDENCE_DIR).join(&name), evidence_dir.join(&name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
-      }
-      continue;
+      continue; // link-carried by the hoisted family batch
     }
     let mut rows = store.rows_of_bucket(bucket);
     rows.retain(|row| match owner_of(u64::from(row.from)) {
@@ -420,19 +429,13 @@ pub fn compose_defs_stable(
     }
   }
   let edges_dir = staging.join(crate::EDGES_DIR);
-  fs::create_dir_all(&edges_dir)?;
   let mut edge_toc = fs::read(prior.join(crate::EDGES_TOC))
     .map_err(|_| io::Error::other("defs-stable: prior edge TOC unreadable"))?;
   let mut rebuilt_rows: HashMap<usize, Vec<SlabRow>> = HashMap::new();
   for bucket in 0..buckets {
     let name = format!("{bucket:04}.bin");
     let Some(rewrite_srcs) = segment_srcs.get(&bucket) else {
-      let (from, to) = (prior.join(crate::EDGES_DIR).join(&name), edges_dir.join(&name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
-      }
-      continue;
+      continue; // link-carried by the hoisted family batch
     };
     let bucket_base = bases[bucket];
     let prior_rows = read_bucket(bucket)?;
