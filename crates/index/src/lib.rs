@@ -623,8 +623,12 @@ fn build_index_inner(
       && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
       && !verify_all
       && policy.mode == ParseHealthMode::Warn
-      && prior.join("strings.heap").exists()
-      && prior.join("graph.bin").exists()
+      // Readiness is FORMAT-AWARE: a bucketed generation's node store answers through
+      // its TOC (graph.bin is a lazy cache there, legitimately absent); the flat names
+      // were a silent v2 gap that made unchanged trees pay a rebuild pass — exposed the
+      // day the default flipped.
+      && (prior.join(vorpal_kg::NODES_TOC).is_file()
+        || (prior.join("strings.heap").exists() && prior.join("graph.bin").exists()))
       && racy_files_verify()
     {
       // Backfill: index dirs written before the name-index sidecar existed gain it here,
@@ -787,9 +791,10 @@ fn build_index_inner(
   let loose: HashSet<OsString> = fs::read_dir(&products_dir)
     .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
     .unwrap_or_default();
-  // The generation's storage format, decided once: flat until the flip, bucketed under
-  // VORPAL_FORMAT=next (the Phase-4 compat posture). It governs the pack layout, the node
-  // store layout, AND the canonical ingest order below — one decision, never re-read.
+  // The generation's storage format, decided once: bucketed by default since the flip,
+  // with VORPAL_FORMAT=flat as the deprecated legacy escape. It governs the pack layout,
+  // the node store layout, AND the canonical ingest order below — one decision, never
+  // re-read.
   let format = vorpal_ingest::PackFormat::from_env();
   // The writer builds the new generation's pack in staging, copying reused bodies out of the
   // prior generation's mapping — the prior pack is never touched.

@@ -960,6 +960,52 @@ its disk twin, landed in three certified sub-slices:
   stays LOUD: any under-approximated closure falls back to the full pipeline, never to a
   wrong generation.
 
+#### The default-format flip (2026-09-01) — bucketed ships as THE format
+
+`PackFormat::from_env` now defaults to **Bucketed**: unset/empty/`next` → bucketed
+(`next` stays as the historical opt-in name, a no-op synonym); `flat` → the deprecated
+legacy writer (an explicit escape hatch until v1 retirement); any other value → stamped
+to the phase log and treated as the default. v1 READS are retained everywhere — legacy
+indexes keep serving and migrate on their first rebuild (rebuild is the migration).
+
+The flip surfaced one REAL v2 gap and one daemon hole, both fixed here rather than
+papered over in tests:
+
+- **Whole-tree reuse gate was flat-only** (`crates/index/src/lib.rs`): the
+  unchanged-tree fast path looked for flat artifact names, so under bucketed a no-edit
+  rebuild replayed the world. Now format-aware (nodes TOC ∨ flat pair). Kernel: no-edit
+  rebuild 0.13 s, generation id unchanged.
+- **Boot-window backstop hole** (`crates/mcp/src/server.rs` + `crates/index/src/live.rs`):
+  `lane_ready` required the overlay, so a daemon serving a fresh index with no overlay
+  yet never swept for offline edits. The backstop now sweeps against the COMMITTED
+  generation's manifest (`stat_changes_against_generation`) when the overlay is absent,
+  and `lane_ready` is overlay-independent. The live_differential suite runs green under
+  the flipped default.
+- Test-truth updates where flat was baked in as "the" layout: artifact-export sentinel
+  (now `!nodes.vseg && !NODES_TOC`), cochange graph-truth count, bookmarks same-file
+  insert, verified-mode stale-view assert, incremental-convergence and live_build
+  expectations, pack_v2's flat selections now set `VORPAL_FORMAT=flat` explicitly.
+
+Docs: `docs/INDEX_FORMAT.md` gained a **Format selection** section (default, escape
+hatch, unknown-value posture, reader compatibility) and the generated version table now
+lists bucketed first as "the default" with flat marked deprecated
+(`crates/index/tests/format_policy.rs` row strings — the doc self-heals from these).
+`scripts/convergence_battery.sh` defaults to the `next` lane; `--formats "next flat"`
+exercises the deprecated writer.
+
+Gates, all on the flipped default: suite 135/135 twice consecutively after the backstop
+fix (plus the final pre-land run); clippy 0/0 workspace AND `-p vorpal-py --features
+python`; battery **24/24** (ast-grep/nats.go/ProxyBroker/pierre — and nats.go's
+span-only shapes, which DECLINED respan in the first battery, now take a scoped compose
+via the c-2/c-3 ladders: convergence identical, path faster); kernel default-env probe
+with NO `VORPAL_FORMAT` in the environment: cold 8.94 s producing the v2 family layout,
+no-edit rebuild 0.13 s same id, scratch twin bit-identical
+(`8e146313a6ab3f19ff1c6351dd80fd90`). Since `from_env` is the single read of the
+variable, `next` and unset are the same code path past that point — the battery's
+explicit-`next` lane certifies the bare default. QUEUED NEXT: the pairing-feed order
+law (canonicalize to (bucket, key, ordinal) now that the flat byte-identity law is no
+longer load-bearing), then multi-file compose sessions (S2).
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

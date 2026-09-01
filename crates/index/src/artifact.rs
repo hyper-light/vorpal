@@ -51,7 +51,8 @@ pub struct ImportReport {
 /// Export the live generation of `index_root` to `out_file`.
 pub fn export_generation(index_root: &Path, out_file: &Path) -> Result<ExportReport, String> {
   let dir = vorpal_kg::resolve_index_dir(index_root);
-  if !dir.join("nodes.vseg").exists() {
+  // Either node-store shape marks a real generation (flat segment, or the bucketed TOC).
+  if !dir.join("nodes.vseg").exists() && !dir.join(vorpal_kg::NODES_TOC).is_file() {
     return Err(format!(
       "no index generation at {} (build one first: `vorpal-index index <src> {}`)",
       dir.display(),

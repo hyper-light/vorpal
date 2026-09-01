@@ -112,8 +112,9 @@ fn live_fast_paths_commit_synchronously_and_hand_back_no_graph() {
   assert!(build.pending.is_none(), "fast path commits synchronously");
   assert_eq!(before, gen_id(&out));
 
-  // Hinted semantic change: full pipeline again (graph + pending); after persist, the
-  // committed generation equals a from-scratch build of the same changed tree.
+  // Hinted single-file semantic change: under the bucketed default this COMPOSES —
+  // committed synchronously, no in-RAM graph handed back (the cutoff/respan contract,
+  // now covering the semantic classes too).
   fs::write(
     src.join("alpha.py"),
     "def alpha():\n    return beta() + 1\n\ndef beta():\n    return 2\n",
@@ -121,7 +122,15 @@ fn live_fast_paths_commit_synchronously_and_hand_back_no_graph() {
   .unwrap();
   let hints: HashSet<PathBuf> = [src.join("alpha.py")].into_iter().collect();
   let build = vorpal_index::build_index_live(&src, &out, Some(&hints), &Default::default()).expect("hinted live");
-  let pending = build.pending.expect("semantic change runs the full pipeline");
+  assert!(build.pending.is_none(), "a composed edit commits synchronously");
+  assert!(build.kg.is_none(), "a composed edit hands back no graph");
+  // A FILE ADDITION is outside every compose class — the full pipeline lane, with the
+  // sealed graph and the deferred persist, stays pinned by it permanently.
+  fs::write(src.join("newcomer.py"), "def newcomer():\n    return alpha()\n").unwrap();
+  let hints: HashSet<PathBuf> = [src.join("newcomer.py")].into_iter().collect();
+  let build = vorpal_index::build_index_live(&src, &out, Some(&hints), &Default::default()).expect("added live");
+  let pending = build.pending.expect("a file addition runs the full pipeline");
+  assert!(build.kg.is_some(), "the full pipeline hands the daemon its sealed graph");
   pending.persist().expect("persist hinted build");
   let out2 = root.join("idx2");
   vorpal_index::build_index(&src, &out2).expect("scratch build of changed tree");

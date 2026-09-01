@@ -12,6 +12,28 @@ the whole old index or the whole new one, never a mixture. GC keeps the new and 
 generations. A legacy flat root (no `CURRENT`) is read as-is and migrated into a generation
 by its first rebuild (pinned by `legacy_flat_index_migrates_on_rebuild`).
 
+## Format selection
+
+The **bucketed** family layout is the default: products in `products/<k>.pack` +
+`products/toc.bin`, nodes/evidence/edges/usage/sigs in per-bucket slabs with per-slab TOC
+digests, generation identity as a Merkle fold of the family TOCs. It is what makes
+incremental builds O(changed) — unchanged buckets hard-link across generations and the
+scoped composes (stamp-cutoff / respan / defs-stable / defs-changed) splice buckets instead
+of rewriting the corpus.
+
+`VORPAL_FORMAT` selects the write format for the generation being built:
+
+- unset, empty, or `next` — bucketed (the default; `next` is the historical opt-in name,
+  kept as an explicit synonym),
+- `flat` — the deprecated legacy monolithic layout (`products.pack`/`products.idx`,
+  single-segment `nodes.vseg`, monolithic sidecars). An escape hatch only; it will be
+  removed with v1 retirement,
+- any other non-empty value — stamped to the phase log and treated as the default.
+
+Readers are format-agnostic: both layouts load through the same surfaces, so existing flat
+indexes keep serving and migrate to bucketed on their first rebuild (rebuild is the
+migration, policy #1). The format is a property of a generation, never mixed within one.
+
 ## Policy
 
 1. **Rebuild is the migration.** Graph segments are never migrated in place: a format bump
@@ -39,8 +61,8 @@ by its first rebuild (pinned by `legacy_flat_index_migrates_on_rebuild`).
 | Artifact | Constant | Value | On mismatch |
 |---|---|---|---|
 | extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 17 | cache miss → re-parse |
-| product pack, flat layout (`products.pack`/`products.idx`) | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
-| product pack, bucketed layout (`products/<k>.pack` + `products/toc.bin`, written under `VORPAL_FORMAT=next`) | `BUCKET_VERSION` (crates/ingest/src/pack.rs) | 1 | pack ignored → rebuilt by next build |
+| product pack, bucketed layout (`products/<k>.pack` + `products/toc.bin`) — the default | `BUCKET_VERSION` (crates/ingest/src/pack.rs) | 1 | pack ignored → rebuilt by next build |
+| product pack, legacy flat layout (`products.pack`/`products.idx`) — deprecated, written only under `VORPAL_FORMAT=flat`; reads retained | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
 | evidence sidecar (`evidence.bin`) | `VERSION` (crates/kg/src/evidence.rs) | 2 | sidecar treated as absent → `why` reports no evidence |
 | data-flow sidecar (`dataflow.bin`) | `VERSION` (crates/kg/src/dataflow.rs) | 1 | load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows) |

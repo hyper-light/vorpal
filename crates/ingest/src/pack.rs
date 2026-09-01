@@ -16,8 +16,9 @@
 //! work, because open() scans any records beyond `covered_len` (bounds-checked; a torn tail
 //! record simply ends the scan) and products remain self-validating at decode time.
 //!
-//! **Bucketed layout v2** (`products/`, SUBSECOND.md P4.1, written behind
-//! `VORPAL_FORMAT=next` until the flip): the pack becomes `products/<k>.pack` bucket files
+//! **Bucketed layout v2** (`products/`, SUBSECOND.md P4.1 — the DEFAULT since the format
+//! flip; `VORPAL_FORMAT=flat` is the deprecated escape): the pack becomes
+//! `products/<k>.pack` bucket files
 //! plus `products/toc.bin`. A file's bucket is `file_key & (B-1)` where
 //! `file_key = xxh3_64(tree-relative path)` — the P4.0 identity — and B is a **pure
 //! function of the live file count** ([`bucket_count_for`]): stamping B at creation would
@@ -87,13 +88,25 @@ pub enum PackFormat {
 }
 
 impl PackFormat {
-  /// The format this process writes: flat until the flip, bucketed under
-  /// `VORPAL_FORMAT=next` (locked Phase-4 compat posture — v1 stays readable for one
-  /// release either way).
+  /// The format this process writes. THE FLIP (P4, 2026-09-01): bucketed is the
+  /// DEFAULT — every Phase-4 property (O(changed) truth writes, the Merkle commit, the
+  /// scoped composes) now ships without opt-in. `VORPAL_FORMAT=next` remains a no-op
+  /// alias for the transition; `VORPAL_FORMAT=flat` is the explicit DEPRECATED escape
+  /// to the v1 writer, kept for one release window. v1 generations stay READABLE
+  /// regardless (existing indexes serve and migrate on their next structural edit).
+  /// Any other value is an error-shaped surprise: we refuse to guess, loudly, by
+  /// treating it as the default and stamping — a typo must never silently select a
+  /// retired lane.
   pub fn from_env() -> PackFormat {
     match std::env::var("VORPAL_FORMAT") {
-      Ok(v) if v == "next" => PackFormat::Bucketed,
-      _ => PackFormat::Flat,
+      Ok(v) if v == "flat" => PackFormat::Flat,
+      Ok(v) if !v.is_empty() && v != "next" => {
+        vorpal_kg::phase_stamp(&format!(
+          "format: unknown VORPAL_FORMAT value {v:?} — using the bucketed default",
+        ));
+        PackFormat::Bucketed
+      }
+      _ => PackFormat::Bucketed,
     }
   }
 }

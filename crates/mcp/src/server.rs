@@ -805,7 +805,10 @@ impl Server {
       // trusting silence. Worst-case staleness under a wedged watcher drops from
       // unbounded to one period, self-scaled per corpus; the common quiet query stays
       // one atomic load + one clock read.
-      let lane_ready = overlay_enabled() && self.env.is_default() && self.overlay.is_some();
+      // The sweep needs no overlay: without one it diffs against the COMMITTED
+      // manifest (the boot window under load was exactly where a disarmed backstop
+      // let a silent watcher starve convergence).
+      let lane_ready = overlay_enabled() && self.env.is_default();
       let due = match (self.last_sweep_at, self.last_sweep_cost) {
         (Some(at), Some(cost)) => at.elapsed() >= cost * BACKSTOP_OVERHEAD_INVERSE,
         // Never swept or never timed: the first eligible quiet query bootstraps the
@@ -843,7 +846,15 @@ impl Server {
       None => {
         if overlay_enabled() && self.kg.is_some() && self.env.is_default() {
           let sweep_started = std::time::Instant::now();
-          let swept = self.overlay.as_ref().map(|overlay| overlay.stat_changes(&src));
+          let swept = match self.overlay.as_ref() {
+            Some(overlay) => Some(overlay.stat_changes(&src)),
+            // No adopted overlay (boot, retirement): the committed generation's
+            // manifest answers the same question from disk.
+            None => Some(vorpal_index::live::stat_changes_against_generation(
+              &self.index_dir,
+              &src,
+            )),
+          };
           if swept.is_some() {
             // Both outcomes measure: the period the backstop derives must reflect what
             // a sweep costs HERE, on this corpus, on this filesystem — success or not.

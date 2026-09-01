@@ -281,36 +281,7 @@ impl LiveOverlay {
   pub fn stat_changes(&self, src: &Path) -> Result<std::collections::HashSet<PathBuf>, String> {
     let scan = Manifest::scan(src, |path| self.extractor.handles(path))
       .map_err(|err| format!("overlay: change scan failed: {err}"))?;
-    let mut changed = std::collections::HashSet::new();
-    let (current, retained) = (scan.entries(), self.manifest.entries());
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < current.len() && j < retained.len() {
-      match current[i].path.cmp(&retained[j].path) {
-        std::cmp::Ordering::Less => {
-          changed.insert(src.join(&current[i].path)); // new file
-          i += 1;
-        }
-        std::cmp::Ordering::Greater => {
-          changed.insert(src.join(&retained[j].path)); // vanished file
-          j += 1;
-        }
-        std::cmp::Ordering::Equal => {
-          if current[i].size != retained[j].size || current[i].mtime_ns != retained[j].mtime_ns
-          {
-            changed.insert(src.join(&current[i].path));
-          }
-          i += 1;
-          j += 1;
-        }
-      }
-    }
-    for entry in &current[i..] {
-      changed.insert(src.join(&entry.path));
-    }
-    for entry in &retained[j..] {
-      changed.insert(src.join(&entry.path));
-    }
-    Ok(changed)
+    Ok(stat_diff(src, scan.entries(), self.manifest.entries()))
   }
 
   /// Change-set routing: whether `changed` files fit the retained absorb envelope (the
@@ -558,6 +529,61 @@ impl LiveOverlay {
   pub fn dead_row_fraction(&self) -> f64 {
     self.index.dead_row_fraction()
   }
+}
+
+/// The stat diff both freshness sweeps share: live scan entries vs a retained manifest,
+/// two-pointer over the sorted paths; vanished files ride along for retraction.
+fn stat_diff(
+  src: &Path,
+  current: &[vorpal_ingest::FileStat],
+  retained: &[vorpal_ingest::FileStat],
+) -> std::collections::HashSet<PathBuf> {
+  let mut changed = std::collections::HashSet::new();
+  let (mut i, mut j) = (0usize, 0usize);
+  while i < current.len() && j < retained.len() {
+    match current[i].path.cmp(&retained[j].path) {
+      std::cmp::Ordering::Less => {
+        changed.insert(src.join(&current[i].path)); // new file
+        i += 1;
+      }
+      std::cmp::Ordering::Greater => {
+        changed.insert(src.join(&retained[j].path)); // vanished file
+        j += 1;
+      }
+      std::cmp::Ordering::Equal => {
+        if current[i].size != retained[j].size || current[i].mtime_ns != retained[j].mtime_ns {
+          changed.insert(src.join(&current[i].path));
+        }
+        i += 1;
+        j += 1;
+      }
+    }
+  }
+  for entry in &current[i..] {
+    changed.insert(src.join(&entry.path));
+  }
+  for entry in &retained[j..] {
+    changed.insert(src.join(&entry.path));
+  }
+  changed
+}
+
+/// The no-overlay freshness sweep: the live tree stat-diffed against the COMMITTED
+/// generation's manifest — the daemon's liveness backstop during the boot window, before
+/// (or without) an adopted overlay. Same walker, same filter, same trust model; only the
+/// retained side's source differs (disk instead of RAM).
+pub fn stat_changes_against_generation(
+  index_dir: &Path,
+  src: &Path,
+) -> Result<std::collections::HashSet<PathBuf>, String> {
+  let generation = vorpal_kg::resolve_index_dir(index_dir);
+  let manifest = Manifest::load(&generation.join("manifest.bin"))
+    .map_err(|err| format!("backstop: prior manifest unreadable: {err}"))?;
+  let extractor =
+    OutlineExtractor::new().map_err(|err| format!("backstop: extractor init failed: {err}"))?;
+  let scan = Manifest::scan(src, |path| extractor.handles(path))
+    .map_err(|err| format!("backstop: change scan failed: {err}"))?;
+  Ok(stat_diff(src, scan.entries(), manifest.entries()))
 }
 
 /// A served build's persistence tail: everything already computed, only writes remain. Runs

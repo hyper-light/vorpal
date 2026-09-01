@@ -16,12 +16,14 @@
 #      hard-link ⇒ respan/cutoff class) — informational, convergence is the gate.
 #
 # Usage: scripts/convergence_battery.sh [--vorpal <bin>] [--formats "next flat"] <repo>...
+# Default lane: next (the shipped default since the flip); pass --formats "next flat" to
+# exercise the deprecated flat writer too.
 # Exit: non-zero on ANY convergence failure. Work areas live under ${TMPDIR:-/tmp}
 # and are removed on exit.
 set -euo pipefail
 
 VORPAL_BIN=""
-FORMATS="next flat"
+FORMATS="next"
 REPOS=()
 while [ $# -gt 0 ]; do
   case "$1" in

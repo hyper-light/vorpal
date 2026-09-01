@@ -169,7 +169,7 @@ fn bucketed_pack_end_to_end() {
   // Cross-format truth oracle: a flat and a bucketed generation of the SAME tree describe
   // the same graph — every node's every field, compared as canonical sets (dense ids
   // legitimately differ: bucket-major vs path order).
-  unsafe { std::env::set_var("VORPAL_FORMAT", "") };
+  unsafe { std::env::set_var("VORPAL_FORMAT", "flat") };
   let out_flat = base.join("index-flat");
   build_index(&src, &out_flat).unwrap();
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
@@ -615,7 +615,7 @@ fn bucketed_pack_end_to_end() {
   );
 
   // 5: v1 → v2 migration — a flat prior migrates through body reuse on the next edit.
-  unsafe { std::env::set_var("VORPAL_FORMAT", "") };
+  unsafe { std::env::set_var("VORPAL_FORMAT", "flat") };
   let out_e = base.join("index-e");
   build_index(&src, &out_e).unwrap();
   let gen_e = live(&out_e);
