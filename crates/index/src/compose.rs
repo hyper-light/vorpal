@@ -700,8 +700,7 @@ pub(crate) fn try_defs_stable_compose(
     .collect();
   let repair = match vorpal_ingest::scoped_similar_repair(
     prior_map,
-    manifest.entries().len(),
-    &prior_rows_sigs,
+    prior_rows_sigs,
     &prior_pairs,
     &swaps,
   ) {
@@ -1270,8 +1269,7 @@ pub(crate) fn try_defs_changed_compose(
     .collect();
   let repair = match vorpal_ingest::scoped_similar_repair(
     &successor_map,
-    manifest.entries().len(),
-    &prior_rows_sigs,
+    prior_rows_sigs,
     &prior_pairs,
     &swaps,
   ) {

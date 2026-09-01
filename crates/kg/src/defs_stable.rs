@@ -236,17 +236,29 @@ pub fn compose_defs_stable(
   // The condensation reads the (src, dst) CALLS pair set; parallel edges and every other
   // etype are invisible to it. Compare each file's prior and fresh call sets first — the
   // common body edit keeps them, and then every scc_size byte is provably stable.
-  let mut slab_cache: HashMap<usize, Vec<SlabRow>> = HashMap::new();
-  let mut read_bucket = |bucket: usize| -> io::Result<Vec<SlabRow>> {
-    if let Some(rows) = slab_cache.get(&bucket) {
-      return Ok(rows.clone());
-    }
+  // Every edge slab this compose consults, read ONCE into owned storage up front —
+  // the set is known at entry (edited buckets for the scc compare + every changed
+  // similar endpoint's bucket for the segment rewrite). The old get-or-insert closure
+  // CLONED the whole row vector on every access (two multi-MB clones per edited
+  // bucket at kernel scale — pure allocation churn).
+  let mut needed_buckets: std::collections::BTreeSet<usize> =
+    ctxs.iter().map(|ctx| ctx.bucket).collect();
+  for &src in &plan.changed_srcs {
+    needed_buckets.insert(bases.partition_point(|&b| b <= u64::from(src)) - 1);
+  }
+  let mut slab_cache: HashMap<usize, Vec<SlabRow>> = HashMap::with_capacity(needed_buckets.len());
+  for &bucket in &needed_buckets {
     let rows = read_edge_slab(
       &prior.join(crate::EDGES_DIR).join(format!("{bucket:04}.bin")),
       bucket,
     )?;
-    slab_cache.insert(bucket, rows.clone());
-    Ok(rows)
+    slab_cache.insert(bucket, rows);
+  }
+  let read_bucket = |bucket: usize| -> io::Result<&[SlabRow]> {
+    slab_cache
+      .get(&bucket)
+      .map(Vec::as_slice)
+      .ok_or_else(|| io::Error::other("defs-stable: edge slab outside the consulted set"))
   };
   let starts: HashMap<u64, u64> =
     map.files().iter().map(|&(key, start, _)| (key, start)).collect();
@@ -262,7 +274,7 @@ pub fn compose_defs_stable(
     let lo_local = (ctx.base - bases[ctx.bucket]) as u32;
     let hi_local = lo_local + ctx.rows;
     let mut prior_calls: HashSet<(u32, u32)> = HashSet::new();
-    for row in &bucket_rows {
+    for row in bucket_rows {
       if row.src_local >= lo_local
         && row.src_local < hi_local
         && EdgeType(row.etype).base() == EdgeType::CALLS
@@ -532,9 +544,19 @@ pub fn compose_defs_stable(
   // EXACT row sets the surgery just wrote, so the cache cannot drift from the slabs.
   {
     let node_count = bases[buckets];
-    let mut srcs: Vec<u32> = Vec::new();
-    let mut dsts: Vec<u32> = Vec::new();
-    let mut etypes: Vec<u16> = Vec::new();
+    // Exact-enough capacity up front: the successor's edge count is the prior's plus
+    // the session's fresh edges (an upper bound — replaced rows only shrink it). The
+    // uncapacitied build reallocated its way to ~30M elements per column at kernel
+    // scale — a doubling cascade copying hundreds of MB per compose.
+    let cap = prior_kg.edge_count() as usize
+      + plan
+        .files
+        .iter()
+        .map(|f| f.edges.len() + f.request_edges.len())
+        .sum::<usize>();
+    let mut srcs: Vec<u32> = Vec::with_capacity(cap);
+    let mut dsts: Vec<u32> = Vec::with_capacity(cap);
+    let mut etypes: Vec<u16> = Vec::with_capacity(cap);
     for (bucket, window) in bases.windows(2).enumerate() {
       if let Some(rows) = rebuilt_rows.get(&bucket) {
         let bucket_base = window[0];

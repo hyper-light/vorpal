@@ -910,85 +910,24 @@ pub struct SimilarRepair {
   pub swapped_rows: Vec<SigRow>,
 }
 
-/// `live_files` is the MANIFEST's live entry count — the bucket law's one input
-/// (never derived from node-bearing files, which drift under parse-health Exclude).
 /// `swaps` is the session's edited files: each `(file_key, fresh run)` replaces that
 /// file's prior run wholesale (multi-file since S2 — the splice law is per file and the
-/// files' canonical positions are disjoint, so k swaps compose).
+/// files' node ranges are disjoint, so k swaps compose). `prior_rows` is CONSUMED and
+/// spliced in place: the old walk materialized a second full ledger copy (~50 MB at
+/// kernel scale, on top of the family decode and the translated copy — the per-phase
+/// alloc trace showed the sigs path holding three buffers) and paid a per-row
+/// `map.locate` (~640k binary searches); each run is now a range lookup from the map's
+/// file table — dense ids are bucket-major, so a file's rows are exactly the node range
+/// `[start, start + rows)` — plus one `Vec::splice`.
 pub fn scoped_similar_repair(
   map: &vorpal_kg::NodeIdMap,
-  live_files: usize,
-  prior_rows: &[SigRow],
+  mut prior_rows: Vec<SigRow>,
   prior_pairs: &[(u64, u64, u8)],
   swaps: &[(u64, &[SigRow])],
 ) -> io::Result<SimilarRepair> {
-  // Canonicalize each fresh run to the family's own law before splicing: content-total
-  // sort, one row per node, survivor = smallest (shingles, sketch) — exactly what
-  // `similar_pairs` produces and the sigs family persists. The raw runs arrive in
-  // PRODUCT LAYOUT order, which is non-monotone on duplicate-collapsed files (a signed
-  // definition collapsing onto an earlier declaration's ordinal lands out of order) and
-  // can carry two rows for one node; without this, the short-circuit below missed on
-  // every such file even when no sketch changed.
-  let mut fresh_of: std::collections::HashMap<u64, Vec<SigRow>> =
-    std::collections::HashMap::with_capacity(swaps.len());
-  for &(key, run) in swaps {
-    let mut fresh: Vec<SigRow> = run.to_vec();
-    fresh.sort_unstable_by(|a, b| {
-      (a.node, a.shingles, &a.sketch).cmp(&(b.node, b.shingles, &b.sketch))
-    });
-    fresh.dedup_by_key(|r| r.node);
-    if fresh_of.insert(key, fresh).is_some() {
-      return Err(io::Error::other("scoped: duplicate file in the pairing swap set"));
-    }
-  }
-  // Swap each edited file's run in place: prior rows are canonically sorted and a file's
-  // rows are contiguous at its (bucket, key) position, so splicing a fresh run at the
-  // old run's position preserves the global feed order the ceiling depends on.
-  let mut rows: Vec<SigRow> =
-    Vec::with_capacity(prior_rows.len() + fresh_of.values().map(Vec::len).sum::<usize>());
-  let mut spliced: HashSet<u64> = HashSet::with_capacity(swaps.len());
-  for row in prior_rows {
-    let Some((key, _)) = map.locate(
-      u32::try_from(row.node)
-        .map_err(|_| io::Error::other("scoped: sig row outside the dense space"))?,
-    ) else {
-      return Err(io::Error::other("scoped: sig row outside the prior universe"));
-    };
-    if let Some(fresh) = fresh_of.get(&key) {
-      if spliced.insert(key) {
-        rows.extend(fresh.iter().cloned());
-      }
-      continue; // the old run is replaced wholesale
-    }
-    rows.push(row.clone());
-  }
-  // Files with no signed definitions before: their fresh runs enter at their canonical
-  // (bucket, key) positions among the survivors — ascending key order so earlier
-  // insertions never disturb later positions' comparisons (the order is total).
-  let mut missing: Vec<u64> =
-    fresh_of.keys().copied().filter(|key| !spliced.contains(key)).collect();
-  missing.sort_unstable();
-  for file_key in missing {
-    let fresh = &fresh_of[&file_key];
-    if fresh.is_empty() {
-      continue; // nothing signed before or after — no run either way
-    }
-    let buckets = u64::from(vorpal_kg::identity::bucket_count_for(live_files));
-    let position = rows.partition_point(|row| {
-      map
-        .locate(row.node as u32)
-        .map(|(key, _)| {
-          let row_bucket = key & (buckets - 1);
-          let file_bucket = file_key & (buckets - 1);
-          (row_bucket, key) < (file_bucket, file_key)
-        })
-        .unwrap_or(false)
-    });
-    let tail = rows.split_off(position);
-    rows.extend(fresh.iter().cloned());
-    rows.extend(tail);
-  }
-  // EXACT short-circuit: identical input rows are a pure-function guarantee of
+  let mut seen: HashSet<u64> = HashSet::with_capacity(swaps.len());
+  // EXACT short-circuit, per run: a fresh run byte-equal to the prior run in place
+  // changes nothing, and identical input rows are a pure-function guarantee of
   // identical pairs — the whole banding+verify pass (measured ~370 ms at kernel scale)
   // vanishes for every edit that changes no signed definition's sketch. Incremental
   // banding beyond this was examined and REJECTED: the per-node partner caps and the
@@ -996,7 +935,67 @@ pub fn scoped_similar_repair(
   // stream (evicted candidates are not persisted; ceiling truncation is order-
   // dependent), so any partial recompute is unsound the moment either bound binds —
   // and at kernel scale the ceiling DOES bind (measured). Recorded in SUBSECOND.md.
-  if rows == *prior_rows {
+  let mut any_changed = false;
+  for &(key, run) in swaps {
+    if !seen.insert(key) {
+      return Err(io::Error::other("scoped: duplicate file in the pairing swap set"));
+    }
+    // Canonicalize the fresh run to the family's own law before splicing: content-total
+    // sort, one row per node, survivor = smallest (shingles, sketch) — exactly what
+    // `similar_pairs` produces and the sigs family persists. The raw runs arrive in
+    // PRODUCT LAYOUT order, which is non-monotone on duplicate-collapsed files (a
+    // signed definition collapsing onto an earlier declaration's ordinal lands out of
+    // order) and can carry two rows for one node; without this, the short-circuit
+    // missed on every such file even when no sketch changed.
+    let mut fresh: Vec<SigRow> = run.to_vec();
+    fresh.sort_unstable_by(|a, b| {
+      (a.node, a.shingles, &a.sketch).cmp(&(b.node, b.shingles, &b.sketch))
+    });
+    fresh.dedup_by_key(|r| r.node);
+    if map.files().iter().all(|&(k, _, _)| k != key) {
+      return Err(io::Error::other("scoped: swap file outside the universe"));
+    }
+    // The ledger is (bucket, key, ordinal)-ordered — NOT dense-node-ordered: files
+    // within a bucket lay out in layout order, not key order, so node values are
+    // non-monotone across file runs (a node-keyed binary search found empty ranges
+    // and spliced DUPLICATE runs; the order law's dedup silently absorbed them into
+    // correct pairs while the short-circuit never fired — caught by the alloc A/B's
+    // +148 ms banding phase, not by convergence). Search in the ledger's own order,
+    // locating only the O(log n) probed rows.
+    let buckets = map.bases().len() as u64 - 1;
+    let rank = |node: u64| -> io::Result<(u64, u64)> {
+      let (k, _) = map
+        .locate(node as u32)
+        .ok_or_else(|| io::Error::other("scoped: sig row outside the universe"))?;
+      Ok((k & (buckets - 1), k))
+    };
+    let target = (key & (buckets - 1), key);
+    let mut rank_err = None;
+    let lo = prior_rows.partition_point(|row| match rank(row.node) {
+      Ok(r) => r < target,
+      Err(e) => {
+        rank_err.get_or_insert(e);
+        false
+      }
+    });
+    let hi = prior_rows.partition_point(|row| match rank(row.node) {
+      Ok(r) => r <= target,
+      Err(e) => {
+        rank_err.get_or_insert(e);
+        false
+      }
+    });
+    if let Some(err) = rank_err {
+      return Err(err);
+    }
+    if prior_rows[lo..hi] == fresh[..] {
+      continue; // byte-equal run — nothing to swap
+    }
+    prior_rows.splice(lo..hi, fresh);
+    any_changed = true;
+  }
+  let rows = prior_rows;
+  if !any_changed {
     return Ok(SimilarRepair {
       fresh_pairs: prior_pairs.to_vec(),
       changed_srcs: Vec::new(),

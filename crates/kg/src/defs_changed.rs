@@ -757,9 +757,18 @@ pub fn compose_defs_changed(
   // ---- the successor graph cache ----
   {
     let node_count = new_bases[buckets];
-    let mut srcs: Vec<u32> = Vec::new();
-    let mut dsts: Vec<u32> = Vec::new();
-    let mut etypes: Vec<u16> = Vec::new();
+    // Exact-enough capacity up front (upper bound: prior count + the session's fresh
+    // edges; dropped rows only shrink it) — the uncapacitied build reallocated its way
+    // to ~30M elements per column at kernel scale.
+    let cap = prior_kg.edge_count() as usize
+      + plan
+        .files
+        .iter()
+        .map(|f| f.edges.len() + f.request_edges.len())
+        .sum::<usize>();
+    let mut srcs: Vec<u32> = Vec::with_capacity(cap);
+    let mut dsts: Vec<u32> = Vec::with_capacity(cap);
+    let mut etypes: Vec<u16> = Vec::with_capacity(cap);
     let starts: HashMap<u64, u64> =
       new_files.iter().map(|&(key, start, _)| (key, start)).collect();
     for bucket in 0..buckets {

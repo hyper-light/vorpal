@@ -1262,6 +1262,41 @@ per-lane TOC guards had it. Kernel chained fn-append toggles: **0.99–1.02 s** 
 crossings. Gates: fixtures 8/8 suites, battery PASS, suite green, clippy 0/0 both
 lanes. The day's full defs-changed trajectory: 1.28–1.32 s → 0.99–1.02 s.
 
+#### Allocation pass (2026-09-02) — reallocs, page reclaims, and a latent ledger-order bug
+
+The compose lanes got their first dedicated allocation examination (alloc-stats builds
+— jemalloc live-byte stamps per phase — plus `/usr/bin/time -l` reclaim/RSS A/Bs on
+pinned binaries, interleaved ×2). Findings and fixes:
+
+- **Realloc cascades in the graph-cache emit** (both defs lanes): three ~30M-element
+  columns built with NO capacity — a doubling cascade touching ~100 MB of
+  abandoned-page churn per compose. Fixed with an exact-enough upper bound
+  (`prior edge count + session fresh edges`); measured −6,100 page reclaims alone.
+- **Per-call whole-vector clones** in defs-stable's edge-slab cache (a get-or-insert
+  closure cloned multi-MB row vectors on every access). Replaced with a one-shot
+  pre-read of exactly the consulted bucket set (known at entry) and borrowed slices.
+- **The sigs path held ~145 MB live at once** (per-phase alloc trace: family decode +
+  translated copy + a THIRD full ledger copy built row-by-row inside the repair, with
+  a per-row `map.locate` — ~640k binary searches). `scoped_similar_repair` now
+  CONSUMES the translated rows and splices each swap run in place: one buffer, one
+  `Vec::splice` per file, per-run byte-equality as the short-circuit.
+- **A latent perf bug the rewrite surfaced, then the A/B caught in the fix itself**:
+  the first splice version range-searched by NODE VALUE, but the family ledger is
+  `(bucket, key, ordinal)`-ordered and within-bucket file layout is NOT key order, so
+  node values are non-monotone across runs — the search found EMPTY ranges, spliced
+  DUPLICATE runs, and the order law's dedup silently absorbed them into correct pairs
+  while the short-circuit never fired (+148 ms of banding that convergence could not
+  see; only the reclaim A/B flagged it). The search now ranks rows by
+  `(bucket(key), key)` via `locate` on just the O(log n) probed rows. LESSON, recorded:
+  the ledger is NOT dense-node-ordered; and multiset-pure downstreams hide duplication
+  from convergence gates — allocation/reclaim A/Bs are the oracle that sees it.
+
+Net (pinned, interleaved ×2): peak RSS **1,066 → 1,020 MB (−47 MB)**, page reclaims
+**135.5k → 125.6k (−7%)**, wall neutral-to-−20 ms, all lanes byte-converged, the
+short-circuit verified firing (zero banding stamps). Live-byte phase profile after:
+the sigs block's +145 MB step is gone; remaining large movers are evidence build
+(+48 MB transient) and names regeneration (+44 MB transient, freed immediately).
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

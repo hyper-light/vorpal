@@ -373,15 +373,9 @@ fn scoped_pairing_repair_equals_scratch_pair_set() {
     })
     .collect();
   let prior_pairs = vorpal_ingest::similar_pairs_of_kg(&prior_kg);
-  let live_files = vorpal_ingest::Manifest::load(&gen_prior.join("manifest.bin"))
-    .expect("prior manifest")
-    .entries()
-    .len();
-
   let repair = vorpal_ingest::scoped_similar_repair(
     &prior_map,
-    live_files,
-    &prior_rows,
+    prior_rows,
     &prior_pairs,
     &[(file_key, outcome.sigs.as_slice())],
   )
