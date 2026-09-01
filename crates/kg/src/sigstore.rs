@@ -151,31 +151,49 @@ pub fn save_sigs(
   }
   starts.push(cursor);
 
+  // Digests STREAM through the hasher (byte-identical to hashing the encoded slab),
+  // so the all-carried case - every compose whose sketches did not move - allocates
+  // no slab bytes at all (~51 MB of encode churn per compose, measured); bytes are
+  // built lazily only for buckets that actually write.
   struct Built {
     rows: u64,
-    bytes: Vec<u8>,
+    len: u64,
     digest: u64,
   }
+  let encode_slab = |bucket: usize| -> Vec<u8> {
+    let slab = &coded[starts[bucket]..starts[bucket + 1]];
+    let mut bytes = Vec::with_capacity(SLAB_HEADER + slab.len() * ROW);
+    bytes.extend_from_slice(SLAB_MAGIC);
+    bytes.extend_from_slice(&VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(bucket as u32).to_le_bytes());
+    bytes.extend_from_slice(&(slab.len() as u64).to_le_bytes());
+    for &(_, key, ordinal, shingles, sketch) in slab {
+      bytes.extend_from_slice(&key.to_le_bytes());
+      bytes.extend_from_slice(&ordinal.to_le_bytes());
+      bytes.extend_from_slice(&shingles.to_le_bytes());
+      bytes.extend_from_slice(&sketch);
+    }
+    bytes
+  };
   let built: Vec<Built> = (0..buckets)
     .into_par_iter()
     .map(|bucket| {
       let slab = &coded[starts[bucket]..starts[bucket + 1]];
-      let mut bytes = Vec::with_capacity(SLAB_HEADER + slab.len() * ROW);
-      bytes.extend_from_slice(SLAB_MAGIC);
-      bytes.extend_from_slice(&VERSION.to_le_bytes());
-      bytes.extend_from_slice(&(bucket as u32).to_le_bytes());
-      bytes.extend_from_slice(&(slab.len() as u64).to_le_bytes());
+      let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+      hasher.update(SLAB_MAGIC);
+      hasher.update(&VERSION.to_le_bytes());
+      hasher.update(&(bucket as u32).to_le_bytes());
+      hasher.update(&(slab.len() as u64).to_le_bytes());
       for &(_, key, ordinal, shingles, sketch) in slab {
-        bytes.extend_from_slice(&key.to_le_bytes());
-        bytes.extend_from_slice(&ordinal.to_le_bytes());
-        bytes.extend_from_slice(&shingles.to_le_bytes());
-        bytes.extend_from_slice(&sketch);
+        hasher.update(&key.to_le_bytes());
+        hasher.update(&ordinal.to_le_bytes());
+        hasher.update(&shingles.to_le_bytes());
+        hasher.update(&sketch);
       }
-      let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
       Built {
         rows: slab.len() as u64,
-        bytes,
-        digest,
+        len: (SLAB_HEADER + slab.len() * ROW) as u64,
+        digest: hasher.digest(),
       }
     })
     .collect();
@@ -185,7 +203,7 @@ pub fn save_sigs(
     let carried = prior_ok
       && prior_toc.as_ref().is_some_and(|toc| {
         let row = &toc.rows[bucket];
-        row.rows == slab.rows && row.len == slab.bytes.len() as u64 && row.digest == slab.digest
+        row.rows == slab.rows && row.len == slab.len && row.digest == slab.digest
       });
     if carried {
       if pre_carried {
@@ -205,7 +223,7 @@ pub fn save_sigs(
       // Link refused: fall through to the write — same bytes, full cost.
     }
     let tmp = sigs_dir.join(format!("{name}.tmp"));
-    fs::write(&tmp, &slab.bytes)?;
+    fs::write(&tmp, encode_slab(bucket))?;
     fs::rename(&tmp, sigs_dir.join(&name))?;
   }
   let total: u64 = built.iter().map(|s| s.rows).sum();
@@ -217,7 +235,7 @@ pub fn save_sigs(
   out.write_all(&total.to_le_bytes())?;
   for slab in &built {
     out.write_all(&slab.rows.to_le_bytes())?;
-    out.write_all(&(slab.bytes.len() as u64).to_le_bytes())?;
+    out.write_all(&slab.len.to_le_bytes())?;
     out.write_all(&slab.digest.to_le_bytes())?;
   }
   drop(out);
@@ -289,7 +307,10 @@ impl SigStore {
   /// families from different generations) abort with `None`: a partial table would make
   /// scoped pairing silently wrong.
   pub fn rows(&self, nodes: &NodeIdMap) -> Option<Vec<SigFamilyRow>> {
-    let mut out = Vec::new();
+    // Exact capacity from the slab counts - the uncapacitied build doubled its way to
+    // 638k rows at kernel scale (~92 MB of realloc copy churn per compose, measured).
+    let total: usize = self.slabs.iter().flatten().map(|slab| slab.1).sum();
+    let mut out = Vec::with_capacity(total);
     for slab in self.slabs.iter().flatten() {
       let bytes = slab.0.as_bytes();
       for i in 0..slab.1 {

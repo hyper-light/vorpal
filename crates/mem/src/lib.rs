@@ -17,6 +17,11 @@
 //! - [`arena`] — reset-per-batch bump arena sized from the policy (§8.3).
 
 pub mod arena;
+/// The tiny libc surface the workspace's trace instrumentation needs (vorpal-mem owns
+/// the libc dependency; callers avoid growing their own).
+pub mod carry_libc {
+  pub use libc::{RUSAGE_SELF, getrusage, rusage};
+}
 pub mod csr;
 pub mod pod;
 pub mod policy;

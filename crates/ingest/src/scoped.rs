@@ -139,6 +139,10 @@ pub(crate) struct CandidateFacts {
   pub id: u64,
   pub kind: SymbolKind,
   pub path: String,
+  /// The defining file's key — from `locate` (a map lookup, NO node materialization),
+  /// so closure base lookups never linear-scan the file table reading heap strings
+  /// (measured ~9.9k first-touch faults / ~159 MB per compose for SIX lookups).
+  pub file_key: u64,
   pub exported: bool,
   /// The containing definition's NAME (never a File) — owner ids resolve by peek at
   /// table build, exactly like `build_symbol_table_over`.
@@ -155,8 +159,10 @@ pub(crate) trait UniverseView: Sync {
   fn all_file_entries(&self) -> Vec<(u64, String)>;
   /// Every Route/Channel definition `(id, name)`, ascending by id.
   fn routes(&self) -> Vec<(u64, String)>;
-  /// A file's dense start by its path (the closure's param-ledger anchor).
-  fn file_start_by_path(&self, path: &str) -> Option<u64>;
+  /// A file's dense start by its KEY (the closure's param-ledger anchor) — key-based
+  /// on purpose: a path-based lookup materialized node views (heap-mmap first touches)
+  /// across the whole file table per call.
+  fn file_start_by_key(&self, key: u64) -> Option<u64>;
 }
 
 /// The prior sealed generation as-is: the defs-stable lane's universe.
@@ -177,10 +183,12 @@ impl UniverseView for PriorUniverse<'_> {
         let container = self.kg.node(cid)?;
         (container.kind != SymbolKind::File).then(|| container.name.to_string())
       });
+      let Some((file_key, _)) = self.map.locate(id.raw() as u32) else { continue };
       facts.push(CandidateFacts {
         id: id.raw(),
         kind: node.kind,
         path: node.path.to_string(),
+        file_key,
         exported: node.exported,
         owner,
       });
@@ -210,15 +218,8 @@ impl UniverseView for PriorUniverse<'_> {
     routes
   }
 
-  fn file_start_by_path(&self, path: &str) -> Option<u64> {
-    self
-      .map
-      .files()
-      .iter()
-      .find(|&&(_, start, _)| {
-        self.kg.node(NodeId::new(start)).is_some_and(|file| file.path == path)
-      })
-      .map(|&(_, start, _)| start)
+  fn file_start_by_key(&self, key: u64) -> Option<u64> {
+    self.map.files().iter().find(|&&(k, _, _)| k == key).map(|&(_, start, _)| start)
   }
 }
 
@@ -317,10 +318,12 @@ impl UniverseView for OverlayUniverse<'_> {
         let container = self.prior.node(cid)?;
         (container.kind != SymbolKind::File).then(|| container.name.to_string())
       });
+      let Some((file_key, _)) = self.map.locate(id.raw() as u32) else { continue };
       facts.push(CandidateFacts {
         id: new_id,
         kind: node.kind,
         path: node.path.to_string(),
+        file_key,
         exported: node.exported,
         owner,
       });
@@ -343,6 +346,7 @@ impl UniverseView for OverlayUniverse<'_> {
           id: block.new_start + ord,
           kind: node.kind,
           path: block.file_path.to_string(),
+          file_key: block.file_key,
           exported: node.exported,
           owner,
         });
@@ -390,17 +394,15 @@ impl UniverseView for OverlayUniverse<'_> {
     routes
   }
 
-  fn file_start_by_path(&self, path: &str) -> Option<u64> {
-    if let Some(block) = self.blocks.iter().find(|b| b.file_path == path) {
+  fn file_start_by_key(&self, key: u64) -> Option<u64> {
+    if let Some(block) = self.block_of_key(key) {
       return Some(block.new_start);
     }
     self
       .map
       .files()
       .iter()
-      .find(|&&(_, start, _)| {
-        self.prior.node(NodeId::new(start)).is_some_and(|file| file.path == path)
-      })
+      .find(|&&(k, _, _)| k == key)
       .and_then(|&(_, start, _)| self.translate(start))
   }
 }
@@ -560,20 +562,22 @@ fn resolve_session(
   // nothing at all here, measured 542 dead decodes/1.4 s before this split). Session
   // files never decode: their views are already in hand.
   let session_paths: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
-  // Candidate enumeration per name is independent — parallel, then one union.
+  // Candidate enumeration per name is independent — parallel, then one union. Each
+  // closure member carries its FILE KEY so the base lookup below never touches node
+  // heap strings.
   let chain_vec: Vec<&str> = chain_keys.iter().copied().collect();
   let call_vec: Vec<&str> = call_names.iter().copied().collect();
-  let mut closure_paths: HashSet<String> = chain_vec
+  let mut closure_files: HashMap<String, u64> = chain_vec
     .par_iter()
     .flat_map_iter(|name| {
       universe
         .candidates_named(name)
         .into_iter()
         .filter(|facts| !session_paths.contains(facts.path.as_str()))
-        .map(|facts| facts.path)
+        .map(|facts| (facts.path, facts.file_key))
     })
     .collect();
-  closure_paths.extend(
+  closure_files.extend(
     call_vec
       .par_iter()
       .flat_map_iter(|name| {
@@ -583,41 +587,41 @@ fn resolve_session(
           .filter(|facts| {
             !session_paths.contains(facts.path.as_str()) && is_python_path(&facts.path)
           })
-          .map(|facts| facts.path)
+          .map(|facts| (facts.path, facts.file_key))
       })
-      .collect::<Vec<String>>(),
+      .collect::<Vec<(String, u64)>>(),
   );
-  if closure_paths.len() > decode_cap {
+  if closure_files.len() > decode_cap {
     return Err(io::Error::other(format!(
       "scoped: closure of {} files exceeds the decode cap ({decode_cap})",
-      closure_paths.len(),
+      closure_files.len(),
     )));
   }
   vorpal_kg::phase_stamp(&format!(
     "scoped: closure {} files over {} call names ({} session files)",
-    closure_paths.len(),
+    closure_files.len(),
     call_names.len(),
     files.len(),
   ));
   let mut rets_rows: Vec<(&str, &str)> = Vec::new();
   let mut param_rows: Vec<(u64, Box<[Box<str>]>)> = Vec::new();
-  let mut decoded: Vec<(String, Vec<u8>)> = Vec::with_capacity(closure_paths.len());
-  let mut sorted_paths: Vec<String> = closure_paths.into_iter().collect();
-  sorted_paths.sort_unstable();
-  for other in sorted_paths {
+  let mut decoded: Vec<(String, u64, Vec<u8>)> = Vec::with_capacity(closure_files.len());
+  let mut sorted_files: Vec<(String, u64)> = closure_files.into_iter().collect();
+  sorted_files.sort_unstable();
+  for (other, key) in sorted_files {
     let Some(bytes) = products.product(&other) else {
       return Err(io::Error::other(format!("scoped: no packed product for {other}")));
     };
-    decoded.push((other, bytes));
+    decoded.push((other, key, bytes));
   }
   // Decodes are independent per product — parallel (the k-scaling sweep measured this
   // serial loop at 181 ms over 59 closure products at kernel k=16).
   let decoded_views: Vec<(&str, u64, ProductView<'_>)> = decoded
     .par_iter()
-    .map(|(other, bytes)| -> io::Result<(&str, u64, ProductView<'_>)> {
+    .map(|(other, key, bytes)| -> io::Result<(&str, u64, ProductView<'_>)> {
       let other_view = decode_product_view(bytes)
         .map_err(|err| io::Error::other(format!("scoped: product decode ({other}): {err}")))?;
-      let Some(other_base) = universe.file_start_by_path(other) else {
+      let Some(other_base) = universe.file_start_by_key(*key) else {
         return Err(io::Error::other(format!("scoped: {other} missing from the universe")));
       };
       Ok((other.as_str(), other_base, other_view))

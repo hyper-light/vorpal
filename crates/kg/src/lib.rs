@@ -208,23 +208,54 @@ pub fn carry_families(
 }
 
 /// Phase stamp for RSS-timeline profiling, active only under `VORPAL_PHASE_TRACE`.
+/// Carries cumulative soft/hard page-fault counters (`getrusage`: minflt/majflt) so a
+/// trace diff attributes FIRST-TOUCH volume per phase — with jemalloc decay off, the
+/// remaining reclaims are genuine first touches, exactly what fault-minimization work
+/// needs to see (2026-09-02 decay sweep: scratch reclaims −82% under decay-off; what
+/// is left is the real page bill).
 pub fn phase_stamp(label: &str) {
   if phase_trace_enabled() {
     #[cfg(feature = "alloc-stats")]
     let stats = {
-      use tikv_jemalloc_ctl::{epoch, stats};
+      use tikv_jemalloc_ctl::{epoch, stats, thread};
       epoch::advance().ok();
+      // `thread.allocated` is CUMULATIVE bytes allocated by the calling thread —
+      // per-phase deltas are allocation VOLUME (churn), which live-byte deltas cannot
+      // see; a churn delta far above the live delta marks realloc/short-lived-buffer
+      // hotspots. Main-thread only: rayon workers' churn lands in their own counters,
+      // so parallel phases under-report — read the number as a lower bound there.
+      let churn = thread::allocatedp::read().map(|p| p.get()).unwrap_or(0);
       format!(
-        " [alloc={}MB active={}MB resident={}MB]",
+        " [alloc={}MB active={}MB resident={}MB churn={}MB]",
         stats::allocated::read().unwrap_or(0) / 1048576,
         stats::active::read().unwrap_or(0) / 1048576,
-        stats::resident::read().unwrap_or(0) / 1048576
+        stats::resident::read().unwrap_or(0) / 1048576,
+        churn / 1048576
       )
     };
     #[cfg(not(feature = "alloc-stats"))]
     let stats = "";
+    #[cfg(unix)]
+    let faults = {
+      let mut usage = std::mem::MaybeUninit::<vorpal_mem::carry_libc::rusage>::zeroed();
+      // SAFETY: RUSAGE_SELF with a zeroed out-param; the kernel fills it.
+      let rc = unsafe {
+        vorpal_mem::carry_libc::getrusage(
+          vorpal_mem::carry_libc::RUSAGE_SELF,
+          usage.as_mut_ptr(),
+        )
+      };
+      if rc == 0 {
+        let usage = unsafe { usage.assume_init() };
+        format!(" [minflt={} majflt={}]", usage.ru_minflt, usage.ru_majflt)
+      } else {
+        String::new()
+      }
+    };
+    #[cfg(not(unix))]
+    let faults = String::new();
     eprintln!(
-      "[phase {:.3}s] {label}{stats}",
+      "[phase {:.3}s] {label}{stats}{faults}",
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

@@ -1297,6 +1297,51 @@ short-circuit verified firing (zero banding stamps). Live-byte phase profile aft
 the sigs block's +145 MB step is gone; remaining large movers are evidence build
 (+48 MB transient) and names regeneration (+44 MB transient, freed immediately).
 
+FAULT-MINIMIZATION PASS (2026-09-02, decay-off as the measurement config per the
+owner: with purge-refault churn gone, remaining reclaims are honest first touches).
+`phase_stamp` now carries cumulative `getrusage` minflt/majflt (trace-gated), giving
+per-phase fault attribution. First table (toggle, 79.3k total): identity block 18.5k
+(~296 MB — sigs decode+translate + session), graph cache 14.4k, kg load 10.9k
+(prior-family mmap first-touch), closure decode **9.9k (~159 MB FOR SIX FILES)**,
+table build 5.6k. The closure number was the tell: `file_start_by_path` linear-scanned
+the 76k-file table MATERIALIZING NODE VIEWS (heap-mmap reads) per lookup. Fixed:
+`CandidateFacts` carries the defining file's KEY (from `locate` — a map lookup, no
+heap touch), the closure keeps (path, key), and both universes look up bases by key —
+the trait method is now `file_start_by_key`. Net **−5.5k faults**; the closure block
+vanished from the table (its remaining heap touches re-attributed to the table build,
+which reads those candidate paths legitimately). Toggle settles at **0.91–0.94 s**
+under decay-off, byte-converged.
+
+STREAMED CSR — MEASURED AND REJECTED UNDER DECAY-OFF: a three-pass
+`Graph::from_edge_stream` (zero triplet columns) cut only −3.6k faults while costing
++66 ms (two extra prior-CSR walks + per-edge dispatch). THE LAW THE NUMBERS TAUGHT:
+with decay off, jemalloc RECYCLES freed-but-resident pages, so transient-buffer fault
+costs mostly vanish on their own — fault-minimization work must target (a) mmap
+first-touches of prior artifacts and (b) LIVE-peak growth, never transient churn
+(transient churn is the decay knob's department). Reverted; the capacity fix from the
+allocation pass stands. Remaining attribution for future pulls: identity block 18.5k
+(sigs decode+translate ~100 MB is the reducible half), graph cache 14.4k (the CSR
+outputs themselves — the real product), kg load 10.9k (prior mmaps).
+
+ALLOC/REALLOC PASS (same sitting; `phase_stamp` under alloc-stats now ALSO carries
+`thread.allocated` — cumulative main-thread allocation VOLUME, so per-phase churn
+deltas expose realloc cascades and short-lived buffers that live-byte deltas cannot
+see; parallel phases under-report by design). First churn table (toggle, decay-off):
+984 MB total main-thread churn — sigs load+translate +192 MB (for a ~50 MB result!),
+graph cache +263 MB (the CSR product + cursor clones; live −1 MB — decay-off-free),
+identity remainder 258 ms at +55 MB churn / +71 faults (the CLOSED link-carry floor,
+confirmed clean of allocation causes), sigs save +54 MB while writing NOTHING. Fixed
+where the numbers said to: `SigStore::rows` was a `Vec::new()` doubling cascade over
+638k rows (~92 MB of realloc copies — capacity now comes from the slab counts), and
+`save_sigs` encoded EVERY bucket's bytes just to compare carry digests — digests now
+STREAM through the hasher (byte-identical) and bytes are built lazily only for buckets
+that write. Measured: sigs load churn 192→92 MB (faults 13.5k→9.2k), sigs save faults
+2,270→120, totals 984→884 MB churn / 73.8k→71.4k faults, byte-converged, oracles
+green. WALL (pinned interleaved ×3, decay-off): baseline 0.90–0.92 s → slice
+0.89–0.91 s — ≤ baseline in every round-pair, ~−10 ms at the edge of noise; the
+slice's substance is the fault/churn economics, as the phase math predicted. What remains is inherent or decay-off-free: the CSR product's own build churn,
+the prior-mmap first touches, the identity block's link floor.
+
 RECORDED SWEEP — jemalloc decay-off on this branch state (owner-suggested;
 `_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`, interleaved ×3, the knob
 verifiably active): kernel scratch reclaims **1.46M → 260k (−82%)** at +23% peak RSS

@@ -1163,6 +1163,7 @@ pub(crate) fn try_defs_changed_compose(
   };
   drop(edited_inputs);
   drop(edited_views);
+  vorpal_kg::phase_stamp("defs-changed: scoped resolution done");
 
   // The pairing repair over the TRANSLATED ledger: each edited file's old rows drop
   // (its fresh run rides its outcome), every other row's node id shifts by the
@@ -1231,6 +1232,7 @@ pub(crate) fn try_defs_changed_compose(
       });
     }
   }
+  vorpal_kg::phase_stamp("defs-changed: sigs family loaded+translated");
   let mut forced_changed: Vec<u32> = Vec::new();
   let mut prior_pairs: Vec<(u64, u64, u8)> = Vec::new();
   for (a, b, confidence) in vorpal_ingest::similar_pairs_of_kg(prior_kg) {
@@ -1280,6 +1282,7 @@ pub(crate) fn try_defs_changed_compose(
     }
   };
   drop(swaps);
+  vorpal_kg::phase_stamp("defs-changed: pairing repaired");
   let mut changed_srcs = repair.changed_srcs.clone();
   changed_srcs.extend(forced_changed);
   changed_srcs.sort_unstable();
