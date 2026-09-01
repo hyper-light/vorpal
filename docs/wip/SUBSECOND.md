@@ -1200,15 +1200,28 @@ directory inode lock serializes even a parallel loop)**; `clonefile()` of the sa
 is ~400 ms of the ~1.05 s wall — the dominant remaining fixed cost, spread across
 every phase's tail (it is why "sigs done" costs ~54 ms while writing nothing).
 
-DESIGNED NEXT SLICE (owner tradeoff stated): carry each family directory by APFS
-`clonefile` (one syscall), then rename the rewritten members over their cloned
-entries; per-file `hard_link` stays the portable fallback (ext4 links are ~10–20 µs —
-this is an APFS-specific pain). The trade: COW clones get NEW inodes, so the
-inode-equality oracles (scoped_compose's names.idx pin, defs_changed_compose's
-unaffected-bucket pin, the battery's `[scoped: names.idx linked]` detector) stop
-observing physical carry — they would move to the report-note lane signal plus
-convergence, which is the true gate anyway. Not landed tonight: it touches every
-carry site plus those oracles, and deserves its own gated slice.
+CLONEFILE CARRIES — BUILT, MEASURED, AND REJECTED (2026-09-01, same night). The full
+conversion was implemented (a `CarryMode` primitive with an explicit write contract —
+rename-over safe in both modes, in-place patching legal only under `Cloned` because a
+write through the `Linked` fallback's hard links would mutate the prior generation's
+sealed bytes — plus pre-carry short-circuits in every family saver and compose loop,
+and the cutoff patching stamps THROUGH clones instead of copy-then-patch). It worked:
+cutoff **0.49 → 0.18 s**, every lane byte-converged, one inode oracle moved to byte
+equality. Then the chained measurement killed it: composing ON TOP of a clone-carried
+generation runs **1.58–1.61 s** vs 1.04–1.10 s on a link-carried prior — six
+consecutive runs, lane-verified. Traced attribution: the successor build's READS of
+the prior's families went cold — closure decode 10→351 ms, table build +274 ms,
+kg load +73 ms. THE MECHANISM: a clone is a NEW vnode, and the page cache is
+vnode-keyed — clone-carried families share extents on disk but NOT cached pages, so
+every chained build re-faults them; a hard link IS the same inode, so link-carried
+families stay warm across generations. Cache identity is worth more than the syscall
+fan-out. Reverted wholesale; chained toggles confirmed back at 1.06–1.11 s.
+
+THE SURVIVING LEAD, reshaped by the rejection: the ~400 ms link floor must be attacked
+WITHOUT losing inode identity — the destination directory locks are independent, so
+the six families' link loops can run on six threads (~400 → ~80 ms), and the defensive
+`remove_file` before each link (staging is always fresh) is a free halving of the
+syscall count. Both preserve warm chains.
 
 ## Execution order & gates
 
