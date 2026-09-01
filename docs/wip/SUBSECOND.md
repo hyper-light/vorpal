@@ -863,8 +863,46 @@ its disk twin, landed in three certified sub-slices:
     stream's global order (pre-link, per-bucket resolution, similar, requests) must be
     recomposed, not approximated. Gate: byte convergence per edit class on the fixture,
     the kernel, AND the battery repos.
-  - **c-3 — defs-changed closure via the usage family** + measured escalation threshold
-    (the retained tier's `within_absorb_budget` shape); then default-format flip and v1
+  - **c-3 slice i — the overlay session and its oracle: SHIPPED (2026-09-01).** The
+    scoped core generalized to a SESSION over a `UniverseView` (candidates by name, file
+    registry, routes — the only three questions resolution asks of the world):
+    `PriorUniverse` re-derives c-2 unchanged (all its gates re-proven through the
+    refactor), `OverlayUniverse` swaps the edited file's definitions for its scratch
+    seal's and translates every dense id by the shift law. One shared table for the whole
+    session, all files' import bindings seeded together (the bulk's own one-table shape).
+    New entries: `views_defs_changed_reject` (grammar + error rungs; defs free),
+    `affected_def_names` (per-name row-sequence diff — ordinal-shifted survivors
+    included, which is what keeps every non-dirty bucket byte-stable),
+    `resolve_defs_changed` (edited + dirty files, successor space). GATE
+    (tests/defs_changed_oracle.rs): a def added ABOVE two survivors — the shift-law file
+    table equals the scratch build's per file; the usage-derived dirty set is exactly the
+    referrer (found through gamma_new's prior NO-EDGE rows — the added-def case);
+    evidence and per-source edge sequences equal scratch for the edited AND dirty files;
+    the dangling reference resolves non-vacuously. Surgery + compose wiring = c3-ii.
+  - **c-3 — defs-changed closure via the usage family (design of record, 2026-09-01).**
+    Single modified file F whose DEFINITION SET changed (adds/removes/renames/signature/
+    export changes; file adds/deletes stay full-pipeline). The dense-shift law collapses:
+    bucket-major order means F's row-count delta `d` shifts every dense id ≥ F's old end
+    by exactly `d` (`translate(x) = x + (x ≥ F_end_old) · d`), `src_local`/`from_local`
+    are bucket-base-relative (whole-bucket shifts cancel), and every durable coordinate —
+    edge dsts, evidence targets, ALT POOL ENTRIES (verified 12-byte `(key, ord)`), sigs,
+    usage — is identity-coded, so a non-dirty bucket's bytes are stable UNLESS a row
+    targets an F ordinal that moved. The dirty law makes that impossible outside the
+    closure: `affected_names` = every F def name whose (ordinal, kind, signature,
+    exported, eid) row sequence differs old→new (ordinal-moves included — that is what
+    keeps unchanged buckets byte-stable, not just semantics-stable); `dirty =
+    ∪ usage[hash(name)] − {F}` — and usage is evidence-derived over ALL outcomes, so
+    referrers of a name that did not exist yet (an ADDED def) are found through their
+    no-edge rows. All dirty files re-resolve through the c-2 kernels against an OVERLAY
+    universe (prior candidates translated to new dense space, F's defs swapped from the
+    scratch seal; one shared table, all files' import bindings seeded — the bulk's own
+    shape). Escalations, each loud: |dirty| past the quarter-of-corpus recorded shape;
+    a Route/Channel def among the affected (request matching is URL-keyed — usage cannot
+    bound its dirty set); error-accounting deltas (slice-1 posture); co-change inputs
+    moved. dataflow.bin and the successor graph translate dense ids wholesale (the step
+    function). Slices: c3-i universe overlay + multi-file resolution + outcome oracle;
+    c3-ii surgery (node file-table splice, multi-file bucket swaps, TOC totals) + compose
+    wiring + convergence gates + kernel + battery. Then the default-format flip and v1
     read retirement.
   Standing gate for c-2/c-3 (the generic-tool law): **scripts/convergence_battery.sh**
   (shipped with c-1) — real repos, real edit shapes, scoped-vs-full BYTE compare per

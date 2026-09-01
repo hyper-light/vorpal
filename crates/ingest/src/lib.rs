@@ -28,8 +28,9 @@ pub mod similar;
 pub use similar::{SigRow, SimilarReport};
 mod scoped;
 pub use scoped::{
-  ProductSource, ScopedOutcome, SimilarRepair, scoped_resolve_file, scoped_similar_repair,
-  similar_pairs_of_kg, views_defs_stable_reject,
+  DirtyFileInput, ProductSource, ScopedOutcome, SimilarRepair, affected_def_names,
+  def_kinds_of, resolve_defs_changed, scoped_resolve_file, scoped_similar_repair,
+  similar_pairs_of_kg, views_defs_changed_reject, views_defs_stable_reject,
 };
 pub mod typefacts;
 
