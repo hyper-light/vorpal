@@ -160,6 +160,13 @@ pub trait Content: Sized {
   /// Used for string replacement. We need this for
   /// indentation and deindentation.
   fn decode_str(src: &str) -> Cow<'_, [Self::Underlying]>;
+  /// Decode an OWNED string into owned underlying content. The default pays
+  /// a copy through `decode_str`; byte-content sources override it with a
+  /// move — transform values are stored through this (one per computed
+  /// transform, millions per large index).
+  fn decode_string(src: String) -> Vec<Self::Underlying> {
+    Self::decode_str(&src).to_vec()
+  }
   /// Used for string replacement. We need this for
   /// transformation.
   fn encode_bytes(bytes: &[Self::Underlying]) -> Cow<'_, str>;
@@ -174,6 +181,9 @@ impl Content for String {
   }
   fn decode_str(src: &str) -> Cow<'_, [Self::Underlying]> {
     Cow::Borrowed(src.as_bytes())
+  }
+  fn decode_string(src: String) -> Vec<Self::Underlying> {
+    src.into_bytes()
   }
   fn encode_bytes(bytes: &[Self::Underlying]) -> Cow<'_, str> {
     String::from_utf8_lossy(bytes)

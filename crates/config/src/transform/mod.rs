@@ -90,6 +90,19 @@ impl Transform {
     }
   }
 
+  /// Whether any transform in this set reads the enclosing env. Only
+  /// `rewrite` transforms do (their sub-rule matching inherits the enclosing
+  /// bindings — see `Rewrite::compute`); `replace`/`substring`/`convert`
+  /// read the live env. Callers without a real enclosing env clone one per
+  /// transformed match solely to satisfy the context — this gate lets them
+  /// skip that clone whenever no `rewrite` is present.
+  pub(crate) fn needs_enclosing_env(&self) -> bool {
+    self
+      .transforms
+      .iter()
+      .any(|(_, t)| matches!(t, Trans::Rewrite(_)))
+  }
+
   pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
     self.transforms.iter().map(|t| &t.0)
   }

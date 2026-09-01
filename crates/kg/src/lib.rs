@@ -19,7 +19,9 @@ mod writer;
 
 pub use kg::{Kg, NodeView, SymbolSelector, resolve_index_dir};
 pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
-pub use evidence::{EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence};
+pub use evidence::{
+  AltSet, EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence,
+};
 pub use model::SymbolKind;
 pub mod communities;
 #[cfg(feature = "alloc-ledger")]

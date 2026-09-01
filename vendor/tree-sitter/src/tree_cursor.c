@@ -1,5 +1,6 @@
 #include "tree_sitter/api.h"
 #include "./tree_cursor.h"
+#include "./children_cache.h"
 #include "./language.h"
 #include "./tree.h"
 
@@ -167,6 +168,18 @@ void ts_tree_cursor_reset(TSTreeCursor *_self, TSNode node) {
 void ts_tree_cursor_init(TreeCursor *self, TSNode node) {
   self->tree = node.tree;
   self->root_alias_symbol = node.context[3];
+  if (!self->stack.contents) {
+    // VORPAL: pre-carve the cursor stack from the thread-local block cache —
+    // cursors are created per tree walk (millions per index; our own
+    // reference extraction and rule matching are the top callers) and the
+    // first descent otherwise mallocs the stack afresh each time. 512 bytes
+    // covers typical AST depths; deeper growth takes the ordinary array
+    // path and still returns through the cache on delete.
+    size_t bytes = 512;
+    self->stack.contents = ts_children_alloc(&bytes);
+    self->stack.capacity = (uint32_t)(bytes / sizeof(TreeCursorEntry));
+    self->stack.size = 0;
+  }
   array_clear(&self->stack);
   array_push(&self->stack, ((TreeCursorEntry) {
     .subtree = (const Subtree *)node.id,
@@ -182,7 +195,16 @@ void ts_tree_cursor_init(TreeCursor *self, TSNode node) {
 
 void ts_tree_cursor_delete(TSTreeCursor *_self) {
   TreeCursor *self = (TreeCursor *)_self;
-  array_delete(&self->stack);
+  // VORPAL: return the stack block to the thread-local cache (exact
+  // physical size; grown non-power-of-two stacks floor-bin, which is safe
+  // and feeds smaller classes).
+  ts_children_free_exact(
+    self->stack.contents,
+    (size_t)self->stack.capacity * sizeof(TreeCursorEntry)
+  );
+  self->stack.contents = NULL;
+  self->stack.size = 0;
+  self->stack.capacity = 0;
 }
 
 // TSTreeCursor - walking the tree

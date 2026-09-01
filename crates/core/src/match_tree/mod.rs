@@ -5,17 +5,28 @@ use match_node::match_node_impl;
 use strictness::MatchOneNode;
 pub use strictness::MatchStrictness;
 
-use crate::meta_var::{MetaVarEnv, MetaVariable};
+use crate::meta_var::{CowEnvExt, CowEnvMark, MetaVarEnv, MetaVariable};
 use crate::{Doc, Node, Pattern};
 
 use std::borrow::Cow;
 
-// the Clone bound is for matching multi-metavar like $$$A
-// since the next node in pattern determines how many nodes to bind to $$$A
-// we need to clone the aggregator to test each node in candidate
-// preferably, Aggregator should be cheap to clone, like Cow or a small struct
-// See https://github.com/ast-grep/ast-grep/pull/2670
-trait Aggregator<'t, D: Doc>: Clone {
+// mark/rollback exists for matching multi-metavar like $$$A: the next node
+// in the pattern determines how many candidate nodes bind to $$$A, so the
+// matcher probes that next goal against each candidate in turn. A probe's
+// writes must not leak — a failed probe's binding would make a later,
+// genuine bind of the same metavar conflict and fail
+// (see https://github.com/ast-grep/ast-grep/pull/2670).
+// Probes used to Clone the aggregator per candidate; at index scale that
+// was a full env clone (four Vec allocations plus inner label lists) per
+// probed candidate in every ellipsis loop. A probe now runs on the live
+// aggregator between `mark()` and `rollback(mark)` — rollback is a
+// byte-exact undo (appends truncate away, overwrites restore from the env's
+// undo journal), so probing allocates nothing. Marks nest LIFO: every mark
+// is rolled back exactly once, on both the success and the failure path.
+trait Aggregator<'t, D: Doc> {
+  type Mark;
+  fn mark(&mut self) -> Self::Mark;
+  fn rollback(&mut self, mark: Self::Mark);
   fn match_terminal(&mut self, node: &Node<'t, D>) -> Option<()>;
   fn match_meta_var(&mut self, var: &MetaVariable, node: &Node<'t, D>) -> Option<()>;
   fn match_ellipsis(
@@ -26,10 +37,16 @@ trait Aggregator<'t, D: Doc>: Clone {
   ) -> Option<()>;
 }
 
-#[derive(Clone)]
 struct ComputeEnd(usize);
 
 impl<'t, D: Doc> Aggregator<'t, D> for ComputeEnd {
+  type Mark = usize;
+  fn mark(&mut self) -> usize {
+    self.0
+  }
+  fn rollback(&mut self, mark: usize) {
+    self.0 = mark;
+  }
   fn match_terminal(&mut self, node: &Node<'t, D>) -> Option<()> {
     self.0 = node.range().end;
     Some(())
@@ -92,7 +109,14 @@ fn match_leaf_meta_var<'tree, D: Doc>(
   }
 }
 
-impl<'t, D: Doc> Aggregator<'t, D> for Cow<'_, MetaVarEnv<'t, D>> {
+impl<'c, 't, D: Doc> Aggregator<'t, D> for Cow<'c, MetaVarEnv<'t, D>> {
+  type Mark = CowEnvMark<'c, 't, D>;
+  fn mark(&mut self) -> Self::Mark {
+    self.env_mark()
+  }
+  fn rollback(&mut self, mark: Self::Mark) {
+    self.env_rollback(mark)
+  }
   fn match_terminal(&mut self, _: &Node<'t, D>) -> Option<()> {
     Some(())
   }

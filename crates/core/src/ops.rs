@@ -1,5 +1,16 @@
+// Branch isolation in the combinators (`And`/`All`/`Any`/`Or`/`Not`) runs on
+// the LIVE env between `env_mark()`/`env_rollback(mark)`: a failed branch is
+// undone byte-exactly (appends truncate, overwrites restore from the env's
+// undo journal), a successful branch's writes simply stay. The old protocol —
+// a `Cow::Borrowed` of the outer env per branch, whose first write cloned the
+// whole env and whose failure threw that clone away — re-bought the same
+// vectors for every candidate; at kernel scale the combinators under
+// relational rules were the two largest stream-phase allocation sites
+// (ledger-sampled ~38 % combined). Rollback keeps clean-on-failure semantics
+// identical to the clone protocol, while growth accrues as reusable capacity
+// in the caller's env (the outline loop recycles one per file).
 use crate::matcher::{MatchAll, MatchNone, Matcher};
-use crate::meta_var::MetaVarEnv;
+use crate::meta_var::{CowEnvExt, MetaVarEnv};
 use crate::{Doc, Node};
 use bit_set::BitSet;
 use std::borrow::Cow;
@@ -19,13 +30,17 @@ where
     node: Node<'tree, D>,
     env: &mut Cow<MetaVarEnv<'tree, D>>,
   ) -> Option<Node<'tree, D>> {
-    // keep the original env intact until both arms match
-    let mut new_env = Cow::Borrowed(env.as_ref());
-    let node = self.pattern1.match_node_with_env(node, &mut new_env)?;
-    let ret = self.pattern2.match_node_with_env(node, &mut new_env)?;
-    // both succeed – commit the combined env
-    *env = Cow::Owned(new_env.into_owned());
-    Some(ret)
+    // keep the original env restorable until both arms match
+    let mark = env.env_mark();
+    let matched = (|| {
+      let node = self.pattern1.match_node_with_env(node, env)?;
+      self.pattern2.match_node_with_env(node, env)
+    })();
+    match matched {
+      Some(_) => env.env_commit(mark),
+      None => env.env_rollback(mark),
+    }
+    matched
   }
 
   fn potential_kinds(&self) -> Option<BitSet> {
@@ -86,15 +101,16 @@ impl<P: Matcher> Matcher for All<P> {
     {
       return None;
     }
-    let mut new_env = Cow::Borrowed(env.as_ref());
+    let mark = env.env_mark();
     let all_satisfied = self
       .patterns
       .iter()
-      .all(|p| p.match_node_with_env(node.clone(), &mut new_env).is_some());
+      .all(|p| p.match_node_with_env(node.clone(), env).is_some());
     if all_satisfied {
-      *env = Cow::Owned(new_env.into_owned());
+      env.env_commit(mark);
       Some(node)
     } else {
+      env.env_rollback(mark);
       None
     }
   }
@@ -142,17 +158,17 @@ impl<M: Matcher> Matcher for Any<M> {
     {
       return None;
     }
-    let mut new_env = Cow::Borrowed(env.as_ref());
-    let found = self.patterns.iter().find_map(|p| {
-      new_env = Cow::Borrowed(env.as_ref());
-      p.match_node_with_env(node.clone(), &mut new_env)
-    });
-    if found.is_some() {
-      *env = Cow::Owned(new_env.into_owned());
-      Some(node)
-    } else {
-      None
+    for p in self.patterns.iter() {
+      // Each branch runs under its own mark: a failed alternative is undone
+      // byte-exactly before the next one tries, the winner's bindings stay.
+      let mark = env.env_mark();
+      if p.match_node_with_env(node.clone(), env).is_some() {
+        env.env_commit(mark);
+        return Some(node);
+      }
+      env.env_rollback(mark);
     }
+    None
   }
 
   fn potential_kinds(&self) -> Option<BitSet> {
@@ -175,14 +191,12 @@ where
     node: Node<'tree, D>,
     env: &mut Cow<MetaVarEnv<'tree, D>>,
   ) -> Option<Node<'tree, D>> {
-    let mut new_env = Cow::Borrowed(env.as_ref());
-    if let Some(ret) = self
-      .pattern1
-      .match_node_with_env(node.clone(), &mut new_env)
-    {
-      *env = Cow::Owned(new_env.into_owned());
+    let mark = env.env_mark();
+    if let Some(ret) = self.pattern1.match_node_with_env(node.clone(), env) {
+      env.env_commit(mark);
       Some(ret)
     } else {
+      env.env_rollback(mark);
       self.pattern2.match_node_with_env(node, env)
     }
   }
@@ -218,17 +232,17 @@ where
     env: &mut Cow<MetaVarEnv<'tree, D>>,
   ) -> Option<Node<'tree, D>> {
     // A `not` rule never contributes bindings: a successful negation means the
-    // inner did NOT match, so there is nothing to bind. Run the inner against a
-    // throwaway clone so that an inner *match* (which makes the negation fail)
-    // cannot leak its partial bindings into the live env. Without this, a `not`
-    // evaluated via a relational rule's `find_map` (which reuses one env across
-    // candidates) can leave a stray binding behind that survives into a later,
-    // successful match. See the env-leak class fixed in PR #2670.
-    let mut probe = Cow::Borrowed(env.as_ref());
-    self
-      .not
-      .match_node_with_env(node.clone(), &mut probe)
-      .xor(Some(node))
+    // inner did NOT match, so there is nothing to bind. The inner runs under a
+    // mark that is ALWAYS rolled back, so an inner *match* (which makes the
+    // negation fail) cannot leak its partial bindings into the live env.
+    // Without this, a `not` evaluated via a relational rule's `find_map`
+    // (which reuses one env across candidates) can leave a stray binding
+    // behind that survives into a later, successful match. See the env-leak
+    // class fixed in PR #2670.
+    let mark = env.env_mark();
+    let inner = self.not.match_node_with_env(node.clone(), env);
+    env.env_rollback(mark);
+    inner.xor(Some(node))
   }
 }
 

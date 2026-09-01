@@ -32,6 +32,45 @@ fn parse_lang(
   parse_fn: impl Fn(&mut Parser) -> Option<Tree>,
   ts_lang: TSLanguage,
 ) -> Result<Tree, TSParseError> {
+  // One parser per thread, language re-pointed per file: the parser's
+  // internal buffers (lexer chunks, reduce actions, stack heads) recycle
+  // across the files a worker parses. Parser reuse was measured-not-worth-it
+  // before the children-block cache landed; re-measured after it (BENCHMARKS
+  // pass 20): −3 M allocations and −0.25 M reallocs per kernel index,
+  // CPU-neutral, artifacts byte-identical — so it is ON by default;
+  // `VORPAL_PARSER_REUSE=0` opts out.
+  use std::cell::RefCell;
+  use std::sync::OnceLock;
+  static REUSE: OnceLock<bool> = OnceLock::new();
+  let reuse = *REUSE
+    .get_or_init(|| !std::env::var_os("VORPAL_PARSER_REUSE").is_some_and(|v| v == "0"));
+  if reuse {
+    thread_local! {
+      static PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+    }
+    // try_borrow_mut: a re-entrant parse (a pattern compiled mid-parse)
+    // falls through to a fresh parser instead of panicking.
+    let reused = PARSER.with(|slot| match slot.try_borrow_mut() {
+      Ok(mut slot) => {
+        let parser = slot.get_or_insert_with(Parser::new);
+        let ret = match parser.set_language(&ts_lang) {
+          Ok(()) => parse_fn(parser).ok_or(TSParseError::TreeUnavailable),
+          Err(e) => Err(e.into()),
+        };
+        if ret.is_err() {
+          // A failed or aborted parse may leave parser-internal state
+          // behind; a failed parse is rare enough that rebuilding the
+          // parser is the simplest correct reset.
+          *slot = None;
+        }
+        Some(ret)
+      }
+      Err(_) => None,
+    });
+    if let Some(ret) = reused {
+      return ret;
+    }
+  }
   let mut parser = Parser::new();
   parser.set_language(&ts_lang)?;
   if let Some(tree) = parse_fn(&mut parser) {

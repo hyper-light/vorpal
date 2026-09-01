@@ -151,22 +151,26 @@ fn may_match_ellipsis_impl<'p, 't: 'p, D: Doc>(
     return Some(ControlFlow::Continue);
   }
   loop {
-    // Probe the next goal against a cloned aggregator to find the ellipsis end.
-    // This prevents failed metavar probes from leaking bindings into the real env.
-    // Leaking them would make a later, genuine bind of the same metavar conflict and fail
-    // Note the match_node_impl here matches the peek nodes, the real consumption and
-    // env write will be done in `match_single_node_while_skip_trivial`
+    // Probe the next goal to find the ellipsis end, under a mark so no
+    // binding leaks into the real env — a failed probe's binding would make
+    // a later, genuine bind of the same metavar conflict and fail.
     // See https://github.com/ast-grep/ast-grep/pull/2670
-    let mut probe = agg.clone();
-    if matches!(
+    // The probe is ALWAYS rolled back, on match too: it only peeks — the
+    // real consumption and env writes are re-done in
+    // `match_single_node_while_skip_trivial` (exactly the old
+    // discard-the-probe-clone semantics, without cloning the env).
+    let mark = agg.mark();
+    let probe_matched = matches!(
       match_node_impl(
         goal_children.peek().unwrap(),
         cand_children.peek().unwrap(),
-        &mut probe,
+        agg,
         strictness,
       ),
       MatchOneNode::MatchedBoth
-    ) {
+    );
+    agg.rollback(mark);
+    if probe_matched {
       // found match non Ellipsis,
       match_ellipsis(
         agg,

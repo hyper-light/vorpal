@@ -216,10 +216,18 @@ impl RuleCore {
       let env = env.to_mut();
       if let Some(enclosing) = enclosing_env {
         trans.apply_transform(env, rewriters, enclosing);
-      } else {
+      } else if trans.needs_enclosing_env() {
+        // Only `rewrite` transforms read the enclosing env (their sub-rule
+        // matching inherits its bindings) — the clone freezes the
+        // pre-transform state for them.
         let enclosing = env.clone();
         trans.apply_transform(env, rewriters, &enclosing);
-      };
+      } else {
+        // No `rewrite`: the enclosing env is provably never read — a shared
+        // empty one satisfies the context without cloning the (warm,
+        // high-water-capacity) env per transformed match.
+        trans.apply_transform(env, rewriters, &MetaVarEnv::new());
+      }
     }
     Some(ret)
   }

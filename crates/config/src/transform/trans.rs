@@ -167,7 +167,8 @@ impl Trans<MetaVariable> {
     ctx.env.insert_transformation(src, key, vec![]);
     let opt = self.compute(ctx);
     let bytes = if let Some(s) = opt {
-      <D::Source as Content>::decode_str(&s).to_vec()
+      // A move for byte-content sources — no copy per stored transform.
+      <D::Source as Content>::decode_string(s)
     } else {
       vec![]
     };

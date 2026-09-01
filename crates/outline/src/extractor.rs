@@ -16,7 +16,8 @@ use vorpal_config::{
 use vorpal_core::{
   Doc, Language, Node, NodeMatch,
   matcher::{Matcher, MatcherExt},
-  replacer::{Replacer, TemplateFix, TemplateFixError},
+  meta_var::MetaVarEnv,
+  replacer::{TemplateFix, TemplateFixError},
   source::Content,
 };
 
@@ -281,13 +282,17 @@ impl NameTemplate {
     })
   }
 
-  fn render<'tree, D: Doc>(&self, node_match: &NodeMatch<'tree, D>) -> Cow<'tree, str> {
+  fn render<'tree, D: Doc>(
+    &self,
+    node_match: &NodeMatch<'tree, D>,
+    scratch: &mut RenderScratch<D>,
+  ) -> Cow<'tree, str> {
     match self {
       NameTemplate::Trivial { var, fallback } => match node_match.get_env().get_match(var) {
         Some(node) => node.text(),
-        None => Cow::Owned(render_template(fallback, node_match)),
+        None => Cow::Owned(render_template(fallback, node_match, scratch)),
       },
-      NameTemplate::Template(fix) => Cow::Owned(render_template(fix, node_match)),
+      NameTemplate::Template(fix) => Cow::Owned(render_template(fix, node_match, scratch)),
     }
   }
 
@@ -306,15 +311,21 @@ enum OutlinePredicate {
 }
 
 impl OutlinePredicate {
-  fn evaluate<D: Doc>(&self, node_match: &NodeMatch<D>) -> bool {
+  fn evaluate<D: Doc>(&self, node_match: &mut NodeMatch<D>) -> bool {
     match self {
       Self::Literal(value) => *value,
       Self::Rule(rule) => {
-        let mut env = Cow::Borrowed(node_match.get_env());
-        // must use env to match main rule's metavariables
-        rule
-          .match_node_with_env(node_match.get_node().clone(), &mut env)
-          .is_some()
+        // The predicate must see the main rule's bindings (metavar
+        // consistency) but never keeps its own writes — `probe` runs it on
+        // the live env and discards them byte-exactly. The old protocol
+        // borrowed the env and let the predicate's first write clone it,
+        // whole and at high-water capacity, once per predicate per item,
+        // only to drop the clone with the verdict (ledger-sampled ~13 % of
+        // kernel-scale stream allocations after pass 16).
+        let node = node_match.get_node().clone();
+        node_match
+          .get_env_mut()
+          .probe(|env| rule.match_node_with_env(node, env).is_some())
       }
     }
   }
@@ -367,13 +378,29 @@ impl<L: Language> ItemExtractor<L> {
     self.common.rule.matcher.match_node(node.clone())
   }
 
+  /// The hot-loop form: failed attempts recycle the caller's scratch env
+  /// instead of buying fresh vectors per candidate (see
+  /// `MatcherExt::match_node_reusing`).
+  pub fn match_node_reusing<'tree, D: Doc>(
+    &self,
+    node: &Node<'tree, D>,
+    scratch: &mut MetaVarEnv<'tree, D>,
+  ) -> Option<NodeMatch<'tree, D>> {
+    self
+      .common
+      .rule
+      .matcher
+      .match_node_reusing(node.clone(), scratch)
+  }
+
   pub fn extract<'tree, D: Doc>(
     &self,
-    node_match: &NodeMatch<'tree, D>,
+    node_match: &mut NodeMatch<'tree, D>,
     members: Vec<OutlineMember<'tree>>,
+    scratch: &mut RenderScratch<D>,
   ) -> OutlineItem<'tree> {
     OutlineItem {
-      entry: self.common.extract_entry(EntryRole::Item, node_match),
+      entry: self.common.extract_entry(EntryRole::Item, node_match, scratch),
       is_import: self.is_import.evaluate(node_match),
       is_exported: self.is_exported.evaluate(node_match),
       members,
@@ -385,9 +412,10 @@ impl<L: Language> ItemExtractor<L> {
   pub fn resolve_member_of<'tree, D: Doc>(
     &self,
     node_match: &NodeMatch<'tree, D>,
+    scratch: &mut RenderScratch<D>,
   ) -> Option<String> {
     let template = self.member_of.as_ref()?;
-    let owner = render_template(template, node_match);
+    let owner = render_template(template, node_match, scratch);
     (!owner.is_empty()).then_some(owner)
   }
 }
@@ -423,9 +451,26 @@ impl<L: Language> MemberExtractor<L> {
     self.common.rule.matcher.match_node(node.clone())
   }
 
-  pub fn extract<'tree, D: Doc>(&self, node_match: &NodeMatch<'tree, D>) -> OutlineMember<'tree> {
+  /// The hot-loop form — see `ItemExtractor::match_node_reusing`.
+  pub fn match_node_reusing<'tree, D: Doc>(
+    &self,
+    node: &Node<'tree, D>,
+    scratch: &mut MetaVarEnv<'tree, D>,
+  ) -> Option<NodeMatch<'tree, D>> {
+    self
+      .common
+      .rule
+      .matcher
+      .match_node_reusing(node.clone(), scratch)
+  }
+
+  pub fn extract<'tree, D: Doc>(
+    &self,
+    node_match: &mut NodeMatch<'tree, D>,
+    scratch: &mut RenderScratch<D>,
+  ) -> OutlineMember<'tree> {
     OutlineMember {
-      entry: self.common.extract_entry(EntryRole::Member, node_match),
+      entry: self.common.extract_entry(EntryRole::Member, node_match, scratch),
       is_public: self.is_public.evaluate(node_match),
     }
   }
@@ -436,14 +481,15 @@ impl<L: Language> ExtractorCommon<L> {
     &self,
     role: EntryRole,
     node_match: &NodeMatch<'tree, D>,
+    scratch: &mut RenderScratch<D>,
   ) -> OutlineEntry<'tree> {
     let node = node_match.get_node();
     OutlineEntry {
       role,
       symbol_type: self.symbol_type,
-      name: self.name.render(node_match),
+      name: self.name.render(node_match, scratch),
       range: source_range(node),
-      signature: self.render_signature(node_match),
+      signature: self.render_signature(node_match, scratch),
       ast_kind: match node.kind_static() {
         // tree-sitter kinds are 'static — borrow instead of building a String
         // per extracted definition (8.8M at kernel scale).
@@ -453,22 +499,36 @@ impl<L: Language> ExtractorCommon<L> {
     }
   }
 
-  fn render_signature<'tree, D: Doc>(&self, node_match: &NodeMatch<'tree, D>) -> Cow<'tree, str> {
+  fn render_signature<'tree, D: Doc>(
+    &self,
+    node_match: &NodeMatch<'tree, D>,
+    scratch: &mut RenderScratch<D>,
+  ) -> Cow<'tree, str> {
     match self.detail {
       OutlineEntryDetail::Name => Cow::Borrowed(""),
       OutlineEntryDetail::Signature => self
         .signature
         .as_ref()
-        .map(|template| Cow::Owned(render_template(template, node_match)))
+        .map(|template| Cow::Owned(render_template(template, node_match, scratch)))
         .unwrap_or_else(|| default_signature(node_match.get_node())),
     }
   }
 }
 
-fn render_template<D: Doc>(template: &TemplateFix, node_match: &NodeMatch<D>) -> String {
-  let bytes = template.generate_replacement(node_match);
-  <D::Source as Content>::encode_bytes(&bytes).to_string()
+fn render_template<D: Doc>(
+  template: &TemplateFix,
+  node_match: &NodeMatch<D>,
+  scratch: &mut RenderScratch<D>,
+) -> String {
+  // One owned String per rendered value (the live datum); every intermediate
+  // rides the caller's per-file scratch (see `TemplateFix::render_into`).
+  template.render_into(node_match, scratch);
+  <D::Source as Content>::encode_bytes(scratch).to_string()
 }
+
+/// Per-file render buffer threaded through the outline walk — the type the
+/// template engine renders into for doc source `D`.
+pub type RenderScratch<D> = vorpal_core::meta_var::Underlying<D>;
 
 /// First non-empty trimmed line of the node's text — BORROWED when the source
 /// is (the overwhelming case; owned only for owned-cow docs), replacing a
@@ -780,10 +840,11 @@ isExported:
       .children()
       .find(|node| node.kind() == "class_declaration")
       .expect("class should exist");
-    let node_match = item
+    let mut node_match = item
       .match_node(&class_node)
       .expect("class should match item rule");
-    let outline = item.extract(&node_match, vec![]);
+    let mut render_scratch = Vec::new();
+    let outline = item.extract(&mut node_match, vec![], &mut render_scratch);
 
     assert_eq!(outline.entry.name.as_ref(), "Foo");
     assert!(!outline.is_exported);

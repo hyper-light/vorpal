@@ -33,6 +33,57 @@ pub struct MetaVarEnv<'tree, D: Doc> {
   /// reconstruct the exact old surface (labels listing, JSON export,
   /// cross-thread re-adoption).
   secondary: Vec<Node<'tree, D>>,
+  /// Undo log for trial matching (`mark`/`rollback_to`). While a trial is
+  /// open (`trial_depth > 0`), any write that is not a plain append — an
+  /// overwrite of an existing slot, a push into an existing label's node
+  /// list — records how to undo itself here; appends need no entry because
+  /// rollback truncates each vec to its marked length. Empty whenever no
+  /// trial is open. EVERY future mutating method must either be append-only
+  /// or journal its non-append effect, or rollback stops being exact.
+  journal: Vec<Undo<'tree, D>>,
+  /// Number of currently open trials (marks not yet rolled back). Trials
+  /// nest (an ellipsis probe inside an ellipsis probe) and are strictly
+  /// LIFO — each `mark` is paired with exactly one `rollback_to`.
+  trial_depth: u32,
+}
+
+/// A snapshot taken by [`MetaVarEnv::mark`]: the four vec lengths plus the
+/// journal watermark. [`MetaVarEnv::rollback_to`] restores the env to this
+/// point byte-exactly — the matcher brackets speculative match attempts
+/// (ellipsis lookahead probes) with a mark/rollback pair instead of cloning
+/// the whole env per probed candidate.
+#[derive(Clone, Copy)]
+pub(crate) struct EnvMark {
+  single: usize,
+  multi: usize,
+  transformed: usize,
+  secondary: usize,
+  journal: usize,
+}
+
+/// One reversible non-append write, replayed in reverse by `rollback_to`.
+/// Old values are MOVED in (`mem::replace`) — journaling allocates nothing
+/// beyond the journal vec's own capacity.
+enum Undo<'tree, D: Doc> {
+  /// `single_matched[i].1` held this node before an overwrite.
+  Single(usize, Node<'tree, D>),
+  /// `multi_matched[i].1` held this list before an overwrite.
+  Multi(usize, Vec<Node<'tree, D>>),
+  /// `transformed_var[i].1` held these bytes before an overwrite.
+  Transformed(usize, Underlying<D>),
+  /// `add_label` pushed one node into `multi_matched[i].1`.
+  MultiInnerPush(usize),
+}
+
+impl<'t, D: Doc> Clone for Undo<'t, D> {
+  fn clone(&self) -> Self {
+    match self {
+      Undo::Single(i, n) => Undo::Single(*i, n.clone()),
+      Undo::Multi(i, ns) => Undo::Multi(*i, ns.clone()),
+      Undo::Transformed(i, v) => Undo::Transformed(*i, v.clone()),
+      Undo::MultiInnerPush(i) => Undo::MultiInnerPush(*i),
+    }
+  }
 }
 
 /// The copy-on-write clone preserves each vector's CAPACITY, not just its
@@ -53,6 +104,11 @@ impl<D: Doc> Clone for MetaVarEnv<'_, D> {
       multi_matched: keep_high_water(&self.multi_matched, self.multi_matched.capacity()),
       transformed_var: keep_high_water(&self.transformed_var, self.transformed_var.capacity()),
       secondary: keep_high_water(&self.secondary, self.secondary.capacity()),
+      // Envs are cloned between trials (relational sub-matches, Cow
+      // materialization), so the journal is virtually always empty here —
+      // cloned anyway so a mid-trial clone stays exactly rollback-able.
+      journal: self.journal.clone(),
+      trial_depth: self.trial_depth,
     }
   }
 }
@@ -96,13 +152,93 @@ fn intern_var(name: &str) -> &'static str {
   })
 }
 
+/// Trial snapshot for a `Cow<MetaVarEnv>`, matching its two states at mark
+/// time. Shared by every speculative-match site — the ellipsis lookahead
+/// probe in the pattern matcher and the composite combinators
+/// (`All`/`Any`/`Or`/`Not`) — which used to isolate branches by cloning the
+/// env per attempt.
+pub(crate) enum CowEnvMark<'c, 'tree, D: Doc> {
+  /// Still borrowed when the trial opened: nothing to journal — if a trial
+  /// write materializes an owned clone (`to_mut`), rollback just restores
+  /// the borrow and drops that clone, exactly the old discard-the-clone
+  /// cost, still paid only when a trial actually writes.
+  Borrowed(&'c MetaVarEnv<'tree, D>),
+  /// Already owned: undo in place via the env's journal — no clone at all.
+  Owned(EnvMark),
+}
+
+/// Mark/rollback/commit on a `Cow`-held env. Marks nest and MUST be closed
+/// LIFO, exactly once each, by either `env_rollback` (undo the trial
+/// byte-exactly) or `env_commit` (keep the trial's writes) — leaving a mark
+/// open leaks the trial depth and the env journals forever after.
+pub(crate) trait CowEnvExt<'c, 'tree, D: Doc> {
+  fn env_mark(&mut self) -> CowEnvMark<'c, 'tree, D>;
+  fn env_rollback(&mut self, mark: CowEnvMark<'c, 'tree, D>);
+  fn env_commit(&mut self, mark: CowEnvMark<'c, 'tree, D>);
+}
+
+impl<'c, 'tree, D: Doc> CowEnvExt<'c, 'tree, D> for Cow<'c, MetaVarEnv<'tree, D>> {
+  fn env_mark(&mut self) -> CowEnvMark<'c, 'tree, D> {
+    match self {
+      Cow::Borrowed(orig) => CowEnvMark::Borrowed(orig),
+      Cow::Owned(env) => CowEnvMark::Owned(env.mark()),
+    }
+  }
+  fn env_rollback(&mut self, mark: CowEnvMark<'c, 'tree, D>) {
+    match mark {
+      CowEnvMark::Borrowed(orig) => *self = Cow::Borrowed(orig),
+      CowEnvMark::Owned(m) => {
+        // A Cow never reverts to Borrowed while an Owned mark is open
+        // (marks pair LIFO), so the env is still the one that was marked.
+        if let Cow::Owned(env) = self {
+          env.rollback_to(m);
+        }
+      }
+    }
+  }
+  fn env_commit(&mut self, mark: CowEnvMark<'c, 'tree, D>) {
+    match mark {
+      // Marked while borrowed: no trial was opened on the env — whatever
+      // state the Cow is in now (still borrowed, or owned via a write) IS
+      // the committed state.
+      CowEnvMark::Borrowed(_) => {}
+      CowEnvMark::Owned(m) => {
+        if let Cow::Owned(env) = self {
+          env.commit_to(m);
+        }
+      }
+    }
+  }
+}
+
 fn assoc_get<'a, V>(list: &'a [(&'static str, V)], key: &str) -> Option<&'a V> {
   list.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
-fn assoc_set<V>(list: &mut Vec<(&'static str, V)>, key: &str, value: V) {
-  match list.iter_mut().find(|(k, _)| *k == key) {
-    Some((_, slot)) => *slot = value,
+/// Set `key` in an assoc vec, journaling the displaced value when a trial is
+/// open. An insert of a NEW key is a plain append — rollback's truncate
+/// undoes it — so only the overwrite arm records an entry; `wrap` names the
+/// `Undo` variant for the vec being written. The old value is moved into the
+/// journal, so no allocation happens on either arm.
+fn assoc_set_undoable<'t, D: Doc, V>(
+  list: &mut Vec<(&'static str, V)>,
+  trial_depth: u32,
+  journal: &mut Vec<Undo<'t, D>>,
+  key: &str,
+  value: V,
+  wrap: fn(usize, V) -> Undo<'t, D>,
+) {
+  let found = list
+    .iter_mut()
+    .enumerate()
+    .find(|(_, (k, _))| *k == key);
+  match found {
+    Some((index, (_, slot))) => {
+      let old = std::mem::replace(slot, value);
+      if trial_depth > 0 {
+        journal.push(wrap(index, old));
+      }
+    }
     None => list.push((intern_var(key), value)),
   }
 }
@@ -114,12 +250,122 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
       multi_matched: Vec::new(),
       transformed_var: Vec::new(),
       secondary: Vec::new(),
+      journal: Vec::new(),
+      trial_depth: 0,
     }
+  }
+
+  /// Open a trial: snapshot the env so a speculative match attempt can be
+  /// undone byte-exactly by [`rollback_to`](Self::rollback_to). Marks nest
+  /// and MUST be rolled back LIFO, exactly once each — while any trial is
+  /// open, non-append writes journal their undo.
+  pub(crate) fn mark(&mut self) -> EnvMark {
+    self.trial_depth += 1;
+    EnvMark {
+      single: self.single_matched.len(),
+      multi: self.multi_matched.len(),
+      transformed: self.transformed_var.len(),
+      secondary: self.secondary.len(),
+      journal: self.journal.len(),
+    }
+  }
+
+  /// Close the most recent open trial KEEPING its writes. Journal entries
+  /// above the mark are retained while any outer trial is still open — the
+  /// outer rollback must be able to undo this trial's committed writes too —
+  /// and dropped once no trial is open (nothing can replay them, and they
+  /// pin tree handles).
+  pub(crate) fn commit_to(&mut self, _mark: EnvMark) {
+    self.trial_depth = self.trial_depth.saturating_sub(1);
+    if self.trial_depth == 0 {
+      self.journal.clear();
+    }
+  }
+
+  /// Close the most recent open trial: replay the journal down to the mark
+  /// (restoring overwritten slots and popping label pushes, newest first),
+  /// then truncate every vec to its marked length. Appends vanish with the
+  /// truncate; everything else is restored from the journal — the env is
+  /// byte-identical to the moment `mark` returned.
+  pub(crate) fn rollback_to(&mut self, mark: EnvMark) {
+    while self.journal.len() > mark.journal {
+      match self.journal.pop() {
+        Some(Undo::Single(i, old)) => {
+          if let Some((_, slot)) = self.single_matched.get_mut(i) {
+            *slot = old;
+          }
+        }
+        Some(Undo::Multi(i, old)) => {
+          if let Some((_, slot)) = self.multi_matched.get_mut(i) {
+            *slot = old;
+          }
+        }
+        Some(Undo::Transformed(i, old)) => {
+          if let Some((_, slot)) = self.transformed_var.get_mut(i) {
+            *slot = old;
+          }
+        }
+        Some(Undo::MultiInnerPush(i)) => {
+          if let Some((_, nodes)) = self.multi_matched.get_mut(i) {
+            nodes.pop();
+          }
+        }
+        None => break,
+      }
+    }
+    self.single_matched.truncate(mark.single);
+    self.multi_matched.truncate(mark.multi);
+    self.transformed_var.truncate(mark.transformed);
+    self.secondary.truncate(mark.secondary);
+    self.trial_depth = self.trial_depth.saturating_sub(1);
+  }
+
+  /// Reset for reuse as a match scratch: every binding, label,
+  /// transformation, and trial record is dropped while every buffer's
+  /// capacity is kept. The outline matching loop recycles one env across
+  /// failed candidate attempts — each attempt used to buy its vectors
+  /// afresh (the two largest stream-phase allocation sites at kernel scale,
+  /// ledger-sampled); successful envs depart into their `NodeMatch`
+  /// instead, which is exactly the live data.
+  pub fn reset_for_reuse(&mut self) {
+    self.single_matched.clear();
+    self.multi_matched.clear();
+    self.transformed_var.clear();
+    self.secondary.clear();
+    self.journal.clear();
+    self.trial_depth = 0;
+  }
+
+  /// Run a speculative match against this env and DISCARD every write it
+  /// makes, returning only the closure's verdict. The closure sees the env's
+  /// current bindings (metavar consistency holds) through a `Cow` it may
+  /// write freely; afterwards the env is byte-identical to before — appends
+  /// truncate away, overwrites restore from the undo journal. This replaces
+  /// the borrow-the-env-and-let-the-first-write-clone-it probe protocol
+  /// (predicate rules, sibling probes): no clone on any path.
+  pub fn probe<R>(&mut self, run: impl FnOnce(&mut Cow<MetaVarEnv<'t, D>>) -> R) -> R {
+    let mut taken = std::mem::take(self);
+    let mark = taken.mark();
+    let mut env = Cow::Owned(taken);
+    let ret = run(&mut env);
+    // The Cow stays Owned (nothing reverts an Owned Cow whose marks pair
+    // LIFO), so this is a move, not a clone.
+    let mut recovered = env.into_owned();
+    recovered.rollback_to(mark);
+    *self = recovered;
+    ret
   }
 
   pub fn insert(&mut self, id: &str, ret: Node<'t, D>) -> Option<&mut Self> {
     if self.match_variable(id, &ret) {
-      assoc_set(&mut self.single_matched, id, ret);
+      assoc_set_undoable(
+        &mut self.single_matched,
+        self.trial_depth,
+        &mut self.journal,
+        id,
+        ret,
+        Undo::Single,
+      );
       Some(self)
     } else {
       None
@@ -128,7 +374,14 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
 
   pub fn insert_multi(&mut self, id: &str, ret: Vec<Node<'t, D>>) -> Option<&mut Self> {
     if self.match_multi_var(id, &ret) {
-      assoc_set(&mut self.multi_matched, id, ret);
+      assoc_set_undoable(
+        &mut self.multi_matched,
+        self.trial_depth,
+        &mut self.journal,
+        id,
+        ret,
+        Undo::Multi,
+      );
       Some(self)
     } else {
       None
@@ -150,8 +403,18 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
       self.secondary.push(node);
       return;
     }
-    match self.multi_matched.iter_mut().find(|(k, _)| *k == label) {
-      Some((_, nodes)) => nodes.push(node),
+    let found = self
+      .multi_matched
+      .iter_mut()
+      .enumerate()
+      .find(|(_, (k, _))| *k == label);
+    match found {
+      Some((index, (_, nodes))) => {
+        nodes.push(node);
+        if self.trial_depth > 0 {
+          self.journal.push(Undo::MultiInnerPush(index));
+        }
+      }
       None => self.multi_matched.push((intern_var(label), vec![node])),
     }
   }
@@ -220,18 +483,51 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
     &mut self,
     var_matchers: &HashMap<MetaVariableID, M>,
   ) -> bool {
-    let mut env = Cow::Borrowed(self);
-    for (var_id, candidate) in &self.single_matched {
-      if let Some(m) = var_matchers.get(*var_id)
-        && m.match_node_with_env(candidate.clone(), &mut env).is_none()
+    if var_matchers.is_empty() {
+      return true;
+    }
+    // Snapshot the constrained bindings first: constraint patterns may append
+    // rows or equality-overwrite them while matching, and each constraint
+    // must see its binding as it stood when checking began — the exact reads
+    // the old iterate-self-write-a-copy protocol performed. The snapshot is
+    // a handful of node handles; the old protocol cloned the WHOLE env on a
+    // constraint's first write (every vector, at high-water capacity once
+    // the outline loop began recycling envs — ledger-sampled at ~5 % of
+    // kernel-scale stream allocations).
+    let pairs: Vec<(&'static str, Node<'t, D>)> = self
+      .single_matched
+      .iter()
+      .filter(|(id, _)| var_matchers.contains_key(*id))
+      .map(|(id, node)| (*id, node.clone()))
+      .collect();
+    if pairs.is_empty() {
+      return true;
+    }
+    // Run the constraints on the live env under a trial: failure restores
+    // this env byte-exactly (the old protocol dropped the written copy),
+    // success commits in place (the old protocol moved the copy over self).
+    let mut taken = std::mem::take(self);
+    let mark = taken.mark();
+    let mut env = Cow::Owned(taken);
+    let mut ok = true;
+    for (var_id, candidate) in pairs {
+      if let Some(m) = var_matchers.get(var_id)
+        && m.match_node_with_env(candidate, &mut env).is_none()
       {
-        return false;
+        ok = false;
+        break;
       }
     }
-    if let Cow::Owned(env) = env {
-      *self = env;
+    // The Cow stayed Owned throughout (nothing reverts an Owned Cow whose
+    // marks all pair LIFO), so this is a move, not a clone.
+    let mut recovered = env.into_owned();
+    if ok {
+      recovered.commit_to(mark);
+    } else {
+      recovered.rollback_to(mark);
     }
-    true
+    *self = recovered;
+    ok
   }
 
   pub fn insert_transformation(&mut self, var: &MetaVariable, name: &str, slice: Underlying<D>) {
@@ -247,7 +543,14 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
     } else {
       slice
     };
-    assoc_set(&mut self.transformed_var, name, deindented);
+    assoc_set_undoable(
+      &mut self.transformed_var,
+      self.trial_depth,
+      &mut self.journal,
+      name,
+      deindented,
+      Undo::Transformed,
+    );
   }
 
   pub fn get_transformed(&self, var: &str) -> Option<&Underlying<D>> {
@@ -280,6 +583,19 @@ impl<D: Doc> MetaVarEnv<'_, D> {
     // other captured node — missing them would leave dangling tree handles.
     for n in self.secondary.iter_mut() {
       f(n)
+    }
+    // The journal is empty whenever no trial is open (envs cross threads
+    // only at rest), but any node it holds is a tree handle all the same.
+    for undo in self.journal.iter_mut() {
+      match undo {
+        Undo::Single(_, n) => f(n),
+        Undo::Multi(_, ns) => {
+          for n in ns {
+            f(n)
+          }
+        }
+        Undo::Transformed(..) | Undo::MultiInnerPush(_) => {}
+      }
     }
   }
 }
@@ -467,6 +783,82 @@ mod test {
   #[test]
   fn test_match_constraints() {
     assert!(match_constraints("a + b", "a + b"));
+  }
+
+  // Trial rollback must be a byte-exact undo: appends vanish, and an
+  // overwrite of a pre-mark binding restores the ORIGINAL node (same
+  // node id), not merely an exactly-matching one — the ellipsis probe in
+  // the matcher relies on this instead of cloning the env per candidate.
+  #[test]
+  fn test_mark_rollback_exact() {
+    let root = Tsx.grep("foo; foo; bar;");
+    let root = root.root();
+    let mut stmts = root.children();
+    let (foo1, foo2, bar) = (
+      stmts.next().expect("has stmt"),
+      stmts.next().expect("has stmt"),
+      stmts.next().expect("has stmt"),
+    );
+    assert_ne!(foo1.node_id(), foo2.node_id());
+
+    let mut env = MetaVarEnv::new();
+    env.insert("A", foo1.clone()).expect("fresh bind");
+    env.add_label("L", bar.clone());
+    let mark = env.mark();
+    // Overwrite below the mark (equality-checked: foo2 matches foo1 exactly),
+    // append a new var, push into an existing label, push a secondary.
+    env.insert("A", foo2.clone()).expect("exact re-bind");
+    assert_eq!(
+      env.get_match("A").expect("bound").node_id(),
+      foo2.node_id()
+    );
+    env.insert("B", bar.clone()).expect("fresh bind");
+    env.add_label("L", foo2.clone());
+    env.add_label("secondary", foo2.clone());
+    env.rollback_to(mark);
+
+    let a = env.get_match("A").expect("A survives rollback");
+    assert_eq!(a.node_id(), foo1.node_id(), "original binding restored");
+    assert!(env.get_match("B").is_none(), "trial append truncated");
+    let labels = env.get_labels("L").expect("label survives");
+    assert_eq!(labels.len(), 1, "trial label push undone");
+    assert_eq!(labels[0].node_id(), bar.node_id());
+    assert!(env.get_labels("secondary").is_none(), "trial secondary undone");
+  }
+
+  // Nested trials roll back LIFO, each to its own mark.
+  #[test]
+  fn test_mark_rollback_nested() {
+    let root = Tsx.grep("foo; foo; bar;");
+    let root = root.root();
+    let mut stmts = root.children();
+    let (foo1, foo2, bar) = (
+      stmts.next().expect("has stmt"),
+      stmts.next().expect("has stmt"),
+      stmts.next().expect("has stmt"),
+    );
+
+    let mut env = MetaVarEnv::new();
+    env.insert("A", foo1.clone()).expect("fresh bind");
+    let outer = env.mark();
+    env.insert("B", bar.clone()).expect("fresh bind");
+    let inner = env.mark();
+    env.insert("A", foo2.clone()).expect("exact re-bind");
+    env.insert("C", bar.clone()).expect("fresh bind");
+    env.rollback_to(inner);
+    // Inner trial undone; outer trial's append still live.
+    assert_eq!(
+      env.get_match("A").expect("bound").node_id(),
+      foo1.node_id()
+    );
+    assert!(env.get_match("B").is_some());
+    assert!(env.get_match("C").is_none());
+    env.rollback_to(outer);
+    assert!(env.get_match("B").is_none());
+    assert_eq!(
+      env.get_match("A").expect("bound").node_id(),
+      foo1.node_id()
+    );
   }
 
   #[test]

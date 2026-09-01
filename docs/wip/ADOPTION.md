@@ -157,8 +157,9 @@ actually matters.
 - **3D graph UI** — demo value, low agent value; revisit only with product demand.
 - **ADR management in the index** — ADRs belong in the repo (docs/, versioned); a graph
   link is a later nicety.
-- **Hop-distance "risk labels" and multi-keyword semantic AND** — cosmetic variants of
-  what `reachable` depths and fused search already express.
+- **Hop-distance "risk labels"** — a cosmetic variant of what `reachable` depths already
+  express. (Multi-keyword semantic AND left this list 2026-08-30: taken after all, as the
+  semantic-tier plan's Stage AND — quoted-phrase conjunction with min-of-RRF scoring.)
 - **RAM-first marketing architecture** — their LZ4 + Aho-Corasick headline features are
   dead code in production; the lesson is the opposite one: keep docs/BENCHMARKS.md
   command-reproducible, claims pinned to tests.

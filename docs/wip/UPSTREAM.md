@@ -102,6 +102,8 @@ change below was verified **byte-identical**: the kernel and CPython index conte
 |---|---|---|
 | **Lexer ASCII fast path** | `vendor/tree-sitter/src/lexer.c` (`ts_lexer__get_lookahead`) | A byte `< 0x80` under UTF-8 is a self-decoding codepoint; handle it inline instead of the encoding dispatch + indirect `decode(...)` call that otherwise ran per character. ~7% off kernel cold-index. |
 | **`set_contains` ASCII fast path** | 23 grammars' `src/tree_sitter/parser.h` | Character sets are sorted by range start; for a lookahead `< 0x80` a short linear scan over the leading ranges beats ~log2(len) probes across the full table (the C identifier set alone is 687 ranges). Recorded per-grammar in `grammars/PROVENANCE.json` `patches`. |
+| **Children-block cache** | NEW `vendor/tree-sitter/src/children_cache.h`; call sites in `stack.c` (`stack__iter` carve) and `subtree.c` (`ts_subtree_array_copy`/`_delete`, `ts_subtree_clone`, `ts_subtree_new_node` grow, `ts_subtree_release` free) | Upstream mallocs one `[children..., SubtreeHeapData]` block per reduction and frees it raw at release; profiled across all 45 vendored grammar corpora this is 24–93 % of every grammar's C-side allocations. A thread-local, size-classed intrusive freelist recycles the blocks across the files a worker parses (two free modes keep reuse provably within physical size; per-class depth swept — 65536 default after a quiet-machine re-sweep, `TS_CHILDREN_CACHE_CAP` overrides; pthread-key drain at thread exit; compiles away on wasm/MSVC). Kernel: C-side allocs 273 M → 89.8 M at the first sweep, −67 %; reallocs −78 %; **user CPU −10 %, wall −9.6 %**; artifacts byte-identical, 4k+ grammar corpus green. |
+| **Leaf-header cache + cursor stacks through the block cache** | `subtree.c` (`ts_subtree_pool_allocate` miss / `_free` overflow / `ts_subtree_pool_delete` teardown → `ts_leaf_cache_*`); `tree_cursor.c` (`ts_tree_cursor_init` pre-carves 512 B from the block cache, `_delete` returns exact-size) | `SubtreePool` recycles leaves only within one parser and `ts_tree_delete` drains through a throwaway pool, so leaves never crossed files (~8.7 M kernel allocs); cursor stacks were malloc'd per tree walk (~8 M — vorpal's own extraction/matching walks are the top callers). `TS_LEAF_CACHE_CAP` swept alongside the block cap. With the raised caps and thread-local parser reuse (vorpal-side, `crates/core`): kernel C-side allocations 273 M → **16.3 M (−94 %)**, user CPU −16 %, wall −11 % vs pre-cache; `TS_STACK_NODE_POOL` sweep measured-null (upstream's 50 stands, knob kept as evidence). |
 
 Both are pure membership/decoding fast paths — same tokens, same trees. Build note: a grammar's
 `build.rs` tracks `src/parser.c`, **not** the headers, so after editing a bundled `parser.h`
@@ -227,6 +229,16 @@ declares MIT but the repository ships **no license text at any ref** (GitHub lic
 none). Vendoring is blocked until upstream adds one; Gradle Kotlin-DSL files (.gradle.kts)
 already route through Kotlin.
 | tree-sitter-yaml | 0.7.2 | `7708026449be` | — |
+
+## Vendored jemalloc (tikv-jemalloc-sys)
+
+**Pin:** crates.io `tikv-jemalloc-sys 0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8`
+(bundled jemalloc 5.3.1), vendored verbatim into `vendor/tikv-jemalloc-sys` via
+`[patch.crates-io]` — same mechanism as the tree-sitter runtime.
+
+| Delta | Why |
+|---|---|
+| `jemalloc/src/ctl.c`: `arena_i_decay_ms_ctl_impl` gains an explicit `MALLCTL_ARENAS_ALL` branch (writes apply to every initialized arena, mirroring `arena_i_decay`; reads of ALL return `EINVAL`) | Upstream's mib resolver (`arena_i_index`) admits the ALL sentinel into every `arena.<i>.*` handler, but the decay_ms handler never checked for it: `arena_get(tsdn, 4096, …)` indexed **one past** the `MALLOCX_ARENA_LIMIT`-slot arenas array and dereferenced garbage — observed as `EXC_BAD_ACCESS` in `pac_decay_ms_set` when the batch indexer set `arena.4096.dirty_decay_ms` (fault-economics knob; see BENCHMARKS). Upstream-worthy: the handlers that do support ALL (`decay`, `purge`, `dss`, `name`) each check explicitly; this one simply lacked the check. |
 
 ## Planned
 

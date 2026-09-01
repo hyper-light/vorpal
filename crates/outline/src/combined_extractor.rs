@@ -16,13 +16,16 @@ use std::collections::HashMap;
 use vorpal_config::GlobalRules;
 use vorpal_core::{
   Language, Matcher, Node, NodeMatch,
+  meta_var::MetaVarEnv,
   tree_sitter::{
     LanguageExt, StrDoc,
     traversal::{Prune, PruneSubtree},
   },
 };
 
-use crate::extractor::{ItemExtractor, MemberExtractor, OutlineRuleError, SerializableOutlineRule};
+use crate::extractor::{
+  ItemExtractor, MemberExtractor, OutlineRuleError, RenderScratch, SerializableOutlineRule,
+};
 use crate::model::{OutlineItem, OutlineMember};
 use crate::options::OutlineExtractorOptions;
 
@@ -154,6 +157,8 @@ impl<L: Language> CombinedExtractors<L> {
     let collected: Vec<(OutlineItem<'tree>, Option<String>)> = OutlineItemIter {
       combined: self,
       traversal: Prune::new(&root),
+      scratch: MetaVarEnv::new(),
+      render_scratch: RenderScratch::<StrDoc<L>>::new(),
     }
     .collect();
     let mut items = adopt_members(collected);
@@ -161,6 +166,8 @@ impl<L: Language> CombinedExtractors<L> {
     // traversal above never enters a matched item's subtree — exactly where route
     // registrations live. Skipped entirely (no walk) when the language declares none.
     if self.nested_kind_index.iter().any(|list| !list.is_empty()) {
+      let mut scratch = MetaVarEnv::new();
+      let mut render_scratch = RenderScratch::<StrDoc<L>>::new();
       for node in root.dfs() {
         for &idx in self
           .nested_kind_index
@@ -168,8 +175,11 @@ impl<L: Language> CombinedExtractors<L> {
           .map(Vec::as_slice)
           .unwrap_or(&[])
         {
-          if let Some(matched) = self.item_extractors[idx].match_node(&node) {
-            let item = self.item_extractors[idx].extract(&matched, vec![]);
+          if let Some(mut matched) = self.item_extractors[idx].match_node_reusing(&node, &mut scratch)
+          {
+            let item =
+              self.item_extractors[idx].extract(&mut matched, vec![], &mut render_scratch);
+            reclaim_env(&mut scratch, &mut matched);
             if self.options.keep_item(&item) {
               items.push(item);
             }
@@ -184,12 +194,13 @@ impl<L: Language> CombinedExtractors<L> {
   fn match_item<'tree>(
     &self,
     node: &Node<'tree, StrDoc<L>>,
+    scratch: &mut MetaVarEnv<'tree, StrDoc<L>>,
   ) -> Option<(&ItemExtractor<L>, NodeMatch<'tree, StrDoc<L>>)>
   where
     L: LanguageExt,
   {
     for extractor in self.item_extractors_for_kind(node.kind_id()) {
-      if let Some(matched) = extractor.match_node(node) {
+      if let Some(matched) = extractor.match_node_reusing(node, scratch) {
         return Some((extractor, matched));
       }
     }
@@ -209,22 +220,50 @@ impl<'a, L: Language> ScopedMemberExtractors<'a, L> {
       .map(|&idx| &self.extractors[idx])
   }
 
-  fn extract_member<'tree>(&self, node: &Node<'tree, StrDoc<L>>) -> Option<OutlineMember<'tree>>
+  fn extract_member<'tree>(
+    &self,
+    node: &Node<'tree, StrDoc<L>>,
+    scratch: &mut MetaVarEnv<'tree, StrDoc<L>>,
+    render_scratch: &mut RenderScratch<StrDoc<L>>,
+  ) -> Option<OutlineMember<'tree>>
   where
     L: LanguageExt,
   {
     for extractor in self.extractors_for_kind(node.kind_id()) {
-      if let Some(matched) = extractor.match_node(node) {
-        return Some(extractor.extract(&matched));
+      if let Some(mut matched) = extractor.match_node_reusing(node, scratch) {
+        let member = extractor.extract(&mut matched, render_scratch);
+        reclaim_env(scratch, &mut matched);
+        return Some(member);
       }
     }
     None
   }
 }
 
+/// Recover a spent match's env into the scratch. An outline `NodeMatch` is
+/// read by `extract` and dropped moments later — its env is not live data, so
+/// its buffers (grown by every binding and relational label of the match) go
+/// back into rotation. With failures already recycling via
+/// `match_node_reusing`, this makes the per-file walk allocation-free at
+/// steady state on the env side.
+fn reclaim_env<'tree, D: vorpal_core::Doc>(
+  scratch: &mut MetaVarEnv<'tree, D>,
+  spent: &mut NodeMatch<'tree, D>,
+) {
+  let mut env = std::mem::take(spent.get_env_mut());
+  env.reset_for_reuse();
+  *scratch = env;
+}
+
 struct OutlineItemIter<'a, 'tree, L: LanguageExt> {
   combined: &'a CombinedExtractors<L>,
   traversal: Prune<'tree, L>,
+  /// One env recycled across every failed match attempt in this file's walk
+  /// — see `MatcherExt::match_node_reusing`.
+  scratch: MetaVarEnv<'tree, StrDoc<L>>,
+  /// One template-render buffer for the file's walk — every rendered name,
+  /// signature, and owner rides it (see `TemplateFix::render_into`).
+  render_scratch: RenderScratch<StrDoc<L>>,
 }
 
 impl<'a, 'tree, L: LanguageExt> Iterator for OutlineItemIter<'a, 'tree, L> {
@@ -315,17 +354,18 @@ impl<'a, 'tree, L: LanguageExt> OutlineItemIter<'a, 'tree, L> {
   ) -> Option<(OutlineItem<'tree>, Option<String>)> {
     let combined = self.combined;
     let item_subtree = self.traversal.current_subtree();
-    let Some((extractor, node_match)) = combined.match_item(&node) else {
+    let Some((extractor, mut node_match)) = combined.match_item(&node, &mut self.scratch) else {
       self.traversal.descend();
       return None;
     };
-    let member_of = extractor.resolve_member_of(&node_match);
+    let member_of = extractor.resolve_member_of(&node_match, &mut self.render_scratch);
     if extractor.transparent {
       // Transparent containers (namespaces, ambient modules): extract the container
       // itself, then keep ITEM-matching inside its body — its contents are items in
       // their own right (classes with their own members), never members of the
       // container. See `SerializableItemRule::transparent`.
-      let item = extractor.extract(&node_match, vec![]);
+      let item = extractor.extract(&mut node_match, vec![], &mut self.render_scratch);
+      reclaim_env(&mut self.scratch, &mut node_match);
       self.traversal.descend();
       return combined
         .options
@@ -333,7 +373,8 @@ impl<'a, 'tree, L: LanguageExt> OutlineItemIter<'a, 'tree, L> {
         .then_some((item, member_of));
     }
     let members = self.collect_members_for_item(&extractor.common.rule.id, item_subtree);
-    let item = extractor.extract(&node_match, members);
+    let item = extractor.extract(&mut node_match, members, &mut self.render_scratch);
+    reclaim_env(&mut self.scratch, &mut node_match);
     combined
       .options
       .keep_item(&item)
@@ -355,6 +396,8 @@ impl<'a, 'tree, L: LanguageExt> OutlineItemIter<'a, 'tree, L> {
       member_extractors,
       &self.combined.options,
       item_subtree,
+      &mut self.scratch,
+      &mut self.render_scratch,
     )
   }
 }
@@ -399,13 +442,15 @@ fn collect_scoped_members<'a, 'tree, L: LanguageExt>(
   member_extractors: ScopedMemberExtractors<'a, L>,
   options: &OutlineExtractorOptions,
   item_subtree: PruneSubtree<'tree>,
+  scratch: &mut MetaVarEnv<'tree, StrDoc<L>>,
+  render_scratch: &mut RenderScratch<StrDoc<L>>,
 ) -> Vec<OutlineMember<'tree>> {
   let mut members = vec![];
   while let Some(node) = traversal.current_node() {
     if traversal.has_left_subtree(item_subtree) {
       break;
     }
-    if let Some(member) = member_extractors.extract_member(&node) {
+    if let Some(member) = member_extractors.extract_member(&node, scratch, render_scratch) {
       if options.keep_member(&member) {
         members.push(member);
       }

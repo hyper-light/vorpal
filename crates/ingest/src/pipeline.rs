@@ -1153,7 +1153,7 @@ fn link_resolve<'i>(
           candidates: edge.candidates,
           span_start: edge.span.0,
           span_end: edge.span.1,
-          alternatives: alt_ids[..alt_count as usize].to_vec(),
+          alternatives: vorpal_kg::AltSet::new(alt_ids, alt_count),
         });
       },
       |unresolved| {
@@ -1174,7 +1174,7 @@ fn link_resolve<'i>(
           candidates: unresolved.candidates,
           span_start: unresolved.span.0,
           span_end: unresolved.span.1,
-          alternatives: Vec::new(),
+          alternatives: vorpal_kg::AltSet::EMPTY,
         });
       },
     )?

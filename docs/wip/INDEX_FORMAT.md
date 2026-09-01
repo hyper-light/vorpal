@@ -38,13 +38,14 @@ by its first rebuild (pinned by `legacy_flat_index_migrates_on_rebuild`).
 <!-- BEGIN GENERATED VERSION TABLE -->
 | Artifact | Constant | Value | On mismatch |
 |---|---|---|---|
-| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 15 | cache miss → re-parse |
+| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 18 | cache miss → re-parse |
 | product pack (`products.pack`/`products.idx`) | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
 | evidence sidecar (`evidence.bin`) | `VERSION` (crates/kg/src/evidence.rs) | 2 | sidecar treated as absent → `why` reports no evidence |
 | data-flow sidecar (`dataflow.bin`) | `VERSION` (crates/kg/src/dataflow.rs) | 1 | load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows) |
 | lexical posting tier (`postings.bin`) | `VERSION` (crates/index/src/postings.rs) | 1 | scan fallback → warm rebuilds |
 | embedding semantics (`ann.model.json`) | `LEXICAL_EMBED_VERSION` (crates/ann/src/embed.rs) | 1 | ANN tier distrusted → exact fallback → warm rebuilds |
+| calls-graph communities (`communities.bin`) | `VERSION` (crates/kg/src/communities.rs) | 1 | sidecar treated as absent → `community` answers `null`, `architecture` says not built → warm rebuilds |
 <!-- END GENERATED VERSION TABLE -->
 
 The ANN tier itself (`ann.bin` + `ann.files` + `ann.stamp`) is freshness-gated by the
@@ -52,3 +53,22 @@ node-segment stamp and the persisted model provenance rather than a standalone f
 version: any mismatch routes queries to the exact fallback until a re-warm rebuilds it.
 The reference spill (`.refs.spill`) is process-private scratch — created, read once, and
 deleted within a single build; it is deliberately unversioned and never persisted.
+
+## Git history in the generation id
+
+Since the co-change pass (`changes_with` edges, 2026-08-30), a generation's content id folds
+the indexed repository's **recent history**, not only its tree: the pass reads the last
+`VORPAL_COCHANGE_COMMITS` (default 2,000) non-merge commits from `git log` and seals
+symmetric `changes_with` edges between files that changed together at least twice (bulk
+commits over 50 files are ignored; each file keeps its 8 strongest partners; confidence =
+co-change count × 20, capped at 100). Consequences, stated:
+
+- Two checkouts of the **same tree** with **different histories** — a shallow CI clone and a
+  full developer clone, or the same tree before and after a commit that touched nothing
+  indexed — can seal **different generation ids**. Builds from identical trees *and*
+  identical histories remain bit-identical (the standing double-build gate).
+- Shared artifacts (`vorpal-index export`/`import`) are unaffected: trust is by
+  recomputation over the artifacts, never by matching a locally recomputed id.
+- Off switch: `VORPAL_COCHANGE_COMMITS=0` restores tree-only identity (the report then
+  says `co-change disabled`); a directory that is not a git repository, or has no history,
+  seals tree-only and says so.

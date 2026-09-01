@@ -58,6 +58,30 @@ pub trait MatcherExt: Matcher {
     Some(NodeMatch::new(node, env.into_owned()))
   }
 
+  /// `match_node` against a caller-owned scratch env. The attempt runs on
+  /// the taken scratch, so growth lands on it: a failed attempt resets the
+  /// env (content cleared, capacity kept) and hands it back — the next
+  /// candidate allocates nothing once the buffers are warm — while a
+  /// successful attempt departs into the `NodeMatch` and leaves the scratch
+  /// empty. Hot loops that try many candidates per hit (the outline
+  /// extractors) hold one scratch per file.
+  fn match_node_reusing<'tree, D: Doc>(
+    &self,
+    node: Node<'tree, D>,
+    scratch: &mut MetaVarEnv<'tree, D>,
+  ) -> Option<NodeMatch<'tree, D>> {
+    let mut env = Cow::Owned(std::mem::take(scratch));
+    match self.match_node_with_env(node, &mut env) {
+      Some(node) => Some(NodeMatch::new(node, env.into_owned())),
+      None => {
+        let mut recycled = env.into_owned();
+        recycled.reset_for_reuse();
+        *scratch = recycled;
+        None
+      }
+    }
+  }
+
   fn find_node<'tree, D: Doc>(&self, node: Node<'tree, D>) -> Option<NodeMatch<'tree, D>> {
     for n in node.dfs() {
       if let Some(ret) = self.match_node(n.clone()) {

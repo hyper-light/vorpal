@@ -85,7 +85,80 @@ pub struct EvidenceRow {
   pub candidates: u32,
   pub span_start: u32,
   pub span_end: u32,
-  pub alternatives: Vec<u32>,
+  pub alternatives: AltSet,
+}
+
+/// Inline capacity of [`AltSet`] — mirrors the resolver's
+/// `MAX_RETAINED_ALTERNATIVES` (the conversion site hands the resolver's
+/// fixed array by value, so a cap drift is a compile error, not a truncation).
+pub const ALT_CAP: usize = 8;
+
+/// Retained tie-set alternatives, stored INLINE. Evidence rows are built in
+/// the millions per link and a heap `Vec` per ambiguous row was the largest
+/// remaining resolve-phase allocation site (ledger-sampled); the sidecar
+/// encodes a length byte plus a pool, so the in-memory shape is free to be
+/// flat. Equality and ordering are slice semantics (length-aware
+/// lexicographic) — exactly the old `Vec<u32>` behavior; reads go through
+/// `Deref<Target = [u32]>`.
+#[derive(Debug, Clone, Copy)]
+pub struct AltSet {
+  ids: [u32; ALT_CAP],
+  count: u8,
+}
+
+impl AltSet {
+  pub const EMPTY: AltSet = AltSet {
+    ids: [0; ALT_CAP],
+    count: 0,
+  };
+
+  pub fn new(ids: [u32; ALT_CAP], count: u8) -> Self {
+    Self {
+      ids,
+      count: count.min(ALT_CAP as u8),
+    }
+  }
+
+  /// Build from an iterator, keeping at most [`ALT_CAP`] entries — the
+  /// decode path's corrupt-tolerant constructor (valid sidecars never carry
+  /// more; a longer claimed count reads truncated instead of panicking).
+  pub fn from_iter_capped(iter: impl Iterator<Item = u32>) -> Self {
+    let mut ids = [0u32; ALT_CAP];
+    let mut count = 0u8;
+    for id in iter.take(ALT_CAP) {
+      ids[count as usize] = id;
+      count += 1;
+    }
+    Self { ids, count }
+  }
+
+  pub fn as_slice(&self) -> &[u32] {
+    &self.ids[..self.count as usize]
+  }
+}
+
+impl std::ops::Deref for AltSet {
+  type Target = [u32];
+  fn deref(&self) -> &[u32] {
+    self.as_slice()
+  }
+}
+
+impl PartialEq for AltSet {
+  fn eq(&self, other: &Self) -> bool {
+    self.as_slice() == other.as_slice()
+  }
+}
+impl Eq for AltSet {}
+impl PartialOrd for AltSet {
+  fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+impl Ord for AltSet {
+  fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    self.as_slice().cmp(other.as_slice())
+  }
 }
 
 impl EvidenceRow {
@@ -168,7 +241,7 @@ pub fn save(dir: &Path, mut rows: Vec<EvidenceRow>) -> io::Result<()> {
           out[24..28].copy_from_slice(&row.span_start.to_le_bytes());
           out[28..32].copy_from_slice(&row.span_end.to_le_bytes());
           out[32..36].copy_from_slice(&alt_off.to_le_bytes());
-          for &alt in &row.alternatives {
+          for &alt in row.alternatives.iter() {
             out_pool[pool_at..pool_at + 4].copy_from_slice(&alt.to_le_bytes());
             pool_at += 4;
           }
@@ -252,12 +325,12 @@ impl EvidenceStore {
     let b = &self.store.as_bytes()[at..at + ROW];
     let alt_count = b[17] as usize;
     let alt_off = u32::from_le_bytes(b[32..36].try_into().unwrap()) as usize;
-    let alternatives = (alt_off..(alt_off + alt_count).min(self.pool_len))
-      .map(|slot| {
+    let alternatives = AltSet::from_iter_capped(
+      (alt_off..(alt_off + alt_count).min(self.pool_len)).map(|slot| {
         let p = self.pool_at + slot * 4;
         u32::from_le_bytes(self.store.as_bytes()[p..p + 4].try_into().unwrap())
-      })
-      .collect();
+      }),
+    );
     EvidenceRow {
       from: u32::from_le_bytes(b[0..4].try_into().unwrap()),
       to: u32::from_le_bytes(b[4..8].try_into().unwrap()),
@@ -364,7 +437,7 @@ mod tests {
       candidates: 1 + alts.len() as u32,
       span_start: span,
       span_end: span + 4,
-      alternatives: alts,
+      alternatives: AltSet::from_iter_capped(alts.into_iter()),
     };
     let absent = |from, span: u32, external: bool| EvidenceRow {
       from,
@@ -381,7 +454,7 @@ mod tests {
       candidates: if external { 0 } else { 3 },
       span_start: span,
       span_end: span + 4,
-      alternatives: Vec::new(),
+      alternatives: AltSet::EMPTY,
     };
     // Arrival order scrambled; save canonicalizes rows AND the alternatives pool.
     save(
@@ -400,8 +473,8 @@ mod tests {
     let hits = store.edges_between(2, 7);
     assert_eq!(hits.len(), 2);
     assert!(hits[0].span_start < hits[1].span_start, "canonical span order");
-    assert_eq!(hits[0].alternatives, vec![5], "pool follows sorted rows");
-    assert_eq!(hits[1].alternatives, vec![9, 11]);
+    assert_eq!(hits[0].alternatives.as_slice(), &[5], "pool follows sorted rows");
+    assert_eq!(hits[1].alternatives.as_slice(), &[9, 11]);
     // Absence lookups by (from, name_hash); no-edge rows sort after real edges.
     assert_eq!(store.absences_from(1, 0xD00D).len(), 1);
     assert_eq!(store.absences_from(1, 0xD00D)[0].outcome, EvidenceOutcome::External);

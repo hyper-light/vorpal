@@ -118,10 +118,10 @@ use std::ops::Range;
 
 /// We assume NEW_LINE, TAB, SPACE is only one code unit.
 /// This is sufficiently true for utf8, utf16 and char.
-fn get_new_line<C: Content>() -> C::Underlying {
+pub(crate) fn get_new_line<C: Content>() -> C::Underlying {
   C::decode_str("\n")[0].clone()
 }
-fn get_space<C: Content>() -> C::Underlying {
+pub(crate) fn get_space<C: Content>() -> C::Underlying {
   C::decode_str(" ")[0].clone()
 }
 

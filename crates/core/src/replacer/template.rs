@@ -1,4 +1,7 @@
-use super::indent::{DeindentedExtract, extract_with_deindent, get_indent_at_offset, indent_lines};
+use super::indent::{
+  DeindentedExtract, extract_with_deindent, get_indent_at_offset, get_new_line, get_space,
+  indent_lines,
+};
 use super::{MetaVarExtract, Replacer, split_first_meta_var};
 use crate::NodeMatch;
 use crate::language::Language;
@@ -37,13 +40,67 @@ impl TemplateFix {
   }
 }
 
-impl<D: Doc> Replacer<D> for TemplateFix {
-  fn generate_replacement(&self, nm: &NodeMatch<'_, D>) -> Underlying<D> {
+impl TemplateFix {
+  /// Render into a caller-owned buffer (cleared first). Byte-equal to
+  /// `generate_replacement`, without its per-render allocations: the fixer
+  /// writes straight into `out`, and re-indentation happens in place — a
+  /// single-line render (the overwhelming outline case) touches nothing.
+  /// Hot loops (outline entry rendering: millions per index, ledger-sampled
+  /// at ~22 % of post-pass-18 stream allocations) hold one buffer per file.
+  pub fn render_into<D: Doc>(&self, nm: &NodeMatch<'_, D>, out: &mut Underlying<D>) {
+    out.clear();
+    replace_fixer_into::<D>(self, nm.get_env(), out);
     let leading = nm.get_doc().get_source().get_range(0..nm.range().start);
     let indent = get_indent_at_offset::<D::Source>(leading);
-    let bytes = replace_fixer(self, nm.get_env());
-    let replaced = DeindentedExtract::MultiLine(&bytes, 0);
-    indent_lines::<D::Source>(indent, replaced).to_vec()
+    if indent > 0 {
+      indent_multiline_in_place::<D::Source>(indent, out);
+    }
+  }
+}
+
+/// In-place equivalent of `indent_lines(indent, MultiLine(bytes, 0))` for the
+/// owned-buffer path: after every newline, insert `indent` spaces (the first
+/// line stays unindented, exactly like `indent_lines_impl`, including the
+/// spaces a trailing newline earns). One backward shift inside the buffer —
+/// no allocation beyond the buffer's own growth.
+fn indent_multiline_in_place<C: Content>(indent: usize, out: &mut Vec<C::Underlying>) {
+  let new_line = get_new_line::<C>();
+  let newlines = out.iter().filter(|b| **b == new_line).count();
+  if newlines == 0 {
+    return;
+  }
+  let space = get_space::<C>();
+  let old_len = out.len();
+  let extra = newlines * indent;
+  out.resize(old_len + extra, space.clone());
+  // Backward shift: reading the original bytes in reverse, each byte's final
+  // slot sits `indent × newlines-at-or-before-it` above its old position, so
+  // the write cursor never touches an unread byte (`write − 1 ≥ read` until
+  // the last pending newline is spent, where the write degenerates to a
+  // self-copy). In forward order a newline is followed by its indent spaces;
+  // writing backwards, the spaces go down first, then the newline.
+  let mut write = old_len + extra;
+  for read in (0..old_len).rev() {
+    let byte = out[read].clone();
+    if byte == new_line {
+      write -= indent;
+      for slot in out[write..write + indent].iter_mut() {
+        *slot = space.clone();
+      }
+      write -= 1;
+      out[write] = new_line.clone();
+    } else {
+      write -= 1;
+      out[write] = byte;
+    }
+  }
+}
+
+impl<D: Doc> Replacer<D> for TemplateFix {
+  fn generate_replacement(&self, nm: &NodeMatch<'_, D>) -> Underlying<D> {
+    let mut out = vec![];
+    self.render_into(nm, &mut out);
+    out
   }
 }
 
@@ -85,24 +142,29 @@ fn create_template(tmpl: &str, mv_char: char, transforms: &[String]) -> Template
   }
 }
 
-fn replace_fixer<D: Doc>(fixer: &TemplateFix, env: &MetaVarEnv<'_, D>) -> Underlying<D> {
+fn replace_fixer_into<D: Doc>(
+  fixer: &TemplateFix,
+  env: &MetaVarEnv<'_, D>,
+  out: &mut Underlying<D>,
+) {
   let template = match fixer {
-    TemplateFix::Textual(n) => return D::Source::decode_str(n).to_vec(),
+    TemplateFix::Textual(n) => {
+      out.extend_from_slice(&D::Source::decode_str(n));
+      return;
+    }
     TemplateFix::WithMetaVar(t) => t,
   };
-  let mut ret = vec![];
   let mut frags = template.fragments.iter();
   let vars = template.vars.iter();
   if let Some(frag) = frags.next() {
-    ret.extend_from_slice(&D::Source::decode_str(frag));
+    out.extend_from_slice(&D::Source::decode_str(frag));
   }
   for ((var, indent), frag) in vars.zip(frags) {
     if let Some(bytes) = maybe_get_var(env, var, indent) {
-      ret.extend_from_slice(&bytes);
+      out.extend_from_slice(&bytes);
     }
-    ret.extend_from_slice(&D::Source::decode_str(frag));
+    out.extend_from_slice(&D::Source::decode_str(frag));
   }
-  ret
 }
 
 fn maybe_get_var<'e, 't, C, D>(
@@ -157,6 +219,28 @@ pub fn gen_replacement<D: Doc>(template: &str, nm: &NodeMatch<'_, D>) -> Underly
 mod test {
 
   use super::*;
+
+  // The in-place indenter must stay byte-equal to `indent_lines` over the
+  // owned-buffer path it replaced — every shape: multi-line, single-line,
+  // trailing/leading newlines, empty.
+  #[test]
+  fn indent_in_place_matches_indent_lines() {
+    for (input, indent) in [
+      ("a\nb\nc", 2usize),
+      ("single", 3),
+      ("trail\n", 4),
+      ("\nlead", 1),
+      ("", 5),
+      ("a\n\nb", 3),
+    ] {
+      let bytes = input.as_bytes().to_vec();
+      let expected =
+        indent_lines::<String>(indent, DeindentedExtract::MultiLine(&bytes, 0)).to_vec();
+      let mut got = bytes.clone();
+      indent_multiline_in_place::<String>(indent, &mut got);
+      assert_eq!(got, expected, "input {input:?} indent {indent}");
+    }
+  }
   use crate::Pattern;
   use crate::language::Tsx;
   use crate::matcher::NodeMatch;

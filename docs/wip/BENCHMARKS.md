@@ -929,6 +929,791 @@ inter-layer LayerNorms absorb the weight rounding), f16 path bitwise
 reproducible. The stated trade: full-size RSS while a handle is live, until the
 f16-native kernel lands.
 
+## Extraction coverage, Wave 1 — macros/unions/type aliases + include-visibility resolution (2026-08-31)
+
+The kernel bench against codebase-memory-mcp exposed the gap: their 8.53M nodes
+vs our 2.76M was almost entirely `#define`s (ground truth: 6,122,556 `#define`
+lines in the tree). Wave 1 makes vorpal extract them — and resolve them
+*correctly*. New kinds `Macro`/`Union`/`TypeAlias` flow outline → product
+(format v18) → KG → CLI/query (the query parser now accepts keyword-spelled
+labels, so `MATCH (n:Union)` parses). Rules landed for C (`preproc_def`,
+`preproc_function_def`, `type_definition`, union fix), C++ (namespace, unions in
+member parents, macros, `typedef`/`using` aliases), Rust (`macro_rules!`, `type`,
+`union`).
+
+Resolution follows the candidate law (`SymbolKind::is_resolution_candidate`, one
+definition consulted by every table feed): macros ARE candidates but bind by
+INCLUSION, not name-globality. `IncludeReach` (crates/resolve/src/reach.rs)
+condenses the file→file include graph through iterative Tarjan SCC (include
+guards make cycles legal) into per-SCC sorted closures; the resolver's gate
+admits a macro candidate only when its defining file is the reference's own file
+or include-reachable — otherwise the reference is *masked*, never faked. Include
+edges come from the import stream: exact → importer-relative → root-relative
+suffix matching, where root-relative (`#include <linux/export.h>`) disambiguates
+by nearest-prefix, then corpus-learned root support (the `-I` set inferred from
+how much of the import stream each root satisfies — `learn_include_roots`), then
+a dead tie stays unresolved.
+
+Measured (release, quiet machine, `VORPAL_NO_AUTOWARM=1 VORPAL_PHASE_TRACE=1
+/usr/bin/time -l vorpal-index index ../linux <dir>`):
+
+| | pre-campaign | Wave 1 |
+|---|---|---|
+| kernel cold index | 10.13 s | **13.32 s** (117 s user; RSS 3.40 GB) |
+| nodes | 2,763,928 | **8,695,186** (Macro 6,032,462 = 98.5% of `#define` truth; Union 3,111; TypeAlias 19,493) |
+| edges | 6.67 M | 14,964,123 (`calls` 4,439,434; `imports` 75,190 → 381,838) |
+| refs | 33 K resolved / 8.10 M **external** (self-index) | kernel: 3.88 M resolved / 1.72 M ambiguous / 217 K external / 976 K masked |
+
+Oracle cost inside link (phase stamps): roots-learn 32 ms, seed 264 ms,
+include-reach build 1.57 s (~1.1 GB transient closures), gated resolve 342 ms.
+Correctness oracles: self-index — all 76 `array_push` call edges bind each
+grammar's `scanner.c` to *its own* `tree_sitter/array.h` (48 same-named copies,
+zero cross-grammar bleed; ambiguous count unchanged vs pre-macro baseline);
+kernel — `EXPORT_SYMBOL` 0 → 2,633 calls, every sample to
+`include/linux/export.h` (not the `tools/include/` shadow — root support broke
+the prefix tie the right way); `list_for_each_entry` 8,312 calls to
+`include/linux/list.h`. Cross-arch `<asm/...>` ties resolve only where one arch
+root strictly dominates; equal-evidence ties stay honestly ambiguous/masked.
+
+### Wave 2 — Java/C#/Go/JS/TS gaps + container transparency (2026-08-31)
+
+Audit-driven rule additions: Java records (+compact constructors), `@interface`
+annotations (+elements), packages, modules, enum constants, interface
+constants; C# namespaces (block + file-scoped), events (both forms),
+operators (arithmetic operators carry a literal `operator` name — the token is
+an anonymous node — and stay distinct by signature), conversion operators,
+indexers, destructors, `#define` → Macro; Go `type_alias` + the correction
+that `type Foo int` is `TypeAlias`, not `TypeParameter`; JS/TS/TSX generator
+functions, `var`-form declarations, TS `function_signature`
+(declare/overloads), interface index/call/construct signatures; TS
+`type_alias_declaration` corrected `Struct` → `TypeAlias`. Python decorated
+definitions verified already-extracting (wrapper-node audit noise).
+
+Two mechanism fixes the fixtures forced:
+
+* **Container transparency** (`transparent: true` item flag,
+  crates/outline/src/{extractor,combined_extractor}.rs): the item traversal
+  never re-enters a matched item's subtree — correct for functions, fatal for
+  namespaces (C++/C# block namespaces and TS namespace/ambient-module bodies
+  swallowed every class inside once namespace rules landed). A transparent
+  container extracts itself, then the traversal DESCENDS and keeps
+  item-matching — contents are items with their own members, never members of
+  the container. Applied to C++/C# namespaces and all TS/TSX
+  namespace/ambient-module rules; pinned by a combined-extractor unit test.
+* **Typedef/record disambiguation**: `typedef struct Config {…} Config;` is
+  the struct's DEFINITION — the c/cpp typedef rules now decline body-bearing
+  record/enum types (the traversal then reaches the struct rule), keeping
+  only bodyless forms (`typedef struct Foo Bar;`, `typedef int u32;`) as
+  aliases. Caught by the c-family goldens.
+
+Real-repo validation (shallow clones, indexed, kind counts vs `rg` ground
+truth): spring-petclinic — Java `Class` **42/42 exact**, `Package` **50/50
+exact**; Humanizer — `.cs` `Module` 491 vs 499 namespace declarations (98.4%;
+the gap sits in its 14 parse-error files); gin — `TypeAlias` 35 + `Struct`
+123 + `Interface` 19 = 177 vs 176 grep'd `type` declarations (grouped-decl
+variance). All outline suites green after golden updates that ADD the new
+symbols (namespace Module lines, enum members, corrected alias kinds).
+
+### Wave 3 — full 49-grammar closure (2026-08-31)
+
+Every remaining language with real gaps, closed against per-language fixtures
+and re-audited grammars (the audit's grammar-path map itself was fixed for
+astro-next, nested md/ocaml, sequel, svelte-ng, toml-ng — astro/svelte/toml
+prove CLEAN with zero definition-like nodes):
+
+ObjC (protocol split from class; the full C-family port — records, enums,
+unions, members, both macro forms, guarded typedefs; property names no longer
+swallow `(nonatomic)` attributes) · Zig (`const X = struct/enum/union/error/
+opaque` kind splits with container fields and enum/error members; `var` vs
+`const` globals; `test` and `extern fn` declarations) · Lua (local + bare
+top-level assignment globals) · Erlang (`-define` macros with arg-strip,
+`-type`) · CMake (macro kind correction) · Julia (macros split from
+functions, consts, primitives) · Haskell (`type` synonyms split to TypeAlias,
+class signatures as methods) · Perl (file-scope `my`/`our`) · PowerShell
+(rules REWRITTEN kind-based — context-pattern snippets never parse in this
+grammar; class/method/property/enum extraction newly functional) · Scala
+(top-level val/var/given, enum cases, abstract members, `type` → TypeAlias) ·
+Kotlin (typealias) · Swift (extensions — the bare `extension` node kind is an
+anonymous token, so class_declaration + declaration_kind with a `user_type`
+descent; typealias, macro declarations, operators, deinit, subscript,
+associatedtype, protocol and class properties, top-level bindings) · PHP
+(transparent block namespaces, file and class consts) · Solidity
+(constructors, modifiers, fallback/receive, errors, user-defined types,
+constants, nested Yul functions) · Dart (typedefs, extension types, top-level
+vars, external functions, getters/setters, all three constructor forms,
+operators, static finals) · GraphQL (schema, directives, enum values, input
+fields) · Bash (`declare`-command and bare-assignment variables; env-prefix
+and function-local assignments excluded) · Elixir (defprotocol, defimpl,
+defstruct) · Rust (top-level `const`/`static` — absent in our own language
+until this wave — and `extern crate`) · OCaml (record/variant/synonym kind
+splits with fields and constructors, module types, exceptions, `external`,
+classes with methods and instance variables) · SQL (columns as table members,
+CREATE TYPE/TRIGGER).
+
+Debug law recorded: a `CombinedExtractors` failure reading "Fail to parse
+yaml as Rule" means an anonymous (named=false) node was used as a `kind:`
+matcher — verify node names against the COMPILED grammar
+(`--debug-query=cst`), not node-types.json alone.
+
+Campaign-final numbers (release, quiet machine, `VORPAL_NO_AUTOWARM=1`):
+kernel **8,807,122 nodes** / 15,060,435 edges, 18.15 s real (121 s user,
+RSS 3.46 GB; 13.3–18.2 s across runs on this hardware), refs 3.86 M resolved
+/ 1.73 M ambiguous / 245 K external / 975 K masked. The typedef guard's
+reclassification is visible at scale: TypeAlias 19,493 → 4,391 honest
+aliases while `typedef enum/struct/union { … } name;` definitions surface as
+the records they are — Enum 23,508 → 33,311 (+86 K EnumMembers), Struct
+88,063 → 90,807, Union 3,111 → 3,274, Field +21 K. Variable +6.5 K from the
+new shell/Perl rules. Self-index mirrors it (TypeAlias 1,069 → 440, Struct
+739 → 766 with +413 fields), with ambiguous refs DOWN 12,840 → 12,331.
+Pre-campaign baseline for the whole arc: 2,763,928 kernel nodes at 10.13 s.
+Commits: 17b2c60 (wave 1) · d64c2de (wave 2) · 7771d3e (wave 3).
+
+## Hyper-optimization campaign, pass 1 — allocation/fault/contention ledger + six fixes (2026-08-31)
+
+Measurement first: feature `alloc-ledger` (opt-in, never default) wraps the
+binary's jemalloc in exact event counters — Rust and tree-sitter C churn
+attributed separately via `set_allocator` counting shims — plus mach
+`TASK_EVENTS_INFO` faults, per-phase `getrusage` (parallel efficiency,
+voluntary context switches), and contention counters at the pipeline's known
+serialization points (interner shard try-locks, byte-budget parks,
+full-channel sends). Counters are sharded across 32 cache-line-aligned
+pthread-affine slots: the first build's four global atomics DOUBLED kernel
+user CPU purely on cache-line ping-pong — the measurement manufacturing the
+contention it measured — and the sharded rework holds overhead to +13 % user
+with exact counts. Per-phase deltas via `ledger_deltas.py` over
+`VORPAL_PHASE_TRACE=1` stamps.
+
+Headline profile (kernel, pre-fix): **444 M allocator events per build** —
+273 M tree-sitter C (~3,600 per file) + 171 M Rust with **57.8 GB cumulative
+churn against a 1.4 GB live peak** (40×); 2.26 M faults; the stream phase
+carries 96 % of Rust churn at healthy 0.87 efficiency in EVERY language
+(polyglot matrix: kernel, cpython, TypeScript, spring-petclinic, gin,
+Humanizer); interner contention is negligible everywhere (≤2.2 K contended of
+~10 M+ acquisitions — the 64-way sharding holds); the real parallelism losses
+are serialized phases (~3.5 s of 13 s at ≤0.08 efficiency). Small repos paid
+a universal tax the kernel never showed: compiling all 49 languages' outline
+rules plus the full canary table — ~160 K allocations, half of gin's total.
+
+Fixes (each A/B-proven, ledger-instrumented kernel unless noted):
+
+1. **IncludeReach closures — level-parallel CSR arena** replacing serial
+   per-SCC `Vec<Vec>` growth: phase 1.85 s → 0.48 s (3.3×), transient spike
+   1,055 MB → 262 MB, linear memory at any scale.
+2. **`scc_sizes` — per-component collection Vec removed** (sizes assigned
+   from the Tarjan stack tail, then truncate): exactly 8.8 M allocations
+   eliminated on the kernel's acyclic-majority graph — every language's shape.
+3. **Lazy per-language rule compilation** (`ExtractorSet::Lazy`): bundled
+   docs bucket per language by a raw `language:` scan (zero-copy `&'static`
+   slices), each language serde-parses + compiles on first use behind a
+   `OnceLock`; eager fallback if bucketing can't attribute a doc; user rule
+   sources keep the eager validating path; rules digest byte-identical.
+   Startup: 158,737 allocs / 44 MB → 78 allocs.
+4. **`build_include_reach` edge collection parallelized** (threads×2 chunks;
+   `from_edges` is order-invariant, pinned by test): 0.27 s serial removed.
+5. **Manifest-scoped canary self-check** (`verify_extraction_for_manifest`,
+   per-language verdicts memoized process-wide): only languages the tree
+   contains are checked — the threat model is per-language, so equally
+   protective for the build at hand. gin total allocations 332 K → 175 K
+   (−47 %), faults −36 %.
+6. **`seed_import_bindings` parallelized** (chunked resolve + in-order serial
+   fold = identical last-write-wins semantics): 0.28 s at 0.06 efficiency →
+   0.04 s at 0.82.
+
+Production A/B (plain release binaries, interleaved base/new, quiet machine,
+`VORPAL_NO_AUTOWARM=1 /usr/bin/time -l`):
+
+| corpus | wall (base → new) | peak RSS | page reclaims |
+|---|---|---|---|
+| kernel | 11.97/12.81 → 11.81/11.03 s (mean **12.39 → 11.42 s, −7.8 %**) | 3.53/3.49 → **3.25 GB (−7 %)** | ~flat |
+| vorpal self | 7.82 → 7.63 s | 8.0 → 8.6 GB (single-file parse-tree monsters dominate; run-order variance) | ~flat |
+| gin (small repo) | 0.08 → 0.07 s | **79 → 44.5 MB (−44 %)** | 11.5 K → 8.3 K (−28 %) |
+
+Ledger-instrumented kernel wall across the pass: 13.46 → 11.43 s (−15 %).
+
+### Pass 2 — callsite attribution sampler + two churn fixes (2026-08-31)
+
+`VORPAL_ALLOC_SAMPLE=<shift>` (ledger builds): every 2^shift-th allocation
+captures a symbolized backtrace into a bounded site table dumped at exit —
+reentrancy-guarded per pthread slot (capture allocates; TLS is unsafe in
+allocator context), and it symbolizes under LTO. Kernel and cpython
+histograms AGREE on the top sites — the extraction inner loop owns Rust
+churn: `extract_entry` 12.9 %, template rendering ~17 % across three stacks,
+`MetaVarEnv::add_label` 5.5 %, `layout_entity_paths` ~15 % across three call
+paths. Fixes from that data:
+
+* **One entity-path layout per file** (`KgWriter::ingest_file_with_layout`):
+  the committer built the same per-entity `String` layout twice (writer
+  identity + reference attribution). Stream-phase allocations 154.9 M →
+  144.8 M (−10.1 M).
+* **Content-id chunk-buffer reuse, correctly**: `map_init` alone did NOT work
+  — rayon's adaptive splitting reaches single-chunk jobs under work-stealing
+  and re-runs the init closure per job, so the 3.9 GB stood. With a
+  shard-derived `with_min_len` floor: interval churn 3,859 MB → 1,220 MB
+  (−68 %), faults 247 K → 78 K, digests identical. (Recorded as a general
+  law: `map_init` without a split floor is not buffer reuse.)
+
+Totals across passes 1+2 (kernel, ledger-instrumented): allocations 171 M →
+151.9 M, faults 2.26 M → 2.09 M, reallocs 16.9 M → 13.85 M, wall 13.46 →
+11.76 s.
+
+### Pass 3 — trivial-name template fast path (2026-08-31)
+
+The dominant sampled template shape is a name template that is exactly one
+plain metavariable. `NameTemplate::Trivial` renders `$NAME` by **borrowing
+the matched node's text** (`Cow<'tree>`), skipping the engine's
+leading-indent scan, byte-vector assembly, re-indent, and `String` build —
+with the compiled engine template retained as an exact-semantics fallback
+for capture shapes `get_match` cannot serve. `default_signature` and
+`render_signature` likewise return borrowed `Cow`s for rules without a
+signature template. Byte-identity proven by the outline golden suites across
+all 49 languages. A/B (ledger kernel): stream-phase allocations 144.8 M →
+**127.0 M (−17.8 M)**; self-index reallocs −26 %. Campaign totals, passes
+1–3: kernel allocations **171 M → 134.2 M (−21.5 %)**.
+
+### Pass 4 — allocation-free path probes + parallel CSR directions (2026-08-31)
+
+`join_normalize_into` writes joined paths into a reused scratch `String`
+with exactly the Vec-collect-and-join semantics (`join_normalize` delegates
+to it — the two cannot drift), threaded through `ResolveScratch` and the
+reach-build chunk closures. The per-probe `Vec<&str>` + `join` + `format!`
+chain ran ~a million times per kernel link. A/B: the reach-build interval
+went 1,148,207 → **106** allocations; reach-done and resolve-done each
+−1.15 M; reallocs 13.85 M → **10.47 M**. `Graph::from_parts` now builds its
+two CSR directions on scoped threads — measured NULL at kernel scale after
+correcting an attribution error (the "seal: compact" interval is segment
+column streaming faulting in ~1 GB of fresh `PodColumn` pages, not the CSR
+build, which occupies the next 0.10 s interval); kept as correct and
+linear-scaling toward 2 B-LOC edge counts. Campaign totals, passes 1–4:
+kernel allocations **171 M → 130.7 M (−23.6 %)**, ledger wall 13.46 →
+11.68 s.
+
+### Pass 5 — assoc-vec metavariable environments (2026-08-31)
+
+The matcher clones the metavariable environment copy-on-write per match
+candidate, and the post-pass-4 histogram put ~29 % of remaining sampled
+allocations in that family (String keys, hashbrown tables, rehashes). The
+env's three maps are now insertion-ordered association vectors — public API
+unchanged, linear scans over a handful of entries beating SipHash on String
+keys, clones reduced to three Vec memcpys, iteration order now
+deterministic. Gated wide (core, config scan/rewrite, outline goldens ×49
+languages, ingest — all green). A/B (ledger kernel): allocations 130.7 M →
+**127.55 M**, cumulative bytes −2 GB, faults −23 K; reallocs +1.4 M (vector
+growth replaces table allocations; net events down). Honest residual: the
+String keys still clone per env copy — interned or `Arc<str>` keys recorded
+as the deeper follow-up. Campaign totals, passes 1–5: kernel allocations
+**171 M → 127.55 M (−25.4 %)**, ledger wall 13.46 → 11.60 s.
+
+Consolidated production A/B, passes 1–5 (plain release binaries vs the
+pre-campaign snapshot, interleaved, quiet machine):
+
+| corpus | wall (base → new) | peak RSS | page reclaims |
+|---|---|---|---|
+| kernel | 12.37/13.05 → 11.52/10.97 s (mean **12.71 → 11.25 s, −11.5 %**) | 3.54/3.48 → **3.25 GB** | 2.28 M → **2.10 M (−7.7 %)** |
+| cpython | 1.11 → 1.11 s (parse-bound; churn already low) | ~flat | ~flat |
+| gin | 0.09 → 0.07 s | 79 → **45.6 MB (−42 %)** | 11.5 K → 8.3 K (−27 %) |
+
+### Pass 21 — template rendering into a per-file buffer + owned-string transforms (2026-09-01)
+
+The post-pass-20 Rust histogram's leaders taken: the **template-render
+family (22.2 %)** — `render_template` → `generate_replacement` →
+`indent_lines` paid up to four allocations per rendered outline entry
+(fixer vec growth, an indent copy that cloned its `leading` pad per line,
+`.to_vec()`, `.to_string()`) — and the transform value's final
+String → bytes copy.
+
+* `TemplateFix::render_into` renders into a caller buffer: the fixer writes
+  straight into it and re-indentation happens IN PLACE via one backward
+  shift (`indent_multiline_in_place`, drift-anchored byte-equal to
+  `indent_lines` across multi-line/trailing/leading/empty shapes); a
+  single-line render — the overwhelming outline case — touches nothing.
+  `generate_replacement` delegates, so the CLI fix path is unchanged. The
+  outline walk threads one `RenderScratch` per file through
+  `extract_entry`/`resolve_member_of`/both extracts; each rendered value
+  costs exactly its one live `String`.
+* `Content::decode_string` gives owned strings a MOVE into stored transform
+  bytes (`String::into_bytes`) instead of the `decode_str(&s).to_vec()`
+  copy; the default keeps the copy for non-byte sources.
+
+A/B (ledger kernel): Rust allocations 9.90 M → 8.02 M (render scratch)
+→ **7.54 M (−23.9 % total)**; TypeScript −7.0 %, Humanizer −12.7 %,
+cpython flat (its templates were already pass-3 Trivial borrows — its
+residue is transform-compute internals). Campaign totals: kernel Rust
+allocations **171 M → 7.54 M (−95.6 %)**. Humanizer artifacts
+byte-identical; full gate 127 suites / 1,223 tests green. Remaining
+recorded leads: transform-compute internals (~1.4 M: per-type
+`compute`-into-scratch through `string_case`/`rewrite`), the resolve
+interner (~0.7 M, mostly live data), `SgNode::ancestors`' per-call Vec
+under `Inside` rules (~0.35 M), reference-extraction `select_all`.
+
+### Pass 20 — the C-side residue, all five items (2026-09-01)
+
+The pass-19 residual (89.8 M) attributed and taken down, item by item —
+each landed only after its own measurement:
+
+1. **Cap "coldness" was ambient noise** — the deciding fact. Interleaved
+   quiet re-runs show depth 65536 matches 8192's user CPU while cutting
+   allocator calls a further 3.5×; the slab mini-allocator designed for the
+   miss path is therefore **not needed** (measured-and-avoided). Default cap
+   raised to 65536 (`TS_CHILDREN_CACHE_CAP` overrides).
+2. **Leaf headers recycle across files** (`ts_leaf_cache_*` in the same TLS
+   cache; `SubtreePool`'s malloc miss, overflow, and — the real leak —
+   `ts_tree_delete`'s throwaway-pool teardown all route through it;
+   `TS_LEAF_CACHE_CAP`).
+3. **Cursor stacks come from the block cache** (`ts_tree_cursor_init`
+   pre-carves 512 B, delete returns exact-size; grown stacks floor-bin and
+   feed smaller classes). This one serves vorpal's own reference-extraction
+   and rule-matching walks, ~8 M creates per kernel index.
+4. **Stack-node pool cap: measured-null** — `TS_STACK_NODE_POOL=1000` moved
+   ~46 K allocations (~0.05 %); upstream's 50 stands, knob kept for
+   evidence.
+5. **Parser reuse re-measured and flipped ON** (one parser per thread,
+   `parse_lang`; the pre-campaign not-worth-it verdict predates the block
+   cache): −3 M allocations, −0.25 M reallocs, CPU-neutral,
+   `VORPAL_PARSER_REUSE=0` opts out. Re-entrant parses fall back to a fresh
+   parser; a failed parse rebuilds it.
+
+Combined (ledger, kernel, quiet ×2): C-side allocations 89.8 M →
+**16.3 M** — from the 273.2 M pre-campaign baseline, **−94.0 %**, now in
+line with the Rust side's −94 %. User CPU 133.7–134.4 → **112.3–113.4 s
+(−16 % vs pre-pass-19)**, wall 10.33–10.37 → **9.20–9.25 s (−11 %)**, RSS
++~0.3 GB (deeper freelists — inside the decay-off frontier). Artifacts
+byte-identical (Humanizer at final defaults; cpython with reuse ON),
+grammar corpus battery green, full 127-suite / 1,222-test gate green.
+
+### Pass 19 — the children-block cache: the one lever, pulled (2026-09-01)
+
+The per-grammar examination's conclusion implemented: a thread-local,
+size-classed intrusive freelist for the `[children..., SubtreeHeapData]`
+blocks in the vendored runtime (`vendor/tree-sitter/src/children_cache.h`;
+call sites: `stack__iter`'s carve, `ts_subtree_array_copy`/`_delete`,
+`ts_subtree_clone`, `ts_subtree_new_node`'s grow, `ts_subtree_release`'s
+free). Blocks a dropped tree returns are reused by the next file parsed on
+that worker thread. Two free modes carry the no-overflow proof: exact
+physical size (array paths, FLOOR class, sub-class bypass) and
+claimed-node lower bound (ROUND-UP class == birth class on every audited
+flow). The first build omitted the sub-class bypass and corrupted the heap
+within seconds (`ref_count` assertion) — the audit's value is that the
+failure was loud and immediate, and the two-mode split is the durable fix.
+
+Per-class depth swept per the no-magic-constants law (kernel + cpython,
+caps 512/8192/65536): kernel user CPU 123.6 / **116.5** / 119.4 s — depth
+8192 is the optimum (deeper lists keep cutting allocator calls but colder
+blocks cost more than the calls saved); cpython mildly prefers deeper.
+Default 8192, `TS_CHILDREN_CACHE_CAP` overrides.
+
+A/B (ledger, kernel): C-side allocations 273.2 M → **89.8 M (−67 %)**,
+C-side reallocs 6.42 M → 1.41 M (−78 %), C-side bytes 27.6 → 12.7 GB,
+**user CPU 129.1 → 116.4 s (−10 %, reproduced ×3), wall 10.32 → 9.33 s
+(−9.6 %)** — the largest single-pass wall win of the campaign, and the
+first to move the parse-bound core. RSS ~flat (3.86–4.24 GB), faults +2 %.
+Polyglot: TypeScript ts-allocs −60 %, Humanizer −57 % (user −10 %),
+cpython −41 %. Artifacts byte-identical (gin + Humanizer full-generation
+diffs empty, at the shipped default cap); the 4k+ vendored grammar corpus
+battery and the full 127-suite workspace gate (1,222 tests) green.
+Ledger entry in docs/wip/UPSTREAM.md (runtime patch table).
+
+### The per-grammar C-side examination (2026-09-01) — every grammar, one lever
+
+Owner directive: examine *each* tree-sitter grammar. Instruments: the
+langcorpus generator (`scripts/gen_langcorpus.py`, 45 languages from the
+vendored grammar test corpora) at ×1 and ×32 content (same file count, ~32×
+bytes — the delta isolates per-byte churn from per-parse setup), the ts
+shims' per-run counters, a static scanner audit, and a NEW `VORPAL_TS_SAMPLE`
+mask in the alloc ledger that backtrace-samples the tree-sitter C-side shims
+(C frames symbolize; separate mask so C and Rust sampling don't swamp each
+other).
+
+**Per-byte slopes** (allocs/KB on grammar-author corpus text; ranking signal,
+not absolute — real code is sparser): 18× spread, median 597. Heavy:
+Haskell 1931 (+243 reallocs/KB), Perl 1404, Kotlin 1246, Elixir 1151,
+OCaml 1147, Svelte 1124 (**+597 reallocs/KB** vs ~5 median), Dart 1093.
+Light: Yaml 106, Proto 136, GraphQL 220, Json 241. C = 403, Cpp = 505,
+TypeScript = 535. Scanner audit correlates: Perl's scanner carries 10
+alloc refs (slope #2), Haskell's is 3,471 lines (slope #1); most scanners
+allocate once, not per token.
+
+**Callsite attribution — the headline**: across the 45-grammar sweep,
+**43 grammars' top C-side site is one function — `stack__iter` under
+`ts_parser__reduce`** (24–93 % of each grammar's C allocations; C = 87.4 %,
+PowerShell = 93.0 %, CSharp = 91.8 %). Mechanism (vendored
+`vendor/tree-sitter/src/stack.c`): every reduction pops its children through
+a freshly `array_new`'d `SubtreeArray` that becomes the new internal node's
+child storage — ~one malloc per internal AST node, the heap-per-node floor
+of the runtime. Two secondary classes: `ts_subtree_new_node` growth chains
+(Svelte 33.5 % — the realloc storm), and the `ts_parser__recover` path
+(Xml 37.6 %, JsDoc 22.4 % lead with it; Haskell's #1 secondary) — recovery
+iteration churns hardest exactly on error-bearing files. At kernel scale
+`stack__iter` ≈ **~240 M of the 273 M C-side allocations (~88 %)** —
+estimated ~4-5 s of user CPU in allocator calls alone, before locality.
+
+**The lever is ONE change, not 49**: a tree-lifetime slab arena for subtree
+child arrays in the vendored runtime (allocated in chunks owned by the tree,
+freed wholesale with it), with realloc-in-arena support for the growth
+chains. Recorded as the next deep arc; grammar-side follow-ups stay
+secondary (Perl/Haskell scanner allocation habits, and the recover-path
+churn which rewards the existing parse-health gates).
+
+### Pass 18 — inline evidence alternatives: `AltSet` (2026-09-01)
+
+The post-pass-17 leader, `link_resolve` (15.5 %), allocated a `Vec<u32>` per
+evidence row with a non-empty tie set — `alt_ids[..alt_count].to_vec()` —
+even though the resolver already hands the alternatives as a fixed
+`[u32; MAX_RETAINED_ALTERNATIVES]` and the sidecar encodes a length byte
+plus a pool. `EvidenceRow.alternatives` is now `AltSet`, a flat
+`[u32; 8] + count` whose equality/ordering are slice semantics (exactly the
+old `Vec`) and whose reads go through `Deref<Target = [u32]>`; the
+conversion site takes the resolver's array by value, so a cap drift is a
+compile error. Decode is corrupt-tolerant (`from_iter_capped`).
+
+A/B (ledger kernel): allocations 11.65 → **9.91 M (−14.9 %)** — ~1.74 M
+kernel rows carried alternatives; bytes 44.06 → 44.21 GB (flat — the array
+rides in the row Vec). Polyglot: TypeScript −3.9 %, cpython −4.0 %, small
+corpora ~flat (few ties). Campaign totals: kernel allocations
+**171 M → 9.91 M (−94.2 %)**. **Byte-proof**: indexing Humanizer with the
+pre-pass-15 baseline binary and this one produces an identical
+`evidence.bin` SHA-256 and an EMPTY recursive diff over the entire
+generation directory — passes 15–18 are invisible in every artifact byte.
+Gate: full workspace `--no-fail-fast` = **127 suites, 1,222 tests green**
+(sole failure remains the docs/wip move's `format_policy` path; earlier
+"37-suite" gate counts were fail-fast truncations at that failure —
+recorded so future gates use `--no-fail-fast`). Sampler after: transform
+value computation (15.0 %) + template rendering (~15.6 % across
+`render_template`/`generate_replacement`/`indent_lines`) + the resolve
+interner (7.4 %) lead — the remaining `link_resolve` residue
+(`DataflowRow.expr` strings) left the top five.
+
+### Pass 17 — the last env clones: constraints, transforms, predicates (2026-09-01)
+
+Pass 16's post-histogram named three surviving `MetaVarEnv` cloners, each a
+borrow-the-env-and-let-the-first-write-clone-it protocol made expensive by
+warm (high-water-capacity) envs. All three now run clone-free:
+
+1. **`match_constraints`** snapshots just the constrained bindings (a
+   handful of node handles — the exact reads the old iterate-self,
+   write-a-copy protocol performed, preserving per-constraint candidate
+   identity), then runs the constraints on the live env under a trial:
+   failure rolls back byte-exactly, success commits in place.
+2. **`do_match`'s transform `enclosing` clone** is gated by
+   `Transform::needs_enclosing_env()`: only `rewrite` transforms read the
+   enclosing env (their sub-rule matching inherits its bindings) —
+   `replace`/`substring`/`convert` sets pass a shared empty env instead of
+   cloning the whole warm env per transformed match.
+3. **`OutlinePredicate::evaluate`** (`isImport`/`isExported`/`isPublic`
+   rules) probed with a borrowed env whose first write — a relational
+   label, a bind — cloned it per predicate per item, then dropped the clone
+   with the verdict. Core now exposes ONE safe speculative surface,
+   `MetaVarEnv::probe` (take → mark → run → rollback → restore): the
+   predicate sees the item's bindings, keeps nothing, allocates nothing.
+
+A/B (ledger, interleaved): kernel 36.54 → **11.65 M (−68.1 % vs the
+pre-pass-15 base)**, bytes 48.65 → 44.06 GB; polyglot: gin −22.3 %,
+Humanizer −33.7 %, spring-petclinic −32.1 %, TypeScript −49.2 %, cpython
+−26.1 %. Campaign totals: kernel allocations **171 M → 11.65 M (−93.2 %)**;
+user CPU flat (parse-bound). Gate: 806 tests / 37 release suites green
+(sole failure remains the docs/wip move's `format_policy` path). The raw
+scan path is untouched by construction (bare patterns carry no constraints,
+transforms, or predicates). Sampler after: the `MetaVarEnv::clone` family
+is GONE from the histogram; the leaders are now `link_resolve` string
+churn (15.5 %), transform value computation (13.5 % + 3.3 %), template
+rendering (~12 %), and the resolve interner (6.9 %) — different subsystems,
+each its own arc. Still on the old protocol (cold, recorded): the
+`nth_child` sibling probe.
+
+### Pass 16 — the rule engine stops cloning envs: mark/commit/rollback everywhere + env recycling (2026-09-01)
+
+Attribution first (the pass-2 sampler, shift 13): the two top kernel sites
+(~38 % of samples) both symbolized inside `MetaVarEnv` growth — and a
+diagnostic backtrace on a Toml-only corpus proved the `RawVec<Undo>` frame a
+**symbol-folding artifact** (LTO identical-code-folding merges same-layout
+`grow_one` bodies; there is no `RawVec<(&str, Node)>` symbol left in the
+binary at all). The real story was env BIRTH: every candidate × rule × bind
+bought vectors that failure threw away. Three coordinated cuts, each
+A/B-measured:
+
+1. **Scratch envs in the outline walk** (`MatcherExt::match_node_reusing` +
+   `MetaVarEnv::reset_for_reuse`): one env per file walk; failed attempts
+   reset-and-recycle it. Alone: kernel FLAT — the growth wasn't on the outer
+   env, which sits empty while rule internals clone.
+2. **Combinators trade the borrow-clone-discard protocol for
+   mark/commit/rollback** (`And`/`All`/`Any`/`Or`/`Not`, plus the ellipsis
+   probe from pass 15, all via one `CowEnvExt`): a failed branch is undone
+   byte-exactly on the live env, a winner commits in place (`commit` closes
+   the trial keeping writes; journal entries survive while any outer trial
+   is open, and drop at depth zero). Kernel 36.52 → 34.28 M (−6.1 %).
+3. **`Pattern::match_node_with_env` — the single biggest engine** — same
+   rewrite, plus success envs RECLAIMED into the scratch after `extract`
+   reads them (an outline `NodeMatch` dies moments after extraction; its
+   buffers are not live data). The interim reclaim-only build regressed
+   +550 K by warming envs that `Pattern`'s clone-per-bind then copied at
+   full high-water capacity — the sampler showed `MetaVarEnv::clone` under
+   `match_node_impl` jumping to 41.7 % — which is exactly why the Pattern
+   rewrite and the reclaim land together.
+
+A/B (ledger, kernel): allocations 36.53 M → **14.80 M (−59.5 %)**, bytes
+48.65 → 44.62 GB; polyglot: gin −19.7 %, Humanizer −24.0 %, spring-petclinic
+−31.7 %, TypeScript **−47.0 %**, cpython −24.8 % (an interim gin +1.2 %
+regression from the composite-only build inverted once Pattern stopped
+cloning). Campaign totals: kernel allocations **171 M → 14.8 M (−91.3 %)**.
+Counterbalanced quiet pairs: user 133.29 vs 133.78 s, wall 10.99 vs 11.25 s,
+RSS flat — CPU-neutral within run-order drift (indexing stays parse-bound;
+the wall gains of this campaign came from earlier passes and accrue with
+scale). The isolating scan bench (pass 15) reproduces **exactly** —
+272,475 allocations, matches byte-identical — the brackets add zero
+allocator traffic on the raw-pattern path. Gate: 806 tests / 37 release
+suites green (sole failure remains the docs/wip move's `format_policy`
+path). Sampler after: the matcher family is down to ~21 % of a 5× smaller
+total — `match_constraints`' Cow commit and `do_match`'s transform
+`enclosing` clone (recorded next), then `link_resolve` (12 %) leads.
+
+### Pass 15 — mark/rollback pattern matcher: ellipsis probes without env clones (2026-09-01)
+
+The lever pass 14 named, implemented by owner directive: the ellipsis
+lookahead probe in `may_match_ellipsis_impl` no longer clones the aggregator
+per candidate — it runs on the live aggregator between `mark()` and
+`rollback(mark)`. The `Aggregator` trait trades its `Clone` bound for
+`type Mark` + the pair; `ComputeEnd` restores its `usize`, and a
+`Cow<MetaVarEnv>` marks by stashing the borrow itself while untouched
+(rollback reassigns `Cow::Borrowed`, dropping any `to_mut` clone) or by an
+`EnvMark` once owned. `MetaVarEnv::rollback_to` replays an undo journal
+newest-first, then truncates the four assoc vecs to their marked lengths.
+The journal — armed only while a trial is open, entries only for non-append
+writes (slot overwrites move the old value in; label inner-pushes pop) —
+makes rollback **byte-exact**, not merely equivalent: `does_node_match_exactly`
+is non-transitive in one corner (named-leaf vs non-leaf text equality), so a
+leaked equality-checked overwrite could otherwise flip a later verdict.
+Probes roll back on success too (real consumption is re-done downstream),
+preserving the old discard-the-probe-clone semantics exactly; marks nest
+LIFO; `visit_nodes` re-adopts journal-held nodes. Two new tests pin
+original-node-identity restoration and LIFO nesting.
+
+Measured honestly, two different verdicts by workload:
+
+* **Index path: neutral, structurally.** Every ellipsis in the bundled
+  outline rules is terminal or trivia-followed (`($$$ARGS)`, `{ $$$BODY }`,
+  `{ $$$SPECIFIERS };`) — the probe loop needs an ellipsis followed by a
+  significant anchor and never executes during extraction. Ledger A/B:
+  kernel 36.516 → 36.513 M allocations (jitter), gin / Humanizer /
+  spring-petclinic / TypeScript / cpython all Δ<0.1 %. Counterbalanced quiet
+  kernel pairs (base,new,new,base): user CPU mean 132.47 vs 132.07 s, wall
+  mean 10.74 vs 10.74 s, RSS overlapping — the run-order drift exceeds any
+  side effect.
+* **Scan path (user patterns): −31 % matcher allocations.** Isolating bench
+  (counting `GlobalAlloc`, `find_all` of `$F($$$A, $L)` plus a
+  function-with-return anchor over 4.2 MB of real TypeScript —
+  checker/parser/utilities.ts ×3 reps; base built from a pristine HEAD
+  worktree): allocations 397,188 → **272,475 (−31.4 %)**, allocated bytes
+  62.0 → **36.7 MB (−40.8 %)**, matches byte-identical (41,358), counts
+  exactly reproducible across interleaved rounds; wall 203 → 200 ms.
+
+Gate: 806 tests across 37 release suites green; the sole failure
+(`format_policy::version_table_matches_the_constants`) reads
+`docs/INDEX_FORMAT.md`, which the in-flight docs → docs/wip move relocated —
+unrelated to this pass.
+
+### Pass 14 — root-scratch env seeding: measured-and-null, reverted (2026-09-01)
+
+Hypothesis: envs born empty per candidate re-pay vector growth, so a per-file
+scratch env (take-on-entry, restore-on-failure) should recycle capacity into
+every relational clone via the capacity-preserving `Clone`. Implemented
+through the outline matching loop, gated green (53 suites, goldens
+byte-identical) — and measured **null**: 36,511,750 vs 36,511,667 allocations
+(Δ83, run noise). The growth the histogram shows lives in per-branch pattern
+clones (ellipsis backtracking inside `match_node_impl`) that are discarded on
+branch failure — their capacity never reaches the root env, so the scratch
+accumulates nothing; successful envs depart with theirs. Clone-out-on-success
+variants price out negative (per-success row copies exceed per-attempt
+growth). The code was reverted; the genuine lever — eliminating the branch clones
+inside the pattern matcher itself (mark/rollback backtracking on the
+insertion-ordered env) — proceeds as the next pass by owner directive.
+
+### Pass 13 — the RSS giveback: real phase-boundary purges (2026-09-01)
+
+Two hypotheses for reclaiming pass-12's +~1.8 GB retained-dirty, measured in
+order. **narenas consolidation: rejected.** Sweeping `narenas:4/8/18/36`
+(kernel, decay-off binary) left peak footprint flat (4.34–4.55 GB — the
+retention is NOT per-arena duplication) while walls ballooned 15.5–19.7 s at
+flat user CPU: arena-mutex blocking under 14–18 allocation-heavy threads.
+
+The resident-per-stamp timeline then localized the stacking: stream retains
+~2.4 GB of dirty slab pages (3,430 MB resident at 1,024 MB live), and
+cochange/link allocate ~1.9 GB of FRESH pages on top (4,202 → 4,541 MB,
+flat to exit) — they never reused stream's pool (size-class mismatch), so
+releasing it at the boundary forfeits almost nothing. The repo already had
+the boundary hook: `release_freed_pages()`, placed at seven once-per-run
+phase-death points by the memory campaign — but it calls macOS
+`malloc_zone_pressure_relief`, a SYSTEM-allocator API that has been a silent
+no-op for as long as the binary has linked jemalloc; default decay did the
+releasing and masked it, and decay-off unmasked it. The fn now purges
+jemalloc's dirty pages via `arena.<MALLCTL_ARENAS_ALL>.purge` (an action
+node that genuinely supports the ALL sentinel; decay-independent), behind a
+target-gated `jemalloc` feature forwarded from the index binary — embedder
+builds keep the zone call.
+
+A/B vs pass-12 (ledger kernel): post-stream resident **4,541 → ≤2,429 MB
+flat (−2.1 GB)**, final resident **4,541 → 1,832 MB**, peak footprint
+4.57 → **4.15 GB** (the remaining peak sits inside the stream drain window,
+bounded by the streaming byte budget — scale-safe); faults 477 K → 582 K
+(+105 K of genuinely forfeited reuse; still **−74 %** vs the 2.246 M
+decay-on baseline), sys +0.5 s of bulk madvise, user CPU and allocation
+counters unchanged. The measured frontier now stands recorded:
+{decay-on: 2.58 GB peak, 2.25 M faults, sys 10.6 s} ↔
+{decay-off + purges: 4.15 GB peak / 1.83 GB final, 0.58 M faults, sys 7.3 s}.
+
+### Pass 12 — fault economics: decay-off for batch runs (2026-09-01)
+
+Per-phase attribution put 71 % of the kernel build's 2.25 M page faults in the
+stream phase, with `cow=86, pageins=0`: almost all were soft faults re-touching
+pages jemalloc's default decay had purged mid-run while ~65 GB of churn cycled
+through a ~1 GB live set. Knob battery on the unmodified binary
+(`MALLOC_CONF`/`_RJEM_MALLOC_CONF`, kernel corpus):
+
+| conf | faults | sys | user | wall | peak footprint |
+|---|---|---|---|---|---|
+| defaults (baseline) | 2,245,820 | 10.6 s | 128.7 s | 10.91 s | 2.58 GB |
+| `dirty_decay_ms:-1,muzzy_decay_ms:-1` | **474,390** | **6.60 s** | 127.6 s | **10.22 s** | 4.36 GB |
+| `oversize_threshold:0` | 2,248,306 | 10.9 s | 129.8 s | 11.00 s | 2.58 GB |
+| both | 659,414 | 6.95 s | 133.5 s | 10.74 s | 4.35 GB |
+
+Verdict: decay-off wins outright (−79 % faults, −4 s sys); `oversize_threshold`
+is measured-and-rejected (fault-flat alone, +5 s user combined). Shipped as a
+runtime `mallctl` at the **`index` command arm only** — a batch process whose
+retained pages die at exit — while the long-lived daemon/serve paths keep
+default decay (that decay is what returns their idle memory). The +~1.8 GB
+peak-footprint trade is recorded as the explicit next target (phase-boundary
+purge + narenas consolidation), not accepted.
+
+Shipping the sentinel exposed an upstream bug: jemalloc 5.3.1's
+`arena_i_decay_ms_ctl_impl` admits `MALLCTL_ARENAS_ALL` through the mib
+resolver but never checks for it, so `arena_get(tsdn, 4096, …)` indexes one
+past the `MALLOCX_ARENA_LIMIT`-slot arenas array and dereferences garbage —
+observed as `EXC_BAD_ACCESS` in `pac_decay_ms_set` (lldb). Fixed at the
+source: `tikv-jemalloc-sys 0.7.1` is vendored (`vendor/tikv-jemalloc-sys`,
+`[patch.crates-io]`, tree-sitter precedent) with the handler mirroring
+`arena_i_decay`'s ALL branch — writes iterate every initialized arena, ALL
+reads return `EINVAL`; the smoke test is the exact crashing path. In-binary
+A/B (ledger kernel, four runs): faults 471–487 K (−79 %), sys 6.1–6.5 s,
+user 126.0–127.3 s (campaign best), wall best 10.54 s quiet (wall readings
+noisy under ambient load; the load-invariant counters agree across all runs);
+allocation counters unchanged (this is a fault pass).
+
+### Pass 11 — interned env keys + high-water clones (2026-09-01)
+
+The match engine owned ~46 % of post-pass-10 allocation samples, split across
+three env sites: `insert`'s key `to_string` per fresh capture (16.0 %), the
+assoc-vec growth under it (13.5 %), and `add_label`'s `secondary` growth
+(16.2 %) — the latter two amplified by copy-on-write env clones whose derived
+`Clone` produced exact-capacity vectors, so the very next push after every
+clone reallocated. Two changes, both inside `meta_var.rs`: keys are now
+interned `&'static str` (`intern_var` — a thread-local cache over a leak-once
+global set; the name universe is compile-bounded rule meta-vars, and the hot
+path touches no shared memory), and a custom `Clone` preserves each vector's
+capacity — the source's own high-water mark, data-derived slack with no
+constants. Read surfaces (`get_matched_variables`, the `HashMap` export)
+reconstruct owned Strings on their cold paths. A/B (ledger kernel, quiet):
+allocations 50.50 M → **36.51 M (−14.0 M, −27.7 %)**, reallocs 4.56 M →
+**3.36 M (−26.4 %)**, faults FLAT at 2.25 M (the passes-9/10 rise stopped),
+wall 10.91 s (within noise of the 10.84 s best), user CPU flat; tree-sitter
+counters byte-identical. Campaign totals, passes 1–11: kernel allocations
+**171 M → 36.5 M (−78.7 %)**, reallocs 16.9 M → 3.36 M (−80.1 %), ledger
+wall 13.46 s → ~10.9 s.
+
+### Pass 10 — fresh parses never materialize the product (2026-09-01)
+
+`own_entry` (two `String`s per definition) plus the reference/request/param
+owning block were ~35 % of post-pass-9 allocation samples — all spent
+detaching extraction from its parse tree into an owned `FileProduct` whose
+only stream-path job was crossing the worker→committer channel. Extraction
+now has one body (`extract_with`) handing **borrowed** parts to one of two
+finishes: the owning finish keeps `extract_product` byte-identical for the
+batch path and tests, and the encoding finish (`encode_parts_into`, the
+byte-for-byte twin of `encode_product_into`, pinned equal by a full-section
+battery) serializes straight into stamped `.vpb` bytes. Those bytes cross
+the channel (`StreamWork::ParsedEncoded`); the committer decodes views off
+them and applies through the existing view kernel, then **moves the same
+buffer** on into the pack sink — a single-owner chain
+worker → committer → pack thread with no `Arc` and no copy (the pack's
+canonical path-sort makes arrival order irrelevant; policy-excluded files
+still bank from the worker, which is the only place they exist). The
+encoded and owned fresh-parse paths are pinned to byte-identical sealed
+output. A/B (ledger kernel, quiet): allocations 75.30 M → **50.50 M
+(−24.8 M, −32.9 % — the largest single-pass cut of the campaign)**, user
+CPU −1.6 s, wall 10.89 s → **10.84 s** (campaign best); reallocs flat;
+tree-sitter counters byte-identical. Honest counters: cumulative churn
++1.1 GB and faults 2.121 M → 2.253 M (+132 K, reproduced on both runs) —
+the per-file buffer lifecycle shifted (fresh encode/view vectors instead of
+recycled product strings); CPU and wall pay for it several times over, but
+the fault trend across passes 9–10 is a standing watch item. Campaign
+totals, passes 1–10: kernel allocations **171 M → 50.5 M (−70.5 %)**,
+reallocs 16.9 M → 4.56 M (−73 %), ledger wall 13.46 s → 10.84 s (−19.5 %).
+
+### Pass 9 — identity paths without the Strings (2026-08-31)
+
+The two `layout_entity_paths` sites were ~19 % of post-pass-8 allocation samples:
+the committer built a `Vec<String>` of entity paths per file solely to hand the
+writer transient `&str`s, and the worker built the same `Vec<String>` solely so
+`owner_of_entity` could read each path's first `.`-segment. Both now share one
+renderer, `write_entity_path_into`: the writer renders each identity into a
+single reused buffer inline in its ingest walk (the caller-supplied-layout
+variant is folded back in — lockstep by shared code instead of a debug
+assertion), and the worker keeps a borrowed `EntityIdentity { owner, name,
+discriminator }` per layout slot (one `Vec` per file), reconstructing the owner
+segment on demand with a unit battery pinning reconstruction ≡ rendered-path
+`split('.')` per branch. A/B (ledger kernel, quiet re-run): allocations
+95.38 M → **75.30 M (−20.1 M, −21.1 %)**, reallocs 10.18 M → **4.56 M
+(−55.2 %** — the layout `format!` growth chains**)**, user CPU −4.6 s, wall
+11.67 s → **10.89 s** (campaign best). Faults 2.048 M → 2.121 M (+73 K,
+reproduced on both runs — an allocator size-class shift, outweighed by the
+CPU/wall win); tree-sitter-side counters byte-identical (parser untouched).
+Campaign totals, passes 1–9: kernel allocations **171 M → 75.3 M (−56.0 %)**,
+reallocs 16.9 M → 4.56 M (−73 %), ledger wall 13.46 s → 10.89 s (−19.1 %).
+
+### Pass 8 — dedicated secondary-label storage (2026-08-31)
+
+`"secondary"` is the only label the workspace ever adds — every relational
+sub-match (`inside`/`has`/`precedes`/`follows`, pervasive in outline rules)
+pushes one, and the map/assoc form allocated a key `String` plus a
+one-element `Vec` per env, re-cloned on every copy-on-write env clone. The
+label now lives in a dedicated `Vec<Node>` field with the old behavior
+reconstructed on every read surface: `get_labels`, the matched-variables
+listing, the JSON env export, and `visit_nodes`' cross-thread re-adoption.
+A/B (ledger kernel): allocations 118.2 M → **95.4 M (−22.8 M, −19.3 % —
+the largest single-pass cut of the campaign)**, reallocs −1.4 M. Campaign
+totals, passes 1–8: kernel allocations **171 M → 95.4 M (−44.2 %)**, faults
+2.26 M → 2.05 M, reallocs 16.9 M → 10.2 M.
+
+### Pass 7 — `'static` kind names end to end (2026-08-31)
+
+tree-sitter kind names live in the compiled grammar with `'static` storage;
+the source trait's `Cow<'_, str>` erased that, so `extract_entry` built one
+`String` per extracted definition — 8.8 M per kernel index — which product
+assembly immediately interned and dropped. A defaulted `kind_static()`
+trait method (tree-sitter backend overrides it; every other Doc keeps the
+default `None`) lets the entry borrow the name. A/B (ledger kernel):
+allocations 127.46 M → **118.19 M (−9.27 M)**; wall confirmed **10.97 s**
+on a quiet re-run (a first 14.2 s reading was external machine noise —
+user CPU flat across both; wall spikes get re-run before they get
+recorded). Campaign totals, passes 1–7: kernel allocations **171 M →
+118.2 M (−30.9 %)**, faults 2.26 M → 2.03 M, ledger wall 13.46 → ~11.0 s.
+
+### Pass 6 — span-indexed entity attribution (2026-08-31)
+
+`apply_parts` now maps every entity index straight into the NodeId array
+`ingest_file_with_layout` already returns — index-aligned with product
+layout order by construction — replacing the per-row canonical lookup that
+blake3-hashed path+entity strings and probed a hash map for every
+reference, parameter-ledger, sketch, and request row (~5.8 M rows per
+kernel link). Correctness pinned by the streamed≡batch identity and
+serial-specification suites. A/B (ledger kernel): instructions 1.892 T →
+**1.866 T (−26 G)**, user CPU −3.8 s, cumulative bytes −800 MB; allocation
+count ~flat — this pass buys CPU and cache locality rather than churn.
+Ranked next arcs: the stream-phase churn monster (155 M Rust allocs — needs
+the 1-in-N backtrace attribution sampler), the remaining serial phases
+(cochange 0.36 s, seal:compact 0.36 s, kg save 0.48 s, content-id hashing's
+3.9 GB buffer reads → streaming/mmap, mandatory at 2 B-LOC scale), resolver
+path-probe string churn, a channel-depth/committer sweep (chfull 2.7 K), and
+the tree-sitter per-parser arena question (273 M C-side allocations,
+already jemalloc-routed).
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

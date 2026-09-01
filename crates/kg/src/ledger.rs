@@ -103,15 +103,26 @@ pub fn note_realloc(new_bytes: usize) {
 #[inline]
 pub fn note_ts_alloc(bytes: usize) {
   let s = slot();
-  s.ts_allocs.fetch_add(1, Ordering::Relaxed);
+  let n = s.ts_allocs.fetch_add(1, Ordering::Relaxed);
   s.ts_alloc_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+  let mask = TS_SAMPLE_MASK.load(Ordering::Relaxed);
+  if mask != 0 && (n & mask) == 0 {
+    sample_backtrace(s, bytes);
+  }
 }
 
 #[inline]
 pub fn note_ts_realloc(new_bytes: usize) {
   let s = slot();
-  s.ts_reallocs.fetch_add(1, Ordering::Relaxed);
+  let n = s.ts_reallocs.fetch_add(1, Ordering::Relaxed);
   s.ts_alloc_bytes.fetch_add(new_bytes as u64, Ordering::Relaxed);
+  // Reallocs sample under the same TS mask: the per-grammar sweep showed
+  // realloc-storm outliers (hundreds per KB against a ~5 median) whose
+  // growth chains are exactly what the backtrace names.
+  let mask = TS_SAMPLE_MASK.load(Ordering::Relaxed);
+  if mask != 0 && (n & mask) == 0 {
+    sample_backtrace(s, new_bytes);
+  }
 }
 
 #[inline]
@@ -145,14 +156,28 @@ pub static CHAN_FULL: AtomicU64 = AtomicU64::new(0);
 /// never lazily from allocator context (env reads allocate).
 static SAMPLE_MASK: AtomicU64 = AtomicU64::new(0);
 
-/// Read `VORPAL_ALLOC_SAMPLE` and arm sampling. Call from `main`, never from
-/// allocator context.
+/// Sampling mask for the tree-sitter C-side shims (`VORPAL_TS_SAMPLE=<shift>`)
+/// — separate from the Rust mask so a per-grammar parse profile can sample
+/// the C side densely without the Rust sites swamping the table (or vice
+/// versa). Backtraces through the vendored runtime symbolize C frames
+/// (subtree pool, lexer arrays, external scanners), which is what attributes
+/// each grammar's parse churn to actual callsites.
+static TS_SAMPLE_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Read `VORPAL_ALLOC_SAMPLE` / `VORPAL_TS_SAMPLE` and arm sampling. Call
+/// from `main`, never from allocator context.
 pub fn init_sampling_from_env() {
   if let Some(shift) = std::env::var("VORPAL_ALLOC_SAMPLE")
     .ok()
     .and_then(|v| v.parse::<u32>().ok())
   {
     SAMPLE_MASK.store((1u64 << shift.min(40)) - 1, Ordering::Relaxed);
+  }
+  if let Some(shift) = std::env::var("VORPAL_TS_SAMPLE")
+    .ok()
+    .and_then(|v| v.parse::<u32>().ok())
+  {
+    TS_SAMPLE_MASK.store((1u64 << shift.min(40)) - 1, Ordering::Relaxed);
   }
 }
 

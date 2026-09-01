@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include "./alloc.h"
 #include "./array.h"
+#include "./children_cache.h"
 #include "./atomic.h"
 #include "./subtree.h"
 #include "./length.h"
@@ -70,7 +71,11 @@ void ts_subtree_array_copy(SubtreeArray self, SubtreeArray *dest) {
   dest->capacity = self.capacity;
   dest->contents = self.contents;
   if (self.capacity > 0) {
-    dest->contents = ts_calloc(self.capacity, sizeof(Subtree));
+    // VORPAL: children blocks come from the thread-local cache (zeroing was
+    // incidental — reads are bounded by `size`).
+    size_t bytes = (size_t)self.capacity * sizeof(Subtree);
+    dest->contents = ts_children_alloc(&bytes);
+    dest->capacity = (uint32_t)(bytes / sizeof(Subtree));
     memcpy(dest->contents, self.contents, self.size * sizeof(Subtree));
     for (uint32_t i = 0; i < self.size; i++) {
       ts_subtree_retain(*array_get(dest, i));
@@ -87,7 +92,12 @@ void ts_subtree_array_clear(SubtreePool *pool, SubtreeArray *self) {
 
 void ts_subtree_array_delete(SubtreePool *pool, SubtreeArray *self) {
   ts_subtree_array_clear(pool, self);
-  array_delete(self);
+  // VORPAL: return the children block to the thread-local cache (capacity is
+  // the block's physical size on every array-flavored path).
+  ts_children_free_exact(self->contents, (size_t)self->capacity * sizeof(Subtree));
+  self->contents = NULL;
+  self->size = 0;
+  self->capacity = 0;
 }
 
 void ts_subtree_array_remove_trailing_extras(
@@ -126,8 +136,11 @@ SubtreePool ts_subtree_pool_new(uint32_t capacity) {
 
 void ts_subtree_pool_delete(SubtreePool *self) {
   if (self->free_trees.contents) {
+    // VORPAL: pooled leaf headers outlive the pool via the thread-local
+    // cache — `ts_tree_delete`'s throwaway pool otherwise discards every
+    // leaf of every dropped tree, and the next file re-mallocs them.
     for (unsigned i = 0; i < self->free_trees.size; i++) {
-      ts_free(array_get(&self->free_trees, i)->ptr);
+      ts_leaf_cache_free(array_get(&self->free_trees, i)->ptr);
     }
     array_delete(&self->free_trees);
   }
@@ -138,7 +151,8 @@ static SubtreeHeapData *ts_subtree_pool_allocate(SubtreePool *self) {
   if (self->free_trees.size > 0) {
     return array_pop(&self->free_trees).ptr;
   } else {
-    return ts_malloc(sizeof(SubtreeHeapData));
+    // VORPAL: miss falls through to the thread-local leaf cache.
+    return ts_leaf_cache_alloc(sizeof(SubtreeHeapData));
   }
 }
 
@@ -146,7 +160,8 @@ static void ts_subtree_pool_free(SubtreePool *self, SubtreeHeapData *tree) {
   if (self->free_trees.capacity > 0 && self->free_trees.size + 1 <= TS_MAX_TREE_POOL_SIZE) {
     array_push(&self->free_trees, (MutableSubtree) {.ptr = tree});
   } else {
-    ts_free(tree);
+    // VORPAL: overflow goes to the thread-local leaf cache, not the heap.
+    ts_leaf_cache_free(tree);
   }
 }
 
@@ -259,7 +274,9 @@ Subtree ts_subtree_new_error(
 // Clone a subtree.
 MutableSubtree ts_subtree_clone(Subtree self) {
   size_t alloc_size = ts_subtree_alloc_size(self.ptr->child_count);
-  Subtree *new_children = ts_malloc(alloc_size);
+  // VORPAL: cache-born (bytes rounds up to the class actually provided).
+  size_t bytes = alloc_size;
+  Subtree *new_children = ts_children_alloc(&bytes);
   Subtree *old_children = ts_subtree_children(self);
   memcpy(new_children, old_children, alloc_size);
   SubtreeHeapData *result = (SubtreeHeapData *)&new_children[self.ptr->child_count];
@@ -489,8 +506,15 @@ MutableSubtree ts_subtree_new_node(
   // Allocate the node's data at the end of the array of children.
   size_t new_byte_size = ts_subtree_alloc_size(children->size);
   if (children->capacity * sizeof(Subtree) < new_byte_size) {
-    children->contents = ts_realloc(children->contents, new_byte_size);
-    children->capacity = (uint32_t)(new_byte_size / sizeof(Subtree));
+    // VORPAL: grow through the thread-local cache (the realloc-storm site in
+    // extras-heavy grammars); the outgrown block returns to the cache.
+    size_t old_bytes = (size_t)children->capacity * sizeof(Subtree);
+    size_t want = new_byte_size;
+    Subtree *grown = ts_children_alloc(&want);
+    memcpy(grown, children->contents, (size_t)children->size * sizeof(Subtree));
+    ts_children_free_exact(children->contents, old_bytes);
+    children->contents = grown;
+    children->capacity = (uint32_t)(want / sizeof(Subtree));
   }
   SubtreeHeapData *data = (SubtreeHeapData *)&children->contents[children->size];
 
@@ -583,7 +607,10 @@ void ts_subtree_release(SubtreePool *pool, Subtree self) {
           array_push(&pool->tree_stack, ts_subtree_to_mut_unsafe(child));
         }
       }
-      ts_free(children);
+      // VORPAL: return the children block to the thread-local cache. The
+      // hint reconstructs the birth class (round-up of alloc_size(count) ≤
+      // physical size on every audited flow).
+      ts_children_free_node(children, ts_subtree_alloc_size(tree.ptr->child_count));
     } else {
       if (tree.ptr->has_external_tokens) {
         ts_external_scanner_state_delete(&tree.ptr->external_scanner_state);

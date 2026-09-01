@@ -1,7 +1,7 @@
 use crate::language::Language;
 use crate::match_tree::{MatchStrictness, match_end_non_recursive, match_node_non_recursive};
 use crate::matcher::{KindMatcher, KindMatcherError, Matcher, kind_utils};
-use crate::meta_var::{MetaVarEnv, MetaVariable};
+use crate::meta_var::{CowEnvExt, MetaVarEnv, MetaVariable};
 use crate::source::SgNode;
 use crate::{Doc, Node, Root};
 
@@ -431,14 +431,23 @@ impl Matcher for Pattern {
     {
       return None;
     }
-    // do not pollute the env if pattern does not match
-    let mut may_write = Cow::Borrowed(env.as_ref());
-    let node = match_node_non_recursive(self, node, &mut may_write)?;
-    if let Cow::Owned(map) = may_write {
-      // only change env when pattern matches
-      *env = Cow::Owned(map);
+    // do not pollute the env if the pattern does not match: the attempt runs
+    // on the live env under a mark — rollback undoes a failed attempt
+    // byte-exactly, a matched one commits in place. (The old protocol probed
+    // a `Cow::Borrowed` whose first bind cloned the whole env per candidate
+    // — the single largest stream-phase allocation site once the outline
+    // loop began recycling warm envs.)
+    let mark = env.env_mark();
+    match match_node_non_recursive(self, node, env) {
+      Some(node) => {
+        env.env_commit(mark);
+        Some(node)
+      }
+      None => {
+        env.env_rollback(mark);
+        None
+      }
     }
-    Some(node)
   }
 
   fn potential_kinds(&self) -> Option<bit_set::BitSet> {

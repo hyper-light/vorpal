@@ -4,12 +4,33 @@
 #include "./array.h"
 #include "./stack.h"
 #include "./length.h"
+#include "./children_cache.h"
 #include <assert.h>
 #include <inttypes.h>
 #include <stdio.h>
 
 #define MAX_LINK_COUNT 8
+// VORPAL: upstream fixed this at 50; overridable for the sweep recorded in
+// BENCHMARKS (`TS_STACK_NODE_POOL`), read once. On targets without pthreads
+// (wasm, MSVC) the upstream constant stands.
+#if defined(_WIN32) || defined(__wasm__) || defined(__EMSCRIPTEN__)
 #define MAX_NODE_POOL_SIZE 50
+#else
+#define MAX_NODE_POOL_SIZE ts_stack_node_pool_cap()
+static long ts_snp_cap = 50;
+static pthread_once_t ts_snp_once = PTHREAD_ONCE_INIT;
+static void ts_snp_init(void) {
+  const char *cap = getenv("TS_STACK_NODE_POOL");
+  if (cap) {
+    long v = strtol(cap, NULL, 10);
+    if (v >= 0) ts_snp_cap = v;
+  }
+}
+static inline long ts_stack_node_pool_cap(void) {
+  (void)pthread_once(&ts_snp_once, ts_snp_init);
+  return ts_snp_cap;
+}
+#endif
 #define MAX_ITERATOR_COUNT 64
 
 #if defined _WIN32 && !defined __GNUC__
@@ -342,7 +363,14 @@ static StackSliceArray stack__iter(
   bool include_subtrees = false;
   if (goal_subtree_count >= 0) {
     include_subtrees = true;
-    array_reserve(&new_iterator.subtrees, (uint32_t)ts_subtree_alloc_size(goal_subtree_count) / sizeof(Subtree));
+    // VORPAL: carve the children block from the thread-local cache instead
+    // of malloc — `ts_subtree_new_node` claims it in place on pop and it
+    // returns to the cache when the node is released. This is the birth
+    // site of ~one allocation per internal AST node (24–93 % of every
+    // grammar's C-side allocations, ledger-profiled).
+    size_t bytes = ts_subtree_alloc_size((uint32_t)goal_subtree_count);
+    new_iterator.subtrees.contents = ts_children_alloc(&bytes);
+    new_iterator.subtrees.capacity = (uint32_t)(bytes / sizeof(Subtree));
   }
 
   array_push(&self->iterators, new_iterator);
