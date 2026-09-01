@@ -65,6 +65,9 @@ migration, policy #1). The format is a property of a generation, never mixed wit
 | product pack, legacy flat layout (`products.pack`/`products.idx`) — deprecated, written only under `VORPAL_FORMAT=flat`; reads retained | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
 | evidence sidecar (`evidence.bin`) | `VERSION` (crates/kg/src/evidence.rs) | 2 | sidecar treated as absent → `why` reports no evidence |
+| edge slabs (`edges/<k>.bin` + toc) | `VERSION` (crates/kg/src/edgestore.rs) | 1 | family treated as absent → scoped composes decline; next full build rewrites it |
+| usage postings (`usage/<k>.bin` + toc) | `VERSION` (crates/kg/src/usagestore.rs) | 1 | family treated as absent → scoped composes decline; next full build rewrites it |
+| sigs sketch ledger (`sigs/<k>.bin` + toc) | `VERSION` (crates/kg/src/sigstore.rs) | 2 | prior generation neither reused nor composed from → full pipeline rebuilds the family |
 | data-flow sidecar (`dataflow.bin`) | `VERSION` (crates/kg/src/dataflow.rs) | 1 | load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows) |
 | lexical posting tier (`postings.bin`) | `VERSION` (crates/index/src/postings.rs) | 1 | scan fallback → warm rebuilds |
 | embedding semantics (`ann.model.json`) | `LEXICAL_EMBED_VERSION` (crates/ann/src/embed.rs) | 2 | ANN tier distrusted → exact fallback → warm rebuilds |

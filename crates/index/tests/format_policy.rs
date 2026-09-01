@@ -73,6 +73,27 @@ fn version_table_matches_the_constants() {
       "sidecar treated as absent → `why` reports no evidence",
     ),
     (
+      "edge slabs (`edges/<k>.bin` + toc)",
+      "VERSION",
+      "crates/kg/src/edgestore.rs",
+      version_of("crates/kg/src/edgestore.rs", "VERSION"),
+      "family treated as absent → scoped composes decline; next full build rewrites it",
+    ),
+    (
+      "usage postings (`usage/<k>.bin` + toc)",
+      "VERSION",
+      "crates/kg/src/usagestore.rs",
+      version_of("crates/kg/src/usagestore.rs", "VERSION"),
+      "family treated as absent → scoped composes decline; next full build rewrites it",
+    ),
+    (
+      "sigs sketch ledger (`sigs/<k>.bin` + toc)",
+      "VERSION",
+      "crates/kg/src/sigstore.rs",
+      version_of("crates/kg/src/sigstore.rs", "VERSION"),
+      "prior generation neither reused nor composed from → full pipeline rebuilds the family",
+    ),
+    (
       "data-flow sidecar (`dataflow.bin`)",
       "VERSION",
       "crates/kg/src/dataflow.rs",

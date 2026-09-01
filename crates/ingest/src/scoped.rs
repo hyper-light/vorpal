@@ -772,10 +772,22 @@ pub fn scoped_similar_repair(
   file_key: u64,
   fresh_file_sigs: &[SigRow],
 ) -> io::Result<SimilarRepair> {
+  // Canonicalize the fresh run to the family's own law before splicing: content-total
+  // sort, one row per node, survivor = smallest (shingles, sketch) — exactly what
+  // `similar_pairs` produces and the sigs family persists. The raw run arrives in
+  // PRODUCT LAYOUT order, which is non-monotone on duplicate-collapsed files (a signed
+  // definition collapsing onto an earlier declaration's ordinal lands out of order) and
+  // can carry two rows for one node; without this, the short-circuit below missed on
+  // every such file even when no sketch changed.
+  let mut fresh: Vec<SigRow> = fresh_file_sigs.to_vec();
+  fresh.sort_unstable_by(|a, b| {
+    (a.node, a.shingles, &a.sketch).cmp(&(b.node, b.shingles, &b.sketch))
+  });
+  fresh.dedup_by_key(|r| r.node);
   // Swap the edited file's run in place: prior rows are canonically sorted and a file's
   // rows are contiguous at its (bucket, key) position, so splicing the fresh run at the
   // old run's position preserves the global feed order the ceiling depends on.
-  let mut rows: Vec<SigRow> = Vec::with_capacity(prior_rows.len() + fresh_file_sigs.len());
+  let mut rows: Vec<SigRow> = Vec::with_capacity(prior_rows.len() + fresh.len());
   let mut spliced = false;
   for row in prior_rows {
     let Some((key, _)) = map.locate(
@@ -786,7 +798,7 @@ pub fn scoped_similar_repair(
     };
     if key == file_key {
       if !spliced {
-        rows.extend(fresh_file_sigs.iter().cloned());
+        rows.extend(fresh.iter().cloned());
         spliced = true;
       }
       continue; // the old run is replaced wholesale
@@ -809,7 +821,7 @@ pub fn scoped_similar_repair(
           .unwrap_or(false)
       });
     let tail = rows.split_off(position);
-    rows.extend(fresh_file_sigs.iter().cloned());
+    rows.extend(fresh.iter().cloned());
     rows.extend(tail);
   }
   // EXACT short-circuit: identical input rows are a pure-function guarantee of

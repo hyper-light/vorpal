@@ -1006,6 +1006,53 @@ explicit-`next` lane certifies the bare default. QUEUED NEXT: the pairing-feed o
 law (canonicalize to (bucket, key, ordinal) now that the flat byte-identity law is no
 longer load-bearing), then multi-file compose sessions (S2).
 
+#### The pairing-feed order law (2026-09-01) — pairs become a pure function of the multiset
+
+The recorded finding held under measurement, and it was sharper than "order": the feed
+can carry TWO rows for ONE node id. The writer collapses same-(entity_path, signature)
+entities onto one node — C decl+def, and cfg-ARM DOUBLE DEFINITIONS (two `#ifdef`
+branches of the same function; the extractor does not preprocess) — and both occurrences
+can sign with different sketches. Census (temporary probe at `similar_pairs` entry):
+**kernel 639,554 rows → 548 duplicate node ids, 543 content-differing; ast-grep 2,128 →
+4, all 4 differing** (so the case is cross-language, not a C quirk). The survivor was
+whatever the node-keyed UNSTABLE sort left first — deterministic per feed arrangement,
+NOT per multiset: bulk stream, retained RAM, and scoped splice arrangements agreed only
+by coincidence. Everything downstream of the dedup (band keys, ceiling truncation, star
+hubs) already walks the node-sorted sequence, so the dedup was the single point of
+order-dependence in the whole pass.
+
+THE LAW: sort by full row content `(node, shingles, sketch)`, dedup by node — survivor =
+smallest content. Pairs and family rows are now a pure function of the row MULTISET by
+construction (unit-pinned: both feed arrangements of a content-differing duplicate yield
+identical pairs and rows). `scoped_similar_repair` canonicalizes the fresh run the same
+way before splicing (the raw run arrives in product-layout order — non-monotone on
+collapsed files, duplicates possible — which is exactly why the EXACT short-circuit
+missed on such files even when no sketch changed).
+
+The survivor change is OUTPUT-changing where duplicates exist, so it rides a version:
+**sigs family VERSION 1 → 2**, and `build_index` gains ONE family-law gate where the
+prior generation is admitted — a v1-family prior is neither reused (whole-tree lane
+included) nor composed from (cutoff/respan/c-2/c-3), stamped loudly; the full pipeline
+rebuilds the family once and every fast lane reopens. Without that gate the byte-carry
+lanes would perpetuate v1 survivor bytes while scratch now writes v2 — silent
+scratch≢incremental. The version table gains the three family rows (edges 1, usage 1,
+sigs 2) alongside the existing evidence row.
+
+Gates: unit invariance pin; dup-collapsed C fixture through the defs-changed compose
+with a NON-VACUITY assertion (two signature records must bridge onto one node id with
+differing sketches — the test refuses to pin nothing); kernel scratch determinism ×2
+(generation id moved ONCE: 8e146313… → 04d3845f…, the 543 survivors); both toggle
+directions byte-converge; v1→v2 migration lane proven live (old-law binary builds, new
+binary declines loudly and full-rebuilds to exactly the new-law scratch id, no-edit
+reuse correctly refused); battery 24/24; suite green; clippy 0/0 both lanes.
+STRUCTURAL A/B (pinned binaries, same edit): old law RAN banding on the kernel tiny-fn
+append (`similar: … candidates` stamped), new law short-circuited (no stamp);
+interleaved walls **1.28 s → 1.18 s** (two rounds each, exact repeats). The earlier
+~0.9–1.0 s guess overestimated banding's share of this shape; the honest win is ~0.10 s
+plus the constructive guarantee. The generation id is stat-sensitive by design (the
+manifest rides the fold): re-appending the same bytes after a revert yields a NEW id —
+convergence comparisons are always within one tree state.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

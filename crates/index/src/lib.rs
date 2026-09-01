@@ -619,9 +619,23 @@ fn build_index_inner(
   // read, no CSR rebuild. An unreadable/corrupt index falls through to a rebuild instead of
   // wedging every subsequent run on the same error.
   if let Ok(prior_manifest) = Manifest::load(&manifest_path) {
+    // Family-law compatibility: a bucketed prior whose sigs family predates the current
+    // survivor law (family VERSION mismatch) is not reused and not composed from — every
+    // carry lane (whole-tree reuse, cutoff, respan, the scoped composes) would
+    // perpetuate the old family's bytes while a scratch build of the same tree now
+    // writes the new law's, breaking scratch ≡ incremental. One loud decline; the full
+    // pipeline rebuilds the family once and every fast lane reopens.
+    let prior_families_current = !prior.join(vorpal_kg::SIGS_TOC).is_file()
+      || vorpal_kg::SigStore::open(&prior).is_some();
+    if !prior_families_current {
+      vorpal_kg::phase_stamp(
+        "compose: prior sigs family is a previous version — full pipeline rebuilds it",
+      );
+    }
     if manifest.unchanged_since(&prior_manifest)
       && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
       && !verify_all
+      && prior_families_current
       && policy.mode == ParseHealthMode::Warn
       // Readiness is FORMAT-AWARE: a bucketed generation's node store answers through
       // its TOC (graph.bin is a lazy cache there, legitimately absent); the flat names
@@ -685,6 +699,7 @@ fn build_index_inner(
     vorpal_ingest::verify_env_extraction(&extractor, &env.canaries).map_err(io::Error::other)?;
     if !verify_all
       && policy.mode == ParseHealthMode::Warn
+      && prior_families_current
       && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
     {
       let ctx = CutoffContext {

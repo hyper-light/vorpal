@@ -143,6 +143,99 @@ fn a_definition_removed_converges() {
 }
 
 #[test]
+fn a_duplicate_collapsed_file_composes_and_converges() {
+  // THE ORDER LAW's end-to-end pin: a C file carrying two cfg-arm DEFINITIONS of the
+  // same function (same entity_path, same signature — the writer collapses them onto
+  // one node id, and BOTH arms are big enough to sign with different sketches) must
+  // ride the compose and byte-converge. Pre-law, the fresh sig run for such a file was
+  // a layout-ordered multiset while the family held one arrangement-picked survivor
+  // per node — equality by coincidence, not construction.
+  unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
+  let base = std::env::temp_dir().join(format!("vorpal-dc-dup-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&base);
+  let src = base.join("repo");
+  fs::create_dir_all(&src).unwrap();
+  let arm = |seed: u32| {
+    let mut body = String::new();
+    for i in 0..12 {
+      body.push_str(&format!("  total = total * {seed} + input[{i}] - {i};\n"));
+    }
+    body
+  };
+  let dup_c = |with_probe: bool| {
+    let mut file = format!(
+      "#ifdef CONFIG_FAST\nstatic long compute_thing(const long *input)\n{{\n  long total = 1;\n{}  return total;\n}}\n#else\nstatic long compute_thing(const long *input)\n{{\n  long total = 2;\n{}  return total;\n}}\n#endif\n\nlong use_thing(const long *input)\n{{\n  return compute_thing(input) + 1;\n}}\n",
+      arm(3),
+      arm(5)
+    );
+    if with_probe {
+      file.push_str("\nstatic int vorpal_probe_fn(void)\n{\n  return 42;\n}\n");
+    }
+    file
+  };
+  fs::write(src.join("dup.c"), dup_c(false)).unwrap();
+  fs::write(src.join("neighbor.c"), "long neighbor_fn(void)\n{\n  return 7;\n}\n").unwrap();
+  let src = src.canonicalize().unwrap();
+
+  // NON-VACUITY: the premise must hold or this test pins nothing — the two arms'
+  // signature records must map through the layout bridge onto ONE node id with
+  // DIFFERENT sketches (the duplicate the survivor law exists for).
+  {
+    let extractor = vorpal_ingest::OutlineExtractor::new().expect("extractor");
+    let dup_path = src.join("dup.c").to_string_lossy().into_owned();
+    let product = extractor.extract_product(&dup_path, &dup_c(false)).expect("product");
+    let mut bytes = Vec::new();
+    vorpal_ingest::encode_product_into(&product, &mut bytes);
+    let view = vorpal_ingest::decode_product_view(&bytes).unwrap();
+    let interner = vorpal_ingest::Interner::default();
+    let mut scratch =
+      vorpal_ingest::Ingestor::new(&interner, vorpal_ingest::OutlineExtractor::new().unwrap());
+    let ords = scratch
+      .ingest_product_mapped(&dup_path, vorpal_ingest::decode_product(&bytes).unwrap());
+    let signed: Vec<(u64, &[u8])> = view
+      .signatures
+      .iter()
+      .filter_map(|sig| ords.get(sig.entity_index as usize).map(|&ord| (ord, sig.sketch)))
+      .collect();
+    let mut nodes: Vec<u64> = signed.iter().map(|&(ord, _)| ord).collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    assert!(
+      signed.len() > nodes.len(),
+      "premise broken: no signature collapse — {} signed records over {} distinct nodes",
+      signed.len(),
+      nodes.len()
+    );
+    let dup_node = signed
+      .iter()
+      .find(|&&(ord, _)| signed.iter().filter(|&&(o, _)| o == ord).count() > 1)
+      .map(|&(ord, _)| ord)
+      .unwrap();
+    let sketches: Vec<&[u8]> =
+      signed.iter().filter(|&&(o, _)| o == dup_node).map(|&(_, s)| s).collect();
+    assert!(
+      sketches.windows(2).any(|w| w[0] != w[1]),
+      "premise broken: the collapsed arms sign identically"
+    );
+  }
+
+  let out = base.join("index");
+  vorpal_index::build_index(&src, &out).expect("initial build");
+  // Toggle a tiny (unsigned) definition on and off in the DUP file: both directions
+  // must compose and equal the scratch build of the same tree.
+  fs::write(src.join("dup.c"), dup_c(true)).unwrap();
+  let report = vorpal_index::build_index(&src, &out).expect("append build");
+  assert!(compose_fired(&report), "the def-adding edit must take the compose: {report:?}");
+  assert_converged(&out, &src, &base, "dup-append");
+  fs::write(src.join("dup.c"), dup_c(false)).unwrap();
+  let report = vorpal_index::build_index(&src, &out).expect("remove build");
+  assert!(compose_fired(&report), "the def-removing edit must take the compose: {report:?}");
+  assert_converged(&out, &src, &base, "dup-remove");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn a_file_addition_declines_to_the_full_pipeline() {
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
   let base = std::env::temp_dir().join(format!("vorpal-dc-decline-{}", std::process::id()));

@@ -29,7 +29,11 @@ pub const SIGS_TOC: &str = "sigs/toc.bin";
 pub const SIG_SKETCH_LEN: usize = 64;
 const SLAB_MAGIC: &[u8; 4] = b"VSGS";
 const TOC_MAGIC: &[u8; 4] = b"VSGT";
-const VERSION: u32 = 1;
+/// v2 (2026-09-01): the duplicate-node survivor became a law — content-total order,
+/// smallest (shingles, sketch) wins. v1 families hold whichever row the unstable sort's
+/// arrangement left first, so they retire here: `open` answers None, the scoped composes
+/// decline, and the next full build writes the canonical family.
+const VERSION: u32 = 2;
 /// Slab header: magic + version + bucket u32 + row count u64.
 const SLAB_HEADER: usize = 20;
 /// One row: file_key u64 + ordinal u32 + shingles u32 + sketch.
