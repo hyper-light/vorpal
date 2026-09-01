@@ -201,6 +201,7 @@ pub fn compose_defs_changed(
     .collect();
   let in_session = |dense: u64| session_ranges.iter().any(|&(lo, hi)| (lo..hi).contains(&dense));
 
+  crate::phase_stamp("defs-changed surgery: identity ready");
   // ---- scc over the successor call graph (the definition set moved; recompute always) ----
   let scc_new: Vec<u32> = {
     let node_count = new_bases[buckets] as usize;
@@ -234,6 +235,7 @@ pub fn compose_defs_changed(
     crate::scc::scc_sizes(node_count, &log)
   };
 
+  crate::phase_stamp("defs-changed surgery: scc done");
   // ---- node store: the edited bucket splices around the fresh seal; every other bucket
   // links unless its scc column moved ----
   let nodes_dir = staging.join(NODES_DIR);
@@ -362,6 +364,7 @@ pub fn compose_defs_changed(
   fs::write(&toc_tmp, &node_toc)?;
   fs::rename(&toc_tmp, staging.join(crate::NODES_TOC))?;
 
+  crate::phase_stamp("defs-changed surgery: nodes done");
   // ---- evidence: the session files' buckets swap their rows (translated); others link ----
   let store = crate::evidence::EvidenceStore::open(prior)
     .ok_or_else(|| io::Error::other("defs-changed: prior evidence unreadable"))?;
@@ -446,6 +449,7 @@ pub fn compose_defs_changed(
   fs::write(&toc_tmp, &ev_toc)?;
   fs::rename(&toc_tmp, staging.join(crate::EVIDENCE_TOC))?;
 
+  crate::phase_stamp("defs-changed surgery: evidence done");
   // ---- edges: session buckets + changed-similar buckets rebuild; the edited bucket's
   // later files shift their locals by the delta; every other bucket's locals cancel ----
   let mut rewrite_srcs: HashMap<usize, HashSet<u32>> = HashMap::new();
@@ -670,6 +674,7 @@ pub fn compose_defs_changed(
   fs::write(&toc_tmp, &edge_toc)?;
   fs::rename(&toc_tmp, staging.join(crate::EDGES_TOC))?;
 
+  crate::phase_stamp("defs-changed surgery: edges done");
   // ---- the successor graph cache ----
   {
     let node_count = new_bases[buckets];
@@ -719,6 +724,7 @@ pub fn compose_defs_changed(
     }
   }
 
+  crate::phase_stamp("defs-changed surgery: graph cache done");
   // ---- usage: every session file's postings delta, bucket-scoped ----
   let removed: HashSet<(u32, u64)> = dropped_by_file
     .iter()
@@ -733,9 +739,11 @@ pub fn compose_defs_changed(
   added.dedup();
   crate::usagestore::apply_delta(staging, prior, buckets as u32, &removed, &added)?;
 
+  crate::phase_stamp("defs-changed surgery: usage done");
   // ---- sigs: the repaired ledger over the successor map ----
   crate::sigstore::save_sigs(staging, &plan.sig_rows, &new_map, Some(prior))?;
 
+  crate::phase_stamp("defs-changed surgery: sigs done");
   // ---- dataflow: drop session rows, translate the rest, extend, canonical save ----
   let mut flows = crate::dataflow::load_dataflow(prior)
     .ok_or_else(|| io::Error::other("defs-changed: prior dataflow unreadable"))?;
@@ -756,6 +764,7 @@ pub fn compose_defs_changed(
   }
   crate::dataflow::save_dataflow(staging, kept)?;
 
+  crate::phase_stamp("defs-changed surgery: dataflow done");
   // ---- names.idx: names CHANGED — regenerate by translation + the fresh blocks' names ----
   {
     let fresh_total: usize = shift.blocks.iter().map(|b| b.fresh.node_count()).sum();

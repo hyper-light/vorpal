@@ -12,6 +12,8 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use vorpal_ingest::{
   ExtractScratch, FileStat, OutlineExtractor, PackMsg, PackReader, PackWriter, decode_product,
   decode_product_view, encode_product_into,
@@ -523,92 +525,101 @@ pub(crate) fn try_defs_stable_compose(
     node_rows: Vec<(u32, u32, u64)>,
   }
   let interner = vorpal_ingest::Interner::default();
-  let mut sealed: Vec<SealedFile> = Vec::with_capacity(changed.len());
-  for entry in &changed {
-    let Ok(source) = fs::read_to_string(&entry.path) else {
-      return Ok(None);
-    };
-    let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
-      return Ok(None);
-    };
-    product.source_size = entry.size;
-    product.source_mtime_ns = entry.mtime_ns;
-    let mut fresh_bytes = Vec::new();
-    encode_product_into(&product, &mut fresh_bytes);
-    let Some(prior_bytes) = pack.get(&entry.path) else {
-      return Ok(None);
-    };
-    let (Ok(old_view), Ok(new_view)) = (
-      decode_product_view(prior_bytes),
-      decode_product_view(&fresh_bytes),
-    ) else {
-      return Ok(None);
-    };
-    if let Some(reason) = vorpal_ingest::views_defs_stable_reject(&old_view, &new_view) {
-      vorpal_kg::phase_stamp(&format!("defs-stable: ineligible ({}): {reason}", entry.path));
-      return Ok(None);
-    }
-    let Ok(fresh_product) = decode_product(&fresh_bytes) else {
-      return Ok(None);
-    };
-    let Ok(scratch_extractor) = OutlineExtractor::new() else {
-      return Ok(None);
-    };
-    let mut ingestor = vorpal_ingest::Ingestor::new(&interner, scratch_extractor);
-    let layout_ords = ingestor.ingest_product_mapped(&entry.path, fresh_product);
-    let scratch_kg = ingestor.seal();
-    let rel = vorpal_kg::identity::tree_relative(&entry.path, tree_root);
-    let file_key = vorpal_kg::identity::FileKey::of(rel).0;
-    let Some(&(_, prior_start, prior_rows)) = prior_map
-      .files()
-      .iter()
-      .find(|&&(key, _, _)| key == file_key)
-    else {
-      vorpal_kg::phase_stamp(&format!(
-        "defs-stable: ineligible ({}): outside the prior universe",
-        entry.path
-      ));
-      return Ok(None);
-    };
-    if scratch_kg.node_count() != prior_rows as usize {
-      vorpal_kg::phase_stamp(&format!(
-        "defs-stable: ineligible ({}): node row count moved",
-        entry.path
-      ));
-      return Ok(None);
-    }
-    let mut node_rows = Vec::with_capacity(prior_rows as usize);
-    for ordinal in 0..prior_rows as u64 {
-      let Some(fresh) = scratch_kg.node(vorpal_kg::NodeId::new(ordinal)) else {
-        return Ok(None);
+  // Per-file seals are independent (no dense id moves under this compose), so the loop
+  // parallelizes — the k-scaling sweep measured the serial loop at ~0.07 s/file at
+  // kernel scale, crossing the full pipeline's wall near k≈10. Any decline anywhere
+  // declines the whole session (stamped in the worker).
+  let sealed_result: Result<Vec<SealedFile>, ()> = changed
+    .par_iter()
+    .map(|entry| -> Result<SealedFile, ()> {
+      let Ok(source) = fs::read_to_string(&entry.path) else {
+        return Err(());
       };
-      let Some(prior_view) = prior_kg.node(vorpal_kg::NodeId::new(prior_start + ordinal))
+      let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
+        return Err(());
+      };
+      product.source_size = entry.size;
+      product.source_mtime_ns = entry.mtime_ns;
+      let mut fresh_bytes = Vec::new();
+      encode_product_into(&product, &mut fresh_bytes);
+      let Some(prior_bytes) = pack.get(&entry.path) else {
+        return Err(());
+      };
+      let (Ok(old_view), Ok(new_view)) = (
+        decode_product_view(prior_bytes),
+        decode_product_view(&fresh_bytes),
+      ) else {
+        return Err(());
+      };
+      if let Some(reason) = vorpal_ingest::views_defs_stable_reject(&old_view, &new_view) {
+        vorpal_kg::phase_stamp(&format!("defs-stable: ineligible ({}): {reason}", entry.path));
+        return Err(());
+      }
+      let Ok(fresh_product) = decode_product(&fresh_bytes) else {
+        return Err(());
+      };
+      let Ok(scratch_extractor) = OutlineExtractor::new() else {
+        return Err(());
+      };
+      let mut ingestor = vorpal_ingest::Ingestor::new(&interner, scratch_extractor);
+      let layout_ords = ingestor.ingest_product_mapped(&entry.path, fresh_product);
+      let scratch_kg = ingestor.seal();
+      let rel = vorpal_kg::identity::tree_relative(&entry.path, tree_root);
+      let file_key = vorpal_kg::identity::FileKey::of(rel).0;
+      let Some(&(_, prior_start, prior_rows)) = prior_map
+        .files()
+        .iter()
+        .find(|&&(key, _, _)| key == file_key)
       else {
-        return Ok(None);
-      };
-      if fresh.name != prior_view.name
-        || fresh.path != prior_view.path
-        || fresh.signature != prior_view.signature
-        || fresh.kind != prior_view.kind
-        || fresh.exported != prior_view.exported
-        || fresh.external_id != prior_view.external_id
-      {
         vorpal_kg::phase_stamp(&format!(
-          "defs-stable: ineligible ({}): stable node field moved at ordinal {ordinal}",
+          "defs-stable: ineligible ({}): outside the prior universe",
           entry.path
         ));
-        return Ok(None);
+        return Err(());
+      };
+      if scratch_kg.node_count() != prior_rows as usize {
+        vorpal_kg::phase_stamp(&format!(
+          "defs-stable: ineligible ({}): node row count moved",
+          entry.path
+        ));
+        return Err(());
       }
-      node_rows.push((fresh.span.0, fresh.span.1, fresh.content_hash));
-    }
-    sealed.push(SealedFile {
-      path: entry.path.clone(),
-      file_key,
-      fresh_bytes,
-      layout_ords,
-      node_rows,
-    });
-  }
+      let mut node_rows = Vec::with_capacity(prior_rows as usize);
+      for ordinal in 0..prior_rows as u64 {
+        let Some(fresh) = scratch_kg.node(vorpal_kg::NodeId::new(ordinal)) else {
+          return Err(());
+        };
+        let Some(prior_view) = prior_kg.node(vorpal_kg::NodeId::new(prior_start + ordinal))
+        else {
+          return Err(());
+        };
+        if fresh.name != prior_view.name
+          || fresh.path != prior_view.path
+          || fresh.signature != prior_view.signature
+          || fresh.kind != prior_view.kind
+          || fresh.exported != prior_view.exported
+          || fresh.external_id != prior_view.external_id
+        {
+          vorpal_kg::phase_stamp(&format!(
+            "defs-stable: ineligible ({}): stable node field moved at ordinal {ordinal}",
+            entry.path
+          ));
+          return Err(());
+        }
+        node_rows.push((fresh.span.0, fresh.span.1, fresh.content_hash));
+      }
+      Ok(SealedFile {
+        path: entry.path.clone(),
+        file_key,
+        fresh_bytes,
+        layout_ords,
+        node_rows,
+      })
+    })
+    .collect();
+  let Ok(mut sealed) = sealed_result else {
+    return Ok(None);
+  };
 
   // Scoped re-resolution against the prior universe — the c2-i oracle's proven entry,
   // ONE session over all edited files (one shared table, all import bindings seeded).
@@ -926,97 +937,103 @@ pub(crate) fn try_defs_changed_compose(
       )
     })
   };
-  let mut sealed: Vec<EditedSeal> = Vec::with_capacity(changed.len());
-  let mut any_affected = false;
-  for entry in &changed {
-    let Ok(source) = fs::read_to_string(&entry.path) else {
-      return Ok(None);
-    };
-    let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
-      return Ok(None);
-    };
-    product.source_size = entry.size;
-    product.source_mtime_ns = entry.mtime_ns;
-    let mut fresh_bytes = Vec::new();
-    encode_product_into(&product, &mut fresh_bytes);
-    let Some(prior_bytes) = pack.get(&entry.path) else {
-      return Ok(None);
-    };
-    let (Ok(old_view), Ok(new_view)) = (
-      decode_product_view(prior_bytes),
-      decode_product_view(&fresh_bytes),
-    ) else {
-      return Ok(None);
-    };
-    if let Some(reason) = vorpal_ingest::views_defs_changed_reject(&old_view, &new_view) {
-      vorpal_kg::phase_stamp(&format!("defs-changed: ineligible ({}): {reason}", entry.path));
-      return Ok(None);
-    }
-    let Ok(fresh_product) = decode_product(&fresh_bytes) else {
-      return Ok(None);
-    };
-    let Ok(scratch_extractor) = OutlineExtractor::new() else {
-      return Ok(None);
-    };
-    let mut ingestor = vorpal_ingest::Ingestor::new(&interner, scratch_extractor);
-    let fresh_ords = ingestor.ingest_product_mapped(&entry.path, fresh_product);
-    let fresh_kg = ingestor.seal();
-    let rel = vorpal_kg::identity::tree_relative(&entry.path, tree_root);
-    let file_key = vorpal_kg::identity::FileKey::of(rel).0;
-    let Some(&(_, old_start, old_rows)) = prior_map
-      .files()
-      .iter()
-      .find(|&&(key, _, _)| key == file_key)
-    else {
-      vorpal_kg::phase_stamp(&format!(
-        "defs-changed: ineligible ({}): outside the prior universe",
-        entry.path
-      ));
-      return Ok(None);
-    };
-    let affected =
-      vorpal_ingest::affected_def_names(&prior_kg, old_start, old_rows, &fresh_kg);
-    any_affected |= !affected.is_empty();
-    // Route/Channel escalation: request matching is URL-keyed — usage cannot bound it.
-    let old_kinds = vorpal_ingest::def_kinds_of(&prior_kg, old_start, old_rows);
-    let new_kinds = vorpal_ingest::def_kinds_of(&fresh_kg, 0, fresh_kg.node_count() as u32);
-    let routeish = |kinds: Option<&Vec<vorpal_kg::SymbolKind>>| {
-      kinds.is_some_and(|list| {
-        list.iter().any(|kind| {
-          matches!(kind, vorpal_kg::SymbolKind::Route | vorpal_kg::SymbolKind::Channel)
+  // Per-file seals are independent, so the loop parallelizes (the k-scaling sweep
+  // measured the serial loop at ~0.07 s/file at kernel scale). Any decline anywhere
+  // declines the whole session (stamped in the worker).
+  let sealed_result: Result<Vec<EditedSeal>, ()> = changed
+    .par_iter()
+    .map(|entry| -> Result<EditedSeal, ()> {
+      let Ok(source) = fs::read_to_string(&entry.path) else {
+        return Err(());
+      };
+      let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
+        return Err(());
+      };
+      product.source_size = entry.size;
+      product.source_mtime_ns = entry.mtime_ns;
+      let mut fresh_bytes = Vec::new();
+      encode_product_into(&product, &mut fresh_bytes);
+      let Some(prior_bytes) = pack.get(&entry.path) else {
+        return Err(());
+      };
+      let (Ok(old_view), Ok(new_view)) = (
+        decode_product_view(prior_bytes),
+        decode_product_view(&fresh_bytes),
+      ) else {
+        return Err(());
+      };
+      if let Some(reason) = vorpal_ingest::views_defs_changed_reject(&old_view, &new_view) {
+        vorpal_kg::phase_stamp(&format!("defs-changed: ineligible ({}): {reason}", entry.path));
+        return Err(());
+      }
+      let Ok(fresh_product) = decode_product(&fresh_bytes) else {
+        return Err(());
+      };
+      let Ok(scratch_extractor) = OutlineExtractor::new() else {
+        return Err(());
+      };
+      let mut ingestor = vorpal_ingest::Ingestor::new(&interner, scratch_extractor);
+      let fresh_ords = ingestor.ingest_product_mapped(&entry.path, fresh_product);
+      let fresh_kg = ingestor.seal();
+      let rel = vorpal_kg::identity::tree_relative(&entry.path, tree_root);
+      let file_key = vorpal_kg::identity::FileKey::of(rel).0;
+      let Some(&(_, old_start, old_rows)) = prior_map
+        .files()
+        .iter()
+        .find(|&&(key, _, _)| key == file_key)
+      else {
+        vorpal_kg::phase_stamp(&format!(
+          "defs-changed: ineligible ({}): outside the prior universe",
+          entry.path
+        ));
+        return Err(());
+      };
+      let affected =
+        vorpal_ingest::affected_def_names(&prior_kg, old_start, old_rows, &fresh_kg);
+      // Route/Channel escalation: request matching is URL-keyed — usage cannot bound it.
+      let old_kinds = vorpal_ingest::def_kinds_of(&prior_kg, old_start, old_rows);
+      let new_kinds = vorpal_ingest::def_kinds_of(&fresh_kg, 0, fresh_kg.node_count() as u32);
+      let routeish = |kinds: Option<&Vec<vorpal_kg::SymbolKind>>| {
+        kinds.is_some_and(|list| {
+          list.iter().any(|kind| {
+            matches!(kind, vorpal_kg::SymbolKind::Route | vorpal_kg::SymbolKind::Channel)
+          })
         })
+      };
+      if affected
+        .iter()
+        .any(|name| routeish(old_kinds.get(name)) || routeish(new_kinds.get(name)))
+      {
+        vorpal_kg::phase_stamp("defs-changed: ineligible (a Route/Channel definition moved)");
+        return Err(());
+      }
+      let new_rows_count = fresh_kg.node_count() as u32;
+      // Per OLD ordinal: identity-and-position survival — the unmoved-ordinal law.
+      let unmoved: Vec<bool> = (0..u64::from(old_rows))
+        .map(|ord| {
+          ord < u64::from(new_rows_count)
+            && row_facts(&prior_kg, old_start + ord) == row_facts(&fresh_kg, ord)
+        })
+        .collect();
+      Ok(EditedSeal {
+        path: entry.path.clone(),
+        file_key,
+        fresh_bytes,
+        fresh_ords,
+        fresh_kg,
+        old_start,
+        old_rows,
+        affected,
+        unmoved,
       })
-    };
-    if affected
-      .iter()
-      .any(|name| routeish(old_kinds.get(name)) || routeish(new_kinds.get(name)))
-    {
-      vorpal_kg::phase_stamp("defs-changed: ineligible (a Route/Channel definition moved)");
-      return Ok(None);
-    }
-    let new_rows_count = fresh_kg.node_count() as u32;
-    // Per OLD ordinal: identity-and-position survival — the unmoved-ordinal law.
-    let unmoved: Vec<bool> = (0..u64::from(old_rows))
-      .map(|ord| {
-        ord < u64::from(new_rows_count)
-          && row_facts(&prior_kg, old_start + ord) == row_facts(&fresh_kg, ord)
-      })
-      .collect();
-    sealed.push(EditedSeal {
-      path: entry.path.clone(),
-      file_key,
-      fresh_bytes,
-      fresh_ords,
-      fresh_kg,
-      old_start,
-      old_rows,
-      affected,
-      unmoved,
-    });
-  }
+    })
+    .collect();
+  let Ok(mut sealed) = sealed_result else {
+    return Ok(None);
+  };
   // Every file defs-stable means the stable lane already declined for a session-level
   // reason; nothing changed-scoped is provable here.
-  if !any_affected {
+  if !sealed.iter().any(|s| !s.affected.is_empty()) {
     return Ok(None);
   }
 

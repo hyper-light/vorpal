@@ -1122,6 +1122,37 @@ battery 28/28; suite green; clippy 0/0 both lanes. S2 COMPLETE: respan (P4.5b),
 defs-stable (S2-a), and defs-changed (S2-b) all compose k-file sessions; mixed classes
 route to the strongest lane that admits them.
 
+#### Session k-scaling sweep + parallelism (2026-09-01) — the slope was the SESSION, not the seals
+
+Recorded sweep (kernel, tiny-fn append per file, defs-changed lane VERIFIED per run by
+its stamp, byte-converged at every point; lesson en route: an early sweep's k=16 wall
+was the FULL PIPELINE's — kernel/exit.c carries parse-error regions, appends shift its
+error accounting, both ladders correctly rejected — lane-verify every sweep row, and
+convergence alone cannot distinguish lanes):
+
+| k (files) | serial session | + parallel seals | + parallel session |
+|---|---|---|---|
+| 2  | 1.27 s | 1.25 s | 1.24 s |
+| 4  | 1.57 s | 1.54 s | 1.39 s |
+| 8  | 1.84 s | 1.77 s | 1.42 s |
+| 16 | 2.23 s | 2.32 s | **1.57 s** |
+
+First attribution FALSIFIED by measurement: parallelizing the per-file seal loops
+(compose.rs, rayon over ladder+seal+verify — kept, structurally right, ~5 ms/file)
+barely moved the slope. The traced k=16 breakdown put it in the SESSION: table build
+385 ms (3,027 call names, serial candidate enumeration), per-file collect 298 ms,
+closure decode 181 ms (59 products); the family surgeries were 59–135 ms each
+(permanent trace-gated stamps now cover every surgery section). Fix: `UniverseView`
+gained `Sync` as a supertrait and the three blocks parallelized — per-file collect
+(sets union after; interner id VALUES never reach artifacts, the bulk pipeline already
+interns in shard-arrival order), closure derivation + product decode per unit, and
+candidate ENUMERATION per name with insertion kept serial in the same per-name order
+(`finalize` canonicalizes across names exactly as before). Slope 0.076 → **0.024 s/file**
+(3.2× flatter); the compose now beats the ~2.0–2.1 s pipeline across the whole measured
+range (the serial crossover was k≈10). k=1 parity: 1.17–1.25 s toggles (was 1.18).
+Gates: all oracles + compose fixtures green (outcome equality is the parallelism's
+correctness pin), battery 28/28, suite green, clippy 0/0 both lanes.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

@@ -21,6 +21,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 
+use rayon::prelude::*;
+
 use vorpal_kg::{Kg, NodeId, SymbolKind};
 use vorpal_resolve::{
   ChainReturns, Interner, Reference, RefForm, RefKind, Resolver, SymbolTable, resolve_batch,
@@ -143,7 +145,10 @@ pub(crate) struct CandidateFacts {
   pub owner: Option<String>,
 }
 
-pub(crate) trait UniverseView {
+/// `Sync` is a supertrait: candidate enumeration parallelizes per name (the k-scaling
+/// sweep measured the serial table build at 385 ms over 3,027 names at kernel k=16),
+/// and both universes are shared-reference views over `Sync` storage.
+pub(crate) trait UniverseView: Sync {
   /// Candidates for `name`, ascending by id — the bulk build's insertion order.
   fn candidates_named(&self, name: &str) -> Vec<CandidateFacts>;
   /// Every file's `(File-node id, path)` in dense order.
@@ -428,13 +433,19 @@ fn resolve_session(
   files: &[SessionFile<'_>],
   decode_cap: usize,
 ) -> io::Result<Vec<ScopedOutcome>> {
-  // --- pass 1 per file (interning parity: references first) + the session name sets ---
-  let mut collected: Vec<CollectedFile<'_>> = Vec::with_capacity(files.len());
-  let mut names: HashSet<&str> = HashSet::new();
-  let mut call_names: HashSet<&str> = HashSet::new();
-  let mut chain_keys: HashSet<&str> = HashSet::new();
-  for file in files {
-    let layout_len =
+  // --- pass 1 per file (interning parity: references first) + the session name sets.
+  // Files are independent here, so the pass parallelizes; the sets union afterwards.
+  // Interner id VALUES never reach artifacts (the bulk pipeline interns in shard-arrival
+  // order and is byte-convergent), so concurrent interning is convergence-safe. ---
+  type FileCollect<'i, 'v> =
+    (CollectedFile<'i>, HashSet<&'v str>, HashSet<&'v str>, HashSet<&'v str>);
+  let per_file: io::Result<Vec<FileCollect<'_, '_>>> = files
+    .par_iter()
+    .map(|file| {
+      let mut names: HashSet<&str> = HashSet::new();
+      let mut call_names: HashSet<&str> = HashSet::new();
+      let mut chain_keys: HashSet<&str> = HashSet::new();
+      let layout_len =
       1 + file.view.items.iter().map(|item| 1 + item.members.len()).sum::<usize>();
     if file.layout_ords.len() != layout_len {
       return Err(io::Error::other(format!(
@@ -519,12 +530,28 @@ fn resolve_session(
         })
       })
       .collect();
-    collected.push(CollectedFile {
-      references,
-      args,
-      req_rows,
-      sigs,
-    });
+      Ok((
+        CollectedFile {
+          references,
+          args,
+          req_rows,
+          sigs,
+        },
+        names,
+        call_names,
+        chain_keys,
+      ))
+    })
+    .collect();
+  let mut collected: Vec<CollectedFile<'_>> = Vec::with_capacity(files.len());
+  let mut names: HashSet<&str> = HashSet::new();
+  let mut call_names: HashSet<&str> = HashSet::new();
+  let mut chain_keys: HashSet<&str> = HashSet::new();
+  for (file_collect, file_names, file_calls, file_chains) in per_file? {
+    collected.push(file_collect);
+    names.extend(file_names);
+    call_names.extend(file_calls);
+    chain_keys.extend(file_chains);
   }
 
   // --- bounded closure, split by CONSUMER (each half decodes only what its reader can
@@ -533,21 +560,33 @@ fn resolve_session(
   // nothing at all here, measured 542 dead decodes/1.4 s before this split). Session
   // files never decode: their views are already in hand.
   let session_paths: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
-  let mut closure_paths: HashSet<String> = HashSet::new();
-  for name in &chain_keys {
-    for facts in universe.candidates_named(name) {
-      if !session_paths.contains(facts.path.as_str()) {
-        closure_paths.insert(facts.path);
-      }
-    }
-  }
-  for name in &call_names {
-    for facts in universe.candidates_named(name) {
-      if !session_paths.contains(facts.path.as_str()) && is_python_path(&facts.path) {
-        closure_paths.insert(facts.path);
-      }
-    }
-  }
+  // Candidate enumeration per name is independent — parallel, then one union.
+  let chain_vec: Vec<&str> = chain_keys.iter().copied().collect();
+  let call_vec: Vec<&str> = call_names.iter().copied().collect();
+  let mut closure_paths: HashSet<String> = chain_vec
+    .par_iter()
+    .flat_map_iter(|name| {
+      universe
+        .candidates_named(name)
+        .into_iter()
+        .filter(|facts| !session_paths.contains(facts.path.as_str()))
+        .map(|facts| facts.path)
+    })
+    .collect();
+  closure_paths.extend(
+    call_vec
+      .par_iter()
+      .flat_map_iter(|name| {
+        universe
+          .candidates_named(name)
+          .into_iter()
+          .filter(|facts| {
+            !session_paths.contains(facts.path.as_str()) && is_python_path(&facts.path)
+          })
+          .map(|facts| facts.path)
+      })
+      .collect::<Vec<String>>(),
+  );
   if closure_paths.len() > decode_cap {
     return Err(io::Error::other(format!(
       "scoped: closure of {} files exceeds the decode cap ({decode_cap})",
@@ -571,15 +610,19 @@ fn resolve_session(
     };
     decoded.push((other, bytes));
   }
-  let mut decoded_views: Vec<(&str, u64, ProductView<'_>)> = Vec::new();
-  for (other, bytes) in &decoded {
-    let other_view = decode_product_view(bytes)
-      .map_err(|err| io::Error::other(format!("scoped: product decode ({other}): {err}")))?;
-    let Some(other_base) = universe.file_start_by_path(other) else {
-      return Err(io::Error::other(format!("scoped: {other} missing from the universe")));
-    };
-    decoded_views.push((other.as_str(), other_base, other_view));
-  }
+  // Decodes are independent per product — parallel (the k-scaling sweep measured this
+  // serial loop at 181 ms over 59 closure products at kernel k=16).
+  let decoded_views: Vec<(&str, u64, ProductView<'_>)> = decoded
+    .par_iter()
+    .map(|(other, bytes)| -> io::Result<(&str, u64, ProductView<'_>)> {
+      let other_view = decode_product_view(bytes)
+        .map_err(|err| io::Error::other(format!("scoped: product decode ({other}): {err}")))?;
+      let Some(other_base) = universe.file_start_by_path(other) else {
+        return Err(io::Error::other(format!("scoped: {other} missing from the universe")));
+      };
+      Ok((other.as_str(), other_base, other_view))
+    })
+    .collect::<io::Result<Vec<_>>>()?;
   for (other_path, other_base, other_view) in &decoded_views {
     for (name, ret) in &other_view.returns {
       rets_rows.push((name, ret));
@@ -618,13 +661,22 @@ fn resolve_session(
   // the interner FIRST; anything outside that set sentinels identically in both worlds.
   let chain = (!rets_rows.is_empty()).then(|| ChainReturns::build(interner, rets_rows));
 
-  // --- the partial symbol table: rule-for-rule with build_symbol_table_over ---
+  // --- the partial symbol table: rule-for-rule with build_symbol_table_over.
+  // Candidate ENUMERATION parallelizes per name (the dominant serial block — 385 ms
+  // over 3,027 names at kernel k=16); insertion stays serial in the same per-name
+  // order (facts arrive id-ascending per name, and `finalize` canonicalizes across
+  // names exactly as before). ---
   let mut table = SymbolTable::new();
   for (id, path) in universe.all_file_entries() {
     table.insert_file(interner, &path, NodeId::new(id));
   }
-  for name in &names {
-    for facts in universe.candidates_named(name) {
+  let names_vec: Vec<&str> = names.iter().copied().collect();
+  let facts_per_name: Vec<Vec<CandidateFacts>> = names_vec
+    .par_iter()
+    .map(|name| universe.candidates_named(name))
+    .collect();
+  for (name, facts_list) in names_vec.iter().zip(facts_per_name) {
+    for facts in facts_list {
       // Owner parity: peek-or-sentinel, exactly like the bulk build — an owner name no
       // reference interned can never match a qualifier, but member-ness must survive.
       let owner = facts.owner.as_deref().map(|owner_name| {
