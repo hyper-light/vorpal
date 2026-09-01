@@ -1,7 +1,15 @@
 //! Keeps docs/INDEX_FORMAT.md's version table true (IMPROVEMENTS #12): the table is
-//! regenerated from the version constants in source, so a format bump that forgets the
-//! compatibility document is impossible — the doc self-heals and the diff rides the commit
-//! that bumped the constant.
+//! generated from the version constants in source, so a format bump that forgets the
+//! compatibility document is impossible.
+//!
+//! The normal run ASSERTS ONLY — a stale table fails with instructions, never a write
+//! (a test that mutates the working tree collides with concurrent sessions and
+//! read-only checkouts; this is the `grammar_provenance` convention). To refresh the
+//! table after bumping a constant:
+//!
+//! `cargo test -p vorpal-index --test format_policy -- --ignored regenerate`
+//!
+//! and own the doc diff in the same commit as the bump.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,8 +42,7 @@ fn version_of(rel_path: &str, name: &str) -> u32 {
   panic!("{name} not found in {rel_path}");
 }
 
-#[test]
-fn version_table_matches_the_constants() {
+fn generated_table() -> String {
   let rows: Vec<(&str, &str, &str, u32, &str)> = vec![
     (
       "extraction products (`products/*.vpb`, pack bodies)",
@@ -115,17 +122,44 @@ fn version_table_matches_the_constants() {
       "| {artifact} | `{constant}` ({file}) | {value} | {mismatch} |\n"
     ));
   }
+  table
+}
 
-  let doc_path = repo_root().join("docs/INDEX_FORMAT.md");
-  let doc = fs::read_to_string(&doc_path).expect("docs/INDEX_FORMAT.md exists");
-  const BEGIN: &str = "<!-- BEGIN GENERATED VERSION TABLE -->\n";
-  const END: &str = "<!-- END GENERATED VERSION TABLE -->";
+const DOC_REL: &str = "docs/INDEX_FORMAT.md";
+const BEGIN: &str = "<!-- BEGIN GENERATED VERSION TABLE -->\n";
+const END: &str = "<!-- END GENERATED VERSION TABLE -->";
+
+/// Read the doc and splice the freshly generated table between the markers.
+fn doc_with_current_table() -> (PathBuf, String, String) {
+  let doc_path = repo_root().join(DOC_REL);
+  let doc = fs::read_to_string(&doc_path)
+    .unwrap_or_else(|e| panic!("{DOC_REL} exists: {e}"));
   let start = doc.find(BEGIN).expect("BEGIN marker") + BEGIN.len();
   let end = doc.find(END).expect("END marker");
-  let rebuilt = format!("{}{}{}", &doc[..start], table, &doc[end..]);
+  let rebuilt = format!("{}{}{}", &doc[..start], generated_table(), &doc[end..]);
+  (doc_path, doc, rebuilt)
+}
+
+#[test]
+fn version_table_matches_the_constants() {
+  let (_, doc, rebuilt) = doc_with_current_table();
+  assert_eq!(
+    doc, rebuilt,
+    "{DOC_REL}'s version table is stale relative to the version constants in source.\n\
+     Refresh it (and own the diff in the bumping commit) with:\n\
+     `cargo test -p vorpal-index --test format_policy -- --ignored regenerate`"
+  );
+}
+
+/// Manual regeneration: rewrite the version table from code truth.
+#[test]
+#[ignore = "mutates docs/INDEX_FORMAT.md; run explicitly after a version bump"]
+fn regenerate() {
+  let (doc_path, doc, rebuilt) = doc_with_current_table();
   if rebuilt != doc {
     fs::write(&doc_path, &rebuilt).unwrap();
-    println!("rewrote docs/INDEX_FORMAT.md version table from code truth");
+    println!("rewrote {DOC_REL} version table from code truth");
+  } else {
+    println!("{DOC_REL} version table already current");
   }
-  assert_eq!(fs::read_to_string(&doc_path).unwrap(), rebuilt);
 }
