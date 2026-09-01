@@ -25,12 +25,30 @@ use crate::{CutoffContext, IndexReport, commit_generation, staging_nonce};
 /// the stamp-only cutoff uses.
 const MAX_RESPANNED: usize = 64;
 
+/// The prior generation's graph identity, loaded ONCE per build for the whole compose
+/// chain. Each lane loaded its own copy before — ~50 ms per load at kernel scale, so a
+/// defs-changed edit paid two wasted loads on its way down the guard chain.
+pub(crate) struct PriorGraph {
+  pub(crate) kg: vorpal_kg::Kg,
+  pub(crate) map: vorpal_kg::NodeIdMap,
+}
+
+/// Map first: `NodeIdMap::from_dir` is a cheap TOC read and answers `None` on flat and
+/// legacy priors, so those skip the whole chain without paying a kg load (exactly what
+/// the per-lane TOC guards did).
+pub(crate) fn load_prior_graph(prior: &Path) -> Option<PriorGraph> {
+  let map = vorpal_kg::NodeIdMap::from_dir(prior)?;
+  let kg = vorpal_kg::Kg::load(prior).ok()?;
+  Some(PriorGraph { kg, map })
+}
+
 pub(crate) fn try_respan_compose(
   out: &Path,
   prior: &Path,
   ctx: &CutoffContext<'_>,
   extractor: &OutlineExtractor,
   cache_mode_label: &'static str,
+  prior_graph: &PriorGraph,
 ) -> io::Result<Option<IndexReport>> {
   let CutoffContext {
     manifest,
@@ -122,12 +140,7 @@ pub(crate) fn try_respan_compose(
   let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
     return Ok(None);
   };
-  let Ok(prior_kg) = vorpal_kg::Kg::load(prior) else {
-    return Ok(None);
-  };
-  let Some(prior_map) = vorpal_kg::NodeIdMap::from_dir(prior) else {
-    return Ok(None);
-  };
+  let (prior_kg, prior_map) = (&prior_graph.kg, &prior_graph.map);
 
   let interner = vorpal_ingest::Interner::default();
   let mut plans: Vec<vorpal_kg::respan::FileRespan> = Vec::with_capacity(changed.len());
@@ -230,7 +243,6 @@ pub(crate) fn try_respan_compose(
     });
     fresh_products.push((entry.path.clone(), fresh_bytes));
   }
-  drop(prior_kg);
   drop(pack);
 
   // Stage the composed generation. Any error inside the surgery falls back to the full
@@ -423,6 +435,7 @@ pub(crate) fn try_defs_stable_compose(
   ctx: &CutoffContext<'_>,
   extractor: &OutlineExtractor,
   cache_mode_label: &'static str,
+  prior_graph: &PriorGraph,
 ) -> io::Result<Option<IndexReport>> {
   let CutoffContext {
     manifest,
@@ -507,12 +520,7 @@ pub(crate) fn try_defs_stable_compose(
   let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
     return Ok(None);
   };
-  let Ok(prior_kg) = vorpal_kg::Kg::load(prior) else {
-    return Ok(None);
-  };
-  let Some(prior_map) = vorpal_kg::NodeIdMap::from_dir(prior) else {
-    return Ok(None);
-  };
+  let (prior_kg, prior_map) = (&prior_graph.kg, &prior_graph.map);
 
   // Per file: fresh product, the defs-stable ladder, the pipeline's own single-file
   // seal, and stable fields VERIFIED against the prior generation row by row (the
@@ -650,8 +658,8 @@ pub(crate) fn try_defs_stable_compose(
     .collect();
   let outcomes = match vorpal_ingest::scoped_resolve_files(
     &interner,
-    &prior_kg,
-    &prior_map,
+    prior_kg,
+    prior_map,
     &vorpal_ingest::Resolver::new(),
     &fetch,
     &inputs,
@@ -671,7 +679,7 @@ pub(crate) fn try_defs_stable_compose(
   let Some(sig_store) = vorpal_kg::SigStore::open(prior) else {
     return Ok(None);
   };
-  let Some(family_rows) = sig_store.rows(&prior_map) else {
+  let Some(family_rows) = sig_store.rows(prior_map) else {
     return Ok(None);
   };
   let prior_rows_sigs: Vec<vorpal_ingest::SigRow> = family_rows
@@ -683,7 +691,7 @@ pub(crate) fn try_defs_stable_compose(
     })
     .collect();
   vorpal_kg::phase_stamp("defs-stable: sigs family loaded");
-  let prior_pairs = vorpal_ingest::similar_pairs_of_kg(&prior_kg);
+  let prior_pairs = vorpal_ingest::similar_pairs_of_kg(prior_kg);
   vorpal_kg::phase_stamp("defs-stable: prior pairs extracted");
   let swaps: Vec<(u64, &[vorpal_ingest::SigRow])> = sealed
     .iter()
@@ -691,7 +699,7 @@ pub(crate) fn try_defs_stable_compose(
     .map(|(file, outcome)| (file.file_key, outcome.sigs.as_slice()))
     .collect();
   let repair = match vorpal_ingest::scoped_similar_repair(
-    &prior_map,
+    prior_map,
     manifest.entries().len(),
     &prior_rows_sigs,
     &prior_pairs,
@@ -748,7 +756,7 @@ pub(crate) fn try_defs_stable_compose(
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
   if let Err(err) =
-    vorpal_kg::defs_stable::compose_defs_stable(&staging, prior, &prior_kg, &plan)
+    vorpal_kg::defs_stable::compose_defs_stable(&staging, prior, prior_kg, &plan)
   {
     vorpal_kg::phase_stamp(&format!("defs-stable: fell back to the full pipeline: {err}"));
     let _ = fs::remove_dir_all(&staging);
@@ -821,6 +829,7 @@ pub(crate) fn try_defs_changed_compose(
   ctx: &CutoffContext<'_>,
   extractor: &OutlineExtractor,
   cache_mode_label: &'static str,
+  prior_graph: &PriorGraph,
 ) -> io::Result<Option<IndexReport>> {
   let CutoffContext {
     manifest,
@@ -904,12 +913,7 @@ pub(crate) fn try_defs_changed_compose(
   let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
     return Ok(None);
   };
-  let Ok(prior_kg) = vorpal_kg::Kg::load(prior) else {
-    return Ok(None);
-  };
-  let Some(prior_map) = vorpal_kg::NodeIdMap::from_dir(prior) else {
-    return Ok(None);
-  };
+  let (prior_kg, prior_map) = (&prior_graph.kg, &prior_graph.map);
 
   // Per changed file: fresh product, the ladder (defs-changed accepts what defs-stable
   // would too — a stable member is a delta-0 block), the scratch seal, prior
@@ -989,9 +993,9 @@ pub(crate) fn try_defs_changed_compose(
         return Err(());
       };
       let affected =
-        vorpal_ingest::affected_def_names(&prior_kg, old_start, old_rows, &fresh_kg);
+        vorpal_ingest::affected_def_names(prior_kg, old_start, old_rows, &fresh_kg);
       // Route/Channel escalation: request matching is URL-keyed — usage cannot bound it.
-      let old_kinds = vorpal_ingest::def_kinds_of(&prior_kg, old_start, old_rows);
+      let old_kinds = vorpal_ingest::def_kinds_of(prior_kg, old_start, old_rows);
       let new_kinds = vorpal_ingest::def_kinds_of(&fresh_kg, 0, fresh_kg.node_count() as u32);
       let routeish = |kinds: Option<&Vec<vorpal_kg::SymbolKind>>| {
         kinds.is_some_and(|list| {
@@ -1012,7 +1016,7 @@ pub(crate) fn try_defs_changed_compose(
       let unmoved: Vec<bool> = (0..u64::from(old_rows))
         .map(|ord| {
           ord < u64::from(new_rows_count)
-            && row_facts(&prior_kg, old_start + ord) == row_facts(&fresh_kg, ord)
+            && row_facts(prior_kg, old_start + ord) == row_facts(&fresh_kg, ord)
         })
         .collect();
       Ok(EditedSeal {
@@ -1144,8 +1148,8 @@ pub(crate) fn try_defs_changed_compose(
   let decode_cap = (manifest.entries().len() / 4).max(1);
   let outcomes = match vorpal_ingest::resolve_defs_changed(
     &interner,
-    &prior_kg,
-    &prior_map,
+    prior_kg,
+    prior_map,
     &vorpal_ingest::Resolver::new(),
     &|path: &str| pack.get(path).map(<[u8]>::to_vec),
     &edited_inputs,
@@ -1210,7 +1214,7 @@ pub(crate) fn try_defs_changed_compose(
   let Some(sig_store) = vorpal_kg::SigStore::open(prior) else {
     return Ok(None);
   };
-  let Some(family_rows) = sig_store.rows(&prior_map) else {
+  let Some(family_rows) = sig_store.rows(prior_map) else {
     return Ok(None);
   };
   let mut prior_rows_sigs: Vec<vorpal_ingest::SigRow> = Vec::with_capacity(family_rows.len());
@@ -1230,7 +1234,7 @@ pub(crate) fn try_defs_changed_compose(
   }
   let mut forced_changed: Vec<u32> = Vec::new();
   let mut prior_pairs: Vec<(u64, u64, u8)> = Vec::new();
-  for (a, b, confidence) in vorpal_ingest::similar_pairs_of_kg(&prior_kg) {
+  for (a, b, confidence) in vorpal_ingest::similar_pairs_of_kg(prior_kg) {
     match (translate(a), translate(b)) {
       (Some(ta), Some(tb)) => prior_pairs.push((ta.min(tb), ta.max(tb), confidence)),
       (Some(t), None) | (None, Some(t)) => forced_changed.push(t as u32),
@@ -1334,7 +1338,7 @@ pub(crate) fn try_defs_changed_compose(
   if let Err(err) = vorpal_kg::defs_changed::compose_defs_changed(
     &staging,
     prior,
-    &prior_kg,
+    prior_kg,
     &fresh_seals,
     &plan,
   ) {
@@ -1343,7 +1347,6 @@ pub(crate) fn try_defs_changed_compose(
     return Ok(None);
   }
   drop(fresh_seals);
-  drop(prior_kg);
   let pack_reader = PackReader::open_rooted(prior, Some(tree_root)).map(Arc::new);
   let writer = PackWriter::new(
     &staging,

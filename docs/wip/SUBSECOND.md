@@ -1249,6 +1249,19 @@ link branches reduced to skips, and dir-exists pre-carry detection in
 primitive, where the next optimizer will look first. Perf-neutral by measurement;
 ~150 lines of repeated link boilerplate gone; every inode-carry oracle intact.
 
+#### One shared prior-graph load for the guard chain (2026-09-02) — SUB-SECOND defs-changed
+
+The guard chain loaded the SAME prior kg + map three times per edit — respan loads
+and declines, defs-stable loads and declines, defs-changed loads and composes
+(~50 ms per load at kernel scale; the trace showed three `kg load:` triplets). One
+`PriorGraph { kg, map }` now loads once in `build_index` and threads through all
+three lanes; `load_prior_graph` reads the map FIRST (a cheap TOC read that answers
+None on flat/legacy priors), so the non-bucketed skip costs nothing, exactly as the
+per-lane TOC guards had it. Kernel chained fn-append toggles: **0.99–1.02 s** (from
+1.05–1.08), byte-converged, six runs — the defs-changed lane's first sub-second
+crossings. Gates: fixtures 8/8 suites, battery PASS, suite green, clippy 0/0 both
+lanes. The day's full defs-changed trajectory: 1.28–1.32 s → 0.99–1.02 s.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

@@ -716,35 +716,57 @@ fn build_index_inner(
         report.unverified_langs = unverified_langs.clone();
         return Ok(report);
       }
-      // Past the cutoff, the RESPAN compose (P4.5b): span-only edits — the class between
-      // "byte-identical products" and "semantic change" — compose the next generation
-      // mechanically from the prior one. Same trust gates, same fallback posture.
+      // The scoped composes share ONE prior-graph load (each lane loaded its own kg +
+      // map before — ~50 ms per load at kernel scale, two wasted loads on every
+      // defs-changed edit). `load_prior_graph` answers None on flat/legacy priors —
+      // the chain is bucketed-only, exactly as the per-lane TOC guards had it.
       if env.is_default()
-        && let Some(mut report) =
-          compose::try_respan_compose(out, &prior, &ctx, &extractor, cache_mode.label())?
+        && let Some(prior_graph) = compose::load_prior_graph(&prior)
       {
-        report.unverified_langs = unverified_langs.clone();
-        return Ok(report);
-      }
-      // Past the respan, the DEFS-STABLE compose (P4.5c-2): a single body-edited file —
-      // definitions unchanged, references free — re-resolves against the prior universe
-      // and the families splice. Same trust gates, same loud-fallback posture.
-      if env.is_default()
-        && let Some(mut report) =
-          compose::try_defs_stable_compose(out, &prior, &ctx, &extractor, cache_mode.label())?
-      {
-        report.unverified_langs = unverified_langs.clone();
-        return Ok(report);
-      }
-      // Past defs-stable, the DEFS-CHANGED compose (P4.5c-3): the definition set moved —
-      // the usage-dirty closure re-resolves against the successor universe and the
-      // families splice under the shift law. Same trust gates, same loud fallback.
-      if env.is_default()
-        && let Some(mut report) =
-          compose::try_defs_changed_compose(out, &prior, &ctx, &extractor, cache_mode.label())?
-      {
-        report.unverified_langs = unverified_langs.clone();
-        return Ok(report);
+        // The RESPAN compose (P4.5b): span-only edits — the class between
+        // "byte-identical products" and "semantic change" — compose the next
+        // generation mechanically from the prior one. Same trust gates, same
+        // fallback posture.
+        if let Some(mut report) = compose::try_respan_compose(
+          out,
+          &prior,
+          &ctx,
+          &extractor,
+          cache_mode.label(),
+          &prior_graph,
+        )? {
+          report.unverified_langs = unverified_langs.clone();
+          return Ok(report);
+        }
+        // Past the respan, the DEFS-STABLE compose (P4.5c-2): body-edited files —
+        // definitions unchanged, references free — re-resolve against the prior
+        // universe and the families splice. Same trust gates, same loud fallback.
+        if let Some(mut report) = compose::try_defs_stable_compose(
+          out,
+          &prior,
+          &ctx,
+          &extractor,
+          cache_mode.label(),
+          &prior_graph,
+        )? {
+          report.unverified_langs = unverified_langs.clone();
+          return Ok(report);
+        }
+        // Past defs-stable, the DEFS-CHANGED compose (P4.5c-3): the definition set
+        // moved — the usage-dirty closure re-resolves against the successor universe
+        // and the families splice under the shift law. Same trust gates, same loud
+        // fallback.
+        if let Some(mut report) = compose::try_defs_changed_compose(
+          out,
+          &prior,
+          &ctx,
+          &extractor,
+          cache_mode.label(),
+          &prior_graph,
+        )? {
+          report.unverified_langs = unverified_langs.clone();
+          return Ok(report);
+        }
       }
     }
   }
