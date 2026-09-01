@@ -15,6 +15,7 @@ mod dataflow;
 mod edgestore;
 mod evidence;
 mod kg;
+pub mod defs_stable;
 pub mod respan;
 mod sigstore;
 mod usagestore;

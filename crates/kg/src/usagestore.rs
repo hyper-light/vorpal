@@ -89,6 +89,21 @@ impl Toc {
 /// Persist the usage postings: `pairs` is the raw `(name_hash, from-file_key)` stream (one
 /// per evidence occurrence; duplicates welcome — deduped here), `buckets` the family
 /// bucket count, `prior` the hard-link source.
+/// Every `(name_hash, file_key)` pair the family holds, slab-concatenation order — the
+/// defs-stable compose's delta base (it swaps one file's contribution and re-saves; the
+/// per-bucket digest carry rewrites only buckets whose pair set moved).
+impl UsageStore {
+  pub(crate) fn all_pairs(&self) -> Vec<(u32, u64)> {
+    let mut pairs = Vec::new();
+    for slab in self.slabs.iter().flatten() {
+      for i in 0..slab.pairs {
+        pairs.push(slab.pair(i));
+      }
+    }
+    pairs
+  }
+}
+
 pub(crate) fn save(
   dir: &Path,
   mut pairs: Vec<(u32, u64)>,

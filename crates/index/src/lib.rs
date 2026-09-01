@@ -701,9 +701,18 @@ fn build_index_inner(
       // "byte-identical products" and "semantic change" — compose the next generation
       // mechanically from the prior one. Same trust gates, same fallback posture.
       if env.is_default()
-        && std::env::var_os("VORPAL_NO_RESPAN").is_none()
         && let Some(mut report) =
           compose::try_respan_compose(out, &prior, &ctx, &extractor, cache_mode.label())?
+      {
+        report.unverified_langs = unverified_langs.clone();
+        return Ok(report);
+      }
+      // Past the respan, the DEFS-STABLE compose (P4.5c-2): a single body-edited file —
+      // definitions unchanged, references free — re-resolves against the prior universe
+      // and the families splice. Same trust gates, same loud-fallback posture.
+      if env.is_default()
+        && let Some(mut report) =
+          compose::try_defs_stable_compose(out, &prior, &ctx, &extractor, cache_mode.label())?
       {
         report.unverified_langs = unverified_langs.clone();
         return Ok(report);

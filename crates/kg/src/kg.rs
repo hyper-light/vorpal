@@ -1065,7 +1065,41 @@ impl Kg {
     hasher.digest()
   }
 
+  /// Every `SIMILAR_TO` pair once (`a < b`, ascending) with its confidence label — the
+  /// scoped compose's prior pair set. A zero-allocation walk over the CSR slices: the
+  /// `out_neighbors` convenience API allocates a Vec per node, which at kernel scale is
+  /// ~9M transient allocations for a full-graph question like this one.
+  /// The CSR out-slices, exposed for the defs-stable compose's successor-graph
+  /// construction (zero-copy; `out_neighbors` allocates per node).
+  pub fn graph_out_targets(&self, u: u32) -> &[u32] {
+    self.graph.out_targets(u)
+  }
+
+  pub fn graph_out_edge_types(&self, u: u32) -> &[u16] {
+    self.graph.out_edge_types(u)
+  }
+
+  pub fn similar_pairs(&self) -> Vec<(u64, u64, u8)> {
+    let mut pairs = Vec::new();
+    for u in 0..self.node_count() as u32 {
+      for (&dst, &etype) in self
+        .graph
+        .out_targets(u)
+        .iter()
+        .zip(self.graph.out_edge_types(u))
+      {
+        let etype = EdgeType(etype);
+        if etype.base() == EdgeType::SIMILAR_TO && u < dst {
+          pairs.push((u64::from(u), u64::from(dst), etype.confidence()));
+        }
+      }
+    }
+    pairs.sort_unstable();
+    pairs
+  }
+
   pub fn nodes_named(&self, name: &str) -> Vec<NodeId> {
+
     if let Some((hashes, ids)) = &self.names {
       let hash = xxhash_rust::xxh3::xxh3_64(name.as_bytes());
       let lo = hashes.partition_point(|&h| h < hash);

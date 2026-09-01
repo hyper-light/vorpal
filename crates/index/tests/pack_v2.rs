@@ -365,7 +365,16 @@ fn bucketed_pack_end_to_end() {
   )
   .unwrap();
   let report = build_index(&src, &out_a).unwrap();
-  assert!(!report.reused && !report.graph_reused, "content edit takes the full pipeline");
+  // A defs-stable body edit (P4.5c-2): the DEFS-STABLE compose re-resolves exactly the
+  // edited file against the prior universe — a real semantic build, scoped.
+  assert!(!report.reused && !report.graph_reused, "content edit is a real semantic build");
+  assert!(
+    report
+      .cochange_note
+      .as_deref()
+      .is_some_and(|note| note.contains("defs-stable compose")),
+    "a defs-stable body edit must take the scoped compose: {report:?}"
+  );
   let gen_a2 = live(&out_a);
   assert_ne!(gen_a.file_name(), gen_a2.file_name());
   let before: std::collections::HashMap<String, (u64, u64)> = bucket_stats(&gen_a)
@@ -387,9 +396,10 @@ fn bucketed_pack_end_to_end() {
     vec![format!("{expected_bucket:04}.pack")],
     "an edit must rewrite exactly the edited file's bucket and hard-link the rest"
   );
-  // The node store obeys the same law (P4.2): exactly the edited file's node/heap slabs
-  // rewrite; every other bucket's slabs hard-link (this fixture has no cross-file cycles,
-  // so no scc_size ripple).
+  // The node store under the compose: exactly the edited file's VSEG rewrites (spans and
+  // content hashes moved); its HEAP hard-links — strings are defs-stable — and every
+  // other bucket's slabs hard-link (this fixture has no cross-file cycles, so no
+  // scc_size ripple).
   #[cfg(unix)]
   {
     use std::os::unix::fs::MetadataExt;
@@ -408,11 +418,8 @@ fn bucketed_pack_end_to_end() {
     node_rewritten.sort();
     assert_eq!(
       node_rewritten,
-      vec![
-        format!("{expected_bucket:04}.heap"),
-        format!("{expected_bucket:04}.vseg"),
-      ],
-      "an edit must rewrite exactly the edited file's node slabs and hard-link the rest"
+      vec![format!("{expected_bucket:04}.vseg")],
+      "a defs-stable edit rewrites exactly the edited file's vseg; heaps and the rest link"
     );
     // Evidence follows the same law (spans in the edited file moved)…
     let mut evidence_rewritten: Vec<String> = Vec::new();

@@ -123,6 +123,13 @@ fn scoped_resolution_equals_scratch_for_a_defs_stable_edit() {
   .0;
   let interner = vorpal_ingest::Interner::default();
   let fetch = |path: &str| pack.get(path).map(<[u8]>::to_vec);
+  // The layout→ordinal mapping through the writer's own duplicate collapse — the same
+  // scratch ingest the compose performs.
+  let layout_ords = {
+    let mut scratch =
+      vorpal_ingest::Ingestor::new(&interner, OutlineExtractor::new().unwrap());
+    scratch.ingest_product_mapped(&edited_str, vorpal_ingest::decode_product(&new_bytes).unwrap())
+  };
   let outcome = vorpal_ingest::scoped_resolve_file(
     &interner,
     &prior_kg,
@@ -132,6 +139,7 @@ fn scoped_resolution_equals_scratch_for_a_defs_stable_edit() {
     &edited_str,
     file_key,
     &new_view,
+    &layout_ords,
     usize::MAX,
   )
   .expect("scoped resolution");
@@ -333,6 +341,11 @@ fn scoped_pairing_repair_equals_scratch_pair_set() {
   .0;
   let interner = vorpal_ingest::Interner::default();
   let fetch = |path: &str| pack.get(path).map(<[u8]>::to_vec);
+  let layout_ords = {
+    let mut scratch =
+      vorpal_ingest::Ingestor::new(&interner, OutlineExtractor::new().unwrap());
+    scratch.ingest_product_mapped(&target_str, vorpal_ingest::decode_product(&bytes).unwrap())
+  };
   let outcome = vorpal_ingest::scoped_resolve_file(
     &interner,
     &prior_kg,
@@ -342,6 +355,7 @@ fn scoped_pairing_repair_equals_scratch_pair_set() {
     &target_str,
     file_key,
     &view,
+    &layout_ords,
     usize::MAX,
   )
   .expect("scoped resolution");

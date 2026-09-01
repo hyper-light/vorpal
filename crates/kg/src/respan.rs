@@ -77,135 +77,9 @@ pub fn respan_generation(
     ));
   }
 
-  // ---- node store ----
-  let nodes_dir = staging.join(NODES_DIR);
-  fs::create_dir_all(&nodes_dir)?;
-  let prior_toc_bytes = fs::read(prior.join(NODES_TOC))
-    .map_err(|_| io::Error::other("respan: prior node TOC unreadable"))?;
-  let mut new_vseg_meta: Vec<Option<(u64, u64)>> = vec![None; buckets]; // (len, digest)
-  let mut vseg_fold = xxhash_rust::xxh3::Xxh3::new();
-  for bucket in 0..buckets {
-    let vseg_name = format!("{bucket:04}.vseg");
-    let heap_name = format!("{bucket:04}.heap");
-    if planned_in_bucket[bucket].is_empty() {
-      for name in [&vseg_name, &heap_name] {
-        let (from, to) = (prior.join(NODES_DIR).join(name), nodes_dir.join(name));
-        let _ = fs::remove_file(&to);
-        if fs::hard_link(&from, &to).is_err() {
-          fs::copy(&from, &to)?;
-        }
-      }
-      let linked = fs::read(nodes_dir.join(&vseg_name))?;
-      vseg_fold.update(&linked);
-      continue;
-    }
-    // Rebuild this bucket's vseg: prior columns verbatim, with the planned files'
-    // span/content-hash entries replaced. The heap is byte-identical (strings unchanged)
-    // and hard-links.
-    let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
-    let segment = Segment::open_owned(prior_bytes)
-      .map_err(|err| io::Error::other(format!("respan: prior node slab: {err}")))?;
-    let col = |name: &str| -> io::Result<usize> {
-      segment
-        .column_index(name)
-        .ok_or_else(|| io::Error::other(format!("respan: prior slab missing column {name}")))
-    };
-    let slice_u32 = |idx: usize| -> io::Result<Vec<u32>> {
-      segment
-        .column_at(idx)
-        .and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))
-        .ok_or_else(|| io::Error::other("respan: column not sliceable"))
-    };
-    let slice_u64 = |idx: usize| -> io::Result<Vec<u64>> {
-      segment
-        .column_at(idx)
-        .and_then(|c| c.as_slice::<u64>().map(<[u64]>::to_vec))
-        .ok_or_else(|| io::Error::other("respan: column not sliceable"))
-    };
-    let slice_u8 = |idx: usize| -> io::Result<Vec<u8>> {
-      segment
-        .column_at(idx)
-        .and_then(|c| c.as_slice::<u8>().map(<[u8]>::to_vec))
-        .ok_or_else(|| io::Error::other("respan: column not sliceable"))
-    };
-    let kind = slice_u8(col("kind")?)?;
-    let name_off = slice_u32(col("name_off")?)?;
-    let name_len = slice_u32(col("name_len")?)?;
-    let path_off = slice_u32(col("path_off")?)?;
-    let path_len = slice_u32(col("path_len")?)?;
-    let sig_off = slice_u32(col("sig_off")?)?;
-    let sig_len = slice_u32(col("sig_len")?)?;
-    let mut content_hash = slice_u64(col("content_hash")?)?;
-    let eid_lo = slice_u64(col("eid_lo")?)?;
-    let eid_hi = slice_u64(col("eid_hi")?)?;
-    let flags = slice_u8(col("flags")?)?;
-    let mut span_start = slice_u32(col("span_start")?)?;
-    let mut span_end = slice_u32(col("span_end")?)?;
-    let scc_size = slice_u32(col("scc_size")?)?;
-    let bucket_base = bases[bucket];
-    for &(key, start, rows) in &planned_in_bucket[bucket] {
-      let plan = by_key[&key];
-      if plan.rows.len() != rows as usize {
-        return Err(io::Error::other(
-          "respan: fresh row count differs from prior — not a respan edit",
-        ));
-      }
-      let local = (start - bucket_base) as usize;
-      for (i, &(new_start, new_end, new_hash)) in plan.rows.iter().enumerate() {
-        span_start[local + i] = new_start;
-        span_end[local + i] = new_end;
-        content_hash[local + i] = new_hash;
-      }
-    }
-    let mut builder = SegmentBuilder::new(0);
-    let build_err = |_| io::Error::other("respan: node slab rebuild failed");
-    builder.add_u8("kind", &kind).map_err(build_err)?;
-    builder.add_u32("name_off", &name_off).map_err(build_err)?;
-    builder.add_u32("name_len", &name_len).map_err(build_err)?;
-    builder.add_u32("path_off", &path_off).map_err(build_err)?;
-    builder.add_u32("path_len", &path_len).map_err(build_err)?;
-    builder.add_u32("sig_off", &sig_off).map_err(build_err)?;
-    builder.add_u32("sig_len", &sig_len).map_err(build_err)?;
-    builder.add_u64("content_hash", &content_hash).map_err(build_err)?;
-    builder.add_u64("eid_lo", &eid_lo).map_err(build_err)?;
-    builder.add_u64("eid_hi", &eid_hi).map_err(build_err)?;
-    builder.add_u8("flags", &flags).map_err(build_err)?;
-    builder.add_u32("span_start", &span_start).map_err(build_err)?;
-    builder.add_u32("span_end", &span_end).map_err(build_err)?;
-    builder.add_u32("scc_size", &scc_size).map_err(build_err)?;
-    let bytes = builder.build().map_err(build_err)?;
-    let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
-    vseg_fold.update(&bytes);
-    let tmp = nodes_dir.join(format!("{vseg_name}.tmp"));
-    fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, nodes_dir.join(&vseg_name))?;
-    let (from, to) = (prior.join(NODES_DIR).join(&heap_name), nodes_dir.join(&heap_name));
-    let _ = fs::remove_file(&to);
-    if fs::hard_link(&from, &to).is_err() {
-      fs::copy(&from, &to)?;
-    }
-    new_vseg_meta[bucket] = Some((bytes.len() as u64, digest));
-  }
-  // Node TOC: prior bytes with the rebuilt buckets' vseg len/digest spliced (rows, heap
-  // columns, and the file table are unchanged by construction).
-  let mut toc = prior_toc_bytes;
-  for (bucket, meta) in new_vseg_meta.iter().enumerate() {
-    if let Some((len, digest)) = meta {
-      let at = 20 + bucket * 36 + 4; // header + rows-per-bucket stride + rows u32
-      toc
-        .get_mut(at..at + 8)
-        .ok_or_else(|| io::Error::other("respan: node TOC too short"))?
-        .copy_from_slice(&len.to_le_bytes());
-      toc
-        .get_mut(at + 8..at + 16)
-        .ok_or_else(|| io::Error::other("respan: node TOC too short"))?
-        .copy_from_slice(&digest.to_le_bytes());
-    }
-  }
-  let toc_tmp = nodes_dir.join("toc.bin.tmp");
-  fs::write(&toc_tmp, &toc)?;
-  fs::rename(&toc_tmp, staging.join(NODES_TOC))?;
-  let node_fold = vseg_fold.digest();
+  // ---- node store (shared with the defs-stable compose) ----
+  let plan_refs: Vec<(u64, &FileRespan)> = plans.iter().map(|p| (p.file_key, p)).collect();
+  let node_fold = rebuild_node_buckets(staging, prior, &map, &bases, &plan_refs, None)?;
 
   // ---- evidence ----
   let store = crate::evidence::EvidenceStore::open(prior)
@@ -325,4 +199,186 @@ pub fn respan_generation(
     }
   }
   Ok(())
+}
+
+/// Rebuild the node-store buckets for a set of per-file span/content patches — and, when
+/// `scc_new` is given, for every bucket whose `scc_size` column moved (the defs-stable
+/// compose's call-graph ripple; `None` for the respan compose, whose edges are untouched).
+/// Unpatched buckets hard-link. Returns the vseg fold over ALL buckets in order (the node
+/// half of the graph-cache stamp).
+pub(crate) fn rebuild_node_buckets(
+  staging: &Path,
+  prior: &Path,
+  map: &NodeIdMap,
+  bases: &[u64],
+  plans: &[(u64, &FileRespan)],
+  scc_new: Option<&[u32]>,
+) -> io::Result<u64> {
+  let buckets = bases.len() - 1;
+  let by_key: HashMap<u64, &FileRespan> = plans.iter().map(|&(key, plan)| (key, plan)).collect();
+  if by_key.len() != plans.len() {
+    return Err(io::Error::other("respan: duplicate file in plan"));
+  }
+  let mut planned_in_bucket: Vec<Vec<(u64, u64, u32)>> = vec![Vec::new(); buckets];
+  for &(key, start, rows) in map.files() {
+    if by_key.contains_key(&key) {
+      let bucket = bases.partition_point(|&b| b <= start) - 1;
+      planned_in_bucket[bucket].push((key, start, rows));
+    }
+  }
+  let planned_files: usize = planned_in_bucket.iter().map(Vec::len).sum();
+  if planned_files != plans.len() {
+    return Err(io::Error::other(
+      "respan: a planned file is not in the prior generation",
+    ));
+  }
+
+  let nodes_dir = staging.join(NODES_DIR);
+  fs::create_dir_all(&nodes_dir)?;
+  let prior_toc_bytes = fs::read(prior.join(NODES_TOC))
+    .map_err(|_| io::Error::other("respan: prior node TOC unreadable"))?;
+  let mut new_vseg_meta: Vec<Option<(u64, u64)>> = vec![None; buckets]; // (len, digest)
+  let mut vseg_fold = xxhash_rust::xxh3::Xxh3::new();
+  for bucket in 0..buckets {
+    let vseg_name = format!("{bucket:04}.vseg");
+    let heap_name = format!("{bucket:04}.heap");
+    let scc_bucket_differs = scc_new.is_some_and(|scc| {
+      let (lo, hi) = (bases[bucket] as usize, bases[bucket + 1] as usize);
+      // Cheap pre-read of just the scc column decides linking without a full rebuild.
+      let prior_bytes = match fs::read(prior.join(NODES_DIR).join(&vseg_name)) {
+        Ok(bytes) => bytes,
+        Err(_) => return true, // unreadable: let the rebuild path surface the error
+      };
+      match Segment::open_owned(prior_bytes)
+        .ok()
+        .and_then(|seg| seg.column_index("scc_size").and_then(|i| seg.column_at(i).and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))))
+      {
+        Some(col) => col.as_slice() != &scc[lo..hi],
+        None => true,
+      }
+    });
+    if planned_in_bucket[bucket].is_empty() && !scc_bucket_differs {
+      for name in [&vseg_name, &heap_name] {
+        let (from, to) = (prior.join(NODES_DIR).join(name), nodes_dir.join(name));
+        let _ = fs::remove_file(&to);
+        if fs::hard_link(&from, &to).is_err() {
+          fs::copy(&from, &to)?;
+        }
+      }
+      let linked = fs::read(nodes_dir.join(&vseg_name))?;
+      vseg_fold.update(&linked);
+      continue;
+    }
+    // Rebuild this bucket's vseg: prior columns verbatim, with the planned files'
+    // span/content-hash entries replaced. The heap is byte-identical (strings unchanged)
+    // and hard-links.
+    let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
+    let segment = Segment::open_owned(prior_bytes)
+      .map_err(|err| io::Error::other(format!("respan: prior node slab: {err}")))?;
+    let col = |name: &str| -> io::Result<usize> {
+      segment
+        .column_index(name)
+        .ok_or_else(|| io::Error::other(format!("respan: prior slab missing column {name}")))
+    };
+    let slice_u32 = |idx: usize| -> io::Result<Vec<u32>> {
+      segment
+        .column_at(idx)
+        .and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))
+        .ok_or_else(|| io::Error::other("respan: column not sliceable"))
+    };
+    let slice_u64 = |idx: usize| -> io::Result<Vec<u64>> {
+      segment
+        .column_at(idx)
+        .and_then(|c| c.as_slice::<u64>().map(<[u64]>::to_vec))
+        .ok_or_else(|| io::Error::other("respan: column not sliceable"))
+    };
+    let slice_u8 = |idx: usize| -> io::Result<Vec<u8>> {
+      segment
+        .column_at(idx)
+        .and_then(|c| c.as_slice::<u8>().map(<[u8]>::to_vec))
+        .ok_or_else(|| io::Error::other("respan: column not sliceable"))
+    };
+    let kind = slice_u8(col("kind")?)?;
+    let name_off = slice_u32(col("name_off")?)?;
+    let name_len = slice_u32(col("name_len")?)?;
+    let path_off = slice_u32(col("path_off")?)?;
+    let path_len = slice_u32(col("path_len")?)?;
+    let sig_off = slice_u32(col("sig_off")?)?;
+    let sig_len = slice_u32(col("sig_len")?)?;
+    let mut content_hash = slice_u64(col("content_hash")?)?;
+    let eid_lo = slice_u64(col("eid_lo")?)?;
+    let eid_hi = slice_u64(col("eid_hi")?)?;
+    let flags = slice_u8(col("flags")?)?;
+    let mut span_start = slice_u32(col("span_start")?)?;
+    let mut span_end = slice_u32(col("span_end")?)?;
+    let mut scc_size = slice_u32(col("scc_size")?)?;
+    if let Some(scc) = scc_new {
+      let (lo, hi) = (bases[bucket] as usize, bases[bucket + 1] as usize);
+      scc_size.copy_from_slice(&scc[lo..hi]);
+    }
+    let bucket_base = bases[bucket];
+    for &(key, start, rows) in &planned_in_bucket[bucket] {
+      let plan = by_key[&key];
+      if plan.rows.len() != rows as usize {
+        return Err(io::Error::other(
+          "respan: fresh row count differs from prior — not a respan edit",
+        ));
+      }
+      let local = (start - bucket_base) as usize;
+      for (i, &(new_start, new_end, new_hash)) in plan.rows.iter().enumerate() {
+        span_start[local + i] = new_start;
+        span_end[local + i] = new_end;
+        content_hash[local + i] = new_hash;
+      }
+    }
+    let mut builder = SegmentBuilder::new(0);
+    let build_err = |_| io::Error::other("respan: node slab rebuild failed");
+    builder.add_u8("kind", &kind).map_err(build_err)?;
+    builder.add_u32("name_off", &name_off).map_err(build_err)?;
+    builder.add_u32("name_len", &name_len).map_err(build_err)?;
+    builder.add_u32("path_off", &path_off).map_err(build_err)?;
+    builder.add_u32("path_len", &path_len).map_err(build_err)?;
+    builder.add_u32("sig_off", &sig_off).map_err(build_err)?;
+    builder.add_u32("sig_len", &sig_len).map_err(build_err)?;
+    builder.add_u64("content_hash", &content_hash).map_err(build_err)?;
+    builder.add_u64("eid_lo", &eid_lo).map_err(build_err)?;
+    builder.add_u64("eid_hi", &eid_hi).map_err(build_err)?;
+    builder.add_u8("flags", &flags).map_err(build_err)?;
+    builder.add_u32("span_start", &span_start).map_err(build_err)?;
+    builder.add_u32("span_end", &span_end).map_err(build_err)?;
+    builder.add_u32("scc_size", &scc_size).map_err(build_err)?;
+    let bytes = builder.build().map_err(build_err)?;
+    let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
+    vseg_fold.update(&bytes);
+    let tmp = nodes_dir.join(format!("{vseg_name}.tmp"));
+    fs::write(&tmp, &bytes)?;
+    fs::rename(&tmp, nodes_dir.join(&vseg_name))?;
+    let (from, to) = (prior.join(NODES_DIR).join(&heap_name), nodes_dir.join(&heap_name));
+    let _ = fs::remove_file(&to);
+    if fs::hard_link(&from, &to).is_err() {
+      fs::copy(&from, &to)?;
+    }
+    new_vseg_meta[bucket] = Some((bytes.len() as u64, digest));
+  }
+  // Node TOC: prior bytes with the rebuilt buckets' vseg len/digest spliced (rows, heap
+  // columns, and the file table are unchanged by construction).
+  let mut toc = prior_toc_bytes;
+  for (bucket, meta) in new_vseg_meta.iter().enumerate() {
+    if let Some((len, digest)) = meta {
+      let at = 20 + bucket * 36 + 4; // header + rows-per-bucket stride + rows u32
+      toc
+        .get_mut(at..at + 8)
+        .ok_or_else(|| io::Error::other("respan: node TOC too short"))?
+        .copy_from_slice(&len.to_le_bytes());
+      toc
+        .get_mut(at + 8..at + 16)
+        .ok_or_else(|| io::Error::other("respan: node TOC too short"))?
+        .copy_from_slice(&digest.to_le_bytes());
+    }
+  }
+  let toc_tmp = nodes_dir.join("toc.bin.tmp");
+  fs::write(&toc_tmp, &toc)?;
+  fs::rename(&toc_tmp, staging.join(NODES_TOC))?;
+  let node_fold = vseg_fold.digest();
+  Ok(node_fold)
 }

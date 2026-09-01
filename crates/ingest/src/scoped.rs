@@ -142,18 +142,33 @@ pub fn scoped_resolve_file(
   path: &str,
   file_key: u64,
   view: &ProductView<'_>,
+  layout_ords: &[u64],
   decode_cap: usize,
 ) -> io::Result<ScopedOutcome> {
   // --- the file's dense range: base + row count, from the nodes TOC file table ---
   let Some(&(_, base, rows)) = map.files().iter().find(|&&(key, _, _)| key == file_key) else {
     return Err(io::Error::other("scoped: file outside the prior universe"));
   };
-  // Layout parity: [File] + items + members. A mismatch means the ladder mis-judged —
-  // refuse rather than mis-attribute a single reference.
+  // Layout parity: [File] + items + members, mapped through the writer's OWN duplicate
+  // collapse (`layout_ords`, from the caller's scratch ingest of this same product) — a C
+  // declaration+definition pair shares one row, so layout length may EXCEED the row
+  // count; every mapped ordinal must land inside it.
   let layout_len = 1 + view.items.iter().map(|item| 1 + item.members.len()).sum::<usize>();
-  if layout_len as u32 != rows {
-    return Err(io::Error::other("scoped: layout drift against the prior node rows"));
+  if layout_ords.len() != layout_len {
+    return Err(io::Error::other(format!(
+      "scoped: layout mapping length {} != fresh layout {layout_len}",
+      layout_ords.len(),
+    )));
   }
+  if layout_ords.iter().any(|&ord| ord >= u64::from(rows)) {
+    return Err(io::Error::other("scoped: layout mapping outside the prior node rows"));
+  }
+  let ord_of = |index: u32| -> io::Result<u64> {
+    layout_ords
+      .get(index as usize)
+      .copied()
+      .ok_or_else(|| io::Error::other("scoped: entity index outside the file layout"))
+  };
 
   // --- pass 1 (interning parity with the pipeline's two-pass shape): references first ---
   let path_id = interner.intern(path);
@@ -161,10 +176,7 @@ pub fn scoped_resolve_file(
   let mut args: Vec<ArgRec> = Vec::new();
   let mut req_rows: Vec<ReqRow> = Vec::new();
   for r in &view.refs {
-    if r.from_entity_index >= rows {
-      return Err(io::Error::other("scoped: reference outside the file layout"));
-    }
-    let from = NodeId::new(base + u64::from(r.from_entity_index));
+    let from = NodeId::new(base + ord_of(r.from_entity_index)?);
     if crate::product::tag_refkind(r.kind) == vorpal_resolve::RefKind::Call && r.args_len() > 0
     {
       let has_receiver = r.receiver.is_some();
@@ -185,11 +197,11 @@ pub fn scoped_resolve_file(
     references.push(reference_from_view(interner, from, path_id, r));
   }
   for req in &view.requests {
-    if req.from_entity_index >= rows {
+    let Ok(from_ord) = ord_of(req.from_entity_index) else {
       continue; // corrupt product index — the apply kernel drops these identically
-    }
+    };
     req_rows.push(ReqRow {
-      from: base + u64::from(req.from_entity_index),
+      from: base + from_ord,
       method: Box::from(req.method),
       path: Box::from(req.path),
       span: (req.start, req.end),
@@ -199,22 +211,32 @@ pub fn scoped_resolve_file(
   // --- the name closure: every table lookup the file's resolution can perform ---
   let mut names: HashSet<&str> = HashSet::new();
   let mut call_names: HashSet<&str> = HashSet::new();
+  let mut chain_keys: HashSet<&str> = HashSet::new();
   for r in &view.refs {
     names.insert(r.name);
     if let Some(receiver_type) = r.receiver_type {
       names.insert(receiver_type);
+      // The resolver's ONE chain consult (`resolver.rs`, ReceiverChained) fires for
+      // Method/MethodHinted refs and keys on the ref's receiver_type — nothing else
+      // ever reads the rets ledger, so nothing else bounds the decode set.
+      if matches!(
+        crate::product::tag_refform(r.form),
+        vorpal_resolve::RefForm::Method | vorpal_resolve::RefForm::MethodHinted
+      ) {
+        chain_keys.insert(receiver_type);
+      }
     }
     if crate::product::tag_refkind(r.kind) == vorpal_resolve::RefKind::Call {
       call_names.insert(r.name);
     }
   }
 
-  // --- bounded closure: decode the files defining any called name, for rets + params ---
-  // Chain resolution consults rets[NAME] only for names the file calls, and every rets
-  // entry for such a name lives in a file defining it. Params bind arguments only at
-  // RESOLVED callees — a subset of the same files. One decode round covers both.
+  // --- bounded closure, split by CONSUMER (each half decodes only what its reader can
+  // ever consult): rets ← files defining a chain key; params ← PYTHON files defining a
+  // called name (`is_python_path` gates the ledger at ingest — a C corpus decodes
+  // nothing at all here, measured 542 dead decodes/1.4 s before this split).
   let mut closure_paths: HashSet<String> = HashSet::new();
-  for name in &call_names {
+  for name in &chain_keys {
     for id in kg.nodes_named(name) {
       let Some(node) = kg.node(id) else { continue };
       if node.kind == SymbolKind::Import || node.kind == SymbolKind::File {
@@ -225,12 +247,28 @@ pub fn scoped_resolve_file(
       }
     }
   }
+  for name in &call_names {
+    for id in kg.nodes_named(name) {
+      let Some(node) = kg.node(id) else { continue };
+      if node.kind == SymbolKind::Import || node.kind == SymbolKind::File {
+        continue;
+      }
+      if node.path != path && is_python_path(node.path) {
+        closure_paths.insert(node.path.to_string());
+      }
+    }
+  }
   if closure_paths.len() > decode_cap {
     return Err(io::Error::other(format!(
       "scoped: closure of {} files exceeds the decode cap ({decode_cap})",
       closure_paths.len(),
     )));
   }
+  vorpal_kg::phase_stamp(&format!(
+    "scoped: closure {} files over {} call names",
+    closure_paths.len(),
+    call_names.len(),
+  ));
   let mut rets_rows: Vec<(&str, &str)> = Vec::new();
   let mut param_rows: Vec<(u64, Box<[Box<str>]>)> = Vec::new();
   let mut decoded: Vec<(String, Vec<u8>)> = Vec::with_capacity(closure_paths.len() + 1);
@@ -262,7 +300,6 @@ pub fn scoped_resolve_file(
   for (other_path, other_base, other_view) in &decoded_views {
     for (name, ret) in &other_view.returns {
       rets_rows.push((name, ret));
-      names.insert(ret);
     }
     if is_python_path(other_path) {
       for (entity_index, params) in other_view.entity_params.iter() {
@@ -277,7 +314,6 @@ pub fn scoped_resolve_file(
   // The edited file's own rets/params (self-calls, self-chains) from the fresh view.
   for (name, ret) in &view.returns {
     rets_rows.push((name, ret));
-    names.insert(ret);
   }
   if is_python_path(path) {
     for (entity_index, params) in view.entity_params.iter() {
@@ -287,6 +323,13 @@ pub fn scoped_resolve_file(
       }
     }
   }
+
+  vorpal_kg::phase_stamp("scoped: closure decoded");
+  // The chain ledger interns its return-type names NOW, before the table build — the
+  // linkers' own order. Owner slots resolve by peek, so every name a comparison can
+  // reach (F's ref fields interned above; rets values interned here) must be in the
+  // interner FIRST; anything outside that set sentinels identically in both worlds.
+  let chain = (!rets_rows.is_empty()).then(|| ChainReturns::build(interner, rets_rows));
 
   // --- the partial symbol table: rule-for-rule with build_symbol_table_over ---
   let mut table = SymbolTable::new();
@@ -333,9 +376,10 @@ pub fn scoped_resolve_file(
   seed_import_bindings(interner, &mut table, &qualified, resolver);
 
   // --- resolution: the pipeline's own chunk kernel, chain-aware ---
-  let chain = (!rets_rows.is_empty()).then(|| ChainReturns::build(interner, rets_rows));
+  vorpal_kg::phase_stamp("scoped: table ready");
   let (resolved, unresolved, stats) =
     resolve_batch(interner, &table, &references, resolver, chain.as_ref());
+  vorpal_kg::phase_stamp(&format!("scoped: resolved {} refs", references.len()));
 
   // --- emission: the per-src slab segment, mirror of the linkers' shared shape ---
   let arg_join = ArgJoin::from_records(args);
@@ -430,11 +474,11 @@ pub fn scoped_resolve_file(
   let sigs: Vec<SigRow> = view
     .signatures
     .iter()
-    .filter(|sig| sig.entity_index < rows)
     .filter_map(|sig| {
+      let ord = layout_ords.get(sig.entity_index as usize).copied()?;
       let sketch = <[u8; crate::signature::BINS]>::try_from(sig.sketch).ok()?;
       Some(SigRow {
-        node: base + u64::from(sig.entity_index),
+        node: base + ord,
         shingles: sig.shingles,
         sketch,
       })
@@ -456,16 +500,9 @@ pub fn scoped_resolve_file(
 /// side of the scoped pairing diff — read from the sealed truth rather than re-paired,
 /// so the diff can never disagree with the bytes it is patching.
 pub fn similar_pairs_of_kg(kg: &Kg) -> Vec<(u64, u64, u8)> {
-  let mut pairs = Vec::new();
-  for id in 0..kg.node_count() as u64 {
-    for (dst, etype) in kg.out_neighbors(NodeId::new(id)) {
-      if etype.base() == vorpal_kg::EdgeType::SIMILAR_TO && id < dst.raw() {
-        pairs.push((id, dst.raw(), etype.confidence()));
-      }
-    }
-  }
-  pairs.sort_unstable();
-  pairs
+  // Delegates to the graph-side zero-allocation walk (`Kg::similar_pairs`): the
+  // per-node `out_neighbors` Vec was ~9M transient allocations at kernel scale.
+  kg.similar_pairs()
 }
 
 /// The scoped pairing repair (P4.5c-2, slice ii). Near-clone pairing is GLOBAL — LSH
@@ -481,6 +518,9 @@ pub struct SimilarRepair {
   pub fresh_pairs: Vec<(u64, u64, u8)>,
   /// Every endpoint of every added, removed, or relabeled pair — ascending, deduped.
   pub changed_srcs: Vec<u32>,
+  /// The full swapped row set in canonical order — the sigs family's new content, handed
+  /// back so the compose persists exactly what was paired.
+  pub swapped_rows: Vec<SigRow>,
 }
 
 /// `live_files` is the MANIFEST's live entry count — the bucket law's one input
@@ -533,7 +573,7 @@ pub fn scoped_similar_repair(
     rows.extend(fresh_file_sigs.iter().cloned());
     rows.extend(tail);
   }
-  let (mut fresh_pairs, _report, _rows) = crate::similar::similar_pairs(rows);
+  let (mut fresh_pairs, _report, swapped_rows) = crate::similar::similar_pairs(rows);
   fresh_pairs.sort_unstable();
 
   // Symmetric difference on (a, b, confidence): a relabeled pair appears on both sides
@@ -574,5 +614,6 @@ pub fn scoped_similar_repair(
   Ok(SimilarRepair {
     fresh_pairs,
     changed_srcs: changed,
+    swapped_rows,
   })
 }

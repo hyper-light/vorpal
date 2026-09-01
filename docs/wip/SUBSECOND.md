@@ -806,6 +806,44 @@ its disk twin, landed in three certified sub-slices:
     solo at 638 k rows (the c2-ii driver; ceiling truncation makes pairing
     order-dependent — SigStore's (bucket, key, ordinal) sort IS the canonical feed
     order).
+  - **c-2 slices ii+iii — the pairing repair and the family surgery: SHIPPED
+    (2026-08-31).** `scoped_similar_repair` re-pairs the FULL ledger with the edited
+    file's run swapped at its canonical (bucket, file, ordinal) position (SigStore's
+    order IS the pipeline's feed order — load-bearing under the measured candidate
+    ceiling), diffs against the prior pair set read from the sealed adjacency
+    (`Kg::similar_pairs`, a zero-allocation CSR walk — `out_neighbors` was ~9M transient
+    allocs at kernel scale), and names every endpoint whose similar segment rewrites.
+    `vorpal_kg::defs_stable::compose_defs_stable` splices the families: node vsegs
+    (spans; heap links — strings are defs-stable), the scc_size column wherever the
+    CALLS condensation ripple lands (recomputed from the prior GRAPH + the delta, only
+    when the file's call set moved), the file's evidence bucket (row/pool/total TOC
+    re-splice), edge slabs by per-source CLASS partition (containment | co-change |
+    resolution+DF | similar | requests — disjoint bases, monotonicity asserted), usage
+    delta, sigs swap, dataflow filter+extend, and — critically — the SUCCESSOR GRAPH
+    CACHE built from the prior CSR + the delta (without it every post-compose build
+    paid a measured ~1.4 s lazy slab-decode; compose chains compounded to 5.1 s).
+    The co-change rung (`cochange::inputs_unchanged`, HEAD-keyed cache header) now
+    gates BOTH composes — a gap this slice found in shipped P4.5b: respan carried
+    CHANGES_WITH bytes with no git-stability check. Two more real-world catches: the
+    writer COLLAPSES duplicate entities (C decl+def pairs — 150 layout entries, 145
+    rows on mm/slab_common.c), so reference attribution goes through the pipeline's own
+    `layout_ids` bridge (`ingest_product_mapped`), and the bounded closure decodes ONLY
+    what its consumers can read (rets ← files defining a Method/MethodHinted ref's
+    receiver_type, the resolver's single chain consult; params ← Python files) — the
+    call-name closure decoded 542 dead products/1.4 s on a C edit before the split,
+    and rets values now intern BEFORE the table build (the linkers' order), making
+    owner-peek hit-ness deterministic.
+    KERNEL (76,868 files, call-inserting edit in mm/slab_common.c — the WORST lane:
+    call set moved ⇒ full scc recompute + pairing recompute): **1.12–1.19 s** steady
+    across a compose chain vs 1.9–2.1 s full pipeline, byte-converged to scratch every
+    cycle (Merkle + full fold). Gates: scoped_compose e2e (scc-ripple cycle across
+    files with the OTHER file's vseg physically rewritten; pair-appearance; def-adding
+    decline), pack_v2 (its semantic-edit step now composes: vseg-only rewrite, heap
+    links), both daemon differentials, suite 133/133, battery 48/48 across
+    rs/go/py/ts × both lanes — nats.go's span-only shapes now compose too (the
+    defs-stable ladder does not require request-span equality; requests re-derive).
+    Remaining measured leads: incremental LSH banding (pairing ~0.3 s of the 1.1 s),
+    scc pre-read double-open, usage all_pairs full read.
   - **c-2 — defs-stable scoped resolve (single-file semantic edits).** Ground truths
     verified in-code (2026-08-31): a file's node rows are exactly [File][item][member…]
     in outline order (`ingest_file_with_spans`), so a defs-stable edit (same items,

@@ -97,7 +97,19 @@ impl<'i, E: FileExtractor> Ingestor<'i, E> {
   /// Takes the product by value: its reference strings are moved into the buffered
   /// [`Reference`]s, so the single-writer apply stage clones nothing.
   pub fn ingest_product(&mut self, path: &str, product: crate::FileProduct) {
-    apply_product(self.interner, path, product, &mut self.writer, &mut self.references);
+    let _ = apply_product(self.interner, path, product, &mut self.writer, &mut self.references);
+  }
+
+  /// [`Ingestor::ingest_product`] returning the layout→ordinal mapping: for layout index
+  /// `i` (0 = the file node), the file-local ordinal the writer assigned — duplicate
+  /// entities COLLAPSE (a C declaration+definition pair lands on one row), so this vec is
+  /// the only sound bridge from product entity indices to node ordinals. The scoped
+  /// compose (P4.5c-2) attributes the fresh references through it.
+  pub fn ingest_product_mapped(&mut self, path: &str, product: crate::FileProduct) -> Vec<u64> {
+    apply_product(self.interner, path, product, &mut self.writer, &mut self.references)
+      .into_iter()
+      .map(|(_, id)| id.raw())
+      .collect()
   }
 
   /// Recursively ingest a directory, respecting `.gitignore`, skipping files the extractor does
@@ -1332,8 +1344,8 @@ pub(crate) fn apply_product<'i>(
   product: crate::FileProduct,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
-) {
-  apply_product_with_args(interner, path, product, writer, references, None);
+) -> Vec<(std::ops::Range<usize>, NodeId)> {
+  apply_product_with_args(interner, path, product, writer, references, None)
 }
 
 pub(crate) fn apply_product_with_args<'i>(
@@ -1343,7 +1355,7 @@ pub(crate) fn apply_product_with_args<'i>(
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
   mut flow_out: Option<&mut FlowSidecar>,
-) {
+) -> Vec<(std::ops::Range<usize>, NodeId)> {
   let crate::FileProduct {
     items,
     refs,
@@ -1395,7 +1407,7 @@ pub(crate) fn apply_product_with_args<'i>(
     writer,
     references,
     flow_out,
-  );
+  )
 }
 
 /// Apply a pack-replayed product straight from its mapped bytes: decode to views, apply —
@@ -1455,7 +1467,7 @@ fn apply_parts<'a, 'i>(
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
   mut flow_out: Option<&mut FlowSidecar>,
-) {
+) -> Vec<(std::ops::Range<usize>, NodeId)> {
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
   writer.forget_identity_scope();
@@ -1549,6 +1561,10 @@ fn apply_parts<'a, 'i>(
     }
     references.push(reference_from_view(interner, from, path_id, &r));
   }
+  // The layout→id mapping (index 0 = file): the writer COLLAPSES duplicate entities
+  // (C declaration+definition pairs land on one row), so layout indices are NOT node
+  // ordinals — this vec is the one true bridge, and the scoped compose consumes it.
+  layout_ids
 }
 
 /// The ONE Reference construction from a product ref view — shared by the bulk/retained
@@ -2380,27 +2396,27 @@ where
               Ok(StreamWork::Parsed(path, product)) => {
                 let mut product = Some(product);
                 apply_one(&mut |w, r, f| {
-                  apply_product_with_args(
+                  let _ = apply_product_with_args(
                     interner,
                     &path,
                     product.take().expect("applied once"),
                     w,
                     r,
                     Some(f),
-                  )
+                  );
                 }, true)
               }
               Ok(StreamWork::Replayed(path, product)) => {
                 let mut product = Some(product);
                 apply_one(&mut |w, r, f| {
-                  apply_product_with_args(
+                  let _ = apply_product_with_args(
                     interner,
                     &path,
                     product.take().expect("applied once"),
                     w,
                     r,
                     Some(f),
-                  )
+                  );
                 }, false)
               }
               Ok(StreamWork::ReplayedPacked(path)) => {
