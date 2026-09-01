@@ -879,6 +879,31 @@ its disk twin, landed in three certified sub-slices:
     referrer (found through gamma_new's prior NO-EDGE rows — the added-def case);
     evidence and per-source edge sequences equal scratch for the edited AND dirty files;
     the dangling reference resolves non-vacuously. Surgery + compose wiring = c3-ii.
+  - **c-3 slice ii — the defs-changed surgery: SHIPPED (2026-09-01).**
+    `vorpal_kg::defs_changed::compose_defs_changed` + `try_defs_changed_compose` (guard
+    order: cutoff → respan → defs-stable → defs-changed → full). The edited bucket's
+    node columns and heap BYTE-SPLICE around the scratch seal's rows (file heap runs are
+    back-to-back by the writer's gather order — asserted); the successor identity
+    (bases, file table, map) builds in RAM from the shift law; session buckets swap
+    evidence/edges with dense translation; scc recomputes over the successor call graph;
+    usage/sigs/dataflow/names.idx/graph all emit successor artifacts (names by
+    translation + the fresh block — never a full rescan). THE LAW THE KERNEL FORCED: an
+    UNMOVED ordinal (same identity, same position — every append's survivors) keeps its
+    dense id verbatim, which is exactly why its referrers are not dirty; `translate` is
+    identity there for TARGETS while source-side enumerations drop the whole old block
+    (the fresh block re-contributes survivors) — the first fixture (insert-at-top,
+    everything moves) could not see either half; the kernel append found both within
+    two runs, each as a LOUD decline/divergence, never a wrong commit. Escalations live:
+    Route/Channel-def changes, dirty past the quarter-corpus shape, error-accounting
+    deltas, co-change movement, file adds/deletes.
+    KERNEL (fn add/remove toggles in mm/slab_common.c): **1.28–1.32 s** per compose,
+    byte-converged to scratch EVERY cycle, vs 1.9–2.1 s full. Gates:
+    tests/defs_changed_compose.rs (add-above-survivors with shift + dirty referrer +
+    fresh names.idx + carried unaffected buckets; remove with edge decay; file-add
+    decline), the oracle, all prior compose gates, suite 135/135, clippy 0/0, battery
+    48/48. REMAINING for the campaign: the default-format flip + v1 read retirement
+    (owner decision — it changes every user's default), multi-file compose sessions,
+    and the recorded perf leads (incremental LSH banding, scc pre-read).
   - **c-3 — defs-changed closure via the usage family (design of record, 2026-09-01).**
     Single modified file F whose DEFINITION SET changed (adds/removes/renames/signature/
     export changes; file adds/deletes stay full-pipeline). The dense-shift law collapses:

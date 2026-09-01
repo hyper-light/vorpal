@@ -729,3 +729,478 @@ const DEFS_STABLE_NOTE: &str = "defs-stable compose: unchanged files' relations 
    byte-identically; the edited file re-resolved against the prior universe and the \
    near-clone pair set repaired over the sigs family";
 
+/// The DEFS-CHANGED compose (P4.5c-3): a single modified file whose definition set moved.
+/// The dirty closure comes from the usage family over `affected_def_names` (ordinal-
+/// shifted survivors included — the byte-impact law); the whole closure re-resolves
+/// through the overlay session (oracle: tests/defs_changed_oracle.rs); and
+/// `vorpal_kg::defs_changed::compose_defs_changed` splices the successor generation.
+/// Convergence is pinned by tests/defs_changed_compose.rs.
+pub(crate) fn try_defs_changed_compose(
+  out: &Path,
+  prior: &Path,
+  ctx: &CutoffContext<'_>,
+  extractor: &OutlineExtractor,
+  cache_mode_label: &'static str,
+) -> io::Result<Option<IndexReport>> {
+  let CutoffContext {
+    manifest,
+    prior_manifest,
+    prior_manifest_ns,
+    tree_root,
+  } = *ctx;
+  if !matches!(
+    vorpal_ingest::PackFormat::from_env(),
+    vorpal_ingest::PackFormat::Bucketed
+  ) {
+    return Ok(None);
+  }
+  for toc in [
+    vorpal_kg::NODES_TOC,
+    vorpal_kg::EVIDENCE_TOC,
+    vorpal_kg::EDGES_TOC,
+    vorpal_kg::USAGE_TOC,
+    vorpal_kg::SIGS_TOC,
+    "products/toc.bin",
+  ] {
+    if !prior.join(toc).is_file() {
+      return Ok(None);
+    }
+  }
+  let current = manifest.entries();
+  let previous = prior_manifest.entries();
+  let (mut i, mut j) = (0usize, 0usize);
+  let mut changed: Vec<&FileStat> = Vec::new();
+  while i < current.len() && j < previous.len() {
+    match current[i].path.cmp(&previous[j].path) {
+      std::cmp::Ordering::Less | std::cmp::Ordering::Greater => return Ok(None),
+      std::cmp::Ordering::Equal => {
+        if current[i].size != previous[j].size || current[i].mtime_ns != previous[j].mtime_ns {
+          changed.push(&current[i]);
+          if changed.len() > 1 {
+            return Ok(None);
+          }
+        }
+        i += 1;
+        j += 1;
+      }
+    }
+  }
+  if i < current.len() || j < previous.len() || changed.len() != 1 {
+    return Ok(None);
+  }
+  let entry = changed[0];
+  {
+    let racy: Vec<&FileStat> = manifest
+      .entries()
+      .iter()
+      .filter(|e| {
+        e.mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000 && e.path != entry.path
+      })
+      .collect();
+    if !racy.is_empty() {
+      let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
+        return Ok(None);
+      };
+      let all_match = racy.iter().all(|racy_entry| {
+        let stored = pack
+          .get(&racy_entry.path)
+          .and_then(vorpal_ingest::peek_product_digest);
+        match (stored, fs::read(&racy_entry.path)) {
+          (Some(digest), Ok(bytes)) => xxhash_rust::xxh3::xxh3_64(&bytes) == digest,
+          _ => false,
+        }
+      });
+      if !all_match {
+        return Ok(None);
+      }
+    }
+  }
+  if !crate::cochange::inputs_unchanged(Path::new(tree_root), &out.join("cochange.cache")) {
+    vorpal_kg::phase_stamp("defs-changed: ineligible (co-change inputs moved)");
+    return Ok(None);
+  }
+
+  let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
+    return Ok(None);
+  };
+  let Ok(prior_kg) = vorpal_kg::Kg::load(prior) else {
+    return Ok(None);
+  };
+  let Some(prior_map) = vorpal_kg::NodeIdMap::from_dir(prior) else {
+    return Ok(None);
+  };
+
+  let Ok(source) = fs::read_to_string(&entry.path) else {
+    return Ok(None);
+  };
+  let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
+    return Ok(None);
+  };
+  product.source_size = entry.size;
+  product.source_mtime_ns = entry.mtime_ns;
+  let mut fresh_bytes = Vec::new();
+  encode_product_into(&product, &mut fresh_bytes);
+  let Some(prior_bytes) = pack.get(&entry.path) else {
+    return Ok(None);
+  };
+  let (Ok(old_view), Ok(new_view)) = (
+    decode_product_view(prior_bytes),
+    decode_product_view(&fresh_bytes),
+  ) else {
+    return Ok(None);
+  };
+  if let Some(reason) = vorpal_ingest::views_defs_changed_reject(&old_view, &new_view) {
+    vorpal_kg::phase_stamp(&format!("defs-changed: ineligible ({}): {reason}", entry.path));
+    return Ok(None);
+  }
+
+  // The fresh scratch seal: rows, layout bridge, and the successor block's bytes.
+  let interner = vorpal_ingest::Interner::default();
+  let Ok(fresh_product) = decode_product(&fresh_bytes) else {
+    return Ok(None);
+  };
+  let Ok(scratch_extractor) = OutlineExtractor::new() else {
+    return Ok(None);
+  };
+  let mut ingestor = vorpal_ingest::Ingestor::new(&interner, scratch_extractor);
+  let fresh_ords = ingestor.ingest_product_mapped(&entry.path, fresh_product);
+  let fresh_kg = ingestor.seal();
+  let rel = vorpal_kg::identity::tree_relative(&entry.path, tree_root);
+  let file_key = vorpal_kg::identity::FileKey::of(rel).0;
+  let Some(&(_, old_start, old_rows)) = prior_map
+    .files()
+    .iter()
+    .find(|&&(key, _, _)| key == file_key)
+  else {
+    return Ok(None);
+  };
+
+  // The affected set — empty means defs-stable territory (that compose already ran and
+  // declined for its own reasons); nothing scoped is provable here.
+  let affected =
+    vorpal_ingest::affected_def_names(&prior_kg, old_start, old_rows, &fresh_kg);
+  if affected.is_empty() {
+    return Ok(None);
+  }
+  // Route/Channel escalation: request matching is URL-keyed — usage cannot bound it.
+  let old_kinds = vorpal_ingest::def_kinds_of(&prior_kg, old_start, old_rows);
+  let new_kinds = vorpal_ingest::def_kinds_of(&fresh_kg, 0, fresh_kg.node_count() as u32);
+  let routeish = |kinds: Option<&Vec<vorpal_kg::SymbolKind>>| {
+    kinds.is_some_and(|list| {
+      list
+        .iter()
+        .any(|kind| matches!(kind, vorpal_kg::SymbolKind::Route | vorpal_kg::SymbolKind::Channel))
+    })
+  };
+  if affected
+    .iter()
+    .any(|name| routeish(old_kinds.get(name)) || routeish(new_kinds.get(name)))
+  {
+    vorpal_kg::phase_stamp("defs-changed: ineligible (a Route/Channel definition moved)");
+    return Ok(None);
+  }
+
+  // The usage-dirty closure, capped by the retained tier's measured escalation shape
+  // (past ~a quarter of the corpus the full pipeline's streaming feed wins).
+  let Some(usage) = vorpal_kg::UsageStore::open(prior) else {
+    return Ok(None);
+  };
+  let mut dirty_keys: Vec<u64> = affected
+    .iter()
+    .flat_map(|name| {
+      usage.files_referencing((xxhash_rust::xxh3::xxh3_64(name.as_bytes()) & 0xFFFF_FFFF) as u32)
+    })
+    .filter(|&key| key != file_key)
+    .collect();
+  dirty_keys.sort_unstable();
+  dirty_keys.dedup();
+  let dirty_cap = (manifest.entries().len() / 4).max(1);
+  if dirty_keys.len() > dirty_cap {
+    vorpal_kg::phase_stamp(&format!(
+      "defs-changed: escalating ({} dirty files past the cap {dirty_cap})",
+      dirty_keys.len(),
+    ));
+    return Ok(None);
+  }
+  vorpal_kg::phase_stamp(&format!(
+    "defs-changed: {} affected names -> {} dirty files",
+    affected.len(),
+    dirty_keys.len(),
+  ));
+
+  // Dirty inputs: unchanged pack products + their layout bridges.
+  let path_of_key = |key: u64| -> Option<String> {
+    prior_map
+      .files()
+      .iter()
+      .find(|&&(k, _, _)| k == key)
+      .and_then(|&(_, start, _)| prior_kg.node(vorpal_kg::NodeId::new(start)))
+      .map(|file| file.path.to_string())
+  };
+  let mut dirty_bytes: Vec<(u64, String, Vec<u8>)> = Vec::with_capacity(dirty_keys.len());
+  for &key in &dirty_keys {
+    let Some(path) = path_of_key(key) else {
+      return Ok(None);
+    };
+    let Some(bytes) = pack.get(&path) else {
+      return Ok(None);
+    };
+    dirty_bytes.push((key, path, bytes.to_vec()));
+  }
+  let mut dirty_views: Vec<(u64, String, vorpal_ingest::ProductView<'_>, Vec<u64>)> =
+    Vec::with_capacity(dirty_bytes.len());
+  for (key, path, bytes) in &dirty_bytes {
+    let Ok(view) = decode_product_view(bytes) else {
+      return Ok(None);
+    };
+    let Ok(product) = decode_product(bytes) else {
+      return Ok(None);
+    };
+    let Ok(map_extractor) = OutlineExtractor::new() else {
+      return Ok(None);
+    };
+    let mut mapper = vorpal_ingest::Ingestor::new(&interner, map_extractor);
+    let ords = mapper.ingest_product_mapped(path, product);
+    dirty_views.push((*key, path.clone(), view, ords));
+  }
+
+  let edited_input = vorpal_ingest::DirtyFileInput {
+    path: entry.path.clone(),
+    file_key,
+    view: &new_view,
+    layout_ords: &fresh_ords,
+  };
+  let dirty_inputs: Vec<vorpal_ingest::DirtyFileInput<'_>> = dirty_views
+    .iter()
+    .map(|(key, path, view, ords)| vorpal_ingest::DirtyFileInput {
+      path: path.clone(),
+      file_key: *key,
+      view,
+      layout_ords: ords,
+    })
+    .collect();
+  let decode_cap = (manifest.entries().len() / 4).max(1);
+  let outcomes = match vorpal_ingest::resolve_defs_changed(
+    &interner,
+    &prior_kg,
+    &prior_map,
+    &vorpal_ingest::Resolver::new(),
+    &|path: &str| pack.get(path).map(<[u8]>::to_vec),
+    &edited_input,
+    &fresh_kg,
+    &dirty_inputs,
+    decode_cap,
+  ) {
+    Ok(outcomes) => outcomes,
+    Err(err) => {
+      vorpal_kg::phase_stamp(&format!("defs-changed: scoped resolution declined: {err}"));
+      return Ok(None);
+    }
+  };
+
+  // The pairing repair over the TRANSLATED ledger: F's old rows drop (its fresh run
+  // rides outcome 0), every other row's node id shifts by the law, and any prior pair
+  // that LOSES its F endpoint forces the surviving endpoint's segment to rewrite.
+  let new_rows_count = fresh_kg.node_count() as u32;
+  let delta = i64::from(new_rows_count) - i64::from(old_rows);
+  let old_end = old_start + u64::from(old_rows);
+  // Per OLD ordinal: identity-and-position survival. Unmoved ordinals keep their dense
+  // ids verbatim — the reason their referrers are not dirty.
+  let row_facts = |kg: &vorpal_kg::Kg, id: u64| {
+    kg.node(vorpal_kg::NodeId::new(id)).map(|node| {
+      (
+        node.name.to_string(),
+        node.kind,
+        node.signature.to_string(),
+        node.exported,
+        node.external_id.map(|eid| eid.to_string()),
+      )
+    })
+  };
+  let unmoved_ordinals: Vec<bool> = (0..u64::from(old_rows))
+    .map(|ord| {
+      ord < u64::from(new_rows_count)
+        && row_facts(&prior_kg, old_start + ord) == row_facts(&fresh_kg, ord)
+    })
+    .collect();
+  let translate = |dense: u64| -> Option<u64> {
+    if (old_start..old_end).contains(&dense) {
+      let ordinal = (dense - old_start) as usize;
+      unmoved_ordinals.get(ordinal).copied().unwrap_or(false).then_some(dense)
+    } else if dense >= old_end {
+      Some((dense as i64 + delta) as u64)
+    } else {
+      Some(dense)
+    }
+  };
+  let Some(sig_store) = vorpal_kg::SigStore::open(prior) else {
+    return Ok(None);
+  };
+  let Some(family_rows) = sig_store.rows(&prior_map) else {
+    return Ok(None);
+  };
+  let mut prior_rows_sigs: Vec<vorpal_ingest::SigRow> = Vec::with_capacity(family_rows.len());
+  for row in family_rows {
+    // The edited file's WHOLE old run is replaced by the fresh one (unmoved ordinals
+    // included — their fresh rows re-contribute); everything else translates.
+    if (old_start..old_end).contains(&u64::from(row.node)) {
+      continue;
+    }
+    if let Some(node) = translate(u64::from(row.node)) {
+      prior_rows_sigs.push(vorpal_ingest::SigRow {
+        node,
+        shingles: row.shingles,
+        sketch: row.sketch,
+      });
+    }
+  }
+  let mut forced_changed: Vec<u32> = Vec::new();
+  let mut prior_pairs: Vec<(u64, u64, u8)> = Vec::new();
+  for (a, b, confidence) in vorpal_ingest::similar_pairs_of_kg(&prior_kg) {
+    match (translate(a), translate(b)) {
+      (Some(ta), Some(tb)) => prior_pairs.push((ta.min(tb), ta.max(tb), confidence)),
+      (Some(t), None) | (None, Some(t)) => forced_changed.push(t as u32),
+      (None, None) => {}
+    }
+  }
+  prior_pairs.sort_unstable();
+  // The successor identity map, for the repair's canonical splice.
+  let successor_map = {
+    let bases = prior_map.bases();
+    let file_bucket = bases.partition_point(|&b| b <= old_start) - 1;
+    let mut new_bases = bases.to_vec();
+    for base in new_bases.iter_mut().skip(file_bucket + 1) {
+      *base = (*base as i64 + delta) as u64;
+    }
+    let mut new_files: Vec<(u64, u64, u32)> = Vec::with_capacity(prior_map.files().len());
+    for &(key, start, rows) in prior_map.files() {
+      if key == file_key {
+        new_files.push((key, old_start, new_rows_count));
+      } else {
+        let Some(translated) = translate(start) else {
+          return Ok(None);
+        };
+        new_files.push((key, translated, rows));
+      }
+    }
+    vorpal_kg::NodeIdMap::from_parts(new_bases, new_files)
+  };
+  let repair = match vorpal_ingest::scoped_similar_repair(
+    &successor_map,
+    manifest.entries().len(),
+    &prior_rows_sigs,
+    &prior_pairs,
+    file_key,
+    &outcomes[0].sigs,
+  ) {
+    Ok(repair) => repair,
+    Err(err) => {
+      vorpal_kg::phase_stamp(&format!("defs-changed: pairing repair declined: {err}"));
+      return Ok(None);
+    }
+  };
+  let mut changed_srcs = repair.changed_srcs.clone();
+  changed_srcs.extend(forced_changed);
+  changed_srcs.sort_unstable();
+  changed_srcs.dedup();
+  let mut sig_rows = Vec::with_capacity(repair.swapped_rows.len());
+  for row in &repair.swapped_rows {
+    let Ok(node) = u32::try_from(row.node) else {
+      return Ok(None);
+    };
+    sig_rows.push(vorpal_kg::SigFamilyRow {
+      node,
+      shingles: row.shingles,
+      sketch: row.sketch,
+    });
+  }
+
+  let mut stats_total = vorpal_ingest::ResolveStats::default();
+  let mut plan_files: Vec<vorpal_kg::defs_changed::ChangedFilePlan> =
+    Vec::with_capacity(outcomes.len());
+  let keys_in_order: Vec<u64> =
+    std::iter::once(file_key).chain(dirty_keys.iter().copied()).collect();
+  for (outcome, key) in outcomes.into_iter().zip(keys_in_order) {
+    stats_total += outcome.stats;
+    plan_files.push(vorpal_kg::defs_changed::ChangedFilePlan {
+      file_key: key,
+      evidence: outcome.evidence,
+      edges: outcome.edges,
+      request_edges: outcome.request_edges,
+      flows: outcome.flows,
+    });
+  }
+  let plan = vorpal_kg::defs_changed::DefsChangedPlan {
+    files: plan_files,
+    unmoved_ordinals,
+    fresh_pairs: repair.fresh_pairs,
+    changed_srcs,
+    sig_rows,
+  };
+  let dirty_count = dirty_keys.len();
+  drop(pack);
+
+  let staging = out.join("gen").join(format!(
+    ".staging-{}-{}",
+    std::process::id(),
+    staging_nonce()
+  ));
+  let _ = fs::remove_dir_all(&staging);
+  fs::create_dir_all(&staging)?;
+  if let Err(err) =
+    vorpal_kg::defs_changed::compose_defs_changed(&staging, prior, &prior_kg, &fresh_kg, &plan)
+  {
+    vorpal_kg::phase_stamp(&format!("defs-changed: fell back to the full pipeline: {err}"));
+    let _ = fs::remove_dir_all(&staging);
+    return Ok(None);
+  }
+  drop(prior_kg);
+  let pack_reader = PackReader::open_rooted(prior, Some(tree_root)).map(Arc::new);
+  let writer = PackWriter::new(
+    &staging,
+    pack_reader,
+    Some(tree_root.to_string()),
+    vorpal_ingest::PackFormat::Bucketed,
+  );
+  let sink = writer.sink();
+  sink
+    .send(PackMsg {
+      path: entry.path.clone(),
+      body: fresh_bytes,
+    })
+    .map_err(|_| io::Error::other("defs-changed: pack sink closed"))?;
+  drop(sink);
+  writer.finish(manifest.entries().iter().map(|e| e.path.clone()))?;
+  manifest.save(&staging.join("manifest.bin"))?;
+  commit_generation(out, prior, staging)?;
+  let nodes = vorpal_kg::Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
+  Ok(Some(IndexReport {
+    reused: false,
+    graph_reused: false,
+    cache_mode: cache_mode_label,
+    error_files: 0,
+    error_nodes: 0,
+    error_bytes: 0,
+    excluded_files: 0,
+    indexed: 1 + dirty_count as u64,
+    skipped: manifest.entries().len() as u64 - 1 - dirty_count as u64,
+    nodes,
+    resolved: stats_total.resolved,
+    ambiguous: stats_total.ambiguous,
+    external: stats_total.external,
+    masked: stats_total.masked,
+    unverified_langs: Vec::new(),
+    cochange_edges: 0,
+    cochange_note: Some(DEFS_CHANGED_NOTE.to_string()),
+    similar_edges: 0,
+    similar_note: Some(DEFS_CHANGED_NOTE.to_string()),
+    request_sites: 0,
+    request_edges: 0,
+    request_note: Some(DEFS_CHANGED_NOTE.to_string()),
+  }))
+}
+
+const DEFS_CHANGED_NOTE: &str = "defs-changed compose: the edited file and its usage-dirty \
+   referrers re-resolved against the successor universe; every other file's relations \
+   carried byte-identically under the shift law";
+

@@ -54,7 +54,7 @@ pub struct DefsStablePlan {
 /// segment splits by CLASS — no positional guessing — and any interleaving is proof of a
 /// premise violation (→ error → full pipeline).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum EdgeClass {
+pub(crate) enum EdgeClass {
   Containment,
   Cochange,
   Resolution,
@@ -62,7 +62,7 @@ enum EdgeClass {
   Request,
 }
 
-fn edge_class(etype: EdgeType) -> EdgeClass {
+pub(crate) fn edge_class(etype: EdgeType) -> EdgeClass {
   match etype.base() {
     EdgeType::DEFINES | EdgeType::HAS_METHOD | EdgeType::HAS_FIELD => EdgeClass::Containment,
     EdgeType::CHANGES_WITH => EdgeClass::Cochange,
@@ -74,21 +74,21 @@ fn edge_class(etype: EdgeType) -> EdgeClass {
 
 /// A parsed edge-slab row in identity coding.
 #[derive(Clone, Copy)]
-struct SlabRow {
-  src_local: u32,
-  dst_key: u64,
-  dst_ord: u32,
-  etype: u16,
+pub(crate) struct SlabRow {
+  pub(crate) src_local: u32,
+  pub(crate) dst_key: u64,
+  pub(crate) dst_ord: u32,
+  pub(crate) etype: u16,
 }
 
 const EDGE_SLAB_HEADER: usize = 20;
 const EDGE_ROW: usize = 18;
-const EDGE_TOC_HEADER: usize = 20;
-const EDGE_TOC_ROW: usize = 24;
-const EVIDENCE_TOC_HEADER: usize = 20;
-const EVIDENCE_TOC_ROW: usize = 32;
+pub(crate) const EDGE_TOC_HEADER: usize = 20;
+pub(crate) const EDGE_TOC_ROW: usize = 24;
+pub(crate) const EVIDENCE_TOC_HEADER: usize = 20;
+pub(crate) const EVIDENCE_TOC_ROW: usize = 32;
 
-fn read_edge_slab(path: &Path, bucket: usize) -> io::Result<Vec<SlabRow>> {
+pub(crate) fn read_edge_slab(path: &Path, bucket: usize) -> io::Result<Vec<SlabRow>> {
   let bytes = fs::read(path)?;
   if bytes.len() < EDGE_SLAB_HEADER
     || &bytes[0..4] != b"VEDG"
@@ -117,7 +117,7 @@ fn read_edge_slab(path: &Path, bucket: usize) -> io::Result<Vec<SlabRow>> {
   Ok(rows)
 }
 
-fn encode_edge_slab(bucket: usize, rows: &[SlabRow]) -> (Vec<u8>, u64) {
+pub(crate) fn encode_edge_slab(bucket: usize, rows: &[SlabRow]) -> (Vec<u8>, u64) {
   let mut bytes = Vec::with_capacity(EDGE_SLAB_HEADER + rows.len() * EDGE_ROW);
   bytes.extend_from_slice(b"VEDG");
   bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -134,7 +134,7 @@ fn encode_edge_slab(bucket: usize, rows: &[SlabRow]) -> (Vec<u8>, u64) {
 }
 
 /// Localize a dense-id edge into identity coding.
-fn localize(
+pub(crate) fn localize(
   map: &NodeIdMap,
   src_base: u64,
   from: u32,

@@ -717,6 +717,16 @@ fn build_index_inner(
         report.unverified_langs = unverified_langs.clone();
         return Ok(report);
       }
+      // Past defs-stable, the DEFS-CHANGED compose (P4.5c-3): the definition set moved —
+      // the usage-dirty closure re-resolves against the successor universe and the
+      // families splice under the shift law. Same trust gates, same loud fallback.
+      if env.is_default()
+        && let Some(mut report) =
+          compose::try_defs_changed_compose(out, &prior, &ctx, &extractor, cache_mode.label())?
+      {
+        report.unverified_langs = unverified_langs.clone();
+        return Ok(report);
+      }
     }
   }
 

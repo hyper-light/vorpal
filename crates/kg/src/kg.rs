@@ -224,7 +224,10 @@ impl NodeIdMap {
     Some(Self::from_parts(bases, toc.files))
   }
 
-  pub(crate) fn from_parts(bases: Vec<u64>, by_start: Vec<(u64, u64, u32)>) -> NodeIdMap {
+  /// Construct a map from explicit parts — the defs-changed compose builds the
+  /// SUCCESSOR identity in RAM (shift-law bases + the swapped file row) before any
+  /// artifact exists to load it from.
+  pub fn from_parts(bases: Vec<u64>, by_start: Vec<(u64, u64, u32)>) -> NodeIdMap {
     let mut by_key = by_start.clone();
     by_key.sort_unstable_by_key(|&(key, _, _)| key);
     NodeIdMap {
@@ -417,6 +420,24 @@ pub struct NodeView<'a> {
 /// Directory positions of the node segment's columns, resolved once at construction so point
 /// access (`kg.node` in every hot loop) is allocation-free: no name hashing, no per-field
 /// directory scan (measured: 6 heap allocations per `node()` call before this cache).
+/// See [`Kg::raw_node_rows`].
+pub(crate) struct RawNodeRows {
+  pub kind: Vec<u8>,
+  pub name_off: Vec<u32>,
+  pub name_len: Vec<u32>,
+  pub path_off: Vec<u32>,
+  pub path_len: Vec<u32>,
+  pub sig_off: Vec<u32>,
+  pub sig_len: Vec<u32>,
+  pub content_hash: Vec<u64>,
+  pub eid_lo: Vec<u64>,
+  pub eid_hi: Vec<u64>,
+  pub flags: Vec<u8>,
+  pub span_start: Vec<u32>,
+  pub span_end: Vec<u32>,
+  pub heap: Vec<u8>,
+}
+
 struct NodeColumns {
   kind: usize,
   name_off: usize,
@@ -1710,21 +1731,36 @@ impl Kg {
   }
 
   pub fn write_names_index(&self, dir: &Path) -> io::Result<()> {
-    use std::io::Write;
+    use rayon::prelude::*;
+    // Name-only extraction in parallel: `node_name` reads one heap string, where the full
+    // `NodeView` materialized three per row — and the scan itself fans out (rayon's ordered
+    // collect keeps row order, so the sorted result is unchanged).
+    let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
+      .into_par_iter()
+      .filter_map(|i| {
+        self
+          .node_name(NodeId::new(i))
+          .map(|name| (xxhash_rust::xxh3::xxh3_64(name.as_bytes()), i))
+      })
+      .collect();
+    pairs.par_sort_unstable();
+    write_names_index_pairs(dir, &pairs)
+  }
+
+  /// The loaded name index's raw `(hash, id)` columns — the defs-changed surgery's
+  /// translation base (names of unchanged files carry; only ids shift).
+  pub(crate) fn names_pairs(&self) -> Option<(&[u64], &[u64])> {
+    self.names.as_ref().map(|(hashes, ids)| (&hashes[..], &ids[..]))
+  }
+}
+
+/// Persist a `names.idx` from ALREADY-SORTED `(hash, id)` pairs — the byte format
+/// [`Kg::write_names_index`] writes, exposed so the defs-changed surgery can emit the
+/// successor index by translation instead of a full node scan.
+pub(crate) fn write_names_index_pairs(dir: &Path, pairs: &[(u64, u64)]) -> io::Result<()> {
+  use std::io::Write;
+  {
     write_via_tmp(dir, "names.idx", |out| {
-      use rayon::prelude::*;
-      // Name-only extraction in parallel: `node_name` reads one heap string, where the full
-      // `NodeView` materialized three per row — and the scan itself fans out (rayon's ordered
-      // collect keeps row order, so the sorted result is unchanged).
-      let mut pairs: Vec<(u64, u64)> = (0..self.node_count() as u64)
-        .into_par_iter()
-        .filter_map(|i| {
-          self
-            .node_name(NodeId::new(i))
-            .map(|name| (xxhash_rust::xxh3::xxh3_64(name.as_bytes()), i))
-        })
-        .collect();
-      pairs.par_sort_unstable();
       out.write_all(&NAMES_MAGIC.to_le_bytes())?;
       out.write_all(&(pairs.len() as u32).to_le_bytes())?;
       // The on-disk format is little-endian. Split the sorted pairs into the two columns and
@@ -1745,6 +1781,60 @@ impl Kg {
         }
       }
       Ok(())
+    })
+  }
+}
+
+/// Re-open the interrupted `impl Kg` (the names writer above closed it to host the free
+/// function; everything below is still Kg surface).
+impl Kg {
+
+  /// The complete raw column set + heap bytes of a SINGLE-SEGMENT graph — the scratch
+  /// single-file seal the defs-changed surgery splices verbatim into the successor
+  /// bucket (heap bytes are file-contiguous by the writer's gather order, so a byte
+  /// splice IS the scratch build's layout).
+  pub(crate) fn raw_node_rows(&self) -> io::Result<RawNodeRows> {
+    if self.segments.len() != 1 {
+      return Err(io::Error::other("raw rows require a single-segment graph"));
+    }
+    let segment = &self.segments[0];
+    let cols = &self.cols[0];
+    let need = |col: Option<usize>, what: &str| -> io::Result<usize> {
+      col.ok_or_else(|| io::Error::other(format!("segment missing {what}")))
+    };
+    let u8s = |col: usize| -> io::Result<Vec<u8>> {
+      segment
+        .column_at(col)
+        .and_then(|c| c.as_slice::<u8>().map(<[u8]>::to_vec))
+        .ok_or_else(|| io::Error::other("column not sliceable"))
+    };
+    let u32s = |col: usize| -> io::Result<Vec<u32>> {
+      segment
+        .column_at(col)
+        .and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))
+        .ok_or_else(|| io::Error::other("column not sliceable"))
+    };
+    let u64s = |col: usize| -> io::Result<Vec<u64>> {
+      segment
+        .column_at(col)
+        .and_then(|c| c.as_slice::<u64>().map(<[u64]>::to_vec))
+        .ok_or_else(|| io::Error::other("column not sliceable"))
+    };
+    Ok(RawNodeRows {
+      kind: u8s(cols.kind)?,
+      name_off: u32s(cols.name_off)?,
+      name_len: u32s(cols.name_len)?,
+      path_off: u32s(cols.path_off)?,
+      path_len: u32s(cols.path_len)?,
+      sig_off: u32s(cols.sig_off)?,
+      sig_len: u32s(cols.sig_len)?,
+      content_hash: u64s(cols.content_hash)?,
+      eid_lo: u64s(need(cols.eid_lo, "eid_lo")?)?,
+      eid_hi: u64s(need(cols.eid_hi, "eid_hi")?)?,
+      flags: u8s(cols.flags)?,
+      span_start: u32s(need(cols.span_start, "span_start")?)?,
+      span_end: u32s(need(cols.span_end, "span_end")?)?,
+      heap: self.heaps[0][..].to_vec(),
     })
   }
 
