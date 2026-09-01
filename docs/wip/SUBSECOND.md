@@ -1087,6 +1087,41 @@ both lanes. Mixed sessions (defs-stable + defs-changed members) still decline to
 full pipeline — S2-b routes them through the changed lane (stable members = delta-0
 blocks) with the multi-block shift law.
 
+#### S2-b (2026-09-01) — multi-file DEFS-CHANGED sessions + mixed routing
+
+k definition-set edits ride ONE defs-changed compose, and MIXED sessions (some members
+defs-stable, some defs-changed) route through the changed lane with stable members as
+delta-0 blocks — every ordinal unmoved, nothing declines just because edits of
+different classes landed together. The single-block shift law generalized to the
+MULTI-BLOCK law everywhere it lived:
+`translate(x) = x + Σ_{i: x ≥ old_end_i} delta_i` outside the blocks (ascending
+disjoint blocks + prefix sums; binary search per lookup), and inside a block the
+unmoved-ordinal identity becomes `new_start + ordinal` — identical to the prior id
+exactly when no earlier block's delta reaches it, which is what keeps identity-coded
+carried rows and the dirty law untouched. Three implementations of the law stay in
+lockstep by construction (the overlay session's `OverlayUniverse::build`, the surgery's
+`Shift`, the compose's successor map) — same block sort, same prefix, same bases rule
+(`new_bases[b] += prefix[partition(old_end ≤ bases[b])]`; files never straddle
+buckets). The edited-bucket node splice generalized from prefix|block|suffix to a
+REGION WALK — alternating gap/splice regions, each gap's heap extent tiling
+monotonically (asserted; two edited files in ONE bucket splice in one pass), offsets
+rebased per region. Fresh edge sources come from each block's OWN seal;
+evidence/usage/dataflow/names already looped per session file (c-3 built them that
+way). `resolve_defs_changed` now takes `edited: &[(DirtyFileInput, &Kg)]`;
+`DefsChangedPlan.unmoved_ordinals` became `edited: Vec<(file_key, unmoved)>`.
+
+Gates, all first-run green: `a_multi_file_defs_changed_session_composes_and_converges`
+(defs added to TWO files in one build, then both removed — two blocks, cumulative
+deltas) and `a_mixed_session_routes_through_the_changed_lane_and_converges` (one
+def-adding member + one body-only member: the stable lane's ladder rejects, the changed
+lane composes both); all 11 prior scoped/changed/oracle gates unchanged-green (the k=1
+path); kernel k=2 fn appends (mm/slab_common.c + kernel/fork.c, one build):
+**1.31 s forward / 1.30 s reverse**, byte-converged both directions — the same
+1.28–1.32 s band as SINGLE-file defs-changed (one table, one pairing pass, one scc);
+battery 28/28; suite green; clippy 0/0 both lanes. S2 COMPLETE: respan (P4.5b),
+defs-stable (S2-a), and defs-changed (S2-b) all compose k-file sessions; mixed classes
+route to the strongest lane that admits them.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

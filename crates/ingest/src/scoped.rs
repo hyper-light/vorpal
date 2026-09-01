@@ -217,33 +217,85 @@ impl UniverseView for PriorUniverse<'_> {
   }
 }
 
-/// The prior universe with ONE file's definitions swapped for a scratch seal's, every
-/// dense id past the old block shifted by the row delta — the defs-changed lane. The
-/// shift law is total: bucket-major order is a single sequence, so
-/// `translate(x) = x + (x ≥ old_end) · delta`, and (file_key, ordinal) coordinates of
-/// every OTHER file are untouched.
-pub(crate) struct OverlayUniverse<'k> {
-  pub prior: &'k Kg,
-  pub map: &'k vorpal_kg::NodeIdMap,
+/// One edited file's overlay block: its old dense range replaced wholesale by a scratch
+/// seal, its successor start carrying the cumulative delta of every earlier block.
+pub(crate) struct OverlayBlock<'k> {
   pub file_key: u64,
   pub file_path: &'k str,
   pub old_start: u64,
   pub old_end: u64,
-  pub delta: i64,
-  /// The edited file's scratch single-file seal: row ordinals ARE the new file-local
-  /// ordinals; dense ids = `old_start + ordinal` (files before it never shift).
+  /// `old_start + Σ delta(earlier blocks)` — where the fresh seal's ordinals land.
+  pub new_start: u64,
+  /// The file's scratch single-file seal: row ordinals ARE the new file-local ordinals;
+  /// dense ids = `new_start + ordinal`.
   pub fresh: &'k Kg,
 }
 
-impl OverlayUniverse<'_> {
+/// The prior universe with k files' definitions swapped for scratch seals — the
+/// defs-changed lane (multi-file since S2-b). The shift law is total: bucket-major order
+/// is one sequence, so `translate(x) = x + Σ_{i: x ≥ old_end_i} delta_i` outside the
+/// edited blocks, and (file_key, ordinal) coordinates of every OTHER file are untouched.
+pub(crate) struct OverlayUniverse<'k> {
+  pub prior: &'k Kg,
+  pub map: &'k vorpal_kg::NodeIdMap,
+  /// Ascending by `old_start` (disjoint by construction — one manifest entry per key).
+  pub blocks: Vec<OverlayBlock<'k>>,
+  /// `prefix[i]` = Σ delta of blocks `[0, i)`; len = blocks.len() + 1.
+  pub prefix: Vec<i64>,
+}
+
+impl<'k> OverlayUniverse<'k> {
+  /// Build from (key, path, seal) triples in any order; resolves prior coordinates and
+  /// bakes cumulative deltas. Errors if a file is outside the prior universe.
+  pub(crate) fn build(
+    prior: &'k Kg,
+    map: &'k vorpal_kg::NodeIdMap,
+    edited: &[(u64, &'k str, &'k Kg)],
+  ) -> io::Result<Self> {
+    let mut blocks: Vec<OverlayBlock<'k>> = Vec::with_capacity(edited.len());
+    for &(file_key, file_path, fresh) in edited {
+      let Some(&(_, old_start, old_rows)) =
+        map.files().iter().find(|&&(key, _, _)| key == file_key)
+      else {
+        return Err(io::Error::other("scoped: edited file outside the prior universe"));
+      };
+      blocks.push(OverlayBlock {
+        file_key,
+        file_path,
+        old_start,
+        old_end: old_start + u64::from(old_rows),
+        new_start: 0, // filled below, in old_start order
+        fresh,
+      });
+    }
+    blocks.sort_by_key(|b| b.old_start);
+    let mut prefix: Vec<i64> = Vec::with_capacity(blocks.len() + 1);
+    prefix.push(0);
+    for block in &mut blocks {
+      let cum = *prefix.last().expect("non-empty prefix");
+      block.new_start = (block.old_start as i64 + cum) as u64;
+      let new_rows = block.fresh.node_count() as i64;
+      let old_rows = (block.old_end - block.old_start) as i64;
+      prefix.push(cum + (new_rows - old_rows));
+    }
+    Ok(Self {
+      prior,
+      map,
+      blocks,
+      prefix,
+    })
+  }
+
   pub(crate) fn translate(&self, prior_dense: u64) -> Option<u64> {
-    if (self.old_start..self.old_end).contains(&prior_dense) {
-      return None; // the old block is replaced wholesale
+    let i = self.blocks.partition_point(|b| b.old_end <= prior_dense);
+    if i < self.blocks.len() && self.blocks[i].old_start <= prior_dense {
+      return None; // inside an edited block — replaced wholesale
     }
-    if prior_dense >= self.old_end {
-      return Some((prior_dense as i64 + self.delta) as u64);
-    }
-    Some(prior_dense)
+    Some((prior_dense as i64 + self.prefix[i]) as u64)
+  }
+
+  fn block_of_key(&self, file_key: u64) -> Option<&OverlayBlock<'k>> {
+    self.blocks.iter().find(|b| b.file_key == file_key)
   }
 }
 
@@ -268,24 +320,28 @@ impl UniverseView for OverlayUniverse<'_> {
         owner,
       });
     }
-    for ord in 0..self.fresh.node_count() as u64 {
-      let id = NodeId::new(ord);
-      let Some(node) = self.fresh.node(id) else { continue };
-      if node.name != name || node.kind == SymbolKind::File || node.kind == SymbolKind::Import
-      {
-        continue;
+    for block in &self.blocks {
+      for ord in 0..block.fresh.node_count() as u64 {
+        let id = NodeId::new(ord);
+        let Some(node) = block.fresh.node(id) else { continue };
+        if node.name != name
+          || node.kind == SymbolKind::File
+          || node.kind == SymbolKind::Import
+        {
+          continue;
+        }
+        let owner = block.fresh.container_of(id).and_then(|cid| {
+          let container = block.fresh.node(cid)?;
+          (container.kind != SymbolKind::File).then(|| container.name.to_string())
+        });
+        facts.push(CandidateFacts {
+          id: block.new_start + ord,
+          kind: node.kind,
+          path: block.file_path.to_string(),
+          exported: node.exported,
+          owner,
+        });
       }
-      let owner = self.fresh.container_of(id).and_then(|cid| {
-        let container = self.fresh.node(cid)?;
-        (container.kind != SymbolKind::File).then(|| container.name.to_string())
-      });
-      facts.push(CandidateFacts {
-        id: self.old_start + ord,
-        kind: node.kind,
-        path: self.file_path.to_string(),
-        exported: node.exported,
-        owner,
-      });
     }
     facts.sort_by_key(|f| f.id);
     facts
@@ -294,8 +350,8 @@ impl UniverseView for OverlayUniverse<'_> {
   fn all_file_entries(&self) -> Vec<(u64, String)> {
     let mut entries = Vec::with_capacity(self.map.files().len());
     for &(key, start, _) in self.map.files() {
-      if key == self.file_key {
-        entries.push((self.old_start, self.file_path.to_string()));
+      if let Some(block) = self.block_of_key(key) {
+        entries.push((block.new_start, block.file_path.to_string()));
         continue;
       }
       let Some(new_start) = self.translate(start) else { continue };
@@ -316,11 +372,13 @@ impl UniverseView for OverlayUniverse<'_> {
         routes.push((new_id, node.name.to_string()));
       }
     }
-    for ord in 0..self.fresh.node_count() as u64 {
-      if let Some(node) = self.fresh.node(NodeId::new(ord))
-        && matches!(node.kind, SymbolKind::Route | SymbolKind::Channel)
-      {
-        routes.push((self.old_start + ord, node.name.to_string()));
+    for block in &self.blocks {
+      for ord in 0..block.fresh.node_count() as u64 {
+        if let Some(node) = block.fresh.node(NodeId::new(ord))
+          && matches!(node.kind, SymbolKind::Route | SymbolKind::Channel)
+        {
+          routes.push((block.new_start + ord, node.name.to_string()));
+        }
       }
     }
     routes.sort_by_key(|r| r.0);
@@ -328,8 +386,8 @@ impl UniverseView for OverlayUniverse<'_> {
   }
 
   fn file_start_by_path(&self, path: &str) -> Option<u64> {
-    if path == self.file_path {
-      return Some(self.old_start);
+    if let Some(block) = self.blocks.iter().find(|b| b.file_path == path) {
+      return Some(block.new_start);
     }
     self
       .map
@@ -1038,11 +1096,11 @@ pub struct DirtyFileInput<'a> {
   pub layout_ords: &'a [u64],
 }
 
-/// Resolve the defs-changed closure: the edited file (against its fresh scratch seal)
+/// Resolve the defs-changed closure: every edited file (against its fresh scratch seal)
 /// plus every usage-dirty file, all in the SUCCESSOR dense space (the shift law:
-/// `translate(x) = x + (x ≥ old_end) · delta`). Outcomes come back edited-first, then in
-/// `dirty` order. The c2-i machinery underneath is unchanged — one session, one table,
-/// the pipeline's own kernels.
+/// `translate(x) = x + Σ_{i: x ≥ old_end_i} delta_i`; multi-file since S2-b). Outcomes
+/// come back in `edited` order first, then in `dirty` order. The c2-i machinery
+/// underneath is unchanged — one session, one table, the pipeline's own kernels.
 #[allow(clippy::too_many_arguments)] // the one defs-changed entry: every input is load-bearing
 pub fn resolve_defs_changed(
   interner: &Interner,
@@ -1050,38 +1108,33 @@ pub fn resolve_defs_changed(
   prior_map: &vorpal_kg::NodeIdMap,
   resolver: &Resolver,
   products: &dyn ProductSource,
-  edited: &DirtyFileInput<'_>,
-  fresh_kg: &Kg,
+  edited: &[(DirtyFileInput<'_>, &Kg)],
   dirty: &[DirtyFileInput<'_>],
   decode_cap: usize,
 ) -> io::Result<Vec<ScopedOutcome>> {
-  let Some(&(_, old_start, old_rows)) = prior_map
-    .files()
+  if edited.is_empty() {
+    return Err(io::Error::other("scoped: defs-changed session with no edited file"));
+  }
+  let triples: Vec<(u64, &str, &Kg)> = edited
     .iter()
-    .find(|&&(key, _, _)| key == edited.file_key)
-  else {
-    return Err(io::Error::other("scoped: edited file outside the prior universe"));
-  };
-  let new_rows = u32::try_from(fresh_kg.node_count())
-    .map_err(|_| io::Error::other("scoped: fresh seal beyond the row space"))?;
-  let universe = OverlayUniverse {
-    prior: prior_kg,
-    map: prior_map,
-    file_key: edited.file_key,
-    file_path: &edited.path,
-    old_start,
-    old_end: old_start + u64::from(old_rows),
-    delta: i64::from(new_rows) - i64::from(old_rows),
-    fresh: fresh_kg,
-  };
-  let mut files: Vec<SessionFile<'_>> = Vec::with_capacity(1 + dirty.len());
-  files.push(SessionFile {
-    path: edited.path.clone(),
-    base: old_start,
-    rows: new_rows,
-    view: edited.view,
-    layout_ords: edited.layout_ords,
-  });
+    .map(|(input, fresh)| (input.file_key, input.path.as_str(), *fresh))
+    .collect();
+  let universe = OverlayUniverse::build(prior_kg, prior_map, &triples)?;
+  let mut files: Vec<SessionFile<'_>> = Vec::with_capacity(edited.len() + dirty.len());
+  for (input, fresh) in edited {
+    let block = universe
+      .block_of_key(input.file_key)
+      .ok_or_else(|| io::Error::other("scoped: edited block missing from the overlay"))?;
+    let rows = u32::try_from(fresh.node_count())
+      .map_err(|_| io::Error::other("scoped: fresh seal beyond the row space"))?;
+    files.push(SessionFile {
+      path: input.path.clone(),
+      base: block.new_start,
+      rows,
+      view: input.view,
+      layout_ords: input.layout_ords,
+    });
+  }
   for input in dirty {
     let Some(&(_, prior_start, rows)) = prior_map
       .files()
@@ -1091,7 +1144,7 @@ pub fn resolve_defs_changed(
       return Err(io::Error::other("scoped: dirty file outside the prior universe"));
     };
     let Some(base) = universe.translate(prior_start) else {
-      return Err(io::Error::other("scoped: dirty file overlaps the edited block"));
+      return Err(io::Error::other("scoped: dirty file overlaps an edited block"));
     };
     files.push(SessionFile {
       path: input.path.clone(),

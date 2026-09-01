@@ -796,12 +796,14 @@ const DEFS_STABLE_NOTE: &str = "defs-stable compose: unchanged files' relations 
    byte-identically; the edited files re-resolved against the prior universe and the \
    near-clone pair set repaired over the sigs family";
 
-/// The DEFS-CHANGED compose (P4.5c-3): a single modified file whose definition set moved.
-/// The dirty closure comes from the usage family over `affected_def_names` (ordinal-
-/// shifted survivors included — the byte-impact law); the whole closure re-resolves
-/// through the overlay session (oracle: tests/defs_changed_oracle.rs); and
-/// `vorpal_kg::defs_changed::compose_defs_changed` splices the successor generation.
-/// Convergence is pinned by tests/defs_changed_compose.rs.
+/// The DEFS-CHANGED compose (P4.5c-3; multi-file sessions since S2-b): modified files
+/// whose definition sets moved — and MIXED sessions, where defs-stable members ride as
+/// delta-0 blocks. The dirty closure comes from the usage family over the union of
+/// `affected_def_names` (ordinal-shifted survivors included — the byte-impact law); the
+/// whole closure re-resolves through the overlay session (oracle:
+/// tests/defs_changed_oracle.rs); and `vorpal_kg::defs_changed::compose_defs_changed`
+/// splices the successor generation under the multi-block shift law. Convergence is
+/// pinned by tests/defs_changed_compose.rs.
 pub(crate) fn try_defs_changed_compose(
   out: &Path,
   prior: &Path,
@@ -833,6 +835,8 @@ pub(crate) fn try_defs_changed_compose(
       return Ok(None);
     }
   }
+  // Modified-only diff; the session composes ANY number of changed files (adds,
+  // deletes, and renames still decline — the file SET must be stable).
   let current = manifest.entries();
   let previous = prior_manifest.entries();
   let (mut i, mut j) = (0usize, 0usize);
@@ -843,25 +847,24 @@ pub(crate) fn try_defs_changed_compose(
       std::cmp::Ordering::Equal => {
         if current[i].size != previous[j].size || current[i].mtime_ns != previous[j].mtime_ns {
           changed.push(&current[i]);
-          if changed.len() > 1 {
-            return Ok(None);
-          }
         }
         i += 1;
         j += 1;
       }
     }
   }
-  if i < current.len() || j < previous.len() || changed.len() != 1 {
+  if i < current.len() || j < previous.len() || changed.is_empty() {
     return Ok(None);
   }
-  let entry = changed[0];
+  let changed_paths: std::collections::HashSet<&str> =
+    changed.iter().map(|e| e.path.as_str()).collect();
   {
     let racy: Vec<&FileStat> = manifest
       .entries()
       .iter()
       .filter(|e| {
-        e.mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000 && e.path != entry.path
+        e.mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000
+          && !changed_paths.contains(e.path.as_str())
       })
       .collect();
     if !racy.is_empty() {
@@ -897,87 +900,141 @@ pub(crate) fn try_defs_changed_compose(
     return Ok(None);
   };
 
-  let Ok(source) = fs::read_to_string(&entry.path) else {
-    return Ok(None);
-  };
-  let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
-    return Ok(None);
-  };
-  product.source_size = entry.size;
-  product.source_mtime_ns = entry.mtime_ns;
-  let mut fresh_bytes = Vec::new();
-  encode_product_into(&product, &mut fresh_bytes);
-  let Some(prior_bytes) = pack.get(&entry.path) else {
-    return Ok(None);
-  };
-  let (Ok(old_view), Ok(new_view)) = (
-    decode_product_view(prior_bytes),
-    decode_product_view(&fresh_bytes),
-  ) else {
-    return Ok(None);
-  };
-  if let Some(reason) = vorpal_ingest::views_defs_changed_reject(&old_view, &new_view) {
-    vorpal_kg::phase_stamp(&format!("defs-changed: ineligible ({}): {reason}", entry.path));
-    return Ok(None);
+  // Per changed file: fresh product, the ladder (defs-changed accepts what defs-stable
+  // would too — a stable member is a delta-0 block), the scratch seal, prior
+  // coordinates, the affected-name set, and the per-old-ordinal unmoved flags.
+  struct EditedSeal {
+    path: String,
+    file_key: u64,
+    fresh_bytes: Vec<u8>,
+    fresh_ords: Vec<u64>,
+    fresh_kg: vorpal_kg::Kg,
+    old_start: u64,
+    old_rows: u32,
+    affected: Vec<String>,
+    unmoved: Vec<bool>,
   }
-
-  // The fresh scratch seal: rows, layout bridge, and the successor block's bytes.
   let interner = vorpal_ingest::Interner::default();
-  let Ok(fresh_product) = decode_product(&fresh_bytes) else {
-    return Ok(None);
-  };
-  let Ok(scratch_extractor) = OutlineExtractor::new() else {
-    return Ok(None);
-  };
-  let mut ingestor = vorpal_ingest::Ingestor::new(&interner, scratch_extractor);
-  let fresh_ords = ingestor.ingest_product_mapped(&entry.path, fresh_product);
-  let fresh_kg = ingestor.seal();
-  let rel = vorpal_kg::identity::tree_relative(&entry.path, tree_root);
-  let file_key = vorpal_kg::identity::FileKey::of(rel).0;
-  let Some(&(_, old_start, old_rows)) = prior_map
-    .files()
-    .iter()
-    .find(|&&(key, _, _)| key == file_key)
-  else {
-    return Ok(None);
-  };
-
-  // The affected set — empty means defs-stable territory (that compose already ran and
-  // declined for its own reasons); nothing scoped is provable here.
-  let affected =
-    vorpal_ingest::affected_def_names(&prior_kg, old_start, old_rows, &fresh_kg);
-  if affected.is_empty() {
-    return Ok(None);
-  }
-  // Route/Channel escalation: request matching is URL-keyed — usage cannot bound it.
-  let old_kinds = vorpal_ingest::def_kinds_of(&prior_kg, old_start, old_rows);
-  let new_kinds = vorpal_ingest::def_kinds_of(&fresh_kg, 0, fresh_kg.node_count() as u32);
-  let routeish = |kinds: Option<&Vec<vorpal_kg::SymbolKind>>| {
-    kinds.is_some_and(|list| {
-      list
-        .iter()
-        .any(|kind| matches!(kind, vorpal_kg::SymbolKind::Route | vorpal_kg::SymbolKind::Channel))
+  let row_facts = |kg: &vorpal_kg::Kg, id: u64| {
+    kg.node(vorpal_kg::NodeId::new(id)).map(|node| {
+      (
+        node.name.to_string(),
+        node.kind,
+        node.signature.to_string(),
+        node.exported,
+        node.external_id.map(|eid| eid.to_string()),
+      )
     })
   };
-  if affected
-    .iter()
-    .any(|name| routeish(old_kinds.get(name)) || routeish(new_kinds.get(name)))
-  {
-    vorpal_kg::phase_stamp("defs-changed: ineligible (a Route/Channel definition moved)");
+  let mut sealed: Vec<EditedSeal> = Vec::with_capacity(changed.len());
+  let mut any_affected = false;
+  for entry in &changed {
+    let Ok(source) = fs::read_to_string(&entry.path) else {
+      return Ok(None);
+    };
+    let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
+      return Ok(None);
+    };
+    product.source_size = entry.size;
+    product.source_mtime_ns = entry.mtime_ns;
+    let mut fresh_bytes = Vec::new();
+    encode_product_into(&product, &mut fresh_bytes);
+    let Some(prior_bytes) = pack.get(&entry.path) else {
+      return Ok(None);
+    };
+    let (Ok(old_view), Ok(new_view)) = (
+      decode_product_view(prior_bytes),
+      decode_product_view(&fresh_bytes),
+    ) else {
+      return Ok(None);
+    };
+    if let Some(reason) = vorpal_ingest::views_defs_changed_reject(&old_view, &new_view) {
+      vorpal_kg::phase_stamp(&format!("defs-changed: ineligible ({}): {reason}", entry.path));
+      return Ok(None);
+    }
+    let Ok(fresh_product) = decode_product(&fresh_bytes) else {
+      return Ok(None);
+    };
+    let Ok(scratch_extractor) = OutlineExtractor::new() else {
+      return Ok(None);
+    };
+    let mut ingestor = vorpal_ingest::Ingestor::new(&interner, scratch_extractor);
+    let fresh_ords = ingestor.ingest_product_mapped(&entry.path, fresh_product);
+    let fresh_kg = ingestor.seal();
+    let rel = vorpal_kg::identity::tree_relative(&entry.path, tree_root);
+    let file_key = vorpal_kg::identity::FileKey::of(rel).0;
+    let Some(&(_, old_start, old_rows)) = prior_map
+      .files()
+      .iter()
+      .find(|&&(key, _, _)| key == file_key)
+    else {
+      vorpal_kg::phase_stamp(&format!(
+        "defs-changed: ineligible ({}): outside the prior universe",
+        entry.path
+      ));
+      return Ok(None);
+    };
+    let affected =
+      vorpal_ingest::affected_def_names(&prior_kg, old_start, old_rows, &fresh_kg);
+    any_affected |= !affected.is_empty();
+    // Route/Channel escalation: request matching is URL-keyed — usage cannot bound it.
+    let old_kinds = vorpal_ingest::def_kinds_of(&prior_kg, old_start, old_rows);
+    let new_kinds = vorpal_ingest::def_kinds_of(&fresh_kg, 0, fresh_kg.node_count() as u32);
+    let routeish = |kinds: Option<&Vec<vorpal_kg::SymbolKind>>| {
+      kinds.is_some_and(|list| {
+        list.iter().any(|kind| {
+          matches!(kind, vorpal_kg::SymbolKind::Route | vorpal_kg::SymbolKind::Channel)
+        })
+      })
+    };
+    if affected
+      .iter()
+      .any(|name| routeish(old_kinds.get(name)) || routeish(new_kinds.get(name)))
+    {
+      vorpal_kg::phase_stamp("defs-changed: ineligible (a Route/Channel definition moved)");
+      return Ok(None);
+    }
+    let new_rows_count = fresh_kg.node_count() as u32;
+    // Per OLD ordinal: identity-and-position survival — the unmoved-ordinal law.
+    let unmoved: Vec<bool> = (0..u64::from(old_rows))
+      .map(|ord| {
+        ord < u64::from(new_rows_count)
+          && row_facts(&prior_kg, old_start + ord) == row_facts(&fresh_kg, ord)
+      })
+      .collect();
+    sealed.push(EditedSeal {
+      path: entry.path.clone(),
+      file_key,
+      fresh_bytes,
+      fresh_ords,
+      fresh_kg,
+      old_start,
+      old_rows,
+      affected,
+      unmoved,
+    });
+  }
+  // Every file defs-stable means the stable lane already declined for a session-level
+  // reason; nothing changed-scoped is provable here.
+  if !any_affected {
     return Ok(None);
   }
 
-  // The usage-dirty closure, capped by the retained tier's measured escalation shape
-  // (past ~a quarter of the corpus the full pipeline's streaming feed wins).
+  // The usage-dirty closure over the UNION of affected names, capped by the retained
+  // tier's measured escalation shape (past ~a quarter of the corpus the full pipeline's
+  // streaming feed wins).
   let Some(usage) = vorpal_kg::UsageStore::open(prior) else {
     return Ok(None);
   };
-  let mut dirty_keys: Vec<u64> = affected
+  let edited_keys: std::collections::HashSet<u64> =
+    sealed.iter().map(|s| s.file_key).collect();
+  let mut dirty_keys: Vec<u64> = sealed
     .iter()
+    .flat_map(|s| s.affected.iter())
     .flat_map(|name| {
       usage.files_referencing((xxhash_rust::xxh3::xxh3_64(name.as_bytes()) & 0xFFFF_FFFF) as u32)
     })
-    .filter(|&key| key != file_key)
+    .filter(|key| !edited_keys.contains(key))
     .collect();
   dirty_keys.sort_unstable();
   dirty_keys.dedup();
@@ -990,8 +1047,9 @@ pub(crate) fn try_defs_changed_compose(
     return Ok(None);
   }
   vorpal_kg::phase_stamp(&format!(
-    "defs-changed: {} affected names -> {} dirty files",
-    affected.len(),
+    "defs-changed: {} edited files, {} affected names -> {} dirty files",
+    sealed.len(),
+    sealed.iter().map(|s| s.affected.len()).sum::<usize>(),
     dirty_keys.len(),
   ));
 
@@ -1031,12 +1089,32 @@ pub(crate) fn try_defs_changed_compose(
     dirty_views.push((*key, path.clone(), view, ords));
   }
 
-  let edited_input = vorpal_ingest::DirtyFileInput {
-    path: entry.path.clone(),
-    file_key,
-    view: &new_view,
-    layout_ords: &fresh_ords,
+  // The session: every edited file (against its seal) + the dirty closure, one table.
+  let edited_views: Vec<vorpal_ingest::ProductView<'_>> = {
+    let mut views = Vec::with_capacity(sealed.len());
+    for file in &sealed {
+      let Ok(view) = decode_product_view(&file.fresh_bytes) else {
+        return Ok(None);
+      };
+      views.push(view);
+    }
+    views
   };
+  let edited_inputs: Vec<(vorpal_ingest::DirtyFileInput<'_>, &vorpal_kg::Kg)> = sealed
+    .iter()
+    .zip(&edited_views)
+    .map(|(file, view)| {
+      (
+        vorpal_ingest::DirtyFileInput {
+          path: file.path.clone(),
+          file_key: file.file_key,
+          view,
+          layout_ords: &file.fresh_ords,
+        },
+        &file.fresh_kg,
+      )
+    })
+    .collect();
   let dirty_inputs: Vec<vorpal_ingest::DirtyFileInput<'_>> = dirty_views
     .iter()
     .map(|(key, path, view, ords)| vorpal_ingest::DirtyFileInput {
@@ -1053,8 +1131,7 @@ pub(crate) fn try_defs_changed_compose(
     &prior_map,
     &vorpal_ingest::Resolver::new(),
     &|path: &str| pack.get(path).map(<[u8]>::to_vec),
-    &edited_input,
-    &fresh_kg,
+    &edited_inputs,
     &dirty_inputs,
     decode_cap,
   ) {
@@ -1064,41 +1141,54 @@ pub(crate) fn try_defs_changed_compose(
       return Ok(None);
     }
   };
+  drop(edited_inputs);
+  drop(edited_views);
 
-  // The pairing repair over the TRANSLATED ledger: F's old rows drop (its fresh run
-  // rides outcome 0), every other row's node id shifts by the law, and any prior pair
-  // that LOSES its F endpoint forces the surviving endpoint's segment to rewrite.
-  let new_rows_count = fresh_kg.node_count() as u32;
-  let delta = i64::from(new_rows_count) - i64::from(old_rows);
-  let old_end = old_start + u64::from(old_rows);
-  // Per OLD ordinal: identity-and-position survival. Unmoved ordinals keep their dense
-  // ids verbatim — the reason their referrers are not dirty.
-  let row_facts = |kg: &vorpal_kg::Kg, id: u64| {
-    kg.node(vorpal_kg::NodeId::new(id)).map(|node| {
-      (
-        node.name.to_string(),
-        node.kind,
-        node.signature.to_string(),
-        node.exported,
-        node.external_id.map(|eid| eid.to_string()),
-      )
-    })
-  };
-  let unmoved_ordinals: Vec<bool> = (0..u64::from(old_rows))
-    .map(|ord| {
-      ord < u64::from(new_rows_count)
-        && row_facts(&prior_kg, old_start + ord) == row_facts(&fresh_kg, ord)
+  // The pairing repair over the TRANSLATED ledger: each edited file's old rows drop
+  // (its fresh run rides its outcome), every other row's node id shifts by the
+  // multi-block law, and any prior pair that LOSES an edited-block endpoint forces the
+  // surviving endpoint's segment to rewrite.
+  // The blocks, ascending, with cumulative deltas — the same law the surgery applies.
+  struct LocalBlock<'a> {
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    new_rows: u32,
+    file_key: u64,
+    unmoved: &'a [bool],
+  }
+  let mut law_blocks: Vec<LocalBlock<'_>> = sealed
+    .iter()
+    .map(|s| LocalBlock {
+      old_start: s.old_start,
+      old_end: s.old_start + u64::from(s.old_rows),
+      new_start: 0,
+      new_rows: s.fresh_kg.node_count() as u32,
+      file_key: s.file_key,
+      unmoved: &s.unmoved,
     })
     .collect();
+  law_blocks.sort_by_key(|b| b.old_start);
+  let mut law_prefix: Vec<i64> = Vec::with_capacity(law_blocks.len() + 1);
+  law_prefix.push(0);
+  for block in &mut law_blocks {
+    let cum = *law_prefix.last().expect("non-empty prefix");
+    block.new_start = (block.old_start as i64 + cum) as u64;
+    law_prefix.push(cum + i64::from(block.new_rows) - (block.old_end - block.old_start) as i64);
+  }
   let translate = |dense: u64| -> Option<u64> {
-    if (old_start..old_end).contains(&dense) {
-      let ordinal = (dense - old_start) as usize;
-      unmoved_ordinals.get(ordinal).copied().unwrap_or(false).then_some(dense)
-    } else if dense >= old_end {
-      Some((dense as i64 + delta) as u64)
-    } else {
-      Some(dense)
+    let i = law_blocks.partition_point(|b| b.old_end <= dense);
+    if i < law_blocks.len() && law_blocks[i].old_start <= dense {
+      let block = &law_blocks[i];
+      let ordinal = (dense - block.old_start) as usize;
+      return block
+        .unmoved
+        .get(ordinal)
+        .copied()
+        .unwrap_or(false)
+        .then_some(block.new_start + (dense - block.old_start));
     }
+    Some((dense as i64 + law_prefix[i]) as u64)
   };
   let Some(sig_store) = vorpal_kg::SigStore::open(prior) else {
     return Ok(None);
@@ -1108,7 +1198,7 @@ pub(crate) fn try_defs_changed_compose(
   };
   let mut prior_rows_sigs: Vec<vorpal_ingest::SigRow> = Vec::with_capacity(family_rows.len());
   for row in family_rows {
-    // The repair's splice replaces the edited file's run WHOLESALE, so keeping its
+    // The repair's splice replaces every edited file's run WHOLESALE, so keeping their
     // unmoved rows here (identity-translated) is safe — and it is what lets the exact
     // pairing short-circuit see an append for what it is: identical signed rows.
     // Moved/removed rows have no successor coordinate and drop; if any signed row
@@ -1131,18 +1221,18 @@ pub(crate) fn try_defs_changed_compose(
     }
   }
   prior_pairs.sort_unstable();
-  // The successor identity map, for the repair's canonical splice.
+  // The successor identity map, for the repair's canonical splice — the surgery's law.
   let successor_map = {
     let bases = prior_map.bases();
-    let file_bucket = bases.partition_point(|&b| b <= old_start) - 1;
     let mut new_bases = bases.to_vec();
-    for base in new_bases.iter_mut().skip(file_bucket + 1) {
-      *base = (*base as i64 + delta) as u64;
+    for base in &mut new_bases {
+      let i = law_blocks.partition_point(|b| b.old_end <= *base);
+      *base = (*base as i64 + law_prefix[i]) as u64;
     }
     let mut new_files: Vec<(u64, u64, u32)> = Vec::with_capacity(prior_map.files().len());
     for &(key, start, rows) in prior_map.files() {
-      if key == file_key {
-        new_files.push((key, old_start, new_rows_count));
+      if let Some(block) = law_blocks.iter().find(|b| b.file_key == key) {
+        new_files.push((key, block.new_start, block.new_rows));
       } else {
         let Some(translated) = translate(start) else {
           return Ok(None);
@@ -1152,12 +1242,17 @@ pub(crate) fn try_defs_changed_compose(
     }
     vorpal_kg::NodeIdMap::from_parts(new_bases, new_files)
   };
+  let swaps: Vec<(u64, &[vorpal_ingest::SigRow])> = sealed
+    .iter()
+    .zip(&outcomes)
+    .map(|(file, outcome)| (file.file_key, outcome.sigs.as_slice()))
+    .collect();
   let repair = match vorpal_ingest::scoped_similar_repair(
     &successor_map,
     manifest.entries().len(),
     &prior_rows_sigs,
     &prior_pairs,
-    &[(file_key, outcomes[0].sigs.as_slice())],
+    &swaps,
   ) {
     Ok(repair) => repair,
     Err(err) => {
@@ -1165,6 +1260,7 @@ pub(crate) fn try_defs_changed_compose(
       return Ok(None);
     }
   };
+  drop(swaps);
   let mut changed_srcs = repair.changed_srcs.clone();
   changed_srcs.extend(forced_changed);
   changed_srcs.sort_unstable();
@@ -1184,8 +1280,11 @@ pub(crate) fn try_defs_changed_compose(
   let mut stats_total = vorpal_ingest::ResolveStats::default();
   let mut plan_files: Vec<vorpal_kg::defs_changed::ChangedFilePlan> =
     Vec::with_capacity(outcomes.len());
-  let keys_in_order: Vec<u64> =
-    std::iter::once(file_key).chain(dirty_keys.iter().copied()).collect();
+  let keys_in_order: Vec<u64> = sealed
+    .iter()
+    .map(|s| s.file_key)
+    .chain(dirty_keys.iter().copied())
+    .collect();
   for (outcome, key) in outcomes.into_iter().zip(keys_in_order) {
     stats_total += outcome.stats;
     plan_files.push(vorpal_kg::defs_changed::ChangedFilePlan {
@@ -1198,7 +1297,7 @@ pub(crate) fn try_defs_changed_compose(
   }
   let plan = vorpal_kg::defs_changed::DefsChangedPlan {
     files: plan_files,
-    unmoved_ordinals,
+    edited: sealed.iter().map(|s| (s.file_key, s.unmoved.clone())).collect(),
     fresh_pairs: repair.fresh_pairs,
     changed_srcs,
     sig_rows,
@@ -1213,13 +1312,20 @@ pub(crate) fn try_defs_changed_compose(
   ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
-  if let Err(err) =
-    vorpal_kg::defs_changed::compose_defs_changed(&staging, prior, &prior_kg, &fresh_kg, &plan)
-  {
+  let fresh_seals: Vec<(u64, &vorpal_kg::Kg)> =
+    sealed.iter().map(|s| (s.file_key, &s.fresh_kg)).collect();
+  if let Err(err) = vorpal_kg::defs_changed::compose_defs_changed(
+    &staging,
+    prior,
+    &prior_kg,
+    &fresh_seals,
+    &plan,
+  ) {
     vorpal_kg::phase_stamp(&format!("defs-changed: fell back to the full pipeline: {err}"));
     let _ = fs::remove_dir_all(&staging);
     return Ok(None);
   }
+  drop(fresh_seals);
   drop(prior_kg);
   let pack_reader = PackReader::open_rooted(prior, Some(tree_root)).map(Arc::new);
   let writer = PackWriter::new(
@@ -1229,17 +1335,20 @@ pub(crate) fn try_defs_changed_compose(
     vorpal_ingest::PackFormat::Bucketed,
   );
   let sink = writer.sink();
-  sink
-    .send(PackMsg {
-      path: entry.path.clone(),
-      body: fresh_bytes,
-    })
-    .map_err(|_| io::Error::other("defs-changed: pack sink closed"))?;
+  for file in &mut sealed {
+    sink
+      .send(PackMsg {
+        path: file.path.clone(),
+        body: std::mem::take(&mut file.fresh_bytes),
+      })
+      .map_err(|_| io::Error::other("defs-changed: pack sink closed"))?;
+  }
   drop(sink);
   writer.finish(manifest.entries().iter().map(|e| e.path.clone()))?;
   manifest.save(&staging.join("manifest.bin"))?;
   commit_generation(out, prior, staging)?;
   let nodes = vorpal_kg::Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
+  let edited_count = sealed.len() as u64;
   Ok(Some(IndexReport {
     reused: false,
     graph_reused: false,
@@ -1248,8 +1357,8 @@ pub(crate) fn try_defs_changed_compose(
     error_nodes: 0,
     error_bytes: 0,
     excluded_files: 0,
-    indexed: 1 + dirty_count as u64,
-    skipped: manifest.entries().len() as u64 - 1 - dirty_count as u64,
+    indexed: edited_count + dirty_count as u64,
+    skipped: manifest.entries().len() as u64 - edited_count - dirty_count as u64,
     nodes,
     resolved: stats_total.resolved,
     ambiguous: stats_total.ambiguous,
@@ -1266,7 +1375,7 @@ pub(crate) fn try_defs_changed_compose(
   }))
 }
 
-const DEFS_CHANGED_NOTE: &str = "defs-changed compose: the edited file and its usage-dirty \
+const DEFS_CHANGED_NOTE: &str = "defs-changed compose: the edited files and their usage-dirty \
    referrers re-resolved against the successor universe; every other file's relations \
    carried byte-identically under the shift law";
 

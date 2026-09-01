@@ -1,16 +1,18 @@
-//! The DEFS-CHANGED compose (P4.5c-3): artifact surgery for a single-file edit whose
-//! DEFINITION SET moved — adds, removes, renames, signature changes. The shift law makes
-//! it tractable: bucket-major order is one sequence, so the edited file's row delta `d`
-//! shifts every dense id past its old block by exactly `d`; bucket-base-relative locals
-//! cancel for every bucket after the edited one; and every durable coordinate is
-//! identity-coded `(file_key, ordinal)`, stable unless it targets an edited-file ordinal
-//! that moved — whose referrers are exactly the usage-dirty files the session already
-//! re-resolved. What remains is mechanical: splice the edited bucket's node columns and
-//! heap around the scratch seal's bytes (file heap runs are back-to-back by the writer's
-//! gather order — asserted, not assumed), swap the session files' evidence/edge rows,
-//! translate the global dense-id artifacts (dataflow, names.idx, the graph cache), and
-//! re-splice the TOCs. Any surprise is an error: the caller falls back to the full
-//! pipeline, never commits a guess.
+//! The DEFS-CHANGED compose (P4.5c-3; multi-file sessions since S2-b): artifact surgery
+//! for edits whose DEFINITION SETS moved — adds, removes, renames, signature changes.
+//! The shift law makes it tractable: bucket-major order is one sequence, so the edited
+//! files' row deltas accumulate — `translate(x) = x + Σ_{i: x ≥ old_end_i} delta_i` —
+//! bucket-base-relative locals cancel for every bucket past the last edited one in it,
+//! and every durable coordinate is identity-coded `(file_key, ordinal)`, stable unless
+//! it targets an edited-file ordinal that moved — whose referrers are exactly the
+//! usage-dirty files the session already re-resolved. A defs-STABLE member of a mixed
+//! session is simply a block with delta 0 and every ordinal unmoved. What remains is
+//! mechanical: splice each edited bucket's node columns and heap around the scratch
+//! seals' bytes (file heap runs are back-to-back by the writer's gather order —
+//! asserted, not assumed), swap the session files' evidence/edge rows, translate the
+//! global dense-id artifacts (dataflow, names.idx, the graph cache), and re-splice the
+//! TOCs. Any surprise is an error: the caller falls back to the full pipeline, never
+//! commits a guess.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -35,16 +37,19 @@ pub struct ChangedFilePlan {
   pub flows: Vec<crate::DataflowRow>,
 }
 
-/// The full defs-changed surgery plan. `files[0]` is the EDITED file; the rest are the
-/// usage-dirty referrers.
+/// The full defs-changed surgery plan. `files` holds EVERY session file's fresh
+/// outcomes (edited and usage-dirty alike, any order); `edited` names the files whose
+/// definition sets moved, each with its per-OLD-ordinal unmoved flags.
 pub struct DefsChangedPlan {
   pub files: Vec<ChangedFilePlan>,
-  /// Per OLD ordinal of the edited file: whether that definition's row identity AND
-  /// ordinal survived unchanged. An unmoved ordinal's dense id is IDENTICAL in the
-  /// successor (same file start, same ordinal) — which is exactly why its referrers are
-  /// not usage-dirty and their carried rows may keep targeting it. A moved/removed
-  /// ordinal must never be targeted by a carried row (premise violation → error).
-  pub unmoved_ordinals: Vec<bool>,
+  /// Per edited file: `(file_key, unmoved)`. `unmoved[ord]` says whether that
+  /// definition's row identity AND ordinal survived unchanged. An unmoved ordinal's
+  /// successor dense id is `new_start + ordinal` (identical to its prior id when no
+  /// earlier block's delta reaches it) — which is exactly why its referrers are not
+  /// usage-dirty: identity-coded `(file_key, ordinal)` slab rows are invariant, and the
+  /// dense translation is total. A moved/removed ordinal must never be targeted by a
+  /// carried row (premise violation → error).
+  pub edited: Vec<(u64, Vec<bool>)>,
   /// The repaired GLOBAL pair set (`a < b`, sorted) in the successor space.
   pub fresh_pairs: Vec<(u64, u64, u8)>,
   /// Endpoints of every added/removed/relabeled pair, successor space.
@@ -53,83 +58,131 @@ pub struct DefsChangedPlan {
   pub sig_rows: Vec<crate::SigFamilyRow>,
 }
 
-struct Shift<'a> {
+/// One edited file's shift block, resolved against the prior universe.
+struct ShiftBlock<'a> {
+  file_key: u64,
   old_start: u64,
   old_end: u64,
-  delta: i64,
-  /// See [`DefsChangedPlan::unmoved_ordinals`].
+  /// `old_start + Σ delta(earlier blocks)`.
+  new_start: u64,
+  new_rows: u32,
+  bucket: usize,
+  /// See [`DefsChangedPlan::edited`].
   unmoved: &'a [bool],
+  /// The file's scratch single-file seal.
+  fresh: &'a crate::Kg,
+}
+
+/// The multi-block shift law: ascending disjoint blocks + prefix deltas.
+struct Shift<'a> {
+  blocks: Vec<ShiftBlock<'a>>,
+  /// `prefix[i]` = Σ delta of blocks `[0, i)`; len = blocks.len() + 1.
+  prefix: Vec<i64>,
 }
 
 impl Shift<'_> {
   fn translate(&self, prior_dense: u64) -> Option<u64> {
-    if (self.old_start..self.old_end).contains(&prior_dense) {
-      // Inside the edited block: an UNMOVED ordinal keeps its dense id verbatim (same
-      // start, same ordinal); anything else has no successor coordinate.
-      let ordinal = (prior_dense - self.old_start) as usize;
-      return self
+    let i = self.blocks.partition_point(|b| b.old_end <= prior_dense);
+    if i < self.blocks.len() && self.blocks[i].old_start <= prior_dense {
+      // Inside an edited block: an UNMOVED ordinal keeps its coordinate — successor id
+      // `new_start + ordinal`; anything else has no successor coordinate.
+      let block = &self.blocks[i];
+      let ordinal = (prior_dense - block.old_start) as usize;
+      return block
         .unmoved
         .get(ordinal)
         .copied()
         .unwrap_or(false)
-        .then_some(prior_dense);
+        .then_some(block.new_start + (prior_dense - block.old_start));
     }
-    if prior_dense >= self.old_end {
-      return Some((prior_dense as i64 + self.delta) as u64);
-    }
-    Some(prior_dense)
+    Some((prior_dense as i64 + self.prefix[i]) as u64)
+  }
+
+  fn block_containing_old(&self, prior_dense: u64) -> Option<&ShiftBlock<'_>> {
+    let i = self.blocks.partition_point(|b| b.old_end <= prior_dense);
+    (i < self.blocks.len() && self.blocks[i].old_start <= prior_dense)
+      .then(|| &self.blocks[i])
   }
 }
 
-/// Compose the successor generation for one defs-changed edit. `fresh` is the edited
-/// file's scratch single-file seal — its rows, strings, and heap bytes ARE the scratch
-/// build's for that block.
+/// Compose the successor generation for a defs-changed session (one or more edited
+/// files, plus their usage-dirty referrers). `fresh` pairs each edited file's key with
+/// its scratch single-file seal — the seal's rows, strings, and heap bytes ARE the
+/// scratch build's for that block.
 pub fn compose_defs_changed(
   staging: &Path,
   prior: &Path,
   prior_kg: &crate::Kg,
-  fresh: &crate::Kg,
+  fresh: &[(u64, &crate::Kg)],
   plan: &DefsChangedPlan,
 ) -> io::Result<()> {
   let map = NodeIdMap::from_dir(prior)
     .ok_or_else(|| io::Error::other("defs-changed: prior has no bucketed node store"))?;
   let bases = map.bases().to_vec();
   let buckets = bases.len() - 1;
-  let edited = plan
-    .files
-    .first()
-    .ok_or_else(|| io::Error::other("defs-changed: empty plan"))?;
-  let &(_, old_start, old_rows) = map
-    .files()
-    .iter()
-    .find(|&&(key, _, _)| key == edited.file_key)
-    .ok_or_else(|| io::Error::other("defs-changed: edited file outside the prior universe"))?;
-  let new_rows = u32::try_from(fresh.node_count())
-    .map_err(|_| io::Error::other("defs-changed: fresh seal beyond the row space"))?;
-  if plan.unmoved_ordinals.len() != old_rows as usize {
-    return Err(io::Error::other("defs-changed: unmoved set disagrees with the prior block"));
+  if plan.edited.is_empty() || plan.files.is_empty() {
+    return Err(io::Error::other("defs-changed: empty plan"));
   }
-  let shift = Shift {
-    old_start,
-    old_end: old_start + u64::from(old_rows),
-    delta: i64::from(new_rows) - i64::from(old_rows),
-    unmoved: &plan.unmoved_ordinals,
-  };
-  let file_bucket = bases.partition_point(|&b| b <= old_start) - 1;
+  if fresh.len() != plan.edited.len() {
+    return Err(io::Error::other("defs-changed: seal set disagrees with the edited set"));
+  }
+
+  // ---- the shift law's blocks, ascending, with cumulative deltas ----
+  let mut blocks: Vec<ShiftBlock<'_>> = Vec::with_capacity(plan.edited.len());
+  for (key, unmoved) in &plan.edited {
+    let &(_, old_start, old_rows) = map
+      .files()
+      .iter()
+      .find(|&&(k, _, _)| k == *key)
+      .ok_or_else(|| io::Error::other("defs-changed: edited file outside the prior universe"))?;
+    if unmoved.len() != old_rows as usize {
+      return Err(io::Error::other("defs-changed: unmoved set disagrees with the prior block"));
+    }
+    let &(_, seal) = fresh
+      .iter()
+      .find(|&&(k, _)| k == *key)
+      .ok_or_else(|| io::Error::other("defs-changed: edited file has no seal"))?;
+    let new_rows = u32::try_from(seal.node_count())
+      .map_err(|_| io::Error::other("defs-changed: fresh seal beyond the row space"))?;
+    blocks.push(ShiftBlock {
+      file_key: *key,
+      old_start,
+      old_end: old_start + u64::from(old_rows),
+      new_start: 0, // filled below in old_start order
+      new_rows,
+      bucket: bases.partition_point(|&b| b <= old_start) - 1,
+      unmoved,
+      fresh: seal,
+    });
+  }
+  blocks.sort_by_key(|b| b.old_start);
+  let mut prefix: Vec<i64> = Vec::with_capacity(blocks.len() + 1);
+  prefix.push(0);
+  for block in &mut blocks {
+    let cum = *prefix.last().expect("non-empty prefix");
+    block.new_start = (block.old_start as i64 + cum) as u64;
+    prefix
+      .push(cum + i64::from(block.new_rows) - (block.old_end - block.old_start) as i64);
+  }
+  let shift = Shift { blocks, prefix };
+  let edited_buckets: HashSet<usize> = shift.blocks.iter().map(|b| b.bucket).collect();
 
   // ---- the successor identity: bases, file table, map ----
+  // A bucket boundary shifts by the cumulative delta of every block strictly below it
+  // (files never straddle buckets, so a block is entirely below or entirely at/above).
   let mut new_bases = bases.clone();
-  for base in new_bases.iter_mut().skip(file_bucket + 1) {
-    *base = (*base as i64 + shift.delta) as u64;
+  for base in &mut new_bases {
+    let i = shift.blocks.partition_point(|b| b.old_end <= *base);
+    *base = (*base as i64 + shift.prefix[i]) as u64;
   }
   let mut new_files: Vec<(u64, u64, u32)> = Vec::with_capacity(map.files().len());
   for &(key, start, rows) in map.files() {
-    if key == edited.file_key {
-      new_files.push((key, old_start, new_rows));
+    if let Some(block) = shift.blocks.iter().find(|b| b.file_key == key) {
+      new_files.push((key, block.new_start, block.new_rows));
     } else {
       let translated = shift
         .translate(start)
-        .ok_or_else(|| io::Error::other("defs-changed: file table overlaps the edited block"))?;
+        .ok_or_else(|| io::Error::other("defs-changed: file table overlaps an edited block"))?;
       new_files.push((key, translated, rows));
     }
   }
@@ -191,7 +244,7 @@ pub fn compose_defs_changed(
     let vseg_name = format!("{bucket:04}.vseg");
     let heap_name = format!("{bucket:04}.heap");
     let (new_lo, new_hi) = (new_bases[bucket] as usize, new_bases[bucket + 1] as usize);
-    if bucket != file_bucket {
+    if !edited_buckets.contains(&bucket) {
       // Content is positionally identical (locals cancel); only the scc column can move.
       let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
       let segment = Segment::open_owned(prior_bytes)
@@ -239,20 +292,33 @@ pub fn compose_defs_changed(
       continue;
     }
 
-    // The edited bucket: columns and heap splice around the fresh seal's bytes.
+    // An edited bucket: columns and heap splice around the fresh seals' bytes — one
+    // pass over ALL of this bucket's edited blocks, ascending.
     let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
     let segment = Segment::open_owned(prior_bytes)
       .map_err(|err| io::Error::other(format!("defs-changed: prior node slab: {err}")))?;
     let prior_heap = fs::read(prior.join(NODES_DIR).join(&heap_name))?;
-    let fresh_rows = fresh.raw_node_rows()?;
-    let f_lo = (old_start - bases[bucket]) as usize;
-    let f_hi = f_lo + old_rows as usize;
+    let bucket_blocks: Vec<&ShiftBlock<'_>> =
+      shift.blocks.iter().filter(|b| b.bucket == bucket).collect();
+    let raw_rows: Vec<crate::kg::RawNodeRows> = bucket_blocks
+      .iter()
+      .map(|b| b.fresh.raw_node_rows())
+      .collect::<io::Result<_>>()?;
+    let splices: Vec<(usize, usize, &crate::kg::RawNodeRows)> = bucket_blocks
+      .iter()
+      .zip(&raw_rows)
+      .map(|(b, rows)| {
+        (
+          (b.old_start - bases[bucket]) as usize,
+          (b.old_end - bases[bucket]) as usize,
+          rows,
+        )
+      })
+      .collect();
     let (bytes, heap, digest, heap_digest) = splice_edited_bucket(
       &segment,
       &prior_heap,
-      f_lo,
-      f_hi,
-      &fresh_rows,
+      &splices,
       &scc_new[new_lo..new_hi],
     )?;
     let tmp = nodes_dir.join(format!("{vseg_name}.tmp"));
@@ -421,7 +487,7 @@ pub fn compose_defs_changed(
   let mut rebuilt_rows: HashMap<usize, Vec<SlabRow>> = HashMap::new();
   for bucket in 0..buckets {
     let name = format!("{bucket:04}.bin");
-    let needs_rebuild = rewrite_srcs.contains_key(&bucket) || bucket == file_bucket;
+    let needs_rebuild = rewrite_srcs.contains_key(&bucket) || edited_buckets.contains(&bucket);
     if !needs_rebuild {
       let (from, to) = (prior.join(crate::EDGES_DIR).join(&name), edges_dir.join(&name));
       let _ = fs::remove_file(&to);
@@ -448,8 +514,8 @@ pub fn compose_defs_changed(
       }
       let run = &prior_rows[run_start..i];
       let src_dense_old = bucket_base_old + u64::from(src_local_old);
-      if (shift.old_start..shift.old_end).contains(&src_dense_old) {
-        continue; // the edited file's old SOURCES are replaced wholesale by the fresh loop
+      if shift.block_containing_old(src_dense_old).is_some() {
+        continue; // an edited file's old SOURCES are replaced wholesale by the fresh loop
       }
       let Some(src_dense_new) = shift.translate(src_dense_old) else {
         return Err(io::Error::other("defs-changed: untranslatable carried source"));
@@ -528,19 +594,25 @@ pub fn compose_defs_changed(
     if i != prior_rows.len() {
       return Err(io::Error::other("defs-changed: prior edge slab rows out of source order"));
     }
-    // The edited file's fresh sources (only in its own bucket).
-    if bucket == file_bucket {
-      let edited_lo = session_ranges[0].0;
-      let edited_hi = session_ranges[0].1;
+    // The edited files' fresh sources (each only in its own bucket).
+    for block in shift.blocks.iter().filter(|b| b.bucket == bucket) {
+      let file = plan
+        .files
+        .iter()
+        .find(|f| f.file_key == block.file_key)
+        .ok_or_else(|| io::Error::other("defs-changed: edited file missing from the plan"))?;
+      let edited_lo = block.new_start;
+      let edited_hi = block.new_start + u64::from(block.new_rows);
       for src_dense in edited_lo..edited_hi {
         let src_local_new = (src_dense - bucket_base_new) as u32;
         let mut segment: Vec<SlabRow> = Vec::new();
         // Containment for the fresh block comes from the SCRATCH SEAL's own edges.
         let fresh_ord = src_dense - edited_lo;
-        for (&dst, &etype) in fresh
+        for (&dst, &etype) in block
+          .fresh
           .graph_out_targets(fresh_ord as u32)
           .iter()
-          .zip(fresh.graph_out_edge_types(fresh_ord as u32))
+          .zip(block.fresh.graph_out_edge_types(fresh_ord as u32))
         {
           if edge_class(EdgeType(etype)) == EdgeClass::Containment {
             segment.push(localize(
@@ -553,7 +625,7 @@ pub fn compose_defs_changed(
           }
         }
         for &(from, to, etype) in
-          edited.edges.iter().filter(|(f, _, _)| u64::from(*f) == src_dense)
+          file.edges.iter().filter(|(f, _, _)| u64::from(*f) == src_dense)
         {
           segment.push(localize(&new_map, bucket_base_new, from, to, etype)?);
         }
@@ -561,7 +633,7 @@ pub fn compose_defs_changed(
           segment.extend_from_slice(similar);
         }
         for &(from, to, etype) in
-          edited.request_edges.iter().filter(|(f, _, _)| u64::from(*f) == src_dense)
+          file.request_edges.iter().filter(|(f, _, _)| u64::from(*f) == src_dense)
         {
           segment.push(localize(&new_map, bucket_base_new, from, to, etype)?);
         }
@@ -684,14 +756,15 @@ pub fn compose_defs_changed(
   }
   crate::dataflow::save_dataflow(staging, kept)?;
 
-  // ---- names.idx: names CHANGED — regenerate by translation + the fresh block's names ----
+  // ---- names.idx: names CHANGED — regenerate by translation + the fresh blocks' names ----
   {
+    let fresh_total: usize = shift.blocks.iter().map(|b| b.fresh.node_count()).sum();
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     if let Some((hashes, ids)) = prior_kg.names_pairs() {
-      pairs.reserve(hashes.len() + fresh.node_count());
+      pairs.reserve(hashes.len() + fresh_total);
       for (&hash, &id) in hashes.iter().zip(ids) {
-        if (shift.old_start..shift.old_end).contains(&id) {
-          continue; // the fresh block re-contributes every surviving name below
+        if shift.block_containing_old(id).is_some() {
+          continue; // each fresh block re-contributes every surviving name below
         }
         if let Some(new_id) = shift.translate(id) {
           pairs.push((hash, new_id));
@@ -700,12 +773,14 @@ pub fn compose_defs_changed(
     } else {
       return Err(io::Error::other("defs-changed: prior generation has no name index"));
     }
-    for ord in 0..fresh.node_count() as u64 {
-      if let Some(name) = fresh.node_name(crate::NodeId::new(ord)) {
-        pairs.push((
-          xxhash_rust::xxh3::xxh3_64(name.as_bytes()),
-          old_start + ord,
-        ));
+    for block in &shift.blocks {
+      for ord in 0..block.fresh.node_count() as u64 {
+        if let Some(name) = block.fresh.node_name(crate::NodeId::new(ord)) {
+          pairs.push((
+            xxhash_rust::xxh3::xxh3_64(name.as_bytes()),
+            block.new_start + ord,
+          ));
+        }
       }
     }
     pairs.sort_unstable();
@@ -785,16 +860,15 @@ fn rebuild_vseg_with(
   Ok((bytes, digest))
 }
 
-/// The edited bucket: prior columns/heap spliced around the fresh seal's rows and heap
-/// bytes. File heap runs are back-to-back by the writer's gather order — ASSERTED here
-/// (prefix|edited|suffix extents must be adjacent), errored otherwise.
+/// An edited bucket: prior columns/heap spliced around the fresh seals' rows and heap
+/// bytes — k splices in one region walk (multi-file since S2-b). File heap runs are
+/// back-to-back by the writer's gather order — ASSERTED here (region extents must tile
+/// monotonically), errored otherwise.
 #[allow(clippy::type_complexity)]
 fn splice_edited_bucket(
   segment: &Segment,
   prior_heap: &[u8],
-  f_lo: usize,
-  f_hi: usize,
-  fresh: &crate::kg::RawNodeRows,
+  splices: &[(usize, usize, &crate::kg::RawNodeRows)],
   scc: &[u32],
 ) -> io::Result<(Vec<u8>, Vec<u8>, u64, u64)> {
   let col = |name: &str| -> io::Result<usize> {
@@ -834,12 +908,20 @@ fn splice_edited_bucket(
   let span_start = u32s(col("span_start")?)?;
   let span_end = u32s(col("span_end")?)?;
   let rows_old = kind.len();
-  if f_hi > rows_old {
+  if splices.is_empty() {
+    return Err(io::Error::other("defs-changed: edited bucket with no splice"));
+  }
+  for window in splices.windows(2) {
+    if window[0].1 > window[1].0 {
+      return Err(io::Error::other("defs-changed: splice blocks overlap or misorder"));
+    }
+  }
+  if splices.last().map(|&(_, hi, _)| hi).unwrap_or(0) > rows_old {
     return Err(io::Error::other("defs-changed: edited block beyond the bucket"));
   }
 
-  // The edited file's heap extent + the suffix's start, from len>0 references.
-  let extent = |range: std::ops::Range<usize>| -> (usize, usize) {
+  // Heap extent of a prior row range, from len>0 references.
+  let extent = |range: std::ops::Range<usize>| -> Option<(usize, usize)> {
     let (mut lo, mut hi) = (usize::MAX, 0usize);
     for i in range {
       for (off, len) in [
@@ -853,67 +935,124 @@ fn splice_edited_bucket(
         }
       }
     }
-    (lo, hi)
+    (lo != usize::MAX).then_some((lo, hi))
   };
-  let (f_heap_lo, f_heap_hi) = extent(f_lo..f_hi);
-  let f_heap_lo = if f_heap_lo == usize::MAX { prior_heap.len() } else { f_heap_lo };
-  let suffix_heap_lo = if f_hi < rows_old {
-    let (lo, _) = extent(f_hi..rows_old);
-    if lo == usize::MAX { prior_heap.len() } else { lo }
-  } else {
-    prior_heap.len()
-  };
-  if f_heap_hi > suffix_heap_lo || suffix_heap_lo > prior_heap.len() {
-    return Err(io::Error::other(
-      "defs-changed: heap runs are not block-adjacent — premise violated",
-    ));
-  }
 
-  // The successor heap: prefix ++ fresh ++ suffix.
-  let mut heap = Vec::with_capacity(f_heap_lo + fresh.heap.len() + (prior_heap.len() - suffix_heap_lo));
-  heap.extend_from_slice(&prior_heap[..f_heap_lo]);
-  heap.extend_from_slice(&fresh.heap);
-  heap.extend_from_slice(&prior_heap[suffix_heap_lo..]);
-  let suffix_shift = f_heap_lo as i64 + fresh.heap.len() as i64 - suffix_heap_lo as i64;
-
-  let rows_new = rows_old - (f_hi - f_lo) + fresh.kind.len();
-  macro_rules! splice_col {
-    ($prior:expr, $fresh:expr) => {{
-      let mut out = Vec::with_capacity(rows_new);
-      out.extend_from_slice(&$prior[..f_lo]);
-      out.extend_from_slice(&$fresh[..]);
-      out.extend_from_slice(&$prior[f_hi..]);
-      out
-    }};
-  }
-  let rebase_offsets = |off: &[u32], len: &[u32], fresh_off: &[u32], fresh_len: &[u32]| {
-    let mut out: Vec<u32> = Vec::with_capacity(rows_new);
-    out.extend_from_slice(&off[..f_lo]);
-    for (&f_off, &f_len) in fresh_off.iter().zip(fresh_len) {
-      out.push(if f_len > 0 { f_off + f_heap_lo as u32 } else { 0 });
-    }
-    for (&p_off, &p_len) in off[f_hi..].iter().zip(&len[f_hi..]) {
-      out.push(if p_len > 0 { (p_off as i64 + suffix_shift) as u32 } else { 0 });
-    }
-    out
-  };
-  let name_off_new = rebase_offsets(&name_off, &name_len, &fresh.name_off, &fresh.name_len);
-  let path_off_new = rebase_offsets(&path_off, &path_len, &fresh.path_off, &fresh.path_len);
-  let sig_off_new = rebase_offsets(&sig_off, &sig_len, &fresh.sig_off, &fresh.sig_len);
+  // Region walk: alternate GAP (carried prior rows) and SPLICE (a fresh seal). Heap
+  // bytes concatenate region by region; each row's offsets rebase to its region's
+  // output start. The writer packs file runs back-to-back, so region extents must tile
+  // monotonically — asserted, errored otherwise.
+  let rows_new = rows_old - splices.iter().map(|&(lo, hi, _)| hi - lo).sum::<usize>()
+    + splices.iter().map(|&(_, _, f)| f.kind.len()).sum::<usize>();
   if scc.len() != rows_new {
     return Err(io::Error::other("defs-changed: scc slice disagrees with the bucket"));
   }
-
-  let kind_new = splice_col!(kind, fresh.kind);
-  let name_len_new = splice_col!(name_len, fresh.name_len);
-  let path_len_new = splice_col!(path_len, fresh.path_len);
-  let sig_len_new = splice_col!(sig_len, fresh.sig_len);
-  let content_hash_new = splice_col!(content_hash, fresh.content_hash);
-  let eid_lo_new = splice_col!(eid_lo, fresh.eid_lo);
-  let eid_hi_new = splice_col!(eid_hi, fresh.eid_hi);
-  let flags_new = splice_col!(flags, fresh.flags);
-  let span_start_new = splice_col!(span_start, fresh.span_start);
-  let span_end_new = splice_col!(span_end, fresh.span_end);
+  let mut heap: Vec<u8> = Vec::with_capacity(
+    prior_heap.len() + splices.iter().map(|&(_, _, f)| f.heap.len()).sum::<usize>(),
+  );
+  let mut kind_new = Vec::with_capacity(rows_new);
+  let mut name_off_new = Vec::with_capacity(rows_new);
+  let mut name_len_new = Vec::with_capacity(rows_new);
+  let mut path_off_new = Vec::with_capacity(rows_new);
+  let mut path_len_new = Vec::with_capacity(rows_new);
+  let mut sig_off_new = Vec::with_capacity(rows_new);
+  let mut sig_len_new = Vec::with_capacity(rows_new);
+  let mut content_hash_new = Vec::with_capacity(rows_new);
+  let mut eid_lo_new = Vec::with_capacity(rows_new);
+  let mut eid_hi_new = Vec::with_capacity(rows_new);
+  let mut flags_new = Vec::with_capacity(rows_new);
+  let mut span_start_new = Vec::with_capacity(rows_new);
+  let mut span_end_new = Vec::with_capacity(rows_new);
+  let mut prior_heap_cursor = 0usize; // monotone tiling checkpoint
+  let emit_gap = |lo: usize, hi: usize, cursor: &mut usize, heap: &mut Vec<u8>,
+                  name_off_new: &mut Vec<u32>, name_len_new: &mut Vec<u32>,
+                  path_off_new: &mut Vec<u32>, path_len_new: &mut Vec<u32>,
+                  sig_off_new: &mut Vec<u32>, sig_len_new: &mut Vec<u32>,
+                  kind_new: &mut Vec<u8>, content_hash_new: &mut Vec<u64>,
+                  eid_lo_new: &mut Vec<u64>, eid_hi_new: &mut Vec<u64>,
+                  flags_new: &mut Vec<u8>, span_start_new: &mut Vec<u32>,
+                  span_end_new: &mut Vec<u32>|
+   -> io::Result<()> {
+    if lo == hi {
+      return Ok(());
+    }
+    let region_out = heap.len() as i64;
+    let region_shift = if let Some((ext_lo, ext_hi)) = extent(lo..hi) {
+      if ext_lo < *cursor || ext_hi > prior_heap.len() {
+        return Err(io::Error::other(
+          "defs-changed: heap runs are not block-adjacent — premise violated",
+        ));
+      }
+      heap.extend_from_slice(&prior_heap[ext_lo..ext_hi]);
+      *cursor = ext_hi;
+      region_out - ext_lo as i64
+    } else {
+      0
+    };
+    for i in lo..hi {
+      kind_new.push(kind[i]);
+      let rebase = |off: u32, len: u32| -> u32 {
+        if len > 0 { (off as i64 + region_shift) as u32 } else { 0 }
+      };
+      name_off_new.push(rebase(name_off[i], name_len[i]));
+      name_len_new.push(name_len[i]);
+      path_off_new.push(rebase(path_off[i], path_len[i]));
+      path_len_new.push(path_len[i]);
+      sig_off_new.push(rebase(sig_off[i], sig_len[i]));
+      sig_len_new.push(sig_len[i]);
+      content_hash_new.push(content_hash[i]);
+      eid_lo_new.push(eid_lo[i]);
+      eid_hi_new.push(eid_hi[i]);
+      flags_new.push(flags[i]);
+      span_start_new.push(span_start[i]);
+      span_end_new.push(span_end[i]);
+    }
+    Ok(())
+  };
+  let mut row_cursor = 0usize;
+  for &(f_lo, f_hi, fresh) in splices {
+    emit_gap(
+      row_cursor, f_lo, &mut prior_heap_cursor, &mut heap, &mut name_off_new,
+      &mut name_len_new, &mut path_off_new, &mut path_len_new, &mut sig_off_new,
+      &mut sig_len_new, &mut kind_new, &mut content_hash_new, &mut eid_lo_new,
+      &mut eid_hi_new, &mut flags_new, &mut span_start_new, &mut span_end_new,
+    )?;
+    // Skip the replaced block's heap bytes in the tiling cursor.
+    if let Some((ext_lo, ext_hi)) = extent(f_lo..f_hi) {
+      if ext_lo < prior_heap_cursor || ext_hi > prior_heap.len() {
+        return Err(io::Error::other(
+          "defs-changed: heap runs are not block-adjacent — premise violated",
+        ));
+      }
+      prior_heap_cursor = ext_hi;
+    }
+    let splice_out = heap.len() as u32;
+    heap.extend_from_slice(&fresh.heap);
+    for i in 0..fresh.kind.len() {
+      kind_new.push(fresh.kind[i]);
+      let rebase =
+        |off: u32, len: u32| -> u32 { if len > 0 { off + splice_out } else { 0 } };
+      name_off_new.push(rebase(fresh.name_off[i], fresh.name_len[i]));
+      name_len_new.push(fresh.name_len[i]);
+      path_off_new.push(rebase(fresh.path_off[i], fresh.path_len[i]));
+      path_len_new.push(fresh.path_len[i]);
+      sig_off_new.push(rebase(fresh.sig_off[i], fresh.sig_len[i]));
+      sig_len_new.push(fresh.sig_len[i]);
+      content_hash_new.push(fresh.content_hash[i]);
+      eid_lo_new.push(fresh.eid_lo[i]);
+      eid_hi_new.push(fresh.eid_hi[i]);
+      flags_new.push(fresh.flags[i]);
+      span_start_new.push(fresh.span_start[i]);
+      span_end_new.push(fresh.span_end[i]);
+    }
+    row_cursor = f_hi;
+  }
+  emit_gap(
+    row_cursor, rows_old, &mut prior_heap_cursor, &mut heap, &mut name_off_new,
+    &mut name_len_new, &mut path_off_new, &mut path_len_new, &mut sig_off_new,
+    &mut sig_len_new, &mut kind_new, &mut content_hash_new, &mut eid_lo_new,
+    &mut eid_hi_new, &mut flags_new, &mut span_start_new, &mut span_end_new,
+  )?;
   let mut builder = SegmentBuilder::new(0);
   let build_err = |_| io::Error::other("defs-changed: node slab rebuild failed");
   builder.add_u8("kind", &kind_new).map_err(build_err)?;

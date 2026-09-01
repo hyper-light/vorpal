@@ -236,6 +236,79 @@ fn a_duplicate_collapsed_file_composes_and_converges() {
 }
 
 #[test]
+fn a_multi_file_defs_changed_session_composes_and_converges() {
+  // S2-b: definitions added to TWO files in one build — two shift blocks, cumulative
+  // deltas, one overlay session — must compose and byte-converge; then both removals
+  // together must too.
+  unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
+  let base = std::env::temp_dir().join(format!("vorpal-dc-multi-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&base);
+  let src = base.join("repo");
+  fs::create_dir_all(&src).unwrap();
+  write_fixture(&src, false);
+  let c_py = |with_extra: bool| {
+    if with_extra {
+      "def unrelated():\n    return 2\n\ndef c_extra():\n    return 5\n"
+    } else {
+      "def unrelated():\n    return 2\n"
+    }
+  };
+  let src = src.canonicalize().unwrap();
+
+  let out = base.join("index");
+  vorpal_index::build_index(&src, &out).expect("initial build");
+  fs::write(src.join("b.py"), b_py(true)).unwrap();
+  fs::write(src.join("c.py"), c_py(true)).unwrap();
+  let report = vorpal_index::build_index(&src, &out).expect("two-file add build");
+  assert!(
+    compose_fired(&report),
+    "two def-adding edits must take ONE defs-changed session: {report:?}"
+  );
+  assert!(report.indexed >= 2, "both edited files re-resolve: {report:?}");
+  assert_converged(&out, &src, &base, "two-adds");
+  fs::write(src.join("b.py"), b_py(false)).unwrap();
+  fs::write(src.join("c.py"), c_py(false)).unwrap();
+  let report = vorpal_index::build_index(&src, &out).expect("two-file remove build");
+  assert!(
+    compose_fired(&report),
+    "two def-removing edits must take ONE defs-changed session: {report:?}"
+  );
+  assert_converged(&out, &src, &base, "two-removes");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_mixed_session_routes_through_the_changed_lane_and_converges() {
+  // S2-b mixed routing: one file's DEFINITION SET moves while another file gets a
+  // body-only (defs-stable) edit in the same build. The stable lane declines (its
+  // ladder rejects the def-adding member), and the changed lane takes BOTH — the
+  // stable member riding as a delta-0 block.
+  unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
+  let base = std::env::temp_dir().join(format!("vorpal-dc-mixed-{}", std::process::id()));
+  let _ = fs::remove_dir_all(&base);
+  let src = base.join("repo");
+  fs::create_dir_all(&src).unwrap();
+  write_fixture(&src, false);
+  let src = src.canonicalize().unwrap();
+
+  let out = base.join("index");
+  vorpal_index::build_index(&src, &out).expect("initial build");
+  // b.py gains a def; c.py's body changes without touching its definition set.
+  fs::write(src.join("b.py"), b_py(true)).unwrap();
+  fs::write(src.join("c.py"), "def unrelated():\n    return 2 + 1\n").unwrap();
+  let report = vorpal_index::build_index(&src, &out).expect("mixed build");
+  assert!(
+    compose_fired(&report),
+    "the mixed session must take the defs-changed lane: {report:?}"
+  );
+  assert!(report.indexed >= 2, "both edited files re-resolve: {report:?}");
+  assert_converged(&out, &src, &base, "mixed");
+
+  let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn a_file_addition_declines_to_the_full_pipeline() {
   unsafe { std::env::set_var("VORPAL_FORMAT", "next") };
   let base = std::env::temp_dir().join(format!("vorpal-dc-decline-{}", std::process::id()));

@@ -383,8 +383,7 @@ fn scoped_pairing_repair_equals_scratch_pair_set() {
     live_files,
     &prior_rows,
     &prior_pairs,
-    file_key,
-    &outcome.sigs,
+    &[(file_key, outcome.sigs.as_slice())],
   )
   .expect("pairing repair");
 

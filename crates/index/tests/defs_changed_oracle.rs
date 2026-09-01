@@ -137,8 +137,7 @@ fn defs_changed_session_equals_scratch_for_the_closure() {
     &prior_map,
     &vorpal_ingest::Resolver::new(),
     &fetch,
-    &edited,
-    &fresh_kg,
+    &[(edited, &fresh_kg)],
     &dirty,
     usize::MAX,
   )
