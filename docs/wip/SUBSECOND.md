@@ -1153,6 +1153,33 @@ range (the serial crossover was k≈10). k=1 parity: 1.17–1.25 s toggles (was 
 Gates: all oracles + compose fixtures green (outcome equality is the parallelism's
 correctness pin), battery 28/28, suite green, clippy 0/0 both lanes.
 
+#### The scc CARRY LAW (2026-09-01) — defs-changed stops paying for cycles it provably didn't touch
+
+The k=1 traced surgery (finer stamps, incl. a names split) put the fixed costs at:
+scc recompute 92 ms, node store 102 ms (the always-recompute forced EVERY bucket's
+column compare — 179 MB of vseg reads per edit), graph cache 118 ms, usage 90 ms,
+names sort 45 ms + write 8 ms, staging tail 100 ms. The law: carried (non-session)
+sources' call edges are translation-invariant by construction, so if every SESSION
+file's fresh call set equals its prior call set under translation, the successor calls
+graph IS translate(prior calls graph) — the condensation is isomorphic under translate
+and every carried node's `scc_size` carries verbatim. Ordinals outside translate's
+image then have no call edges (one would break the equality) and take the algorithm's
+own isolated-node value, 1 (scc.rs: `sizes = vec![1; n]`, "1 for acyclic nodes" — a
+definition, not a constant). Any untranslatable endpoint on a prior call bails to the
+recompute, so a moved def that participates in calls always recomputes. Under the
+carry, non-edited buckets hard-link BLIND (no read, no compare) and the edited bucket's
+scc slice assembles from the prior column + unmoved flags.
+
+Kernel (fn-append toggles, all byte-converged, lane-verified): k=1 **1.10–1.12 s**
+(was 1.17–1.25); sweep k=2/4/8/16 → **1.11 / 1.26 / 1.30 / 1.47 s** (was
+1.24/1.39/1.42/1.57 post-parallelism; 2.32 s at k=16 this morning). scc phase 92→0 ms,
+node store 102→85 ms on the append shape. The day's defs-changed trajectory:
+1.28–1.32 s → 1.10–1.12 s single-file. Gates: all compose/oracle fixtures green (both
+carry and recompute paths exercised — call-set-changing fixtures recompute, uncalled
+adds carry), battery 28/28, suite green, clippy 0/0 both lanes. Remaining k=1 spend,
+should sub-second demand more: graph cache 118 ms, staging tail 100 ms, usage 90 ms,
+identity 78 ms, names 53 ms, sigs 53 ms.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,

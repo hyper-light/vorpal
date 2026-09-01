@@ -202,8 +202,58 @@ pub fn compose_defs_changed(
   let in_session = |dense: u64| session_ranges.iter().any(|&(lo, hi)| (lo..hi).contains(&dense));
 
   crate::phase_stamp("defs-changed surgery: identity ready");
-  // ---- scc over the successor call graph (the definition set moved; recompute always) ----
-  let scc_new: Vec<u32> = {
+  // ---- scc over the successor call graph ----
+  // THE CARRY LAW: carried (non-session) sources' call edges are translation-invariant
+  // by construction, so if every SESSION file's fresh call set equals its prior call
+  // set under translation, the successor calls graph IS translate(prior calls graph) —
+  // the condensation is isomorphic under translate and every carried node's scc_size
+  // carries verbatim. Ordinals outside translate's image (added defs) then have no
+  // call edges (one would break the equality) and take the algorithm's own
+  // isolated-node value, 1 (scc.rs: "1 for acyclic nodes"; `sizes = vec![1; n]`). Any
+  // untranslatable endpoint on a prior call bails to the recompute — a moved def that
+  // participates in calls always recomputes. The common append/remove of uncalled
+  // definitions skips both the recompute AND every non-edited bucket's column compare
+  // (measured 92 ms + most of 102 ms per kernel edit).
+  let calls_preserved: bool = 'preserved: {
+    for file in &plan.files {
+      let &(_, old_file_start, old_file_rows) = map
+        .files()
+        .iter()
+        .find(|&&(k, _, _)| k == file.file_key)
+        .ok_or_else(|| io::Error::other("defs-changed: session file outside the universe"))?;
+      let mut prior_calls: HashSet<(u32, u32)> = HashSet::new();
+      for u in old_file_start..old_file_start + u64::from(old_file_rows) {
+        for (&dst, &etype) in prior_kg
+          .graph_out_targets(u as u32)
+          .iter()
+          .zip(prior_kg.graph_out_edge_types(u as u32))
+        {
+          if EdgeType(etype).base() != EdgeType::CALLS {
+            continue;
+          }
+          let (Some(src_new), Some(dst_new)) =
+            (shift.translate(u), shift.translate(u64::from(dst)))
+          else {
+            break 'preserved false; // a call touches a moved/removed ordinal
+          };
+          prior_calls.insert((src_new as u32, dst_new as u32));
+        }
+      }
+      let fresh_calls: HashSet<(u32, u32)> = file
+        .edges
+        .iter()
+        .filter(|(_, _, etype)| etype.base() == EdgeType::CALLS)
+        .map(|&(from, to, _)| (from, to))
+        .collect();
+      if prior_calls != fresh_calls {
+        break 'preserved false;
+      }
+    }
+    true
+  };
+  let scc_new: Option<Vec<u32>> = if calls_preserved {
+    None
+  } else {
     let node_count = new_bases[buckets] as usize;
     let mut log = vorpal_graph::EdgeLog::default();
     for u in 0..prior_kg.node_count() as u64 {
@@ -232,7 +282,7 @@ pub fn compose_defs_changed(
         }
       }
     }
-    crate::scc::scc_sizes(node_count, &log)
+    Some(crate::scc::scc_sizes(node_count, &log))
   };
 
   crate::phase_stamp("defs-changed surgery: scc done");
@@ -248,6 +298,17 @@ pub fn compose_defs_changed(
     let (new_lo, new_hi) = (new_bases[bucket] as usize, new_bases[bucket + 1] as usize);
     if !edited_buckets.contains(&bucket) {
       // Content is positionally identical (locals cancel); only the scc column can move.
+      // Under the carry law it provably did NOT — link blind, no read, no compare.
+      let Some(scc_new) = scc_new.as_deref() else {
+        for name in [&vseg_name, &heap_name] {
+          let (from, to) = (prior.join(NODES_DIR).join(name), nodes_dir.join(name));
+          let _ = fs::remove_file(&to);
+          if fs::hard_link(&from, &to).is_err() {
+            fs::copy(&from, &to)?;
+          }
+        }
+        continue;
+      };
       let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
       let segment = Segment::open_owned(prior_bytes)
         .map_err(|err| io::Error::other(format!("defs-changed: prior node slab: {err}")))?;
@@ -317,11 +378,45 @@ pub fn compose_defs_changed(
         )
       })
       .collect();
+    let scc_slice: Vec<u32> = match scc_new.as_deref() {
+      Some(full) => full[new_lo..new_hi].to_vec(),
+      None => {
+        // The carry law's slice for THIS bucket: gap rows keep their prior values
+        // positionally; a block's unmoved ordinal carries its prior value (same old
+        // ordinal by the unmoved law); added/moved-uncalled ordinals are isolated in
+        // the calls graph and take the algorithm's own value for an acyclic node, 1.
+        let scc_idx = segment
+          .column_index("scc_size")
+          .ok_or_else(|| io::Error::other("defs-changed: slab missing column scc_size"))?;
+        let prior_scc = segment
+          .column_at(scc_idx)
+          .and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))
+          .ok_or_else(|| io::Error::other("defs-changed: scc column not sliceable"))?;
+        let mut slice = Vec::with_capacity(new_hi - new_lo);
+        let mut row_cursor = 0usize;
+        for (block, &(f_lo, f_hi, _)) in bucket_blocks.iter().zip(&splices) {
+          slice.extend_from_slice(&prior_scc[row_cursor..f_lo]);
+          for j in 0..block.new_rows as usize {
+            if block.unmoved.get(j).copied().unwrap_or(false) {
+              slice.push(prior_scc[f_lo + j]);
+            } else {
+              slice.push(1);
+            }
+          }
+          row_cursor = f_hi;
+        }
+        slice.extend_from_slice(&prior_scc[row_cursor..]);
+        if slice.len() != new_hi - new_lo {
+          return Err(io::Error::other("defs-changed: carried scc slice disagrees"));
+        }
+        slice
+      }
+    };
     let (bytes, heap, digest, heap_digest) = splice_edited_bucket(
       &segment,
       &prior_heap,
       &splices,
-      &scc_new[new_lo..new_hi],
+      &scc_slice,
     )?;
     let tmp = nodes_dir.join(format!("{vseg_name}.tmp"));
     fs::write(&tmp, &bytes)?;
@@ -793,8 +888,10 @@ pub fn compose_defs_changed(
       }
     }
     pairs.sort_unstable();
+    crate::phase_stamp("defs-changed surgery: names sorted");
     crate::kg::write_names_index_pairs(staging, &pairs)?;
   }
+  crate::phase_stamp("defs-changed surgery: names done");
   Ok(())
 }
 
