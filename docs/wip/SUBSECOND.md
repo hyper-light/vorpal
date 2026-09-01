@@ -842,8 +842,24 @@ its disk twin, landed in three certified sub-slices:
     links), both daemon differentials, suite 133/133, battery 48/48 across
     rs/go/py/ts × both lanes — nats.go's span-only shapes now compose too (the
     defs-stable ladder does not require request-span equality; requests re-derive).
-    Remaining measured leads: incremental LSH banding (pairing ~0.3 s of the 1.1 s),
-    scc pre-read double-open, usage all_pairs full read.
+    PERF LEADS (landed 2026-09-01): the node-bucket loop reads+parses each vseg ONCE
+    (was up to three times on the scc lane); usage updates are bucket-scoped deltas with
+    digest-carry (untouched postings buckets hard-link; the full-swap re-encoded the
+    world to rediscover nothing moved); and the pairing gained an EXACT short-circuit —
+    identical input rows are a pure-function guarantee of identical pairs, so every edit
+    that changes no signed row's (id, shingles, sketch) skips banding+verify entirely.
+    Incremental LSH banding beyond that was examined and REJECTED: partner caps and the
+    global candidate ceiling make pair selection a function of the ENTIRE candidate
+    stream (evicted candidates are not persisted; truncation is order-dependent, and at
+    kernel scale the ceiling BINDS — measured), so any partial recompute is unsound the
+    moment either bound engages. Kernel post-leads: defs-stable call-insert 1.16–1.20 s.
+    ORDER-LAW FINDING (queued behind the format flip): the pipeline's pairing feed is
+    LAYOUT order within a file while the sigs family is ORDINAL order — they differ
+    exactly on duplicate-collapsed files (C decl+def). Every convergence gate including
+    the dup-heavy kernel has held, but the equivalence deserves construction: after the
+    flip retires the flat byte-identity law, the feed canonicalizes to
+    (bucket, key, ordinal) everywhere — one order, exact by build, and the short-circuit
+    then fires on dup-reordered files too.
   - **c-2 — defs-stable scoped resolve (single-file semantic edits).** Ground truths
     verified in-code (2026-08-31): a file's node rows are exactly [File][item][member…]
     in outline order (`ingest_file_with_spans`), so a defs-stable edit (same items,

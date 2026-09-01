@@ -486,21 +486,19 @@ pub fn compose_defs_stable(
     }
   }
 
-  // ---- usage: the file's referenced-name postings delta over the prior pair set ----
-  let usage = crate::usagestore::UsageStore::open(prior)
-    .ok_or_else(|| io::Error::other("defs-stable: prior usage unreadable"))?;
-  let mut pairs: Vec<(u32, u64)> = usage.all_pairs();
-  let old_file_pairs: HashSet<u32> = dropped_rows.iter().map(|row| row.name_hash).collect();
-  pairs.retain(|&(hash, key)| !(key == plan.file_key && old_file_pairs.contains(&hash)));
-  let mut new_file_pairs: Vec<(u32, u64)> = plan
+  // ---- usage: the file's postings delta, bucket-scoped (untouched buckets link) ----
+  let removed: HashSet<(u32, u64)> = dropped_rows
+    .iter()
+    .map(|row| (row.name_hash, plan.file_key))
+    .collect();
+  let mut added: Vec<(u32, u64)> = plan
     .evidence
     .iter()
     .map(|row| (row.name_hash, plan.file_key))
     .collect();
-  new_file_pairs.sort_unstable();
-  new_file_pairs.dedup();
-  pairs.extend(new_file_pairs);
-  crate::usagestore::save(staging, pairs, buckets as u32, Some(prior))?;
+  added.sort_unstable();
+  added.dedup();
+  crate::usagestore::apply_delta(staging, prior, buckets as u32, &removed, &added)?;
 
   // ---- sigs: the repaired ledger, digest-carried per bucket ----
   crate::sigstore::save_sigs(staging, &plan.sig_rows, &map, Some(prior))?;

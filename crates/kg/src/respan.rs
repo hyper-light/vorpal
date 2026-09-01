@@ -242,22 +242,7 @@ pub(crate) fn rebuild_node_buckets(
   for bucket in 0..buckets {
     let vseg_name = format!("{bucket:04}.vseg");
     let heap_name = format!("{bucket:04}.heap");
-    let scc_bucket_differs = scc_new.is_some_and(|scc| {
-      let (lo, hi) = (bases[bucket] as usize, bases[bucket + 1] as usize);
-      // Cheap pre-read of just the scc column decides linking without a full rebuild.
-      let prior_bytes = match fs::read(prior.join(NODES_DIR).join(&vseg_name)) {
-        Ok(bytes) => bytes,
-        Err(_) => return true, // unreadable: let the rebuild path surface the error
-      };
-      match Segment::open_owned(prior_bytes)
-        .ok()
-        .and_then(|seg| seg.column_index("scc_size").and_then(|i| seg.column_at(i).and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))))
-      {
-        Some(col) => col.as_slice() != &scc[lo..hi],
-        None => true,
-      }
-    });
-    if planned_in_bucket[bucket].is_empty() && !scc_bucket_differs {
+    let link_pair = |nodes_dir: &Path| -> io::Result<()> {
       for name in [&vseg_name, &heap_name] {
         let (from, to) = (prior.join(NODES_DIR).join(name), nodes_dir.join(name));
         let _ = fs::remove_file(&to);
@@ -265,16 +250,39 @@ pub(crate) fn rebuild_node_buckets(
           fs::copy(&from, &to)?;
         }
       }
-      let linked = fs::read(nodes_dir.join(&vseg_name))?;
-      vseg_fold.update(&linked);
+      Ok(())
+    };
+    // One read, at most one parse per bucket: the fold consumes the same bytes the link
+    // or the rebuild does (the pre-fix shape read every vseg up to three times on the
+    // scc-ripple lane: compare, fold-after-link, rebuild).
+    let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
+    if planned_in_bucket[bucket].is_empty() && scc_new.is_none() {
+      vseg_fold.update(&prior_bytes);
+      link_pair(&nodes_dir)?;
+      continue;
+    }
+    let segment = Segment::open_owned(prior_bytes)
+      .map_err(|err| io::Error::other(format!("respan: prior node slab: {err}")))?;
+    let scc_bucket_differs = match scc_new {
+      None => false,
+      Some(scc) => {
+        let (lo, hi) = (bases[bucket] as usize, bases[bucket + 1] as usize);
+        match segment.column_index("scc_size").and_then(|i| {
+          segment.column_at(i).and_then(|c| c.as_slice::<u32>().map(<[u32]>::to_vec))
+        }) {
+          Some(col) => col.as_slice() != &scc[lo..hi],
+          None => true, // missing column: the rebuild path surfaces the real error
+        }
+      }
+    };
+    if planned_in_bucket[bucket].is_empty() && !scc_bucket_differs {
+      vseg_fold.update(segment.bytes());
+      link_pair(&nodes_dir)?;
       continue;
     }
     // Rebuild this bucket's vseg: prior columns verbatim, with the planned files'
     // span/content-hash entries replaced. The heap is byte-identical (strings unchanged)
     // and hard-links.
-    let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
-    let segment = Segment::open_owned(prior_bytes)
-      .map_err(|err| io::Error::other(format!("respan: prior node slab: {err}")))?;
     let col = |name: &str| -> io::Result<usize> {
       segment
         .column_index(name)

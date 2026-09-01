@@ -1041,11 +1041,11 @@ pub(crate) fn try_defs_changed_compose(
   };
   let mut prior_rows_sigs: Vec<vorpal_ingest::SigRow> = Vec::with_capacity(family_rows.len());
   for row in family_rows {
-    // The edited file's WHOLE old run is replaced by the fresh one (unmoved ordinals
-    // included — their fresh rows re-contribute); everything else translates.
-    if (old_start..old_end).contains(&u64::from(row.node)) {
-      continue;
-    }
+    // The repair's splice replaces the edited file's run WHOLESALE, so keeping its
+    // unmoved rows here (identity-translated) is safe — and it is what lets the exact
+    // pairing short-circuit see an append for what it is: identical signed rows.
+    // Moved/removed rows have no successor coordinate and drop; if any signed row
+    // moved, the equality fails and the full re-pair runs, as it must.
     if let Some(node) = translate(u64::from(row.node)) {
       prior_rows_sigs.push(vorpal_ingest::SigRow {
         node,

@@ -89,19 +89,115 @@ impl Toc {
 /// Persist the usage postings: `pairs` is the raw `(name_hash, from-file_key)` stream (one
 /// per evidence occurrence; duplicates welcome — deduped here), `buckets` the family
 /// bucket count, `prior` the hard-link source.
-/// Every `(name_hash, file_key)` pair the family holds, slab-concatenation order — the
-/// defs-stable compose's delta base (it swaps one file's contribution and re-saves; the
-/// per-bucket digest carry rewrites only buckets whose pair set moved).
-impl UsageStore {
-  pub(crate) fn all_pairs(&self) -> Vec<(u32, u64)> {
-    let mut pairs = Vec::new();
-    for slab in self.slabs.iter().flatten() {
+/// Apply a per-file postings delta without re-bucketing the world: only the buckets a
+/// removed or added pair maps to are rebuilt (prior rows minus removals plus additions,
+/// re-sorted, re-deduped); every other member hard-links and the TOC re-splices. The
+/// full-swap `save` re-encoded every bucket to rediscover that nothing moved — measured
+/// waste on every compose.
+pub(crate) fn apply_delta(
+  staging: &Path,
+  prior: &Path,
+  buckets: u32,
+  removed: &std::collections::HashSet<(u32, u64)>,
+  added: &[(u32, u64)],
+) -> io::Result<()> {
+  if buckets == 0 {
+    return Err(io::Error::other("usage family requires a bucket count"));
+  }
+  let store = UsageStore::open(prior)
+    .ok_or_else(|| io::Error::other("usage delta requires a readable prior family"))?;
+  if store.slabs.len() != buckets as usize {
+    return Err(io::Error::other("usage delta: bucket count moved"));
+  }
+  let mut touched: Vec<Vec<(u32, u64)>> = vec![Vec::new(); buckets as usize];
+  let mut is_touched = vec![false; buckets as usize];
+  for &(hash, key) in removed.iter().chain(added) {
+    is_touched[(hash & (buckets - 1)) as usize] = true;
+    let _ = key;
+  }
+  for &(hash, key) in added {
+    touched[(hash & (buckets - 1)) as usize].push((hash, key));
+  }
+  let usage_dir = staging.join(USAGE_DIR);
+  fs::create_dir_all(&usage_dir)?;
+  let mut toc = fs::read(prior.join(USAGE_TOC))
+    .map_err(|_| io::Error::other("usage delta: prior TOC unreadable"))?;
+  for bucket in 0..buckets as usize {
+    let name = format!("{bucket:04}.idx");
+    if !is_touched[bucket] {
+      let (from, to) = (prior.join(USAGE_DIR).join(&name), usage_dir.join(&name));
+      let _ = fs::remove_file(&to);
+      if fs::hard_link(&from, &to).is_err() {
+        fs::copy(&from, &to)?;
+      }
+      continue;
+    }
+    let mut rows: Vec<(u32, u64)> = Vec::new();
+    if let Some(slab) = &store.slabs[bucket] {
       for i in 0..slab.pairs {
-        pairs.push(slab.pair(i));
+        let pair = slab.pair(i);
+        if !removed.contains(&pair) {
+          rows.push(pair);
+        }
       }
     }
-    pairs
+    rows.extend_from_slice(&touched[bucket]);
+    rows.sort_unstable();
+    rows.dedup();
+    let mut bytes = Vec::with_capacity(SLAB_HEADER + rows.len() * ROW);
+    bytes.extend_from_slice(SLAB_MAGIC);
+    bytes.extend_from_slice(&VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(bucket as u32).to_le_bytes());
+    bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    for (hash, key) in &rows {
+      bytes.extend_from_slice(&hash.to_le_bytes());
+      bytes.extend_from_slice(&key.to_le_bytes());
+    }
+    let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
+    // Digest-carry parity with the full saver: a net-identical bucket (a pair removed
+    // and re-added) hard-links instead of rewriting, preserving the inode carry laws.
+    let at = TOC_HEADER + bucket * TOC_ROW;
+    let prior_digest = u64::from_le_bytes(
+      toc
+        .get(at + 16..at + 24)
+        .ok_or_else(|| io::Error::other("usage delta: TOC too short"))?
+        .try_into()
+        .map_err(|_| io::Error::other("usage delta: TOC"))?,
+    );
+    let prior_len = u64::from_le_bytes(
+      toc[at + 8..at + 16].try_into().map_err(|_| io::Error::other("usage delta: TOC"))?,
+    );
+    if prior_digest == digest && prior_len == bytes.len() as u64 {
+      let (from, to) = (prior.join(USAGE_DIR).join(&name), usage_dir.join(&name));
+      let _ = fs::remove_file(&to);
+      if fs::hard_link(&from, &to).is_err() {
+        fs::copy(&from, &to)?;
+      }
+      continue;
+    }
+    let tmp = usage_dir.join(format!("{name}.tmp"));
+    fs::write(&tmp, &bytes)?;
+    fs::rename(&tmp, usage_dir.join(&name))?;
+    let prior_pairs_here = u64::from_le_bytes(
+      toc
+        .get(at..at + 8)
+        .ok_or_else(|| io::Error::other("usage delta: TOC too short"))?
+        .try_into()
+        .map_err(|_| io::Error::other("usage delta: TOC"))?,
+    );
+    let prior_total = u64::from_le_bytes(
+      toc[12..20].try_into().map_err(|_| io::Error::other("usage delta: TOC header"))?,
+    );
+    toc[12..20]
+      .copy_from_slice(&(prior_total - prior_pairs_here + rows.len() as u64).to_le_bytes());
+    toc[at..at + 8].copy_from_slice(&(rows.len() as u64).to_le_bytes());
+    toc[at + 8..at + 16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+    toc[at + 16..at + 24].copy_from_slice(&digest.to_le_bytes());
   }
+  let toc_tmp = usage_dir.join("toc.bin.tmp");
+  fs::write(&toc_tmp, &toc)?;
+  fs::rename(&toc_tmp, staging.join(USAGE_TOC))?;
+  Ok(())
 }
 
 pub(crate) fn save(

@@ -812,6 +812,21 @@ pub fn scoped_similar_repair(
     rows.extend(fresh_file_sigs.iter().cloned());
     rows.extend(tail);
   }
+  // EXACT short-circuit: identical input rows are a pure-function guarantee of
+  // identical pairs — the whole banding+verify pass (measured ~370 ms at kernel scale)
+  // vanishes for every edit that changes no signed definition's sketch. Incremental
+  // banding beyond this was examined and REJECTED: the per-node partner caps and the
+  // global candidate ceiling make pair selection a function of the ENTIRE candidate
+  // stream (evicted candidates are not persisted; ceiling truncation is order-
+  // dependent), so any partial recompute is unsound the moment either bound binds —
+  // and at kernel scale the ceiling DOES bind (measured). Recorded in SUBSECOND.md.
+  if rows == *prior_rows {
+    return Ok(SimilarRepair {
+      fresh_pairs: prior_pairs.to_vec(),
+      changed_srcs: Vec::new(),
+      swapped_rows: rows,
+    });
+  }
   let (mut fresh_pairs, _report, swapped_rows) = crate::similar::similar_pairs(rows);
   fresh_pairs.sort_unstable();
 

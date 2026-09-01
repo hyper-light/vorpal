@@ -28,7 +28,7 @@ pub const MAX_PARTNERS: usize = 8;
 const MAX_CANDIDATES: usize = 8_000_000;
 
 /// One signed definition, as replayed from its product.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SigRow {
   pub node: u64,
   pub shingles: u32,
