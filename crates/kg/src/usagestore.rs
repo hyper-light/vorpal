@@ -106,94 +106,149 @@ pub(crate) fn apply_delta(
   }
   let store = UsageStore::open(prior)
     .ok_or_else(|| io::Error::other("usage delta requires a readable prior family"))?;
+  crate::phase_stamp("usage delta: prior store open");
   if store.slabs.len() != buckets as usize {
     return Err(io::Error::other("usage delta: bucket count moved"));
   }
-  let mut touched: Vec<Vec<(u32, u64)>> = vec![Vec::new(); buckets as usize];
-  let mut is_touched = vec![false; buckets as usize];
-  for &(hash, key) in removed.iter().chain(added) {
-    is_touched[(hash & (buckets - 1)) as usize] = true;
-    let _ = key;
+  // Per-bucket partitions, both sorted: slab rows are SAVED sorted by (hash, key), so
+  // the delta is one three-way two-pointer pass — subtract `removed`, union `added` —
+  // with no hash probes and no re-sort. A single edited file's names touch nearly
+  // every bucket (hash & mask spreads them), so the old per-pair `HashSet` probe +
+  // per-bucket sort walked the whole pair family through SipHash — measured 86 ms at
+  // kernel k=1. Buckets are independent; the pass parallelizes.
+  use rayon::prelude::*;
+  let mut removed_by: Vec<Vec<(u32, u64)>> = vec![Vec::new(); buckets as usize];
+  for &(hash, key) in removed {
+    removed_by[(hash & (buckets - 1)) as usize].push((hash, key));
   }
+  for list in &mut removed_by {
+    list.sort_unstable();
+  }
+  // `added` arrives sorted + deduped; partitioning by hash preserves per-bucket order.
+  let mut added_by: Vec<Vec<(u32, u64)>> = vec![Vec::new(); buckets as usize];
   for &(hash, key) in added {
-    touched[(hash & (buckets - 1)) as usize].push((hash, key));
+    added_by[(hash & (buckets - 1)) as usize].push((hash, key));
   }
   let usage_dir = staging.join(USAGE_DIR);
   fs::create_dir_all(&usage_dir)?;
   let mut toc = fs::read(prior.join(USAGE_TOC))
     .map_err(|_| io::Error::other("usage delta: prior TOC unreadable"))?;
-  for bucket in 0..buckets as usize {
-    let name = format!("{bucket:04}.idx");
-    if !is_touched[bucket] {
-      let (from, to) = (prior.join(USAGE_DIR).join(&name), usage_dir.join(&name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
+  let toc_snapshot = toc.clone();
+  let prior_toc_row = |toc_bytes: &[u8], bucket: usize| -> io::Result<(u64, u64, u64)> {
+    let at = TOC_HEADER + bucket * TOC_ROW;
+    let field = |lo: usize| -> io::Result<u64> {
+      Ok(u64::from_le_bytes(
+        toc_bytes
+          .get(at + lo..at + lo + 8)
+          .ok_or_else(|| io::Error::other("usage delta: TOC too short"))?
+          .try_into()
+          .map_err(|_| io::Error::other("usage delta: TOC"))?,
+      ))
+    };
+    Ok((field(0)?, field(8)?, field(16)?))
+  };
+  enum BucketOut {
+    Linked,
+    Wrote { rows: u64, len: u64, digest: u64 },
+  }
+  let outs: io::Result<Vec<BucketOut>> = (0..buckets as usize)
+    .into_par_iter()
+    .map(|bucket| -> io::Result<BucketOut> {
+      let name = format!("{bucket:04}.idx");
+      let link = || -> io::Result<BucketOut> {
+        let (from, to) = (prior.join(USAGE_DIR).join(&name), usage_dir.join(&name));
+        let _ = fs::remove_file(&to);
+        if fs::hard_link(&from, &to).is_err() {
+          fs::copy(&from, &to)?;
+        }
+        Ok(BucketOut::Linked)
+      };
+      let (removed_b, added_b) = (&removed_by[bucket], &added_by[bucket]);
+      if removed_b.is_empty() && added_b.is_empty() {
+        return link();
       }
-      continue;
-    }
-    let mut rows: Vec<(u32, u64)> = Vec::new();
-    if let Some(slab) = &store.slabs[bucket] {
-      for i in 0..slab.pairs {
-        let pair = slab.pair(i);
-        if !removed.contains(&pair) {
+      // EXACT no-op: identical sorted delta sides cancel — (S − R) ∪ R = S whenever
+      // R ⊆ S, and every removed pair IS a prior posting by construction (the family
+      // is exactly the prior evidence's postings; the exact-postings oracle pins it).
+      // An edit re-contributing a file's unchanged names lands here for every bucket
+      // the changed names miss — no slab walk, no hash, no write.
+      if removed_b == added_b {
+        return link();
+      }
+      let mut rows: Vec<(u32, u64)> = Vec::with_capacity(
+        store.slabs[bucket].as_ref().map_or(0, |s| s.pairs) + added_b.len(),
+      );
+      let (mut ri, mut ai) = (0usize, 0usize);
+      if let Some(slab) = &store.slabs[bucket] {
+        for i in 0..slab.pairs {
+          let pair = slab.pair(i);
+          while ri < removed_b.len() && removed_b[ri] < pair {
+            ri += 1;
+          }
+          if ri < removed_b.len() && removed_b[ri] == pair {
+            continue; // subtracted
+          }
+          while ai < added_b.len() && added_b[ai] < pair {
+            rows.push(added_b[ai]);
+            ai += 1;
+          }
+          if ai < added_b.len() && added_b[ai] == pair {
+            ai += 1; // a re-added survivor — union keeps one
+          }
           rows.push(pair);
         }
       }
-    }
-    rows.extend_from_slice(&touched[bucket]);
-    rows.sort_unstable();
-    rows.dedup();
-    let mut bytes = Vec::with_capacity(SLAB_HEADER + rows.len() * ROW);
-    bytes.extend_from_slice(SLAB_MAGIC);
-    bytes.extend_from_slice(&VERSION.to_le_bytes());
-    bytes.extend_from_slice(&(bucket as u32).to_le_bytes());
-    bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
-    for (hash, key) in &rows {
-      bytes.extend_from_slice(&hash.to_le_bytes());
-      bytes.extend_from_slice(&key.to_le_bytes());
-    }
-    let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
-    // Digest-carry parity with the full saver: a net-identical bucket (a pair removed
-    // and re-added) hard-links instead of rewriting, preserving the inode carry laws.
-    let at = TOC_HEADER + bucket * TOC_ROW;
-    let prior_digest = u64::from_le_bytes(
-      toc
-        .get(at + 16..at + 24)
-        .ok_or_else(|| io::Error::other("usage delta: TOC too short"))?
-        .try_into()
-        .map_err(|_| io::Error::other("usage delta: TOC"))?,
-    );
-    let prior_len = u64::from_le_bytes(
-      toc[at + 8..at + 16].try_into().map_err(|_| io::Error::other("usage delta: TOC"))?,
-    );
-    if prior_digest == digest && prior_len == bytes.len() as u64 {
-      let (from, to) = (prior.join(USAGE_DIR).join(&name), usage_dir.join(&name));
-      let _ = fs::remove_file(&to);
-      if fs::hard_link(&from, &to).is_err() {
-        fs::copy(&from, &to)?;
+      rows.extend_from_slice(&added_b[ai..]);
+      let mut bytes = Vec::with_capacity(SLAB_HEADER + rows.len() * ROW);
+      bytes.extend_from_slice(SLAB_MAGIC);
+      bytes.extend_from_slice(&VERSION.to_le_bytes());
+      bytes.extend_from_slice(&(bucket as u32).to_le_bytes());
+      bytes.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+      for (hash, key) in &rows {
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(&key.to_le_bytes());
       }
+      let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
+      // Digest-carry parity with the full saver: a net-identical bucket (a pair removed
+      // and re-added) hard-links instead of rewriting, preserving the inode carry laws.
+      let (_, prior_len, prior_digest) = prior_toc_row(&toc_snapshot, bucket)?;
+      if prior_digest == digest && prior_len == bytes.len() as u64 {
+        return link();
+      }
+      let tmp = usage_dir.join(format!("{name}.tmp"));
+      fs::write(&tmp, &bytes)?;
+      fs::rename(&tmp, usage_dir.join(&name))?;
+      Ok(BucketOut::Wrote {
+        rows: rows.len() as u64,
+        len: bytes.len() as u64,
+        digest,
+      })
+    })
+    .collect();
+  let outs = outs?;
+  if crate::phase_trace_enabled() {
+    let wrote = outs.iter().filter(|o| matches!(o, BucketOut::Wrote { .. })).count();
+    crate::phase_stamp(&format!(
+      "usage delta: par loop done ({} wrote, {} linked)",
+      wrote,
+      outs.len() - wrote
+    ));
+  }
+  let mut total = u64::from_le_bytes(
+    toc[12..20].try_into().map_err(|_| io::Error::other("usage delta: TOC header"))?,
+  );
+  for (bucket, out) in outs.iter().enumerate() {
+    let BucketOut::Wrote { rows, len, digest } = out else {
       continue;
-    }
-    let tmp = usage_dir.join(format!("{name}.tmp"));
-    fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, usage_dir.join(&name))?;
-    let prior_pairs_here = u64::from_le_bytes(
-      toc
-        .get(at..at + 8)
-        .ok_or_else(|| io::Error::other("usage delta: TOC too short"))?
-        .try_into()
-        .map_err(|_| io::Error::other("usage delta: TOC"))?,
-    );
-    let prior_total = u64::from_le_bytes(
-      toc[12..20].try_into().map_err(|_| io::Error::other("usage delta: TOC header"))?,
-    );
-    toc[12..20]
-      .copy_from_slice(&(prior_total - prior_pairs_here + rows.len() as u64).to_le_bytes());
-    toc[at..at + 8].copy_from_slice(&(rows.len() as u64).to_le_bytes());
-    toc[at + 8..at + 16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+    };
+    let (prior_rows_here, _, _) = prior_toc_row(&toc_snapshot, bucket)?;
+    total = total - prior_rows_here + rows;
+    let at = TOC_HEADER + bucket * TOC_ROW;
+    toc[at..at + 8].copy_from_slice(&rows.to_le_bytes());
+    toc[at + 8..at + 16].copy_from_slice(&len.to_le_bytes());
     toc[at + 16..at + 24].copy_from_slice(&digest.to_le_bytes());
   }
+  toc[12..20].copy_from_slice(&total.to_le_bytes());
   let toc_tmp = usage_dir.join("toc.bin.tmp");
   fs::write(&toc_tmp, &toc)?;
   fs::rename(&toc_tmp, staging.join(USAGE_TOC))?;

@@ -1180,6 +1180,36 @@ adds carry), battery 28/28, suite green, clippy 0/0 both lanes. Remaining k=1 sp
 should sub-second demand more: graph cache 118 ms, staging tail 100 ms, usage 90 ms,
 identity 78 ms, names 53 ms, sigs 53 ms.
 
+#### Usage delta rework + THE LINK-FAN-OUT FINDING (2026-09-01)
+
+`usagestore::apply_delta` reworked: per-bucket sorted three-way merge (slab rows are
+saved sorted by (hash, key)) replaces the per-pair `HashSet` probe + per-bucket re-sort
+— no SipHash, no sort; PLUS the EXACT NO-OP law — identical sorted delta sides cancel
+((S − R) ∪ R = S with R ⊆ S by the family's evidence-derivation invariant, which the
+exact-postings oracle pins), so every bucket the changed names miss links with no slab
+walk at all; and the bucket loop parallelized. On the kernel append the census reads
+**0 wrote, 256 linked**. Byte-converged; fixtures/battery/suite green; k=1 settles at
+**1.04–1.10 s**.
+
+But the phase only fell 90→72 ms, and the census exposed why — THE REAL FLOOR:
+**256 pure hard-links cost ~68 ms.** Isolating experiment (this box, APFS): 256
+remove-miss+link into one directory = **69.2 ms serial-equivalent (0.27 ms/entry — the
+directory inode lock serializes even a parallel loop)**; `clonefile()` of the same
+256-entry directory = **1.5 ms** (46×). A compose carries ~1,800 family entries
+(nodes 512 incl. heaps, evidence/edges/usage/sigs/products × 256) ⇒ the link fan-out
+is ~400 ms of the ~1.05 s wall — the dominant remaining fixed cost, spread across
+every phase's tail (it is why "sigs done" costs ~54 ms while writing nothing).
+
+DESIGNED NEXT SLICE (owner tradeoff stated): carry each family directory by APFS
+`clonefile` (one syscall), then rename the rewritten members over their cloned
+entries; per-file `hard_link` stays the portable fallback (ext4 links are ~10–20 µs —
+this is an APFS-specific pain). The trade: COW clones get NEW inodes, so the
+inode-equality oracles (scoped_compose's names.idx pin, defs_changed_compose's
+unaffected-bucket pin, the battery's `[scoped: names.idx linked]` detector) stop
+observing physical carry — they would move to the report-note lane signal plus
+convergence, which is the true gate anyway. Not landed tonight: it touches every
+carry site plus those oracles, and deserves its own gated slice.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,
