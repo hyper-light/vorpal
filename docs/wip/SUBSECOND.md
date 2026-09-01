@@ -1297,6 +1297,17 @@ short-circuit verified firing (zero banding stamps). Live-byte phase profile aft
 the sigs block's +145 MB step is gone; remaining large movers are evidence build
 (+48 MB transient) and names regeneration (+44 MB transient, freed immediately).
 
+RECORDED SWEEP — jemalloc decay-off on this branch state (owner-suggested;
+`_RJEM_MALLOC_CONF=dirty_decay_ms:-1,muzzy_decay_ms:-1`, interleaved ×3, the knob
+verifiably active): kernel scratch reclaims **1.46M → 260k (−82%)** at +23% peak RSS
+(2,540 → 3,130 MB), wall ~−2% (within round drift); compose toggle reclaims
+**125.5k → 84.8k (−32%)** at +12% RSS (1,012 → 1,129 MB), wall −3–5%
+(0.93–0.95 → 0.88–0.94 s). The fault economics are large; the wall win on THIS box is
+modest because macOS soft reclaims are cheap and the allocation pass above already
+removed the worst churn. Batch-run decay-off wiring already exists on the hyperopt
+line (pass 12, "decay-off fault economics for batch runs") — inherit it at merge
+rather than duplicating here; the env knob works today for anyone who wants it.
+
 ## Execution order & gates
 
 Phase 0 chunks land independently, each gated (streamed≡batch, content-id A/B, ann SHA A/B,
