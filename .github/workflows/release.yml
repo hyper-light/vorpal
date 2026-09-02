@@ -87,7 +87,13 @@ jobs:
       - name: Build (alpine container, native musl)
         if: matrix.musl
         run: |
-          docker run --rm -v "$PWD:/w" -w /w rust:1.98-alpine sh -c '
+          # The LINKER env overrides .cargo/config.toml's triple-prefixed musl linker
+          # (aarch64-linux-musl-gcc), which does not exist in alpine — its native cc IS
+          # the musl toolchain. Same override publish-node.yml's musl builds use.
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            rust:1.98-alpine sh -c '
             set -e
             apk add --no-cache build-base
             export RUSTFLAGS="-C target-feature=+crt-static"
@@ -152,6 +158,8 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/w" -w /w \
             -e VORPAL_LOADER_PUBKEY_HEX="${VORPAL_LOADER_PUBKEY_HEX}" \
+            -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
             rust:1.98-alpine sh -c '
               set -e
               apk add --no-cache build-base
