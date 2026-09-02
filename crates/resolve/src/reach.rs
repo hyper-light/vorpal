@@ -287,3 +287,260 @@ mod tests {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Persisted include-edge graph (`reach.bin`) — the merge-era compose contract.
+//
+// Full builds resolve every path-form import into (includer, included) edges
+// and seal this graph beside the generation. Scoped composes cannot afford —
+// and do not need — the full closure rebuild: resolution queries reach ONLY
+// from a reference's own file (`reaches(reference.from_path, …)`), so a
+// compose re-resolving session files needs exactly the forward-reachable
+// subgraph from those files. [`IncludeReach::for_roots`] walks it: session
+// files contribute their FRESH first-hop edges (an import-editing compose is
+// therefore correct with no decline), everything beyond first hop comes from
+// this persisted graph (unchanged by definition — only session files changed).
+//
+// Layout (canonical: paths sorted, per-row targets sorted by target index):
+// `VRCH` + version u32 + path_count u32 + edge_count u64 + path table
+// (u32 len + UTF-8 bytes, sorted ascending) + row_starts ((path_count+1) ×
+// u32) + targets (edge_count × u32 path indices).
+// ---------------------------------------------------------------------------
+
+/// File name of the persisted include-edge graph inside a generation.
+pub const REACH_GRAPH_FILE: &str = "reach.bin";
+const REACH_MAGIC: &[u8; 4] = b"VRCH";
+/// Bumped when the layout or the edge-derivation semantics change.
+pub const REACH_GRAPH_VERSION: u32 = 1;
+
+/// Encode `(includer, included)` path edges canonically. Determinism: the
+/// path table is the sorted, deduped path set; rows sort by (from, to) index.
+pub fn encode_reach_graph(edges: &[(&str, &str)]) -> Vec<u8> {
+  let mut paths: Vec<&str> = edges.iter().flat_map(|&(a, b)| [a, b]).collect();
+  paths.sort_unstable();
+  paths.dedup();
+  let index_of: HashMap<&str, u32> = paths
+    .iter()
+    .enumerate()
+    .map(|(i, &p)| (p, i as u32))
+    .collect();
+  let mut pairs: Vec<(u32, u32)> = edges
+    .iter()
+    .map(|&(a, b)| (index_of[a], index_of[b]))
+    .collect();
+  pairs.sort_unstable();
+  pairs.dedup();
+  let mut out = Vec::new();
+  out.extend_from_slice(REACH_MAGIC);
+  out.extend_from_slice(&REACH_GRAPH_VERSION.to_le_bytes());
+  out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+  out.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+  for path in &paths {
+    out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    out.extend_from_slice(path.as_bytes());
+  }
+  let mut starts: Vec<u32> = Vec::with_capacity(paths.len() + 1);
+  let mut at = 0u32;
+  let mut cursor = 0usize;
+  for row in 0..paths.len() as u32 {
+    starts.push(at);
+    while cursor < pairs.len() && pairs[cursor].0 == row {
+      cursor += 1;
+      at += 1;
+    }
+  }
+  starts.push(at);
+  for start in &starts {
+    out.extend_from_slice(&start.to_le_bytes());
+  }
+  for &(_, to) in &pairs {
+    out.extend_from_slice(&to.to_le_bytes());
+  }
+  out
+}
+
+/// Decoded persisted include-edge graph. Foreign or corrupt bytes decode to
+/// `None` — the caller treats the family as absent (composes decline).
+pub struct ReachGraph {
+  paths: Vec<String>,
+  row_starts: Vec<u32>,
+  targets: Vec<u32>,
+}
+
+impl ReachGraph {
+  pub fn decode(bytes: &[u8]) -> Option<Self> {
+    let header = 4 + 4 + 4 + 8;
+    if bytes.len() < header || &bytes[0..4] != REACH_MAGIC {
+      return None;
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    if version != REACH_GRAPH_VERSION {
+      return None;
+    }
+    let path_count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let edge_count = u64::from_le_bytes(bytes[12..20].try_into().ok()?) as usize;
+    let mut at = header;
+    let mut paths = Vec::with_capacity(path_count);
+    for _ in 0..path_count {
+      let len = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+      at += 4;
+      let path = std::str::from_utf8(bytes.get(at..at + len)?).ok()?;
+      at += len;
+      paths.push(path.to_string());
+    }
+    let mut row_starts = Vec::with_capacity(path_count + 1);
+    for _ in 0..=path_count {
+      row_starts.push(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+      at += 4;
+    }
+    let mut targets = Vec::with_capacity(edge_count);
+    for _ in 0..edge_count {
+      targets.push(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+      at += 4;
+    }
+    (at == bytes.len()).then_some(Self {
+      paths,
+      row_starts,
+      targets,
+    })
+  }
+
+  fn row_of(&self, path: &str) -> Option<usize> {
+    self.paths.binary_search_by(|p| p.as_str().cmp(path)).ok()
+  }
+
+  fn out_of(&self, row: usize) -> &[u32] {
+    let start = self.row_starts[row] as usize;
+    let end = self.row_starts[row + 1] as usize;
+    &self.targets[start..end]
+  }
+}
+
+impl<'i> IncludeReach<'i> {
+  /// The compose-side reach: forward-reachable subgraph from `roots`, with the
+  /// session files' FRESH first-hop edges (`fresh`, replacing whatever the
+  /// persisted graph holds for them) and the persisted graph beyond. The
+  /// closure over the traversed edge set answers `reaches(root, …)` exactly
+  /// as the full build's closure does — the same `from_edges` oracle over the
+  /// same reachable edges.
+  pub fn for_roots(
+    interner: &'i crate::Interner,
+    graph: &ReachGraph,
+    fresh: &[(NameId<'i>, NameId<'i>)],
+    roots: &[NameId<'i>],
+  ) -> IncludeReach<'i> {
+    use std::collections::HashSet;
+    // Every root is session-fresh: its first hop comes ONLY from `fresh`
+    // (covering import deletions — a root with no fresh rows has no edges).
+    let session: HashSet<NameId<'i>> = roots.iter().copied().collect();
+    let mut edges: Vec<(NameId<'i>, NameId<'i>)> = Vec::new();
+    let mut visited: HashSet<NameId<'i>> = HashSet::new();
+    let mut queue: Vec<NameId<'i>> = Vec::new();
+    for &root in roots {
+      if visited.insert(root) {
+        queue.push(root);
+      }
+    }
+    while let Some(file) = queue.pop() {
+      if session.contains(&file) {
+        for &(from, to) in fresh.iter().filter(|&&(from, _)| from == file) {
+          edges.push((from, to));
+          if visited.insert(to) {
+            queue.push(to);
+          }
+        }
+        continue;
+      }
+      let Some(row) = graph.row_of(interner.text_of(file)) else {
+        continue;
+      };
+      for &target in graph.out_of(row) {
+        let to = interner.intern(&graph.paths[target as usize]);
+        edges.push((file, to));
+        if visited.insert(to) {
+          queue.push(to);
+        }
+      }
+    }
+    IncludeReach::from_edges(&edges)
+  }
+}
+
+/// Whether every root's FRESH out-edge target set equals the persisted graph's
+/// row for it — the compose guard: composes hard-link `reach.bin`, so a session
+/// whose imports changed must decline rather than resolve against a stale graph.
+/// (Stored rows are target-index-ascending and the path table is sorted, so
+/// index order IS lexicographic path order; the fresh side sorts to match.)
+pub fn reach_rows_match<'i>(
+  interner: &'i crate::Interner,
+  graph: &ReachGraph,
+  roots: &[NameId<'i>],
+  fresh: &[(NameId<'i>, NameId<'i>)],
+) -> bool {
+  for &root in roots {
+    let mut fresh_targets: Vec<&str> = fresh
+      .iter()
+      .filter(|&&(from, _)| from == root)
+      .map(|&(_, to)| interner.text_of(to))
+      .collect();
+    fresh_targets.sort_unstable();
+    fresh_targets.dedup();
+    let stored: Vec<&str> = match graph.row_of(interner.text_of(root)) {
+      Some(row) => graph
+        .out_of(row)
+        .iter()
+        .map(|&t| graph.paths[t as usize].as_str())
+        .collect(),
+      None => Vec::new(),
+    };
+    if fresh_targets != stored {
+      return false;
+    }
+  }
+  true
+}
+
+#[cfg(test)]
+mod graph_tests {
+  use super::*;
+  use crate::Interner;
+
+  /// for_roots must answer `reaches(root, x)` exactly as the full closure —
+  /// every root, every target, cycles included.
+  #[test]
+  fn for_roots_matches_full_closure() {
+    let interner = Interner::new();
+    let names: Vec<&str> = vec!["a", "b", "c", "d", "e", "f", "g"];
+    let id = |s: &str| interner.intern(s);
+    // Includes with a cycle (b<->c), a diamond, and an island (g).
+    let edge_strs = [
+      ("a", "b"),
+      ("b", "c"),
+      ("c", "b"),
+      ("b", "d"),
+      ("a", "e"),
+      ("e", "d"),
+      ("f", "a"),
+    ];
+    let edges: Vec<(NameId, NameId)> =
+      edge_strs.iter().map(|&(x, y)| (id(x), id(y))).collect();
+    let full = IncludeReach::from_edges(&edges);
+    let encoded = encode_reach_graph(&edge_strs);
+    let graph = ReachGraph::decode(&encoded).expect("round-trips");
+    for root_name in &names {
+      let root = id(root_name);
+      // Fresh first hop == the graph's row (the unchanged-imports compose case).
+      let fresh: Vec<(NameId, NameId)> =
+        edges.iter().copied().filter(|&(from, _)| from == root).collect();
+      let scoped = IncludeReach::for_roots(&interner, &graph, &fresh, &[root]);
+      for target_name in &names {
+        let target = id(target_name);
+        assert_eq!(
+          full.reaches(root, target),
+          scoped.reaches(root, target),
+          "root {root_name} target {target_name}"
+        );
+      }
+    }
+  }
+}

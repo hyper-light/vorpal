@@ -339,6 +339,10 @@ pub struct SerializableRefSpec {
   pub routes: Vec<SerializableRouteSpec>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub requests: Vec<SerializableRequestSpec>,
+  /// Body-less type WRAPPER kinds (`struct_specifier` in C's `struct X y;`): the wrapper's
+  /// `name` field is the type in use, not a definition name.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub type_ref_wrappers: Vec<String>,
 }
 
 impl SerializableRefSpec {
@@ -422,6 +426,7 @@ impl SerializableRefSpec {
         .map(|rule| (rule.callee.clone(), rule.action.into()))
         .collect(),
       types: self.types.clone(),
+      type_ref_wrappers: self.type_ref_wrappers.clone(),
       implements,
       type_params: self.type_params.clone(),
       type_placeholders: self.type_placeholders.clone(),
@@ -464,6 +469,7 @@ impl SerializableRefSpec {
         .map(|rule| (rule.callee.clone(), rule.action.into()))
         .collect(),
       types: self.types.clone(),
+      type_ref_wrappers: self.type_ref_wrappers.clone(),
       implements: self
         .implements
         .iter()
@@ -523,6 +529,7 @@ impl SerializableRefSpec {
         })
         .collect(),
       types: data.types.clone(),
+      type_ref_wrappers: data.type_ref_wrappers.clone(),
       implements: data
         .implements
         .iter()

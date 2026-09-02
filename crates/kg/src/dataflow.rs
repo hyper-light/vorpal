@@ -51,6 +51,52 @@ impl DataflowRow {
   }
 }
 
+/// Load every row of `dir/dataflow.bin` (the respan compose's read side). `None` for an
+/// absent or foreign file — degraded, never an error.
+pub fn load_dataflow(dir: &Path) -> Option<Vec<DataflowRow>> {
+  let bytes = std::fs::read(dir.join("dataflow.bin")).ok()?;
+  if bytes.len() < 16 || &bytes[0..4] != MAGIC {
+    return None;
+  }
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != VERSION {
+    return None;
+  }
+  let count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+  let pool_len = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+  let rows_at = 16usize;
+  let pool_at = rows_at + count * ROW;
+  if bytes.len() != pool_at + pool_len {
+    return None;
+  }
+  let pool = &bytes[pool_at..];
+  let mut rows = Vec::with_capacity(count);
+  for i in 0..count {
+    let at = rows_at + i * ROW;
+    let b = &bytes[at..at + ROW];
+    let expr_off = u32::from_le_bytes(b[22..26].try_into().ok()?);
+    let expr_len = u16::from_le_bytes(b[26..28].try_into().ok()?) as usize;
+    let expr = if expr_off == NO_EXPR {
+      None
+    } else {
+      let start = expr_off as usize;
+      Some(std::str::from_utf8(pool.get(start..start + expr_len)?).ok()?.to_string())
+    };
+    rows.push(DataflowRow {
+      from: u32::from_le_bytes(b[0..4].try_into().ok()?),
+      to: u32::from_le_bytes(b[4..8].try_into().ok()?),
+      span: (
+        u32::from_le_bytes(b[8..12].try_into().ok()?),
+        u32::from_le_bytes(b[12..16].try_into().ok()?),
+      ),
+      arg_index: u16::from_le_bytes(b[16..18].try_into().ok()?),
+      param_index: u16::from_le_bytes(b[18..20].try_into().ok()?),
+      class: b[20],
+      expr,
+    });
+  }
+  Some(rows)
+}
+
 /// Persist rows to `dir/dataflow.bin`. Deterministic: total-order sort, first-occurrence
 /// pool interning over the sorted sequence.
 pub fn save_dataflow(dir: &Path, mut rows: Vec<DataflowRow>) -> io::Result<()> {

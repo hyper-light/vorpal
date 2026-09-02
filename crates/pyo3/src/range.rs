@@ -5,7 +5,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use vorpal_core::{Doc, Node, Position};
 
-#[pyclass(frozen, get_all)]
+#[pyclass(frozen, get_all, from_py_object)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Pos {
   /// line number starting from 0
@@ -58,7 +58,7 @@ fn to_pos<D: Doc>(node: &Node<D>, pos: Position, offset: usize) -> Pos {
   }
 }
 
-#[pyclass(frozen, get_all)]
+#[pyclass(frozen, get_all, from_py_object)]
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Range {
   /// starting position of the range

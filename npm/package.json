@@ -1,6 +1,6 @@
 {
   "name": "@hyper-light/vorpal-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publishConfig": {
     "access": "public"
   },
@@ -19,7 +19,6 @@
     "rewrite"
   ],
   "files": [
-    "vp",
     "vorpal",
     "postinstall.js"
   ],
@@ -30,17 +29,16 @@
     "postinstall": "node postinstall.js"
   },
   "optionalDependencies": {
-    "@hyper-light/vorpal-cli-win32-arm64-msvc": "0.2.0",
-    "@hyper-light/vorpal-cli-win32-ia32-msvc": "0.2.0",
-    "@hyper-light/vorpal-cli-win32-x64-msvc": "0.2.0",
-    "@hyper-light/vorpal-cli-darwin-arm64": "0.2.0",
-    "@hyper-light/vorpal-cli-linux-arm64-gnu": "0.2.0",
-    "@hyper-light/vorpal-cli-linux-x64-gnu": "0.2.0",
-    "@hyper-light/vorpal-cli-linux-arm64-musl": "0.2.0",
-    "@hyper-light/vorpal-cli-linux-x64-musl": "0.2.0"
+    "@hyper-light/vorpal-cli-win32-arm64-msvc": "0.3.0",
+    "@hyper-light/vorpal-cli-win32-ia32-msvc": "0.3.0",
+    "@hyper-light/vorpal-cli-win32-x64-msvc": "0.3.0",
+    "@hyper-light/vorpal-cli-darwin-arm64": "0.3.0",
+    "@hyper-light/vorpal-cli-linux-arm64-gnu": "0.3.0",
+    "@hyper-light/vorpal-cli-linux-x64-gnu": "0.3.0",
+    "@hyper-light/vorpal-cli-linux-arm64-musl": "0.3.0",
+    "@hyper-light/vorpal-cli-linux-x64-musl": "0.3.0"
   },
   "bin": {
-    "vp": "vp",
     "vorpal": "vorpal"
   }
 }

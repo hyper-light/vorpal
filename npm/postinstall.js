@@ -2,7 +2,6 @@ const fs = require("fs");
 const path = require("path");
 
 const binaryName = process.platform === "win32" ? "vorpal.exe" : "vorpal";
-const alternativeName = process.platform === "win32" ? "vp.exe" : "vp";
 
 function detectPackageName() {
   const { platform, arch } = process;
@@ -60,15 +59,12 @@ function main() {
 
   const src = path.join(sourceDir, binaryName);
   const destBin = path.join(__dirname, binaryName);
-  const destAlt = path.join(__dirname, alternativeName);
 
   try {
     fs.linkSync(src, destBin);
-    fs.linkSync(src, destAlt);
   } catch (_) {
     try {
       fs.copyFileSync(src, destBin);
-      fs.copyFileSync(src, destAlt);
     } catch (err) {
       console.error("Failed to move @hyper-light/vorpal-cli binary into place.");
       process.exit(1);
@@ -81,7 +77,6 @@ function main() {
 
 module.exports = {
   binaryName,
-  alternativeName,
   detectPackageName,
   resolveBinaryDir,
   resolveBinaryPath,

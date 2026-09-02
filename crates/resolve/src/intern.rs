@@ -21,8 +21,7 @@
 //! drops. [`Interner::retained_bytes`] / [`Interner::retained_strings`] remain as per-session
 //! telemetry.
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::BuildHasher;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::sync::RwLock;
@@ -61,6 +60,14 @@ impl<'i> NameId<'i> {
   fn raw(self) -> u32 {
     self.0.get() - 1
   }
+
+  /// `(shard, per-shard dense index)` — the id's structural decomposition. The per-shard
+  /// index is assigned by insertion order, which is what makes a direct-indexed table over
+  /// ids sound (see `SymbolTable`'s dense ranges). Process-private, like the id itself.
+  pub(crate) fn shard_slot(self) -> (usize, usize) {
+    let raw = self.raw();
+    ((raw >> INDEX_BITS) as usize, (raw & INDEX_MASK) as usize)
+  }
 }
 
 /// Shard read-lock acquisition with contention accounting (ledger builds): a
@@ -84,21 +91,33 @@ fn read_shard(lock: &RwLock<Shard>) -> std::sync::RwLockReadGuard<'_, Shard> {
 }
 
 const SHARD_BITS: u32 = 6;
-const SHARDS: usize = 1 << SHARD_BITS;
+pub(crate) const SHARDS: usize = 1 << SHARD_BITS;
 const INDEX_BITS: u32 = 32 - SHARD_BITS;
 const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
 
 #[derive(Default)]
 struct Shard {
+  /// Dedup lookup only — a raw `HashTable` probed with the caller-supplied hash, so each
+  /// intern hashes its string exactly ONCE (the same fixed-seed hash picks the shard and
+  /// probes the table; the previous form hashed once for the shard and again inside the
+  /// map). Entries pair the per-shard index with the key for the probe's equality check.
   /// Keys borrow the arena boxes below; `'static` is an internal shorthand for "as long as
   /// the arena entry", which [`Interner`]'s ownership guarantees for every handed-out
-  /// borrow (all public borrows are bounded by the interner's own lifetime).
-  by_text: HashMap<&'static str, u32>,
+  /// borrow. The id is (shard, insertion-index) — never this table's layout — so the hash
+  /// function cannot affect any output byte (pinned by the content-id A/B gate).
+  by_text: hashbrown::HashTable<(u32, &'static str)>,
   by_index: Vec<&'static str>,
   /// Owns every string the two maps borrow. `Box<str>` contents are heap-stable, so the
   /// vector may grow freely while borrows into the boxes circulate; everything drops
   /// together with the [`Interner`].
   arena: Vec<Box<str>>,
+}
+
+/// The single fixed-seed hash every interner call performs — deterministic across runs and
+/// platforms by construction (foldhash's fixed state), shared by shard selection and probe.
+#[inline]
+fn hash_of(text: &str) -> u64 {
+  foldhash::fast::FixedState::default().hash_one(text)
 }
 
 /// One build session's string table. Create per session, share by reference (`Sync`), drop
@@ -114,21 +133,18 @@ struct Shard {
 /// };
 /// ```
 pub struct Interner {
-  shards: [RwLock<Shard>; SHARDS],
+  /// Cache-line padded so one shard's lock RMW never invalidates a neighbor shard's line
+  /// (unpadded, the 112-byte shards packed ~1.14 per 128-byte Apple-Silicon line;
+  /// `CachePadded` picks the right alignment per architecture).
+  shards: [crossbeam_utils::CachePadded<RwLock<Shard>>; SHARDS],
 }
 
 impl Default for Interner {
   fn default() -> Self {
     Self {
-      shards: std::array::from_fn(|_| RwLock::new(Shard::default())),
+      shards: std::array::from_fn(|_| crossbeam_utils::CachePadded::new(RwLock::new(Shard::default()))),
     }
   }
-}
-
-fn shard_of(text: &str) -> usize {
-  let mut hasher = std::collections::hash_map::DefaultHasher::new();
-  text.hash(&mut hasher);
-  (hasher.finish() as usize) & (SHARDS - 1)
 }
 
 impl Interner {
@@ -139,15 +155,16 @@ impl Interner {
   /// Intern `text`, returning its stable id (allocating into the shard arena on first
   /// sight).
   pub fn intern<'i>(&'i self, text: &str) -> NameId<'i> {
-    let shard_index = shard_of(text);
+    let hash = hash_of(text);
+    let shard_index = (hash as usize) & (SHARDS - 1);
     let lock = &self.shards[shard_index];
-    if let Some(&index) = read_shard(lock).by_text.get(text) {
+    if let Some(&(index, _)) = read_shard(lock).by_text.find(hash, |&(_, key)| key == text) {
       return NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index);
     }
     #[cfg(feature = "alloc-ledger")]
     vorpal_kg::ledger::INTERN_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut shard = lock.write().unwrap();
-    if let Some(&index) = shard.by_text.get(text) {
+    if let Some(&(index, _)) = shard.by_text.find(hash, |&(_, key)| key == text) {
       return NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index);
     }
     let boxed: Box<str> = text.to_string().into_boxed_str();
@@ -155,22 +172,26 @@ impl Interner {
     // long as the arena entry — which lives exactly as long as `self`, the bound every
     // public borrow carries.
     let interned: &'static str = unsafe { &*(boxed.as_ref() as *const str) };
+    let shard = &mut *shard;
     shard.arena.push(boxed);
     let index = shard.by_index.len() as u32;
     assert!(index < INDEX_MASK, "interner shard overflow");
     shard.by_index.push(interned);
-    shard.by_text.insert(interned, index);
+    shard
+      .by_text
+      .insert_unique(hash, (index, interned), |&(_, key)| hash_of(key));
     NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index)
   }
 
   /// The id of `text` iff it was ever interned — for speculative probes (path-form import
   /// joins) that must not grow the table with strings nothing will ever look up again.
   pub fn peek<'i>(&'i self, text: &str) -> Option<NameId<'i>> {
-    let shard_index = shard_of(text);
+    let hash = hash_of(text);
+    let shard_index = (hash as usize) & (SHARDS - 1);
     read_shard(&self.shards[shard_index])
       .by_text
-      .get(text)
-      .map(|&index| NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index))
+      .find(hash, |&(_, key)| key == text)
+      .map(|&(index, _)| NameId::from_raw(((shard_index as u32) << INDEX_BITS) | index))
   }
 
   /// The interned text of `id`, borrowed for as long as the session lives.

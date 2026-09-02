@@ -1,6 +1,7 @@
 //! MCP protocol handling + the warm-index tool implementations.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -94,12 +95,147 @@ pub struct Server {
   /// Crash isolation for builds (D3): rebuilds run in a child indexer process when one can be
   /// discovered, so a pathological input costs one build attempt, never the daemon.
   supervisor: Supervisor,
-  kg: Option<Kg>,
+  /// `Arc` because the live-rebuild path serves the sealed graph from RAM while the deferred
+  /// persistence tail still holds a reference on its background thread.
+  kg: Option<Arc<Kg>>,
   /// The resolved generation directory the cached graph was loaded from — the artifacts a
   /// `why` snippet is digest-verified against, so a concurrent `CURRENT` swap can never split
   /// an answer from the pinned graph that produced its ids.
   kg_dir: Option<PathBuf>,
   watch: Option<SourceWatch>,
+  /// Hinted-rebuild counter — every 64th watched revalidation full-scans as reconciliation
+  /// insurance, even when capture certainty held.
+  hinted_rebuilds: u64,
+  /// The in-flight restamp-class background canonicalization, if any (serve-immediately
+  /// probe). The synchronous rebuild path drains this first so an older stamp-only commit
+  /// can never land after — and regress — a newer semantic one.
+  canonicalizing: Option<std::thread::JoinHandle<bool>>,
+  /// The in-flight PROACTIVE full rebuild (`tick`'s heavy tier): a supervised child indexer
+  /// — or an in-process background thread when none is discoverable — committing a
+  /// generation while the daemon keeps serving. One more drain-ordered committer: every
+  /// other commit path reaps or drains it first, so commits can never invert.
+  rebuilding: Option<std::thread::JoinHandle<bool>>,
+  /// Watch-quiet debounce for `tick`: set when the watch first reports dirt, cleared when
+  /// the proactive build starts — an editor's save burst builds once, after it settles.
+  dirty_since: Option<std::time::Instant>,
+  /// Whether `tick` may START builds (the D1 toggle, re-homed): `--no-watch-rebuild` /
+  /// `VORPAL_WATCH_REBUILD=0` turn proactive building off; query-path freshness is lazy
+  /// and unaffected.
+  proactive: bool,
+  /// The in-flight background ANN warm, if any. Warms are **single-flight and coalescing**:
+  /// a rebuild that lands while one is running sets `warm_pending` instead of stacking a
+  /// second core-saturating build, and the trailing warm re-resolves `CURRENT` when it
+  /// finally spawns — so an edit burst costs at most one wasted warm, and the newest
+  /// generation always ends up warm.
+  warm: Option<std::thread::JoinHandle<()>>,
+  warm_pending: bool,
+  /// The in-flight deferred persistence of a live-adopted build (SUBSECOND.md live rebuild
+  /// v1): the daemon is already serving the sealed graph; this handle is writing its
+  /// generation. `kg_dir` stays `None` until it lands — generation-bound tools drain it
+  /// first (see `run_tool`), and the synchronous rebuild path drains it so two committers
+  /// never race.
+  persisting: Option<std::thread::JoinHandle<Result<PathBuf, String>>>,
+  /// The retained live overlay (SUBSECOND.md Phase 3): in-memory pipeline state that turns
+  /// a small semantic edit into a sealed scratch-identical graph without replaying the
+  /// corpus. Built in the background after a successful rebuild; any change it cannot
+  /// absorb exactly drops it (rebuilt later) — stale overlays never serve.
+  overlay: Option<vorpal_index::live::LiveOverlay>,
+  overlay_building: Option<std::thread::JoinHandle<Result<vorpal_index::live::LiveOverlay, String>>>,
+  /// The live vector tier (ANN_FRONTIER.md Tier 3): per-edit tombstone+insert instead of
+  /// the full per-generation warm. `live_ann_task` covers both adoption (from a fresh
+  /// committed tier) and per-edit updates — the tier travels INTO the task and back, so
+  /// the serve path never blocks on O(n) id refreshes.
+  live_ann: Option<vorpal_index::live_ann::LiveAnnTier>,
+  live_ann_task: Option<
+    std::thread::JoinHandle<
+      Result<vorpal_index::live_ann::LiveAnnTier, vorpal_index::live_ann::AdoptDecline>,
+    >,
+  >,
+  /// Edit churn that arrived while a tier task was in flight — applied at reap.
+  pending_churn: Vec<(Vec<u64>, Vec<u64>)>,
+  /// Adoption latch: the generation adoption last declined against, how many attempts
+  /// it has consumed there, and whether a completed warm re-armed one retry. Bounds
+  /// EVERY decline class — known or future — to at most
+  /// [`LIVE_ANN_ATTEMPTS_PER_GENERATION`] attempts per generation: a curable decline
+  /// gets exactly one warm-mediated retry; an incurable one (flat tier for this corpus
+  /// size) consumes the whole budget at once. The next commit changes the generation
+  /// and naturally re-opens the question.
+  live_ann_latch: Option<LiveAnnLatch>,
+  /// Liveness backstop clocks (see `refresh`): when the last manifest stat sweep ran and
+  /// what it cost. `None` cost = never measured; the first eligible quiet query measures.
+  last_sweep_at: Option<std::time::Instant>,
+  last_sweep_cost: Option<std::time::Duration>,
+  /// Set when the served graph advances past an in-flight live-ANN task: the reap
+  /// drops that task's result instead of installing a tier keyed to a retired graph.
+  live_ann_discard_task: bool,
+}
+
+/// The live overlay is on by default; `VORPAL_NO_LIVE_OVERLAY=1` (or `true`/`yes`) keeps the
+/// daemon on the replay pipeline for every semantic edit — the escape hatch while the
+/// overlay earns trust, and the knob for memory-constrained hosts (the overlay retains the
+/// pre-link pipeline state in RAM).
+/// Retained persistence (a served build commits its own generation — no replay pipeline in
+/// the background) is on by default; `VORPAL_NO_RETAINED_PERSIST=1` restores the full
+/// hinted canonicalizer build behind every overlay serve.
+fn retained_persist_enabled() -> bool {
+  !matches!(
+    std::env::var("VORPAL_NO_RETAINED_PERSIST").ok().as_deref(),
+    Some("1" | "true" | "yes")
+  )
+}
+
+fn overlay_enabled() -> bool {
+  !matches!(
+    std::env::var("VORPAL_NO_LIVE_OVERLAY").ok().as_deref(),
+    Some("1" | "true" | "yes")
+  )
+}
+
+/// Eager ANN warming is on by default; `VORPAL_NO_AUTOWARM=1` (or `true`/`yes`) switches the
+/// daemon to fully lazy vector-tier builds — the first semantic search pays instead. For
+/// benchmarking, constrained machines, and operators who never use semantic search.
+/// Adoption attempts a single generation may consume: the artifacts have exactly two
+/// observable states per generation — as committed, and as rewritten by the one classic
+/// warm a failed adopt requests — so two judgments exhaust the information available.
+/// A structural count, not a tuning value; anything still declining past it is
+/// generation-inherent and waits for the next commit.
+const LIVE_ANN_ATTEMPTS_PER_GENERATION: u8 = 2;
+
+/// See `Server::live_ann_latch`.
+struct LiveAnnLatch {
+  generation: PathBuf,
+  attempts: u8,
+  /// A warm landed since the last attempt — the one signal that may justify a retry
+  /// (the warm rewrote the artifacts the last judgment saw). Consumed by the retry.
+  rearmed: bool,
+}
+
+/// Wall-time share the liveness-backstop sweep may consume on the quiet query path
+/// (`refresh`): the sweep re-runs only after 100× its own measured duration has elapsed,
+/// i.e. a stated <=1% overhead budget. The PERIOD is therefore data-derived per corpus —
+/// microseconds-scale trees re-check within milliseconds, kernel-scale trees every few
+/// seconds — and the constant is the policy share, not a tuned interval.
+const BACKSTOP_OVERHEAD_INVERSE: u32 = 100;
+
+fn autowarm_enabled() -> bool {
+  !matches!(
+    std::env::var("VORPAL_NO_AUTOWARM").ok().as_deref(),
+    Some("1" | "true" | "yes")
+  )
+}
+
+/// A clean shutdown lets in-flight committers finish their (short) tails rather than
+/// abandoning staged generations to GC. The ANN warm is deliberately NOT joined: it can run
+/// for seconds and is stamp-validated + lazily rebuilt, so losing it costs nothing.
+impl Drop for Server {
+  fn drop(&mut self) {
+    if let Some(handle) = self.canonicalizing.take() {
+      let _ = handle.join();
+    }
+    if let Some(handle) = self.persisting.take() {
+      let _ = handle.join();
+    }
+  }
 }
 
 impl Server {
@@ -124,89 +260,927 @@ impl Server {
   ) -> Self {
     let watch = watch_root(&index_dir).and_then(|src| SourceWatch::start(&src));
     // Boot-time warm: if the persisted index exists with a stale (or absent) vector tier,
-    // start building it now instead of on the first semantic search.
-    if index_dir.join("nodes.vseg").exists() {
+    // start building it now instead of on the first semantic search. The generation must be
+    // resolved first — artifacts live in `gen/<id>/`, never at the index root. When the
+    // persisted tier looks RECONCILABLE (identity sidecar present, built by the active
+    // model), the rebuild yields to live-tier adoption on the first refresh — ~200 ms of
+    // reconciliation instead of a full build; if adoption declines after all (torn pair,
+    // churn past the overlay ceiling), its reap requests this very warm.
+    let generation = vorpal_kg::resolve_index_dir(&index_dir);
+    let tier_reconcilable = generation.join("ann.files").exists()
+      && vorpal_index::persisted_model_provenance(&generation).as_ref()
+        == Some(&vorpal_index::model_provenance());
+    let mut warm = None;
+    if autowarm_enabled() && generation.join("nodes.vseg").exists() && !tier_reconcilable {
       let warm_dir = index_dir.clone();
-      std::thread::spawn(move || {
+      warm = Some(std::thread::spawn(move || {
         let _ = vorpal_index::warm_ann(&warm_dir);
-      });
+      }));
     }
     let supervisor = Supervisor::discover();
-    // Proactive rebuild worker (D1): its OWN watch on the same tree, debounced, building
-    // through the supervisor so a crash costs an error line on stderr, never the daemon.
-    // It never touches server state — the serving thread's `ensure_fresh` observes the
-    // committed CURRENT via its own dirty flag and pays only a fast-path check + mmap
-    // reload, so the first query after a save is already warm.
-    if watch_rebuild
-      && !std::env::var("VORPAL_WATCH_REBUILD").is_ok_and(|v| v == "0")
-      && watch.is_some()
-    {
-      if let Some(src) = watch.as_ref().map(|w| w.src().to_path_buf()) {
-        spawn_rebuild_worker(src, index_dir.clone(), supervisor.clone(), env.clone());
-      }
-    }
-    Self {
+    // Proactive freshness (D1) is a serve-loop concern now: the protocol loop calls
+    // [`Server::tick`] between requests, which drives the SAME retained freshness path
+    // queries use. The original stateless worker thread was a second committer — its
+    // child-process builds could land between this daemon's own drain-ordered commits
+    // and regress `CURRENT` — so the worker's debounce and supervised build live inside
+    // `tick`/`refresh` instead, where commit ordering is provable.
+    let proactive =
+      watch_rebuild && !std::env::var("VORPAL_WATCH_REBUILD").is_ok_and(|v| v == "0");
+    let mut server = Self {
       index_dir,
       profile,
       env,
       supervisor,
       kg: None,
       kg_dir: None,
+      hinted_rebuilds: 0,
+      canonicalizing: None,
+      rebuilding: None,
+      dirty_since: None,
+      proactive,
+      warm,
+      warm_pending: false,
+      persisting: None,
+      overlay: None,
+      overlay_building: None,
+      live_ann: None,
+      live_ann_task: None,
+      pending_churn: Vec::new(),
+      live_ann_latch: None,
+      last_sweep_at: None,
+      last_sweep_cost: None,
+      live_ann_discard_task: false,
       watch,
+    };
+    // The overlay is the serving architecture, not an optimization to warm lazily: start
+    // building it the moment the daemon exists (its own gates decline when there is no
+    // generation yet, a committer is mid-write, or the environment is custom).
+    server.spawn_overlay_build();
+    server
+  }
+
+  /// Retire the live tier because the served graph advanced WITHOUT an eid-churn ledger
+  /// (replay-pipeline commits): its id translations and edited-symbol vectors are stale
+  /// against the new graph, and no later signal would ever resync them. An in-flight
+  /// live-ANN task computed against the old graph, so its result is discarded on reap;
+  /// queued churn is superseded by the fresh adoption's reconciliation.
+  fn retire_live_ann_for_resync(&mut self) {
+    if self.live_ann.is_none() && self.live_ann_task.is_none() {
+      return;
+    }
+    vorpal_kg::phase_stamp("live-ann: retiring tier (graph advanced without churn ledger)");
+    self.live_ann = None;
+    self.pending_churn.clear();
+    if self.live_ann_task.is_some() {
+      self.live_ann_discard_task = true;
     }
   }
 
-  /// Bring the in-memory graph up to date with the watched source tree. With a clean watch
-  /// this is a single atomic load; with a dirty one it runs the incremental `build_index`
-  /// (stat manifest + product replay — only changed files parse) and reloads. Any failure
-  /// re-arms the dirty flag so the next query retries rather than serving stale data as fresh.
-  fn ensure_fresh(&mut self) -> Result<(), String> {
-    let Some(watch) = &self.watch else {
-      return Ok(());
-    };
-    if self.kg.is_some() && !watch.take_dirty() {
-      return Ok(());
+  /// Reap a finished live-ANN task (adopt or update); queued churn drains through a fresh
+  /// update task so the serve path stays free of O(n) work.
+  fn reap_live_ann(&mut self) {
+    if !self.live_ann_task.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
     }
-    // Crash-isolated when possible (D3): the child process pays for any pathological input;
-    // in-process only when no indexer binary exists (library embedders, test harnesses).
-    let built = match self.supervisor.build(watch.src(), &self.index_dir) {
-      Ok(BuildOutcome::Supervised(_)) => Ok(()),
-      Ok(BuildOutcome::Unavailable) => {
-        let _guard = in_process_build_guard();
-        build_index_env(
-          watch.src(),
-          &self.index_dir,
-          CacheMode::default(),
-          ParseHealthPolicy::default(),
-          &self.env,
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    if let Some(handle) = self.live_ann_task.take() {
+      // A panicked task is a curable decline: nothing about the generation was judged.
+      let joined = handle
+        .join()
+        .unwrap_or(Err(vorpal_index::live_ann::AdoptDecline { curable: true }));
+      if std::mem::take(&mut self.live_ann_discard_task) {
+        // The graph this task computed against is no longer the served one — drop the
+        // result; the commit that retired the tier already queued a fresh adoption.
+        vorpal_kg::phase_stamp("live-ann: discarded stale task result");
+        return;
       }
-      Err(err) => Err(err),
-    };
-    let rebuilt = built.and_then(|()| {
-      let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
-      Kg::load(&dir)
-        .map(|kg| (kg, dir))
-        .map_err(|err| err.to_string())
-    });
-    match rebuilt {
-      Ok((kg, dir)) => {
-        self.kg = Some(kg);
-        self.kg_dir = Some(dir);
-        // Warm the vector tier in the background so the *next* semantic search never pays
-        // the build. Best-effort: a failure just means the search that needs it builds it
-        // (and reports its own error); the in-process build lock prevents duplicate work
-        // if a search arrives mid-warm.
-        let index_dir = self.index_dir.clone();
-        std::thread::spawn(move || {
-          let _ = vorpal_index::warm_ann(&index_dir);
+      match joined {
+        Ok(tier) => {
+          vorpal_kg::phase_stamp("live-ann: tier ready");
+          self.live_ann = Some(tier);
+          self.live_ann_latch = None;
+        }
+        Err(decline) => {
+          let generation = vorpal_kg::resolve_index_dir(&self.index_dir);
+          let attempts = match &self.live_ann_latch {
+            Some(latch) if latch.generation == generation => latch.attempts,
+            _ => 0,
+          };
+          let attempts = if decline.curable {
+            attempts.saturating_add(1)
+          } else {
+            // Generation-inherent: no warm can change the verdict — spend the budget.
+            LIVE_ANN_ATTEMPTS_PER_GENERATION
+          };
+          vorpal_kg::phase_stamp(&format!(
+            "live-ann: declined for this generation ({}, attempt {attempts}/{LIVE_ANN_ATTEMPTS_PER_GENERATION})",
+            if decline.curable { "curable" } else { "incurable" },
+          ));
+          self.live_ann_latch = Some(LiveAnnLatch { generation, attempts, rearmed: false });
+          // The tier is absent and its presence was suppressing warms: hand the
+          // generation to the classic warm (stamp-guarded — a fresh sidecar no-ops).
+          // The attempts budget above keeps the warm→retry cycle bounded.
+          self.request_warm();
+        }
+      }
+    }
+    if self.live_ann.is_some() && !self.pending_churn.is_empty() {
+      let churn = std::mem::take(&mut self.pending_churn);
+      self.spawn_live_ann_update(churn);
+    }
+  }
+
+  /// Try to adopt the committed generation's tier (background). Preconditions mirror the
+  /// overlay builder's: never while a committer is writing.
+  fn spawn_live_ann_adopt(&mut self) {
+    if self.live_ann.is_some()
+      || self.live_ann_task.is_some()
+      || self.canonicalizing.is_some()
+      || self.persisting.is_some()
+      // A running warm is about to REPLACE these artifacts (compaction, failed-adopt
+      // recovery): adopting mid-warm re-loads the tier the warm is retiring. `reap_warm`
+      // clears the latch when it lands, so adoption follows the fresh tier instead.
+      || self.warm.is_some()
+    {
+      return;
+    }
+    let Some(kg) = self.kg.clone() else { return };
+    // Structural gate: below the quantized-graph floor the committed tier is provably
+    // flat and adoption can never succeed — decide with one integer compare instead of
+    // a thread spawn + a tier load whose verdict is predetermined (the sub-floor case
+    // is every small repo). While ANY latch stands the hot path is compare + Option
+    // check, no CURRENT resolve; the stamp fires on the transition, not per query.
+    if !vorpal_index::live_ann::quantized_tier_possible(kg.node_count()) {
+      if self.live_ann_latch.is_none() {
+        vorpal_kg::phase_stamp(&format!(
+          "live-ann: inapplicable (n={} at or below the quantized-graph floor)",
+          kg.node_count(),
+        ));
+        self.live_ann_latch = Some(LiveAnnLatch {
+          generation: vorpal_kg::resolve_index_dir(&self.index_dir),
+          attempts: LIVE_ANN_ATTEMPTS_PER_GENERATION,
+          rearmed: false,
         });
+      }
+      return;
+    }
+    // Budgeted latch: a declined generation is retried only while budget remains AND a
+    // warm re-armed the question by rewriting the artifacts the last judgment saw.
+    if let Some(latch) = &mut self.live_ann_latch {
+      if latch.generation == vorpal_kg::resolve_index_dir(&self.index_dir) {
+        if latch.attempts >= LIVE_ANN_ATTEMPTS_PER_GENERATION || !latch.rearmed {
+          return;
+        }
+        latch.rearmed = false; // consume the retry
+      } else {
+        // New generation: the question re-opens from scratch.
+        self.live_ann_latch = None;
+      }
+    }
+    let index_dir = self.index_dir.clone();
+    vorpal_kg::phase_stamp("live-ann: adopt spawned");
+    self.live_ann_task = Some(std::thread::spawn(move || {
+      let generation = vorpal_kg::resolve_index_dir(&index_dir);
+      vorpal_index::live_ann::LiveAnnTier::adopt(&generation, &kg)
+    }));
+  }
+
+  /// Apply edit churn to the tier on a background task: refresh the eid→id translation
+  /// against the newly served graph, tombstone removed eids, insert added ones (~ms each).
+  fn spawn_live_ann_update(&mut self, churn: Vec<(Vec<u64>, Vec<u64>)>) {
+    let Some(mut tier) = self.live_ann.take() else {
+      // No tier to maintain. Queue only if one can ever exist for this corpus size:
+      // sub-floor corpora previously accumulated churn here UNBOUNDED (the tier never
+      // adopts, and only an adopted tier drains the queue).
+      if self
+        .kg
+        .as_ref()
+        .is_some_and(|kg| vorpal_index::live_ann::quantized_tier_possible(kg.node_count()))
+      {
+        self.pending_churn.extend(churn);
+      }
+      return;
+    };
+    let Some(kg) = self.kg.clone() else {
+      self.live_ann = Some(tier);
+      return;
+    };
+    vorpal_kg::phase_stamp(&format!("live-ann: update spawned ({} batches)", churn.len()));
+    self.live_ann_task = Some(std::thread::spawn(move || {
+      let start = std::time::Instant::now();
+      tier.refresh_ids(&kg);
+      let (mut removed_total, mut added_total) = (0usize, 0usize);
+      for (removed, added) in &churn {
+        removed_total += removed.len();
+        added_total += added.len();
+        tier.apply_edit(&kg, removed, added);
+      }
+      vorpal_kg::phase_stamp(&format!(
+        "live-ann: update done (-{removed_total} +{added_total} rows, {} ms)",
+        start.elapsed().as_millis(),
+      ));
+      // Quality is measured, not assumed: anchor the baseline on the first update, then
+      // re-probe per churn step; a degraded probe latches the compaction trigger.
+      tier.probe_if_due();
+      Ok(tier)
+    }));
+  }
+
+  /// Start building the live overlay from the committed generation, unless one is already
+  /// live, building, or disabled. Heavy (one product replay) — always a background thread.
+  fn spawn_overlay_build(&mut self) {
+    if !overlay_enabled() || self.overlay.is_some() || self.overlay_building.is_some() {
+      return;
+    }
+    // Retained fast paths re-extract with the BUNDLED extractor: under a custom extraction
+    // environment they would absorb edits with the wrong rules — decline, and every change
+    // takes the full env-aware pipeline instead (see ExtractionEnv::is_default).
+    if !self.env.is_default() {
+      return;
+    }
+    // NEVER build from a generation a committer is still writing: reading stale CURRENT
+    // resurrects rows the daemon already retired (a deleted file's symbols would reappear).
+    // The committer reaps retrigger this the moment the commit lands.
+    if self.canonicalizing.is_some() || self.persisting.is_some() || self.rebuilding.is_some()
+    {
+      return;
+    }
+    // The overlay serves WATCHED trees (its serve path consumes captured hints), and its
+    // per-link co-change pass needs the source root — no watch, no overlay.
+    let Some(src) = self.watch.as_ref().map(|watch| watch.src().to_path_buf()) else {
+      return;
+    };
+    let index_dir = self.index_dir.clone();
+    vorpal_kg::phase_stamp("overlay: builder spawned");
+    self.overlay_building = Some(std::thread::spawn(move || {
+      vorpal_index::live::LiveOverlay::build(&index_dir, &src)
+    }));
+  }
+
+  /// Reap a finished overlay build (non-blocking). A failed build simply leaves the daemon
+  /// on the replay pipeline; the next successful rebuild retriggers construction.
+  fn reap_overlay_build(&mut self) {
+    if !self.overlay_building.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
+    }
+    if let Some(handle) = self.overlay_building.take()
+      && let Ok(Ok(overlay)) = handle.join()
+    {
+      vorpal_kg::phase_stamp("overlay: adopted");
+      self.overlay = Some(overlay);
+    }
+  }
+
+  /// Keep the overlay truthful across a NON-overlay mutation: absorb the change set when it
+  /// is completely known, drop the overlay when it is not (or when absorption fails, or the
+  /// tombstone debt says a fresh build is cheaper). Every path that changes the committed
+  /// index must pass through here.
+  fn overlay_absorb_or_drop(&mut self, hints: Option<&std::collections::HashSet<PathBuf>>) {
+    let Some(overlay) = &mut self.overlay else {
+      return;
+    };
+    let absorbed = match hints {
+      Some(paths) => overlay.absorb(paths).is_ok(),
+      None => false,
+    };
+    if !absorbed || overlay.dead_row_fraction() > 0.5 {
+      // Retire WITHOUT respawning: this runs before the caller's commit is durable, and a
+      // builder started now would read the pre-commit generation and resurrect retired
+      // rows. The post-commit sites (committer reaps, committed adopt branches) respawn.
+      vorpal_kg::phase_stamp("overlay: retired (sync-path change)");
+      self.overlay = None;
+    }
+  }
+
+  /// Reap (or, when `block`, drain) the background persistence of a live-adopted build. On
+  /// success the committed generation becomes the artifact pin and the ANN warm fires; on
+  /// failure the watch re-arms so the next query rebuilds — the served graph stays correct
+  /// (it reflects the source tree), only durability lagged.
+  fn reap_persist(&mut self, block: bool) {
+    if !block && !self.persisting.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
+    }
+    let Some(handle) = self.persisting.take() else {
+      return;
+    };
+    match handle.join() {
+      Ok(Ok(dir)) => {
+        self.kg_dir = Some(dir);
+        // Adoption first, warm second: with an adopt task in flight the warm request
+        // defers (its gate treats the task as tier-present), and a failed adopt requests
+        // the warm itself — so the ~full-build rebuild only runs when reconciliation
+        // genuinely cannot bridge the committed tier to the served graph.
+        self.spawn_live_ann_adopt();
+        self.request_warm();
+        self.spawn_overlay_build();
+      }
+      _ => {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+      }
+    }
+  }
+
+  /// Reap a finished warm (non-blocking). A completed warm rewrote this generation's ANN
+  /// artifacts IN PLACE, so a CURABLE decline's judgment is stale — re-arm one retry.
+  /// The latch itself survives (its attempts budget is the spin fence: adopt → fail →
+  /// warm → retry forever was exactly the loop that buried this daemon's watcher in its
+  /// own artifact churn on every sub-floor corpus).
+  fn reap_warm(&mut self) {
+    if self.warm.as_ref().is_some_and(|h| h.is_finished()) {
+      let _ = self.warm.take().map(std::thread::JoinHandle::join);
+      if let Some(latch) = &mut self.live_ann_latch {
+        latch.rearmed = true;
+      }
+    }
+  }
+
+  /// Request an eager background ANN warm of the current generation. Single-flight: while a
+  /// warm is running this only marks the request, and the reap below (called from the same
+  /// places) spawns the trailing warm once the runner finishes. `warm_ann` re-resolves
+  /// `CURRENT` at spawn time, so the trailing warm covers everything the burst committed.
+  fn request_warm(&mut self) {
+    if !autowarm_enabled() {
+      return;
+    }
+    // A healthy live tier IS the warm tier: per-edit maintenance replaces the ~full-build
+    // background rebuild. The compaction trigger clears `live_ann` first when a real
+    // rebuild is wanted, so this gate never blocks compaction. A live-ANN task in flight
+    // counts as present: an update task briefly OWNS the tier (it travels into the
+    // thread), and treating that window as tier-less fired a full rebuild on every edit —
+    // the reap reinstalls the tier, or requests this warm itself when the task fails.
+    if self.live_ann.as_ref().is_some_and(|t| !t.needs_compaction())
+      || self.live_ann_task.is_some()
+    {
+      return;
+    }
+    self.reap_warm();
+    if self.warm.is_some() {
+      self.warm_pending = true;
+      return;
+    }
+    self.warm_pending = false;
+    let index_dir = self.index_dir.clone();
+    self.warm = Some(std::thread::spawn(move || {
+      let _ = vorpal_index::warm_ann(&index_dir);
+    }));
+  }
+
+  /// Bring the in-memory graph up to date with the watched source tree. A dirty watch runs
+  /// the incremental build and **adopts the sealed in-memory graph the build hands back**
+  /// (no reload of bytes we just wrote); fast paths keep the already-mapped graph, whose
+  /// artifacts the new generation hardlinks. Any failure re-arms the dirty flag so the next
+  /// query retries rather than serving stale data as fresh.
+  /// Adopt whatever generation `CURRENT` names as the served graph. Shared by every
+  /// commit that arrives WITHOUT a change-set capture or eid-churn ledger (the proactive
+  /// child rebuild, first-contact builds): the overlay retires (rebuilt in the background
+  /// from the new generation) and the live ANN tier retires for resync (lifecycle law 5 —
+  /// the stale-tolerant adopt reconciles a fresh tier from the committed artifacts).
+  fn adopt_committed_generation(&mut self) -> Result<(), String> {
+    let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+    match Kg::load(&dir) {
+      Ok(kg) => {
+        self.overlay = None;
+        self.retire_live_ann_for_resync();
+        self.kg = Some(Arc::new(kg));
+        self.kg_dir = Some(dir);
+        self.spawn_live_ann_adopt();
+        self.request_warm();
+        self.spawn_overlay_build();
         Ok(())
       }
       Err(err) => {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+        Err(format!("loading committed generation failed: {err}"))
+      }
+    }
+  }
+
+  /// Reap (or drain) the proactive rebuild. Success adopts the committed generation;
+  /// failure re-arms the watch — queries surface the error — and holds the debounce for
+  /// the worker's original 5-second retry cadence so a persistently failing build never
+  /// thrashes the CPU.
+  fn reap_rebuilding(&mut self, block: bool) {
+    if !block && !self.rebuilding.as_ref().is_some_and(|h| h.is_finished()) {
+      return;
+    }
+    let Some(handle) = self.rebuilding.take() else {
+      return;
+    };
+    let ok = handle.join().unwrap_or(false);
+    if !ok {
+      if let Some(watch) = &self.watch {
         watch.mark_dirty();
+      }
+      self.dirty_since =
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(4500));
+      return;
+    }
+    if let Err(err) = self.adopt_committed_generation() {
+      eprintln!("vorpal-mcp: proactive rebuild committed but adoption failed: {err}");
+    }
+  }
+
+  /// Advance every background lifecycle without doing freshness work: reap finished
+  /// committers, warms, overlay builds, and live-ANN tasks; run compaction policy; and
+  /// green-light follow-on stages. Shared by the query path ([`Self::ensure_fresh`]) and
+  /// the between-requests pulse ([`Self::tick`]).
+  fn advance_background(&mut self) {
+    // Trailing coalesced warm: if a warm finished while a newer request was pending, spawn
+    // the follow-up now (it warms whatever CURRENT is today).
+    if self.warm_pending && self.warm.as_ref().is_none_or(|h| h.is_finished()) {
+      self.request_warm();
+    }
+    self.reap_warm();
+    // Reap a finished background persist (non-blocking) so `kg_dir` pins the committed
+    // generation as soon as it exists.
+    self.reap_persist(false);
+    self.reap_overlay_build();
+    self.reap_live_ann();
+    // Compaction trigger: tombstone debt past the ceiling OR measured recall through the
+    // degradation bar — either way the incremental tier retires and the classic full warm
+    // rebuilds a dense one (re-adopted on the next pass).
+    if self.live_ann.as_ref().is_some_and(vorpal_index::live_ann::LiveAnnTier::needs_compaction) {
+      vorpal_kg::phase_stamp("live-ann: retiring tier to compactor");
+      self.live_ann = None;
+      self.request_warm();
+    }
+    if self.live_ann.is_none() && self.live_ann_task.is_none() {
+      self.spawn_live_ann_adopt();
+    }
+    // Reap a finished background canonicalization (non-blocking): a failure re-arms the
+    // dirty flag; a success is the overlay builder's green light (spawn_overlay_build
+    // itself re-checks every committer, so this can never read a mid-write generation).
+    if self.canonicalizing.as_ref().is_some_and(|h| h.is_finished()) {
+      let ok = self
+        .canonicalizing
+        .take()
+        .expect("checked above")
+        .join()
+        .unwrap_or(false);
+      if ok {
+        self.spawn_overlay_build();
+      } else if let Some(watch) = &self.watch {
+        watch.mark_dirty();
+      }
+    }
+    self.reap_rebuilding(false);
+  }
+
+  /// Between-requests freshness pulse (D1, re-homed): reap background work, debounce the
+  /// watch, and START — never run — anything heavy, so the protocol loop stays responsive.
+  /// Small change sets absorb inline through the retained tiers (milliseconds); one that
+  /// needs the full pipeline builds through [`Self::refresh`]'s background tier as the
+  /// single in-flight committer, and the daemon keeps serving the current graph meanwhile.
+  pub fn tick(&mut self) {
+    self.advance_background();
+    if !self.proactive {
+      return;
+    }
+    let Some(watch) = &self.watch else {
+      return;
+    };
+    if watch.take_dirty() {
+      self.dirty_since = Some(std::time::Instant::now());
+    } else if self.kg.is_none() && self.dirty_since.is_none() && self.rebuilding.is_none() {
+      // Boot on a possibly-stale tree: changes since the last index produced no watch
+      // events, so treat startup itself as dirt — the first pass brings the index current
+      // before the first query needs it (the worker's old "starts dirty" behavior).
+      self.dirty_since = Some(std::time::Instant::now());
+    }
+    let Some(since) = self.dirty_since else {
+      return;
+    };
+    // Editor-burst debounce (the worker's half-second quiet rule): build once per burst.
+    if since.elapsed() < std::time::Duration::from_millis(500) {
+      return;
+    }
+    // Single committer: never stack a proactive build on an in-flight commit path. The
+    // debounce timestamp survives, so the next quiet tick retries.
+    if self.rebuilding.is_some() || self.canonicalizing.is_some() || self.persisting.is_some()
+    {
+      return;
+    }
+    self.dirty_since = None;
+    // Hand the consumed dirt back to the shared flag — `refresh` keys off it, and a fresh
+    // edit landing meanwhile simply re-arms the debounce on the next tick.
+    watch.mark_dirty();
+    if let Err(err) = self.refresh(true) {
+      // stderr is free under stdio MCP (the protocol owns stdout). The failure path
+      // re-armed the dirty flag, so queries retry and surface the error themselves.
+      eprintln!("vorpal-mcp: proactive refresh failed: {err}");
+    }
+  }
+
+  fn ensure_fresh(&mut self) -> Result<(), String> {
+    self.advance_background();
+    self.refresh(false)
+  }
+
+  /// The freshness path proper. `background: false` is the query path — any full pipeline
+  /// run happens synchronously because the caller needs its answer. `background: true` is
+  /// the proactive pulse — the full pipeline commits through a supervised child indexer
+  /// (crash isolation, D3; in-process thread fallback) parked in `self.rebuilding`, and
+  /// serving continues from the current graph until [`Self::reap_rebuilding`] adopts.
+  fn refresh(&mut self, background: bool) -> Result<(), String> {
+    // A proactive rebuild in flight means the tree moved and its commit is pending: the
+    // clean-fast-path below must not serve pre-edit state, so drain and adopt FIRST (a
+    // no-op when nothing is in flight). Draining costs at most what building here
+    // ourselves would have — the child is building the very freshness a query wants.
+    self.reap_rebuilding(true);
+    let Some(watch) = &self.watch else {
+      return Ok(());
+    };
+    let mut backstop = false;
+    if self.kg.is_some() && !watch.take_dirty() {
+      // Liveness backstop: a clean flag is necessary-condition evidence ONLY while the
+      // OS channel is actually delivering — and FSEvents can defer delivery beyond any
+      // deadline with no error and no overflow flag (event-trace-proven on a loaded
+      // APFS box: the full event history arrived in one coalesced burst, tens of
+      // seconds late). So when the stat-sweep lane is available and the amortized
+      // budget allows (see BACKSTOP_OVERHEAD_INVERSE — period = 100× the sweep's own
+      // measured cost), re-verify the tree against the retained manifest instead of
+      // trusting silence. Worst-case staleness under a wedged watcher drops from
+      // unbounded to one period, self-scaled per corpus; the common quiet query stays
+      // one atomic load + one clock read.
+      // The sweep needs no overlay: without one it diffs against the COMMITTED
+      // manifest (the boot window under load was exactly where a disarmed backstop
+      // let a silent watcher starve convergence).
+      let lane_ready = overlay_enabled() && self.env.is_default();
+      let due = match (self.last_sweep_at, self.last_sweep_cost) {
+        (Some(at), Some(cost)) => at.elapsed() >= cost * BACKSTOP_OVERHEAD_INVERSE,
+        // Never swept or never timed: the first eligible quiet query bootstraps the
+        // measurement the period derives from.
+        _ => true,
+      };
+      if !(lane_ready && due) {
+        return Ok(());
+      }
+      backstop = true;
+    }
+    // Hinted revalidation: a COMPLETE captured change set patches the prior manifest in
+    // place of the stat sweep (SUBSECOND.md 1c). Certainty gaps (`None`) and every 64th
+    // hinted rebuild (belt-and-braces reconciliation) take the full sweep; the committed
+    // generation is identical either way (pinned by crates/index/tests/hinted_scan.rs).
+    // Backstop entries deliberately IGNORE the capture set: the flag was clean, so a
+    // complete capture is empty — and an empty hint set would route to the probe
+    // short-circuit, not the sweep this entry exists to run.
+    let hints = if backstop { None } else { watch.take_changes() };
+    // Decision telemetry (VORPAL_PHASE_TRACE): which freshness tier a dirty pass takes is
+    // the first question every daemon-latency investigation asks — stamp the input.
+    match &hints {
+      Some(paths) => vorpal_kg::phase_stamp(&format!("refresh: captured {} path(s)", paths.len())),
+      None if backstop => vorpal_kg::phase_stamp("refresh: backstop sweep (watcher quiet)"),
+      None => vorpal_kg::phase_stamp("refresh: capture lost"),
+    }
+    let src = watch.src().to_path_buf();
+    // The absorbable change set: capture-certain hints, or — when the watcher lost
+    // certainty — the overlay's own stat sweep against its retained manifest. The retained
+    // tier is THE path for absorbable edits; the streaming pipeline is reserved for change
+    // sets past the absorb budget, a missing/retired overlay, a custom extraction
+    // environment, or boot — each stated in the trace, never a silent fall-through.
+    let change_set: Option<std::collections::HashSet<PathBuf>> = match &hints {
+      Some(paths) => Some(paths.clone()),
+      None => {
+        if overlay_enabled() && self.kg.is_some() && self.env.is_default() {
+          let sweep_started = std::time::Instant::now();
+          let swept = match self.overlay.as_ref() {
+            Some(overlay) => Some(overlay.stat_changes(&src)),
+            // No adopted overlay (boot, retirement): the committed generation's
+            // manifest answers the same question from disk.
+            None => Some(vorpal_index::live::stat_changes_against_generation(
+              &self.index_dir,
+              &src,
+            )),
+          };
+          if swept.is_some() {
+            // Both outcomes measure: the period the backstop derives must reflect what
+            // a sweep costs HERE, on this corpus, on this filesystem — success or not.
+            self.last_sweep_cost = Some(sweep_started.elapsed());
+            self.last_sweep_at = Some(std::time::Instant::now());
+          }
+          match swept {
+            Some(Ok(paths)) => {
+              vorpal_kg::phase_stamp(&format!(
+                "refresh: stat sweep recovered {} path(s) in {:?}",
+                paths.len(),
+                self.last_sweep_cost.unwrap_or_default(),
+              ));
+              if paths.is_empty() {
+                // Spurious wake (or a quiet backstop pass): the tree stat-matches the
+                // retained manifest exactly — nothing to rebuild, nothing to serve
+                // differently.
+                return Ok(());
+              }
+              Some(paths)
+            }
+            Some(Err(err)) => {
+              vorpal_kg::phase_stamp(&format!("refresh: stat sweep failed ({err})"));
+              if backstop {
+                // The flag never fired — nothing asserted the tree changed. Serving on
+                // is the stock behavior; the next period retries the sweep. Falling
+                // through would run the FULL pipeline on a quiet daemon.
+                return Ok(());
+              }
+              None
+            }
+            None => None,
+          }
+        } else {
+          None
+        }
+      }
+    };
+    // Serve-immediately probe (SUBSECOND.md Phase 3): when the capture is complete, small,
+    // and every changed file re-extracts byte-identical to its cached product, NO answer can
+    // differ from the loaded graph's — so answer now (single-digit ms: one re-extraction per
+    // changed file) and canonicalize the stamps in a background build. Any doubt falls
+    // through to the synchronous rebuild below. A failed or superseded background build
+    // re-arms the dirty flag, so the next query retries.
+    // One extraction per changed file serves BOTH fast paths: the serve-immediately
+    // decision (byte-identical to cached products?) and, failing that, the overlay's
+    // absorb — which previously re-extracted the same files.
+    let mut probe = if let Some(paths) = &change_set
+      && !paths.is_empty()
+      && self.kg.is_some()
+      // The probe re-extracts with the bundled extractor — custom environments fall
+      // through to the full env-aware pipeline (ExtractionEnv::is_default). No size cap:
+      // the extraction is the same per-file work the absorb pays, done once and shared;
+      // the absorb budget below is the routing bound.
+      && self.env.is_default()
+      && let Some(watch_src) = self.watch.as_ref().map(|watch| watch.src().to_path_buf())
+    {
+      vorpal_index::live::probe_extraction(&self.index_dir, &watch_src, paths).ok()
+    } else {
+      None
+    };
+    if probe.as_ref().is_some_and(vorpal_index::live::ExtractionProbe::all_unchanged) {
+      if self.canonicalizing.is_some() || self.persisting.is_some() || self.rebuilding.is_some()
+      {
+        // A background committer is still in flight (stamp canonicalization or a live
+        // build's persistence): answers are STILL provably unchanged — the probe verified
+        // the touched files against the cached products, and the pending generation was
+        // extracted from the same tree state — so keep serving; the armed flag makes the
+        // next quiet query re-probe once the committer lands.
+        watch.mark_dirty();
+        return Ok(());
+      }
+      let src = watch.src().to_path_buf();
+      let index_dir = self.index_dir.clone();
+      let env = self.env.clone();
+      let paths = change_set.as_ref().expect("a probe implies a change set").clone();
+      // The overlay saw no graph change here, but its retained manifest must track the
+      // moved stamps or a LATER served persistence would commit stale ones and fork the
+      // generation id from what a scratch build produces.
+      if let (Some(overlay), Some(probe)) = (self.overlay.as_mut(), probe.as_ref()) {
+        overlay.note_stamps(probe);
+      }
+      self.canonicalizing = Some(std::thread::spawn(move || {
+        vorpal_index::build_index_watched(&src, &index_dir, &paths, &env).is_ok()
+      }));
+      return Ok(());
+    }
+    // Live-overlay semantic serve (SUBSECOND.md Phase 3): a COMPLETE, small change set with
+    // a ready overlay skips the replay pipeline — extract the changed files, re-link the
+    // retained state, seal in canonical order, and serve. The sealed bytes are pinned
+    // byte-identical to a from-scratch build of this tree, so the background canonicalizer
+    // spawned here commits the very generation these answers came from; ordering holds
+    // because both committers are drained first, exactly like the synchronous path.
+    if overlay_enabled()
+      && self.kg.is_some()
+      && self
+        .overlay
+        .as_ref()
+        .is_some_and(|overlay| {
+          let within = change_set
+            .as_ref()
+            .is_some_and(|paths| overlay.within_absorb_budget(paths.len()));
+          if !within && change_set.is_some() {
+            vorpal_kg::phase_stamp("refresh: change set past absorb budget — pipeline");
+          }
+          within
+        })
+      && let Some(probe) = probe.take()
+      && let Some(paths) = &change_set
+    {
+      if let Some(handle) = self.canonicalizing.take() {
+        let _ = handle.join();
+      }
+      self.reap_persist(true);
+      let paths = paths.clone();
+      let overlay = self.overlay.as_mut().expect("checked above");
+      vorpal_kg::phase_stamp("overlay: serving");
+      if retained_persist_enabled() {
+        // Retained persistence: the served build commits its OWN generation on the
+        // background thread — same bytes a from-scratch build of this tree produces, at a
+        // fraction of the replay pipeline's CPU. All the `persisting` ordering machinery
+        // (drain-before-sync, generation-bound drains, reap→pin→warm→overlay-greenlight)
+        // applies unchanged.
+        let prior = vorpal_kg::resolve_index_dir(&self.index_dir);
+        match overlay.apply_and_link_probed_persisting(probe, prior, self.index_dir.clone()) {
+          Ok((kg, pending)) => {
+            let stale = overlay.dead_row_fraction() > 0.5;
+            let churn = overlay.take_eid_churn();
+            self.kg = Some(kg);
+            self.kg_dir = None;
+            self.persisting = Some(std::thread::spawn(move || pending.persist()));
+            if !(churn.0.is_empty() && churn.1.is_empty()) {
+              self.spawn_live_ann_update(vec![churn]);
+            }
+            if stale {
+              vorpal_kg::phase_stamp("overlay: retired (tombstone debt)");
+              self.overlay = None;
+              self.spawn_overlay_build();
+            }
+            return Ok(());
+          }
+          Err(err) => {
+            vorpal_kg::phase_stamp(&format!("overlay: dropped ({err})"));
+            self.overlay = None;
+          }
+        }
+      } else {
+        match overlay.apply_and_link_probed(&probe) {
+          Ok(kg) => {
+            let stale = overlay.dead_row_fraction() > 0.5;
+            self.kg = Some(Arc::new(kg));
+            self.kg_dir = None;
+            let index_dir = self.index_dir.clone();
+            let canon_src = src.clone();
+            let env = self.env.clone();
+            self.canonicalizing = Some(std::thread::spawn(move || {
+              vorpal_index::build_index_watched(&canon_src, &index_dir, &paths, &env).is_ok()
+            }));
+            if stale {
+              // Tombstone debt crossed the line: retire this overlay and rebuild it from
+              // the canonical generation in the background (fresh writer, fresh interner).
+              vorpal_kg::phase_stamp("overlay: retired (tombstone debt)");
+              self.overlay = None;
+              self.spawn_overlay_build();
+            }
+            return Ok(());
+          }
+          Err(err) => {
+            // Something the overlay cannot absorb exactly (unreadable file, extraction
+            // change, unknown spelling): drop it and take the replay pipeline below.
+            vorpal_kg::phase_stamp(&format!("overlay: dropped ({err})"));
+            self.overlay = None;
+          }
+        }
+      }
+    }
+    // Synchronous rebuild: drain any in-flight background committer FIRST — commits must
+    // land in order (an older generation must never supersede a newer one), and the build
+    // about to run must see the freshest CURRENT.
+    if let Some(handle) = self.canonicalizing.take() {
+      let _ = handle.join();
+    }
+    self.reap_persist(true);
+    self.hinted_rebuilds = self.hinted_rebuilds.wrapping_add(1);
+    // Both sources are COMPLETE change sets (watcher certainty, or the stat sweep that IS
+    // a full-scan diff), so either satisfies the hinted-manifest-patch contract.
+    let use_hints = change_set.as_ref().is_some_and(|set| !set.is_empty())
+      && self.hinted_rebuilds % 64 != 0
+      && self.kg.is_some();
+    // Live adoption (SUBSECOND.md Phase 3, live rebuild v1): a full pipeline run returns
+    // with the sealed in-memory graph — serve it NOW; its artifact writes + content-
+    // addressed commit continue on a background thread. Fast paths (whole-tree reuse, the
+    // stamp-only cutoff) commit synchronously and hardlink the very artifacts the loaded
+    // graph has mapped, so the graph is kept and only `kg_dir` repoints.
+    if background {
+      // Proactive heavy tier: commit through a supervised child indexer (crash isolation,
+      // D3) — or an in-process background thread when no indexer binary is discoverable —
+      // while the daemon keeps serving the current graph. Hints are deliberately NOT
+      // forwarded: the child runs the plain incremental pipeline (stat sweep + product
+      // replay), and the serving thread's capture state stays intact for the query path.
+      let supervisor = self.supervisor.clone();
+      let index_dir = self.index_dir.clone();
+      let env = self.env.clone();
+      self.rebuilding = Some(std::thread::spawn(move || {
+        match supervisor.build(&src, &index_dir) {
+          Ok(BuildOutcome::Supervised(_)) => true,
+          Ok(BuildOutcome::Unavailable) => {
+            let _guard = in_process_build_guard();
+            // `from_env` (not `default`) for parity with both the child indexer and the
+            // synchronous path — all three honor the same cache-mode override.
+            build_index_env(
+              &src,
+              &index_dir,
+              CacheMode::from_env(),
+              ParseHealthPolicy::default(),
+              &env,
+            )
+            .is_ok()
+          }
+          Err(err) => {
+            eprintln!("vorpal-mcp: supervised rebuild failed: {err}");
+            false
+          }
+        }
+      }));
+      return Ok(());
+    }
+    if self.kg.is_none()
+      && !vorpal_kg::resolve_index_dir(&self.index_dir)
+        .join("nodes.vseg")
+        .exists()
+    {
+      // First contact with a never-indexed tree: the likeliest place for a pathological
+      // input, and no retained state exists to protect — crash-isolate the build (D3).
+      // Steady-state watched rebuilds stay in-process below: retained serving re-extracts
+      // in-process by design (probe/overlay), so the isolation boundary is first contact
+      // and the explicit `index` tool, stated.
+      let built = match self.supervisor.build(&src, &self.index_dir) {
+        Ok(BuildOutcome::Supervised(_)) => Ok(()),
+        Ok(BuildOutcome::Unavailable) => {
+          let _guard = in_process_build_guard();
+          build_index_env(
+            &src,
+            &self.index_dir,
+            CacheMode::from_env(),
+            ParseHealthPolicy::default(),
+            &self.env,
+          )
+          .map(|_| ())
+          .map_err(|err| err.to_string())
+        }
+        Err(err) => Err(err),
+      };
+      if let Err(err) = built {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+        return Err(format!("revalidating watched index failed: {err}"));
+      }
+      return self.adopt_committed_generation();
+    }
+    let hint_set = use_hints.then(|| change_set.as_ref().expect("checked above"));
+    match vorpal_index::build_index_live(&src, &self.index_dir, hint_set, &self.env) {
+      Ok(build) => {
+        if let Some(kg) = build.kg {
+          // The committed tree moved without the overlay: absorb the exact change set or
+          // retire the overlay (rebuilt in the background from the new generation). A
+          // COMPLETE capture absorbs even on the every-64th reconciliation sweep — the
+          // sweep insures manifest patching, not capture exactness.
+          self.overlay_absorb_or_drop(change_set.as_ref());
+          // The replay pipeline produced a NEW sealed graph with no eid-churn ledger:
+          // the live tier's translations and edited-symbol vectors are stale against it,
+          // and nothing downstream would ever resync them. Retire the tier; the
+          // stale-tolerant adopt reconciles a fresh one from the committed generation
+          // (the same primitive that bridges any persisted-tier drift).
+          self.retire_live_ann_for_resync();
+          self.kg = Some(kg);
+          if let Some(pending) = build.pending {
+            // No committed generation for this graph yet: leave `kg_dir` unpinned;
+            // generation-bound tools drain the handle, and `reap_persist` pins + warms
+            // the moment it lands.
+            self.kg_dir = None;
+            self.persisting = Some(std::thread::spawn(move || pending.persist()));
+          } else {
+            self.kg_dir = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
+            // Adoption before warm at every kg-servable site — see `reap_persist`.
+            self.spawn_live_ann_adopt();
+            self.request_warm();
+          }
+          self.spawn_overlay_build();
+          return Ok(());
+        }
+        let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+        if build.report.graph_reused && self.kg.is_some() {
+          // Byte-identical graph carry (whole-tree reuse or the stamp-only cutoff): the
+          // SAME graph keeps serving — the live tier's translations are still exact.
+          self.kg_dir = Some(dir);
+          self.spawn_live_ann_adopt();
+          self.request_warm();
+          self.spawn_overlay_build();
+          return Ok(());
+        }
+        match Kg::load(&dir) {
+          Ok(kg) => {
+            // A synchronously committed generation replaces the served graph — same
+            // staleness argument as the live-build branch above.
+            self.retire_live_ann_for_resync();
+            self.kg = Some(Arc::new(kg));
+            self.kg_dir = Some(dir);
+            self.spawn_live_ann_adopt();
+            self.request_warm();
+            self.spawn_overlay_build();
+            Ok(())
+          }
+          Err(err) => {
+            if let Some(watch) = &self.watch {
+              watch.mark_dirty();
+            }
+            Err(format!("revalidating watched index failed: {err}"))
+          }
+        }
+      }
+      Err(err) => {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
         Err(format!("revalidating watched index failed: {err}"))
       }
     }
@@ -314,6 +1288,51 @@ impl Server {
         .ensure_fresh()
         .map_err(|message| ToolError::coded("index-unavailable", message))?;
     }
+    // Generation-bound tools answer from committed artifacts (digest-verified spans, the
+    // product pack, ANN sidecars) rather than the served in-memory graph — they wait for an
+    // in-flight background persist so their generation pin exists. The navigation and
+    // pattern tools keep serving from the sealed graph at full speed during the window.
+    const GENERATION_BOUND: &[&str] = &[
+      "index",
+      "search",
+      "code_search",
+      "architecture",
+      "coverage",
+      "health",
+      "schema",
+      "fetch_span",
+      "dead_code",
+      "snippet",
+      "why",
+      "compare_generations",
+      "impact",
+    ];
+    if GENERATION_BOUND.contains(&tool) {
+      self.reap_persist(true);
+      // An overlay-served answer's generation is written by the canonicalizer: wait for it,
+      // then pin the fresh generation — its bytes (and therefore its ids) are the very ones
+      // the served graph was sealed from. A failed canonicalization leaves `kg_dir` unpinned
+      // (the tool reports unavailable) and re-arms the watch.
+      if let Some(handle) = self.canonicalizing.take() {
+        let ok = handle.join().unwrap_or(false);
+        if !ok && let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+      }
+      if self.kg_dir.is_none() && self.kg.is_some() {
+        let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+        if dir.join("nodes.vseg").exists() {
+          self.kg_dir = Some(dir);
+        }
+      }
+    }
+    if tool == "index"
+      && let Some(handle) = self.canonicalizing.take()
+    {
+      // The explicit `index` tool commits synchronously — it must not race the
+      // serve-immediately probe's stamp canonicalization either.
+      let _ = handle.join();
+    }
     match tool {
       "index" => {
         let src = str_arg("src")?;
@@ -343,6 +1362,9 @@ impl Server {
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
         };
+        // An explicit rebuild is a commit: drain the proactive rebuild first so commits
+        // stay single-file (its generation lands, then this one supersedes it).
+        self.reap_rebuilding(true);
         // Optional embedding-tier selection: written to the index ROOT before the build,
         // because the selection file is the single cross-process truth every warm reads
         // (in-daemon or child indexer alike). Absent = keep the existing selection.
@@ -391,8 +1413,16 @@ impl Server {
         // Reload so queries serve the fresh graph (a cheap mmap cold-open), pinning the
         // new generation directory alongside it.
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
-        self.kg = Some(Kg::load(&dir).map_err(|err| err.to_string())?);
+        self.kg = Some(Arc::new(Kg::load(&dir).map_err(|err| err.to_string())?));
         self.kg_dir = Some(dir);
+        // An explicit rebuild moved the committed tree with no change-set capture: the
+        // overlay cannot be trusted to match — retire it and rebuild from the new generation.
+        // The live ANN tier goes with it (lifecycle law 5): this commit carried no eid-churn
+        // ledger, so the tier's id translations are stale against the reloaded graph; the
+        // stale-tolerant adopt reconciles a fresh tier from the committed generation.
+        self.overlay = None;
+        self.retire_live_ann_for_resync();
+        self.spawn_overlay_build();
         let mut text = match (&report, supervised_note) {
           // Child ran: its stdout tail IS the report (counts, damage note, unverified note).
           (None, Some(child_text)) => format!("(supervised) {child_text}"),
@@ -430,7 +1460,7 @@ impl Server {
         let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::code_search(
@@ -454,7 +1484,7 @@ impl Server {
         let top = args.get("top").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize;
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::architecture_report(kg, dir.as_deref(), top);
@@ -535,7 +1565,7 @@ impl Server {
         let changed = vorpal_index::impact::changed_paths(&root, since.as_deref())
           .map_err(ToolError::from)?;
         self.kg()?;
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let (seeds, missing) = vorpal_index::impact::seeds_for_paths(kg, &root, &changed);
@@ -586,7 +1616,7 @@ impl Server {
         if tool == "node" {
           if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
             self.kg()?;
-            let Some(kg) = self.kg.as_ref() else {
+            let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
             let text =
@@ -641,8 +1671,15 @@ impl Server {
         // agents get ranking provenance by default (§11's "expose which rankers
         // contributed"). Multi-phrase conjunctions (`"…" AND "…"`) ride the same report:
         // phrase-tagged provenance, and an eliminator line instead of silent emptiness.
-        let report = vorpal_index::search_report_filtered(&self.index_dir, &query, k, &filter)
-          .map_err(|err| err.to_string())?;
+        // With a live ANN tier, the semantic pool is served live and everything
+        // downstream (rerank, fusion, report) is the shared path.
+        let report = if let Some(tier) = &self.live_ann {
+          vorpal_kg::phase_stamp("live-ann: semantic pool served by live tier");
+          vorpal_index::search_report_filtered_live(&self.index_dir, &query, k, &filter, tier)
+        } else {
+          vorpal_index::search_report_filtered(&self.index_dir, &query, k, &filter)
+        }
+        .map_err(|err| err.to_string())?;
         let vorpal_index::records::SearchReport { hits, multi_phrase } = report;
         let mut text = String::new();
         for hit in &hits {
@@ -718,7 +1755,7 @@ impl Server {
         // the call an agent makes before forming its first real query.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::schema_report(kg, dir.as_deref());
@@ -781,7 +1818,7 @@ impl Server {
         // Slice against the pinned generation's digests: stale offsets refuse, never guess.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         crate::tools::fetch_span(kg, dir.as_deref(), id, max_bytes.clamp(64, 262_144))
@@ -803,7 +1840,7 @@ impl Server {
         };
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let report = vorpal_index::records::dead_records_page(
@@ -977,7 +2014,7 @@ impl Server {
           .clamp(64, 262_144) as usize;
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let selected = vorpal_index::records::snippet_records(
@@ -1020,7 +2057,7 @@ impl Server {
         // that produced these ids, and the snippet digest-checks against the same generation.
         self.kg()?;
         let dir = self.kg_dir.clone();
-        let Some(kg) = self.kg.as_ref() else {
+        let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let text = match (to_id, name.as_deref()) {
@@ -1145,12 +2182,12 @@ impl Server {
           self.index_dir.display()
         )
       })?;
-      self.kg = Some(loaded);
+      self.kg = Some(Arc::new(loaded));
       self.kg_dir = Some(dir);
     }
     self
       .kg
-      .as_ref()
+      .as_deref()
       .ok_or_else(|| "index load raced away — retry the query".to_string())
   }
 }
@@ -1239,7 +2276,7 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
         "lang": {"type": "string", "description": "Restrict to one language (rust, c, py, …)"},
         "prefix": {"type": "string", "description": "Restrict to paths starting with this prefix"},
         "k": {"type": "integer", "description": "Top definitions to return (default 20, max 1000)"},
-        "format": {"type": "string", "enum": ["toon", "lean", "ids"], "description": "Token-oriented text rendering"},
+        "format": {"type": "string", "enum": ["toon", "lean", "ids"], "description": "Text rendering: lean = minimal columns (cheapest structured form), toon = lossless tab-grid grouped by directory, ids = durable handles only"},
         "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
         "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
       }),
@@ -1620,60 +2657,6 @@ fn unreachable_report() -> Result<String, String> {
   Err("internal: index build produced neither a report nor a supervised note".to_string())
 }
 
-/// The D1 proactive rebuild worker: debounce dirtiness, build through the supervisor (or
-/// in-process when unavailable), repeat. Detached for the daemon's lifetime; it owns its own
-/// watch and touches no server state — commits publish via the atomic CURRENT swap, and the
-/// serving thread reloads on its own dirty signal.
-fn spawn_rebuild_worker(
-  src: PathBuf,
-  index_dir: PathBuf,
-  supervisor: Supervisor,
-  env: ExtractionEnv,
-) {
-  std::thread::spawn(move || {
-    let Some(watch) = SourceWatch::start(&src) else {
-      return;
-    };
-    // The flag starts dirty (changes since the last index produced no events): the first
-    // pass brings the index current before the first query needs it.
-    loop {
-      if !watch.take_dirty() {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        continue;
-      }
-      // Debounce: wait for a quiet half-second so an editor's save burst builds once.
-      loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if !watch.take_dirty() {
-          break;
-        }
-      }
-      let outcome = match supervisor.build(&src, &index_dir) {
-        Ok(BuildOutcome::Supervised(_)) => Ok(()),
-        Ok(BuildOutcome::Unavailable) => {
-          let _guard = in_process_build_guard();
-          build_index_env(
-            &src,
-            &index_dir,
-            CacheMode::default(),
-            ParseHealthPolicy::default(),
-            &env,
-          )
-          .map(|_| ())
-          .map_err(|err| err.to_string())
-        }
-        Err(err) => Err(err),
-      };
-      if let Err(err) = outcome {
-        // stderr is free under stdio MCP (the protocol owns stdout). The serving thread's
-        // own dirty flag is still set, so queries retry and surface the error themselves.
-        eprintln!("vorpal-mcp: background rebuild failed: {err}");
-        watch.mark_dirty();
-        std::thread::sleep(std::time::Duration::from_secs(5));
-      }
-    }
-  });
-}
 
 /// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`), if
 /// that root exists — the precondition for watching.

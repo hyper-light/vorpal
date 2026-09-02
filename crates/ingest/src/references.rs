@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::LazyLock;
 
-use vorpal_core::tree_sitter::StrDoc;
+use vorpal_core::tree_sitter::{PreWithDepth, StrDoc};
 use vorpal_core::{Language, Node};
 use vorpal_kg::{EntityIdentity, NodeId};
 use vorpal_lang_registry::SgLang;
@@ -265,6 +265,12 @@ pub(crate) struct RefSpec {
   routes: &'static [RouteSpec],
   /// HTTP client call constructs (see [`RequestSpec`]).
   requests: &'static [RequestSpec],
+  /// Body-less type WRAPPER kinds: in `struct X y;` the wrapper's `name` field IS the
+  /// type being used, so the generic definition-name skip must not eat it. A wrapper
+  /// WITH a body is the definition itself and stays skipped. Measured before this
+  /// existed: 7 of ~2,340 `struct file_operations`-typed kernel declarations produced a
+  /// type reference.
+  type_ref_wrappers: &'static [&'static str],
 }
 
 const NONE_TEXT: &[(&str, TextAction)] = &[];
@@ -287,6 +293,7 @@ const SPEC_DEFAULTS: RefSpec = RefSpec {
   self_receivers: NO_KINDS,
   routes: &[],
   requests: &[],
+  type_ref_wrappers: NO_KINDS,
 };
 
 // ---- Owned spec data (F-M4) ---------------------------------------------------------------
@@ -478,6 +485,7 @@ pub(crate) struct RefSpecData {
   pub(crate) self_receivers: Vec<String>,
   pub(crate) routes: Vec<RouteSpecData>,
   pub(crate) requests: Vec<RequestSpecData>,
+  pub(crate) type_ref_wrappers: Vec<String>,
 }
 
 impl From<&RefSpec> for RefSpecData {
@@ -500,6 +508,7 @@ impl From<&RefSpec> for RefSpecData {
       self_receivers: owned(spec.self_receivers),
       routes: spec.routes.iter().map(RouteSpecData::from).collect(),
       requests: spec.requests.iter().map(RequestSpecData::from).collect(),
+      type_ref_wrappers: owned(spec.type_ref_wrappers),
     }
   }
 }
@@ -839,6 +848,7 @@ const C_LIKE: RefSpec = RefSpec {
   static_callee_kinds: &["qualified_identifier"],
   method_callee_kinds: &["field_expression"],
   self_receivers: &["this"],
+  type_ref_wrappers: &["struct_specifier", "union_specifier", "enum_specifier"],
   ..SPEC_DEFAULTS
 };
 
@@ -1785,140 +1795,148 @@ pub(crate) fn extract_references_with_facts<'t>(
   let mut seen_impls: HashSet<(u64, Cow<'t, str>)> = HashSet::new();
   let mut pending: Vec<Pending<'t>> = Vec::new();
   let mut span_cursor = SpanCursor::new(def_spans);
-  // Single-cursor pre-order (document order): `children()` allocates a fresh tree cursor per
-  // call, so the previous stack walk paid one C-side cursor malloc per visited node (~350k per
-  // index of this repo); `dfs()` streams the whole file over ONE cursor. Anonymous token
-  // leaves still stream past, but a skipped iterator step is free where a cursor was not.
-  for node in root.dfs() {
-    // Near-clone signatures (v16) read every leaf token — anonymous ones included — before
-    // the named-only dispatch below.
+  // Explicit ancestor stack, driven by the walk's own depth (a truncate + push per node):
+  // every parent the handlers consult reads from this stack instead of `Node::parent`,
+  // which has no parent pointer and re-walks from the tree ROOT (one
+  // `child_with_descendant` scan per level) on every call — per-node parent queries were
+  // a leading slice of the whole build's cursor churn at kernel scale.
+  let mut ancestors: Vec<SgNode<'t>> = Vec::new();
+  for (node, depth) in PreWithDepth::new(&root) {
+    ancestors.truncate(depth);
+    // Near-clone signatures (v16) read every leaf token — anonymous ones included —
+    // before the named-only dispatch below.
     if let Some(signer) = signer.as_deref_mut() {
       signer.visit(&node);
     }
-    if !node.is_named() {
-      continue;
-    }
-    let kind_id = node.kind_id();
-    if let Some(facts) = typefacts {
-      if let Some(bind) = facts.arm(kind_id) {
-        crate::typefacts::capture_at(bind, &node, bindings);
+    'dispatch: {
+      if !node.is_named() {
+        break 'dispatch;
       }
-    }
-    if resolved.declares_type_params(kind_id) {
-      collect_binders_in(&node, &mut binders);
-    }
-    // Route registrations dispatch beside the chain: their kinds are usually also call
-    // kinds, and the same node legitimately yields both the framework call and the
-    // route → handler reference.
-    for (idx, &id) in resolved.route_kind_ids.iter().enumerate() {
-      if id != 0 && id == kind_id {
-        emit_route_handler(&node, &spec.routes[idx], spec, &mut span_cursor, &mut pending);
+      let kind_id = node.kind_id();
+      if let Some(facts) = typefacts {
+        if let Some(bind) = facts.arm(kind_id) {
+          crate::typefacts::capture_at(bind, &node, bindings);
+        }
       }
-    }
-    for (idx, &id) in resolved.request_kind_ids.iter().enumerate() {
-      if id != 0 && id == kind_id {
-        emit_request(&node, &spec.requests[idx], &mut span_cursor, requests_out);
+      if resolved.declares_type_params(kind_id) {
+        collect_binders_in(&node, ancestors.last(), &mut binders);
       }
-    }
-    match resolved.chain_at(kind_id) {
-      Chain::None => {}
-      Chain::Import => {
-        for (ispec, &id) in spec.imports.iter().zip(&resolved.import_kind_ids) {
-          if id == kind_id {
-            emit_imports(&node, ispec, def_spans, &mut pending);
+      // Route registrations dispatch beside the chain: their kinds are usually also call
+      // kinds, and the same node legitimately yields both the framework call and the
+      // route → handler reference.
+      for (idx, &id) in resolved.route_kind_ids.iter().enumerate() {
+        if id != 0 && id == kind_id {
+          emit_route_handler(&node, &spec.routes[idx], spec, &mut span_cursor, &mut pending);
+        }
+      }
+      for (idx, &id) in resolved.request_kind_ids.iter().enumerate() {
+        if id != 0 && id == kind_id {
+          emit_request(&node, &spec.requests[idx], &mut span_cursor, requests_out);
+        }
+      }
+      match resolved.chain_at(kind_id) {
+        Chain::None => {}
+        Chain::Import => {
+          for (ispec, &id) in spec.imports.iter().zip(&resolved.import_kind_ids) {
+            if id == kind_id {
+              emit_imports(&node, ispec, def_spans, &mut pending);
+            }
           }
         }
-      }
-      Chain::Type => stage_type_use(&node, spec, &mut span_cursor, &mut pending),
-      Chain::Implements(idx) => emit_implements(
-        &node,
-        &spec.implements[idx as usize],
-        spec,
-        &mut span_cursor,
-        &mut seen_impls,
-        &mut pending,
-      ),
-      Chain::Call(idx) => {
-        let cspec = &spec.calls[idx as usize];
-        if suppressed.remove(&node.node_id()) || is_chain_link(&node, spec) {
-          continue;
-        }
-        let Some(mut callee) = select(&node, &cspec.callee) else {
-          continue;
-        };
-        // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
-        // chain yields one reference, attributed at the outermost node.
-        while let Some(inner) = spec
-          .calls
-          .iter()
-          .find(|c| c.kind == callee.kind().as_ref())
-          .and_then(|c| select(&callee, &c.callee))
-        {
-          callee = inner;
-        }
-        let Some(name) = callee_name(&callee) else {
-          continue;
-        };
-        let range = node.range();
-        match spec
-          .text_rules
-          .iter()
-          .find(|(text, _)| name.as_ref() == *text)
-        {
-          Some((_, TextAction::SkipDefinition)) => {
-            if let Some(args) = node.children().find(|c| c.kind().as_ref() == "arguments") {
-              if let Some(head) = args.children().find(|c| c.is_named()) {
-                if spec.calls.iter().any(|c| c.kind == head.kind().as_ref()) {
-                  suppressed.insert(head.node_id());
+        Chain::Type => stage_type_use(&node, &ancestors, spec, &mut span_cursor, &mut pending),
+        Chain::Implements(idx) => emit_implements(
+          &node,
+          &spec.implements[idx as usize],
+          spec,
+          &mut span_cursor,
+          &mut seen_impls,
+          &mut pending,
+        ),
+        Chain::Call(idx) => {
+          let cspec = &spec.calls[idx as usize];
+          if suppressed.remove(&node.node_id())
+            || is_chain_link(&node, ancestors.last(), spec)
+          {
+            break 'dispatch;
+          }
+          let Some(mut callee) = select(&node, &cspec.callee) else {
+            break 'dispatch;
+          };
+          // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
+          // chain yields one reference, attributed at the outermost node.
+          while let Some(inner) = spec
+            .calls
+            .iter()
+            .find(|c| c.kind == callee.kind().as_ref())
+            .and_then(|c| select(&callee, &c.callee))
+          {
+            callee = inner;
+          }
+          let Some(name) = callee_name(&callee) else {
+            break 'dispatch;
+          };
+          let range = node.range();
+          match spec
+            .text_rules
+            .iter()
+            .find(|(text, _)| name.as_ref() == *text)
+          {
+            Some((_, TextAction::SkipDefinition)) => {
+              if let Some(args) = node.children().find(|c| c.kind().as_ref() == "arguments") {
+                if let Some(head) = args.children().find(|c| c.is_named()) {
+                  if spec.calls.iter().any(|c| c.kind == head.kind().as_ref()) {
+                    suppressed.insert(head.node_id());
+                  }
                 }
               }
             }
-          }
-          Some((_, TextAction::ImportFirstArg)) => {
-            if let (Some(arg), Some(from)) =
-              (first_argument(&node), outermost(def_spans, range.start))
-            {
-              if let Some(import) = import_arg_name(&arg) {
-                pending.push(Pending::Ready(RawRef::plain(
-                  from,
-                  import,
-                  RefKind::Import,
-                  range.start as u32,
-                  range.end as u32,
-                )));
+            Some((_, TextAction::ImportFirstArg)) => {
+              if let (Some(arg), Some(from)) =
+                (first_argument(&node), outermost(def_spans, range.start))
+              {
+                if let Some(import) = import_arg_name(&arg) {
+                  pending.push(Pending::Ready(RawRef::plain(
+                    from,
+                    import,
+                    RefKind::Import,
+                    range.start as u32,
+                    range.end as u32,
+                  )));
+                }
               }
             }
-          }
-          None => {
-            if let Some(from) = span_cursor.enclosing(range.start) {
-              let (form, qualifier, receiver) =
-                classify_call(&node, cspec, &callee, spec, entities, from);
-              // Receiver/arg extras are persisted to feed typed-receiver resolution and
-              // data-flow; languages without capture tables would carry them as dead pack
-              // weight (measured on the kernel's C: +33% pack, +7% cold) — so capture is
-              // exactly as wide as the typefacts launch set.
-              let (receiver, args) = if typefacts.is_some() {
-                (receiver, capture_args(&node))
-              } else {
-                (None, Vec::new())
-              };
-              pending.push(Pending::Ready(RawRef {
-                from,
-                name,
-                kind: RefKind::Call,
-                start: range.start as u32,
-                end: range.end as u32,
-                qualifier,
-                form,
-                alias: None,
-                receiver,
-                args,
-              }));
+            None => {
+              if let Some(from) = span_cursor.enclosing(range.start) {
+                let (form, qualifier, receiver) =
+                  classify_call(&node, cspec, &callee, spec, entities, from);
+                // Receiver/arg extras are persisted to feed typed-receiver resolution and
+                // data-flow; languages without capture tables would carry them as dead pack
+                // weight (measured on the kernel's C: +33% pack, +7% cold) — so capture is
+                // exactly as wide as the typefacts launch set.
+                let (receiver, args) = if typefacts.is_some() {
+                  (receiver, capture_args(&node))
+                } else {
+                  (None, Vec::new())
+                };
+                pending.push(Pending::Ready(RawRef {
+                  from,
+                  name,
+                  kind: RefKind::Call,
+                  start: range.start as u32,
+                  end: range.end as u32,
+                  qualifier,
+                  form,
+                  alias: None,
+                  receiver,
+                  args,
+                }));
+              }
             }
           }
         }
       }
     }
+    ancestors.push(node);
   }
 
   // Post-pass in visit order: binder-shadowed type uses drop; survivors dedup per
@@ -2150,9 +2168,13 @@ const BINDER_LEAF_KINDS: &[&str] = &["type_identifier", "identifier", "simple_id
 /// parameter's *binder* name (the declared name only — never its bounds or defaults, which are
 /// real type uses) scoped to the declaring item's full span. Runs inside the fused walk when
 /// the dispatch table flags the node's kind.
-fn collect_binders_in<'t>(node: &SgNode<'t>, binders: &mut Vec<(Range<usize>, Cow<'t, str>)>) {
+fn collect_binders_in<'t>(
+  node: &SgNode<'t>,
+  parent: Option<&SgNode<'t>>,
+  binders: &mut Vec<(Range<usize>, Cow<'t, str>)>,
+) {
   // The suppression scope is the whole declaring item (fn/struct/impl…, including its body).
-  let scope = node.parent().map_or_else(|| node.range(), |p| p.range());
+  let scope = parent.map_or_else(|| node.range(), |p| p.range());
   for param in node.children().filter(|c| c.is_named()) {
     let binder = if BINDER_LEAF_KINDS.contains(&param.kind().as_ref()) {
       Some(param)
@@ -2179,26 +2201,36 @@ const IMPL_TARGET_KINDS: &[&str] = &["type_identifier", "identifier", "constant"
 /// dedup run in the post-pass, once the walk has seen every `type_parameters` declaration.
 fn stage_type_use<'t>(
   node: &SgNode<'t>,
+  ancestors: &[SgNode<'t>],
   spec: &RefSpecData,
   span_cursor: &mut SpanCursor<'_>,
   pending: &mut Vec<Pending<'t>>,
 ) {
-  let Some(parent) = node.parent() else {
+  let Some(parent) = ancestors.last() else {
     return;
   };
   if parent
     .field("name")
     .is_some_and(|name| name.node_id() == node.node_id())
   {
-    return;
+    // A parent's `name` is normally a DEFINITION's own name — never a use. The one
+    // exception: body-less type wrappers (`struct X y;` — declarations, parameters,
+    // fields), where the wrapped name is exactly the type in use.
+    let bodyless_wrapper = spec
+      .type_ref_wrappers
+      .iter()
+      .any(|k| k.as_str() == parent.kind().as_ref())
+      && parent.field("body").is_none();
+    if !bodyless_wrapper {
+      return;
+    }
   }
-  let mut ancestor = Some(parent);
-  for _ in 0..2 {
-    let Some(a) = ancestor else { break };
+  // Parent and grandparent, straight off the walk stack (was two root-walking
+  // `Node::parent` calls per type leaf).
+  for a in ancestors.iter().rev().take(2) {
     if spec.implements.iter().any(|s| s.kind == a.kind().as_ref()) {
       return;
     }
-    ancestor = a.parent();
   }
   let range = node.range();
   let (Some(name), Some(from)) = (callee_name(node), span_cursor.enclosing(range.start)) else {
@@ -2260,8 +2292,8 @@ fn emit_implements<'t>(
 }
 
 /// A call node that is its same-kind parent's selected callee is a chain link, not a call site.
-fn is_chain_link(node: &SgNode<'_>, spec: &RefSpecData) -> bool {
-  let Some(parent) = node.parent() else {
+fn is_chain_link(node: &SgNode<'_>, parent: Option<&SgNode<'_>>, spec: &RefSpecData) -> bool {
+  let Some(parent) = parent else {
     return false;
   };
   let parent_kind = parent.kind();
@@ -2272,7 +2304,7 @@ fn is_chain_link(node: &SgNode<'_>, spec: &RefSpecData) -> bool {
     .calls
     .iter()
     .find(|c| c.kind == parent_kind.as_ref())
-    .and_then(|c| select(&parent, &c.callee))
+    .and_then(|c| select(parent, &c.callee))
     .is_some_and(|callee| callee.node_id() == node.node_id())
 }
 
@@ -2863,6 +2895,30 @@ mod tests {
   }
 
   #[test]
+  fn c_bodyless_struct_wrappers_stage_type_uses() {
+    // `struct fops` as a variable's or parameter's type is a USE of the type — the
+    // wrapper's name field must stage even though name-field nodes are normally
+    // definition names. The definition itself (body present) must not self-reference.
+    let var_refs = refs_for(
+      SupportLang::C,
+      "struct fops { int x; };\nstatic const struct fops my_ops = { 0 };\n",
+    );
+    let param_refs = refs_for(
+      SupportLang::C,
+      "struct fops { int x; };\nvoid takes(struct fops *f) { int y; }\n",
+    );
+    let count = |refs: &[(String, RefKind)]| {
+      refs.iter().filter(|(n, k)| n == "fops" && *k == RefKind::Type).count()
+    };
+    // (The shared test harness maps every span to one NodeId, so per-(from, name) dedup
+    // makes a combined-source count meaningless — the split sources are the real check.)
+    assert!(
+      count(&var_refs) >= 1 && count(&param_refs) >= 1,
+      "variable ({var_refs:?}) and parameter ({param_refs:?}) type uses must stage"
+    );
+  }
+
+  #[test]
   fn elixir_defs_skip_calls_emit_and_imports_resolve() {
     let refs = refs_for(
       SupportLang::Elixir,
@@ -3118,7 +3174,7 @@ mod tests {
     while let Some(node) = stack.pop() {
       push_children(&mut stack, &node);
       if spec.type_params.iter().any(|t| t.as_str() == node.kind().as_ref()) {
-        collect_binders_in(&node, &mut binders);
+        collect_binders_in(&node, node.parent().as_ref(), &mut binders);
       }
     }
 
@@ -3174,7 +3230,14 @@ mod tests {
           .field("name")
           .is_some_and(|name| name.node_id() == node.node_id())
         {
-          continue;
+          let bodyless_wrapper = spec
+            .type_ref_wrappers
+            .iter()
+            .any(|k| k.as_str() == parent.kind().as_ref())
+            && parent.field("body").is_none();
+          if !bodyless_wrapper {
+            continue;
+          }
         }
         let mut skip = false;
         let mut ancestor = Some(parent);
@@ -3254,7 +3317,8 @@ mod tests {
       let Some(cspec) = spec.calls.iter().find(|c| c.kind == kind) else {
         continue;
       };
-      if suppressed.remove(&node.node_id()) || is_chain_link(&node, spec) {
+      if suppressed.remove(&node.node_id()) || is_chain_link(&node, node.parent().as_ref(), spec)
+      {
         continue;
       }
       let Some(mut callee) = select(&node, &cspec.callee) else {

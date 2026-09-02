@@ -1,7 +1,7 @@
 # Adoption plan — what vorpal takes from the codebase-memory-mcp comparison
 
 Source: full architecture review + head-to-head kernel benchmarks of
-`../codebase-memory-mcp` (2026-08-29, see docs/BENCHMARKS.md hardware; their repo @
+`../codebase-memory-mcp` (2026-08-29, see README.md#performance hardware; their repo @
 `997d087b`). Where vorpal is ahead — cold index ~35×, incremental ~28×, no-change ~74×,
 queries ~80–700×, index size 7.5× smaller, bit-reproducible output (theirs drifts across
 identical runs) — nothing changes. This document is only the list worth taking, phrased in
@@ -161,7 +161,7 @@ actually matters.
   express. (Multi-keyword semantic AND left this list 2026-08-30: taken after all, as the
   semantic-tier plan's Stage AND — quoted-phrase conjunction with min-of-RRF scoring.)
 - **RAM-first marketing architecture** — their LZ4 + Aho-Corasick headline features are
-  dead code in production; the lesson is the opposite one: keep docs/BENCHMARKS.md
+  dead code in production; the lesson is the opposite one: keep README.md#performance
   command-reproducible, claims pinned to tests.
 
 ## Sequencing sketch

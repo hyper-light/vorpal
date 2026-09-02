@@ -72,10 +72,12 @@ pub fn seeds_for_paths(
 ) -> (Vec<vorpal_kg::NodeId>, usize) {
   let mut seeds: Vec<vorpal_kg::NodeId> = Vec::new();
   let mut missing = 0usize;
+  // The index stores paths under the CANONICAL root spelling (the build canonicalizes its
+  // src so every producer keys identically); a caller's verbatim root (symlinked /tmp,
+  // relative spellings) must resolve the same way before joining, or every lookup misses.
+  let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
   for rel in changed {
-    // The index stores paths exactly as walked — the CLI indexes an absolute or relative
-    // root and paths inherit that spelling, so join onto the same root the index was built
-    // from. File nodes carry their path as their NAME, so the name index resolves them.
+    // File nodes carry their path as their NAME, so the name index resolves them.
     let full = root.join(rel);
     let spelled = full.to_string_lossy();
     let file_nodes = kg.nodes_named(&spelled);

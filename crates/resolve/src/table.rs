@@ -7,11 +7,42 @@
 //! overhead *per shard* (hot names recur in every shard) and re-paid it during table
 //! absorption; at kernel scale that was a ~600 MB spike for ~58 MB of payload.
 
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use vorpal_kg::{Kg, NodeId, SymbolKind};
 
 use crate::intern::{Interner, NameId};
+
+/// Post-finalize `name → (start, len)` map, direct-indexed by the id's `(shard, slot)`
+/// decomposition: the per-shard slot is the dense insertion index the interner mints — a
+/// perfect hash we already own — so a `candidates()` probe is two dependent loads, no
+/// hashing, no probe sequence (~6.8M probes per link ran through SipHash before). Slots grow
+/// on touch; `len == 0` marks an absent name. Contents are a pure function of the pair
+/// sequence, so serial and sharded builds still compare equal.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct DenseRanges {
+  shards: Vec<Vec<(u32, u32)>>,
+  names: usize,
+}
+
+impl DenseRanges {
+  fn slot_mut(&mut self, name: NameId<'_>) -> &mut (u32, u32) {
+    if self.shards.is_empty() {
+      self.shards = vec![Vec::new(); crate::intern::SHARDS];
+    }
+    let (shard, slot) = name.shard_slot();
+    let vec = &mut self.shards[shard];
+    if vec.len() <= slot {
+      vec.resize(slot + 1, (u32::MAX, 0));
+    }
+    &mut vec[slot]
+  }
+
+  fn get(&self, name: NameId<'_>) -> Option<(u32, u32)> {
+    let (shard, slot) = name.shard_slot();
+    let value = *self.shards.get(shard)?.get(slot)?;
+    (value.1 > 0).then_some(value)
+  }
+}
 
 /// A definition candidate for resolution — plain old data over interned strings (~24 bytes;
 /// the owned-`String` form cost ~130 bytes per symbol × millions at kernel scale).
@@ -38,24 +69,24 @@ pub struct SymbolTable<'i> {
   pending: Vec<(NameId<'i>, Symbol<'i>)>,
   /// Post-finalize: symbols grouped contiguously by name, insertion order within a name.
   grouped: Vec<Symbol<'i>>,
-  /// Post-finalize: name → `(start, len)` into `grouped`.
-  ranges: HashMap<NameId<'i>, (u32, u32)>,
-  files: HashMap<NameId<'i>, NodeId>,
+  /// Post-finalize: name → `(start, len)` into `grouped`, direct-indexed (see [`DenseRanges`]).
+  ranges: DenseRanges,
+  files: FxHashMap<NameId<'i>, NodeId>,
   /// Import-proven per-file bindings: `(importing file's path, imported name)` → the node the
   /// file's import statement resolved to at constrained-or-better, single-target confidence
   /// (seeded by [`crate::seed_import_bindings`]). Consulted for bare-name references after
   /// local definitions (which shadow imports) and before global visibility. Probed, never
   /// iterated, so map order is never observed.
-  import_bindings: HashMap<(NameId<'i>, NameId<'i>), NodeId>,
+  import_bindings: FxHashMap<(NameId<'i>, NameId<'i>), NodeId>,
   /// Basename → every indexed file carrying it, as `(full path text, node)`, sorted by
   /// path at finalize — the candidate pool for root-relative import suffix matching
   /// ([`SymbolTable::file_by_suffix`]).
-  file_suffixes: HashMap<&'i str, Vec<(&'i str, NodeId)>>,
+  file_suffixes: FxHashMap<&'i str, Vec<(&'i str, NodeId)>>,
   /// Include-root support learned from the corpus's own import stream
   /// ([`SymbolTable::learn_include_roots`]): directory prefix → how many import
   /// occurrences it satisfies. The `-I` set inferred from data — probed for suffix
   /// tie-breaking, never iterated.
-  root_support: HashMap<&'i str, u32>,
+  root_support: FxHashMap<&'i str, u32>,
 }
 
 impl<'i> SymbolTable<'i> {
@@ -110,7 +141,7 @@ impl<'i> SymbolTable<'i> {
 
   /// Install the import-binding map (see the field's doc). Called once by the link phase's
   /// pre-pass, between `finalize` and the main resolution pass.
-  pub fn set_import_bindings(&mut self, bindings: HashMap<(NameId<'i>, NameId<'i>), NodeId>) {
+  pub fn set_import_bindings(&mut self, bindings: FxHashMap<(NameId<'i>, NameId<'i>), NodeId>) {
     self.import_bindings = bindings;
   }
 
@@ -130,6 +161,10 @@ impl<'i> SymbolTable<'i> {
     interner: &'i Interner,
     imports: &[crate::reference::Reference<'i>],
   ) {
+    // Derived from THIS import stream alone: a retained (maintained) table re-learns on
+    // every link, and support must equal what a from-scratch table learns from the same
+    // alive set — accumulation across links would let historical edits sway rung 2.
+    self.root_support.clear();
     for reference in imports {
       if reference.kind != crate::reference::RefKind::Import {
         continue;
@@ -256,15 +291,15 @@ impl<'i> SymbolTable<'i> {
     if total == 0 {
       return;
     }
-    // Pass 1: count occurrences per name.
-    into.ranges.reserve(total / 4);
+    // Pass 1: count occurrences per name (dense slots grow on first touch).
     for (name, _) in pairs.clone() {
-      into.ranges.entry(name).or_insert((u32::MAX, 0)).1 += 1;
+      into.ranges.slot_mut(name).1 += 1;
     }
     // Pass 2: assign each name's start at first appearance; scatter to the running slot.
     // (`u32::MAX` marks "start not yet assigned"; `grouped` is pre-filled with an arbitrary
     // symbol and fully overwritten by construction.)
     let mut cursor = 0u32;
+    let mut names = 0usize;
     let first = pairs
       .clone()
       .next()
@@ -272,15 +307,17 @@ impl<'i> SymbolTable<'i> {
       .1;
     into.grouped = vec![first; total];
     for (name, symbol) in pairs {
-      let range = into.ranges.get_mut(&name).expect("counted in pass 1");
+      let range = into.ranges.slot_mut(name);
       if range.0 == u32::MAX {
         range.0 = cursor;
         cursor += range.1;
         range.1 = 0;
+        names += 1;
       }
       into.grouped[(range.0 + range.1) as usize] = symbol;
       range.1 += 1;
     }
+    into.ranges.names = names;
   }
 
   /// Build a finalized table straight from per-shard tables in absorb order, without ever
@@ -347,21 +384,91 @@ impl<'i> SymbolTable<'i> {
     table
   }
 
+  /// Replace one name's candidate run in place (the retained daemon's table maintenance):
+  /// the new run appends at the tail of `grouped` and the name's slot repoints to it; the
+  /// old run becomes garbage (tracked by the caller via [`SymbolTable::grouped_len`] deltas
+  /// and retired by a full rebuild past a threshold). Candidate ORDER within the name is the
+  /// caller's contract — pass the run in canonical (path-major, row-ascending) order and
+  /// `candidates()` behaves exactly as a from-scratch build's.
+  pub fn replace_candidates(&mut self, name: NameId<'i>, run: &[Symbol<'i>]) {
+    debug_assert!(self.pending.is_empty(), "maintenance only after finalize");
+    let slot = self.ranges.slot_mut(name);
+    let had = slot.1 > 0;
+    if run.is_empty() {
+      if had {
+        self.ranges.names -= 1;
+      }
+      *self.ranges.slot_mut(name) = (u32::MAX, 0);
+      return;
+    }
+    let start = self.grouped.len() as u32;
+    self.grouped.extend_from_slice(run);
+    *self.ranges.slot_mut(name) = (start, run.len() as u32);
+    if !had {
+      self.ranges.names += 1;
+    }
+  }
+
+  /// Update (or insert) the file-node entry for `path` — an edited file's node id moves.
+  pub fn update_file(&mut self, path: NameId<'i>, id: NodeId) {
+    self.files.insert(path, id);
+  }
+
+  /// Drop the file-node entry for `path` — the file was deleted; path-form imports of it
+  /// must stop resolving instead of pointing at a retired row.
+  pub fn remove_file(&mut self, path: NameId<'i>) {
+    self.files.remove(&path);
+  }
+
+  /// Current length of the grouped candidate store — tail growth from
+  /// [`SymbolTable::replace_candidates`] minus nothing (garbage is never reclaimed in
+  /// place); callers difference this against live candidate counts to decide when a full
+  /// rebuild is cheaper than the accumulated waste.
+  pub fn grouped_len(&self) -> usize {
+    self.grouped.len()
+  }
+
   /// Every definition carrying `name` (the candidate set for resolution), in insertion order.
   pub fn candidates(&self, name: NameId<'i>) -> &[Symbol<'i>] {
     debug_assert!(
       self.pending.is_empty(),
       "finalize the table before resolving"
     );
-    match self.ranges.get(&name) {
-      Some(&(start, len)) => &self.grouped[start as usize..(start + len) as usize],
+    match self.ranges.get(name) {
+      Some((start, len)) => &self.grouped[start as usize..(start + len) as usize],
       None => &[],
     }
   }
 
   /// Total distinct names in the table (post-finalize).
   pub fn names(&self) -> usize {
-    self.ranges.len()
+    self.ranges.names
+  }
+}
+
+/// A finalized table with its interner brand erased, so a retained daemon can own it beside
+/// the `Interner` that built it (SUBSECOND.md Phase 3 — the same lifetime-free discipline as
+/// `RefStore`). Sound because the table stores interned IDS only — `NameId` is an index plus
+/// a phantom brand, never a pointer — and the brand exists solely to prevent cross-interner
+/// id confusion. [`RetainedSymbolTable::borrow_mut`] restores the brand; callers uphold the
+/// one rule that matters: **rebind only with the interner that built the table.**
+pub struct RetainedSymbolTable(SymbolTable<'static>);
+
+impl RetainedSymbolTable {
+  pub fn erase(table: SymbolTable<'_>) -> Self {
+    // SAFETY: `SymbolTable` transitively contains no references — `NameId<'i>` is
+    // `(NonZeroU32, PhantomData<&'i str>)` — so the only effect of the transmute is the
+    // phantom brand. The public contract above confines rebinding to the originating
+    // interner, which is exactly the invariant the brand encodes.
+    Self(unsafe { std::mem::transmute::<SymbolTable<'_>, SymbolTable<'static>>(table) })
+  }
+
+  pub fn borrow_mut<'i>(&mut self, _interner: &'i Interner) -> &mut SymbolTable<'i> {
+    // SAFETY: inverse of `erase` under the same no-references argument; `_interner` pins
+    // the caller to naming the session the ids belong to.
+    unsafe {
+      std::mem::transmute::<&mut SymbolTable<'static>, &mut SymbolTable<'i>>(&mut self.0)
+    }
   }
 }
 

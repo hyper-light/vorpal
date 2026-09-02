@@ -29,17 +29,44 @@ impl Graph {
     Self::from_parts(node_count, log.srcs(), log.dsts(), log.etypes())
   }
 
-  /// Build both directions from parallel `(src, dst, etype)` columns.
-  pub(crate) fn from_parts(node_count: u32, srcs: &[u32], dsts: &[u32], etypes: &[u16]) -> Self {
-    // out-CSR keys on src; in-CSC keys on dst (so its "targets" are the sources).
-    // The two directions are independent counting sorts over the same columns;
-    // building them concurrently halves the seal-compact interval (measured
-    // 0.36 s single-threaded at kernel scale). Scoped threads, no Arc (§7).
-    let (out, inc) = std::thread::scope(|scope| {
-      let out = scope.spawn(|| DirectedCsr::build(node_count, srcs, dsts, etypes));
-      let inc = DirectedCsr::build(node_count, dsts, srcs, etypes);
-      (out.join().expect("csr build panicked"), inc)
-    });
+  /// [`Graph::compact`] under the bucketed format's CSC law (P4.3): the CSC scatters over
+  /// the SRC-MAJOR enumeration (each source's edges in log order, sources ascending)
+  /// instead of the raw interleaved log. That enumeration is exactly what the per-bucket
+  /// edge slabs store, so a graph rebuilt from slabs is bit-identical to the sealed one —
+  /// per-destination adjacency order included. The out-CSR is unchanged (its per-src order
+  /// IS the log's restriction either way).
+  pub fn compact_src_major(node_count: u32, log: &EdgeLog) -> Self {
+    let out = DirectedCsr::build(node_count, log.srcs(), log.dsts(), log.etypes());
+    let total = out.total_edges();
+    let mut srcs = Vec::with_capacity(total);
+    let mut dsts = Vec::with_capacity(total);
+    let mut etypes = Vec::with_capacity(total);
+    for u in 0..node_count {
+      for (&dst, &et) in out.targets(u).iter().zip(out.edge_types(u)) {
+        srcs.push(u);
+        dsts.push(dst);
+        etypes.push(et);
+      }
+    }
+    let inc = DirectedCsr::build(node_count, &dsts, &srcs, &etypes);
+    Self {
+      node_count,
+      out,
+      inc,
+    }
+  }
+
+  /// Build both directions from parallel `(src, dst, etype)` columns. Public for the
+  /// bucketed edge store (P4.3), whose slab concatenation IS the src-major enumeration —
+  /// building from it here reproduces `compact_src_major`'s bytes exactly.
+  pub fn from_parts(node_count: u32, srcs: &[u32], dsts: &[u32], etypes: &[u16]) -> Self {
+    // out-CSR keys on src; in-CSC keys on dst (so its "targets" are the sources). The two
+    // directions share no state — build them concurrently (each build is itself a
+    // deterministic counting scatter, so the output bytes are unchanged).
+    let (out, inc) = rayon::join(
+      || DirectedCsr::build(node_count, srcs, dsts, etypes),
+      || DirectedCsr::build(node_count, dsts, srcs, etypes),
+    );
     Self {
       node_count,
       out,

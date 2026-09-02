@@ -120,6 +120,13 @@ impl EdgeLog {
     self.etypes.push(etype.0);
   }
 
+  /// Pre-size for a known batch (the bulk drain's per-chunk extend).
+  pub fn reserve(&mut self, additional: usize) {
+    self.srcs.reserve(additional);
+    self.dsts.reserve(additional);
+    self.etypes.reserve(additional);
+  }
+
   pub fn len(&self) -> usize {
     self.srcs.len()
   }
@@ -132,6 +139,19 @@ impl EdgeLog {
     self.srcs.clear();
     self.dsts.clear();
     self.etypes.clear();
+  }
+
+  /// Truncate to the first `len` edges — the retained-writer link path rolls the log back
+  /// to its containment watermark before re-appending fresh resolution edges.
+  pub fn truncate(&mut self, len: usize) {
+    self.srcs.truncate(len);
+    self.dsts.truncate(len);
+    self.etypes.truncate(len);
+  }
+
+  /// One `(src, dst, etype)` triple by index — random access for range-gathering seals.
+  pub fn triple(&self, index: usize) -> (u32, u32, EdgeType) {
+    (self.srcs[index], self.dsts[index], EdgeType(self.etypes[index]))
   }
 
   /// Release growth slack (capacity beyond length) back to the allocator.

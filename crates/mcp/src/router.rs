@@ -53,6 +53,13 @@ impl MultiServer {
     }
   }
 
+  /// The between-requests freshness pulse, fanned out to every enrolled project's server.
+  pub fn tick(&mut self) {
+    for server in self.servers.values_mut() {
+      server.tick();
+    }
+  }
+
   pub fn handle_line(&mut self, line: &str) -> Option<String> {
     let msg: Value = match serde_json::from_str(line) {
       Ok(v) => v,

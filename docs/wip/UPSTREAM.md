@@ -28,7 +28,7 @@ byte-for-byte where the surrounding code had not diverged.
 | `94bc9582` | Stop consulting ignore files outside `ruleDirs`/`utilDirs` (`.parents(false)`) | **Adopted** — `cli/src/config.rs`, both walker sites |
 | `63e94c48` + `4f75c214` | Outline recognizes TypeScript `namespace` and ambient `declare module` (incl. `ambient_declaration` wrapping), TS + TSX | **Adopted** — 8 rules appended to `outline/src/default_rules/typescript.yml`; verified extracting `export namespace` and `declare module "x"` |
 | `07080186` | Bump `ignore` crate to 0.4.27 | **Not applicable** — dependency version, tracked by the workspace lockfile |
-| `sg` deprecation, MSRV/dep bumps | CLI alias + toolchain | **Intentional divergence** — vorpal ships its own CLI identity (`vorpal`/`vp`); MSRV governed locally |
+| `sg` deprecation, MSRV/dep bumps | CLI alias + toolchain | **Intentional divergence** — vorpal ships its own CLI identity (`vorpal`); MSRV governed locally |
 
 Differential fixtures comparing vorpal against the pinned ast-grep binary across
 `run`/`scan`/`test`/outline/JSON/edits are still to be added (the `#1` "Done when" bar).
@@ -54,7 +54,7 @@ unaudited window between the fork base and the declared v0.45.0 baseline.
 
 | Area | Divergence | Reason |
 |---|---|---|
-| Branding / crate names | `ast-grep-*` → `vorpal-*`, CLI `sg`/`ast-grep` → `vorpal`/`vp` | Product identity; API shapes preserved |
+| Branding / crate names | `ast-grep-*` → `vorpal-*`, CLI `sg`/`ast-grep` → `vorpal` | Product identity; API shapes preserved |
 | Scan/run prefilter | SIMD literal prefilter incl. regex required-literal analysis + `vorpal-ignore` suppression awareness | Perf (kernel-scale scan at/below ripgrep); behavior-preserving by necessary-condition design |
 | Outline default rules | Bundled outline rules for all 28 languages; C/C++ declarator-identity fixes (pointer/array/fn-ptr names, body-required type definitions, method vs fn-ptr-field classification) | Feeds the knowledge graph; upstream coverage is narrower |
 | Repository layer | `index`/`graph`/`search`/`mcp` subcommands, knowledge graph, ANN, bindings additions | Vorpal's differentiating layer; additive |

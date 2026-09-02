@@ -20,9 +20,6 @@ rust-version.workspace = true
 name = "vorpal"
 path = "src/main.rs"
 
-[[bin]]
-name = "vp"
-path = "src/bin/alias.rs"
 
 [dependencies]
 vorpal-core.workspace = true
@@ -80,10 +77,30 @@ tokio = { version = "1.37", features = ["full"] }
 
 # Support cargo bininstall, https://github.com/hyper-light/vorpal/issues/1742
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/{ version }/app-{ target }{ archive-suffix }"
-pkg-fmt = "zip"
+# Release assets are raw single binaries named vorpal-<os>-<arch> (Windows: .exe) — one
+# override per supported target below; unsupported targets fail instead of guessing.
+pkg-fmt = "bin"
 bin-dir = "{ bin }{ binary-ext }"
 disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-macos-arm64"
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-macos-x64"
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-linux-x64"
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-linux-arm64"
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-linux-x64-musl"
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-linux-arm64-musl"
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-windows-x64.exe"
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-windows-arm64.exe"
+[package.metadata.binstall.overrides.i686-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/vorpal-windows-x86.exe"
 
 # jemalloc is the binary's allocator on every platform except MSVC (tikv-jemalloc-sys does
 # not build there); main.rs cfg-gates the #[global_allocator] to match.

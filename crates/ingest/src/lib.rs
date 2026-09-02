@@ -19,15 +19,24 @@ mod pack;
 mod pipeline;
 mod product;
 mod references;
+mod retained;
 mod selfcheck;
 pub mod requests;
 pub use requests::RequestReport;
 pub mod signature;
 pub mod similar;
-pub use similar::SimilarReport;
+pub use similar::{SigRow, SimilarReport};
+mod scoped;
+pub use scoped::{
+  DirtyFileInput, ProductSource, ScopedFileInput, ScopedOutcome, SimilarRepair,
+  affected_def_names, def_kinds_of, resolve_defs_changed, scoped_resolve_file,
+  scoped_resolve_files, scoped_similar_repair, similar_pairs_of_kg,
+  views_defs_changed_reject, views_defs_stable_reject,
+};
 pub mod typefacts;
 
 pub use manifest::{FileStat, Manifest};
+pub use vorpal_outline::model::OutlineItem;
 pub use outline_extractor::{OutlineExtractor, RuleSource};
 
 /// The extraction environment an index build runs under (F-M3): everything beyond the bundled
@@ -63,6 +72,18 @@ pub struct DynamicCanary {
 }
 
 impl ExtractionEnv {
+  /// Whether this is byte-for-byte the bundled behavior (no custom rules, specs, canaries,
+  /// or injection config). Retained fast paths that re-extract with the bundled extractor
+  /// (the daemon's serve-immediately probe and live overlay) key off this: a custom
+  /// environment falls through to the full env-aware pipeline instead of silently
+  /// extracting under the wrong rules.
+  pub fn is_default(&self) -> bool {
+    self.outline_sources.is_empty()
+      && self.ref_spec_sources.is_empty()
+      && self.canaries.is_empty()
+      && self.injection_config.is_none()
+  }
+
   /// The extractor this environment describes. Languages named by the sources must already be
   /// registered — dlopen is the caller's job (a one-shot at startup), never extraction's.
   pub fn extractor(&self) -> Result<OutlineExtractor, String> {
@@ -89,10 +110,15 @@ pub use selfcheck::{
   verify_default_extraction, verify_env_extraction, verify_extraction,
   verify_extraction_for_manifest,
 };
-pub use pack::{PackMsg, PackReader, PackWriter};
+pub use pack::{
+  BucketMeta, PACK_DIR, PACK_TOC, PackFormat, PackMsg, PackReader, PackWriter, bucket_count_for,
+  bucket_file_name, is_pack_member, splice_toc_digest,
+};
+pub use retained::{CanonicalOrder, RetainedIndex};
 pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,
-  StreamWork, apply_products_sharded, link_writer, link_writer_spilled, link_writer_spilled_with_flows, release_freed_pages,
+  PairingHandle, StreamWork, apply_products_sharded, link_writer, link_writer_spilled,
+  link_writer_spilled_with_flows, release_freed_pages, spawn_sig_pairing,
   stream_apply, stream_apply_spilled,
 };
 pub use product::{
@@ -106,7 +132,7 @@ pub use product::{
 };
 pub use vorpal_kg::{Kg, KgWriter, NodeDef, NodeId, SymbolKind};
 pub use vorpal_resolve::{
-  Confidence, RefKind, Reference, ResolutionGrade, ResolveReason, ResolveStats, Resolver,
+  Confidence, RefKind, Reference, ResolutionGrade, ResolveReason, ResolveStats, Resolver, REACH_GRAPH_FILE, ReachGraph,
 };
 pub use vorpal_resolve::Interner;
 

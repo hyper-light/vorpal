@@ -23,6 +23,10 @@ typedef struct {
 #define TS_MAX_INLINE_TREE_LENGTH UINT8_MAX
 #define TS_MAX_TREE_POOL_SIZE 32
 
+// vorpal: leaf-header recycling lives in children_cache.h (`ts_leaf_cache_*`),
+// superseding the earlier in-file freelist: same three hook points, plus a
+// swept env cap (`TS_LEAF_CACHE_CAP`) and a pthread-key drain at thread exit.
+
 // ExternalScannerState
 
 void ts_external_scanner_state_init(ExternalScannerState *self, const char *data, unsigned length) {

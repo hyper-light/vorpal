@@ -14,6 +14,8 @@ pub mod annfiles;
 pub mod artifact;
 pub mod cochange;
 pub mod traces;
+pub mod live;
+pub mod live_ann;
 pub mod gendiff;
 pub mod impact;
 pub mod autowarm;
@@ -50,6 +52,12 @@ use vorpal_kg::NodeId;
 pub struct IndexReport {
   /// The tree was unchanged since the last index — reused without re-parsing (§3.4).
   pub reused: bool,
+  /// The committed generation's GRAPH artifacts are byte-identical carries of the prior
+  /// generation's (whole-tree reuse, and the stamp-only cutoff — which re-extracts changed
+  /// files but proves their extraction unchanged). A serving daemon may keep its loaded
+  /// graph, ANN tier, and overlay: they remain exact for the new generation. Distinct from
+  /// `reused`, which additionally claims no file was re-parsed at all.
+  pub graph_reused: bool,
   /// Files re-parsed this run (changed, new, or cache-missing).
   pub indexed: u64,
   /// Files whose cached extraction product was replayed without a parse.
@@ -149,7 +157,7 @@ pub enum CacheMode {
 
 impl CacheMode {
   /// The mode the environment requests when a caller passes none.
-  fn from_env() -> CacheMode {
+  pub fn from_env() -> CacheMode {
     if std::env::var_os("VORPAL_VERIFY_CACHE").is_some_and(|v| v == "1") {
       CacheMode::Verified
     } else {
@@ -219,20 +227,97 @@ pub fn build_index_with(
   out: &Path,
   cache_mode: CacheMode,
 ) -> Result<IndexReport, Box<dyn Error>> {
-  build_index_full(src, out, cache_mode, ParseHealthPolicy::default())
+  build_index_full(src, out, cache_mode, ParseHealthPolicy::default(), None)
+}
+
+/// Watched-daemon build: `hints` is a COMPLETE set of every file changed since the prior
+/// manifest (the watcher's certainty contract — see `SourceWatch::take_changes`). The stat
+/// sweep is replaced by patching the prior manifest for exactly those paths; any hint the
+/// patch cannot prove equivalent to a full scan (a path the prior manifest never held — a
+/// nested .gitignore could make the walker disagree with the watcher about it) falls back to
+/// the full sweep. The committed generation is identical either way (pinned by test).
+pub fn build_index_watched(
+  src: &Path,
+  out: &Path,
+  hints: &std::collections::HashSet<PathBuf>,
+  env: &vorpal_ingest::ExtractionEnv,
+) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_inner(
+    src,
+    out,
+    CacheMode::from_env(),
+    ParseHealthPolicy::default(),
+    Some(hints),
+    None,
+    env,
+  )
 }
 
 /// [`build_index_with`] plus an explicit [`ParseHealthPolicy`] (IMPROVEMENTS #11): warn is
 /// today's behavior; exclude drops unhealthy files from the graph; fail aborts before the
 /// generation commits, listing offenders. Non-warn policies bypass the unchanged-tree fast
 /// path (its prior generation was built under some other policy and proves nothing).
+/// Patch a prior manifest with a COMPLETE set of changed paths in place of a stat sweep.
+/// `None` = the patch cannot be proven equivalent to a full scan (a hinted path the prior
+/// manifest never carried — the walker's ignore rules could disagree with the watcher about
+/// it) → the caller sweeps. Modified files re-stat; vanished files drop; hints the extractor
+/// does not handle are irrelevant by construction (the sweep would skip them too).
+fn patch_manifest(
+  prior: &Manifest,
+  hints: &std::collections::HashSet<PathBuf>,
+  handled: impl Fn(&str) -> bool,
+) -> Option<Manifest> {
+  let mut entries = prior.entries().to_vec();
+  for hint in hints {
+    let path_str = hint.to_string_lossy();
+    if !handled(&path_str) {
+      continue;
+    }
+    let at = entries.binary_search_by(|entry| entry.path.as_str().cmp(&path_str));
+    match (at, fs::metadata(hint)) {
+      (Ok(found), Ok(meta)) if meta.is_file() => {
+        let mtime_ns = meta
+          .modified()
+          .ok()
+          .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+          .map(|d| d.as_nanos() as u64)
+          .unwrap_or(0);
+        entries[found].size = meta.len();
+        entries[found].mtime_ns = mtime_ns;
+      }
+      (Ok(found), _) => {
+        // Vanished (deleted, or replaced by a non-file): drop it, as the sweep would.
+        entries.remove(found);
+      }
+      (Err(_), Err(_)) => {
+        // Never indexed and no longer present — transient noise, nothing to patch.
+      }
+      (Err(_), Ok(_)) => {
+        // A path the prior manifest never carried: only the ignore-aware walk can decide
+        // whether it belongs. Fall back to the sweep.
+        return None;
+      }
+    }
+  }
+  Some(Manifest::from_entries(entries))
+}
+
 pub fn build_index_full(
   src: &Path,
   out: &Path,
   cache_mode: CacheMode,
   policy: ParseHealthPolicy,
+  hints: Option<&std::collections::HashSet<PathBuf>>,
 ) -> Result<IndexReport, Box<dyn Error>> {
-  build_index_env(src, out, cache_mode, policy, &vorpal_ingest::ExtractionEnv::default())
+  build_index_inner(
+    src,
+    out,
+    cache_mode,
+    policy,
+    hints,
+    None,
+    &vorpal_ingest::ExtractionEnv::default(),
+  )
 }
 
 /// [`build_index_full`] under an explicit [`ExtractionEnv`] (F-M3): extra outline-rule sources
@@ -247,6 +332,202 @@ pub fn build_index_env(
   policy: ParseHealthPolicy,
   env: &vorpal_ingest::ExtractionEnv,
 ) -> Result<IndexReport, Box<dyn Error>> {
+  build_index_inner(src, out, cache_mode, policy, None, None, env)
+}
+
+/// Persist the sigs family (P4.5c): every signed definition's near-clone sketch, keyed by
+/// sealed node id, identity-coded to `(file_key, ordinal)` and bucketed for hard-link carry.
+/// Bucketed generations only — the flat lane's artifact set is frozen (its byte-identity to
+/// the pre-P4 binary is a proven law), so under `SegmentLayout::Flat` this writes nothing.
+/// The u64→u32 narrowing is checked: a sealed id past u32 is a corrupt universe, not data.
+pub(crate) fn save_sig_family(
+  staging: &Path,
+  rows: &[vorpal_ingest::SigRow],
+  bases: &Option<vorpal_kg::NodeIdMap>,
+  prior: &Path,
+) -> io::Result<()> {
+  let Some(map) = bases else {
+    return Ok(());
+  };
+  let mut family = Vec::with_capacity(rows.len());
+  for row in rows {
+    let node = u32::try_from(row.node)
+      .map_err(|_| io::Error::other("sig row node id exceeds the sealed id space"))?;
+    family.push(vorpal_kg::SigFamilyRow { node, shingles: row.shingles, sketch: row.sketch });
+  }
+  vorpal_kg::save_sigs(staging, &family, map, Some(prior))
+}
+
+/// A full-pipeline build whose persistence tail was deferred (SUBSECOND.md Phase 3, live
+/// rebuild v1). Everything answer-affecting is already computed — the graph is sealed and
+/// [`PendingPersist::persist`] performs only writes: evidence + segments + manifest into the
+/// staged directory, then the content-addressed generation commit. It is the exact
+/// synchronous tail, byte for byte and in the same order — only the thread differs — so the
+/// committed generation is identical to what a synchronous build of the same tree commits.
+pub struct PendingPersist {
+  out: PathBuf,
+  prior: PathBuf,
+  staging: PathBuf,
+  evidence: Vec<vorpal_kg::EvidenceRow>,
+  flows: Vec<vorpal_kg::DataflowRow>,
+  /// Sigs-family rows (P4.5c) in sealed-id space — persisted beside evidence, bucketed
+  /// generations only.
+  sigs: Vec<vorpal_ingest::SigRow>,
+  manifest: Manifest,
+  /// Encoded `reach.bin` bytes from the link — the deferred tail writes them exactly
+  /// where the synchronous tail does (beside dataflow), so both commit identical
+  /// generations.
+  reach_graph: Vec<u8>,
+  kg: Arc<Kg>,
+  /// The node-store layout this generation persists under (P4.2) — decided by the build
+  /// that deferred here, carried so the background tail writes the same format.
+  layout: vorpal_kg::SegmentLayout,
+  /// The still-running pack consolidation from the build that deferred here — joined
+  /// before the manifest/commit, so the deferred tail overlaps it exactly like the
+  /// synchronous tail does.
+  pack: Option<std::thread::JoinHandle<io::Result<()>>>,
+}
+
+impl PendingPersist {
+  /// Run the deferred tail. Returns the committed generation directory — the pin for
+  /// artifact-grade tools (`fetch_span`, `why`) once the caller adopts it. `String` error
+  /// (not `Box<dyn Error>`) because this crosses a thread boundary.
+  pub fn persist(self) -> Result<PathBuf, String> {
+    let PendingPersist {
+      out,
+      prior,
+      staging,
+      evidence,
+      flows,
+      sigs,
+      manifest,
+      reach_graph,
+      kg,
+      layout,
+      pack,
+    } = self;
+    let evidence_bases = kg
+      .node_id_map(&layout)
+      .map_err(|err| format!("evidence bases: {err}"))?;
+    let (evidence_result, dataflow_result, sigs_result, reach_result, kg_result) = std::thread::scope(|scope| {
+      let evidence_task = scope.spawn(|| {
+        let evidence_layout = match &evidence_bases {
+          None => vorpal_kg::EvidenceLayout::Flat,
+          Some(map) => vorpal_kg::EvidenceLayout::Bucketed {
+            nodes: map,
+            prior: Some(&prior),
+          },
+        };
+        vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
+      });
+      let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
+      let sigs_task = scope.spawn(|| save_sig_family(&staging, &sigs, &evidence_bases, &prior));
+      let reach_result = fs::write(staging.join("reach.bin"), &reach_graph);
+      let kg_result = kg.save_with(&staging, &layout);
+      (
+        evidence_task.join().expect("evidence saver panicked"),
+        dataflow_task.join().expect("dataflow saver panicked"),
+        sigs_task.join().expect("sigs saver panicked"),
+        reach_result,
+        kg_result,
+      )
+    });
+    evidence_result.map_err(|err| format!("evidence save failed: {err}"))?;
+    dataflow_result.map_err(|err| format!("dataflow save failed: {err}"))?;
+    sigs_result.map_err(|err| format!("sigs save failed: {err}"))?;
+    reach_result.map_err(|err| format!("reach save failed: {err}"))?;
+    kg_result.map_err(|err| format!("graph save failed: {err}"))?;
+    if let Some(pack) = pack {
+      pack
+        .join()
+        .map_err(|_| "pack writer panicked".to_string())?
+        .map_err(|err| format!("pack write failed: {err}"))?;
+    }
+    manifest
+      .save(&staging.join("manifest.bin"))
+      .map_err(|err| format!("manifest save failed: {err}"))?;
+    let id = commit_generation(&out, &prior, staging)
+      .map_err(|err| format!("generation commit failed: {err}"))?;
+    Ok(out.join("gen").join(id))
+  }
+}
+
+/// What [`build_index_live`] hands the daemon.
+pub struct LiveBuild {
+  pub report: IndexReport,
+  /// The sealed in-memory graph when the full pipeline ran — the daemon serves it directly
+  /// instead of re-loading bytes it just wrote. Fast paths (whole-tree reuse, the stamp-only
+  /// cutoff) leave it `None`: the caller's loaded graph is already answer-identical, and the
+  /// generation those paths committed hardlinks the very artifacts it has mapped.
+  pub kg: Option<Arc<Kg>>,
+  /// The deferred persistence tail when the full pipeline ran; the caller runs it on a
+  /// background thread and serves `kg` meanwhile. `None` whenever `kg` is `None` (fast
+  /// paths commit synchronously — they are already cheap).
+  pub pending: Option<PendingPersist>,
+}
+
+#[derive(Default)]
+struct LiveSlots {
+  kg: Option<Arc<Kg>>,
+  pending: Option<PendingPersist>,
+}
+
+/// Daemon variant of [`build_index_full`]: identical computation, but a full pipeline run
+/// returns with the sealed graph in hand and persistence deferred to the caller — the
+/// edit→queryable latency stops paying artifact writes, content hashing, and the commit.
+pub fn build_index_live(
+  src: &Path,
+  out: &Path,
+  hints: Option<&std::collections::HashSet<PathBuf>>,
+  env: &vorpal_ingest::ExtractionEnv,
+) -> Result<LiveBuild, Box<dyn Error>> {
+  let mut slots = LiveSlots::default();
+  let report = build_index_inner(
+    src,
+    out,
+    CacheMode::from_env(),
+    ParseHealthPolicy::default(),
+    hints,
+    Some(&mut slots),
+    env,
+  )?;
+  Ok(LiveBuild {
+    report,
+    kg: slots.kg,
+    pending: slots.pending,
+  })
+}
+
+fn build_index_inner(
+  src: &Path,
+  out: &Path,
+  cache_mode: CacheMode,
+  policy: ParseHealthPolicy,
+  hints: Option<&std::collections::HashSet<PathBuf>>,
+  live: Option<&mut LiveSlots>,
+  env: &vorpal_ingest::ExtractionEnv,
+) -> Result<IndexReport, Box<dyn Error>> {
+  // One tree, ONE spelling: canonicalize the root so every producer — CLI argv, daemon
+  // watch root, bindings — keys manifests, pack entries, and node identities (eids hash
+  // the path) identically. Without this a daemon-committed generation (canonical watch
+  // root, e.g. /private/tmp on macOS) and a CLI run of the same tree (verbatim argv,
+  // /tmp) miss every cache lookup and silently re-parse the world on each alternation.
+  // Hints rebase onto the canonical root by prefix swap (pure string op — works for
+  // deleted files, which canonicalize() cannot touch); an unreadable root keeps its
+  // verbatim spelling and the scan below reports the real error.
+  let canonical_src = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+  let rebased_hints: Option<std::collections::HashSet<PathBuf>> =
+    hints.filter(|_| canonical_src != src).map(|set| {
+      set
+        .iter()
+        .map(|hint| match hint.strip_prefix(src) {
+          Ok(rel) => canonical_src.join(rel),
+          Err(_) => hint.clone(),
+        })
+        .collect()
+    });
+  let hints = rebased_hints.as_ref().or(hints);
+  let src = canonical_src.as_path();
   // The build session's string interner (scoped-interner contract, docs/EMBEDDING.md):
   // created here, dropped when this function returns — reclaim is `Drop`, and the `NameId`
   // lifetime brand makes anything holding a session id un-returnable at compile time.
@@ -262,13 +543,37 @@ pub fn build_index_env(
   // Both the whole-tree fast path (via the manifest stamp) and the per-file replay gates key on
   // it, so editing a grammar OR an outline rule invalidates reuse just as a file edit would.
   let rules_digest = extractor.rules_digest();
-  vorpal_kg::phase_stamp("scan: manifest start");
-  let mut manifest = Manifest::scan(src, |p| extractor.handles(p))?;
-  vorpal_kg::phase_stamp("scan: manifest done");
+  // The prior generation resolves before the scan so a hinted build can patch its manifest.
+  let hinted_prior = vorpal_kg::resolve_index_dir(out);
+  let mut manifest = 'scan: {
+    if let Some(hints) = hints
+      && let Ok(prior_manifest) = Manifest::load(&hinted_prior.join("manifest.bin"))
+      && let Some(patched) = patch_manifest(&prior_manifest, hints, |p| extractor.handles(p))
+    {
+      vorpal_kg::phase_stamp("scan: hinted patch");
+      break 'scan patched;
+    }
+    vorpal_kg::phase_stamp("scan: manifest start");
+    let swept = Manifest::scan(src, |p| extractor.handles(p))?;
+    vorpal_kg::phase_stamp("scan: manifest done");
+    swept
+  };
   manifest.set_grammar_stamp(vorpal_ingest::extraction_identity(
     vorpal_ingest::global_grammar_stamp(),
     rules_digest,
   ));
+  // Phase-4 identity gate (P4.0): every file's tree-relative path must map to a unique
+  // 64-bit file key — the bucketed format keys storage by it. O(files) on every build,
+  // same posture as the u32 ceilings: loud and actionable, never a silent degradation.
+  // `tree_root` is also the pack's absolute→tree-relative conversion root (P4.1).
+  let tree_root: String = src.to_string_lossy().into_owned();
+  vorpal_kg::identity::verify_file_keys(
+    manifest
+      .entries()
+      .iter()
+      .map(|entry| vorpal_kg::identity::tree_relative(&entry.path, &tree_root)),
+  )
+  .map_err(io::Error::other)?;
   vorpal_kg::phase_stamp("build: grammar stamp done");
   // Generation layout (IMPROVEMENTS §4): `out` is the index *root*. The live artifacts sit in
   // an immutable, content-addressed generation dir named by `out/CURRENT`; this run reads the
@@ -304,7 +609,7 @@ pub fn build_index_env(
     if racy.is_empty() {
       return true;
     }
-    let Some(pack) = PackReader::open(&prior) else {
+    let Some(pack) = PackReader::open_rooted(&prior, Some(&tree_root)) else {
       return false;
     };
     racy.iter().all(|entry| {
@@ -323,12 +628,30 @@ pub fn build_index_env(
   // read, no CSR rebuild. An unreadable/corrupt index falls through to a rebuild instead of
   // wedging every subsequent run on the same error.
   if let Ok(prior_manifest) = Manifest::load(&manifest_path) {
+    // Family-law compatibility: a bucketed prior whose sigs family predates the current
+    // survivor law (family VERSION mismatch) is not reused and not composed from — every
+    // carry lane (whole-tree reuse, cutoff, respan, the scoped composes) would
+    // perpetuate the old family's bytes while a scratch build of the same tree now
+    // writes the new law's, breaking scratch ≡ incremental. One loud decline; the full
+    // pipeline rebuilds the family once and every fast lane reopens.
+    let prior_families_current = !prior.join(vorpal_kg::SIGS_TOC).is_file()
+      || vorpal_kg::SigStore::open(&prior).is_some();
+    if !prior_families_current {
+      vorpal_kg::phase_stamp(
+        "compose: prior sigs family is a previous version — full pipeline rebuilds it",
+      );
+    }
     if manifest.unchanged_since(&prior_manifest)
       && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
       && !verify_all
+      && prior_families_current
       && policy.mode == ParseHealthMode::Warn
-      && prior.join("strings.heap").exists()
-      && prior.join("graph.bin").exists()
+      // Readiness is FORMAT-AWARE: a bucketed generation's node store answers through
+      // its TOC (graph.bin is a lazy cache there, legitimately absent); the flat names
+      // were a silent v2 gap that made unchanged trees pay a rebuild pass — exposed the
+      // day the default flipped.
+      && (prior.join(vorpal_kg::NODES_TOC).is_file()
+        || (prior.join("strings.heap").exists() && prior.join("graph.bin").exists()))
       && racy_files_verify()
     {
       // Backfill: index dirs written before the name-index sidecar existed gain it here,
@@ -343,6 +666,7 @@ pub fn build_index_env(
       if let Ok(nodes) = Kg::peek_node_count(&prior) {
         return Ok(IndexReport {
           reused: true,
+          graph_reused: true,
           cache_mode: cache_mode.label(),
           error_files: 0,
           error_nodes: 0,
@@ -364,6 +688,94 @@ pub fn build_index_env(
           request_edges: 0,
           request_note: None,
         });
+      }
+    }
+    // Product-equality early cutoff (docs/wip/SUBSECOND.md Phase 1a — Bazel-style "change
+    // pruning"): stats changed, but if every changed file re-extracts to a product whose BODY
+    // is byte-equal to the cached one (mtime-only touches, checkout restamps, comment or
+    // whitespace edits that extraction cannot see), then a from-scratch build's graph
+    // artifacts are provably identical to the prior generation's — determinism makes
+    // "inputs byte-equal ⇒ outputs byte-equal" a theorem, not a hope. Stage the new
+    // generation as hardlinks of the five graph artifacts + a stamp-patched pack clone + the
+    // fresh manifest, and commit through the ordinary atomic path. Any doubt bails to the
+    // full pipeline. Gated exactly like the whole-tree fast path (verified mode and
+    // non-Warn health policies re-derive everything; racy files digest-verify).
+    // Trust gates BEFORE the stamp-only cutoff: the cutoff re-extracts changed files and
+    // rewrites stamp windows — extraction it trusts must pass the same selfcheck and
+    // environment canaries the pipeline demands. (The whole-tree reuse path above stays
+    // ungated: a reused build writes nothing, so there is nothing to trust anew.)
+    vorpal_ingest::verify_default_extraction(&extractor).map_err(io::Error::other)?;
+    vorpal_ingest::verify_env_extraction(&extractor, &env.canaries).map_err(io::Error::other)?;
+    if !verify_all
+      && policy.mode == ParseHealthMode::Warn
+      && prior_families_current
+      && manifest.grammar_stamp() == prior_manifest.grammar_stamp()
+    {
+      let ctx = CutoffContext {
+        manifest: &manifest,
+        prior_manifest: &prior_manifest,
+        prior_manifest_ns,
+        tree_root: &tree_root,
+      };
+      if let Some(mut report) =
+        try_stamp_only_cutoff(out, &prior, &ctx, &extractor, cache_mode.label())?
+      {
+        // The cutoff re-extracts changed files with this environment's extractor — the
+        // best-effort tier disclosure travels with every report, fast paths included.
+        report.unverified_langs = unverified_langs.clone();
+        return Ok(report);
+      }
+      // The scoped composes share ONE prior-graph load (each lane loaded its own kg +
+      // map before — ~50 ms per load at kernel scale, two wasted loads on every
+      // defs-changed edit). `load_prior_graph` answers None on flat/legacy priors —
+      // the chain is bucketed-only, exactly as the per-lane TOC guards had it.
+      if env.is_default()
+        && let Some(prior_graph) = compose::load_prior_graph(&prior)
+      {
+        // The RESPAN compose (P4.5b): span-only edits — the class between
+        // "byte-identical products" and "semantic change" — compose the next
+        // generation mechanically from the prior one. Same trust gates, same
+        // fallback posture.
+        if let Some(mut report) = compose::try_respan_compose(
+          out,
+          &prior,
+          &ctx,
+          &extractor,
+          cache_mode.label(),
+          &prior_graph,
+        )? {
+          report.unverified_langs = unverified_langs.clone();
+          return Ok(report);
+        }
+        // Past the respan, the DEFS-STABLE compose (P4.5c-2): body-edited files —
+        // definitions unchanged, references free — re-resolve against the prior
+        // universe and the families splice. Same trust gates, same loud fallback.
+        if let Some(mut report) = compose::try_defs_stable_compose(
+          out,
+          &prior,
+          &ctx,
+          &extractor,
+          cache_mode.label(),
+          &prior_graph,
+        )? {
+          report.unverified_langs = unverified_langs.clone();
+          return Ok(report);
+        }
+        // Past defs-stable, the DEFS-CHANGED compose (P4.5c-3): the definition set
+        // moved — the usage-dirty closure re-resolves against the successor universe
+        // and the families splice under the shift law. Same trust gates, same loud
+        // fallback.
+        if let Some(mut report) = compose::try_defs_changed_compose(
+          out,
+          &prior,
+          &ctx,
+          &extractor,
+          cache_mode.label(),
+          &prior_graph,
+        )? {
+          report.unverified_langs = unverified_langs.clone();
+          return Ok(report);
+        }
       }
     }
   }
@@ -399,7 +811,11 @@ pub fn build_index_env(
   // commit. Fresh per run (a crashed run's staging is swept by the next commit's GC).
   let staging = out
     .join("gen")
-    .join(format!(".staging-{}", std::process::id()));
+    .join(format!(
+      ".staging-{}-{}",
+      std::process::id(),
+      staging_nonce()
+    ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
 
@@ -419,13 +835,23 @@ pub fn build_index_env(
   // serializes the open path) plus **loose files**, still written by search banking (separate
   // processes must not contend on the pack) and consolidated — then deleted — here. Loose
   // wins over pack on lookup: it is only ever fresher.
-  let pack_reader = PackReader::open(&prior).map(Arc::new);
+  let pack_reader = PackReader::open_rooted(&prior, Some(&tree_root)).map(Arc::new);
   let loose: HashSet<OsString> = fs::read_dir(&products_dir)
     .map(|dir| dir.flatten().map(|f| f.file_name()).collect())
     .unwrap_or_default();
+  // The generation's storage format, decided once: bucketed by default since the flip,
+  // with VORPAL_FORMAT=flat as the deprecated legacy escape. It governs the pack layout,
+  // the node store layout, AND the canonical ingest order below — one decision, never
+  // re-read.
+  let format = vorpal_ingest::PackFormat::from_env();
   // The writer builds the new generation's pack in staging, copying reused bodies out of the
   // prior generation's mapping — the prior pack is never touched.
-  let pack_writer = PackWriter::new(&staging, pack_reader.clone());
+  let pack_writer = PackWriter::new(
+    &staging,
+    pack_reader.clone(),
+    Some(tree_root.clone()),
+    format,
+  );
   let pack_sink = pack_writer.sink();
   let live_paths: Vec<String> = manifest.entries().iter().map(|e| e.path.clone()).collect();
   let pack_thread = std::thread::spawn(move || pack_writer.finish(live_paths));
@@ -447,15 +873,39 @@ pub fn build_index_env(
   };
   let spill_path = staging.join(".refs.spill");
   let heap_stream = staging.join("strings.heap.tmp");
+  // P4.2: under the bucketed format the canonical order is BUCKET-MAJOR — and the batch
+  // pipeline's canonical order IS its ingest order, so the stream walks a permuted view of
+  // the entries. The manifest FILE stays path-sorted: every diff (two-pointer, racy-window,
+  // whole-tree fast path) keeps its sort invariant.
+  let bucket_major: Option<Vec<vorpal_ingest::FileStat>> = match format {
+    vorpal_ingest::PackFormat::Bucketed => {
+      let buckets = vorpal_kg::identity::bucket_count_for(manifest.entries().len());
+      let mut entries = manifest.entries().to_vec();
+      entries.sort_by(|a, b| {
+        let ka = vorpal_kg::identity::bucket_of(
+          vorpal_kg::identity::tree_relative(&a.path, &tree_root),
+          buckets,
+        );
+        let kb = vorpal_kg::identity::bucket_of(
+          vorpal_kg::identity::tree_relative(&b.path, &tree_root),
+          buckets,
+        );
+        ka.cmp(&kb).then_with(|| a.path.cmp(&b.path))
+      });
+      Some(entries)
+    }
+    vorpal_ingest::PackFormat::Flat => None,
+  };
+  let stream_entries: &[vorpal_ingest::FileStat] =
+    bucket_major.as_deref().unwrap_or(manifest.entries());
   vorpal_kg::phase_stamp("stream: start");
   let stream_result = stream_apply_spilled(
     &interner,
-    manifest.entries(),
+    stream_entries,
     stream_budget_bytes(),
     &spill_path,
     Some(&heap_stream),
     pack_reader.as_deref(),
-    Some(&pack_sink),
     |entry, scratch: &mut ExtractScratch| {
       let cache_name = cache_file_name(&entry.path);
       if loose.contains(&OsString::from(&cache_name)) {
@@ -537,56 +987,66 @@ pub fn build_index_env(
       let Ok(source) = scratch.read_source(Path::new(&entry.path)) else {
         return Ok(StreamWork::Skipped);
       };
-      // Extract-and-encode without materializing the owned product: borrowed parts serialize
-      // straight into this buffer, stamped with the entry's stat identity — byte-identical
-      // to encoding the stamped owned product (pinned by test). A fresh Vec per file is the
-      // old flow's cost too: mem::take surrendered the scratch buffer to the pack message
-      // every file, so there was never any capacity to reuse.
-      let mut body = Vec::new();
-      let Some(stats) = extractor.extract_product_encoded(
-        &entry.path,
-        source,
-        entry.size,
-        entry.mtime_ns,
-        &mut body,
-      ) else {
+      let Some(mut product) = extractor.extract_product(&entry.path, source) else {
         return Ok(StreamWork::Skipped);
       };
-      if stats.error_nodes > 0 {
+      if product.error_nodes > 0 {
         error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        error_nodes.fetch_add(stats.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
-        error_bytes.fetch_add(stats.error_bytes, std::sync::atomic::Ordering::Relaxed);
+        error_nodes.fetch_add(product.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
+        error_bytes.fetch_add(product.error_bytes, std::sync::atomic::Ordering::Relaxed);
       }
-      let unhealthy = policy.is_unhealthy(stats.error_bytes, entry.size);
+      let unhealthy = policy.is_unhealthy(product.error_bytes, entry.size);
       if unhealthy && policy.mode == ParseHealthMode::Fail {
-        note_unhealthy(&entry.path, stats.error_bytes, entry.size);
+        note_unhealthy(&entry.path, product.error_bytes, entry.size);
       }
-      if unhealthy && policy.mode == ParseHealthMode::Exclude {
-        // Excluded from the graph but still banked (exclusion is a graph decision, not a
-        // cache one) — this entry never reaches a committer, so the worker packs it itself.
-        pack_sink
-          .send(PackMsg {
-            path: entry.path.clone(),
-            body,
-          })
-          .map_err(send_fatal)?;
+      let excluded = unhealthy && policy.mode == ParseHealthMode::Exclude;
+      product.source_size = entry.size;
+      product.source_mtime_ns = entry.mtime_ns;
+      scratch.encode.clear();
+      vorpal_ingest::encode_product_into(&product, &mut scratch.encode);
+      // Move the encoded bytes into the message — cloning re-copied every parsed product
+      // (half a gigabyte on a cold kernel build); the scratch buffer regrows on next use.
+      pack_sink
+        .send(PackMsg {
+          path: entry.path.clone(),
+          body: std::mem::take(&mut scratch.encode),
+        })
+        .map_err(send_fatal)?;
+      if excluded {
         excluded_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(StreamWork::Skipped);
       }
-      // Healthy fresh parse: the buffer MOVES to the committer, which applies its decoded
-      // views and forwards the same buffer into the pack sink — one owner end to end, no
-      // copy, no sharing (the pack's canonical sort makes arrival order irrelevant).
-      Ok(StreamWork::ParsedEncoded(entry.path.clone(), body))
+      Ok(StreamWork::Parsed(entry.path.clone(), product))
     },
   );
   drop(pack_sink);
-  let pack_result = pack_thread.join().expect("pack writer panicked");
-  let (mut writer, spilled_refs, stream, arg_spill) = stream_result?;
-  pack_result?;
+  // The pack writer's tail (consolidation + flush of a ~0.5 GB pack at kernel scale) is
+  // pure I/O nothing before the commit reads — it keeps running while cochange, the table,
+  // resolution, and the seal proceed; every exit below joins it (the staged directory must
+  // never outlive an abandoned build with a writer still in it).
+  let (mut writer, spilled_refs, stream, mut arg_spill) = match stream_result {
+    Ok(parts) => parts,
+    Err(err) => {
+      let _ = pack_thread.join();
+      return Err(err.into());
+    }
+  };
+  // Near-clone pairing starts HERE — its input (the sig spill) closed with the stream, and
+  // it needs nothing else, so it overlaps the pack tail, cochange, the table build, AND
+  // resolution instead of only the link (it was the link's critical path by ~110ms at
+  // kernel scale).
+  let pairing = match vorpal_ingest::spawn_sig_pairing(&mut arg_spill) {
+    Ok(handle) => handle,
+    Err(err) => {
+      let _ = pack_thread.join();
+      return Err(err.into());
+    }
+  };
   // Fail policy judges here — before sealing, before the generation commits: nothing is
   // published, and the message lists the worst offenders with their damage ratios.
   let offenders = unhealthy_files.into_inner().unwrap();
   if !offenders.is_empty() {
+    let _ = pack_thread.join();
     let mut sorted = offenders;
     sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let shown: Vec<String> = sorted
@@ -611,6 +1071,7 @@ pub fn build_index_env(
   // so a single check on its final size proves no intermediate offset wrapped.
   const U32_CEIL: usize = u32::MAX as usize;
   if writer.node_count() > U32_CEIL {
+    let _ = pack_thread.join();
     return Err(format!(
       "index exceeds the supported node limit: {} definitions (max {U32_CEIL}); node ids are \
        32-bit — split the corpus into multiple indexes",
@@ -619,6 +1080,7 @@ pub fn build_index_env(
     .into());
   }
   if writer.heap_len() > U32_CEIL as u64 {
+    let _ = pack_thread.join();
     return Err(format!(
       "index string heap exceeds the 4 GiB addressable limit: {} bytes (max {U32_CEIL}); \
        names/paths/signatures use 32-bit offsets — split the corpus into multiple indexes",
@@ -679,37 +1141,25 @@ pub fn build_index_env(
   // Full re-link from the complete product set: identity, resolution, and edges are recomputed
   // from scratch, so stale state is structurally impossible; resolution links the merged
   // graph over the sharded table/resolve passes.
-  let (kg, resolve, evidence, flows, similar, request_report) =
-    vorpal_ingest::link_writer_spilled_with_flows(
+  let linked = vorpal_ingest::link_writer_spilled_with_flows(
     &interner,
     writer,
     spilled_refs,
     &Resolver::new(),
     Some(arg_spill),
-  )?;
-  // Persist the evidence sidecar (§5) and the graph segments CONCURRENTLY: they are
-  // independent artifacts in the same staged generation, and running them serially left
-  // 17 cores idle for the longer of the two. Evidence is canonically sorted (total order)
-  // inside its saver, so it still joins the content identity deterministically. The
-  // manifest stays strictly last — it is the commit point.
-  let (evidence_result, dataflow_result, kg_result) = std::thread::scope(|scope| {
-    let evidence_task = scope.spawn(|| vorpal_kg::save_evidence(&staging, evidence));
-    let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
-    let kg_result = kg.save(&staging);
-    (
-      evidence_task.join().map_err(|_| io::Error::other("evidence saver panicked")),
-      dataflow_task.join().map_err(|_| io::Error::other("dataflow saver panicked")),
-      kg_result,
-    )
-  });
-  evidence_result??;
-  dataflow_result??;
-  kg_result?;
-  manifest.save(&staging.join("manifest.bin"))?;
-  // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
-  commit_generation(out, &prior, staging)?;
-  Ok(IndexReport {
+    pairing,
+  );
+  let (kg, resolve, evidence, flows, similar, request_report, sig_rows, reach_graph) =
+    match linked {
+    Ok(parts) => parts,
+    Err(err) => {
+      let _ = pack_thread.join();
+      return Err(err.into());
+    }
+  };
+  let report = IndexReport {
     reused: false,
+    graph_reused: false,
     cache_mode: cache_mode.label(),
     indexed: reparsed,
     skipped: replayed,
@@ -730,15 +1180,98 @@ pub fn build_index_env(
     request_sites: request_report.sites,
     request_edges: request_report.edges,
     request_note: request_report.note,
-  })
+  };
+  // The node-store layout this generation persists under — same format decision as the
+  // pack, with the bucket law's one input (live file count) pinned from the manifest.
+  let layout = match format {
+    vorpal_ingest::PackFormat::Flat => vorpal_kg::SegmentLayout::Flat,
+    vorpal_ingest::PackFormat::Bucketed => vorpal_kg::SegmentLayout::Bucketed {
+      tree_root: tree_root.clone(),
+      prior: Some(prior.clone()),
+      live_files: manifest.entries().len(),
+    },
+  };
+  if let Some(slots) = live {
+    // Deferred persistence: the sealed graph is answer-complete NOW — hand it to the daemon
+    // and move the artifact writes + content-addressed commit onto its background thread.
+    // `PendingPersist::persist` is the exact tail below, so the committed generation is
+    // byte-identical either way.
+    let mut kg = kg;
+    // A served-from-RAM graph needs the in-memory name index: without it, every named query
+    // pays the full parallel scan the persisted names.idx exists to avoid.
+    kg.build_names_index();
+    let kg = Arc::new(kg);
+    slots.kg = Some(kg.clone());
+    slots.pending = Some(PendingPersist {
+      out: out.to_path_buf(),
+      prior,
+      staging,
+      evidence,
+      flows,
+      sigs: sig_rows,
+      manifest,
+      reach_graph,
+      kg,
+      layout,
+      pack: Some(pack_thread),
+    });
+    return Ok(report);
+  }
+  // Synchronous tail: the pack must be complete before the manifest (the commit point) and
+  // the content hash — join it here, after everything it overlapped.
+  pack_thread
+    .join()
+    .expect("pack writer panicked")?;
+  // Persist the evidence sidecar (§5) and the graph segments CONCURRENTLY: they are
+  // independent artifacts in the same staged generation, and running them serially left
+  // 17 cores idle for the longer of the two. Evidence is canonically sorted (total order)
+  // inside its saver, so it still joins the content identity deterministically. The
+  // manifest stays strictly last — it is the commit point.
+  let evidence_bases = kg.node_id_map(&layout)?;
+  let (evidence_result, dataflow_result, sigs_result, reach_result, kg_result) = std::thread::scope(|scope| {
+    let evidence_task = scope.spawn(|| {
+      let evidence_layout = match &evidence_bases {
+        None => vorpal_kg::EvidenceLayout::Flat,
+        Some(map) => vorpal_kg::EvidenceLayout::Bucketed {
+          nodes: map,
+          prior: Some(&prior),
+        },
+      };
+      vorpal_kg::save_evidence_with(&staging, evidence, &evidence_layout)
+    });
+    let dataflow_task = scope.spawn(|| vorpal_kg::save_dataflow(&staging, flows));
+    let sigs_task = scope.spawn(|| save_sig_family(&staging, &sig_rows, &evidence_bases, &prior));
+    // The include-edge graph scoped composes replay the reach oracle from — a
+    // single canonical artifact beside dataflow.bin (see resolve::reach).
+    let reach_result = fs::write(staging.join("reach.bin"), &reach_graph);
+    drop(reach_graph);
+    let kg_result = kg.save_with(&staging, &layout);
+    (
+      evidence_task.join().map_err(|_| io::Error::other("evidence saver panicked")),
+      dataflow_task.join().map_err(|_| io::Error::other("dataflow saver panicked")),
+      sigs_task.join().map_err(|_| io::Error::other("sigs saver panicked")),
+      reach_result,
+      kg_result,
+    )
+  });
+  evidence_result??;
+  dataflow_result??;
+  sigs_result??;
+  reach_result?;
+  kg_result?;
+  manifest.save(&staging.join("manifest.bin"))?;
+  // Commit: name the staged generation by its content, atomically repoint CURRENT, GC.
+  commit_generation(out, &prior, staging)?;
+  Ok(report)
 }
 
 /// The core artifact set a generation is named by — the complete persisted index, in fixed
 /// (sorted) order. Lazy sidecars added after commit (the ANN tier) are deliberately excluded:
 /// they are stamp-validated against the node segment, deterministic given the generation, and
 /// must not change its identity.
-pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
+pub(crate) const GENERATION_ARTIFACTS: [&str; 10] = [
   "dataflow.bin",
+  "reach.bin",
   "evidence.bin",
   "graph.bin",
   "manifest.bin",
@@ -748,6 +1281,55 @@ pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
   "products.pack",
   "strings.heap",
 ];
+
+/// Whether `name` is a legal generation-artifact name: the fixed flat set, a bucketed
+/// pack member (P4.1), or a bucketed node-store member (P4.2). The import allowlist and
+/// every sweep share this single predicate.
+pub(crate) fn is_generation_artifact_name(name: &str) -> bool {
+  GENERATION_ARTIFACTS.contains(&name)
+    || vorpal_ingest::is_pack_member(name)
+    || vorpal_kg::is_nodes_member(name)
+    || vorpal_kg::is_evidence_member(name)
+    || vorpal_kg::is_edges_member(name)
+    || vorpal_kg::is_usage_member(name)
+    || vorpal_kg::is_sigs_member(name)
+}
+
+/// Every artifact name this generation actually carries, in fixed order: the flat list
+/// (missing members skipped by callers that open them), then each bucketed family's
+/// members sorted by name (`products/…`, then `nodes/…`). The bucketed families have
+/// corpus-dependent file counts, so identity and staging walk THIS, never the const alone.
+pub(crate) fn generation_artifact_names(dir: &Path) -> Vec<String> {
+  // Bucketed generations (P4.2/P4.3) carry two DERIVED caches the identity must not fold:
+  // graph.bin (rebuilt from the edge slabs on any stamp mismatch) and names.idx (queries
+  // fall back to the scan). Flat generations keep both as truth.
+  let bucketed = dir.join(vorpal_kg::NODES_TOC).is_file();
+  let mut names: Vec<String> = GENERATION_ARTIFACTS
+    .iter()
+    .filter(|name| !(bucketed && (**name == "graph.bin" || **name == "names.idx")))
+    .map(|s| s.to_string())
+    .collect();
+  for family in [
+    vorpal_ingest::PACK_DIR,
+    vorpal_kg::NODES_DIR,
+    vorpal_kg::EVIDENCE_DIR,
+    vorpal_kg::EDGES_DIR,
+    vorpal_kg::USAGE_DIR,
+    vorpal_kg::SIGS_DIR,
+  ] {
+    if let Ok(dirents) = fs::read_dir(dir.join(family)) {
+      let mut members: Vec<String> = dirents
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .map(|file| format!("{family}/{file}"))
+        .filter(|name| is_generation_artifact_name(name))
+        .collect();
+      members.sort_unstable();
+      names.extend(members);
+    }
+  }
+  names
+}
 
 /// Commit a staged generation (IMPROVEMENTS §4): name it by its **content**, atomically swap
 /// the `CURRENT` pointer, and garbage-collect superseded generations.
@@ -771,19 +1353,85 @@ pub(crate) const GENERATION_ARTIFACTS: [&str; 9] = [
 /// cross-version interchange format — see docs on the shareable-artifact import for how that
 /// is handled honestly).
 pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
-  const HASH_CHUNK: u64 = 8 << 20;
-  let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-  for artifact in GENERATION_ARTIFACTS {
-    let path = dir.join(artifact);
-    let Ok(file) = fs::File::open(&path) else {
-      continue; // an artifact a smaller index legitimately lacks still yields a stable id
-    };
-    let len = file.metadata()?.len();
-    hasher.update(artifact.as_bytes());
-    hasher.update(&len.to_le_bytes());
-    let chunk_count = len.div_ceil(HASH_CHUNK);
-    let chunk_digests: io::Result<Vec<u128>> = {
-      use rayon::prelude::*;
+  generation_content_id_folded(dir, HASH_CHUNK)
+}
+
+/// The content-id fold's chunk size. A **fold-protocol constant**, not a tuning knob: chunk
+/// boundaries shape the per-chunk digests the id folds, so the value must be identical on
+/// every machine (a runtime-derived size would make generation ids machine-dependent) —
+/// changing it re-keys every generation id, which the dedup guard absorbs as one re-commit
+/// per tree. 1 MiB sits mid-plateau in the recorded two-scale sweep (docs/wip/SUBSECOND.md
+/// §P4.1, `content_id_sweep` example — linux-kernel and vorpal-repo generations, flat and
+/// bucketed): 256 KiB–1 MiB tie at the optimum on every shape, and the 8 MiB this replaced
+/// measured ~47% slower (kernel flat 24.0 ms → 16.3 ms).
+const HASH_CHUNK: u64 = 1 << 20;
+
+/// [`generation_content_id`] with an explicit chunk size — the sweep tool's entry point
+/// (`examples/content_id_sweep.rs`). Not an API: ids from non-default chunk sizes name
+/// nothing.
+#[doc(hidden)]
+pub fn generation_content_id_folded(dir: &Path, chunk: u64) -> io::Result<String> {
+  // P4.4 — the MERKLE commit: for bucketed generations the fold's input is the small
+  // fixed set {manifest.bin, dataflow.bin, each family's toc.bin} — the TOCs already pin
+  // every member's digest, so the id covers the same bytes transitively while the commit
+  // reads ~13 MB instead of ~1.5 GB at kernel scale. Dedup-guard soundness is preserved
+  // by construction: writers compute TOCs FROM member bytes, so equal TOCs from
+  // pipeline-produced directories mean equal members. (Adversarial member tampering
+  // without its TOC is caught where trust is needed — import verifies every exported
+  // artifact's raw digest, and loaders verify lengths and self-checks.)
+  if dir.join(vorpal_kg::NODES_TOC).is_file() {
+    return content_id_fold(dir, merkle_artifact_names(), chunk);
+  }
+  content_id_fold(dir, generation_artifact_names(dir), chunk)
+}
+
+/// The Merkle fold's fixed input set for bucketed generations, in sorted order.
+fn merkle_artifact_names() -> Vec<String> {
+  [
+    "dataflow.bin",
+    "edges/toc.bin",
+    "evidence/toc.bin",
+    "manifest.bin",
+    "nodes/toc.bin",
+    "products/toc.bin",
+    "reach.bin",
+    "sigs/toc.bin",
+    "usage/toc.bin",
+  ]
+  .into_iter()
+  .map(str::to_string)
+  .collect()
+}
+
+/// The pre-Merkle full-rehash fold over every artifact byte — the agreement oracle's
+/// reference (`tests/pack_v2.rs`): two generations agree under the Merkle id exactly when
+/// they agree under this.
+#[doc(hidden)]
+pub fn generation_content_id_full(dir: &Path) -> io::Result<String> {
+  content_id_fold(dir, generation_artifact_names(dir), HASH_CHUNK)
+}
+
+fn content_id_fold(dir: &Path, names: Vec<String>, chunk: u64) -> io::Result<String> {
+  use rayon::prelude::*;
+  let hash_chunk = chunk.max(1);
+  // Two axes of parallelism, one deterministic fold. The flat layout is one ~gigabyte pack
+  // — the win is chunk-parallel hashing WITHIN the file; the bucketed layout (P4.1) is ~10³
+  // megabyte-scale files — the win is hashing ACROSS them. Both run under one nested
+  // par_iter (rayon work-steals whichever axis has work), and the serial fold below
+  // consumes per-artifact digests in fixed name order, so the id is byte-for-byte the same
+  // fold as the sequential form — parallelism is a schedule, never a semantics.
+  // (artifact length, ordered per-chunk digests) — `None` for an absent artifact.
+  type ArtifactDigest = Option<(u64, Vec<u128>)>;
+  let digests: io::Result<Vec<ArtifactDigest>> = names
+    .par_iter()
+    .map(|artifact| {
+      let path = dir.join(artifact);
+      let Ok(file) = fs::File::open(&path) else {
+        // An artifact a smaller index legitimately lacks still yields a stable id.
+        return Ok(None);
+      };
+      let len = file.metadata()?.len();
+      let chunk_count = len.div_ceil(hash_chunk);
       // Positional reads per chunk: threads never share a cursor, and in-flight memory
       // stays at (pool width × 8 MiB) — the whole-artifact read would have re-materialized
       // a ~gigabyte pack this build just spent effort never holding at once. Unix pread's
@@ -801,7 +1449,7 @@ pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
         chunk_file.seek(SeekFrom::Start(offset))?;
         chunk_file.read_exact(buf)
       };
-      (0..chunk_count as usize)
+      let chunks: io::Result<Vec<u128>> = (0..chunk_count as usize)
         .into_par_iter()
         // Without a split floor, rayon's adaptive splitting reaches single-chunk
         // jobs under work-stealing and `map_init` runs its init per job — the
@@ -815,26 +1463,393 @@ pub(crate) fn generation_content_id(dir: &Path) -> io::Result<String> {
             .max(1),
         )
         .map_init(
-          // One reusable buffer per worker split: the per-chunk `vec![0; 8 MiB]`
+          // One reusable buffer per worker split: the per-chunk `vec![0; chunk]`
           // this replaces churned ~4 GB of allocations through the commit
           // hash at kernel scale (ledger-attributed) for identical digests.
           Vec::<u8>::new,
           |buf, index| {
-            let offset = index as u64 * HASH_CHUNK;
-            let want = HASH_CHUNK.min(len - offset) as usize;
+            let offset = index as u64 * hash_chunk;
+            let want = hash_chunk.min(len - offset) as usize;
             buf.clear();
             buf.resize(want, 0);
             read_chunk(buf, offset)?;
             Ok(xxhash_rust::xxh3::xxh3_128(buf))
           },
         )
-        .collect()
+        .collect();
+      Ok(Some((len, chunks?)))
+    })
+    .collect();
+  let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+  for (artifact, entry) in names.iter().zip(digests?) {
+    let Some((len, chunks)) = entry else {
+      continue;
     };
-    for digest in chunk_digests? {
+    hasher.update(artifact.as_bytes());
+    hasher.update(&len.to_le_bytes());
+    for digest in chunks {
       hasher.update(&digest.to_le_bytes());
     }
   }
   Ok(format!("{:032x}", hasher.digest128()))
+}
+
+/// The stamp-only commit cutoff (Phase 1a). Returns `Ok(Some(report))` after committing a
+/// new generation whose graph artifacts are carried forward byte-identically, `Ok(None)` to
+/// fall through to the full pipeline. Never guesses: every changed file's fresh extraction
+/// must match its cached product byte-for-byte outside the stamp window `[8..32)`
+/// (source size, mtime, content digest — magic/version before it and the grammar digest and
+/// entire extraction body after it must be equal), and adds/removes/loose-bank products all
+/// disqualify.
+/// The manifest-side context [`try_stamp_only_cutoff`] judges a build against: the fresh
+/// and prior manifests, the prior's write clock (racy-mtime window), and the canonical
+/// tree root (the pack's absolute→relative conversion point).
+#[derive(Clone, Copy)]
+pub(crate) struct CutoffContext<'a> {
+  pub(crate) manifest: &'a Manifest,
+  pub(crate) prior_manifest: &'a Manifest,
+  pub(crate) prior_manifest_ns: u64,
+  pub(crate) tree_root: &'a str,
+}
+
+fn try_stamp_only_cutoff(
+  out: &Path,
+  prior: &Path,
+  ctx: &CutoffContext<'_>,
+  extractor: &OutlineExtractor,
+  cache_mode_label: &'static str,
+) -> io::Result<Option<IndexReport>> {
+  let CutoffContext {
+    manifest,
+    prior_manifest,
+    prior_manifest_ns,
+    tree_root,
+  } = *ctx;
+  /// Above this many changed files the full pipeline is competitive and the cutoff's
+  /// serial re-extraction is not — a policy bound, not a correctness one.
+  const MAX_RESTAMPED: usize = 64;
+  // Path-sorted two-pointer diff: any add or remove disqualifies (the pipeline would change
+  // node ids and the pack's record set).
+  let current = manifest.entries();
+  let previous = prior_manifest.entries();
+  let (mut i, mut j) = (0usize, 0usize);
+  let mut changed: Vec<&vorpal_ingest::FileStat> = Vec::new();
+  while i < current.len() && j < previous.len() {
+    match current[i].path.cmp(&previous[j].path) {
+      std::cmp::Ordering::Less | std::cmp::Ordering::Greater => return Ok(None),
+      std::cmp::Ordering::Equal => {
+        if current[i].size != previous[j].size || current[i].mtime_ns != previous[j].mtime_ns {
+          changed.push(&current[i]);
+          if changed.len() > MAX_RESTAMPED {
+            return Ok(None);
+          }
+        }
+        i += 1;
+        j += 1;
+      }
+    }
+  }
+  if i < current.len() || j < previous.len() || changed.is_empty() {
+    return Ok(None);
+  }
+  // The racy-mtime hazard applies to files this run will TRUST WITHOUT READING — the
+  // stat-unchanged ones. (Changed files are re-extracted and byte-compared below, a
+  // strictly stronger check than the digest probe.) A stat-invisible edit inside the racy
+  // window among the unchanged set disqualifies the cutoff, exactly as it disqualifies the
+  // whole-tree fast path.
+  {
+    let changed_paths: std::collections::HashSet<&str> =
+      changed.iter().map(|e| e.path.as_str()).collect();
+    let racy_unchanged: Vec<&vorpal_ingest::FileStat> = manifest
+      .entries()
+      .iter()
+      .filter(|e| {
+        e.mtime_ns.abs_diff(prior_manifest_ns) < 2_000_000_000
+          && !changed_paths.contains(e.path.as_str())
+      })
+      .collect();
+    if !racy_unchanged.is_empty() {
+      let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
+        return Ok(None);
+      };
+      let all_match = racy_unchanged.iter().all(|entry| {
+        let stored = pack
+          .get(&entry.path)
+          .and_then(vorpal_ingest::peek_product_digest);
+        match (stored, fs::read(&entry.path)) {
+          (Some(digest), Ok(bytes)) => xxhash_rust::xxh3::xxh3_64(&bytes) == digest,
+          _ => false,
+        }
+      });
+      if !all_match {
+        return Ok(None);
+      }
+    }
+  }
+  // The full pipeline would consolidate loose bank products into the pack — a non-empty bank
+  // means the carried-forward pack would diverge.
+  if let Ok(mut bank) = fs::read_dir(out.join("products"))
+    && bank.next().is_some()
+  {
+    return Ok(None);
+  }
+  for artifact in ["dataflow.bin", "reach.bin", "manifest.bin"] {
+    if !prior.join(artifact).exists() {
+      return Ok(None);
+    }
+  }
+  // The node store, evidence, and edges are format-dependent families: flat files, or
+  // bucketed members (a family's toc present ⇒ every member it names is verified by its
+  // loader; the cutoff links whole families verbatim — stamps never live in any of them).
+  // graph.bin/names.idx are TRUTH for flat generations (required) and derived CACHES for
+  // bucketed ones (linked when present, never required).
+  let nodes_bucketed = prior.join(vorpal_kg::NODES_TOC).is_file();
+  if nodes_bucketed {
+    if !prior.join(vorpal_kg::EVIDENCE_TOC).is_file()
+      || !prior.join(vorpal_kg::EDGES_TOC).is_file()
+      || !prior.join(vorpal_kg::USAGE_TOC).is_file()
+      || !prior.join(vorpal_kg::SIGS_TOC).is_file()
+    {
+      return Ok(None);
+    }
+  } else if !prior.join("nodes.vseg").exists()
+    || !prior.join("strings.heap").exists()
+    || !prior.join("graph.bin").exists()
+    || !prior.join("evidence.bin").exists()
+    || !prior.join("names.idx").exists()
+  {
+    return Ok(None);
+  }
+  let Some(pack) = PackReader::open_rooted(prior, Some(tree_root)) else {
+    return Ok(None);
+  };
+  // Pack members are layout-specific. Flat: the staging below clones the one pack file and
+  // hard-links its sidecar, so both must exist. Bucketed: members come from the TOC — and a
+  // recovery-scanned pack (no trusted TOC) cannot prove per-bucket byte identity, so it
+  // falls to the full pipeline, which republishes a consistent TOC.
+  if pack.is_bucketed() {
+    if pack.bucket_meta().is_none() {
+      return Ok(None);
+    }
+  } else if !prior.join("products.pack").exists() || !prior.join("products.idx").exists() {
+    return Ok(None);
+  }
+  // Re-extract each changed file and compare against its cached product. The stamp window
+  // [8..32) (size u64, mtime u64, source-xxh3 u64 at fixed offsets after magic+version) is
+  // the only region allowed to differ; it is patched into the pack clone below so the pack
+  // equals what the pipeline would have written (fresh stamps, identical body).
+  let mut patches: Vec<(u32, u64, [u8; 24])> = Vec::new();
+  let mut encode_buf: Vec<u8> = Vec::new();
+  for entry in &changed {
+    let Ok(source) = fs::read_to_string(&entry.path) else {
+      return Ok(None);
+    };
+    let Some(mut product) = extractor.extract_product(&entry.path, &source) else {
+      return Ok(None);
+    };
+    product.source_size = entry.size;
+    product.source_mtime_ns = entry.mtime_ns;
+    encode_buf.clear();
+    vorpal_ingest::encode_product_into(&product, &mut encode_buf);
+    let Some(cached) = pack.get(&entry.path) else {
+      return Ok(None);
+    };
+    if encode_buf.len() != cached.len()
+      || encode_buf.len() < 32
+      || encode_buf[0..8] != cached[0..8]
+      || encode_buf[32..] != cached[32..]
+    {
+      return Ok(None);
+    }
+    // (The daemon's `extraction_unchanged` probe shares this exact window contract via
+    // `extraction_matches_cache`; the cutoff additionally needs the fresh stamps below.)
+    let Some((bucket, body_off, _)) = pack.body_locus(&entry.path) else {
+      return Ok(None);
+    };
+    let stamp: [u8; 24] = encode_buf[8..32].try_into().expect("stamp window");
+    patches.push((bucket, body_off + 8, stamp));
+  }
+  let bucketed = pack.is_bucketed();
+  let bucket_total = pack.loaded_buckets();
+  let prior_meta: Option<Vec<vorpal_ingest::BucketMeta>> = pack.bucket_meta().map(<[_]>::to_vec);
+  drop(pack);
+
+  // Stage the generation: hardlink (copy fallback) the byte-identical artifacts, clone the
+  // pack and patch the stamp windows in place (fs::copy clones on reflink-capable
+  // filesystems — APFS/btrfs/XFS — and degrades to a plain copy elsewhere; the patch then
+  // touches only the affected blocks), and write the fresh manifest. commit_generation
+  // provides the same atomic CURRENT swap, dedup guard, GC, and ANN carry-forward as the
+  // full pipeline — and because nodes.vseg is unchanged, the carried ANN tier's stamp still
+  // matches: the vector tier stays warm through the cutoff.
+  let staging = out.join(format!(
+    ".staging-{}-{}",
+    std::process::id(),
+    staging_nonce()
+  ));
+  let _ = fs::remove_dir_all(&staging);
+  fs::create_dir_all(&staging)?;
+  // Required flat carries; under the bucketed format graph.bin/names.idx are caches —
+  // linked when present via the optional list below, never required.
+  let link_required: &[&str] = if nodes_bucketed {
+    &["dataflow.bin", "reach.bin"]
+  } else {
+    &[
+      "graph.bin",
+      "evidence.bin",
+      "dataflow.bin",
+      "reach.bin",
+      "names.idx",
+      "nodes.vseg",
+      "strings.heap",
+    ]
+  };
+  for artifact in link_required {
+    let (from, to) = (prior.join(artifact), staging.join(artifact));
+    if fs::hard_link(&from, &to).is_err() {
+      fs::copy(&from, &to)?;
+    }
+  }
+  if nodes_bucketed {
+    for artifact in ["graph.bin", "graph.stamp", "names.idx"] {
+      let (from, to) = (prior.join(artifact), staging.join(artifact));
+      if from.exists() && fs::hard_link(&from, &to).is_err() {
+        fs::copy(&from, &to)?;
+      }
+    }
+  }
+  // Carry the bucketed families byte-identically (hard-links — the cutoff never
+  // patches their bytes; stamps live in the manifest and the pack). The carries run
+  // CONCURRENTLY: each destination directory's inode lock serializes its own links
+  // (~0.27 ms/entry on APFS), but the directories lock independently, so the fan-out
+  // costs roughly one family's worth of wall. The bucketed pack rides in the same
+  // batch; its patched buckets are replaced with private copies below.
+  let mut carry_list: Vec<(&str, vorpal_kg::FamilyMemberFn)> = Vec::with_capacity(6);
+  if nodes_bucketed {
+    carry_list.extend([
+      (vorpal_kg::NODES_DIR, vorpal_kg::is_nodes_member as fn(&str) -> bool),
+      (vorpal_kg::EVIDENCE_DIR, vorpal_kg::is_evidence_member),
+      (vorpal_kg::EDGES_DIR, vorpal_kg::is_edges_member),
+      (vorpal_kg::USAGE_DIR, vorpal_kg::is_usage_member),
+      (vorpal_kg::SIGS_DIR, vorpal_kg::is_sigs_member),
+    ]);
+  }
+  if bucketed {
+    carry_list.push((vorpal_ingest::PACK_DIR, vorpal_ingest::is_pack_member));
+  }
+  if !carry_list.is_empty() {
+    vorpal_kg::carry_families(prior, &staging, &carry_list)?;
+  }
+  if bucketed {
+    // Bucketed layout: untouched buckets hard-link (zero bytes moved); buckets holding a
+    // restamped product COPY-then-patch — never patch through a link, the prior
+    // generation's bytes are sealed. The TOC digest column is recomputed for exactly the
+    // patched buckets and spliced into the carried TOC.
+    use std::io::{Seek, SeekFrom, Write};
+    let Some(mut meta) = prior_meta else {
+      return Ok(None); // unreachable: gated above, kept as a fact not an assumption
+    };
+    let mut by_bucket: std::collections::HashMap<u32, Vec<(u64, [u8; 24])>> =
+      std::collections::HashMap::new();
+    for (bucket, offset, stamp) in patches {
+      by_bucket.entry(bucket).or_default().push((offset, stamp));
+    }
+    // The whole pack was link-carried in the parallel family batch above (the bucketed
+    // branch); a patched bucket must never be written through its link — the prior
+    // generation's bytes are sealed — so it is replaced with a private copy first.
+    for k in 0..bucket_total {
+      let name = vorpal_ingest::bucket_file_name(k);
+      let (from, to) = (prior.join(&name), staging.join(&name));
+      let Some(bucket_patches) = by_bucket.get(&k) else {
+        continue; // link-carried by the parallel family batch
+      };
+      let _ = fs::remove_file(&to);
+      fs::copy(&from, &to)?;
+      let mut pack_file = fs::OpenOptions::new().write(true).open(&to)?;
+      for (offset, stamp) in bucket_patches {
+        pack_file.seek(SeekFrom::Start(*offset))?;
+        pack_file.write_all(stamp)?;
+      }
+      pack_file.sync_all()?;
+      let Some(row) = meta.get_mut(k as usize) else {
+        return Ok(None);
+      };
+      row.digest = xxhash_rust::xxh3::xxh3_64(&fs::read(&to)?);
+    }
+    let mut toc = fs::read(prior.join(vorpal_ingest::PACK_TOC))?;
+    for &k in by_bucket.keys() {
+      let Some(row) = meta.get(k as usize) else {
+        return Ok(None);
+      };
+      if !vorpal_ingest::splice_toc_digest(&mut toc, k, row.digest) {
+        return Ok(None);
+      }
+    }
+    // The carried TOC entry is REPLACED, never written through (a truncate through the
+    // link would destroy the prior generation's TOC).
+    let toc_path = staging.join(vorpal_ingest::PACK_TOC);
+    let _ = fs::remove_file(&toc_path);
+    fs::write(&toc_path, &toc)?;
+  } else {
+    let (from, to) = (prior.join("products.idx"), staging.join("products.idx"));
+    if fs::hard_link(&from, &to).is_err() {
+      fs::copy(&from, &to)?;
+    }
+    fs::copy(prior.join("products.pack"), staging.join("products.pack"))?;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut pack_file = fs::OpenOptions::new()
+      .write(true)
+      .open(staging.join("products.pack"))?;
+    for (_, offset, stamp) in &patches {
+      pack_file.seek(SeekFrom::Start(*offset))?;
+      pack_file.write_all(stamp)?;
+    }
+    pack_file.sync_all()?;
+  }
+  manifest.save(&staging.join("manifest.bin"))?;
+  commit_generation(out, prior, staging)?;
+  let nodes = Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
+  Ok(Some(IndexReport {
+    // A stamp-only commit re-extracted the changed files and committed a NEW generation —
+    // `reused` ("unchanged, nothing re-parsed") would misreport both. The GRAPH, however,
+    // is a proven byte-identical carry.
+    reused: false,
+    graph_reused: true,
+    cache_mode: cache_mode_label,
+    error_files: 0,
+    error_nodes: 0,
+    error_bytes: 0,
+    excluded_files: 0,
+    indexed: changed.len() as u64,
+    skipped: manifest.len() as u64 - changed.len() as u64,
+    nodes,
+    resolved: 0,
+    ambiguous: 0,
+    external: 0,
+    masked: 0,
+    // The stamp-only commit carries every graph artifact forward byte-identically —
+    // cochange/similarity/request edges from the prior generation persist unchanged; the
+    // passes themselves did not run this build. Stated, never a silent zero.
+    unverified_langs: Vec::new(),
+    cochange_edges: 0,
+    cochange_note: Some(STAMP_ONLY_CARRY_NOTE.to_string()),
+    similar_edges: 0,
+    similar_note: Some(STAMP_ONLY_CARRY_NOTE.to_string()),
+    request_sites: 0,
+    request_edges: 0,
+    request_note: Some(STAMP_ONLY_CARRY_NOTE.to_string()),
+  }))
+}
+
+/// Report note for edge passes on the stamp-only path: the edges live in the carried
+/// artifacts; this build did not recompute them.
+const STAMP_ONLY_CARRY_NOTE: &str =
+  "carried forward from prior generation (stamp-only commit)";
+
+/// Process-unique staging suffix: concurrent builds in ONE process (the daemon's background
+/// canonicalizer racing a synchronous rebuild) must never share a staging directory.
+pub(crate) fn staging_nonce() -> u64 {
+  static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> io::Result<String> {
@@ -842,9 +1857,18 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // so the generation holds exactly its artifacts.
   for entry in fs::read_dir(&staging)?.flatten() {
     let name = entry.file_name();
-    let keep = GENERATION_ARTIFACTS
-      .iter()
-      .any(|artifact| name.as_os_str() == *artifact);
+    // The bucketed families (pack, node store) are the artifacts that are directories;
+    // their members are swept by the predicate below.
+    let keep = name.as_os_str() == vorpal_ingest::PACK_DIR
+      || name.as_os_str() == vorpal_kg::NODES_DIR
+      || name.as_os_str() == vorpal_kg::EVIDENCE_DIR
+      || name.as_os_str() == vorpal_kg::EDGES_DIR
+      || name.as_os_str() == vorpal_kg::USAGE_DIR
+      || name.as_os_str() == vorpal_kg::SIGS_DIR
+      || name.as_os_str() == "graph.stamp"
+      || GENERATION_ARTIFACTS
+        .iter()
+        .any(|artifact| name.as_os_str() == *artifact);
     if !keep {
       let path = entry.path();
       let _ = if path.is_dir() {
@@ -852,6 +1876,26 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       } else {
         fs::remove_file(&path)
       };
+    }
+  }
+  for family in [
+    vorpal_ingest::PACK_DIR,
+    vorpal_kg::NODES_DIR,
+    vorpal_kg::EVIDENCE_DIR,
+    vorpal_kg::EDGES_DIR,
+    vorpal_kg::USAGE_DIR,
+    vorpal_kg::SIGS_DIR,
+  ] {
+    if let Ok(dirents) = fs::read_dir(staging.join(family)) {
+      for entry in dirents.flatten() {
+        let member = entry
+          .file_name()
+          .into_string()
+          .map(|file| format!("{family}/{file}"));
+        if !member.as_deref().is_ok_and(is_generation_artifact_name) {
+          let _ = fs::remove_file(entry.path());
+        }
+      }
     }
   }
   // Content id over every artifact in fixed order. Chunked-parallel: each artifact is read
@@ -870,7 +1914,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // freshly staged one. Same-id ⇒ same artifact set, so presence-checking staging's artifacts
   // against it is a sufficient completeness test.
   let existing_is_complete = final_dir.exists()
-    && GENERATION_ARTIFACTS
+    && generation_artifact_names(&staging)
       .iter()
       .all(|artifact| !staging.join(artifact).exists() || final_dir.join(artifact).exists());
   if existing_is_complete {
@@ -889,13 +1933,17 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
   // would pay the exhaustive fallback until a full re-warm. Hardlinks are safe because ANN
   // artifacts are only ever *replaced* (tmp + rename), never mutated in place: a re-warm in
   // this generation unlinks its name without touching the prior generation's inode. Never
-  // overwrites — a generation that already warmed its own tier keeps it.
+  // overwrites — a generation that already warmed its own tier keeps it. The model
+  // provenance travels with the tier it describes: without it the carried bin reads as
+  // "unverifiable model" and every provenance-gated consumer (freshness, live-tier
+  // adoption) rejects a tier that is in fact reconcilable.
   if *prior != final_dir {
     for ann_file in [
       "ann.bin",
       "ann.files",
       "ann.model.bin",
       "ann.model.json",
+      "ann.calibration.json",
       "ann.stamp",
     ] {
       let from = prior.join(ann_file);
@@ -981,14 +2029,14 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
 /// necessary-condition semantics, same as every other cache in the pipeline. Hashing the
 /// loaded mapping (never re-reading `nodes.vseg`) pins every freshness decision to the
 /// generation actually in hand.
-fn stamp_of(kg: &Kg) -> u64 {
-  xxhash_rust::xxh3::xxh3_64(kg.node_segment_bytes())
+pub(crate) fn stamp_of(kg: &Kg) -> u64 {
+  kg.node_segment_stamp()
 }
 
 /// The vector tier's row set: every non-Import node id, ascending. Import nodes are wiring,
 /// not semantic targets (they stay reachable through the exact-name channel); build and
 /// fallback must agree on this filter or cold results would resurface import noise.
-fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
+pub(crate) fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
   (0..kg.node_count() as u64)
     .filter(|&i| {
       kg.node(NodeId::new(i))
@@ -999,10 +2047,52 @@ fn semantic_row_ids(kg: &Kg) -> Vec<u64> {
 
 /// Embed node `id`'s parts into `row` — the one embedding recipe (name double-weighted,
 /// signature, file basename) shared by the index build, the cold fallback, and the rerank.
-fn embed_node_into(kg: &Kg, embedder: &ActiveEmbedder, id: u64, row: &mut [f32]) {
+/// The canonical tree prefix every stored path shares (up to and including its trailing
+/// `/`), from the File nodes. Embeddings strip it so vectors are a function of the TREE,
+/// never its mount point: the same corpus indexed from two directories, machines, or OS
+/// temp layouts must rank identically — the cross-platform pinned retrieval baselines
+/// exist because of this invariance. Empty when the graph holds no File nodes.
+pub(crate) fn embedding_root(kg: &Kg) -> String {
+  let mut root: Option<String> = None;
+  for raw in 0..kg.node_count() as u64 {
+    let id = NodeId::new(raw);
+    if kg.node_kind(id) != Some(vorpal_kg::SymbolKind::File) {
+      continue;
+    }
+    let Some(path) = kg.node_path(id) else { continue };
+    match &mut root {
+      None => root = Some(path.to_string()),
+      Some(prefix) => {
+        let common = prefix
+          .bytes()
+          .zip(path.bytes())
+          .take_while(|(a, b)| a == b)
+          .count();
+        prefix.truncate(common);
+      }
+    }
+  }
+  let mut root = root.unwrap_or_default();
+  match root.rfind('/') {
+    Some(at) => root.truncate(at + 1),
+    None => root.clear(),
+  }
+  root
+}
+
+pub(crate) fn embed_node_into(
+  kg: &Kg,
+  embedder: &ActiveEmbedder,
+  id: u64,
+  row: &mut [f32],
+  root: &str,
+) {
   if let Some(view) = kg.node(NodeId::new(id)) {
+    // File nodes are NAMED by their stored (canonical, absolute) path — strip the tree
+    // root so only tree-relative tokens reach the vector (see `embedding_root`).
+    let name = view.name.strip_prefix(root).unwrap_or(view.name);
     let basename = view.path.rsplit('/').next().unwrap_or(view.path);
-    let parts = [view.name, view.name, view.signature, basename];
+    let parts = [name, name, view.signature, basename];
     embedder.embed_node_parts(&parts, row);
   } else {
     row.fill(0.0);
@@ -1044,7 +2134,7 @@ pub fn peek_ann_header(index_dir: &Path) -> Option<(usize, u64)> {
 /// deterministic lexical hasher is the offline default; a learned adapter would be selected
 /// here and carry `learned: true` in its persisted provenance — labeled honestly, never
 /// silently swapped (the provenance gate below invalidates the tier on ANY model change).
-fn active_embedder() -> LexicalEmbedder {
+pub(crate) fn active_embedder() -> LexicalEmbedder {
   LexicalEmbedder::default()
 }
 
@@ -1280,6 +2370,7 @@ fn write_model_provenance(
   fs::write(&tmp, json)?;
   fs::rename(tmp, index_dir.join("ann.model.json"))
 }
+
 
 /// Query-side coherence: are the persisted vector artifacts internally consistent for
 /// `current_stamp` — stamp file, bin header, tier record, and (learned) the model file
@@ -1740,12 +2831,12 @@ fn train_learned_model(kg: &Kg, index_dir: &Path) -> Result<LearnedStaticEmbedde
   fs::create_dir_all(&scratch).map_err(|e| format!("creating {}: {e}", scratch.display()))?;
   let policy = vorpal_mem::ResourcePolicy::new(
     vorpal_mem::HardwareProbe::detect(),
-    vorpal_mem::CorpusProbe::new(kg.node_segment_bytes().len() as u64, kg.node_count() as u64),
+    vorpal_mem::CorpusProbe::new(kg.node_segment_slabs().map(|s| s.len() as u64).sum::<u64>(), kg.node_count() as u64),
   );
   let resources = TrainResources {
     scratch_dir: scratch.clone(),
     page_bytes: policy.hardware().base_page_bytes,
-    arena_chunk_bytes: policy.arena_chunk_bytes(kg.node_segment_bytes().len() as u64),
+    arena_chunk_bytes: policy.arena_chunk_bytes(kg.node_segment_slabs().map(|s| s.len() as u64).sum::<u64>()),
     // Training sub-steps land in the same phase-stamp stream as every warm phase
     // (`VORPAL_PHASE_TRACE=1`) — the kernel-scale attribution discipline.
     progress: vorpal_kg::phase_stamp,
@@ -2150,13 +3241,14 @@ fn retrofit_learned_rows(
   let mut anchors = region("q.f32", vorpal_mem::AccessPattern::Sequential)?;
   let mut refined = region("a.f32", vorpal_mem::AccessPattern::Random)?;
   let mut spare = region("b.f32", vorpal_mem::AccessPattern::Random)?;
+  let embed_root = embedding_root(kg);
   {
     let rows: &mut [f32] = bytemuck::try_cast_slice_mut(anchors.as_mut_bytes())
       .map_err(|e| format!("scratch alignment: {e}"))?;
     rows
       .par_chunks_mut(dim)
       .enumerate()
-      .for_each(|(i, row)| embed_node_into(kg, embedder, ids[i], row));
+      .for_each(|(i, row)| embed_node_into(kg, embedder, ids[i], row, &embed_root));
   }
   vorpal_kg::phase_stamp("retrofit: anchors embedded");
   let edges = {
@@ -2253,6 +3345,7 @@ fn build_ann(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
   vorpal_kg::phase_stamp("ann: build start");
   let dim = embedder.dim();
+  let root = embedding_root(kg);
   let ids = semantic_row_ids(kg);
   let row_ids = ids.clone();
   // Rows embed straight into the index's storage (i8 codes at scale, in parallel): the
@@ -2269,13 +3362,22 @@ fn build_ann(
       }
     }),
     None => AnnIndex::build_rows(dim, ids, |i, row| {
-      embed_node_into(kg, embedder, row_ids[i], row)
+      embed_node_into(kg, embedder, row_ids[i], row, &root)
     }),
   };
+  let calibration = index.calibration();
   vorpal_kg::phase_stamp("ann: save start");
   index
     .with_base_stamp(base_stamp)
     .save(&out.join("ann.bin"))?;
+  // Persist the Phase-2a calibration beside the tier so provenance survives the process:
+  // a sidecar line the model-provenance reader ignores and humans/tools can read.
+  if let Some((l_build, recall)) = calibration {
+    let _ = fs::write(
+      out.join("ann.calibration.json"),
+      format!("{{\"l_build\":{l_build},\"pool_recall\":{recall:.4},\"probes\":32,\"k\":10,\"search_l\":200}}\n"),
+    );
+  }
   // The per-file identity map for this generation — what lets a later search remap
   // unchanged files and overlay changed ones instead of rebuilding (§ overlay).
   annfiles::save(out, base_stamp, &annfiles::file_runs_of(kg))?;
@@ -2522,6 +3624,7 @@ fn calibrate_semantic_cutover(kg: &Kg, ann: &AnnIndex, embedder: &ActiveEmbedder
     samples.sort_by(f64::total_cmp);
     samples.get(samples.len() / 2).copied().unwrap_or(0.0)
   };
+  let embed_root = embedding_root(kg);
   let mut scan_samples = Vec::new();
   for _ in 0..3 {
     for query in &queries {
@@ -2540,7 +3643,7 @@ fn calibrate_semantic_cutover(kg: &Kg, ann: &AnnIndex, embedder: &ActiveEmbedder
         std::hint::black_box(vorpal_ann::exhaustive_semantic(
           dim,
           &rows,
-          |i, row| embed_node_into(kg, embedder, rows[i], row),
+          |i, row| embed_node_into(kg, embedder, rows[i], row, &embed_root),
           query,
           1,
         ));
@@ -2783,7 +3886,10 @@ pub fn path_class(path: &str) -> PathClass {
 
 /// The filter compiled for the hot path: kind/lang parsed once, applied per node view.
 struct CompiledSearchFilter<'f> {
-  path_prefix: Option<&'f str>,
+  /// `Cow` because an existing prefix path re-spells to the graph's canonical form at
+  /// compile time (the build canonicalizes its root, so `/tmp/...` filters must meet
+  /// `/private/tmp/...` node paths); a prefix that names nothing stays verbatim.
+  path_prefix: Option<std::borrow::Cow<'f, str>>,
   path_suffix: Option<&'f str>,
   kind: Option<vorpal_kg::SymbolKind>,
   lang: Option<String>,
@@ -2807,8 +3913,26 @@ impl<'f> CompiledSearchFilter<'f> {
       ),
       None => None,
     };
+    let path_prefix = filter.path_prefix.as_deref().map(|prefix| {
+      // Canonicalize a prefix that names a real path (preserving an intentional trailing
+      // slash); partial prefixes cannot resolve and keep their verbatim spelling.
+      match Path::new(prefix).canonicalize() {
+        Ok(canonical) => {
+          let mut spelled = canonical.to_string_lossy().into_owned();
+          if prefix.ends_with('/') && !spelled.ends_with('/') {
+            spelled.push('/');
+          }
+          if spelled == prefix {
+            std::borrow::Cow::Borrowed(prefix)
+          } else {
+            std::borrow::Cow::Owned(spelled)
+          }
+        }
+        Err(_) => std::borrow::Cow::Borrowed(prefix),
+      }
+    });
     Ok(Self {
-      path_prefix: filter.path_prefix.as_deref(),
+      path_prefix,
       path_suffix: filter.path_suffix.as_deref(),
       kind,
       lang,
@@ -2821,8 +3945,8 @@ impl<'f> CompiledSearchFilter<'f> {
     let Some(view) = kg.node(NodeId::new(id)) else {
       return false;
     };
-    if let Some(prefix) = self.path_prefix {
-      if !view.path.starts_with(prefix) {
+    if let Some(prefix) = &self.path_prefix {
+      if !view.path.starts_with(prefix.as_ref()) {
         return false;
       }
     }
@@ -2861,6 +3985,51 @@ pub fn search_records(
   search_records_filtered(index_dir, query, k, &SearchFilter::default())
 }
 
+/// [`search_records_filtered`] with the semantic candidate pool supplied by the daemon's
+/// live ANN tier. Filters, the full-precision rerank, and fusion are the shared path — the
+/// live tier only replaces WHERE the approximate pool came from.
+pub fn search_records_filtered_live(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+  filter: &SearchFilter,
+  tier: &live_ann::LiveAnnTier,
+) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
+  let searcher = cached_searcher(index_dir)?;
+  let pool = (k * 4).max(50);
+  let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
+  let query_vec = active_embedder().embed(query);
+  let semantic_pool = tier.search_ids(&query_vec, take);
+  let ranked = searcher.run_with_semantic_pool(query, k, filter, semantic_pool)?;
+  Ok(hit_records(&searcher.kg, ranked))
+}
+
+/// Map a ranked `(row, score, per-channel ranks)` list into hit records — shared by every
+/// search-records surface.
+fn hit_records(kg: &Kg, ranked: Vec<(u64, f32, Vec<Option<usize>>)>) -> Vec<records::SearchHitRecord> {
+  const CHANNELS: [&str; 3] = ["name", "vector", "graph"];
+  ranked
+    .into_iter()
+    .filter_map(|(row, score, ranks)| {
+      Some(records::SearchHitRecord {
+        node: records::node_record(kg, NodeId::new(row))?,
+        score,
+        channels: CHANNELS
+          .iter()
+          .zip(&ranks)
+          .filter_map(|(&channel, rank)| {
+            rank.map(|rank| records::ChannelRank {
+              channel,
+              rank: rank + 1,
+              phrase: None,
+            })
+          })
+          .collect(),
+      })
+    })
+    .collect()
+}
+
 /// [`search_records`] with structured pre-ranking filters.
 pub fn search_records_filtered(
   index_dir: &Path,
@@ -2881,6 +4050,24 @@ pub fn search_report_filtered(
   filter: &SearchFilter,
 ) -> Result<records::SearchReport, Box<dyn Error>> {
   cached_searcher(index_dir)?.report(query, k, filter)
+}
+
+/// [`search_report_filtered`] with the semantic candidate pool served by the daemon's
+/// LIVE ANN tier — pool sizing mirrors the persisted dispatch, and the query vector
+/// comes from the searcher's own embedder so live rows and rerank rows share one model.
+pub fn search_report_filtered_live(
+  index_dir: &Path,
+  query: &str,
+  k: usize,
+  filter: &SearchFilter,
+  tier: &live_ann::LiveAnnTier,
+) -> Result<records::SearchReport, Box<dyn Error>> {
+  let searcher = cached_searcher(index_dir)?;
+  let pool = (k * 4).max(50);
+  let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
+  let query_vec = searcher.embedder.embed(query);
+  let semantic_pool = tier.search_ids(&query_vec, take);
+  searcher.report_live(query, k, filter, semantic_pool)
 }
 
 /// Parse the conjunctive search syntax: the ENTIRE query must be two or more double-quoted
@@ -3132,7 +4319,7 @@ impl Searcher {
       // the two vecs (record types are deliberately Clone-free).
       return Ok((self.records(query, k, filter)?, self.records(query, k, filter)?));
     }
-    let channels = self.channel_lists_with_bm25(query, rerank_pool(k), filter, true)?;
+    let channels = self.channel_lists_with_bm25(query, rerank_pool(k), filter, true, None)?;
     let without = vec![
       channels.named.clone(),
       channels.semantic.clone(),
@@ -3165,6 +4352,27 @@ impl Searcher {
     match parse_and_phrases(query) {
       None => Ok(records::SearchReport {
         hits: self.hits_from_ranked(self.run(query, k, filter)?, None),
+        multi_phrase: None,
+      }),
+      Some(phrases) => self.report_multi(&phrases, k, filter),
+    }
+  }
+
+  /// [`Searcher::report`] with the semantic pool served by the daemon's live ANN
+  /// tier. Single-phrase queries ride [`Searcher::run_with_semantic_pool`];
+  /// conjunctions keep the persisted-tier multi-phrase path (the live tier serves
+  /// one pool per query — per-phrase live pools are a recorded seam, not silently
+  /// approximated).
+  pub fn report_live(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+    semantic_pool: Vec<u64>,
+  ) -> Result<records::SearchReport, Box<dyn Error>> {
+    match parse_and_phrases(query) {
+      None => Ok(records::SearchReport {
+        hits: self.hits_from_ranked(self.run_with_semantic_pool(query, k, filter, semantic_pool)?, None),
         multi_phrase: None,
       }),
       Some(phrases) => self.report_multi(&phrases, k, filter),
@@ -3604,7 +4812,7 @@ impl Searcher {
         .collect::<Vec<_>>()
         .join(" ");
       // Both fusions PAIRED from one channel computation.
-      let channels = self.channel_lists_with_bm25(&query, rerank_pool(CUTOFF), &filter, true)?;
+      let channels = self.channel_lists_with_bm25(&query, rerank_pool(CUTOFF), &filter, true, None)?;
       let base = vec![channels.named, channels.semantic, channels.by_degree];
       let rank_of = |lists: &[Vec<u64>]| -> f64 {
         rrf_fuse_explained(lists, CUTOFF)
@@ -3650,18 +4858,47 @@ impl Searcher {
     pool: usize,
     filter: &SearchFilter,
   ) -> Result<Channels, Box<dyn Error>> {
-    self.channel_lists_with_bm25(query, pool, filter, self.bm25_enabled)
+    self.channel_lists_with_bm25(query, pool, filter, self.bm25_enabled, None)
+  }
+
+  /// [`Searcher::run`] with the semantic candidate pool SUPPLIED by the caller (the
+  /// daemon's live ANN tier) instead of chosen by the tier dispatch below. Everything
+  /// downstream — filters, the full-precision re-embedding rerank, RRF fusion, the
+  /// encoder rerank — is the shared path, so a live-tier answer differs from a
+  /// persisted-tier answer only in which approximate pool fed the exact rerank.
+  pub fn run_with_semantic_pool(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+    semantic_pool: Vec<u64>,
+  ) -> Result<Vec<FusedHit>, Box<dyn Error>> {
+    let channels = self.channel_lists_with_bm25(
+      query,
+      rerank_pool(k),
+      filter,
+      self.bm25_enabled,
+      Some(semantic_pool),
+    )?;
+    let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
+    if self.bm25_enabled {
+      lists.push(channels.bm25);
+    }
+    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k)))
   }
 
   /// [`Searcher::channel_lists`] with the BM25 list computed on demand — the serving
   /// path passes the record's per-corpus verdict; the warm-time gate passes `true`
   /// so both fusions probe from ONE channel computation (paired by construction).
+  /// `supplied_pool` (the daemon's live ANN tier) replaces the semantic tier
+  /// dispatch when present; every other channel is unchanged.
   fn channel_lists_with_bm25(
     &self,
     query: &str,
     pool: usize,
     filter: &SearchFilter,
     want_bm25: bool,
+    supplied_pool: Option<Vec<u64>>,
   ) -> Result<Channels, Box<dyn Error>> {
     let kg = &self.kg;
     let index_dir = self.generation_dir.as_path();
@@ -3670,6 +4907,9 @@ impl Searcher {
     // so query vectors, overlay embeds, and the rerank always match the stored rows.
     let embedder = &self.embedder;
     let query_vec = embedder.embed(query);
+    // One root per query session: every node vector this search computes strips the same
+    // canonical tree prefix (see `embedding_root`).
+    let embed_root = embedding_root(kg);
 
   // Semantic candidate pool, by tier — a search NEVER waits on an ANN build:
   // 1. **Base-fresh**: the persisted tier matches this KG generation → beam search.
@@ -3706,7 +4946,11 @@ impl Searcher {
     /// [`POSITIVE_BOUNDARY`] trim they feed) are the same algebra at code precision.
     Quantized(Vec<(u64, f32)>),
   }
-  let candidates: SemanticCandidates = if !take_exhaustive && let Some(ann) = &self.ann {
+  let candidates: SemanticCandidates = if let Some(supplied) = supplied_pool {
+    // The daemon's live tier already picked the pool; the exact rerank below
+    // orders it — identical downstream to any approximate tier.
+    SemanticCandidates::Approx(supplied)
+  } else if !take_exhaustive && let Some(ann) = &self.ann {
     SemanticCandidates::Approx(
       ann
         .search(&query_vec, take)
@@ -3735,7 +4979,7 @@ impl Searcher {
     let overlay_hits = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &overlay.overlay_ids,
-      |i, row| embed_node_into(kg, embedder, overlay.overlay_ids[i], row),
+      |i, row| embed_node_into(kg, embedder, overlay.overlay_ids[i], row, &embed_root),
       &query_vec,
       take,
     );
@@ -3780,7 +5024,7 @@ impl Searcher {
         SemanticCandidates::Exact(vorpal_ann::exhaustive_semantic(
           embedder.dim(),
           &ids,
-          |i, row| embed_node_into(kg, embedder, ids[i], row),
+          |i, row| embed_node_into(kg, embedder, ids[i], row, &embed_root),
           &query_vec,
           take,
         ))
@@ -3808,7 +5052,7 @@ impl Searcher {
           .filter(|&id| filter.is_empty() || compiled_filter.admits(kg, id))
           .map(|id| {
             let mut row = vec![0.0f32; embedder.dim()];
-            embed_node_into(kg, embedder, id, &mut row);
+            embed_node_into(kg, embedder, id, &mut row, &embed_root);
             // The ONE shared distance tree (vorpal_ann::l2_sq — lane-decomposed SIMD,
             // bit-deterministic): the exhaustive arm's rerank-skip is sound only
             // because scan and rerank distances agree bit-for-bit.
@@ -3889,7 +5133,11 @@ impl Searcher {
   let mut by_degree: Vec<u64> = named.clone();
   by_degree.sort_by_key(|&id| {
     (
-      std::cmp::Reverse(kg.in_neighbors(NodeId::new(id)).len()),
+      // Referential degree only: the flow-era edge families (similar_to, changes_with,
+      // data_flows, …) are topology, not usage — counting them silently redefined this
+      // disambiguator when they landed (an 8-partner clone family gains 16 raw in-edges
+      // that say nothing about how called the symbol is).
+      std::cmp::Reverse(kg.in_degree_referential(NodeId::new(id))),
       id,
     )
   });
@@ -4106,7 +5354,8 @@ pub mod bench {
   /// fill costs are the training/warm phase stamps' business.)
   pub fn embed_row(kg: &Kg, id: u64, row: &mut [f32]) {
     let embedder = super::ActiveEmbedder::Lexical(super::active_embedder());
-    super::embed_node_into(kg, &embedder, id, row);
+    let root = super::embedding_root(kg);
+    super::embed_node_into(kg, &embedder, id, row, &root);
   }
 
   /// A query embedding, as production computes it.
@@ -4141,6 +5390,7 @@ pub mod bench {
     let Some(embedder) = super::coherent_persisted_embedder(&generation_dir, stamp) else {
       return Err("no coherent persisted tier — warm first".into());
     };
+    let embed_root = super::embedding_root(&kg);
     let query = embedder.embed(phrase);
     let rows = super::semantic_row_ids(&kg);
     let ann = vorpal_ann::AnnIndex::load(&generation_dir.join("ann.bin"))?;
@@ -4152,7 +5402,7 @@ pub mod bench {
       None => vorpal_ann::exhaustive_semantic(
         embedder.dim(),
         &rows,
-        |i, row| super::embed_node_into(&kg, &embedder, rows[i], row),
+        |i, row| super::embed_node_into(&kg, &embedder, rows[i], row, &embed_root),
         &query,
         rows.len(),
       )
@@ -4291,7 +5541,7 @@ pub fn explain_edge_on(
     // digest to check (older generation), the snippet is labeled as current-file contents.
     if let Ok(bytes) = fs::read(&from_path) {
       let indexed_digest = artifacts_dir
-        .and_then(PackReader::open)
+        .and_then(open_generation_pack)
         .and_then(|pack| {
           pack
             .get(&from_path)
@@ -4317,7 +5567,48 @@ pub fn explain_edge_on(
   Ok(out)
 }
 
+mod compose;
+
 pub use vorpal_kg::resolve_index_dir;
+
+/// Open the pack of a committed generation for QUERY surfaces that hold only the index
+/// directory (no src root in scope), deriving the bucketed layout's stripping root
+/// **exactly** from the generation's own manifest — never by guessing.
+///
+/// Derivation: take the first manifest entry's absolute path and try every `/` boundary as
+/// the root; a candidate is accepted only if stripping it maps EVERY manifest entry onto a
+/// pack hit and the pack's live-entry count equals the manifest's. That acceptance is
+/// unique: two accepting roots would compose into a length-shifting bijection of a finite
+/// key set (every key `k` would need `x/k` present too), which cannot exist — so a false
+/// root can never pass, and a pack that fails derivation is returned rootless (absolute
+/// lookups miss, callers degrade to "unverified", wrong bytes are impossible).
+pub(crate) fn open_generation_pack(dir: &Path) -> Option<PackReader> {
+  let pack = PackReader::open(dir)?;
+  if !pack.is_bucketed() {
+    return Some(pack);
+  }
+  let Ok(manifest) = Manifest::load(&dir.join("manifest.bin")) else {
+    return Some(pack);
+  };
+  let entries = manifest.entries();
+  if entries.is_empty() || entries.len() != pack.live_entries() {
+    return Some(pack);
+  }
+  let probe = entries[0].path.as_str();
+  let mut root: Option<String> = None;
+  for (at, _) in probe.match_indices('/') {
+    let candidate = &probe[..at];
+    let accepts = entries.iter().all(|entry| {
+      let key = vorpal_kg::identity::tree_relative(&entry.path, candidate);
+      key != entry.path && pack.get(key).is_some()
+    });
+    if accepts {
+      root = Some(candidate.to_string());
+      break;
+    }
+  }
+  Some(pack.with_root(root))
+}
 
 /// Process-wide cache of open [`PackReader`]s, keyed by the **immutable** generation dir —
 /// the read-few query surfaces (`snippet`, `fetch_span`, `why`) verify one or two files per
@@ -4340,7 +5631,7 @@ pub(crate) fn cached_pack(generation_dir: &Path) -> Option<Arc<PackReader>> {
     }
   }
   // Open (mmap + sidecar parse) outside the lock.
-  let pack = Arc::new(PackReader::open(generation_dir)?);
+  let pack = Arc::new(open_generation_pack(generation_dir)?);
   let mut guard = cache.lock().unwrap();
   if let Some(pos) = guard.iter().position(|(dir, _)| dir == generation_dir) {
     return Some(guard[pos].1.clone());
@@ -4430,7 +5721,7 @@ pub fn read_indexed_source_with(
 pub fn parse_health_report(index_dir: &Path) -> Result<String, Box<dyn Error>> {
   let dir = vorpal_kg::resolve_index_dir(index_dir);
   let kg = Kg::load(&dir)?;
-  let pack = PackReader::open(&dir).ok_or("no product pack in this generation")?;
+  let pack = open_generation_pack(&dir).ok_or("no product pack in this generation")?;
 
   // One pass over the nodes: file paths, and per-path entity lists for overlap checks.
   let mut files: Vec<(u64, String)> = Vec::new();

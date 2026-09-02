@@ -38,7 +38,11 @@ use vorpal_resolve::{RefForm, RefKind};
 // 18: SymbolType tags 28–30 (Macro/Union/TypeAlias — extraction-coverage campaign);
 // older caches re-parse under the new rules rather than replaying pre-campaign
 // products that lack the new symbol classes.
-pub const PRODUCT_FORMAT_VERSION: u32 = 18;
+// 19: the two development lines merged — 17 (`struct X y;` staged type uses, lean
+// records) and 18 (the coverage kinds) carried DIFFERENT semantics under different
+// numbers, and the merged extraction differs from both; neither line's cached
+// products may replay against it.
+pub const PRODUCT_FORMAT_VERSION: u32 = 19;
 
 /// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
 pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;

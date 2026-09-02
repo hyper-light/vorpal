@@ -24,7 +24,7 @@ use crate::reference::{RefForm, RefKind, Reference};
 /// Bytes per spilled reference record.
 // 39 since G-M2: +4 receiver-type NameId bits (0 = none) +1 origin tag. Process-private
 // scratch — no versioning, both sides are this binary.
-const RECORD: usize = 39;
+pub(crate) const RECORD: usize = 39;
 
 /// References per read chunk (~1 MB in flight per chunk).
 pub const SPILL_CHUNK: usize = 32_768;
@@ -67,7 +67,7 @@ fn form_of(tag: u8) -> RefForm {
   }
 }
 
-fn encode(reference: &Reference, buf: &mut [u8; RECORD]) {
+pub(crate) fn encode_record(reference: &Reference, buf: &mut [u8; RECORD]) {
   buf[0..8].copy_from_slice(&reference.from.raw().to_le_bytes());
   buf[8..12].copy_from_slice(&reference.name.to_bits().to_le_bytes());
   buf[12..16].copy_from_slice(&reference.from_path.to_bits().to_le_bytes());
@@ -85,7 +85,7 @@ fn encode(reference: &Reference, buf: &mut [u8; RECORD]) {
   buf[38] = reference.receiver_type_origin;
 }
 
-fn decode<'i>(interner: &'i Interner, buf: &[u8; RECORD]) -> Reference<'i> {
+pub(crate) fn decode_record<'i>(interner: &'i Interner, buf: &[u8; RECORD]) -> Reference<'i> {
   let u64_at = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
   let u32_at = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
   Reference {
@@ -139,7 +139,7 @@ impl<'i> RefSpillWriter<'i> {
       self.qualified_imports.push(*reference);
     }
     let mut buf = [0u8; RECORD];
-    encode(reference, &mut buf);
+    encode_record(reference, &mut buf);
     self.out.write_all(&buf)?;
     self.count += 1;
     Ok(())
@@ -177,6 +177,27 @@ impl<'i> RefSpill<'i> {
     &self.qualified_imports
   }
 
+  /// Sequential RAW chunk reader: yields each chunk's undecoded record bytes, in write
+  /// order. Decoding is pure per-record work — callers fan it out to the threads that will
+  /// consume the references (the resolve workers), leaving the reading thread with nothing
+  /// but sequential `read_exact`s.
+  pub fn raw_chunks(&self) -> io::Result<RefSpillRawChunks> {
+    Ok(RefSpillRawChunks {
+      reader: BufReader::with_capacity(1 << 20, File::open(&self.path)?),
+      remaining: self.count,
+    })
+  }
+
+  /// Decode one raw chunk (as yielded by [`RefSpill::raw_chunks`]) against this session's
+  /// interner — byte-for-byte the records the sequential reader would have produced.
+  pub fn decode_chunk(&self, bytes: &[u8]) -> Vec<Reference<'i>> {
+    debug_assert_eq!(bytes.len() % RECORD, 0);
+    bytes
+      .chunks_exact(RECORD)
+      .map(|record| decode_record(self.interner, record.try_into().expect("record-sized chunk")))
+      .collect()
+  }
+
   /// Sequential chunk reader over the spilled records, in write order.
   pub fn chunks(&self) -> io::Result<RefSpillChunks<'i>> {
     Ok(RefSpillChunks {
@@ -189,6 +210,29 @@ impl<'i> RefSpill<'i> {
   /// Delete the spill file. Errors are the caller's to ignore where cleanup is best-effort.
   pub fn remove(self) -> io::Result<()> {
     std::fs::remove_file(&self.path)
+  }
+}
+
+/// Iterator of raw record-byte chunks (each `SPILL_CHUNK` records long except the last).
+pub struct RefSpillRawChunks {
+  reader: BufReader<File>,
+  remaining: u64,
+}
+
+impl Iterator for RefSpillRawChunks {
+  type Item = io::Result<Vec<u8>>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.remaining == 0 {
+      return None;
+    }
+    let take = (self.remaining as usize).min(SPILL_CHUNK);
+    let mut bytes = vec![0u8; take * RECORD];
+    if let Err(err) = self.reader.read_exact(&mut bytes) {
+      return Some(Err(err));
+    }
+    self.remaining -= take as u64;
+    Some(Ok(bytes))
   }
 }
 
@@ -213,7 +257,7 @@ impl<'i> Iterator for RefSpillChunks<'i> {
       if let Err(err) = self.reader.read_exact(&mut buf) {
         return Some(Err(err));
       }
-      chunk.push(decode(self.interner, &buf));
+      chunk.push(decode_record(self.interner, &buf));
     }
     self.remaining -= take as u64;
     Some(Ok(chunk))

@@ -97,7 +97,19 @@ impl<'i, E: FileExtractor> Ingestor<'i, E> {
   /// Takes the product by value: its reference strings are moved into the buffered
   /// [`Reference`]s, so the single-writer apply stage clones nothing.
   pub fn ingest_product(&mut self, path: &str, product: crate::FileProduct) {
-    apply_product(self.interner, path, product, &mut self.writer, &mut self.references);
+    let _ = apply_product(self.interner, path, product, &mut self.writer, &mut self.references);
+  }
+
+  /// [`Ingestor::ingest_product`] returning the layout→ordinal mapping: for layout index
+  /// `i` (0 = the file node), the file-local ordinal the writer assigned — duplicate
+  /// entities COLLAPSE (a C declaration+definition pair lands on one row), so this vec is
+  /// the only sound bridge from product entity indices to node ordinals. The scoped
+  /// compose (P4.5c-2) attributes the fresh references through it.
+  pub fn ingest_product_mapped(&mut self, path: &str, product: crate::FileProduct) -> Vec<u64> {
+    apply_product(self.interner, path, product, &mut self.writer, &mut self.references)
+      .into_iter()
+      .map(|(_, id)| id.raw())
+      .collect()
   }
 
   /// Recursively ingest a directory, respecting `.gitignore`, skipping files the extractor does
@@ -278,6 +290,20 @@ impl ArgJoin {
     }
   }
 
+  /// Build the join from in-RAM records — the retained store's path (the bulk build loads
+  /// the same shape from its spill). One sort, any input order: the join is a pure function
+  /// of the record SET.
+  pub(crate) fn from_records(mut records: Vec<ArgRec>) -> Self {
+    use rayon::prelude::*;
+    // Stable by (key, index): records per call site keep their capture order.
+    records.par_sort_by_key(|r| (r.from.raw(), r.span.0, r.span.1, r.index));
+    let keys = records
+      .par_iter()
+      .map(|r| arg_key(r.from.raw(), r.span))
+      .collect();
+    Self { records, keys }
+  }
+
   pub(crate) fn is_empty(&self) -> bool {
     self.records.is_empty()
   }
@@ -351,16 +377,7 @@ pub(crate) fn load_arg_spill(path: &std::path::Path, expected: u64) -> io::Resul
       "arg spill holds {seen} records, absorber wrote {expected} — torn scratch"
     )));
   }
-  let keys = {
-    use rayon::prelude::*;
-    // Stable by (key, index): records per call site keep their capture order.
-    records.par_sort_by_key(|r| (r.from.raw(), r.span.0, r.span.1, r.index));
-    records
-      .par_iter()
-      .map(|r| arg_key(r.from.raw(), r.span))
-      .collect()
-  };
-  Ok(ArgJoin { records, keys })
+  Ok(ArgJoin::from_records(records))
 }
 
 /// Append-only parameter-ledger spill (`.params.spill`), one record per Python entity with
@@ -482,6 +499,13 @@ impl ParamTable {
     Self { rows: Vec::new() }
   }
 
+  /// Build the ledger from in-RAM rows — the retained store's path. Sorted by entity id;
+  /// a pure function of the row set.
+  pub(crate) fn from_rows(mut rows: Vec<(u64, Box<[Box<str>]>)>) -> Self {
+    rows.sort_unstable_by_key(|(id, _)| *id);
+    Self { rows }
+  }
+
   pub(crate) fn is_empty(&self) -> bool {
     self.rows.is_empty()
   }
@@ -525,8 +549,7 @@ pub(crate) fn load_param_spill(path: &std::path::Path, expected: u64) -> io::Res
       "param spill holds {seen} records, absorber wrote {expected} — torn scratch"
     )));
   }
-  rows.sort_unstable_by_key(|(id, _)| *id);
-  Ok(ParamTable { rows })
+  Ok(ParamTable::from_rows(rows))
 }
 
 /// Fixed-width sketch spill (`.sigs.spill`): entity u64 · shingles u32 · 64 sketch bytes.
@@ -772,7 +795,7 @@ fn absorb_shard<'i>(
 
 /// Routes exactly like extraction: the parameter ledger is collected for files the registry
 /// hands to the Python grammar (kwarg call-site binding is a Python-shaped semantic).
-fn is_python_path(path: &str) -> bool {
+pub(crate) fn is_python_path(path: &str) -> bool {
   matches!(
     vorpal_lang_registry::from_path(std::path::Path::new(path)),
     Some(vorpal_lang_registry::SgLang::Builtin(vorpal_language::SupportLang::Python))
@@ -792,42 +815,7 @@ pub fn phase_trace(label: &str) {
 /// makes the footprint track the live set instead. Elsewhere this is a no-op — the peak
 /// figures we publish are honest live-set peaks, not allocator accidents.
 pub fn release_freed_pages() {
-  // Every call site marks the death of a large allocation profile (stream scratch, the
-  // symbol table, link transients, seal buffers) — once per run each, never per shard.
-  //
-  // Under the shipped allocator this purges jemalloc's dirty pages via
-  // `arena.<MALLCTL_ARENAS_ALL>.purge`: an explicit bulk madvise that works regardless of
-  // decay settings — which matters because batch index runs disable decay for fault
-  // economics (2.25 M soft faults → ~0.48 M), and decay-based releasing is a no-op there.
-  // The macOS `malloc_zone_pressure_relief` below addresses the SYSTEM allocator, which a
-  // jemalloc-global binary no longer routes through — it silently released nothing for
-  // years of jemalloc builds; only non-jemalloc (embedder) builds keep it.
-  #[cfg(all(
-    feature = "jemalloc",
-    not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
-  ))]
-  {
-    // Action node: no old/new value. The ALL sentinel is genuinely supported for purge
-    // (`arena_i_purge` handles it explicitly — see vendor/tikv-jemalloc-sys). A refused
-    // call only means pages return later; never a correctness input.
-    let name = b"arena.4096.purge\0";
-    unsafe {
-      let _ = tikv_jemalloc_sys::mallctl(
-        name.as_ptr() as *const std::ffi::c_char,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        0,
-      );
-    }
-  }
-  #[cfg(all(
-    target_os = "macos",
-    not(all(
-      feature = "jemalloc",
-      not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
-    ))
-  ))]
+  #[cfg(target_os = "macos")]
   {
     unsafe extern "C" {
       fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
@@ -852,26 +840,21 @@ pub fn link_writer<'i>(
   phase_trace("link: resolve start");
   // Import-binding pre-pass (§3.3 scope step): resolve the qualifier-carrying imports first,
   // so bare uses in an importing file inherit its import-proven targets.
-  let qualified: Vec<Reference<'i>> = references
+  let qualified: Vec<vorpal_resolve::Reference> = references
     .iter()
-    .filter(|r| {
-      r.kind == vorpal_resolve::RefKind::Import && r.form == vorpal_resolve::RefForm::Static
-    })
+    .filter(|r| r.kind == vorpal_resolve::RefKind::Import)
     .copied()
     .collect();
-  // Root-relative imports (`<linux/export.h>`) resolve by suffix with corpus-learned
-  // include roots — learn them before anything consults the path prober.
+  // One predicate everywhere (spill, store, scoped session, here): the seed's own
+  // resolution-reason filter decides what binds; narrowing the input here made this
+  // driver's generations diverge from the spilled driver's over the same tree.
   phase_trace("link: include-roots learn");
   table.learn_include_roots(interner, &references);
   phase_trace("link: import-binding seed");
   vorpal_resolve::seed_import_bindings(interner, &mut table, &qualified, resolver);
   drop(qualified);
-  // Include-reachability pre-pass (the candidate law's macro gate): file→file
-  // edges from every resolved path-form import, closed transitively — macro
-  // candidates then bind by inclusion, exactly like the preprocessor.
   phase_trace("link: include-reach build");
   let reach = vorpal_resolve::build_include_reach(interner, &table, &references);
-  phase_trace("link: resolve refs");
   let (edges, stats) = resolve_all(interner, &table, &references, resolver, Some(&reach));
   phase_trace("link: resolve done");
   drop(table);
@@ -906,8 +889,8 @@ pub fn link_writer_spilled<'i>(
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
 ) -> io::Result<(Kg, ResolveStats, Vec<vorpal_kg::EvidenceRow>)> {
-  let (kg, stats, evidence, _flows, _similar, _requests) =
-    link_writer_spilled_with_flows(interner, writer, spill, resolver, None)?;
+  let (kg, stats, evidence, _flows, _similar, _requests, _sigs, _reach) =
+    link_writer_spilled_with_flows(interner, writer, spill, resolver, None, None)?;
   Ok((kg, stats, evidence))
 }
 
@@ -940,6 +923,70 @@ fn bind_param_index(rec: &ArgRec, callee_params: Option<&[Box<str>]>) -> u16 {
   }
 }
 
+/// The CALLS→data-flow join, shared verbatim by the bulk link sink and the retained
+/// assembly so the two paths cannot drift: the first (caller, callee) occurrence emits one
+/// `DATA_FLOWS` edge (through `push_edge`, at the caller's position in the edge stream —
+/// stream order is part of the sealed bytes), and every traceable argument emits one
+/// data-flow sidecar row. Ids are whatever space the caller resolves in; rows are remapped
+/// by the caller when its space is not the sealed one.
+/// The traceable-argument rows for one resolved CALLS edge (empty when the site carried
+/// none) — pure, worker-safe; the DATA_FLOWS-edge dedup stays with the ordered consumer.
+pub(crate) fn call_arg_rows(
+  from: u64,
+  to: u64,
+  span: (u32, u32),
+  arg_join: &ArgJoin,
+  param_table: &ParamTable,
+) -> Vec<vorpal_kg::DataflowRow> {
+  if arg_join.is_empty() {
+    return Vec::new();
+  }
+  let records = arg_join.get(from, span);
+  if records.is_empty() {
+    return Vec::new();
+  }
+  let callee_params = if param_table.is_empty() {
+    None
+  } else {
+    param_table.get(to)
+  };
+  records
+    .iter()
+    .map(|rec| vorpal_kg::DataflowRow {
+      from: from as u32,
+      to: to as u32,
+      span,
+      arg_index: rec.index,
+      param_index: bind_param_index(rec, callee_params),
+      class: rec.class,
+      expr: rec.expr.as_deref().map(str::to_string),
+    })
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // one join, both linkers: every input is load-bearing
+pub(crate) fn join_call_edge(
+  from: u64,
+  to: u64,
+  span: (u32, u32),
+  confidence: u8,
+  arg_join: &ArgJoin,
+  param_table: &ParamTable,
+  flow_pairs: &mut std::collections::HashSet<(u64, u64)>,
+  flows: &mut Vec<vorpal_kg::DataflowRow>,
+  mut push_edge: impl FnMut(vorpal_kg::EdgeType),
+) {
+  let rows = call_arg_rows(from, to, span, arg_join, param_table);
+  if rows.is_empty() {
+    return;
+  }
+  // One DATA_FLOWS edge per (caller, callee) pair; one row per traceable arg.
+  if flow_pairs.insert((from, to)) {
+    push_edge(vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(confidence));
+  }
+  flows.extend(rows);
+}
+
 /// What a spilled link yields: the sealed graph, resolution stats, evidence rows, data-flow
 /// rows, and the near-clone pairing report.
 pub type LinkedGraph = (
@@ -949,7 +996,39 @@ pub type LinkedGraph = (
   Vec<vorpal_kg::DataflowRow>,
   crate::similar::SimilarReport,
   crate::requests::RequestReport,
+  // Every signed definition's sketch, canonical-id keyed — the sigs family's rows
+  // (P4.5c: persisted per bucketed generation for scoped re-pairing).
+  Vec<crate::similar::SigRow>,
+  // The encoded include-edge graph (`reach.bin`) — persisted so scoped composes
+  // replay the reach oracle without the full closure rebuild.
+  Vec<u8>,
 );
+
+/// The near-clone pairing thread's yield: sorted canonical-id pairs, the pass report, and
+/// the sketch rows handed back for the sigs family.
+pub type PairingHandle = std::thread::JoinHandle<(
+  Vec<(u64, u64, u8)>,
+  crate::similar::SimilarReport,
+  Vec<crate::similar::SigRow>,
+)>;
+
+/// Start the near-clone pairing as early as its input exists — the sig spill closes with
+/// the stream phase, and the pairing needs nothing else, so a caller that spawns here
+/// overlaps it with the pack tail, the table build, AND resolution instead of only the
+/// link. Consumes the spill's sig entry (the file is deleted; the count zeroes so the
+/// link's own loader knows). `None` when there is nothing to pair — the link then derives
+/// the honest empty report inline.
+pub fn spawn_sig_pairing(flow_spill: &mut FlowSpill) -> io::Result<Option<PairingHandle>> {
+  if flow_spill.sigs.1 == 0 {
+    let _ = std::fs::remove_file(&flow_spill.sigs.0);
+    return Ok(None);
+  }
+  let rows = load_sig_spill(&flow_spill.sigs.0, flow_spill.sigs.1)?;
+  flow_spill.sigs.1 = 0;
+  // Tiny row sets still go through the thread: `similar_pairs` produces the stated
+  // too-few-to-pair notes, and the report text must not depend on WHERE pairing started.
+  Ok(Some(std::thread::spawn(move || crate::similar::similar_pairs(rows))))
+}
 
 pub fn link_writer_spilled_with_flows<'i>(
   interner: &'i vorpal_resolve::Interner,
@@ -957,16 +1036,24 @@ pub fn link_writer_spilled_with_flows<'i>(
   spill: vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
   flow_spill: Option<FlowSpill>,
+  pairing: Option<PairingHandle>,
 ) -> io::Result<LinkedGraph> {
   // Near-clone sketches (v16): paired on their own thread while the table builds and
-  // resolution runs — they need no writer state, only the spill rows.
-  let sig_rows: Vec<crate::similar::SigRow> = match &flow_spill {
-    Some(spill) if spill.sigs.1 > 0 => load_sig_spill(&spill.sigs.0, spill.sigs.1)?,
-    Some(spill) => {
-      let _ = std::fs::remove_file(&spill.sigs.0);
-      Vec::new()
+  // resolution runs. A pre-spawned handle (see `spawn_sig_pairing`) started even earlier —
+  // at the stream tail — and the spill's sig count is zero then; otherwise spawn here.
+  let pairing = match pairing {
+    Some(handle) => Some(handle),
+    None => {
+      let sig_rows: Vec<crate::similar::SigRow> = match &flow_spill {
+        Some(spill) if spill.sigs.1 > 0 => load_sig_spill(&spill.sigs.0, spill.sigs.1)?,
+        Some(spill) => {
+          let _ = std::fs::remove_file(&spill.sigs.0);
+          Vec::new()
+        }
+        None => Vec::new(),
+      };
+      Some(std::thread::spawn(move || crate::similar::similar_pairs(sig_rows)))
     }
-    None => Vec::new(),
   };
   let req_rows: Vec<crate::requests::ReqRow> = match &flow_spill {
     Some(spill) if spill.requests.1 > 0 => load_req_spill(&spill.requests.0, spill.requests.1)?,
@@ -976,20 +1063,13 @@ pub fn link_writer_spilled_with_flows<'i>(
     }
     None => Vec::new(),
   };
-  // The pairing needs nothing below — it starts now and overlaps the spill loads, the table
-  // build, and resolution; its result is joined once resolution has finished.
-  let (link, pairing) = std::thread::scope(|scope| {
-    let pairing = scope.spawn(move || crate::similar::similar_pairs(sig_rows));
-    let link = link_resolve(interner, &mut writer, &spill, resolver, flow_spill);
-    (
-      link,
-      pairing
-        .join()
-        .map_err(|_| io::Error::other("similarity pairing panicked")),
-    )
-  });
-  let (stats, evidence, flows) = link?;
-  let (similar_pairs, similar_report) = pairing?;
+  let link = link_resolve(interner, &mut writer, &spill, resolver, flow_spill);
+  let pairing = pairing
+    .expect("set above")
+    .join()
+    .map_err(|_| io::Error::other("similarity pairing panicked"));
+  let (stats, evidence, flows, reach_graph) = link?;
+  let (similar_pairs, similar_report, sig_family_rows) = pairing?;
   phase_trace("link: resolve done");
   // Symmetric near-clone edges, sorted pairs — deterministic edge-log order.
   for &(a, b, confidence) in &similar_pairs {
@@ -1035,7 +1115,16 @@ pub fn link_writer_spilled_with_flows<'i>(
   let kg = writer.seal();
   release_freed_pages();
   phase_trace("link: seal done");
-  Ok((kg, stats, evidence, flows, similar_report, request_report))
+  Ok((
+    kg,
+    stats,
+    evidence,
+    flows,
+    similar_report,
+    request_report,
+    sig_family_rows,
+    reach_graph,
+  ))
 }
 
 /// The resolution half of a spilled link: load the flow spills, build the table, resolve
@@ -1046,7 +1135,12 @@ fn link_resolve<'i>(
   spill: &vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
   flow_spill: Option<FlowSpill>,
-) -> io::Result<(ResolveStats, Vec<vorpal_kg::EvidenceRow>, Vec<vorpal_kg::DataflowRow>)> {
+) -> io::Result<(
+  ResolveStats,
+  Vec<vorpal_kg::EvidenceRow>,
+  Vec<vorpal_kg::DataflowRow>,
+  Vec<u8>,
+)> {
   let arg_join: ArgJoin = match &flow_spill {
     Some(spill) if spill.args.1 > 0 => load_arg_spill(&spill.args.0, spill.args.1)?,
     Some(spill) => {
@@ -1081,24 +1175,43 @@ fn link_resolve<'i>(
   let mut table = build_symbol_table(interner, writer);
   release_freed_pages();
   phase_trace("link: resolve start");
-  // Import-binding pre-pass (§3.3 scope step): the spill retained the import references
-  // in RAM, so bare uses in an importing file inherit its import-proven targets. The
-  // same retained slice feeds the include-reachability oracle (the candidate law's
+  // Import-binding pre-pass (§3.3 scope step): the spill retained the qualifier-carrying
+  // imports in RAM, so bare uses in an importing file inherit its import-proven targets.
+  // The same retained imports feed the include-reachability oracle (the candidate law's
   // macro gate) — path-form imports build the file→file graph, closed transitively.
   phase_trace("link: include-roots learn");
   table.learn_include_roots(interner, spill.imports());
   phase_trace("link: import-binding seed");
   vorpal_resolve::seed_import_bindings(interner, &mut table, spill.imports(), resolver);
   phase_trace("link: include-reach build");
-  let reach = vorpal_resolve::build_include_reach(interner, &table, spill.imports());
+  // Edges derived once: the reach oracle for THIS link, and the persisted
+  // `reach.bin` graph scoped composes replay from (see resolve::reach).
+  let include_edges = vorpal_resolve::include_edges(interner, &table, spill.imports());
+  let reach = vorpal_resolve::IncludeReach::from_edges(&include_edges);
   phase_trace("link: include-reach done");
   // Edges stream straight into the writer's edge log, in resolution order — the collected
   // edge vector was ~90 MB alive under the seal at kernel scale. Evidence rows are collected
   // alongside (24 bytes per emitted edge; they must all exist before the canonical sort that
   // makes the sidecar deterministic, so streaming them out is not an option).
-  let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::new();
+  // Reserved to the spill's exact record count (an upper bound on emitted rows): at kernel
+  // scale this vector reaches ~6.8M rows, and growing it from empty cost ~23 doubling
+  // reallocations — the last a full-vector memcpy — on the ordered-sink thread.
+  let mut evidence: Vec<vorpal_kg::EvidenceRow> = Vec::with_capacity(spill.count() as usize);
+  // Bulk drain: workers hand back whole prepared chunks — edge triples in emission order,
+  // evidence rows already constructed, traceable-arg candidates with their data-flow rows
+  // pre-built — and the ordered consumer only appends, segmented around the DATA_FLOWS
+  // interleave (whose first-pair dedup is inherently sequential). The previous per-edge
+  // sink built every row on the single drain thread: ~9M indirect calls at kernel scale,
+  // the link's serial floor.
+  struct LinkedChunk {
+    edges: Vec<(u32, u32, vorpal_kg::EdgeType)>,
+    evidence: Vec<vorpal_kg::EvidenceRow>,
+    /// `(index into edges of the CALLS edge, from, to, confidence, arg rows)`.
+    df: Vec<(usize, u64, u64, u8, Vec<vorpal_kg::DataflowRow>)>,
+  }
   let stats = {
-    let evidence = std::cell::RefCell::new(&mut evidence);
+    let arg_join = &arg_join;
+    let param_table = &param_table;
     vorpal_resolve::resolve_all_spilled_into(
       interner,
       &table,
@@ -1106,76 +1219,83 @@ fn link_resolve<'i>(
       resolver,
       chain.as_ref(),
       Some(&reach),
-      |edge| {
-        writer.add_edge(
-          edge.from,
-          edge.to,
-          edge.edge.with_confidence(edge.confidence),
-        );
-        if edge.edge.base() == vorpal_kg::EdgeType::CALLS && !arg_join.is_empty() {
-          let records = arg_join.get(edge.from.raw(), edge.span);
-          if !records.is_empty() {
-            // One DATA_FLOWS edge per (caller, callee) pair; one row per traceable arg.
-            if flow_pairs.insert((edge.from.raw(), edge.to.raw())) {
-              writer.add_edge(
-                edge.from,
-                edge.to,
-                vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(edge.confidence),
-              );
-            }
-            let callee_params = if param_table.is_empty() {
-              None
-            } else {
-              param_table.get(edge.to.raw())
-            };
-            for rec in records {
-              flows.push(vorpal_kg::DataflowRow {
-                from: edge.from.raw() as u32,
-                to: edge.to.raw() as u32,
-                span: edge.span,
-                arg_index: rec.index,
-                param_index: bind_param_index(rec, callee_params),
-                class: rec.class,
-                expr: rec.expr.as_deref().map(str::to_string),
-              });
+      |resolved, unresolved| {
+        let mut chunk = LinkedChunk {
+          edges: Vec::with_capacity(resolved.len()),
+          evidence: Vec::with_capacity(resolved.len() + unresolved.len()),
+          df: Vec::new(),
+        };
+        for edge in &resolved {
+          let at = chunk.edges.len();
+          chunk.edges.push((
+            edge.from.raw() as u32,
+            edge.to.raw() as u32,
+            edge.edge.with_confidence(edge.confidence),
+          ));
+          if edge.edge.base() == vorpal_kg::EdgeType::CALLS {
+            let rows =
+              call_arg_rows(edge.from.raw(), edge.to.raw(), edge.span, arg_join, param_table);
+            if !rows.is_empty() {
+              chunk
+                .df
+                .push((at, edge.from.raw(), edge.to.raw(), edge.confidence, rows));
             }
           }
+          let (alt_ids, alt_count) = edge.alternatives;
+          chunk.evidence.push(vorpal_kg::EvidenceRow {
+            from: edge.from.raw() as u32,
+            to: edge.to.raw() as u32,
+            name_hash: edge.name_hash,
+            etype: edge.edge.base().0,
+            reason: edge.reason as u8,
+            confidence: edge.confidence,
+            outcome: vorpal_kg::EvidenceOutcome::Edge,
+            candidates: edge.candidates,
+            span_start: edge.span.0,
+            span_end: edge.span.1,
+            alternatives: vorpal_kg::AltSet::new(alt_ids, alt_count),
+          });
         }
-        let (alt_ids, alt_count) = edge.alternatives;
-        evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
-          from: edge.from.raw() as u32,
-          to: edge.to.raw() as u32,
-          name_hash: edge.name_hash,
-          etype: edge.edge.base().0,
-          reason: edge.reason as u8,
-          confidence: edge.confidence,
-          outcome: vorpal_kg::EvidenceOutcome::Edge,
-          candidates: edge.candidates,
-          span_start: edge.span.0,
-          span_end: edge.span.1,
-          alternatives: vorpal_kg::AltSet::new(alt_ids, alt_count),
-        });
+        for unresolved in &unresolved {
+          // No-edge outcomes are evidence too (07-29 §4): "why is there no edge here?"
+          // is answerable from the sidecar instead of only aggregate counts.
+          chunk.evidence.push(vorpal_kg::EvidenceRow {
+            from: unresolved.from.raw() as u32,
+            to: vorpal_kg::NO_EDGE,
+            name_hash: unresolved.name_hash,
+            etype: unresolved.etype.base().0,
+            reason: 0,
+            confidence: 0,
+            outcome: if unresolved.external {
+              vorpal_kg::EvidenceOutcome::External
+            } else {
+              vorpal_kg::EvidenceOutcome::Masked
+            },
+            candidates: unresolved.candidates,
+            span_start: unresolved.span.0,
+            span_end: unresolved.span.1,
+            alternatives: vorpal_kg::AltSet::EMPTY,
+          });
+        }
+        chunk
       },
-      |unresolved| {
-        // No-edge outcomes are evidence too (07-29 §4): "why is there no edge here?" is
-        // answerable from the sidecar instead of only aggregate counts.
-        evidence.borrow_mut().push(vorpal_kg::EvidenceRow {
-          from: unresolved.from.raw() as u32,
-          to: vorpal_kg::NO_EDGE,
-          name_hash: unresolved.name_hash,
-          etype: unresolved.etype.base().0,
-          reason: 0,
-          confidence: 0,
-          outcome: if unresolved.external {
-            vorpal_kg::EvidenceOutcome::External
-          } else {
-            vorpal_kg::EvidenceOutcome::Masked
-          },
-          candidates: unresolved.candidates,
-          span_start: unresolved.span.0,
-          span_end: unresolved.span.1,
-          alternatives: vorpal_kg::AltSet::EMPTY,
-        });
+      |mut chunk: LinkedChunk| {
+        let mut cursor = 0usize;
+        for (at, from, to, confidence, rows) in std::mem::take(&mut chunk.df) {
+          writer.extend_edges(&chunk.edges[cursor..=at]);
+          cursor = at + 1;
+          // One DATA_FLOWS edge per (caller, callee) pair, at the caller's stream position.
+          if flow_pairs.insert((from, to)) {
+            writer.add_edge(
+              vorpal_kg::NodeId::new(from),
+              vorpal_kg::NodeId::new(to),
+              vorpal_kg::EdgeType::DATA_FLOWS.with_confidence(confidence),
+            );
+          }
+          flows.extend(rows);
+        }
+        writer.extend_edges(&chunk.edges[cursor..]);
+        evidence.append(&mut chunk.evidence);
       },
     )?
   };
@@ -1184,7 +1304,16 @@ fn link_resolve<'i>(
   drop(param_table);
   drop(chain);
   drop(flow_pairs);
-  Ok((stats, evidence, flows))
+  // Encoded here, where the interner still borrows the edge names: one buffer
+  // travels up, no per-edge Strings.
+  let edge_strs: Vec<(&str, &str)> = include_edges
+    .iter()
+    .map(|&(from, to)| (interner.text_of(from), interner.text_of(to)))
+    .collect();
+  let reach_graph = vorpal_resolve::encode_reach_graph(&edge_strs);
+  drop(edge_strs);
+  drop(include_edges);
+  Ok((stats, evidence, flows, reach_graph))
 }
 
 /// Fewer files than this per shard and the fan-out overhead outweighs the win: small trees
@@ -1259,8 +1388,8 @@ pub(crate) fn apply_product<'i>(
   product: crate::FileProduct,
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
-) {
-  apply_product_with_args(interner, path, product, writer, references, None);
+) -> Vec<(std::ops::Range<usize>, NodeId)> {
+  apply_product_with_args(interner, path, product, writer, references, None)
 }
 
 pub(crate) fn apply_product_with_args<'i>(
@@ -1270,7 +1399,7 @@ pub(crate) fn apply_product_with_args<'i>(
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
   mut flow_out: Option<&mut FlowSidecar>,
-) {
+) -> Vec<(std::ops::Range<usize>, NodeId)> {
   let crate::FileProduct {
     items,
     refs,
@@ -1322,7 +1451,7 @@ pub(crate) fn apply_product_with_args<'i>(
     writer,
     references,
     flow_out,
-  );
+  )
 }
 
 /// Apply a pack-replayed product straight from its mapped bytes: decode to views, apply —
@@ -1382,19 +1511,18 @@ fn apply_parts<'a, 'i>(
   writer: &mut KgWriter,
   references: &mut Vec<Reference<'i>>,
   mut flow_out: Option<&mut FlowSidecar>,
-) {
+) -> Vec<(std::ops::Range<usize>, NodeId)> {
   // Identity lookups below are scoped to this file's entities, and each path lands exactly
   // once (manifest invariant) — so the previous files' identity keys are dead weight.
   writer.forget_identity_scope();
-  // The writer hands back each layout position's NodeId in walk order (spans[0] = the file
-  // node, then items and members — the exact order product entity indices use), rendering
-  // each identity path into one reused buffer as it walks. Attribution below is therefore
-  // ARRAY INDEXING; the per-reference canonical lookup this replaces hashed (blake3) the
-  // path+entity strings ~5.8M times per kernel link, and the per-file layout `Vec<String>`
-  // it once consumed was ~9 % of stream-phase allocation samples. An out-of-range index —
-  // a corrupt product — still simply drops the row.
-  let spans = writer.ingest_file_with_spans(path, items);
-  let id_at = |index: u32| spans.get(index as usize).map(|(_, id)| *id);
+  // One traversal defines the nodes AND yields each layout index's node id: `spans[i]` is the
+  // id of layout entity `i` (index 0 = file), the same convention `local_layout` documents —
+  // both derive from `layout_entity_paths`. References carry entity *indices* into that
+  // layout, so attribution is a direct index — this replaced a second `layout_entity_paths`
+  // pass (~38 `format!` strings per file) plus a blake3 `entity_id` lookup PER REFERENCE
+  // (~6.8M hashes + 32-byte-key probes at kernel scale) with an array index. An out-of-range
+  // index — a corrupt product — simply drops the ref, exactly as before.
+  let layout_ids = writer.ingest_file_with_spans(path, items);
   // Intern the file's path once; every reference carries the 4-byte id.
   let path_id = interner.intern(path);
   // Callee parameter ledgers (G-M5): Python entities only — the one language whose call
@@ -1402,7 +1530,11 @@ fn apply_parts<'a, 'i>(
   if let Some(flow_out) = flow_out.as_deref_mut() {
     if !entity_params.is_empty() && is_python_path(path) {
       for (entity_index, names) in entity_params {
-        if let Some(id) = id_at(*entity_index) {
+        // Layout index -> node id directly (A2): no path-string round trip, same id.
+        let Some(&(_, id)) = layout_ids.get(*entity_index as usize) else {
+          continue;
+        };
+        {
           if !names.is_empty() {
             flow_out.params.push(ParamRec {
               entity: id,
@@ -1417,72 +1549,89 @@ fn apply_parts<'a, 'i>(
   // collector exists (the spilled index-build path).
   if let Some(flow_out) = flow_out.as_deref_mut() {
     for (entity_index, shingles, sketch) in signatures {
+      let Some(&(_, id)) = layout_ids.get(entity_index as usize) else {
+        continue;
+      };
       let Ok(sketch) = <[u8; crate::signature::BINS]>::try_from(sketch) else {
         continue; // a corrupt width — the decoder guarantees 64, so this never fires
       };
-      if let Some(id) = id_at(entity_index) {
-        flow_out.sigs.push(SigRec {
-          entity: id,
-          shingles,
-          sketch,
-        });
-      }
+      flow_out.sigs.push(SigRec {
+        entity: id,
+        shingles,
+        sketch,
+      });
     }
   }
   // Request records (v17): keyed to the writer's fresh node id, collected only where a
   // collector exists (the spilled index-build path).
   if let Some(flow_out) = flow_out.as_deref_mut() {
     for (entity_index, method, url, span) in requests {
-      if let Some(from) = id_at(entity_index) {
-        flow_out.requests.push(ReqRec {
-          from,
-          method: Box::from(method),
-          path: Box::from(url),
-          span,
-        });
-      }
+      let Some(&(_, from)) = layout_ids.get(entity_index as usize) else {
+        continue;
+      };
+      flow_out.requests.push(ReqRec {
+        from,
+        method: Box::from(method),
+        path: Box::from(url),
+        span,
+      });
     }
   }
   for r in refs {
-    if let Some(from) = id_at(r.from_entity_index) {
-      // Traceable call-site arguments ride beside the reference (G-M3): lazily decoded off
-      // the view, captured only where a collector exists (the spilled index-build path).
-      if let Some(flow_out) = flow_out.as_deref_mut() {
-        if crate::product::tag_refkind(r.kind) == vorpal_resolve::RefKind::Call
-          && r.args_len() > 0
-        {
-          let has_receiver = r.receiver.is_some();
-          for arg in r.args() {
-            if arg.class <= 2 {
-              flow_out.args.push(ArgRec {
-                from,
-                span: (r.start, r.end),
-                index: arg.index,
-                class: arg.class,
-                has_receiver,
-                expr: arg.expr.map(Box::from),
-                kw: arg.kw_name.map(Box::from),
-              });
-            }
+    let Some(&(_, from)) = layout_ids.get(r.from_entity_index as usize) else {
+      continue;
+    };
+    // Traceable call-site arguments ride beside the reference (G-M3): lazily decoded off
+    // the view, captured only where a collector exists (the spilled index-build path).
+    // `from` is already bound by the layout index above (A2) — no per-reference re-hash.
+    if let Some(flow_out) = flow_out.as_deref_mut() {
+      if crate::product::tag_refkind(r.kind) == vorpal_resolve::RefKind::Call && r.args_len() > 0
+      {
+        let has_receiver = r.receiver.is_some();
+        for arg in r.args() {
+          if arg.class <= 2 {
+            flow_out.args.push(ArgRec {
+              from,
+              span: (r.start, r.end),
+              index: arg.index,
+              class: arg.class,
+              has_receiver,
+              expr: arg.expr.map(Box::from),
+              kw: arg.kw_name.map(Box::from),
+            });
           }
         }
       }
-      references.push(
-        Reference::with_interned_path(
-          interner,
-          from,
-          path_id,
-          r.name,
-          crate::product::tag_refkind(r.kind),
-        )
-        .with_evidence(r.start, r.end)
-        .with_qualifier_ref(interner, r.qualifier)
-        .with_alias_ref(interner, r.alias)
-        .with_form(crate::product::tag_refform(r.form))
-        .with_receiver_type_ref(interner, r.receiver_type, r.receiver_type_origin),
-      );
     }
+    references.push(reference_from_view(interner, from, path_id, &r));
   }
+  // The layout→id mapping (index 0 = file): the writer COLLAPSES duplicate entities
+  // (C declaration+definition pairs land on one row), so layout indices are NOT node
+  // ordinals — this vec is the one true bridge, and the scoped compose consumes it.
+  layout_ids
+}
+
+/// The ONE Reference construction from a product ref view — shared by the bulk/retained
+/// application kernel above and the scoped compose (P4.5c-2), so the two feeds cannot
+/// drift field by field.
+pub(crate) fn reference_from_view<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  from: NodeId,
+  path_id: vorpal_resolve::NameId<'i>,
+  r: &crate::product::RefView<'_>,
+) -> Reference<'i> {
+  Reference::with_interned_path(
+    interner,
+    from,
+    path_id,
+    r.name,
+    crate::product::tag_refkind(r.kind),
+  )
+  .with_evidence(r.start, r.end)
+  .with_qualifier_ref(interner, r.qualifier)
+  .with_alias_ref(interner, r.alias)
+  .with_form(crate::product::tag_refform(r.form))
+  .with_receiver_type_ref(interner, r.receiver_type, r.receiver_type_origin)
 }
 
 /// Below this many definitions the table builds serially — fan-out costs more than it saves.
@@ -1491,7 +1640,9 @@ const MIN_DEFS_PER_SHARD: usize = 4096;
 /// The owner id for members whose owner's name no reference ever interned: a reserved,
 /// unparseable string (control character) that can never equal a real qualifier, preserving
 /// "is a member" without admitting a match.
-fn unmatchable_owner<'i>(interner: &'i vorpal_resolve::Interner) -> vorpal_resolve::NameId<'i> {
+pub(crate) fn unmatchable_owner<'i>(
+  interner: &'i vorpal_resolve::Interner,
+) -> vorpal_resolve::NameId<'i> {
   interner.intern("\u{1}vorpal:unreferenced-owner")
 }
 
@@ -1499,9 +1650,20 @@ fn build_symbol_table<'i>(
   interner: &'i vorpal_resolve::Interner,
   writer: &KgWriter,
 ) -> SymbolTable<'i> {
-  // Derive each member's owner row from the containment edges (`Kg` for `Kg.load`) — the
-  // target side of qualified-reference matching. Containment from a File node is not
-  // ownership: top-level items match by module file instead. One cheap serial pass.
+  build_symbol_table_over(interner, writer, std::slice::from_ref(&(0..writer.node_count())))
+}
+
+/// [`build_symbol_table`] over an explicit, ordered list of alive row ranges — the retained
+/// (tombstone-and-append) writer's table build. Insertion order is the ranges' order, so a
+/// caller passing canonical (path-sorted) blocks reproduces exactly the candidate order a
+/// from-scratch build inserts; dead rows are simply never visited. The owner pass still
+/// walks the full containment log: containment never crosses files, so a dead edge only
+/// writes an owner for a dead row, which no range visits.
+pub(crate) fn build_symbol_table_over<'i>(
+  interner: &'i vorpal_resolve::Interner,
+  writer: &KgWriter,
+  ranges: &[std::ops::Range<usize>],
+) -> SymbolTable<'i> {
   let node_count = writer.node_count();
   let mut owner_of: Vec<Option<u32>> = vec![None; node_count];
   for (src, dst, etype) in writer.edge_log().iter() {
@@ -1509,10 +1671,7 @@ fn build_symbol_table<'i>(
       || etype.base() == EdgeType::HAS_METHOD
       || etype.base() == EdgeType::HAS_FIELD;
     if containment
-      && writer
-        .definition(src as usize)
-        .map(|(_, _, _, kind, _)| kind)
-        != Some(SymbolKind::File)
+      && writer.node_kind(src as usize) != Some(SymbolKind::File)
       && (dst as usize) < owner_of.len()
     {
       owner_of[dst as usize] = Some(src);
@@ -1522,35 +1681,58 @@ fn build_symbol_table<'i>(
   // §7.5 sharded table build: contiguous row ranges each fill a private table on their own
   // thread, absorbed in row order — candidate lists end up in the exact order the serial
   // insertion produced (pinned by test). Small graphs build serially.
-  let insert_range = |range: std::ops::Range<usize>| {
+  let insert_ranges = |ranges: &[std::ops::Range<usize>]| {
     let mut table = SymbolTable::new();
-    table.reserve(range.len());
-    for row in range {
+    table.reserve(ranges.iter().map(std::ops::Range::len).sum());
+    // Rows are contiguous per file and members are contiguous per owner, so both the path
+    // intern and the owner peek repeat their previous answer almost every row. Memoize on the
+    // heap slice identity (writer paths intern once per file into the heap, so equal paths ARE
+    // the same `&str` — pointer+length equality is exact), collapsing ~node_count interner
+    // round-trips per build to ~distinct-file count. `intern`/`peek` are idempotent, so the
+    // memo returns byte-identical ids and the table layout is unchanged.
+    let mut last_path: Option<(*const u8, usize, vorpal_resolve::NameId<'i>)> = None;
+    let mut last_owner: Option<(u32, Option<vorpal_resolve::NameId<'i>>)> = None;
+    for row in ranges.iter().flat_map(Clone::clone) {
       let (id, name, path, kind, exported) = writer.definition(row).expect("row < node_count");
       if kind == SymbolKind::File {
         // File nodes are the targets of path-form imports (`import "./util"`).
         table.insert_file(interner, path, id);
-      } else if kind.is_resolution_candidate() {
-        // The candidate law lives on SymbolKind (ONE definition for every table
-        // feed): imports are wiring, macros are visibility-gated — see
-        // `SymbolKind::is_resolution_candidate`.
+      } else if kind != SymbolKind::Import {
+        // Import/alias nodes are wiring, not definitions: offering them as resolution targets
+        // let a `use foo` in one file steal call edges meant for the real `foo`.
         // Owners resolve by `peek`: an owner name no reference ever interned can never match
         // a qualifier, but member-ness must survive — the unmatchable sentinel keeps such
         // members out of the top-level (module-stem) matching path.
-        let owner = owner_of[row]
-          .and_then(|src| writer.definition(src as usize))
-          .map(|(_, owner_name, _, _, _)| {
-            interner
-              .peek(owner_name)
-              .unwrap_or_else(|| unmatchable_owner(interner))
-          });
+        let owner = match owner_of[row] {
+          None => None,
+          Some(src) => match last_owner {
+            Some((cached_src, cached)) if cached_src == src => cached,
+            _ => {
+              let looked_up = writer.definition(src as usize).map(|(_, owner_name, _, _, _)| {
+                interner
+                  .peek(owner_name)
+                  .unwrap_or_else(|| unmatchable_owner(interner))
+              });
+              last_owner = Some((src, looked_up));
+              looked_up
+            }
+          },
+        };
+        let path_id = match last_path {
+          Some((ptr, len, id)) if ptr == path.as_ptr() && len == path.len() => id,
+          _ => {
+            let id = interner.intern(path);
+            last_path = Some((path.as_ptr(), path.len(), id));
+            id
+          }
+        };
         table.insert_if_referenced(
           interner,
           name,
           Symbol {
             id,
             kind,
-            path: interner.intern(path),
+            path: path_id,
             exported,
             owner,
           },
@@ -1560,19 +1742,41 @@ fn build_symbol_table<'i>(
     table
   };
 
-  if node_count <= MIN_DEFS_PER_SHARD {
-    let mut table = insert_range(0..node_count);
+  let total: usize = ranges.iter().map(std::ops::Range::len).sum();
+  if total <= MIN_DEFS_PER_SHARD {
+    let mut table = insert_ranges(ranges);
     table.finalize();
     return table;
   }
   use rayon::prelude::*;
   vorpal_kg::phase_stamp("table: owner pass done");
   let threads = rayon::current_num_threads().max(1);
-  let shard_size = node_count.div_ceil(threads * 2).max(MIN_DEFS_PER_SHARD);
-  let starts: Vec<usize> = (0..node_count).step_by(shard_size).collect();
-  let shards: Vec<SymbolTable> = starts
+  let shard_size = total.div_ceil(threads * 2).max(MIN_DEFS_PER_SHARD);
+  // Pack the ordered ranges into contiguous groups of ~shard_size rows (splitting a large
+  // range across groups); groups absorb in order, so the merged table's insertion order is
+  // identical to the serial pass over the same ranges.
+  let mut groups: Vec<Vec<std::ops::Range<usize>>> = Vec::new();
+  let mut current: Vec<std::ops::Range<usize>> = Vec::new();
+  let mut current_rows = 0usize;
+  for range in ranges {
+    let mut rest = range.clone();
+    while !rest.is_empty() {
+      let take = (shard_size - current_rows).min(rest.len());
+      current.push(rest.start..rest.start + take);
+      rest.start += take;
+      current_rows += take;
+      if current_rows == shard_size {
+        groups.push(std::mem::take(&mut current));
+        current_rows = 0;
+      }
+    }
+  }
+  if !current.is_empty() {
+    groups.push(current);
+  }
+  let shards: Vec<SymbolTable> = groups
     .par_iter()
-    .map(|&start| insert_range(start..(start + shard_size).min(node_count)))
+    .map(|group| insert_ranges(group))
     .collect();
   vorpal_kg::phase_stamp("table: shards built");
   let table = SymbolTable::from_shards(shards);
@@ -1616,7 +1820,7 @@ mod sharded_table_tests {
     writer.for_each_definition(|id, name, path, kind, exported| {
       if kind == SymbolKind::File {
         table.insert_file(itn(), path, id);
-      } else if kind.is_resolution_candidate() {
+      } else if kind != SymbolKind::Import {
         let owner = owner_of[id.raw() as usize].map(|src| {
           itn()
             .peek(&names[src as usize])
@@ -1771,8 +1975,6 @@ impl ByteBudget {
       if self.used.load(Ordering::Acquire) + want <= self.capacity {
         continue; // Released between the check and the lock.
       }
-      #[cfg(feature = "alloc-ledger")]
-      vorpal_kg::ledger::BUDGET_PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       let _guard = self.room.wait(guard).unwrap();
     }
   }
@@ -1832,13 +2034,6 @@ impl ExtractScratch {
 pub enum StreamWork {
   /// Freshly parsed this run.
   Parsed(String, crate::FileProduct),
-  /// Freshly parsed and already encoded to stamped `.vpb` bytes
-  /// (`OutlineExtractor::extract_product_encoded`): the committer decodes views straight off
-  /// the bytes and applies them — no owned product ever exists. Single-owner all the way:
-  /// the buffer MOVES worker → committer → pack thread (the committer forwards it into the
-  /// pack sink after applying; the pack's canonical path-sort makes arrival order
-  /// irrelevant), so nothing is shared and nothing is copied.
-  ParsedEncoded(String, Vec<u8>),
   /// Replayed from the incremental cache.
   Replayed(String, crate::FileProduct),
   /// Replayed from the products pack: only the path travels — the committer decodes views
@@ -1859,26 +2054,24 @@ pub struct StreamStats {
 }
 
 /// What a shard committer receives for one admitted entry: its global sequence number and
-/// either a product to apply or a skip marker (skips still advance the in-shard order).
-enum Slot {
-  Product {
-    path: String,
-    product: Box<crate::FileProduct>,
-    parsed: bool,
-    reserved: u64,
-  },
-  /// A fresh parse already encoded to `.vpb` bytes — applied as decoded views, like
-  /// [`Slot::Packed`] but off the in-flight buffer instead of the mapped pack; the buffer
-  /// then moves on into the pack sink.
-  ProductBytes {
-    path: String,
-    bytes: Vec<u8>,
-    reserved: u64,
-  },
-  Packed {
-    path: String,
-    reserved: u64,
-  },
+/// either a fully-applied per-file writer or a skip marker (skips still advance the in-shard
+/// order). Application (decode, intern, define, reference building) happens on the extraction
+/// workers — the wide side of the pipeline; the committer's whole job is a sequence-ordered
+/// `absorb` + reference/flow rebase, which is what keeps 18 workers busy instead of 9
+/// committers.
+struct AppliedFile<'i> {
+  writer: KgWriter,
+  references: Vec<Reference<'i>>,
+  /// Data-flow side rows (G-M3) collected during the worker-side apply, file-local ids;
+  /// the committer rebases them by the same absorb offset the references get.
+  flow: FlowSidecar,
+  parsed: bool,
+  reserved: u64,
+}
+
+enum Slot<'i> {
+  /// Boxed so channel sends and the reorder buffer move one pointer, not the whole writer.
+  Applied(Box<AppliedFile<'i>>),
   Skipped,
 }
 
@@ -1921,7 +2114,6 @@ where
     RefSink::Ram(&mut references, &mut flow),
     None,
     None,
-    None,
   )?;
   Ok((writer, references, stats))
 }
@@ -1930,7 +2122,6 @@ where
 /// RAM — the bulk-build configuration. Resolve the result with
 /// [`vorpal_resolve::resolve_all_spilled`] (or [`link_writer_spilled`]), which streams the
 /// file back in bounded chunks and deletes it.
-#[allow(clippy::too_many_arguments)] // the bulk-build entry: spill, heap-stream, and pack read/write sides are each load-bearing
 pub fn stream_apply_spilled<'i, F>(
   interner: &'i vorpal_resolve::Interner,
   entries: &[crate::FileStat],
@@ -1938,7 +2129,6 @@ pub fn stream_apply_spilled<'i, F>(
   spill_path: &std::path::Path,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
-  pack_out: Option<&crossbeam_channel::Sender<crate::PackMsg>>,
   work: F,
 ) -> io::Result<(
   KgWriter,
@@ -1978,7 +2168,6 @@ where
     ),
     heap_stream_path,
     pack,
-    pack_out,
   )?;
   let flow_spill = FlowSpill {
     args: arg_writer.finish()?,
@@ -1999,7 +2188,6 @@ pub struct FlowSpill {
   pub(crate) requests: (std::path::PathBuf, u64),
 }
 
-#[allow(clippy::too_many_arguments)] // the one streaming engine behind both public entries
 fn stream_apply_impl<'i, F>(
   interner: &'i vorpal_resolve::Interner,
   entries: &[crate::FileStat],
@@ -2008,7 +2196,6 @@ fn stream_apply_impl<'i, F>(
   mut sink: RefSink<'_, 'i>,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
-  pack_out: Option<&crossbeam_channel::Sender<crate::PackMsg>>,
 ) -> io::Result<(KgWriter, StreamStats)>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
@@ -2048,20 +2235,6 @@ where
         StreamWork::Parsed(path, product) => {
           parsed += 1;
           apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut flow));
-        }
-        StreamWork::ParsedEncoded(path, bytes) => {
-          {
-            let view = crate::product::decode_product_view(&bytes).map_err(|e| {
-              io::Error::other(format!("freshly encoded product failed to decode ({path}): {e}"))
-            })?;
-            apply_product_view_with_args(interner, &path, &view, &mut writer, &mut references, Some(&mut flow));
-            parsed += 1;
-          }
-          if let Some(pack_out) = pack_out {
-            pack_out
-              .send(crate::PackMsg { path, body: bytes })
-              .map_err(|_| io::Error::other("pack sink closed during streaming"))?;
-          }
         }
         StreamWork::Replayed(path, product) => {
           replayed += 1;
@@ -2113,7 +2286,7 @@ where
   // Workers → committers: one bounded channel per committer thread; shard k routes to
   // committer k % committers.
   let (slot_txs, slot_rxs): (Vec<_>, Vec<_>) = (0..committers)
-    .map(|_| crossbeam_channel::bounded::<(usize, Slot)>(64))
+    .map(|_| crossbeam_channel::bounded::<(usize, Slot<'i>)>(64))
     .unzip();
 
   let total_sequences = entries.len();
@@ -2137,7 +2310,6 @@ where
       .enumerate()
       .map(|(committer_index, slot_rx)| {
         let budget = &budget;
-        let fail = &fail;
         let done_tx = done_tx.clone();
         scope.spawn(move || {
           let owned_shards: Vec<usize> =
@@ -2166,61 +2338,48 @@ where
             while let Some(slot) = queue.remove(expected) {
               *expected += 1;
               match slot {
-                Slot::Product {
-                  path,
-                  product,
-                  parsed: was_parsed,
-                  reserved,
-                } => {
+                Slot::Applied(applied) => {
+                  let AppliedFile {
+                    writer: file_writer,
+                    references: file_references,
+                    flow: file_flow,
+                    parsed: was_parsed,
+                    reserved,
+                  } = *applied;
+                  // File-granularity absorb: identical to applying the product directly at
+                  // this position (absorb is a pure additive-offset splice — the same
+                  // associativity the shard→merged absorb rests on, one level down), so the
+                  // shard writer's bytes are unchanged. References AND flow side rows (G-M3)
+                  // rebase by the same base; `rets` are entity-path keyed and never rebase.
                   let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
-                  apply_product_with_args(interner, &path, *product, writer, references, Some(flow));
+                  let id_base = writer.absorb(file_writer);
+                  references.extend(file_references.into_iter().map(|mut reference| {
+                    reference.from = NodeId::new(reference.from.raw() + id_base);
+                    reference
+                  }));
+                  flow.args.extend(file_flow.args.into_iter().map(|mut rec| {
+                    rec.from = NodeId::new(rec.from.raw() + id_base);
+                    rec
+                  }));
+                  flow.params.extend(file_flow.params.into_iter().map(|mut rec| {
+                    rec.entity = NodeId::new(rec.entity.raw() + id_base);
+                    rec
+                  }));
+                  flow.rets.extend(file_flow.rets);
+                  flow.sigs.extend(file_flow.sigs.into_iter().map(|mut rec| {
+                    rec.entity = NodeId::new(rec.entity.raw() + id_base);
+                    rec
+                  }));
+                  flow.requests.extend(file_flow.requests.into_iter().map(|mut rec| {
+                    rec.from = NodeId::new(rec.from.raw() + id_base);
+                    rec
+                  }));
                   budget.release(reserved);
                   if was_parsed {
                     parsed += 1;
                   } else {
                     replayed += 1;
                   }
-                }
-                Slot::ProductBytes { path, bytes, reserved } => {
-                  // Bytes a worker encoded moments ago: decode views, apply, then MOVE the
-                  // buffer on into the pack sink — single owner end to end. A decode failure
-                  // is an internal bug, surfaced through the run's error path (never a
-                  // silent drop, never a panic), and its bytes are never banked.
-                  let decoded = match crate::product::decode_product_view(&bytes) {
-                    Ok(view) => {
-                      let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
-                      apply_product_view_with_args(interner, &path, &view, writer, references, Some(flow));
-                      parsed += 1;
-                      true
-                    }
-                    Err(e) => {
-                      fail(io::Error::other(format!(
-                        "freshly encoded product failed to decode ({path}): {e}"
-                      )));
-                      false
-                    }
-                  };
-                  if decoded
-                    && let Some(pack_out) = pack_out
-                    && pack_out.send(crate::PackMsg { path, body: bytes }).is_err()
-                  {
-                    fail(io::Error::other("pack sink closed during streaming"));
-                  }
-                  budget.release(reserved);
-                }
-                Slot::Packed { path, reserved } => {
-                  // Decode views straight out of the mapped pack and apply — validated by
-                  // the producer, so a failure here is disk rot; the file is then absent
-                  // from this build rather than fatal.
-                  if let Some(view) = pack
-                    .and_then(|p| p.get(&path))
-                    .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
-                  {
-                    let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
-                    apply_product_view_with_args(interner, &path, &view, writer, references, Some(flow));
-                    replayed += 1;
-                  }
-                  budget.release(reserved);
                 }
                 Slot::Skipped => {}
               }
@@ -2260,25 +2419,67 @@ where
               continue;
             }
             let reserved = entry.size; // released with the same value; clamps match
+            // Apply HERE, on the worker: decode (for packed replays), intern, define, and
+            // reference building all run on the wide 18-way side into a private per-file
+            // writer; the committer only splices it in sequence order.
+            let apply_one = |go: &mut dyn FnMut(&mut KgWriter, &mut Vec<Reference<'i>>, &mut FlowSidecar),
+                             parsed_flag: bool| {
+              let mut file_writer = KgWriter::new();
+              let mut file_references: Vec<Reference<'i>> = Vec::new();
+              let mut file_flow = FlowSidecar::default();
+              go(&mut file_writer, &mut file_references, &mut file_flow);
+              Slot::Applied(Box::new(AppliedFile {
+                writer: file_writer,
+                references: file_references,
+                flow: file_flow,
+                parsed: parsed_flag,
+                reserved,
+              }))
+            };
             let slot = match work(entry, &mut scratch) {
-              Ok(StreamWork::Parsed(path, product)) => Slot::Product {
-                path,
-                product: Box::new(product),
-                parsed: true,
-                reserved,
-              },
-              Ok(StreamWork::ParsedEncoded(path, bytes)) => Slot::ProductBytes {
-                path,
-                bytes,
-                reserved,
-              },
-              Ok(StreamWork::Replayed(path, product)) => Slot::Product {
-                path,
-                product: Box::new(product),
-                parsed: false,
-                reserved,
-              },
-              Ok(StreamWork::ReplayedPacked(path)) => Slot::Packed { path, reserved },
+              Ok(StreamWork::Parsed(path, product)) => {
+                let mut product = Some(product);
+                apply_one(&mut |w, r, f| {
+                  let _ = apply_product_with_args(
+                    interner,
+                    &path,
+                    product.take().expect("applied once"),
+                    w,
+                    r,
+                    Some(f),
+                  );
+                }, true)
+              }
+              Ok(StreamWork::Replayed(path, product)) => {
+                let mut product = Some(product);
+                apply_one(&mut |w, r, f| {
+                  let _ = apply_product_with_args(
+                    interner,
+                    &path,
+                    product.take().expect("applied once"),
+                    w,
+                    r,
+                    Some(f),
+                  );
+                }, false)
+              }
+              Ok(StreamWork::ReplayedPacked(path)) => {
+                // Decode views straight out of the mapped pack and apply — validated by the
+                // producer, so a failure here is disk rot; the file is then absent from this
+                // build rather than fatal (the skip still advances the in-shard order).
+                match pack
+                  .and_then(|p| p.get(&path))
+                  .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
+                {
+                  Some(view) => apply_one(&mut |w, r, f| {
+                    apply_product_view_with_args(interner, &path, &view, w, r, Some(f))
+                  }, false),
+                  None => {
+                    budget.release(reserved);
+                    Slot::Skipped
+                  }
+                }
+              }
               Ok(StreamWork::Skipped) => {
                 budget.release(reserved);
                 Slot::Skipped
@@ -2290,23 +2491,7 @@ where
               }
             };
             let shard = sequence / shard_size;
-            let slot_tx = &slot_txs[shard % committers];
-            #[cfg(feature = "alloc-ledger")]
-            let sent = match slot_tx.try_send((sequence, slot)) {
-              Ok(()) => Ok(()),
-              Err(crossbeam_channel::TrySendError::Full(item)) => {
-                // A full committer channel blocks this worker — the exact
-                // chokepoint the parallelism audit counts.
-                vorpal_kg::ledger::CHAN_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                slot_tx.send(item)
-              }
-              Err(crossbeam_channel::TrySendError::Disconnected(item)) => {
-                Err(crossbeam_channel::SendError(item))
-              }
-            };
-            #[cfg(not(feature = "alloc-ledger"))]
-            let sent = slot_tx.send((sequence, slot));
-            if sent.is_err() {
+            if slot_txs[shard % committers].send((sequence, slot)).is_err() {
               break; // committer gone: only happens on abort/teardown
             }
           }
@@ -2360,20 +2545,7 @@ where
         break;
       }
       budget.reserve(entry.size.max(1));
-      #[cfg(feature = "alloc-ledger")]
-      let admitted = match work_tx.try_send((sequence, entry)) {
-        Ok(()) => Ok(()),
-        Err(crossbeam_channel::TrySendError::Full(item)) => {
-          vorpal_kg::ledger::CHAN_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-          work_tx.send(item)
-        }
-        Err(crossbeam_channel::TrySendError::Disconnected(item)) => {
-          Err(crossbeam_channel::SendError(item))
-        }
-      };
-      #[cfg(not(feature = "alloc-ledger"))]
-      let admitted = work_tx.send((sequence, entry));
-      if admitted.is_err() {
+      if work_tx.send((sequence, entry)).is_err() {
         break;
       }
       bytes_admitted += entry.size.max(1);
@@ -2428,7 +2600,6 @@ where
   }
   // The writer has absorbed its last shard: return growth slack before link stacks the
   // table and edge transients on top, and reopen a streamed heap for the link pass's reads.
-  phase_trace("stream: consolidate (shrink + heap finalize)");
   writer.shrink_to_fit();
   writer.finalize_streamed_heap()?;
   Ok((

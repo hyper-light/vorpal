@@ -20,18 +20,20 @@ mod reach;
 mod reference;
 mod resolver;
 pub mod spill;
+mod store;
 mod table;
 
 pub use intern::{Interner, NameId};
-pub use reach::IncludeReach;
+pub use reach::{IncludeReach, REACH_GRAPH_FILE, ReachGraph, encode_reach_graph, reach_rows_match};
 pub use reference::{RefForm, RefKind, Reference};
 pub use resolver::{
   ChainReturns, Confidence, MAX_RETAINED_ALTERNATIVES, Resolution, ResolutionGrade, ResolveReason, ResolveStats,
   ResolvedEdge, Resolver, UnresolvedEvidence,
-  build_include_reach, resolve_all, resolve_all_spilled, resolve_all_spilled_into,
-  seed_import_bindings,
+  build_include_reach, include_edges, resolve_all, resolve_all_spilled, resolve_all_spilled_into,
+  resolve_all_store_into, resolve_batch, seed_import_bindings,
 };
 pub use spill::{RefSpill, RefSpillWriter};
-pub use table::{Symbol, SymbolTable};
+pub use store::{RefStore, StoreRawChunks};
+pub use table::{Symbol, SymbolTable, RetainedSymbolTable};
 
 pub use vorpal_kg::{EdgeType, NodeId, SymbolKind};

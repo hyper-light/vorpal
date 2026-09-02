@@ -12,6 +12,28 @@ the whole old index or the whole new one, never a mixture. GC keeps the new and 
 generations. A legacy flat root (no `CURRENT`) is read as-is and migrated into a generation
 by its first rebuild (pinned by `legacy_flat_index_migrates_on_rebuild`).
 
+## Format selection
+
+The **bucketed** family layout is the default: products in `products/<k>.pack` +
+`products/toc.bin`, nodes/evidence/edges/usage/sigs in per-bucket slabs with per-slab TOC
+digests, generation identity as a Merkle fold of the family TOCs. It is what makes
+incremental builds O(changed) — unchanged buckets hard-link across generations and the
+scoped composes (stamp-cutoff / respan / defs-stable / defs-changed) splice buckets instead
+of rewriting the corpus.
+
+`VORPAL_FORMAT` selects the write format for the generation being built:
+
+- unset, empty, or `next` — bucketed (the default; `next` is the historical opt-in name,
+  kept as an explicit synonym),
+- `flat` — the deprecated legacy monolithic layout (`products.pack`/`products.idx`,
+  single-segment `nodes.vseg`, monolithic sidecars). An escape hatch only; it will be
+  removed with v1 retirement,
+- any other non-empty value — stamped to the phase log and treated as the default.
+
+Readers are format-agnostic: both layouts load through the same surfaces, so existing flat
+indexes keep serving and migrate to bucketed on their first rebuild (rebuild is the
+migration, policy #1). The format is a property of a generation, never mixed within one.
+
 ## Policy
 
 1. **Rebuild is the migration.** Graph segments are never migrated in place: a format bump
@@ -38,13 +60,18 @@ by its first rebuild (pinned by `legacy_flat_index_migrates_on_rebuild`).
 <!-- BEGIN GENERATED VERSION TABLE -->
 | Artifact | Constant | Value | On mismatch |
 |---|---|---|---|
-| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 18 | cache miss → re-parse |
-| product pack (`products.pack`/`products.idx`) | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
+| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 19 | cache miss → re-parse |
+| product pack, bucketed layout (`products/<k>.pack` + `products/toc.bin`) — the default | `BUCKET_VERSION` (crates/ingest/src/pack.rs) | 1 | pack ignored → rebuilt by next build |
+| product pack, legacy flat layout (`products.pack`/`products.idx`) — deprecated, written only under `VORPAL_FORMAT=flat`; reads retained | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
 | evidence sidecar (`evidence.bin`) | `VERSION` (crates/kg/src/evidence.rs) | 2 | sidecar treated as absent → `why` reports no evidence |
+| edge slabs (`edges/<k>.bin` + toc) | `VERSION` (crates/kg/src/edgestore.rs) | 1 | family treated as absent → scoped composes decline; next full build rewrites it |
+| usage postings (`usage/<k>.bin` + toc) | `VERSION` (crates/kg/src/usagestore.rs) | 1 | family treated as absent → scoped composes decline; next full build rewrites it |
+| sigs sketch ledger (`sigs/<k>.bin` + toc) | `VERSION` (crates/kg/src/sigstore.rs) | 2 | prior generation neither reused nor composed from → full pipeline rebuilds the family |
+| include-reach graph (`reach.bin`) | `REACH_GRAPH_VERSION` (crates/resolve/src/reach.rs) | 1 | scoped composes decline (reach oracle unreplayable) → full pipeline rebuilds it |
 | data-flow sidecar (`dataflow.bin`) | `VERSION` (crates/kg/src/dataflow.rs) | 1 | load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows) |
 | lexical posting tier (`postings.bin`) | `VERSION` (crates/index/src/postings.rs) | 2 | scan fallback → warm rebuilds |
-| embedding semantics (`ann.model.json`) | `LEXICAL_EMBED_VERSION` (crates/ann/src/embed.rs) | 1 | ANN tier distrusted → exact fallback → warm rebuilds |
+| embedding semantics (`ann.model.json`) | `LEXICAL_EMBED_VERSION` (crates/ann/src/embed.rs) | 2 | ANN tier distrusted → exact fallback → warm rebuilds |
 | calls-graph communities (`communities.bin`) | `VERSION` (crates/kg/src/communities.rs) | 1 | sidecar treated as absent → `community` answers `null`, `architecture` says not built → warm rebuilds |
 | semantic engine calibration (`ann.calib`) | `ANN_CALIB_VERSION` (crates/index/src/lib.rs) | 1 | calibration treated as absent → structural routing floor (full-population fetches scan; the beam keeps everything below) → next warm re-measures |
 | learned embedding model (`ann.model.bin`) | `LEARNED_MODEL_VERSION` (crates/ann/src/learned/persist.rs) | 3 | model unreadable/stale → lexical fallback stated in provenance → warm retrains |
@@ -55,22 +82,3 @@ node-segment stamp and the persisted model provenance rather than a standalone f
 version: any mismatch routes queries to the exact fallback until a re-warm rebuilds it.
 The reference spill (`.refs.spill`) is process-private scratch — created, read once, and
 deleted within a single build; it is deliberately unversioned and never persisted.
-
-## Git history in the generation id
-
-Since the co-change pass (`changes_with` edges, 2026-08-30), a generation's content id folds
-the indexed repository's **recent history**, not only its tree: the pass reads the last
-`VORPAL_COCHANGE_COMMITS` (default 2,000) non-merge commits from `git log` and seals
-symmetric `changes_with` edges between files that changed together at least twice (bulk
-commits over 50 files are ignored; each file keeps its 8 strongest partners; confidence =
-co-change count × 20, capped at 100). Consequences, stated:
-
-- Two checkouts of the **same tree** with **different histories** — a shallow CI clone and a
-  full developer clone, or the same tree before and after a commit that touched nothing
-  indexed — can seal **different generation ids**. Builds from identical trees *and*
-  identical histories remain bit-identical (the standing double-build gate).
-- Shared artifacts (`vorpal-index export`/`import`) are unaffected: trust is by
-  recomputation over the artifacts, never by matching a locally recomputed id.
-- Off switch: `VORPAL_COCHANGE_COMMITS=0` restores tree-only identity (the report then
-  says `co-change disabled`); a directory that is not a git repository, or has no history,
-  seals tree-only and says so.

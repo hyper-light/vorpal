@@ -29,34 +29,34 @@ $ vorpal mcp          # serve all of the above to agents over MCP (stdio)
 
 ## Install
 
-Vorpal ships two interchangeable binaries: **`vorpal`** and the short alias **`vp`**.
-
 ### Prebuilt binary (recommended)
 
-Every [release](https://github.com/hyper-light/vorpal/releases) attaches a zip per platform,
-`app-<target>.zip`, containing both `vorpal` and `vp`.
+Every [release](https://github.com/hyper-light/vorpal/releases) attaches **one binary per
+platform** — download it, make it executable, done. No archive to unpack.
 
 ```sh
-# macOS (Apple Silicon) — swap the asset name for your platform (table below)
-curl -L -o vorpal.zip https://github.com/hyper-light/vorpal/releases/latest/download/app-aarch64-apple-darwin.zip
-unzip vorpal.zip && chmod +x vorpal vp && sudo mv vorpal vp /usr/local/bin/
+# macOS (Apple Silicon) — pick your asset from the table below
+curl -L -o vorpal https://github.com/hyper-light/vorpal/releases/latest/download/vorpal-macos-arm64
+chmod +x vorpal && sudo mv vorpal /usr/local/bin/
 vorpal --help
 ```
 
 | Platform | Asset |
 |---|---|
-| macOS Apple Silicon | `app-aarch64-apple-darwin.zip` |
-| macOS Intel | `app-x86_64-apple-darwin.zip` |
-| Linux x86-64 (glibc) | `app-x86_64-unknown-linux-gnu.zip` |
-| Linux ARM64 (glibc) | `app-aarch64-unknown-linux-gnu.zip` |
-| Linux x86-64 (musl/static) | `app-x86_64-unknown-linux-musl.zip` |
-| Linux ARM64 (musl/static) | `app-aarch64-unknown-linux-musl.zip` |
-| Windows x64 / ARM64 | `app-x86_64-pc-windows-msvc.zip` · `app-aarch64-pc-windows-msvc.zip` |
+| macOS Apple Silicon | `vorpal-macos-arm64` |
+| macOS Intel | `vorpal-macos-x64` |
+| Linux x64 (glibc) | `vorpal-linux-x64` |
+| Linux ARM64 (glibc) | `vorpal-linux-arm64` |
+| Linux x64 (static/musl) | `vorpal-linux-x64-musl` |
+| Linux ARM64 (static/musl) | `vorpal-linux-arm64-musl` |
+| Windows x64 | `vorpal-windows-x64.exe` |
+| Windows ARM64 | `vorpal-windows-arm64.exe` |
+| Windows x86 (32-bit) | `vorpal-windows-x86.exe` |
 
 ### npm (cross-platform, global CLI)
 
 ```sh
-npm install -g @hyper-light/vorpal-cli   # installs the vorpal + vp binaries for your platform
+npm install -g @hyper-light/vorpal-cli   # installs the vorpal binary for your platform
 ```
 
 ### From source (any platform, Rust 1.85+)
@@ -64,7 +64,7 @@ npm install -g @hyper-light/vorpal-cli   # installs the vorpal + vp binaries for
 ```sh
 git clone https://github.com/hyper-light/vorpal && cd vorpal
 cargo build --release -p vorpal
-sudo mv target/release/vorpal target/release/vp /usr/local/bin/   # or add to PATH
+sudo mv target/release/vorpal /usr/local/bin/   # or add to PATH
 ```
 
 More detail (PATH setup, verifying, troubleshooting): **[docs/getting-started.md](docs/getting-started.md)**.
@@ -155,30 +155,89 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 
 ## Performance
 
-Release builds, Apple Silicon; wall-clock for the whole CLI invocation including process start.
+All numbers below are release builds on an Apple M5 Max (18 cores, 128 GB, macOS 26.4.1,
+rustc 1.98.0), measured 2026-08-31, wall-clock for the whole CLI invocation including
+process start. Datasets are pinned so you can re-run them: Linux kernel @ `1590cf032971`
+(75,954 indexable files), CPython @ `b86a41cbf63` (3,841 files). Cold times are best of 3.
+Indexing derives the full relation set — calls, imports, types, data flow, near-clone
+pairs, request→route links, co-change history — so every number below buys the whole
+graph, not a bare symbol table.
 
-**This repository** (~351 files, ~9.6k nodes):
+### Indexing
+
+```
+vorpal index <source-tree> --out <index-dir>
+```
+
+| Tree | Cold index | Edit one file, re-index | `touch` one file | Nothing changed |
+|---|---|---|---|---|
+| **Linux kernel** (75,954 files, ~30 M LOC → 2.85 M nodes, 8.9 M references) | **6.6 s** | **1.7 s** | 0.23 s | 0.13 s |
+| **CPython** (3,841 files → 151k nodes) | 0.87 s | — | — | — |
+| **This repository** (1,311 files → 64k nodes, incl. vendored tree-sitter runtime + 49 grammars) | 6.0 s¹ | 0.06 s | — | 0.06 s |
+
+¹ Dominated by a single 33 MB generated `parser.c`; the other files parse in parallel
+underneath it.
+
+Peak memory for the kernel cold index is 1.9 GB. The index on disk for the kernel is a
+1.5 GB generation (the parsed-file cache inside it is what makes the 3.1 s re-index
+possible), plus an 840 MB semantic-search index once that is built; the previous
+generation is kept until the next commit, then swept.
+
+### Search (Linux kernel index, k = 10)
+
+```
+vorpal search "socket buffer alloc" -k 10 --index <index-dir>
+```
+
+| State | Time | What runs |
+|---|---|---|
+| First searches, before the semantic index exists | 0.28 s | exact scan of every candidate |
+| Semantic index built | **0.03 s** | accelerated lookup |
+
+The semantic index builds once in the background (19 s for the kernel) and is validated
+before every use; results are **identical** with or without it — it changes latency, never
+answers. Building it is never on your critical path: searches work immediately after
+indexing.
+
+### Running as an MCP server
+
+`vorpal mcp` watches your tree, keeps the index fresh as you edit, and answers over
+stdio — you never re-index by hand. Round-trip times measured from the client side
+(medians of 50 calls, kernel tree):
 
 | Operation | Time |
 |---|---|
-| Full cold index | **0.05 s** |
-| Re-index after touching one file | 0.03 s |
-| Re-index, nothing changed | 0.01 s |
-| Graph / search query (mmap cold-open) | milliseconds |
-| `scan` regex rule over the **Linux kernel** (63,775 C files) | **1.0 s** — faster than ripgrep, with structural results |
+| Graph query (callers, references, …) | **< 1 ms** |
+| Hybrid search | **27 ms** |
+| Save a file → queries reflect the change (full relation set, kernel tree) | ~0.57 s |
+| Comment-only / metadata-only saves | ~10 ms |
+| Keeping the semantic index current after an edit | ~140 ms, in the background |
+| Server start → answering queries on an existing index | immediate |
+| Server start → in-memory serving tier rebuilt (background) | ~15 s |
 
-**Linux kernel scale** (72,541 files, ~30M LOC → 2.74M nodes, 6.8M references; M-series, 18 cores):
+Editing never triggers index rebuilds — changes are applied incrementally, including to
+the semantic-search index.
 
-| Operation | Time |
-|---|---|
-| Cold index | **~7 s** at a sub-gigabyte peak footprint |
-| One-file incremental re-index | ~1.25 s |
-| Unchanged re-index | ~0.10 s |
-| Vector tier build (lazy, first search) | ~14 s, stamp-validated thereafter |
-| Warm MCP tool call (parse + freshness + query + render) | **2.8 µs** |
+### Structural scan vs. text grep (Linux kernel, 63,775 C files)
 
-Indexing is deterministic and bit-identical run to run. Full methodology — commands, datasets,
-hardware, cold/warm states, raw numbers: **[docs/wip/BENCHMARKS.md](docs/wip/BENCHMARKS.md)**.
+```
+vorpal scan --rule rule.yml ~/linux     # kind: call_expression + regex: kmalloc
+rg 'kmalloc\(' -t c ~/linux             # comparison
+```
+
+| Tool | Time | What you get |
+|---|---|---|
+| `vorpal scan` | 1.4 s | 42.6k structural matches — real `call_expression` nodes, not lines that happen to contain the text |
+| `ripgrep` | 0.7 s | raw text lines |
+
+Full parsing plus AST matching of 63,775 files costs about 2× a plain text grep of the
+same tree.
+
+### Determinism
+
+Indexing the same tree always produces byte-identical output — two independent cold
+builds of the kernel commit the exact same content-addressed generation. Every release
+re-verifies this.
 
 ## What it does
 
@@ -203,7 +262,7 @@ JSDoc, JSON, Julia, Kotlin, Lua, Make, Markdown, Nix, Objective-C, OCaml, Perl, 
 PowerShell, Protobuf, Python, R, Ruby, Rust, Scala, Solidity, SQL, Svelte, Swift, TOML, TSX,
 TypeScript, Vue, XML, YAML, Zig. Vue/Svelte/Astro single-file components extract their
 script/style/frontmatter content through real embedded parses (C3a injections). The relation edges each supports are in
-the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simply absent — never guessed.
+the **[language matrix](docs/LANGUAGES.md)**. Anything not extracted is simply absent — never guessed.
 
 ## Documentation
 
@@ -212,9 +271,8 @@ the **[language matrix](docs/wip/LANGUAGES.md)**. Anything not extracted is simp
 | [Getting started](docs/getting-started.md) | Install, first index, every CLI command with examples |
 | [MCP setup](docs/mcp.md) | Wire vorpal into Claude / Codex / any MCP client; the tool reference |
 | [Python](docs/python.md) · [TypeScript/JS](docs/typescript.md) | Library quickstarts (patterns + index API) |
-| [Supported languages](docs/wip/LANGUAGES.md) | The full matrix of what each of the 49 grammars extracts |
+| [Supported languages](docs/LANGUAGES.md) | The full matrix of what each of the 49 grammars extracts |
 | [Architecture](docs/wip/ARCHITECTURE.md) | Storage format, memory model, concurrency, scaling roadmap |
-| [Benchmarks](docs/wip/BENCHMARKS.md) | Reproducible perf: commands, datasets, hardware, results |
 | [Index format](docs/INDEX_FORMAT.md) | On-disk compatibility & migration policy |
 
 ## How it works

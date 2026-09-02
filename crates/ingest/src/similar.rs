@@ -28,8 +28,8 @@ pub const MAX_PARTNERS: usize = 8;
 const MAX_CANDIDATES: usize = 8_000_000;
 
 /// One signed definition, as replayed from its product.
-#[derive(Clone)]
-pub(crate) struct SigRow {
+#[derive(Clone, PartialEq, Eq)]
+pub struct SigRow {
   pub node: u64,
   pub shingles: u32,
   pub sketch: [u8; BINS],
@@ -50,7 +50,12 @@ pub struct SimilarReport {
 }
 
 /// Similar pairs `(a, b, confidence)` with `a < b`, sorted; confidence = similarity × 100.
-pub(crate) fn similar_pairs(mut rows: Vec<SigRow>) -> (Vec<(u64, u64, u8)>, SimilarReport) {
+// The sigs family (P4.5c) persists exactly these sketches; the widths must never drift.
+const _: () = assert!(BINS == vorpal_kg::SIG_SKETCH_LEN);
+
+pub(crate) fn similar_pairs(
+  mut rows: Vec<SigRow>,
+) -> (Vec<(u64, u64, u8)>, SimilarReport, Vec<SigRow>) {
   let mut report = SimilarReport {
     signed: rows.len() as u64,
     ..SimilarReport::default()
@@ -60,10 +65,23 @@ pub(crate) fn similar_pairs(mut rows: Vec<SigRow>) -> (Vec<(u64, u64, u8)>, Simi
       0 => "no definition reached the signing floor (32 tokens)".to_string(),
       _ => "one signed definition — nothing to pair".to_string(),
     });
-    return (Vec::new(), report);
+    return (Vec::new(), report, rows);
   }
   let started = std::time::Instant::now();
-  rows.par_sort_unstable_by_key(|r| r.node);
+  // THE ORDER LAW (P4.5c): sort by full row CONTENT, then keep the first row per node —
+  // the survivor for a duplicate node id is the smallest (shingles, sketch). Duplicates
+  // are real, not theoretical: the writer collapses same-(entity_path, signature)
+  // entities onto one node (C decl+def, cfg-variant bodies) and BOTH occurrences can
+  // sign with different sketches — census 2026-09-01: kernel 639,554 rows → 548 dup
+  // nodes, 543 content-differing; ast-grep 2,128 → 4, all differing. Everything after
+  // this dedup walks the node-sorted sequence (band keys, ceiling truncation, star
+  // hubs), so with a content-total survivor the ENTIRE pass is a pure function of the
+  // row MULTISET — feed order (bulk stream, retained RAM, scoped splice) is irrelevant
+  // by construction. A node-only sort key left the survivor to the unstable sort's
+  // arrangement — deterministic per feed, but not per multiset (sigs VERSION 1 → 2).
+  rows.par_sort_unstable_by(|a, b| {
+    (a.node, a.shingles, &a.sketch).cmp(&(b.node, b.shingles, &b.sketch))
+  });
   rows.dedup_by_key(|r| r.node);
   // Band keys: (band, 4 sketch bytes) → row index. Sorted, so equal keys are adjacent.
   let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(rows.len() * BANDS);
@@ -185,7 +203,7 @@ pub(crate) fn similar_pairs(mut rows: Vec<SigRow>) -> (Vec<(u64, u64, u8)>, Simi
   } else if pairs.is_empty() {
     report.note = Some("no pair of signed definitions reached 0.7 similarity".to_string());
   }
-  (pairs, report)
+  (pairs, report, rows)
 }
 
 #[cfg(test)]
@@ -201,6 +219,30 @@ mod tests {
   }
 
   #[test]
+  fn duplicate_node_survivor_is_feed_order_invariant() {
+    // THE ORDER LAW's unit pin: two content-differing rows on ONE node id (the writer's
+    // duplicate-entity collapse — C decl+def, cfg-variant bodies) must yield the same
+    // pairs AND the same family rows whichever order the feed delivers them in.
+    let dup_a = row(2, 1, 100); // matches node 1's sketch → would pair
+    let dup_b = row(2, 7, 100); // matches nothing
+    let base = vec![row(1, 1, 100), row(3, 7, 100)];
+    let mut feed_ab = base.clone();
+    feed_ab.extend([dup_a.clone(), dup_b.clone()]);
+    let mut feed_ba = base;
+    feed_ba.extend([dup_b, dup_a]);
+    let (pairs_ab, _, rows_ab) = similar_pairs(feed_ab);
+    let (pairs_ba, _, rows_ba) = similar_pairs(feed_ba);
+    assert_eq!(pairs_ab, pairs_ba, "pairs must be a pure function of the row multiset");
+    assert!(rows_ab == rows_ba, "family rows must be a pure function of the row multiset");
+    // And the survivor is the CONTENT-smallest row, not an arrangement accident: fill 1
+    // sorts below fill 7, so node 2 keeps the sketch that pairs with node 1.
+    assert_eq!(pairs_ab.len(), 1, "{pairs_ab:?}");
+    assert_eq!((pairs_ab[0].0, pairs_ab[0].1), (1, 2));
+    let survivor = rows_ab.iter().find(|r| r.node == 2).expect("node 2 survives");
+    assert_eq!(survivor.sketch, [1; BINS], "smallest (shingles, sketch) wins");
+  }
+
+  #[test]
   fn pairs_equal_sketches_and_refuses_unrelated_or_mismatched_sizes() {
     let mut near = row(2, 1, 100);
     near.sketch[0] = 9; // 63/64 equal → ~0.98
@@ -210,7 +252,7 @@ mod tests {
       row(3, 2, 100),   // unrelated fill
       row(4, 1, 10),    // equal sketch, but a tenth of the size: refused by the ratio
     ];
-    let (pairs, report) = similar_pairs(rows);
+    let (pairs, report, _) = similar_pairs(rows);
     assert_eq!(pairs.len(), 1, "{pairs:?}");
     assert_eq!((pairs[0].0, pairs[0].1), (1, 2));
     assert!(pairs[0].2 >= 97, "{}", pairs[0].2);
@@ -224,7 +266,7 @@ mod tests {
     // 100 identical definitions: every bucket exceeds the all-pairs bound, so each member
     // pairs with the lowest id, and the hub keeps only MAX_PARTNERS partners.
     let rows: Vec<SigRow> = (0..100).map(|n| row(n, 5, 50)).collect();
-    let (pairs, report) = similar_pairs(rows);
+    let (pairs, report, _) = similar_pairs(rows);
     assert!(report.starred_buckets > 0);
     assert!(pairs.iter().all(|&(a, _, _)| a == 0), "{pairs:?}");
     // Every member keeps its one pair to the representative (a pair survives when either
@@ -234,7 +276,7 @@ mod tests {
     assert!(report.note.is_none());
     // A mid-sized family under the all-pairs bound is still capped per member.
     let rows: Vec<SigRow> = (0..40).map(|n| row(n, 5, 50)).collect();
-    let (pairs, _) = similar_pairs(rows);
+    let (pairs, _, _) = similar_pairs(rows);
     let mut degree = vec![0usize; 40];
     for &(a, b, _) in &pairs {
       degree[a as usize] += 1;
@@ -248,9 +290,9 @@ mod tests {
 
   #[test]
   fn nothing_to_pair_is_stated() {
-    let (_, report) = similar_pairs(vec![row(1, 1, 40)]);
+    let (_, report, _) = similar_pairs(vec![row(1, 1, 40)]);
     assert!(report.note.as_deref().unwrap().contains("one signed"));
-    let (_, report) = similar_pairs(vec![row(1, 1, 40), row(2, 2, 40)]);
+    let (_, report, _) = similar_pairs(vec![row(1, 1, 40), row(2, 2, 40)]);
     assert!(report.note.as_deref().unwrap().contains("no pair"));
   }
 }

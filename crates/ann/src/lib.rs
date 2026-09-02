@@ -14,11 +14,14 @@
 //! token similarity, not a neural model). Neural embedders plug in behind the same trait.
 //! RaBitQ-grade quantization and IVF sharding are the §10 successors behind the same seams.
 
+#[cfg(test)]
+mod fastscan_probe;
 mod embed;
 pub mod encoder;
 mod index;
 mod kernels;
 pub mod learned;
+mod overlay;
 pub mod retrofit;
 mod qmatrix;
 mod quant;
@@ -27,6 +30,7 @@ mod vamana;
 
 pub use embed::{Embedder, LEXICAL_EMBED_VERSION, LexicalEmbedder, ModelProvenance, tokenize};
 pub use index::{AnnConfig, AnnIndex};
+pub use overlay::AnnOverlay;
 pub use quant::SignQuantizer;
 pub use scan::exhaustive_semantic;
 
@@ -72,5 +76,12 @@ impl Rng {
   /// Uniform in `[0, bound)`.
   pub fn below(&mut self, bound: usize) -> usize {
     (self.next() % bound.max(1) as u64) as usize
+  }
+}
+
+/// Build-phase telemetry, VORPAL_PHASE_TRACE-gated like the pipeline's phase stamps.
+pub(crate) fn trace(label: &str) {
+  if std::env::var_os("VORPAL_PHASE_TRACE").is_some() {
+    eprintln!("[ann] {label}");
   }
 }

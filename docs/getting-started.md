@@ -7,46 +7,38 @@ from install to your first queries in a few minutes.
 
 ## Install the CLI
 
-vorpal ships two binaries: **`vorpal`** and **`vp`** (a short alias for the same tool).
+### Prebuilt binary (from a tagged release)
 
-### From source (works today, any platform)
+Each tagged release attaches **one binary per platform** to the
+[Releases page](https://github.com/hyper-light/vorpal/releases) — download, `chmod +x`, done:
+
+| Platform | Asset |
+|---|---|
+| macOS (Apple Silicon) | `vorpal-macos-arm64` |
+| macOS (Intel) | `vorpal-macos-x64` |
+| Linux x64 (glibc) | `vorpal-linux-x64` |
+| Linux ARM64 (glibc) | `vorpal-linux-arm64` |
+| Linux x64 (static/musl) | `vorpal-linux-x64-musl` |
+| Linux ARM64 (static/musl) | `vorpal-linux-arm64-musl` |
+| Windows x64 | `vorpal-windows-x64.exe` |
+| Windows ARM64 | `vorpal-windows-arm64.exe` |
+| Windows x86 (32-bit) | `vorpal-windows-x86.exe` |
+
+```sh
+# macOS Apple Silicon example
+curl -L -o vorpal https://github.com/hyper-light/vorpal/releases/latest/download/vorpal-macos-arm64
+chmod +x vorpal && mv vorpal ~/.local/bin/    # or /usr/local/bin
+```
+
+### From source (any platform)
 
 Requires Rust 1.85+ ([rustup.rs](https://rustup.rs)).
 
 ```sh
 git clone https://github.com/hyper-light/vorpal && cd vorpal
 cargo build --release -p vorpal
-# binaries are now at ./target/release/vorpal and ./target/release/vp
-```
-
-Put them on your `PATH`, e.g.:
-
-```sh
-cp target/release/vorpal target/release/vp ~/.local/bin/    # or /usr/local/bin
+cp target/release/vorpal ~/.local/bin/    # or /usr/local/bin
 vorpal --help
-```
-
-### Prebuilt binaries (from a tagged release)
-
-Each tagged release attaches a zip per platform to the
-[Releases page](https://github.com/hyper-light/vorpal/releases), named `app-<target>.zip`
-(each contains both `vorpal` and `vp`):
-
-| Platform | Asset |
-|---|---|
-| macOS (Apple Silicon) | `app-aarch64-apple-darwin.zip` |
-| macOS (Intel) | `app-x86_64-apple-darwin.zip` |
-| Linux x86-64 (glibc) | `app-x86_64-unknown-linux-gnu.zip` |
-| Linux ARM64 (glibc) | `app-aarch64-unknown-linux-gnu.zip` |
-| Linux x86-64 (musl/static) | `app-x86_64-unknown-linux-musl.zip` |
-| Linux ARM64 (musl/static) | `app-aarch64-unknown-linux-musl.zip` |
-| Windows x64 | `app-x86_64-pc-windows-msvc.zip` |
-| Windows ARM64 | `app-aarch64-pc-windows-msvc.zip` |
-
-```sh
-# macOS Apple Silicon example
-curl -L -o vorpal.zip https://github.com/hyper-light/vorpal/releases/latest/download/app-aarch64-apple-darwin.zip
-unzip vorpal.zip && chmod +x vorpal vp && mv vorpal vp ~/.local/bin/
 ```
 
 > **No release yet for the version you want?** Build from source (above) — that's the supported
@@ -155,4 +147,4 @@ text.
 - **[Python quickstart](./python.md)** — `pip install vorpal-py`.
 - **[TypeScript / JavaScript quickstart](./typescript.md)** — the pattern engine for Node & the browser.
 - **[Supported languages](./wip/LANGUAGES.md)** — the full matrix of what each grammar extracts.
-- **[How it works](./wip/ARCHITECTURE.md)** and **[benchmarks](./wip/BENCHMARKS.md)** — for the curious.
+- **[How it works](./wip/ARCHITECTURE.md)** and **[benchmarks](../README.md#performance)** — for the curious.

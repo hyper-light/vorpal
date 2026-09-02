@@ -105,6 +105,36 @@ struct RawPair {
 
 const CACHE_MAGIC: &str = "vorpal-cochange/1";
 
+/// Whether the co-change derivation's inputs are provably unchanged since the prior
+/// build — the composes' carry premise for CHANGES_WITH edges (respan and defs-stable
+/// both carry them byte-identically). True when: co-change is disabled; or the tree is
+/// not a git repository (both builds derive nothing); or the HEAD-keyed cache the prior
+/// build read or wrote matches the CURRENT (head, commit-window) exactly — a commit's
+/// ancestry is immutable, so header equality pins the pair set. Anything unprovable is
+/// `false`: the caller declines and the full pipeline re-derives honestly.
+pub(crate) fn inputs_unchanged(src: &Path, cache_path: &Path) -> bool {
+  let commits = commits_from_env();
+  if commits == 0 {
+    return true;
+  }
+  if git_output(src, &["rev-parse", "--show-toplevel"]).is_err() {
+    return true;
+  }
+  let Ok(head) = git_output(src, &["rev-parse", "HEAD"]) else {
+    return false;
+  };
+  let Ok(text) = std::fs::read_to_string(cache_path) else {
+    return false;
+  };
+  let Some(header) = text.lines().next() else {
+    return false;
+  };
+  let mut parts = header.split(' ');
+  parts.next() == Some(CACHE_MAGIC)
+    && parts.next() == Some(head.trim())
+    && parts.next().and_then(|c| c.parse::<usize>().ok()) == Some(commits)
+}
+
 /// Begin the pass: resolve the repository, consult the HEAD-keyed cache, else spawn
 /// `git log`. Cheap (two `git rev-parse` calls) — call before the extraction stream.
 pub fn start(src: &Path, cache_path: &Path) -> Pending {

@@ -14,6 +14,9 @@ version.workspace = true
 vorpal-mem.workspace = true
 
 bytemuck = "1"
-blake3.workspace = true
+# `rayon` turns on blake3's tree-parallel `update_rayon` — same digest as the serial hash by
+# construction (blake3 is a tree hash), used for the whole-segment integrity hash at seal.
+blake3 = { workspace = true, features = ["rayon"] }
+rayon.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror.workspace = true

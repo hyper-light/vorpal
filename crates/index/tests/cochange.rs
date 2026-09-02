@@ -110,10 +110,22 @@ fn cochange_edges_follow_git_history() {
   .unwrap();
   assert!(cache.starts_with(&format!("vorpal-cochange/1 {} ", head.trim())), "{cache}");
   assert!(cache.lines().count() >= 2, "raw pairs stored: {cache}");
-  write("a.rs", "pub fn a() { 4; }\n"); // touch, then rebuild from the cache → same id
-  fs::write(src.join("a.rs"), "pub fn a() { 1; }\n").unwrap();
+  // An extraction-visible edit (longer body → item spans shift), so the rebuild runs the
+  // full pipeline and the cochange pass hits its HEAD-keyed cache. A same-length touch
+  // would take the stamp-only commit cutoff instead — artifacts (cochange edges included)
+  // carried forward byte-identically with the pass stated as not re-run on the report.
+  write("a.rs", "pub fn a() { 400; }\n");
   let cached = build_index(&src, &out).unwrap();
-  assert_eq!(cached.cochange_edges, 1, "{cached:?}");
+  // Under the bucketed default this span-only edit takes the RESPAN compose, which
+  // carries relations byte-identically (the HEAD-keyed rung proved the co-change inputs
+  // unmoved) and reports the pass as not re-run — so assert the GRAPH truth, which is
+  // what the cache guarantees either way.
+  let kg = vorpal_kg::Kg::load(&vorpal_kg::resolve_index_dir(&out)).unwrap();
+  let cochange_in_graph: usize = (0..kg.node_count() as u64)
+    .flat_map(|id| kg.out_neighbors(vorpal_kg::NodeId::new(id)))
+    .filter(|(_, etype)| etype.base() == vorpal_kg::EdgeType::CHANGES_WITH)
+    .count();
+  assert_eq!(cochange_in_graph, 2, "one symmetric pair, both directions: {cached:?}");
   // A commit that couples a and c twice more flips c's partner set — the cache is stale
   // by HEAD and refreshes.
   write("a.rs", "pub fn a() { 5; }\n");

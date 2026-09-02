@@ -135,6 +135,30 @@ rule:
         inside:
           kind: compound_statement
           stopBy: end
+    # A declaration whose type is a NAMED, body-bearing struct/union/enum is first and
+    # foremost a type definition (`struct file_operations { ... } __randomize_layout;` —
+    # the kernel's randomized-layout idiom, or any `struct X { ... } y;`). Declining it
+    # here lets the traversal descend so c-struct/c-union/c-enum mint the TYPE node, whose
+    # fields then extract as members; an item match would swallow the whole subtree and
+    # the type would never exist (measured: file_operations, cpuinfo_x86, and every
+    # __randomize_layout struct were absent at kernel scale). Anonymous bodies keep the
+    # variable — there is no type name to prefer.
+    - not:
+        has:
+          field: type
+          any:
+            - all:
+                - kind: struct_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: union_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: enum_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: enumerator_list }
 name: $NAME
 # Internal linkage is honest visibility (§3.3), same as c-function: a `static` file-scope
 # variable is translation-unit-local. Exporting it did double damage — the resolver could

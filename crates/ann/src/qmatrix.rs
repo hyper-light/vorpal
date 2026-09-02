@@ -40,7 +40,91 @@ pub(crate) struct QuantQuery {
 
 /// Quantize one row: `scale = max|x| / 127`, codes rounded to nearest. Exactly reversible
 /// ordering-wise for the common case; the all-zero row gets scale 0 and a zero self term.
-fn quantize_row(row: &[f32], codes: &mut [i8]) -> (f32, f32) {
+/// Deterministic random rotation (RaBitQ-style fast JL transform): three rounds of
+/// {seeded ±1 sign flips → 64-point fast Walsh-Hadamard per block → seeded permutation}.
+/// An L2 isometry (up to one global power-of-two scale), pure function of
+/// (row, ROTATION_SEED) — byte-deterministic everywhere.
+///
+/// NOT applied to the i8 tier: gated on-corpus and rejected there (pool recall 0.9812 →
+/// 0.9469 — the spiky lexical-hash coordinates the rotation smooths out were acting as
+/// natural navigation signposts, and at 8 bits the fidelity gain cannot repay that; see
+/// docs/wip/ANN_FRONTIER.md). Retained as the foundation the 1-bit RaBitQ tier requires:
+/// sign-bit codes are only unbiased estimators AFTER this rotation.
+// Dead-code allowances: consumed by the 1-bit RaBitQ tier (in progress) and pinned by the
+// rotation_tests module meanwhile; release builds see no callers yet.
+#[allow(dead_code)]
+const ROTATION_SEED: u64 = 0x0051_7AC1_ED07_A7E5;
+#[allow(dead_code)]
+const ROTATION_ROUNDS: usize = 3;
+
+#[inline]
+#[allow(dead_code)]
+fn splitmix64(state: &mut u64) -> u64 {
+  *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+  let mut z = *state;
+  z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+  z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+  z ^ (z >> 31)
+}
+
+#[allow(dead_code)]
+fn fht64(block: &mut [f32]) {
+  debug_assert_eq!(block.len(), 64);
+  let mut h = 1;
+  while h < 64 {
+    let mut i = 0;
+    while i < 64 {
+      for j in i..i + h {
+        let x = block[j];
+        let y = block[j + h];
+        block[j] = x + y;
+        block[j + h] = x - y;
+      }
+      i += h * 2;
+    }
+    h *= 2;
+  }
+  // Exact power-of-two normalization (1/sqrt(64) = 2^-3): the transform stays an isometry
+  // and every operation is exactly representable.
+  for x in block.iter_mut() {
+    *x *= 0.125;
+  }
+}
+
+#[allow(dead_code)]
+pub(crate) fn rotate_row(row: &mut [f32]) {
+  let d = row.len();
+  if d == 0 || d % 64 != 0 {
+    return;
+  }
+  let mut state = ROTATION_SEED;
+  for _round in 0..ROTATION_ROUNDS {
+    // Seeded sign flips: one bit per element, drawn in fixed order.
+    let mut bits = 0u64;
+    let mut left = 0u32;
+    for x in row.iter_mut() {
+      if left == 0 {
+        bits = splitmix64(&mut state);
+        left = 64;
+      }
+      if bits & 1 == 1 {
+        *x = -*x;
+      }
+      bits >>= 1;
+      left -= 1;
+    }
+    for block in row.chunks_mut(64) {
+      fht64(block);
+    }
+    // Seeded Fisher-Yates over the whole row: mixes across blocks between rounds.
+    for i in (1..d).rev() {
+      let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+      row.swap(i, j);
+    }
+  }
+}
+
+pub(crate) fn quantize_row(row: &[f32], codes: &mut [i8]) -> (f32, f32) {
   let max_abs = row.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
   if max_abs == 0.0 {
     codes.fill(0);
@@ -59,6 +143,11 @@ fn quantize_row(row: &[f32], codes: &mut [i8]) -> (f32, f32) {
 }
 
 impl QuantMatrix {
+  /// Row stride (dim padded to a 16 multiple) — overlay rows must match it exactly.
+  pub(crate) fn padded(&self) -> usize {
+    self.padded
+  }
+
   /// Build by filling and quantizing one row at a time, in parallel — the full-precision
   /// matrix never exists (at kernel scale it was 2.9 GB of pure transient).
   pub fn from_rows<F: Fn(usize, &mut [f32]) + Sync>(n: usize, dim: usize, fill: F) -> Self {
@@ -134,7 +223,16 @@ impl QuantMatrix {
   /// Stage row `i`'s codes into cache (the beam loop's next-neighbor prefetch).
   #[inline]
   pub fn prefetch_row(&self, i: u32) {
-    vorpal_mem::prefetch_read(self.codes[i as usize * self.padded..].as_ptr());
+    // The whole row, not just its first cache line: a 256-byte row spans 2 lines on Apple
+    // Silicon (128 B) and 4 on x86 (64 B); prefetching at a 64 B stride covers both layouts
+    // (a second hint into an already-staged 128 B line is a no-op).
+    let base = self.codes[i as usize * self.padded..].as_ptr();
+    let mut off = 0usize;
+    while off < self.padded {
+      // SAFETY: `base + off` stays inside row `i`'s `padded`-byte allocation.
+      vorpal_mem::prefetch_read(unsafe { base.add(off) });
+      off += 64;
+    }
   }
 
   /// Squared L2 between dequantized rows `a` and `b`.
@@ -143,6 +241,30 @@ impl QuantMatrix {
     let dot = dot_i8(self.row_codes(a), self.row_codes(b));
     self.snorm[a as usize] + self.snorm[b as usize]
       - 2.0 * self.scales[a as usize] * self.scales[b as usize] * dot as f32
+  }
+
+  /// Four [`QuantMatrix::dist_sq`] evaluations against one shared row, batched so the four
+  /// candidates' memory stalls overlap. Per-pair arithmetic identical to the single form.
+  #[inline]
+  pub fn dist_sq_x4(&self, rows: [u32; 4], q: u32) -> [f32; 4] {
+    let qc = self.row_codes(q);
+    let dots = dot_i8_x4(
+      [
+        self.row_codes(rows[0]),
+        self.row_codes(rows[1]),
+        self.row_codes(rows[2]),
+        self.row_codes(rows[3]),
+      ],
+      qc,
+    );
+    let qs = self.scales[q as usize];
+    let qn = self.snorm[q as usize];
+    let mut out = [0.0f32; 4];
+    for k in 0..4 {
+      let i = rows[k] as usize;
+      out[k] = self.snorm[i] + qn - 2.0 * self.scales[i] * qs * dots[k] as f32;
+    }
+    out
   }
 
   /// Squared L2 between dequantized row `i` and a quantized query.
@@ -157,7 +279,89 @@ impl QuantMatrix {
 /// widening-multiply NEON, scalar — computes the identical integer, so dispatch can never
 /// affect results.
 #[inline]
-fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+/// Four independent dot products against one shared query, with interleaved accumulator
+/// chains: the four candidate rows' cache misses overlap instead of serializing call by
+/// call (the beam's dominant stall). Each lane computes the IDENTICAL integer the
+/// single-pair kernel computes — dispatch and batching can never affect results.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_i8_sdot_x4(a: [&[i8]; 4], b: &[i8]) -> [i32; 4] {
+  debug_assert!(a.iter().all(|row| row.len() == b.len()));
+  debug_assert_eq!(b.len() % 16, 0);
+  let mut p0 = a[0].as_ptr();
+  let mut p1 = a[1].as_ptr();
+  let mut p2 = a[2].as_ptr();
+  let mut p3 = a[3].as_ptr();
+  let mut pb = b.as_ptr();
+  let mut steps = b.len() / 16;
+  let (acc0, acc1, acc2, acc3): (i32, i32, i32, i32);
+  // SAFETY: pointers stay within the equal-length slices (steps·16 == len); loads only.
+  unsafe {
+    std::arch::asm!(
+      ".arch_extension dotprod",
+      "movi v0.4s, #0",
+      "movi v1.4s, #0",
+      "movi v2.4s, #0",
+      "movi v3.4s, #0",
+      "2:",
+      "ldr q4, [{pb}], #16",
+      "ldr q5, [{p0}], #16",
+      "ldr q6, [{p1}], #16",
+      "ldr q7, [{p2}], #16",
+      "ldr q16, [{p3}], #16",
+      "sdot v0.4s, v5.16b, v4.16b",
+      "sdot v1.4s, v6.16b, v4.16b",
+      "sdot v2.4s, v7.16b, v4.16b",
+      "sdot v3.4s, v16.16b, v4.16b",
+      "subs {steps}, {steps}, #1",
+      "b.ne 2b",
+      "addv s0, v0.4s",
+      "addv s1, v1.4s",
+      "addv s2, v2.4s",
+      "addv s3, v3.4s",
+      "fmov {a0:w}, s0",
+      "fmov {a1:w}, s1",
+      "fmov {a2:w}, s2",
+      "fmov {a3:w}, s3",
+      p0 = inout(reg) p0,
+      p1 = inout(reg) p1,
+      p2 = inout(reg) p2,
+      p3 = inout(reg) p3,
+      pb = inout(reg) pb,
+      steps = inout(reg) steps,
+      a0 = out(reg) acc0,
+      a1 = out(reg) acc1,
+      a2 = out(reg) acc2,
+      a3 = out(reg) acc3,
+      out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+      out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+      out("v16") _,
+      options(nostack, readonly),
+    );
+  }
+  let _ = (p0, p1, p2, p3, pb, steps);
+  [acc0, acc1, acc2, acc3]
+}
+
+/// Batched form of [`dot_i8`]: identical integers per pair on every path (the fallback IS
+/// four single calls), so batching is invisible to output bytes.
+fn dot_i8_x4(a: [&[i8]; 4], b: &[i8]) -> [i32; 4] {
+  #[cfg(target_arch = "aarch64")]
+  {
+    if cfg!(target_feature = "dotprod") || std::arch::is_aarch64_feature_detected!("dotprod") {
+      // SAFETY: dotprod verified; equal 16-multiple lengths by construction.
+      return unsafe { dot_i8_sdot_x4(a, b) };
+    }
+  }
+  [
+    dot_i8(a[0], b),
+    dot_i8(a[1], b),
+    dot_i8(a[2], b),
+    dot_i8(a[3], b),
+  ]
+}
+
+pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
   #[cfg(target_arch = "aarch64")]
   {
     // Apple Silicon builds enable `dotprod` at compile time, so this is a static branch;
@@ -423,5 +627,35 @@ mod tests {
         assert!(err < 0.02, "quantized distance drifted: {err}");
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+  use super::*;
+
+  /// The rotation is an isometry up to one global power-of-two scale: pairwise squared
+  /// distances scale uniformly, so RELATIVE geometry — all any quantizer or estimator
+  /// consumes — is exactly preserved. Also pins byte-determinism across calls.
+  #[test]
+  fn rotation_preserves_relative_geometry_and_is_deterministic() {
+    let mut a: Vec<f32> = (0..256).map(|i| ((i * 37 + 11) % 97) as f32 / 97.0 - 0.5).collect();
+    let mut b: Vec<f32> = (0..256).map(|i| ((i * 53 + 29) % 89) as f32 / 89.0 - 0.5).collect();
+    let d0: f32 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum();
+    let n0: f32 = a.iter().map(|x| x * x).sum();
+    let mut a2 = a.clone();
+    rotate_row(&mut a);
+    rotate_row(&mut a2);
+    assert_eq!(a, a2, "rotation must be a pure function");
+    rotate_row(&mut b);
+    let d1: f32 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum();
+    let n1: f32 = a.iter().map(|x| x * x).sum();
+    // Same power-of-two scale on distances and norms (3 rounds of 2^-6 on squared values).
+    let scale = n1 / n0;
+    assert!((d1 / d0 - scale).abs() < 1e-3 * scale, "isometry up to uniform scale");
+    // Non-multiple-of-64 rows are identity — deterministic skip.
+    let mut short = vec![1.0f32; 48];
+    rotate_row(&mut short);
+    assert_eq!(short, vec![1.0f32; 48]);
   }
 }

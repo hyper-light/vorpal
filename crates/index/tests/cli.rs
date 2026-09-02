@@ -202,19 +202,24 @@ fn incremental_generation_converges_to_from_scratch() {
   );
   // And the generation contents are byte-identical, artifact by artifact.
   let (inc_live, fresh_live) = (live(&inc), live(&fresh));
-  let mut names: Vec<_> = fs::read_dir(&inc_live)
-    .unwrap()
-    .flatten()
-    .map(|e| e.file_name())
-    .collect();
-  names.sort();
-  for name in names {
-    assert_eq!(
-      fs::read(inc_live.join(&name)).unwrap(),
-      fs::read(fresh_live.join(&name)).unwrap(),
-      "artifact {name:?} differs between incremental and from-scratch"
-    );
+  fn assert_dir_equal(a: &std::path::Path, b: &std::path::Path) {
+    let mut names: Vec<_> =
+      fs::read_dir(a).unwrap().flatten().map(|e| e.file_name()).collect();
+    names.sort();
+    for name in names {
+      let (pa, pb) = (a.join(&name), b.join(&name));
+      if pa.is_dir() {
+        assert_dir_equal(&pa, &pb); // bucketed families are directories of members
+      } else {
+        assert_eq!(
+          fs::read(&pa).unwrap(),
+          fs::read(&pb).unwrap(),
+          "artifact {name:?} differs between incremental and from-scratch"
+        );
+      }
+    }
   }
+  assert_dir_equal(&inc_live, &fresh_live);
 
   let _ = fs::remove_dir_all(&base);
 }
@@ -369,8 +374,14 @@ fn external_id_bookmarks_survive_rebuilds() {
   let eid = kg.node(id_v1).unwrap().external_id.expect("eid persisted");
   drop(kg);
 
-  // A new file that sorts earlier shifts every dense id; the bookmark must not care.
-  fs::write(src.join("a.rs"), "pub fn earlier() -> u32 { 0 }\n").unwrap();
+  // A definition added ABOVE in the same file shifts the bookmark's dense id under
+  // BOTH formats (flat path-order and the bucketed shift law — where this rides the
+  // defs-changed compose); the bookmark must not care.
+  fs::write(
+    src.join("m.rs"),
+    "pub fn earlier() -> u32 { 0 }\npub fn bookmark_me() -> u32 { 1 }\n",
+  )
+  .unwrap();
   build_index(&src, &out).unwrap();
   let kg = Kg::load(&out).unwrap();
   let id_v2 = kg.nodes_named("bookmark_me")[0];
@@ -448,11 +459,19 @@ fn verified_mode_catches_stale_banked_products() {
   // product replays — the documented blind spot.
   vorpal_index::build_index_with(&src, &out, vorpal_index::CacheMode::FastStat).unwrap();
   let kg = Kg::load(&out).unwrap();
+  // The documented fast-stat blind spot: the camouflaged edit is INVISIBLE. Which stale
+  // content survives depends on the lane — the flat full pipeline replayed the stale
+  // BANK (mode_two); the bucketed composes never re-extract an unchanged-by-stat file
+  // at all, so the PRIOR GENERATION's content carries (mode_one). Either way the truth
+  // (mode_ten) is absent, and only Verified below can see it.
+  let stale_bank = kg.nodes_named("mode_two").len();
+  let stale_prior = kg.nodes_named("mode_one").len();
   assert_eq!(
-    kg.nodes_named("mode_two").len(),
+    stale_bank + stale_prior,
     1,
-    "fast-stat replays the stale bank (documented blind spot)"
+    "fast-stat serves ONE stale view of the camouflaged file (documented blind spot)"
   );
+  assert!(kg.nodes_named("mode_ten").is_empty(), "the truth needs verified mode");
   drop(kg);
 
   // Verified: content-authoritative — the stale bank is rejected and the file re-parses.
@@ -1595,8 +1614,12 @@ fn model_provenance_is_persisted_and_gates_the_tier() {
   let before = vorpal_index::search_index_explained(&out, "gadget maker", 5).unwrap();
 
   // A model change (simulated: bump the persisted semantics version) invalidates the tier;
-  // search still answers — the exact fallback — with identical results.
-  let tampered = raw.replace("\"version\":1", "\"version\":999");
+  // search still answers — the exact fallback — with identical results. The tamper targets
+  // whatever version is CURRENTLY persisted, so bumping LEXICAL_EMBED_VERSION can never
+  // silently turn this into a no-op (the guard below proved that the hard-coded form did).
+  let at = raw.find("\"version\":").expect("provenance carries a version") + "\"version\":".len();
+  let digits = raw[at..].chars().take_while(char::is_ascii_digit).count();
+  let tampered = format!("{}999{}", &raw[..at], &raw[at + digits..]);
   assert_ne!(raw, tampered, "test must actually change the version");
   fs::write(gen_dir.join("ann.model.json"), &tampered).unwrap();
   let stale = vorpal_index::search_index_explained(&out, "gadget maker", 5).unwrap();
@@ -1651,7 +1674,7 @@ fn parse_health_policies_and_report() {
     mode: vorpal_index::ParseHealthMode::Fail,
     max_error_ratio: 0.0,
   };
-  let err = vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), strict)
+  let err = vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), strict, None)
     .expect_err("strict fail policy must abort");
   assert!(err.to_string().contains("broken.rs"), "{err}");
   assert!(
@@ -1662,7 +1685,7 @@ fn parse_health_policies_and_report() {
     mode: vorpal_index::ParseHealthMode::Fail,
     max_error_ratio: 0.99,
   };
-  vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), lenient)
+  vorpal_index::build_index_full(&src, &out_fail, vorpal_index::CacheMode::default(), lenient, None)
     .expect("under-threshold damage passes a lenient fail policy");
 
   // Exclude: the unhealthy file contributes nothing; clean files are untouched.
@@ -1672,7 +1695,7 @@ fn parse_health_policies_and_report() {
     max_error_ratio: 0.0,
   };
   let report =
-    vorpal_index::build_index_full(&src, &out_excl, vorpal_index::CacheMode::default(), exclude)
+    vorpal_index::build_index_full(&src, &out_excl, vorpal_index::CacheMode::default(), exclude, None)
       .unwrap();
   assert_eq!(report.excluded_files, 1);
   let kg = vorpal_index::Kg::load(&live(&out_excl)).unwrap();

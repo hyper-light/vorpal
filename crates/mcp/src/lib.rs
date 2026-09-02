@@ -89,20 +89,13 @@ pub fn serve_stdio_projects_with_envs(
     ));
   }
   let mut server = router::MultiServer::with_envs(projects, profile, envs);
-  let stdin = io::stdin();
-  let mut stdout = io::stdout().lock();
-  for line in stdin.lock().lines() {
-    let line = line?;
-    if line.trim().is_empty() {
-      continue;
+  pump(|line| match line {
+    Some(line) => server.handle_line(line),
+    None => {
+      server.tick();
+      None
     }
-    if let Some(response) = server.handle_line(&line) {
-      stdout.write_all(response.as_bytes())?;
-      stdout.write_all(b"\n")?;
-      stdout.flush()?;
-    }
-  }
-  Ok(())
+  })
 }
 
 pub fn serve_stdio_env(
@@ -113,8 +106,10 @@ pub fn serve_stdio_env(
   serve_stdio_opts(index_dir, profile, env, true)
 }
 
-/// [`serve_stdio_env`] plus the D1 toggle: `watch_rebuild` gates the proactive background
-/// rebuild worker (also disable-able at runtime with `VORPAL_WATCH_REBUILD=0`).
+/// [`serve_stdio_env`] plus the D1 toggle: `watch_rebuild` gates proactive freshness — the
+/// serve loop pulses [`Server::tick`] between requests, which rebuilds through the retained
+/// tiers (or a supervised child) once the watch goes quiet. Also disable-able at runtime
+/// with `VORPAL_WATCH_REBUILD=0`; query-path freshness is lazy and unaffected either way.
 pub fn serve_stdio_opts(
   index_dir: PathBuf,
   profile: Profile,
@@ -122,18 +117,50 @@ pub fn serve_stdio_opts(
   watch_rebuild: bool,
 ) -> io::Result<()> {
   let mut server = Server::with_profile_env_rebuild(index_dir, profile, env, watch_rebuild);
-  let stdin = io::stdin();
-  let mut stdout = io::stdout().lock();
-  for line in stdin.lock().lines() {
-    let line = line?;
-    if line.trim().is_empty() {
-      continue;
+  pump(|line| match line {
+    Some(line) => server.handle_line(line),
+    None => {
+      server.tick();
+      None
     }
-    if let Some(response) = server.handle_line(&line) {
-      // One message per line; flush so the client sees each response immediately.
-      writeln!(stdout, "{response}")?;
-      stdout.flush()?;
+  })
+}
+
+/// The shared stdio pump: a reader thread forwards stdin lines over a channel so the serve
+/// loop wakes on QUIET (250 ms) and pulses background freshness between requests — a
+/// blocking read would pin proactivity to request arrival. Protocol behavior is unchanged:
+/// one JSON-RPC message per line in, one per line out, EOF ends the daemon.
+/// `step(Some(line))` handles a request; `step(None)` is the quiet pulse.
+fn pump(mut step: impl FnMut(Option<&str>) -> Option<String>) -> io::Result<()> {
+  let (tx, rx) = std::sync::mpsc::channel::<io::Result<String>>();
+  std::thread::spawn(move || {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+      let failed = line.is_err();
+      if tx.send(line).is_err() || failed {
+        return;
+      }
+    }
+    // EOF: dropping the sender disconnects the pump below, ending the daemon cleanly.
+  });
+  let mut stdout = io::stdout().lock();
+  loop {
+    match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+      Ok(line) => {
+        let line = line?;
+        if line.trim().is_empty() {
+          continue;
+        }
+        if let Some(response) = step(Some(&line)) {
+          // One message per line; flush so the client sees each response immediately.
+          writeln!(stdout, "{response}")?;
+          stdout.flush()?;
+        }
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        let _ = step(None);
+      }
+      Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
     }
   }
-  Ok(())
 }

@@ -251,6 +251,38 @@ impl<'tree, L: LanguageExt> Iterator for Pre<'tree, L> {
   }
 }
 
+/// [`Pre`] that also yields each node's DEPTH below the walk root (root = 0) — the
+/// bookkeeping callers need to maintain an explicit ancestor stack across one pre-order
+/// pass. `Node::parent` has no parent pointer to follow: every call re-walks from the
+/// tree root (one `child_with_descendant` scan per level), so a walk that consults
+/// parents per node pays quadratic-shaped cursor churn; a depth-driven stack replaces
+/// all of it with a `Vec` truncate + push. The cursor already tracks the depth — this
+/// only surfaces it.
+pub struct PreWithDepth<'tree, L: LanguageExt> {
+  root: &'tree Root<StrDoc<L>>,
+  inner: TsPre<'tree>,
+}
+
+impl<'tree, L: LanguageExt> Iterator for PreWithDepth<'tree, L> {
+  type Item = (Node<'tree, StrDoc<L>>, usize);
+  fn next(&mut self) -> Option<Self::Item> {
+    // `TsPre::next` yields the node the cursor rests on BEFORE stepping, so the depth
+    // read here is exactly the yielded node's depth.
+    let depth = self.inner.current_depth;
+    let inner = self.inner.next()?;
+    Some((self.root.adopt(inner), depth))
+  }
+}
+
+impl<'t, L: LanguageExt> PreWithDepth<'t, L> {
+  pub fn new(node: &Node<'t, StrDoc<L>>) -> Self {
+    Self {
+      root: node.root,
+      inner: TsPre::new(&node.inner),
+    }
+  }
+}
+
 impl<'t, L: LanguageExt> Pre<'t, L> {
   pub fn new(node: &Node<'t, StrDoc<L>>) -> Self {
     let inner = TsPre::new(&node.inner);

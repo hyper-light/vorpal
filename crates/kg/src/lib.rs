@@ -12,23 +12,42 @@
 //! [`KgWriter`] accumulates and [`KgWriter::seal`]s into a queryable [`Kg`].
 
 mod dataflow;
+mod edgestore;
 mod evidence;
 mod kg;
+pub mod defs_changed;
+pub mod defs_stable;
+pub mod respan;
+mod sigstore;
+mod usagestore;
 mod model;
 mod writer;
 
-pub use kg::{Kg, NodeView, SymbolSelector, resolve_index_dir};
-pub use dataflow::{DataflowRow, DataflowStore, FlowView, save_dataflow};
+pub use kg::{
+  Kg, NODES_DIR, NODES_TOC, NodeIdMap, NodeView, SegmentLayout, SymbolSelector,
+  is_nodes_member, resolve_index_dir,
+};
+pub use dataflow::{DataflowRow, DataflowStore, FlowView, load_dataflow, save_dataflow};
+pub use edgestore::{EDGES_DIR, EDGES_TOC, is_edges_member};
+pub use sigstore::{
+  SIG_SKETCH_LEN, SIGS_DIR, SIGS_TOC, SigFamilyRow, SigStore, is_sigs_member, save_sigs,
+};
+pub use usagestore::{USAGE_DIR, USAGE_TOC, UsageStore, is_usage_member};
 pub use evidence::{
-  AltSet, EvidenceOutcome, EvidenceRow, EvidenceStore, NO_EDGE, save as save_evidence,
+  AltSet, EVIDENCE_DIR, EVIDENCE_TOC, EvidenceLayout, EvidenceOutcome, EvidenceRow,
+  EvidenceStore, NO_EDGE, is_evidence_member, save as save_evidence,
+  save_with as save_evidence_with,
 };
 pub use model::SymbolKind;
 pub mod communities;
+pub mod identity;
 #[cfg(feature = "alloc-ledger")]
 pub mod ledger;
 pub mod observed;
 mod scc;
-pub use writer::{EntityIdentity, KgWriter, NodeDef, layout_entity_identities, layout_entity_paths};
+pub use writer::{
+  EntityIdentity, FileBlock, KgWriter, NodeDef, layout_entity_identities, layout_entity_paths,
+};
 
 pub use vorpal_graph::{Direction, EdgeLog, EdgeType, ReachStep};
 pub use vorpal_segment::NodeId;
@@ -133,18 +152,90 @@ pub fn phase_trace_enabled() -> bool {
   std::env::var_os("VORPAL_PHASE_TRACE").is_some()
 }
 
+/// A family's generation-relative membership predicate (`"usage/0001.idx"` → true).
+pub type FamilyMemberFn = fn(&str) -> bool;
+
+/// Carry one family directory from a prior generation into staging by per-entry HARD
+/// LINKS — inode identity preserved, deliberately: link-carried families keep the same
+/// inode and therefore the same page-cache pages, so chained incremental builds read
+/// them warm. (The whole-directory `clonefile` alternative was built, measured, and
+/// REJECTED 2026-09-01: clones are new vnodes, the page cache is vnode-keyed, and every
+/// chained compose re-faulted the prior's families cold — 1.04–1.10 s → 1.58–1.61 s at
+/// kernel scale. SUBSECOND.md carries the record; do not reopen with clones.)
+///
+/// `staging.join(family)` is created here and assumed FRESH: a link into a fresh
+/// directory cannot collide (per-entry `remove_file` dieting was measured
+/// free-of-benefit anyway — 0.263 vs 0.270 ms/link). Rewritten members are renamed
+/// over their linked entries afterwards, which replaces the directory entry and never
+/// writes through the shared inode.
+pub fn carry_family_dir(
+  prior: &std::path::Path,
+  staging: &std::path::Path,
+  family: &str,
+  member_ok: FamilyMemberFn,
+) -> std::io::Result<()> {
+  use std::fs;
+  let (src, dst) = (prior.join(family), staging.join(family));
+  fs::create_dir_all(&dst)?;
+  for entry in fs::read_dir(&src)?.flatten() {
+    let Ok(file) = entry.file_name().into_string() else {
+      continue;
+    };
+    if !member_ok(&format!("{family}/{file}")) {
+      continue;
+    }
+    let (from, to) = (entry.path(), dst.join(&file));
+    if fs::hard_link(&from, &to).is_err() {
+      // Cross-device staging or an unexpected existing entry: replace-copy, honestly.
+      let _ = fs::remove_file(&to);
+      fs::copy(&from, &to)?;
+    }
+  }
+  Ok(())
+}
+
+/// Carry several families, SERIALLY — measured law (2026-09-01, this box): hard-link
+/// creation on APFS serializes ABOVE the directory (volume catalog/journal), so six
+/// families' links across six threads ran 1.8× SLOWER than one thread (405 vs 740 ms
+/// for 6×256 links, three interleaved rounds), and dropping the defensive per-entry
+/// `remove_file` was ALSO measured free-of-benefit (0.263 vs 0.270 ms/link). The
+/// per-entry cost is the filesystem's, not ours; neither thread fan-out nor syscall
+/// dieting moves it. Do not reopen either without new measurements.
+pub fn carry_families(
+  prior: &std::path::Path,
+  staging: &std::path::Path,
+  families: &[(&str, FamilyMemberFn)],
+) -> std::io::Result<()> {
+  for &(family, member_ok) in families {
+    carry_family_dir(prior, staging, family, member_ok)?;
+  }
+  Ok(())
+}
+
 /// Phase stamp for RSS-timeline profiling, active only under `VORPAL_PHASE_TRACE`.
+/// Carries cumulative soft/hard page-fault counters (`getrusage`: minflt/majflt) so a
+/// trace diff attributes FIRST-TOUCH volume per phase — with jemalloc decay off, the
+/// remaining reclaims are genuine first touches, exactly what fault-minimization work
+/// needs to see (2026-09-02 decay sweep: scratch reclaims −82% under decay-off; what
+/// is left is the real page bill).
 pub fn phase_stamp(label: &str) {
   if phase_trace_enabled() {
     #[cfg(feature = "alloc-stats")]
     let stats = {
-      use tikv_jemalloc_ctl::{epoch, stats};
+      use tikv_jemalloc_ctl::{epoch, stats, thread};
       epoch::advance().ok();
+      // `thread.allocated` is CUMULATIVE bytes allocated by the calling thread —
+      // per-phase deltas are allocation VOLUME (churn), which live-byte deltas cannot
+      // see; a churn delta far above the live delta marks realloc/short-lived-buffer
+      // hotspots. Main-thread only: rayon workers' churn lands in their own counters,
+      // so parallel phases under-report — read the number as a lower bound there.
+      let churn = thread::allocatedp::read().map(|p| p.get()).unwrap_or(0);
       format!(
-        " [alloc={}MB active={}MB resident={}MB]",
+        " [alloc={}MB active={}MB resident={}MB churn={}MB]",
         stats::allocated::read().unwrap_or(0) / 1048576,
         stats::active::read().unwrap_or(0) / 1048576,
-        stats::resident::read().unwrap_or(0) / 1048576
+        stats::resident::read().unwrap_or(0) / 1048576,
+        churn / 1048576
       )
     };
     #[cfg(not(feature = "alloc-stats"))]
@@ -177,8 +268,27 @@ pub fn phase_stamp(label: &str) {
     };
     #[cfg(not(feature = "alloc-ledger"))]
     let ledger = "";
+    #[cfg(all(unix, not(feature = "alloc-ledger")))]
+    let faults = {
+      let mut usage = std::mem::MaybeUninit::<vorpal_mem::carry_libc::rusage>::zeroed();
+      // SAFETY: RUSAGE_SELF with a zeroed out-param; the kernel fills it.
+      let rc = unsafe {
+        vorpal_mem::carry_libc::getrusage(
+          vorpal_mem::carry_libc::RUSAGE_SELF,
+          usage.as_mut_ptr(),
+        )
+      };
+      if rc == 0 {
+        let usage = unsafe { usage.assume_init() };
+        format!(" [minflt={} majflt={}]", usage.ru_minflt, usage.ru_majflt)
+      } else {
+        String::new()
+      }
+    };
+    #[cfg(any(not(unix), feature = "alloc-ledger"))]
+    let faults = String::new();
     eprintln!(
-      "[phase {:.3}s] {label}{stats}{ledger}",
+      "[phase {:.3}s] {label}{stats}{ledger}{faults}",
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

@@ -177,7 +177,22 @@ mod tests {
       vec!["exec".into(), "-i".into(), "pod".into(), "--".into()],
     );
 
-    let mut proc = t.exec(&ExecSpec::argv(["printf", "through-the-wrapper"])).await.unwrap();
+    // First exec retries ETXTBSY: another test's concurrently forked child can transiently
+    // inherit the just-written stub's write fd (the classic multi-threaded fork/exec race
+    // on a fresh script) — a test-harness artifact, not a transport defect. Bounded, loud.
+    let mut proc = {
+      let mut attempts = 0u32;
+      loop {
+        match t.exec(&ExecSpec::argv(["printf", "through-the-wrapper"])).await {
+          Ok(proc) => break proc,
+          Err(err) if attempts < 20 && format!("{err:?}").contains("os error 26") => {
+            attempts += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+          }
+          Err(err) => panic!("wrapper exec failed: {err:?}"),
+        }
+      }
+    };
     let mut out = String::new();
     proc.stdout.take().unwrap().read_to_string(&mut out).await.unwrap();
     assert_eq!(out, "through-the-wrapper");

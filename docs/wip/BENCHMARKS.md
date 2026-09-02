@@ -1714,6 +1714,63 @@ path-probe string churn, a channel-depth/committer sweep (chfull 2.7 K), and
 the tree-sitter per-parser arena question (273 M C-side allocations,
 already jemalloc-routed).
 
+## Two-mains integration — hyperopt line × phase-4/live line (2026-09-01)
+
+Two divergent mains (this session's hyperopt passes 1–21 + semantic tier; the
+other session's phase-4 bucketed format + subsecond daemon + live ANN + 0.3.0
+release) merged into one line under a hard owner constraint: **no wall-clock
+regression on either side's numbers**. Merge law where both sides bumped the
+same constant independently: `PRODUCT_FORMAT_VERSION` → 19.
+
+New persisted family: **`reach.bin`** (`VRCH`, `REACH_GRAPH_VERSION=1`,
+path-table + u32 CSR; `crates/resolve/src/reach.rs`) — the full pipeline
+persists its include-edge graph so scoped composes REPLAY the include-reach
+oracle instead of rebuilding it (session-fresh first hop + BFS over stored
+rows; `reach_rows_match` declines on any divergence, absence is a hard decline
+to the full pipeline). Every generation assembler carries it: full save,
+deferred (`PendingPersist`), served (`ServedPersist`), defs-stable,
+defs-changed, respan, cutoff.
+
+Convergence root causes found by the battery and closed:
+1. **Seed-predicate asymmetry** — the spill retains EVERY import
+   (`spill.imports()`) but the scoped compose, legacy link driver, and retained
+   store all seeded from `Import && form==Static` subsets; a bare use bound
+   ImportBound (reason 8) in scratch vs VisibleExport (6) in composes — one
+   byte, evidence row 761, caught by generation-id divergence. Now ONE
+   predicate everywhere (`kind == Import`); the seed's own resolution-reason
+   filter decides what binds.
+2. **Missing reach carries** — respan and the deferred/served persists did not
+   write `reach.bin`; their generations differed from the scratch twin by
+   exactly that file. `learn_include_roots` now clears root support before
+   learning (idempotent re-learn — a maintained retained table must equal a
+   from-scratch table over the same alive set).
+
+Verification (release build, kernel = Linux tree, VORPAL_FORMAT=next):
+- convergence battery: gin / Humanizer / cpython, scratch-determinism + 6 edit
+  shapes — **PASS** (all 21 rows);
+- kernel-scale convergence: one-shot edit incremental generation id ≡
+  from-scratch id — **PASS**;
+- full workspace gate 140 suites / **1275 passed / 0 failed**; clippy clean.
+
+Walls vs the owner's no-regression bars:
+| lane | their line (pre-merge) | merged | verdict |
+|---|---|---|---|
+| kernel cold build | — (mine ~9.2 s ledger-era) | 8.61–9.51 s (median 8.7) | ≤ bar |
+| one-shot edit, steady state | 0.89–0.91 s | **0.52–0.53 s** | −41 % |
+| respan (span-shift, clean parse) | 0.86 s | **0.74–0.77 s** | −12 % |
+| ledger cold (vorpal-index alloc-ledger bin) | — | 7.60 s | campaign best |
+
+Files whose error accounting shifts under an edit (macro-heavy kernel C, e.g.
+`kernel/sched/core.c` top-insert changing tree-sitter error recovery) decline
+all scoped composes by the UNCHANGED eligibility ladder and take the full
+pipeline (~4.5 s) — their line declines identically; the ladder is byte-equal.
+
+Ledger A/B on the merged tree (kernel): Rust allocs **36.9 M** (pass-21 line
+was 7.54 M — their worker-side apply supersedes the encode-only extraction and
+re-materializes products; recorded follow-up lead: port encode-only into the
+worker apply), ts-side **16.08 M** (bar 16.3 M — held), wall 7.60 s (campaign
+best; the alloc delta is outweighed by their pipeline restructure).
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

@@ -8,7 +8,7 @@ use crate::{Matcher, Vorpal};
 use std::borrow::Cow;
 use std::num::NonZero;
 use thiserror::Error;
-pub use traversal::{TsPre, Visitor};
+pub use traversal::{PreWithDepth, TsPre, Visitor};
 pub use tree_sitter::Language as TSLanguage;
 use tree_sitter::{InputEdit, LanguageError, Node, Parser, Point, Tree};
 pub use tree_sitter::{Point as TSPoint, Range as TSRange};
@@ -27,45 +27,50 @@ pub enum TSParseError {
   TreeUnavailable,
 }
 
+std::thread_local! {
+  /// One reusable parser per worker thread. A fresh `Parser::new()` per file made bulk
+  /// indexing recreate the GLR stack's node pool and the lexer's buffers tens of millions
+  /// of times per large corpus (the allocator was ~a quarter of cold-build samples); a
+  /// warm parser keeps those pools across files. Parser state never influences tree
+  /// CONTENT — same input, same grammar, same tree — so reuse cannot change output bytes.
+  /// Injection parsing (which sets included ranges) deliberately does NOT use this slot:
+  /// it builds fresh parsers, so the shared one never carries range state between files.
+  static REUSED_PARSER: std::cell::RefCell<Option<Parser>> = const { std::cell::RefCell::new(None) };
+}
+
 #[inline]
 fn parse_lang(
   parse_fn: impl Fn(&mut Parser) -> Option<Tree>,
   ts_lang: TSLanguage,
 ) -> Result<Tree, TSParseError> {
-  // One parser per thread, language re-pointed per file: the parser's
-  // internal buffers (lexer chunks, reduce actions, stack heads) recycle
-  // across the files a worker parses. Parser reuse was measured-not-worth-it
-  // before the children-block cache landed; re-measured after it (BENCHMARKS
-  // pass 20): −3 M allocations and −0.25 M reallocs per kernel index,
-  // CPU-neutral, artifacts byte-identical — so it is ON by default;
-  // `VORPAL_PARSER_REUSE=0` opts out.
-  use std::cell::RefCell;
+  // Reuse is ON by default — both lines measured it independently (−3 M
+  // allocations per kernel index post-children-cache, CPU-neutral, artifacts
+  // byte-identical); `VORPAL_PARSER_REUSE=0` opts out for A/B runs. The
+  // shared slot never carries included-range state: injection parsing builds
+  // fresh parsers (see `REUSED_PARSER`'s doc).
   use std::sync::OnceLock;
   static REUSE: OnceLock<bool> = OnceLock::new();
   let reuse = *REUSE
     .get_or_init(|| !std::env::var_os("VORPAL_PARSER_REUSE").is_some_and(|v| v == "0"));
   if reuse {
-    thread_local! {
-      static PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
-    }
-    // try_borrow_mut: a re-entrant parse (a pattern compiled mid-parse)
-    // falls through to a fresh parser instead of panicking.
-    let reused = PARSER.with(|slot| match slot.try_borrow_mut() {
-      Ok(mut slot) => {
-        let parser = slot.get_or_insert_with(Parser::new);
-        let ret = match parser.set_language(&ts_lang) {
-          Ok(()) => parse_fn(parser).ok_or(TSParseError::TreeUnavailable),
-          Err(e) => Err(e.into()),
-        };
-        if ret.is_err() {
-          // A failed or aborted parse may leave parser-internal state
-          // behind; a failed parse is rare enough that rebuilding the
-          // parser is the simplest correct reset.
-          *slot = None;
-        }
-        Some(ret)
+    let reused = REUSED_PARSER.with(|slot| {
+      // A nested parse while the slot is borrowed (defensive — none exists
+      // today) falls back to a fresh parser rather than panicking.
+      let Ok(mut slot) = slot.try_borrow_mut() else {
+        return None;
+      };
+      let parser = slot.get_or_insert_with(Parser::new);
+      let ret = match parser.set_language(&ts_lang) {
+        Ok(()) => parse_fn(parser).ok_or(TSParseError::TreeUnavailable),
+        Err(e) => Err(e.into()),
+      };
+      if ret.is_err() {
+        // A failed or aborted parse may leave parser-internal state behind;
+        // failures are rare enough that rebuilding the parser is the
+        // simplest correct reset.
+        *slot = None;
       }
-      Err(_) => None,
+      Some(ret)
     });
     if let Some(ret) = reused {
       return ret;
