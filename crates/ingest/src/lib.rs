@@ -119,7 +119,7 @@ pub use pipeline::{
   ByteBudget, ExtractScratch, FileExtractor, FileOutcome, IngestStats, Ingestor, StreamStats,
   PairingHandle, StreamWork, apply_products_sharded, link_writer, link_writer_spilled,
   link_writer_spilled_with_flows, release_freed_pages, spawn_sig_pairing,
-  stream_apply, stream_apply_spilled,
+  stream_apply, stream_apply_with_fresh, stream_apply_spilled,
 };
 pub use product::{
   FileProduct, ProductRef, ProductRequest, ProductSignature, ProductStats, ProductView, RefView,

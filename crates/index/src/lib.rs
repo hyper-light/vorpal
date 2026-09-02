@@ -899,6 +899,14 @@ fn build_index_inner(
   let stream_entries: &[vorpal_ingest::FileStat] =
     bucket_major.as_deref().unwrap_or(manifest.entries());
   vorpal_kg::phase_stamp("stream: start");
+  // Fresh-product sink: the worker hands over the encoded bytes it just applied from;
+  // they travel to the pack writer by move (the canonical consolidating sort makes
+  // arrival order irrelevant).
+  let fresh_sink = |path: String, body: Vec<u8>| -> io::Result<()> {
+    pack_sink
+      .send(PackMsg { path, body })
+      .map_err(|_| io::Error::other("pack sink closed"))
+  };
   let stream_result = stream_apply_spilled(
     &interner,
     stream_entries,
@@ -906,6 +914,7 @@ fn build_index_inner(
     &spill_path,
     Some(&heap_stream),
     pack_reader.as_deref(),
+    Some(&fresh_sink),
     |entry, scratch: &mut ExtractScratch| {
       let cache_name = cache_file_name(&entry.path);
       if loose.contains(&OsString::from(&cache_name)) {
@@ -984,39 +993,50 @@ fn build_index_inner(
         }
       }
       // Changed, new, or cache-missing: re-parse (unreadable files are skipped, not fatal).
+      // Encode-only extraction (hyperopt pass 10, re-landed post-merge): borrowed parts
+      // stream straight to `.vpb` bytes — no owned product is ever materialized for a
+      // fresh parse. The worker applies from a view over these bytes, then the SAME
+      // buffer reaches the pack through the fresh sink above. The buffer is taken out
+      // of the scratch first (read_source's borrow spans the whole extraction) and
+      // restored on the skip paths so its capacity keeps recycling.
+      let mut encode = std::mem::take(&mut scratch.encode);
+      encode.clear();
       let Ok(source) = scratch.read_source(Path::new(&entry.path)) else {
+        scratch.encode = encode;
         return Ok(StreamWork::Skipped);
       };
-      let Some(mut product) = extractor.extract_product(&entry.path, source) else {
+      let Some(stats) = extractor.extract_product_encoded(
+        &entry.path,
+        source,
+        entry.size,
+        entry.mtime_ns,
+        &mut encode,
+      ) else {
+        scratch.encode = encode;
         return Ok(StreamWork::Skipped);
       };
-      if product.error_nodes > 0 {
+      if stats.error_nodes > 0 {
         error_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        error_nodes.fetch_add(product.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
-        error_bytes.fetch_add(product.error_bytes, std::sync::atomic::Ordering::Relaxed);
+        error_nodes.fetch_add(stats.error_nodes as u64, std::sync::atomic::Ordering::Relaxed);
+        error_bytes.fetch_add(stats.error_bytes, std::sync::atomic::Ordering::Relaxed);
       }
-      let unhealthy = policy.is_unhealthy(product.error_bytes, entry.size);
+      let unhealthy = policy.is_unhealthy(stats.error_bytes, entry.size);
       if unhealthy && policy.mode == ParseHealthMode::Fail {
-        note_unhealthy(&entry.path, product.error_bytes, entry.size);
+        note_unhealthy(&entry.path, stats.error_bytes, entry.size);
       }
-      let excluded = unhealthy && policy.mode == ParseHealthMode::Exclude;
-      product.source_size = entry.size;
-      product.source_mtime_ns = entry.mtime_ns;
-      scratch.encode.clear();
-      vorpal_ingest::encode_product_into(&product, &mut scratch.encode);
-      // Move the encoded bytes into the message — cloning re-copied every parsed product
-      // (half a gigabyte on a cold kernel build); the scratch buffer regrows on next use.
-      pack_sink
-        .send(PackMsg {
-          path: entry.path.clone(),
-          body: std::mem::take(&mut scratch.encode),
-        })
-        .map_err(send_fatal)?;
-      if excluded {
+      if unhealthy && policy.mode == ParseHealthMode::Exclude {
+        // Banked in the pack (live_paths keeps it) but absent from this build's graph —
+        // ship the bytes here and skip the apply.
         excluded_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pack_sink
+          .send(PackMsg {
+            path: entry.path.clone(),
+            body: encode,
+          })
+          .map_err(send_fatal)?;
         return Ok(StreamWork::Skipped);
       }
-      Ok(StreamWork::Parsed(entry.path.clone(), product))
+      Ok(StreamWork::ParsedEncoded(entry.path.clone(), encode))
     },
   );
   drop(pack_sink);

@@ -193,6 +193,7 @@ fn spilled_references_are_byte_identical_to_the_ram_path() {
     &spill_path,
     Some(&heap_stream),
     None,
+    None,
     |entry, _scratch| {
       Ok(StreamWork::Parsed(
         entry.path.clone(),
@@ -237,3 +238,79 @@ fn spilled_references_are_byte_identical_to_the_ram_path() {
 // worker-side-apply architecture applies products on the extraction workers, so
 // the encoded fresh-parse committer path it pinned no longer exists.)
 
+/// The encoded fresh-parse path (`ParsedEncoded` → worker view apply → fresh sink) must
+/// produce byte-identical sealed output to the owned path (`Parsed` → owned apply), and
+/// the bytes handed to the fresh sink must be exactly the stamped `.vpb` encoding — the
+/// streaming pipeline ships extraction as encoded bytes and never materializes the product.
+#[test]
+fn encoded_stream_matches_owned_stream() {
+  let files = corpus();
+  let entries = entries_for(&files);
+  let sources: HashMap<String, String> = files.iter().cloned().collect();
+  let extractor = OutlineExtractor::new().expect("rules compile");
+
+  let shipped: std::sync::Mutex<HashMap<String, Vec<u8>>> = std::sync::Mutex::new(HashMap::new());
+  let fresh = |path: String, body: Vec<u8>| -> std::io::Result<()> {
+    shipped.lock().unwrap().insert(path, body);
+    Ok(())
+  };
+  let (writer, references, stats) =
+    vorpal_ingest::stream_apply_with_fresh(itn(), &entries, 64 * 1024 * 1024, &fresh, |entry, _scratch| {
+      let mut body = Vec::new();
+      Ok(
+        match extractor.extract_product_encoded(
+          &entry.path,
+          &sources[&entry.path],
+          entry.size,
+          entry.mtime_ns,
+          &mut body,
+        ) {
+          Some(_) => StreamWork::ParsedEncoded(entry.path.clone(), body),
+          None => StreamWork::Skipped,
+        },
+      )
+    })
+    .expect("encoded stream succeeds");
+  assert_eq!(stats.parsed, 120, "every corpus file takes the encoded path");
+  let shipped = shipped.into_inner().unwrap();
+  assert_eq!(shipped.len(), 120, "every encoded parse reached the fresh sink");
+  let (encoded_kg, encoded_stats) = link_writer(itn(), writer, references, &Resolver::new());
+
+  let owned_by_path: HashMap<String, FileProduct> = extracted(&files).into_iter().collect();
+  for (path, product) in &owned_by_path {
+    let mut expect = Vec::new();
+    let mut stamped = product.clone();
+    let entry = entries.iter().find(|e| &e.path == path).expect("entry");
+    stamped.source_size = entry.size;
+    stamped.source_mtime_ns = entry.mtime_ns;
+    vorpal_ingest::encode_product_into(&stamped, &mut expect);
+    assert_eq!(
+      shipped.get(path).expect("shipped"),
+      &expect,
+      "{path}: fresh-sink bytes diverged from the owned encoding"
+    );
+  }
+  let (writer, references, _) = stream_apply(itn(), &entries, 64 * 1024 * 1024, |entry, _scratch| {
+    Ok(StreamWork::Parsed(
+      entry.path.clone(),
+      owned_by_path[&entry.path].clone(),
+    ))
+  })
+  .expect("owned stream succeeds");
+  let (owned_kg, owned_stats) = link_writer(itn(), writer, references, &Resolver::new());
+
+  assert_eq!(encoded_stats, owned_stats, "link stats diverged");
+  let base = std::env::temp_dir().join(format!("vorpal-streamed-enc-{}", std::process::id()));
+  let (a, b) = (base.join("encoded"), base.join("owned"));
+  let _ = fs::remove_dir_all(&base);
+  encoded_kg.save(&a).unwrap();
+  owned_kg.save(&b).unwrap();
+  for file in ["nodes.vseg", "strings.heap", "graph.bin"] {
+    assert_eq!(
+      fs::read(a.join(file)).unwrap(),
+      fs::read(b.join(file)).unwrap(),
+      "{file} diverged between encoded and owned fresh-parse paths"
+    );
+  }
+  let _ = fs::remove_dir_all(&base);
+}

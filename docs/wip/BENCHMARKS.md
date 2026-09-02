@@ -1771,6 +1771,32 @@ re-materializes products; recorded follow-up lead: port encode-only into the
 worker apply), ts-side **16.08 M** (bar 16.3 M — held), wall 7.60 s (campaign
 best; the alloc delta is outweighed by their pipeline restructure).
 
+## Encode-only extraction, re-landed inside the worker-apply topology (2026-09-02)
+
+The merge's one recorded alloc regression closed: fresh parses again never
+materialize an owned `FileProduct`. `StreamWork::ParsedEncoded(path, bytes)` —
+extraction encodes borrowed parts straight to stamped `.vpb` bytes
+(`extract_product_encoded`), the worker applies from a `ProductView` decoded
+over those bytes (the same view-apply machinery `ReplayedPacked` uses), then
+the SAME buffer moves to the pack through a fresh-product sink threaded into
+the stream (`stream_apply_spilled` gained the parameter; `ParsedEncoded`
+without a sink is a hard error, not a silent drop). Unhealthy-excluded files
+still bank their bytes from the closure and skip the apply.
+
+Oracle restored (`encoded_stream_matches_owned_stream`): encoded-path sealed
+artifacts byte-equal the owned path's, AND the sink receives exactly the owned
+encoding, per file.
+
+Kernel A/B (ledger binary): Rust allocs **36.92 M → 9.88 M (−73.2 %)**;
+ts-side flat (16.08 M); churn bytes flat (same product bytes, fewer buffers);
+wall flat within the recorded thermal band (best 7.71 s vs 7.60 s pre-port,
+user floor 110.9 s vs 110.6 s). Production: cold 8.96–8.97 s, steady one-shot
+edit 0.52–0.53 s — both unchanged. Battery PASS ×3 corpora; kernel edit
+convergence PASS; workspace gate 140 suites / 1276 / 0.
+
+Remaining gap to the pass-21 line's 7.54 M is their pipeline's own share
+(worker-side writers, map_chunk streaming) — no single dominant site recorded.
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

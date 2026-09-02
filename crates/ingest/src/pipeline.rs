@@ -2038,6 +2038,12 @@ impl ExtractScratch {
 pub enum StreamWork {
   /// Freshly parsed this run.
   Parsed(String, crate::FileProduct),
+  /// Freshly parsed this run, already encoded to `.vpb` bytes by the extraction
+  /// (borrowed parts straight to the wire — no owned product is ever materialized).
+  /// The worker applies from a view decoded over these bytes, then hands the SAME
+  /// buffer to the caller's fresh-product sink (the pack) — one encode, zero copies.
+  /// Requires a `fresh` sink on the stream call; without one this variant is an error.
+  ParsedEncoded(String, Vec<u8>),
   /// Replayed from the incremental cache.
   Replayed(String, crate::FileProduct),
   /// Replayed from the products pack: only the path travels — the committer decodes views
@@ -2118,6 +2124,35 @@ where
     RefSink::Ram(&mut references, &mut flow),
     None,
     None,
+    None,
+  )?;
+  Ok((writer, references, stats))
+}
+
+/// [`stream_apply`] plus a fresh-product sink, so RAM-path callers (the equivalence
+/// oracle) can exercise [`StreamWork::ParsedEncoded`] — production's spilled entry takes
+/// the sink directly.
+pub fn stream_apply_with_fresh<'i, F>(
+  interner: &'i vorpal_resolve::Interner,
+  entries: &[crate::FileStat],
+  budget_bytes: u64,
+  fresh: &(dyn Fn(String, Vec<u8>) -> io::Result<()> + Sync),
+  work: F,
+) -> io::Result<(KgWriter, Vec<Reference<'i>>, StreamStats)>
+where
+  F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
+{
+  let mut references = Vec::new();
+  let mut flow = FlowSidecar::default();
+  let (writer, stats) = stream_apply_impl(
+    interner,
+    entries,
+    budget_bytes,
+    work,
+    RefSink::Ram(&mut references, &mut flow),
+    None,
+    None,
+    Some(fresh),
   )?;
   Ok((writer, references, stats))
 }
@@ -2133,6 +2168,7 @@ pub fn stream_apply_spilled<'i, F>(
   spill_path: &std::path::Path,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
+  fresh: Option<&(dyn Fn(String, Vec<u8>) -> io::Result<()> + Sync)>,
   work: F,
 ) -> io::Result<(
   KgWriter,
@@ -2172,6 +2208,7 @@ where
     ),
     heap_stream_path,
     pack,
+    fresh,
   )?;
   let flow_spill = FlowSpill {
     args: arg_writer.finish()?,
@@ -2200,10 +2237,13 @@ fn stream_apply_impl<'i, F>(
   mut sink: RefSink<'_, 'i>,
   heap_stream_path: Option<&std::path::Path>,
   pack: Option<&crate::PackReader>,
+  fresh: Option<&(dyn Fn(String, Vec<u8>) -> io::Result<()> + Sync)>,
 ) -> io::Result<(KgWriter, StreamStats)>
 where
   F: Fn(&crate::FileStat, &mut ExtractScratch) -> io::Result<StreamWork> + Sync,
 {
+  let no_fresh_sink =
+    || io::Error::other("StreamWork::ParsedEncoded requires a fresh-product sink");
   let threads = std::env::var("VORPAL_INDEX_THREADS")
     .ok()
     .and_then(|v| v.parse().ok())
@@ -2239,6 +2279,14 @@ where
         StreamWork::Parsed(path, product) => {
           parsed += 1;
           apply_product_with_args(interner, &path, product, &mut writer, &mut references, Some(&mut flow));
+        }
+        StreamWork::ParsedEncoded(path, bytes) => {
+          parsed += 1;
+          let view = crate::product::decode_product_view(&bytes)
+            .map_err(|err| io::Error::other(format!("fresh encode decode: {err}")))?;
+          apply_product_view_with_args(interner, &path, &view, &mut writer, &mut references, Some(&mut flow));
+          drop(view);
+          fresh.ok_or_else(no_fresh_sink)?(path, bytes)?;
         }
         StreamWork::Replayed(path, product) => {
           replayed += 1;
@@ -2453,6 +2501,34 @@ where
                     Some(f),
                   );
                 }, true)
+              }
+              Ok(StreamWork::ParsedEncoded(path, bytes)) => {
+                // Apply from a view borrowed over the encoded bytes, then move the SAME
+                // buffer to the fresh-product sink (the pack) — the encode already
+                // happened inside extraction, so no owned product ever exists.
+                match crate::product::decode_product_view(&bytes) {
+                  Ok(view) => {
+                    let slot = apply_one(&mut |w, r, f| {
+                      apply_product_view_with_args(interner, &path, &view, w, r, Some(f))
+                    }, true);
+                    drop(view);
+                    let shipped = match fresh {
+                      Some(fresh) => fresh(path, bytes),
+                      None => Err(no_fresh_sink()),
+                    };
+                    if let Err(err) = shipped {
+                      budget.release(reserved);
+                      fail(err);
+                      continue;
+                    }
+                    slot
+                  }
+                  Err(err) => {
+                    budget.release(reserved);
+                    fail(io::Error::other(format!("fresh encode decode: {err}")));
+                    continue;
+                  }
+                }
               }
               Ok(StreamWork::Replayed(path, product)) => {
                 let mut product = Some(product);
