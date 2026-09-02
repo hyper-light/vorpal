@@ -141,6 +141,31 @@ impl KgWriter {
     self.csc_src_major = on;
   }
 
+  /// Pre-size for a known apply: `nodes` definitions (all thirteen dense columns, so a
+  /// per-file writer never walks the doubling ladder from zero — the realloc sampler
+  /// put 37% of a kernel build's reallocations in exactly those chains) and
+  /// `heap_bytes` of interned string content.
+  pub fn reserve(&mut self, nodes: usize, heap_bytes: usize) {
+    self.kind.reserve(nodes);
+    self.name_off.reserve(nodes);
+    self.name_len.reserve(nodes);
+    self.path_off.reserve(nodes);
+    self.path_len.reserve(nodes);
+    self.sig_off.reserve(nodes);
+    self.sig_len.reserve(nodes);
+    self.content_hash.reserve(nodes);
+    self.eid_lo.reserve(nodes);
+    self.eid_hi.reserve(nodes);
+    self.flags.reserve(nodes);
+    self.span_start.reserve(nodes);
+    self.span_end.reserve(nodes);
+    if let HeapStore::Ram(heap) = &mut self.heap {
+      heap.reserve(heap_bytes);
+    }
+    // Containment edges land once per defined node during apply.
+    self.edges.reserve(nodes);
+  }
+
   /// Intern an entity; if new, append its column row. Returns the dense node id. Re-defining the
   /// same identity returns the existing id (dedup, §9.2) without appending.
   pub fn define(&mut self, def: NodeDef<'_>) -> NodeId {

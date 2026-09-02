@@ -139,6 +139,12 @@ pub(crate) fn grep_cached_unpoliced(lang: SgLang, path: &str, source: &str) -> R
     }
     Err(_) => (None, false),
   };
+  if std::env::var("VORPAL_TREE_CACHE_TRACE").is_ok() {
+    eprintln!(
+      "[tree-cache] {path}: history={} promote={promote}",
+      history.is_some()
+    );
+  }
   let root = match &history {
     Some(entry) => vorpal_core::Vorpal::try_new_incremental(
       source,

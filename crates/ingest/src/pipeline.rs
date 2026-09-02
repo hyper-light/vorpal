@@ -2034,6 +2034,23 @@ impl ExtractScratch {
   }
 }
 
+
+/// Capacity hints for one file's apply: (nodes incl. the file node, heap string bytes,
+/// reference count). Item/member names, signatures, and the path are the heap content.
+fn apply_sizes(path: &str, items: &[vorpal_outline::model::OutlineItem<'_>], refs: usize) -> (usize, usize, usize) {
+  let mut nodes = 1usize;
+  let mut heap = path.len();
+  for item in items {
+    nodes += 1;
+    heap += item.entry.name.len() + item.entry.signature.len();
+    for member in &item.members {
+      nodes += 1;
+      heap += member.entry.name.len() + member.entry.signature.len();
+    }
+  }
+  (nodes, heap, refs)
+}
+
 /// One entry's streaming outcome, produced by the caller's work closure.
 pub enum StreamWork {
   /// Freshly parsed this run.
@@ -2476,10 +2493,17 @@ where
             // Apply HERE, on the worker: decode (for packed replays), intern, define, and
             // reference building all run on the wide 18-way side into a private per-file
             // writer; the committer only splices it in sequence order.
+            // (nodes, heap-byte, reference) capacity hints — each apply arm knows its
+            // product's exact shape before the writer exists, so the per-file column
+            // Vecs never walk the doubling ladder from zero (37% of a kernel build's
+            // reallocations, by the realloc sampler).
             let apply_one = |go: &mut dyn FnMut(&mut KgWriter, &mut Vec<Reference<'i>>, &mut FlowSidecar),
-                             parsed_flag: bool| {
+                             parsed_flag: bool,
+                             sizes: (usize, usize, usize)| {
+              let (nodes, heap_bytes, refs) = sizes;
               let mut file_writer = KgWriter::new();
-              let mut file_references: Vec<Reference<'i>> = Vec::new();
+              file_writer.reserve(nodes, heap_bytes);
+              let mut file_references: Vec<Reference<'i>> = Vec::with_capacity(refs);
               let mut file_flow = FlowSidecar::default();
               go(&mut file_writer, &mut file_references, &mut file_flow);
               Slot::Applied(Box::new(AppliedFile {
@@ -2492,6 +2516,7 @@ where
             };
             let slot = match work(entry, &mut scratch) {
               Ok(StreamWork::Parsed(path, product)) => {
+                let sizes = apply_sizes(&path, &product.items, product.refs.len());
                 let mut product = Some(product);
                 apply_one(&mut |w, r, f| {
                   let _ = apply_product_with_args(
@@ -2502,7 +2527,7 @@ where
                     r,
                     Some(f),
                   );
-                }, true)
+                }, true, sizes)
               }
               Ok(StreamWork::ParsedEncoded(path, bytes)) => {
                 // Apply from a view borrowed over the encoded bytes, then move the SAME
@@ -2510,9 +2535,10 @@ where
                 // happened inside extraction, so no owned product ever exists.
                 match crate::product::decode_product_view(&bytes) {
                   Ok(view) => {
+                    let sizes = apply_sizes(&path, &view.items, view.refs.len());
                     let slot = apply_one(&mut |w, r, f| {
                       apply_product_view_with_args(interner, &path, &view, w, r, Some(f))
-                    }, true);
+                    }, true, sizes);
                     drop(view);
                     let shipped = match fresh {
                       Some(fresh) => fresh(path, bytes),
@@ -2533,6 +2559,7 @@ where
                 }
               }
               Ok(StreamWork::Replayed(path, product)) => {
+                let sizes = apply_sizes(&path, &product.items, product.refs.len());
                 let mut product = Some(product);
                 apply_one(&mut |w, r, f| {
                   let _ = apply_product_with_args(
@@ -2543,7 +2570,7 @@ where
                     r,
                     Some(f),
                   );
-                }, false)
+                }, false, sizes)
               }
               Ok(StreamWork::ReplayedPacked(path)) => {
                 // Decode views straight out of the mapped pack and apply — validated by the
@@ -2553,9 +2580,12 @@ where
                   .and_then(|p| p.get(&path))
                   .and_then(|bytes| crate::product::decode_product_view(bytes).ok())
                 {
-                  Some(view) => apply_one(&mut |w, r, f| {
-                    apply_product_view_with_args(interner, &path, &view, w, r, Some(f))
-                  }, false),
+                  Some(view) => {
+                    let sizes = apply_sizes(&path, &view.items, view.refs.len());
+                    apply_one(&mut |w, r, f| {
+                      apply_product_view_with_args(interner, &path, &view, w, r, Some(f))
+                    }, false, sizes)
+                  }
                   None => {
                     budget.release(reserved);
                     Slot::Skipped

@@ -91,8 +91,12 @@ pub fn note_dealloc(_bytes: usize) {
 #[inline]
 pub fn note_realloc(new_bytes: usize) {
   let s = slot();
-  s.reallocs.fetch_add(1, Ordering::Relaxed);
+  let n = s.reallocs.fetch_add(1, Ordering::Relaxed);
   s.alloc_bytes.fetch_add(new_bytes as u64, Ordering::Relaxed);
+  let mask = REALLOC_SAMPLE_MASK.load(Ordering::Relaxed);
+  if mask != 0 && (n & mask) == 0 {
+    sample_backtrace(s, new_bytes);
+  }
 }
 
 // --- tree-sitter C-side counters: the parser's allocations route through
@@ -164,6 +168,11 @@ static SAMPLE_MASK: AtomicU64 = AtomicU64::new(0);
 /// each grammar's parse churn to actual callsites.
 static TS_SAMPLE_MASK: AtomicU64 = AtomicU64::new(0);
 
+/// Sampling mask for REALLOCATIONS only (`VORPAL_REALLOC_SAMPLE=<shift>`) — growth
+/// chains hide inside the alloc histogram (a Vec that doubles eight times is one
+/// logical site but eight reallocs), so realloc-heavy regressions get their own lens.
+static REALLOC_SAMPLE_MASK: AtomicU64 = AtomicU64::new(0);
+
 /// Read `VORPAL_ALLOC_SAMPLE` / `VORPAL_TS_SAMPLE` and arm sampling. Call
 /// from `main`, never from allocator context.
 pub fn init_sampling_from_env() {
@@ -178,6 +187,12 @@ pub fn init_sampling_from_env() {
     .and_then(|v| v.parse::<u32>().ok())
   {
     TS_SAMPLE_MASK.store((1u64 << shift.min(40)) - 1, Ordering::Relaxed);
+  }
+  if let Some(shift) = std::env::var("VORPAL_REALLOC_SAMPLE")
+    .ok()
+    .and_then(|v| v.parse::<u32>().ok())
+  {
+    REALLOC_SAMPLE_MASK.store((1u64 << shift.min(40)) - 1, Ordering::Relaxed);
   }
 }
 
