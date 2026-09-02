@@ -148,45 +148,49 @@ mod avx2 {
   #[target_feature(enable = "avx2")]
   pub(super) unsafe fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     let blocks = a.len() / LANES;
-    let mut acc = _mm256_setzero_ps(); // one register = the 8 lanes, in element order
-    for i in 0..blocks {
-      let va = _mm256_loadu_ps(a.as_ptr().add(i * LANES));
-      let vb = _mm256_loadu_ps(b.as_ptr().add(i * LANES));
-      let d = _mm256_sub_ps(va, vb);
-      // multiply THEN add — never _mm256_fmadd_ps (FMA changes the tree).
-      acc = _mm256_add_ps(acc, _mm256_mul_ps(d, d));
+    unsafe {
+      let mut acc = _mm256_setzero_ps(); // one register = the 8 lanes, in element order
+      for i in 0..blocks {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i * LANES));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i * LANES));
+        let d = _mm256_sub_ps(va, vb);
+        // multiply THEN add — never _mm256_fmadd_ps (FMA changes the tree).
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(d, d));
+      }
+      let mut lanes = [0.0f32; LANES];
+      _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+      let mut sum = 0.0f32;
+      for lane in lanes {
+        sum += lane;
+      }
+      for i in blocks * LANES..a.len() {
+        let d = a[i] - b[i];
+        sum += d * d;
+      }
+      sum
     }
-    let mut lanes = [0.0f32; LANES];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut sum = 0.0f32;
-    for lane in lanes {
-      sum += lane;
-    }
-    for i in blocks * LANES..a.len() {
-      let d = a[i] - b[i];
-      sum += d * d;
-    }
-    sum
   }
 
   #[target_feature(enable = "avx2")]
   pub(super) unsafe fn sum_sq(v: &[f32]) -> f32 {
     let blocks = v.len() / LANES;
-    let mut acc = _mm256_setzero_ps();
-    for i in 0..blocks {
-      let x = _mm256_loadu_ps(v.as_ptr().add(i * LANES));
-      acc = _mm256_add_ps(acc, _mm256_mul_ps(x, x));
+    unsafe {
+      let mut acc = _mm256_setzero_ps();
+      for i in 0..blocks {
+        let x = _mm256_loadu_ps(v.as_ptr().add(i * LANES));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(x, x));
+      }
+      let mut lanes = [0.0f32; LANES];
+      _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+      let mut sum = 0.0f32;
+      for lane in lanes {
+        sum += lane;
+      }
+      for x in &v[blocks * LANES..] {
+        sum += x * x;
+      }
+      sum
     }
-    let mut lanes = [0.0f32; LANES];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut sum = 0.0f32;
-    for lane in lanes {
-      sum += lane;
-    }
-    for x in &v[blocks * LANES..] {
-      sum += x * x;
-    }
-    sum
   }
 
 }

@@ -166,6 +166,10 @@ include/
 # which the C build needs. Re-include that specific path despite the broad Python-venv rule above.
 !vendor/tree-sitter/include/
 !vendor/tree-sitter/include/**
+# Same hole for the vendored jemalloc (pass 12 ALL-sentinel fix): its build consumes
+# include/jemalloc/*.h.in autoconf templates, and a partial vendor is a trap.
+!vendor/tikv-jemalloc-sys/**/include/
+!vendor/tikv-jemalloc-sys/**/include/**
 man/
 venv/
 *.egg-info/
