@@ -28,6 +28,7 @@ mod tokenizer;
 use std::path::{Path, PathBuf};
 
 use forward::{LayerWeights, ModelWeights};
+pub use f16::{f16_bits_to_f32, f32_to_f16_bits};
 pub use forward::{GemmPath, l2_normalize};
 pub use safetensors::{convert_safetensors_f32_to_f16, safetensors_is_f16};
 

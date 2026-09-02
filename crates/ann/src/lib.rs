@@ -16,6 +16,7 @@
 
 #[cfg(test)]
 mod fastscan_probe;
+pub mod dense;
 mod embed;
 pub mod encoder;
 mod index;

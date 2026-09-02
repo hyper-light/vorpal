@@ -12,6 +12,7 @@
 
 pub mod annfiles;
 pub mod artifact;
+mod dense;
 pub mod cochange;
 pub mod traces;
 pub mod live;
@@ -2561,6 +2562,125 @@ pub fn write_encoder_opt_out(index_root: &Path) -> io::Result<()> {
   fs::rename(tmp, index_root.join("encoder.dir"))
 }
 
+/// The dense sidecar a handle serves, and whether its channel is ON: fresh for
+/// this generation and the OPENED encoder (else `None`), enabled by the record's
+/// per-corpus verdict. `VORPAL_DENSE_CHANNEL=on|off` overrides the verdict under
+/// `bench-internals` only (the harness's forced A/B) — never a production knob.
+fn load_dense_sidecar(
+  generation_dir: &Path,
+  stamp: u64,
+  encoder: Option<&vorpal_ann::encoder::CodeEncoder>,
+) -> (Option<dense::DenseSidecar>, bool) {
+  let Some(encoder) = encoder else {
+    return (None, false);
+  };
+  if !dense::is_fresh(generation_dir, stamp, encoder, None) {
+    return (None, false);
+  }
+  let Some(sidecar) = dense::DenseSidecar::load(generation_dir, stamp) else {
+    return (None, false);
+  };
+  let verdict = dense::read_record(generation_dir)
+    .and_then(|record| record.gate)
+    .unwrap_or(false);
+  #[cfg(feature = "bench-internals")]
+  let verdict = match std::env::var("VORPAL_DENSE_CHANNEL").as_deref() {
+    Ok("on") => true,
+    Ok("off") => false,
+    _ => verdict,
+  };
+  (Some(sidecar), verdict)
+}
+
+/// Warm options beyond the tier selection: the dense sidecar's wall-clock
+/// budget (`dense.rs`, the coverage rule). `None` consults the root's
+/// `dense.budget` file; no budget anywhere = no sidecar (the channel is opt-in,
+/// like the encoder itself).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WarmOptions {
+  pub dense_budget_secs: Option<f64>,
+}
+
+/// The root's persisted dense budget (`<root>/dense.budget`, seconds), if any.
+pub fn dense_budget_selection(index_root: &Path) -> Option<f64> {
+  fs::read_to_string(index_root.join("dense.budget"))
+    .ok()?
+    .trim()
+    .parse::<f64>()
+    .ok()
+    .filter(|secs| *secs > 0.0)
+}
+
+/// Persist the root's dense budget (tmp + rename) — an index-shaped write, like
+/// `semantic.tier`; warms are pure readers of it.
+pub fn write_dense_budget(index_root: &Path, secs: f64) -> io::Result<()> {
+  let tmp = index_root.join("dense.budget.tmp");
+  fs::write(&tmp, format!("{secs}\n"))?;
+  fs::rename(tmp, index_root.join("dense.budget"))
+}
+
+/// Build/heal the dense sidecar and its gate when a budget AND an encoder exist.
+/// Every problem is a stated degradation (phase-stamped), never a failed warm —
+/// the fusion serves its four lists until a later warm heals the sidecar.
+fn ensure_dense(
+  index_dir: &Path,
+  kg: &Kg,
+  stamp: u64,
+  encoder: Option<Box<vorpal_ann::encoder::CodeEncoder>>,
+  budget: Option<f64>,
+) {
+  let (Some(encoder), Some(budget)) = (encoder, budget) else {
+    return;
+  };
+  if !dense::is_fresh(index_dir, stamp, &encoder, Some(budget))
+    && let Err(reason) = dense::build(kg, index_dir, stamp, &encoder, budget)
+  {
+    vorpal_kg::phase_stamp(&format!("dense: build failed ({reason}) — channel stays off"));
+    return;
+  }
+  ensure_dense_gate(index_dir, stamp, encoder);
+}
+
+/// Gate the dense channel per corpus iff the record carries no verdict, and
+/// rewrite the record with one (deterministic from content + sidecar, like the
+/// BM25 gate). Probes through the encoder the warm resolved from the root.
+fn ensure_dense_gate(index_dir: &Path, stamp: u64, encoder: Box<vorpal_ann::encoder::CodeEncoder>) {
+  let Some(record) = dense::read_record(index_dir) else {
+    return;
+  };
+  if record.gate.is_some() || record.stamp != stamp {
+    return;
+  }
+  let searcher = match Searcher::open_with_encoder(index_dir, Some(encoder), None) {
+    Ok(searcher) => searcher,
+    Err(err) => {
+      vorpal_kg::phase_stamp(&format!("dense: gate skipped (open failed: {err})"));
+      return;
+    }
+  };
+  let started = std::time::Instant::now();
+  match searcher.dense_self_probe_verdict(stamp) {
+    Ok((enabled, evidence)) => {
+      let gated = dense::DenseRecord {
+        gate: Some(enabled),
+        gate_evidence: Some(evidence.clone()),
+        ..record
+      };
+      if let Err(err) = dense::write_record(index_dir, &gated) {
+        vorpal_kg::phase_stamp(&format!("dense: gate record write failed: {err}"));
+        return;
+      }
+      vorpal_kg::phase_stamp(&format!(
+        "dense: gate {} over {} rows ({evidence}) in {:.1}s",
+        if enabled { "ON" } else { "OFF" },
+        searcher.dense.as_ref().map_or(0, |sidecar| sidecar.len()),
+        started.elapsed().as_secs_f64()
+      ));
+    }
+    Err(err) => vorpal_kg::phase_stamp(&format!("dense: gate failed ({err}) — channel stays off")),
+  }
+}
+
 fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -> bool {
   let stamp_ok = fs::read(index_dir.join("ann.stamp"))
     .ok()
@@ -2631,10 +2751,22 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -
 /// build; a search that arrives mid-build serializes on the same lock and proceeds the
 /// moment the tier is fresh.
 pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+  warm_ann_with(index_dir, WarmOptions::default())
+}
+
+/// [`warm_ann`] with explicit [`WarmOptions`] (the CLI's `--dense-budget-secs`).
+pub fn warm_ann_with(index_dir: &Path, options: WarmOptions) -> Result<(), Box<dyn Error>> {
   // The tier selection lives at the ROOT (it survives generations); read it before
   // resolving. A caller handing a raw generation dir gets the lexical default — only
   // index-shaped commands write selections, and they operate on roots.
   let selection = tier_selection(index_dir)?;
+  // The dense sidecar embeds through the ROOT's encoder selection (per-index
+  // `encoder.dir`, else the global enable) — resolved only when a budget asks
+  // for a sidecar, so budget-less warms never touch the 547 MB weights.
+  let dense_budget = options
+    .dense_budget_secs
+    .or_else(|| dense_budget_selection(index_dir));
+  let dense_encoder = dense_budget.and_then(|_| open_selected_encoder(index_dir).0);
   // Warm the generation CURRENT names right now; its artifacts land inside that generation
   // (the ANN tier is the one stamp-validated sidecar an existing generation admits). If a
   // rebuild supersedes it mid-warm, the work is simply for a generation about to retire —
@@ -2655,7 +2787,7 @@ pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   let Ok(_guard) = lock.try_write() else {
     return Ok(());
   };
-  ensure_ann(index_dir, selection)
+  ensure_ann(index_dir, selection, dense_encoder, dense_budget)
 }
 
 /// Run the warm-time per-corpus BM25 gate iff the committed record carries no
@@ -2717,7 +2849,12 @@ pub fn set_bm25_override(index_dir: &Path, enabled: bool, evidence: &str) -> Res
   .map_err(|e| format!("rewriting tier record: {e}"))
 }
 
-fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn Error>> {
+fn ensure_ann(
+  index_dir: &Path,
+  selection: SemanticTier,
+  dense_encoder: Option<Box<vorpal_ann::encoder::CodeEncoder>>,
+  dense_budget: Option<f64>,
+) -> Result<(), Box<dyn Error>> {
   // One build at a time **per index directory**: an eager background warm and a foreground
   // search on the same index must not both build (duplicate work, racing writes), but a
   // host serving several indexes warms them concurrently — the old process-wide mutex
@@ -2758,6 +2895,9 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
     // The per-corpus BM25 gate heals independently too (pre-gate records carry no
     // verdict) — deterministic from content, so healing converges in one pass.
     ensure_bm25_gate(index_dir, current)?;
+    // The dense sidecar heals independently (stamp-gated; budget- and
+    // encoder-conditional — see `dense.rs`).
+    ensure_dense(index_dir, &kg, current, dense_encoder, dense_budget);
     return Ok(());
   }
   // Build under the SELECTED tier. A learned selection whose corpus is below the
@@ -2855,6 +2995,8 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
   // Gate the per-corpus BM25 fourth list on the now-fully-servable generation and
   // rewrite the record with the verdict (deterministic — see `ensure_bm25_gate`).
   ensure_bm25_gate(index_dir, current)?;
+  // Last: the dense sidecar + its gate, over the committed tier (`dense.rs`).
+  ensure_dense(index_dir, &kg, current, dense_encoder, dense_budget);
   Ok(())
 }
 
@@ -3613,7 +3755,11 @@ fn build_warm_root(index_root: &Path) -> io::Result<Option<WarmRoot>> {
 /// list regressed every graded gate — true answers tokenize to subwords exact-token
 /// BM25 cannot see (sock ≠ socket) — while cpython IMPROVED (all 0.308 → 0.392);
 /// both rounds recorded in BENCHMARKS "Stage 4".
-const SEARCH_CHANNELS: [&str; 4] = ["name", "vector", "graph", "bm25"];
+/// The fifth is the doc-side DENSE channel (`dense.rs`): present only where a
+/// fresh sidecar exists and its per-corpus gate enabled it; when it fuses
+/// without BM25, an EMPTY fourth list holds BM25's position (an empty list adds
+/// no RRF mass), so ranks stay positional against this table.
+const SEARCH_CHANNELS: [&str; 5] = ["name", "vector", "graph", "bm25", "dense"];
 
 /// One fused-ranking row: `(node id, RRF score, per-channel 0-based ranks)` — the shape
 /// [`Searcher::run`] returns.
@@ -3633,6 +3779,9 @@ struct Channels {
   /// appended after graph so tier-0 name hits keep 1/(60+0): BM25 adds mass, never
   /// demotes the short-query supremacy invariant.
   bm25: Vec<u64>,
+  /// The doc-side dense channel (`dense.rs`): encoder cosine over the sidecar's
+  /// covered definitions — empty when no query embedding was supplied.
+  dense: Vec<u64>,
 }
 
 /// The orthogonality boundary of the semantic space: embeddings are L2-normalized, so
@@ -3822,6 +3971,10 @@ enum RerankMode {
   Reorder,
   BlendPinned,
   Blend,
+  /// Bench-only (`VORPAL_RERANK_MODE=off`): the encoder stays open (the dense
+  /// channel still embeds the query) but the fused order is returned untouched —
+  /// the "channel without rerank" arm of the dense A/B.
+  Off,
 }
 
 const RERANK_MODE: RerankMode = RerankMode::Reorder;
@@ -3833,6 +3986,7 @@ fn rerank_mode() -> RerankMode {
       "reorder" => RerankMode::Reorder,
       "blend-pinned" => RerankMode::BlendPinned,
       "blend" => RerankMode::Blend,
+      "off" => RerankMode::Off,
       _ => RERANK_MODE,
     };
   }
@@ -4333,6 +4487,11 @@ pub struct Searcher {
   /// surfaces are immutable per pinned generation, so rows never go stale within
   /// a handle. FIFO-bounded at [`ENCODER_CACHE_ROWS`].
   encoder_cache: Mutex<EncoderCache>,
+  /// The doc-side dense sidecar (`dense.rs`) — present only when fresh for this
+  /// generation AND the opened encoder; absent → the fifth list never forms.
+  dense: Option<dense::DenseSidecar>,
+  /// The sidecar record's per-corpus verdict (`None`/absent → off).
+  dense_enabled: bool,
   /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
   /// effect (autowarm) so queries take the exact reference paths only. Set by
   /// [`Searcher::open_exact`]; never used in serving.
@@ -4342,6 +4501,18 @@ pub struct Searcher {
 impl Searcher {
   /// Open (mmap) every tier for `index_dir`'s current generation, once.
   pub fn open(index_dir: &Path) -> Result<Searcher, Box<dyn Error>> {
+    let (encoder, encoder_note) = open_selected_encoder(index_dir);
+    Self::open_with_encoder(index_dir, encoder, encoder_note)
+  }
+
+  /// [`Searcher::open`] over an ALREADY-opened encoder (or a stated absence) —
+  /// the dense gate's entry, which probes a pinned generation through the
+  /// encoder the warm resolved from the root.
+  fn open_with_encoder(
+    index_dir: &Path,
+    encoder: Option<Box<vorpal_ann::encoder::CodeEncoder>>,
+    encoder_note: Option<String>,
+  ) -> Result<Searcher, Box<dyn Error>> {
     // Pin the generation for the handle's lifetime: an immutable, content-addressed snapshot,
     // so nothing this handle serves can ever be a mixed or stale pair.
     let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
@@ -4372,7 +4543,7 @@ impl Searcher {
     let bm25_enabled = persisted_tier_record(&generation_dir)
       .and_then(|record| record.bm25)
       .unwrap_or(false);
-    let (encoder, encoder_note) = open_selected_encoder(index_dir);
+    let (dense, dense_enabled) = load_dense_sidecar(&generation_dir, stamp, encoder.as_deref());
     Ok(Searcher {
       generation_dir,
       kg,
@@ -4384,6 +4555,8 @@ impl Searcher {
       encoder,
       encoder_note,
       encoder_cache: Mutex::new(EncoderCache::default()),
+      dense,
+      dense_enabled,
       exact_only: false,
     })
   }
@@ -4410,8 +4583,10 @@ impl Searcher {
       .and_then(|record| record.bm25)
       .unwrap_or(false);
     // Same reranker semantics as serving: exact-vs-tier comparisons measure the
-    // pipeline the index actually answers with.
+    // pipeline the index actually answers with — the dense channel included,
+    // under the same per-corpus verdict.
     let (encoder, encoder_note) = open_selected_encoder(index_dir);
+    let (dense, dense_enabled) = load_dense_sidecar(&generation_dir, stamp, encoder.as_deref());
     Ok(Searcher {
       generation_dir,
       kg,
@@ -4423,8 +4598,37 @@ impl Searcher {
       encoder,
       encoder_note,
       encoder_cache: Mutex::new(EncoderCache::default()),
+      dense,
+      dense_enabled,
       exact_only: true,
     })
+  }
+
+  /// The fusion's list set for one query, positional against [`SEARCH_CHANNELS`]:
+  /// the three always-on channels; BM25 where the record enabled it; and, when a
+  /// query embedding produced a dense list, that list — behind an EMPTY BM25
+  /// placeholder if BM25 is off (an empty list adds no RRF mass).
+  fn fused_lists(&self, channels: Channels, dense_on: bool) -> Vec<Vec<u64>> {
+    let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
+    if self.bm25_enabled || dense_on {
+      lists.push(channels.bm25);
+    }
+    if dense_on {
+      lists.push(channels.dense);
+    }
+    lists
+  }
+
+  /// The fixed-order QUERY embedding for the dense channel — computed ONCE per
+  /// search and handed to the rerank too (`rerank_with_encoder`), so the channel
+  /// adds no encoder work beyond the sidecar scan. `None` = the channel is off
+  /// for this handle (no fresh sidecar, gate off, or no encoder); a runtime embed
+  /// failure degrades to the un-channelled fusion for this query.
+  fn dense_query(&self, query: &str) -> Option<Vec<f32>> {
+    if !self.dense_enabled || self.dense.is_none() {
+      return None;
+    }
+    self.encoder.as_ref()?.embed_query(query).ok()
   }
 
   /// Which warm tiers this handle holds, as `(ann, postings)` — fresh-and-open vs
@@ -4433,6 +4637,13 @@ impl Searcher {
   #[cfg(feature = "bench-internals")]
   pub fn tiers(&self) -> (bool, bool) {
     (self.ann.is_some(), self.postings.is_some())
+  }
+
+  /// The dense sidecar this handle holds — `(covered rows, channel on)` — or
+  /// `None` when no fresh sidecar exists for the opened encoder. Bench-only.
+  #[cfg(feature = "bench-internals")]
+  pub fn dense_status(&self) -> Option<(usize, bool)> {
+    self.dense.as_ref().map(|sidecar| (sidecar.len(), self.dense_enabled))
   }
 
   /// The typed-record surface over [`Searcher::run`]: one record per hit with the fused
@@ -4466,16 +4677,21 @@ impl Searcher {
     if parse_and_phrases(query).is_some() {
       return Ok((self.records(query, k, filter)?, None));
     }
-    let channels = self.channel_lists(query, rerank_pool(k), filter)?;
-    let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
-    if self.bm25_enabled {
-      lists.push(channels.bm25);
-    }
+    let dense_query = self.dense_query(query);
+    let channels = self.channel_lists_with_bm25(
+      query,
+      rerank_pool(k),
+      filter,
+      self.bm25_enabled,
+      None,
+      dense_query.as_deref(),
+    )?;
+    let lists = self.fused_lists(channels, dense_query.is_some());
     let fused = rrf_fuse_explained(&lists, k);
     let reranked = self
       .encoder
       .is_some()
-      .then(|| self.hits_from_ranked(self.rerank_with_encoder(query, fused.clone()), None));
+      .then(|| self.hits_from_ranked(self.rerank_with_encoder(query, fused.clone(), dense_query), None));
     Ok((self.hits_from_ranked(fused, None), reranked))
   }
 
@@ -4496,19 +4712,25 @@ impl Searcher {
       // the two vecs (record types are deliberately Clone-free).
       return Ok((self.records(query, k, filter)?, self.records(query, k, filter)?));
     }
-    let channels = self.channel_lists_with_bm25(query, rerank_pool(k), filter, true, None)?;
-    let without = vec![
+    // The pair isolates the BM25 list: the dense channel (when on) rides in
+    // BOTH fusions, so it cancels out of the comparison.
+    let dense_query = self.dense_query(query);
+    let channels =
+      self.channel_lists_with_bm25(query, rerank_pool(k), filter, true, None, dense_query.as_deref())?;
+    let mut without = vec![
       channels.named.clone(),
       channels.semantic.clone(),
       channels.by_degree.clone(),
     ];
-    let with_bm25 = {
-      let mut lists = without.clone();
-      lists.push(channels.bm25);
-      lists
-    };
-    let off = self.rerank_with_encoder(query, rrf_fuse_explained(&without, k));
-    let on = self.rerank_with_encoder(query, rrf_fuse_explained(&with_bm25, k));
+    let mut with_bm25 = without.clone();
+    with_bm25.push(channels.bm25);
+    if dense_query.is_some() {
+      without.push(Vec::new());
+      without.push(channels.dense.clone());
+      with_bm25.push(channels.dense);
+    }
+    let off = self.rerank_with_encoder(query, rrf_fuse_explained(&without, k), dense_query.clone());
+    let on = self.rerank_with_encoder(query, rrf_fuse_explained(&with_bm25, k), dense_query);
     Ok((
       self.hits_from_ranked(off, None),
       self.hits_from_ranked(on, None),
@@ -4797,12 +5019,17 @@ impl Searcher {
   /// name/semantic/in-degree channels fused by RRF, each hit carrying its per-channel ranks.
   /// Reads only the handle's already-open mappings — no `Kg::load`/`AnnIndex::load` per call.
   pub fn run(&self, query: &str, k: usize, filter: &SearchFilter) -> Result<Vec<FusedHit>, Box<dyn Error>> {
-    let channels = self.channel_lists(query, rerank_pool(k), filter)?;
-    let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
-    if self.bm25_enabled {
-      lists.push(channels.bm25);
-    }
-    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k)))
+    let dense_query = self.dense_query(query);
+    let channels = self.channel_lists_with_bm25(
+      query,
+      rerank_pool(k),
+      filter,
+      self.bm25_enabled,
+      None,
+      dense_query.as_deref(),
+    )?;
+    let lists = self.fused_lists(channels, dense_query.is_some());
+    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k), dense_query))
   }
 
   /// The stated reason a configured encoder is NOT active (`None` = active, or no
@@ -4819,7 +5046,16 @@ impl Searcher {
   /// the fused order exactly (open() already validated the model — a runtime
   /// failure degrades one query, never fails a search). Conjunctions
   /// (`run_multi`) keep their own min-RRF contract un-reranked.
-  fn rerank_with_encoder(&self, query: &str, mut fused: Vec<FusedHit>) -> Vec<FusedHit> {
+  /// `query_vec`: the fixed-order query embedding already computed for the dense
+  /// channel (`dense_query`) — reused here so the channel costs no second query
+  /// forward; `None` embeds the prefixed query in the candidate batch as before
+  /// (bitwise equal either way, by the batch oracle).
+  fn rerank_with_encoder(
+    &self,
+    query: &str,
+    mut fused: Vec<FusedHit>,
+    query_vec: Option<Vec<f32>>,
+  ) -> Vec<FusedHit> {
     let Some(encoder) = &self.encoder else {
       return fused;
     };
@@ -4831,7 +5067,8 @@ impl Searcher {
     // pin, the kernel gates GREEN (all-NDCG +5%, the protected class itself +8%)
     // while cpython measures mixed — the per-corpus tables live in BENCHMARKS
     // "Stage 6", and `encoder.dir` is the per-corpus opt-in that expresses them.
-    if fused.len() <= 1 {
+    let mode = rerank_mode();
+    if fused.len() <= 1 || mode == RerankMode::Off {
       return fused;
     }
     // ONE batched forward serves the whole query: the prefixed query plus every
@@ -4839,7 +5076,6 @@ impl Searcher {
     // (`embed_batch` — bitwise equal to solo embeds by the batch oracle), and the
     // per-generation-immutable candidate rows persist in the FIFO session cache.
     let prefixed = format!("{}{query}", vorpal_ann::encoder::QUERY_PREFIX);
-    let mode = rerank_mode();
     // The pool the encoder arbitrates: the tail under the pinned modes, everything
     // under the unpinned blend.
     let first = if mode == RerankMode::Blend { 0 } else { 1 };
@@ -4863,31 +5099,47 @@ impl Searcher {
         continue;
       }
       if let Some(view) = self.kg.node(NodeId::new(id)) {
-        let basename = view.path.rsplit('/').next().unwrap_or(view.path);
         miss_ids.push(id);
-        miss_surfaces.push(format!("{} {} {basename}", view.name, view.signature));
+        miss_surfaces.push(dense::surface_of(&view));
       }
     }
+    // One batch: the prefixed query (unless already embedded) plus every missed
+    // candidate surface; nothing to embed at all when the query is in hand and
+    // every candidate is cached.
+    let query_in_batch = query_vec.is_none();
     let mut sequences: Vec<&str> = Vec::with_capacity(1 + miss_surfaces.len());
-    sequences.push(&prefixed);
+    if query_in_batch {
+      sequences.push(&prefixed);
+    }
     sequences.extend(miss_surfaces.iter().map(String::as_str));
-    let query_vec = match encoder.embed_batch(&sequences) {
-      Ok(mut embedded) => {
-        let query_vec = embedded.remove(0);
-        let mut cache = self
-          .encoder_cache
-          .lock()
-          .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (id, row) in miss_ids.iter().zip(embedded) {
-          cache.insert(*id, row.clone());
-          rows.insert(*id, row);
-        }
-        query_vec
+    let embedded = if sequences.is_empty() {
+      Vec::new()
+    } else {
+      match encoder.embed_batch(&sequences) {
+        Ok(embedded) => embedded,
+        // open() validated the model; a runtime failure degrades one query, never
+        // fails the search.
+        Err(_) => return fused,
       }
-      // open() validated the model; a runtime failure degrades one query, never
-      // fails the search.
-      Err(_) => return fused,
     };
+    let mut embedded = embedded.into_iter();
+    let query_vec = match query_vec {
+      Some(vec) => vec,
+      None => match embedded.next() {
+        Some(vec) => vec,
+        None => return fused,
+      },
+    };
+    {
+      let mut cache = self
+        .encoder_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+      for (id, row) in miss_ids.iter().zip(embedded) {
+        cache.insert(*id, row.clone());
+        rows.insert(*id, row);
+      }
+    }
     let mut keyed: Vec<(f64, usize)> = Vec::with_capacity(fused.len().saturating_sub(first));
     for (position, hit) in fused.iter().enumerate().skip(first) {
       let cosine = rows.get(&hit.0).map_or(f64::NEG_INFINITY, |row| {
@@ -4903,7 +5155,7 @@ impl Searcher {
     // breaking ties (a missing row sorts last, deterministically).
     keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     let order: Vec<usize> = match mode {
-      RerankMode::Reorder => keyed.iter().map(|&(_, position)| position).collect(),
+      RerankMode::Reorder | RerankMode::Off => keyed.iter().map(|&(_, position)| position).collect(),
       RerankMode::BlendPinned | RerankMode::Blend => {
         // One more reciprocal-rank list, added to each hit's fused mass with the
         // fusion's own K — the encoder re-weights within the pool but can never inject
@@ -5021,7 +5273,8 @@ impl Searcher {
         .collect::<Vec<_>>()
         .join(" ");
       // Both fusions PAIRED from one channel computation.
-      let channels = self.channel_lists_with_bm25(&query, rerank_pool(CUTOFF), &filter, true, None)?;
+      let channels =
+        self.channel_lists_with_bm25(&query, rerank_pool(CUTOFF), &filter, true, None, None)?;
       let base = vec![channels.named, channels.semantic, channels.by_degree];
       let rank_of = |lists: &[Vec<u64>]| -> f64 {
         rrf_fuse_explained(lists, CUTOFF)
@@ -5057,6 +5310,128 @@ impl Searcher {
     Ok((enabled, evidence))
   }
 
+  /// Label-free per-corpus DENSE-channel gate — the BM25 gate's protocol
+  /// applied to the fifth list (same content-seeded probes, same token-subset
+  /// probe queries, MRR@10 of the probe's own node, paired fusions from ONE
+  /// channel computation, same sign-test bound): enable iff the paired mean
+  /// strictly improves AND wins − losses > 1.96·√(wins+losses). What it can and
+  /// cannot see: probes are name-token queries, so the verdict measures whether
+  /// the sidecar's COVERAGE and ranking help known-item retrieval — a hot-subset
+  /// sidecar that misses most probed nodes fails the gate (and rightly stays off
+  /// where it would only add noise); the descriptive/paraphrase classes the
+  /// channel exists for are label-only evidence (the harness), recorded beside
+  /// this verdict, never inferred from it. Each probe costs one fixed-order
+  /// query forward (~tens of ms), once per generation.
+  fn dense_self_probe_verdict(&self, stamp: u64) -> Result<(bool, String), Box<dyn Error>> {
+    const PROBES: usize = 512;
+    #[cfg(feature = "bench-internals")]
+    let probe_target: usize = std::env::var("VORPAL_BM25_GATE_PROBES")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(PROBES);
+    #[cfg(not(feature = "bench-internals"))]
+    let probe_target: usize = PROBES;
+    const CUTOFF: usize = 10;
+    let Some(encoder) = self.encoder.as_deref() else {
+      return Ok((false, "no encoder".to_string()));
+    };
+    if self.dense.is_none() {
+      return Ok((false, "no sidecar".to_string()));
+    }
+    let kg = &self.kg;
+    let mut order: Vec<(u64, u64)> = (0..kg.node_count() as u64)
+      .map(|id| {
+        (
+          xxhash_rust::xxh3::xxh3_64_with_seed(&id.to_le_bytes(), stamp),
+          id,
+        )
+      })
+      .collect();
+    order.sort_unstable();
+    let filter = SearchFilter::default();
+    let mut probes = 0usize;
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    let (mut mean_on, mut mean_off) = (0.0f64, 0.0f64);
+    for &(_, id) in &order {
+      if probes == probe_target {
+        break;
+      }
+      let Some(view) = kg.node(NodeId::new(id)) else {
+        continue;
+      };
+      if view.kind == vorpal_kg::SymbolKind::Import {
+        continue;
+      }
+      let tokens = tokenize(view.name);
+      let mut distinct = tokens.clone();
+      distinct.sort_unstable();
+      distinct.dedup();
+      if distinct.len() < 3 {
+        continue;
+      }
+      let take = 2 + (probes & 1);
+      let query = tokens
+        .iter()
+        .take(take)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+      let query_vec = encoder.embed_query(&query)?;
+      let channels = self.channel_lists_with_bm25(
+        &query,
+        rerank_pool(CUTOFF),
+        &filter,
+        self.bm25_enabled,
+        None,
+        Some(&query_vec),
+      )?;
+      let rank_of = |lists: &[Vec<u64>]| -> f64 {
+        rrf_fuse_explained(lists, CUTOFF)
+          .iter()
+          .position(|hit| hit.0 == id)
+          .map_or(0.0, |rank| 1.0 / (rank as f64 + 1.0))
+      };
+      let dense = std::mem::take(&mut { channels }.dense);
+      let channels = self.channel_lists_with_bm25(
+        &query,
+        rerank_pool(CUTOFF),
+        &filter,
+        self.bm25_enabled,
+        None,
+        None,
+      )?;
+      let base = self.fused_lists(channels, false);
+      let rr_off = rank_of(&base);
+      let mut with_dense = base;
+      if !self.bm25_enabled {
+        with_dense.push(Vec::new());
+      }
+      with_dense.push(dense);
+      let rr_on = rank_of(&with_dense);
+      mean_on += rr_on;
+      mean_off += rr_off;
+      if rr_on > rr_off {
+        wins += 1;
+      } else if rr_on < rr_off {
+        losses += 1;
+      }
+      probes += 1;
+    }
+    if probes == 0 {
+      return Ok((false, "probes=0 (no eligible nodes)".to_string()));
+    }
+    mean_on /= probes as f64;
+    mean_off /= probes as f64;
+    let contested = (wins + losses) as f64;
+    let significant = wins as f64 - losses as f64 > 1.96 * contested.sqrt();
+    let enabled = significant && mean_on > mean_off;
+    let evidence = format!(
+      "probes={probes} wins={wins} losses={losses} mean_on={mean_on:.4} mean_off={mean_off:.4}"
+    );
+    Ok((enabled, evidence))
+  }
+
   /// The three ranked candidate channels (name, semantic, graph) at one pool depth —
   /// the shared body behind [`Searcher::run`] (which RRF-fuses them at k) and the
   /// multi-phrase rungs (which accumulate them into dense per-phrase score tables
@@ -5067,7 +5442,7 @@ impl Searcher {
     pool: usize,
     filter: &SearchFilter,
   ) -> Result<Channels, Box<dyn Error>> {
-    self.channel_lists_with_bm25(query, pool, filter, self.bm25_enabled, None)
+    self.channel_lists_with_bm25(query, pool, filter, self.bm25_enabled, None, None)
   }
 
   /// [`Searcher::run`] with the semantic candidate pool SUPPLIED by the caller (the
@@ -5082,25 +5457,26 @@ impl Searcher {
     filter: &SearchFilter,
     semantic_pool: Vec<u64>,
   ) -> Result<Vec<FusedHit>, Box<dyn Error>> {
+    let dense_query = self.dense_query(query);
     let channels = self.channel_lists_with_bm25(
       query,
       rerank_pool(k),
       filter,
       self.bm25_enabled,
       Some(semantic_pool),
+      dense_query.as_deref(),
     )?;
-    let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
-    if self.bm25_enabled {
-      lists.push(channels.bm25);
-    }
-    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k)))
+    let lists = self.fused_lists(channels, dense_query.is_some());
+    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k), dense_query))
   }
 
   /// [`Searcher::channel_lists`] with the BM25 list computed on demand — the serving
   /// path passes the record's per-corpus verdict; the warm-time gate passes `true`
   /// so both fusions probe from ONE channel computation (paired by construction).
   /// `supplied_pool` (the daemon's live ANN tier) replaces the semantic tier
-  /// dispatch when present; every other channel is unchanged.
+  /// dispatch when present; every other channel is unchanged. `dense_query` (the
+  /// fixed-order encoder embedding of the prefixed query) turns the dense
+  /// sidecar channel on for this call; `None` leaves that list empty.
   fn channel_lists_with_bm25(
     &self,
     query: &str,
@@ -5108,6 +5484,7 @@ impl Searcher {
     filter: &SearchFilter,
     want_bm25: bool,
     supplied_pool: Option<Vec<u64>>,
+    dense_query: Option<&[f32]>,
   ) -> Result<Channels, Box<dyn Error>> {
     let kg = &self.kg;
     let index_dir = self.generation_dir.as_path();
@@ -5368,12 +5745,22 @@ impl Searcher {
     Vec::new()
   };
 
+  // The dense channel (`dense.rs`): int8 scan + f16 rescore over the sidecar's
+  // covered definitions, filtered BEFORE ranking (exact, no overfetch slack).
+  let dense = match (dense_query, &self.dense) {
+    (Some(query_vec), Some(sidecar)) => sidecar.search(query_vec, pool, &|id| {
+      filter.is_empty() || compiled_filter.admits(kg, id)
+    }),
+    _ => Vec::new(),
+  };
+
     Ok(Channels {
       named,
       semantic,
       semantic_dist2,
       by_degree,
       bm25,
+      dense,
     })
   }
 
@@ -5583,6 +5970,44 @@ pub mod bench {
     let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
     let kg = Kg::load(&generation_dir)?;
     Ok(super::coherent_persisted_embedder(&generation_dir, super::stamp_of(&kg)).is_some())
+  }
+
+  /// Dense-channel rank probe (the paraphrase question): the sidecar's FULL ranking
+  /// of every covered row for `query`, reported as the 0-based dense rank of each
+  /// named node (`None` = not covered) — with the encoder cosine at that rank and
+  /// the top few names for context. Opens the index as serving does (encoder from
+  /// the root/global selection), so a missing sidecar or encoder is a typed error.
+  #[allow(clippy::type_complexity)] // (per-name rank, top-10 names) — a bench report tuple
+  pub fn dense_ranks(
+    index_dir: &Path,
+    query: &str,
+    names: &[&str],
+  ) -> Result<(Vec<(String, Option<usize>)>, Vec<String>), Box<dyn Error>> {
+    let searcher = super::Searcher::open(index_dir)?;
+    let Some(sidecar) = &searcher.dense else {
+      return Err("no fresh dense sidecar for this index/encoder".into());
+    };
+    let Some(encoder) = searcher.encoder.as_deref() else {
+      return Err("no encoder selected".into());
+    };
+    let query_vec = encoder.embed_query(query)?;
+    let ranked = sidecar.search(&query_vec, sidecar.len(), &|_| true);
+    let name_of = |id: u64| -> String {
+      searcher
+        .kg
+        .node(vorpal_kg::NodeId::new(id))
+        .map(|view| view.name.to_string())
+        .unwrap_or_default()
+    };
+    let ranks = names
+      .iter()
+      .map(|name| {
+        let at = ranked.iter().position(|&id| name_of(id) == *name);
+        (name.to_string(), at)
+      })
+      .collect();
+    let head = ranked.iter().take(10).map(|&id| name_of(id)).collect();
+    Ok((ranks, head))
   }
 
   /// Positivity probe for the conjunction-support question: for one phrase, how many

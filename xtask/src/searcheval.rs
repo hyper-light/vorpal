@@ -80,6 +80,13 @@ pub fn run(index: &Path, labels_path: &Path, overlap: bool) -> Result<()> {
     if ann_fresh { "fresh" } else { "ABSENT/STALE (semantic channel = exact fallback)" },
     if postings_fresh { "fresh" } else { "ABSENT/STALE (name channel = full scan)" },
   );
+  match searcher.dense_status() {
+    Some((rows, on)) => println!(
+      "dense sidecar: {rows} rows, channel {}",
+      if on { "ON" } else { "OFF (gate verdict)" }
+    ),
+    None => println!("dense sidecar: none for this encoder/generation"),
+  }
   if !labels.description.is_empty() {
     println!("labels: {}", labels.description);
   }
@@ -130,6 +137,25 @@ pub fn run(index: &Path, labels_path: &Path, overlap: bool) -> Result<()> {
       "rank[{}] {:?} -> {:?}  ndcg@10 {:.3}  mrr {:.3}  recall@5 {:.2}",
       q.class, q.query, best_top, ndcg, mrr, recall
     );
+    // `VORPAL_SEARCHEVAL_CHANNELS=1`: per-channel provenance of every labelled hit
+    // in the top-25 — which channel surfaced it and at what rank (the
+    // candidate-generation question the dense channel exists to answer).
+    if std::env::var_os("VORPAL_SEARCHEVAL_CHANNELS").is_some() {
+      for (rank, grade) in &matches {
+        let hit = &hits[*rank];
+        let provenance: Vec<String> = hit
+          .channels
+          .iter()
+          .map(|c| format!("{}#{}", c.channel, c.rank))
+          .collect();
+        println!(
+          "    label {:?} (grade {grade}) fused#{}  channels [{}]",
+          hit.node.name,
+          rank + 1,
+          provenance.join(", ")
+        );
+      }
+    }
 
     let agg = per_class.entry(q.class.as_str()).or_default();
     agg.queries += 1;

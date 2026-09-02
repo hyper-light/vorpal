@@ -55,6 +55,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let Some(index) = args.first() else {
     return Err("usage: sweep_encoder <index-dir> [batch ...]  (default batches: 26 256 1024)".into());
   };
+  // Dense-channel rank probe: `<index-dir> --dense-rank <query> <name> [<name> ...]`
+  // (serving-style open: the encoder comes from the root/global selection).
+  if args.get(1).map(String::as_str) == Some("--dense-rank") {
+    let query = args.get(2).ok_or("usage: sweep_encoder <index-dir> --dense-rank <query> <name...>")?;
+    let names: Vec<&str> = args[3..].iter().map(String::as_str).collect();
+    let (ranks, head) = vorpal_index::bench::dense_ranks(Path::new(index), query, &names)?;
+    println!("query {query:?}: dense top-10 = {head:?}");
+    for (name, rank) in ranks {
+      println!("  {name}: dense rank {:?}", rank.map(|r| r + 1));
+    }
+    return Ok(());
+  }
   let model_dir = std::env::var_os("VORPAL_CODERANK_DIR")
     .map(std::path::PathBuf::from)
     .ok_or("set VORPAL_CODERANK_DIR to the model directory")?;

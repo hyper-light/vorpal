@@ -5,7 +5,7 @@
 //! the 65 536 half bit patterns.
 
 /// Narrow one f32 to half bits, round-to-nearest-even.
-pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
+pub fn f32_to_f16_bits(value: f32) -> u16 {
   let bits = value.to_bits();
   let sign = ((bits >> 16) & 0x8000) as u16;
   let exponent = ((bits >> 23) & 0xff) as i32;
@@ -42,7 +42,7 @@ pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
 }
 
 /// Widen half bits to f32 (exact — every half value is representable).
-pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
   let sign = ((bits & 0x8000) as u32) << 16;
   let exponent = ((bits >> 10) & 0x1f) as u32;
   let mantissa = (bits & 0x03ff) as u32;
