@@ -18,7 +18,9 @@
 
 pub mod arena;
 /// The tiny libc surface the workspace's trace instrumentation needs (vorpal-mem owns
-/// the libc dependency; callers avoid growing their own).
+/// the libc dependency; callers avoid growing their own). Unix-only — libc exposes no
+/// rusage on Windows, and every consumer is already `#[cfg(unix)]`-gated.
+#[cfg(unix)]
 pub mod carry_libc {
   pub use libc::{RUSAGE_SELF, getrusage, rusage};
 }
