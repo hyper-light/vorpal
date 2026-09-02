@@ -244,9 +244,28 @@ pub(crate) fn take_reuse(path: &str) -> Option<(Box<WalkSnapshot>, IncrementalDe
   })
 }
 
+/// Cheap lock-free pre-gate for [`wants_snapshot`]: a source the cache policy would
+/// never retain can never have an entry, so callers skip the global mutex for the
+/// overwhelming majority of files (a cold kernel build would otherwise tap it once
+/// per eligible C file from every worker thread).
+pub(crate) fn retainable(source_len: usize) -> bool {
+  // Oracles drive tiny files through the unpoliced seam; the gate is a lock-avoidance
+  // shortcut, not a correctness surface, so tests keep it open.
+  #[cfg(test)]
+  {
+    let _ = source_len;
+    true
+  }
+  #[cfg(not(test))]
+  {
+    let policy = policy();
+    policy.enabled && source_len >= policy.min_bytes
+  }
+}
+
 /// Whether extraction should capture a walk snapshot for `path`: only when the tree
 /// cache actually retained the parse (the two-touch save-loop shape) — cold single
-/// parses never pay capture.
+/// parses never pay capture. Guard calls with [`retainable`] first.
 pub(crate) fn wants_snapshot(path: &str) -> bool {
   cache()
     .lock()

@@ -1843,6 +1843,74 @@ of retained SOURCE (tree mass ≈ 10–40× source, ledger-profiled → ~2.5 GB 
 + cross-language + the vendored 3.8 MB giant, products byte-identical incremental vs
 fresh; full gate 141 suites / 1280 / 0; battery PASS.
 
+## Walk reuse — incremental saves re-walk only the dirty region (2026-09-02)
+
+The tree cache's recorded residual — the extraction walk itself — closed. Beside the
+retained parse, extraction now snapshots its PRE-finalize outputs per giant file:
+pre-adoption outline items, pre-dedup reference rows, binders, finished near-clone
+sketches, and the definition layout, in a compact span-or-text form (`Snip`: source
+slices as byte offsets, rendered strings as text — capture allocates for rendered
+strings only, and resolving against the next save's source is `Cow::Borrowed` both
+ways). On the next save, `try_new_incremental_ranged` reports the spanning edit plus
+tree-sitter's changed-range verdict; the dirty region = that union expanded to whole
+top-level item spans (fixpoint); ONLY the dirty subtrees re-walk (ancestor context
+seeded so parent-sensitive dispatch matches the full walk; a regional signer signs only
+dirty definitions); retained rows splice around the fresh ones — byte positions
+shifted, attribution remapped by definition-span lookup in the NEW layout, sketches
+carried verbatim — and the unchanged file-global laws (adoption, layout, binder
+shadowing, type/impl dedup, receiver stamping, error scan, encode) run over the merged
+whole. Eligibility, C first: no injections, no typefacts, no request specs, no nested
+item rules; parse ERRORS deliberately do NOT gate (the incremental tree equals a fresh
+parse by the library contract — the error-carrying vendored giant is oracle-pinned).
+Every splice invariant is re-checked at runtime; any violation falls back to the full
+walk. `VORPAL_WALK_REUSE=0` disables, `_TRACE` prints dirty regions + phase millis,
+`SPLICES`/`FALLBACKS` counters keep the oracles non-vacuous.
+
+Snapshot mass (`snapshot_mass` example): 2.0–2.8× source across giant classes —
+tree-sitter-c parser.c 3.87 MB → 9.5 MB (2.5×, 70,133 rows); -haskell 19.8 → 40.5 MB
+(2.0×); -cpp 17.3 → 43.9 MB (2.5×); -julia 54.7 → 152.4 MB (2.8×, 1,133,046 rows).
+Cache accounting therefore charges entry cost = source + snapshot, and the default
+budget rescales to the swept 64 MiB source capacity × (1 + ratio ceiling 3) = 256 MiB —
+same retention intent (one julia-class giant, or a handful of kernel-class files).
+
+Measured (M5 Max, cumulative-save bench, byte-verified vs a genuinely fresh whole-file
+extraction every round — the control probe name is now unique per round, since the old
+shared name entered the cache itself from round 2 and quietly weakened the check):
+
+| 54.7 MB julia parser.c, per save | wall | vs fresh 4.2 s |
+|---|---:|---:|
+| tree cache only | ~1.93 s | 2.2× |
+| + walk splice, edit between definitions | **0.66–0.71 s** | **6.1×** |
+| + walk splice, edit INSIDE the single 43.3 MB parse-table item | 1.70–1.71 s | 2.5× |
+
+Splice machinery inside a 684 ms save (`_TRACE` phases): row split 31 ms + regional
+walk/merge 10 ms + capture/store 30 ms + finalize 13 ms ≈ 84 ms on 1.13 M retained
+rows; the remainder is the incremental reparse plus the bench's owning finish
+(production streams encoded parts). Item granularity is the honest floor: one item
+spanning 80 % of the file means an in-item edit re-walks that item.
+
+Oracles: 12 edit shapes (add/delete/rename definitions, struct-member change,
+two-distant-edits, whitespace, identical, UTF-8 retained prefix …), multi-save chains
+(splicing against snapshots the splice path itself captured), and the error-carrying
+vendored giant — each byte-compared against fresh extraction, with a SPLICES-moved
+assert so a silently-dead reuse path can never pass. Cold builds stay inert (two-touch:
+capture needs a retained entry): kernel cold 8.25 s reuse-on vs 8.82 s off (noise law);
+`wants_snapshot`'s per-file mutex tap is additionally pre-gated by the lock-free 1 MiB
+policy check so cold builds touch the cache lock only for actual giants.
+
+Closing gates for the campaign (kernel, this landing): workspace 141 suites /
+**1286 passed / 0 failed**, both clippy lanes clean; convergence battery **21/21 PASS**
+(ast-grep, cpython@HEAD, kafka@HEAD); polyglot canary 15 repos @ HEAD cold+unchanged
+all exit 0 (llvm re-checked under the README protocol at 7.86 s best-of-3 — the sweep's
+one-shot 9.0 s reading was thermal context, not a regression); production cold
+**8.25 s** / one-shot edit **0.51 s** / unchanged 0.12 s (bars 8.6–9.5 / 0.52–0.53 /
+0.13). Ledger binary (exact counters, deterministic): Rust allocs **7.60 M** (campaign
+start 9.87 M, pre-walk-reuse 7.99 M), reallocs **3.11 M** (start 7.77 M), churn
+**48.9 GB** (start 56.1 GB), ts-side 16.06 M (bar 16.3 M held), faults 653 K,
+`time -l` peak RSS 5.58–5.64 GB (campaign start 6.7 GB), user 108–113 s at the
+recorded 110.9 s floor; walls 7.9–9.1 s across a warm session — inside this file's
+standing thermal-variance law (identical builds vary 101–117 s user).
+
 ## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
 
 The premise: split giant C sources at proven top-level boundaries, parse slices in

@@ -212,21 +212,32 @@ underneath it.
 ### Editing large files (long-lived processes)
 
 A process that indexes repeatedly — the MCP daemon, a watch loop, an SDK server calling
-`indexBuild` on every save — re-parses edited multi-megabyte sources **incrementally**:
-vorpal retains parse state for files over 1 MiB and applies tree-sitter's own
-incremental reparse, with output verified byte-identical to a fresh parse on every
-measurement round below.
+`indexBuild` on every save — treats an edited multi-megabyte source **incrementally**,
+twice over: vorpal retains parse state for files over 1 MiB and applies tree-sitter's
+own incremental reparse, and it also snapshots the extraction walk's rows so the next
+save re-walks only the edited top-level region and splices the retained rows around it
+(byte positions shifted, attribution remapped, near-clone sketches carried). Output is
+verified byte-identical to a fresh whole-file extraction on every measurement round
+below.
 
-| Edited file | Fresh parse, per save | Incremental, per save |
-|---|---:|---:|
-| 54 MB generated C (`tree-sitter-julia` parser) | 4.2 s | **1.9 s** |
-| 17 MB generated C (`tree-sitter-cpp` parser) | 1.33 s | **0.58 s** |
-| 1.4 MB hand-written C (CPython `Parser/parser.c`) | 104 ms | **34 ms** |
+| Edited file (per save) | Fresh | Incremental parse | + walk splice² |
+|---|---:|---:|---:|
+| 54 MB generated C (`tree-sitter-julia` parser), edit between definitions | 4.2 s | 1.9 s | **0.7 s** |
+| 54 MB generated C, edit *inside* its single 43 MB parse-table definition | 4.2 s | 1.9 s | **1.7 s** |
+| 17 MB generated C (`tree-sitter-cpp` parser) | 1.33 s | **0.58 s** | — |
+| 1.4 MB hand-written C (CPython `Parser/parser.c`) | 104 ms | **34 ms** | — |
 
-The parse share is eliminated entirely (the residual is definition/reference
-extraction). One-shot CLI builds are unaffected by design — retention only pays when a
-file is parsed again. `VORPAL_TREE_CACHE=0` disables; `_MIN`/`_BUDGET` tune the 1 MiB
-floor and 64 MiB retained-source budget.
+The parse share is eliminated entirely, and for edits between definitions the walk
+share too — the splice machinery itself costs ~84 ms on 1.13 M retained rows (the
+granularity floor is the enclosing definition: an edit inside one giant definition
+re-walks that definition). Walk splicing ships for C first, gated hard: any splice
+invariant violation falls back to the full walk, and one-shot CLI builds are unaffected
+by design — retention only pays when a file is parsed again. `VORPAL_TREE_CACHE=0`
+disables retention, `VORPAL_WALK_REUSE=0` just the splice; `_MIN`/`_BUDGET` tune the
+1 MiB floor and the 256 MiB retained source+snapshot budget.
+
+² Walk-splice column measured on current `main` (post-v0.6.0); it ships in the next
+release. All other numbers are v0.6.0 as stated above.
 
 ### Search (Linux kernel index, 8.9 M definitions, k = 10)
 

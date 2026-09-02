@@ -610,7 +610,9 @@ impl OutlineExtractor {
       && spec.is_some_and(|s| s.spec.requests.is_empty());
     // Whether to CAPTURE a snapshot for the next save: same shape constraints, and only
     // for paths the tree cache actually retained (the save-loop's two-touch promotion).
-    let want_snap = eligible && crate::tree_cache::wants_snapshot(path);
+    let want_snap = eligible
+      && crate::tree_cache::retainable(source.len())
+      && crate::tree_cache::wants_snapshot(path);
 
     // Reuse attempt, item side: resolve retained items around the dirty region and walk
     // only the dirty top-level subtrees fresh. Any geometry violation abandons the whole
