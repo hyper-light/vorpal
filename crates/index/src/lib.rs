@@ -2862,13 +2862,58 @@ fn train_learned_model(kg: &Kg, index_dir: &Path) -> Result<LearnedStaticEmbedde
     // (`VORPAL_PHASE_TRACE=1`) — the kernel-scale attribution discipline.
     progress: vorpal_kg::phase_stamp,
   };
+  // Kind policy (see `TrainKindPolicy`): under `BalanceToCallables` every kind's
+  // document count is capped at the population of the largest callable kind, by a
+  // deterministic stride over id order — the cap is read off this corpus, never set.
+  let policy = train_kind_policy();
+  // Per-kind tallies indexed by the kind's discriminant (SymbolKind is a fieldless enum).
+  let mut kind_counts: Vec<u64> = vec![0; 256];
+  let mut callable_max: u64 = 0;
+  if policy == TrainKindPolicy::BalanceToCallables {
+    for id in 0..kg.node_count() as u64 {
+      if let Some(view) = kg.node(NodeId::new(id)) {
+        kind_counts[view.kind as u8 as usize] += 1;
+      }
+    }
+    for kind in [
+      vorpal_kg::SymbolKind::Function,
+      vorpal_kg::SymbolKind::Method,
+      vorpal_kg::SymbolKind::Constructor,
+    ] {
+      callable_max = callable_max.max(kind_counts[kind as u8 as usize]);
+    }
+  }
+  let cap: u64 = if callable_max == 0 { u64::MAX } else { callable_max };
   let corpus = |callback: &mut dyn FnMut(&[String])| {
+    let mut seen_per_kind: Vec<u64> = vec![0; 256];
     for id in 0..kg.node_count() as u64 {
       let Some(view) = kg.node(NodeId::new(id)) else {
         continue;
       };
       if view.kind == vorpal_kg::SymbolKind::Import {
         continue;
+      }
+      match policy {
+        TrainKindPolicy::All => {}
+        TrainKindPolicy::ExcludeMacros => {
+          if view.kind == vorpal_kg::SymbolKind::Macro {
+            continue;
+          }
+        }
+        TrainKindPolicy::BalanceToCallables => {
+          let slot = view.kind as u8 as usize;
+          let total = kind_counts[slot];
+          if total > cap {
+            // Keep the i-th node of this kind iff the stride bucket advances:
+            // floor(i·cap/total) changes exactly `cap` times over i in [0, total).
+            let ordinal = seen_per_kind[slot];
+            let keep = (ordinal * cap) / total != ((ordinal + 1) * cap) / total;
+            seen_per_kind[slot] += 1;
+            if !keep {
+              continue;
+            }
+          }
+        }
       }
       let basename = view.path.rsplit('/').next().unwrap_or(view.path);
       let mut doc = tokenize(view.name);
@@ -3738,6 +3783,73 @@ fn load_ann_calibration(index_dir: &Path, stamp: u64, node_count: usize) -> Opti
 /// Reciprocal Rank Fusion constant (the standard K=60): dampens the head of each list so no
 /// single signal dominates, while rank-1 placements still carry the most weight.
 const RRF_K: f32 = 60.0;
+
+/// How the encoder's verdict combines with the fusion in `rerank_with_encoder`:
+/// `Reorder` = the encoder's cosine order REPLACES the fused order of the tail (rank-0
+/// pinned); `BlendPinned` = the encoder enters as one more reciprocal-rank list over the
+/// tail, added to each hit's fused RRF mass (rank-0 pinned); `Blend` = the same over the
+/// whole pool, rank 0 included. Production pins `Reorder` by measurement (BENCHMARKS
+/// "Rerank mode A/B", 2026-09-02): the blends recover most of the kernel's
+/// short-keyword loss (0.143 → 0.184 NDCG) but damp exactly the deep pulls that buy
+/// recall elsewhere (cpython recall@5 0.50 → 0.33, this repo 0.75 → 0.55) — no mode
+/// dominates, and per-index `vorpal tune` remains the instrument that decides whether
+/// the encoder is on at all. `VORPAL_RERANK_MODE=reorder|blend-pinned|blend` sweeps
+/// it under `bench-internals`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RerankMode {
+  Reorder,
+  BlendPinned,
+  Blend,
+}
+
+const RERANK_MODE: RerankMode = RerankMode::Reorder;
+
+fn rerank_mode() -> RerankMode {
+  #[cfg(feature = "bench-internals")]
+  if let Ok(value) = std::env::var("VORPAL_RERANK_MODE") {
+    return match value.as_str() {
+      "reorder" => RerankMode::Reorder,
+      "blend-pinned" => RerankMode::BlendPinned,
+      "blend" => RerankMode::Blend,
+      _ => RERANK_MODE,
+    };
+  }
+  RERANK_MODE
+}
+
+/// Which definitions feed the learned tier's distributional training corpus
+/// (`train_learned_model`): every non-import node; every non-import node except
+/// macros; or every kind capped at the population of the largest CALLABLE kind
+/// (deterministic stride subsample) — the balance rule is data-derived, no constant.
+/// Measured 2026-09-02 (BENCHMARKS "Learned-tier kind policy A/B"): excluding macros
+/// loses on the kernel (macros are retrieval targets and real signal); balance lifts
+/// the kernel (all 0.295 → 0.313 NDCG@10, protected short-keyword 0.202 → 0.222), is
+/// bit-identical on cpython, and costs this repo one conjunctive query (0.559 →
+/// 0.529). `All` stays pinned pending the owner's decision; pinning `Balance` must
+/// also carry the policy label in `ann.model.json` so freshness retrains on a flip.
+/// `VORPAL_LEARNED_KIND_POLICY=all|exclude-macros|balance` sweeps it under
+/// `bench-internals`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrainKindPolicy {
+  All,
+  ExcludeMacros,
+  BalanceToCallables,
+}
+
+const LEARNED_TRAIN_KINDS: TrainKindPolicy = TrainKindPolicy::All;
+
+fn train_kind_policy() -> TrainKindPolicy {
+  #[cfg(feature = "bench-internals")]
+  if let Ok(value) = std::env::var("VORPAL_LEARNED_KIND_POLICY") {
+    return match value.as_str() {
+      "all" => TrainKindPolicy::All,
+      "exclude-macros" => TrainKindPolicy::ExcludeMacros,
+      "balance" => TrainKindPolicy::BalanceToCallables,
+      _ => LEARNED_TRAIN_KINDS,
+    };
+  }
+  LEARNED_TRAIN_KINDS
+}
 
 /// Fuse ranked candidate lists by RRF: `score(d) = Σ 1/(K + rank_in_list)`. Ties break by id for
 /// determinism. Lists may overlap and have different lengths; absence from a list adds nothing.
@@ -4683,7 +4795,11 @@ impl Searcher {
     // (`embed_batch` — bitwise equal to solo embeds by the batch oracle), and the
     // per-generation-immutable candidate rows persist in the FIFO session cache.
     let prefixed = format!("{}{query}", vorpal_ann::encoder::QUERY_PREFIX);
-    let tail_ids: Vec<u64> = fused.iter().skip(1).map(|hit| hit.0).collect();
+    let mode = rerank_mode();
+    // The pool the encoder arbitrates: the tail under the pinned modes, everything
+    // under the unpinned blend.
+    let first = if mode == RerankMode::Blend { 0 } else { 1 };
+    let tail_ids: Vec<u64> = fused.iter().skip(first).map(|hit| hit.0).collect();
     let mut rows: HashMap<u64, Vec<f32>> = HashMap::with_capacity(tail_ids.len());
     {
       let cache = self
@@ -4728,8 +4844,8 @@ impl Searcher {
       // fails the search.
       Err(_) => return fused,
     };
-    let mut keyed: Vec<(f64, usize)> = Vec::with_capacity(fused.len().saturating_sub(1));
-    for (position, hit) in fused.iter().enumerate().skip(1) {
+    let mut keyed: Vec<(f64, usize)> = Vec::with_capacity(fused.len().saturating_sub(first));
+    for (position, hit) in fused.iter().enumerate().skip(first) {
       let cosine = rows.get(&hit.0).map_or(f64::NEG_INFINITY, |row| {
         query_vec
           .iter()
@@ -4739,10 +4855,38 @@ impl Searcher {
       });
       keyed.push((cosine, position));
     }
+    // The encoder's own rank list over the pool: cosine descending, fused position
+    // breaking ties (a missing row sorts last, deterministically).
     keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let order: Vec<usize> = match mode {
+      RerankMode::Reorder => keyed.iter().map(|&(_, position)| position).collect(),
+      RerankMode::BlendPinned | RerankMode::Blend => {
+        // One more reciprocal-rank list, added to each hit's fused mass with the
+        // fusion's own K — the encoder re-weights within the pool but can never inject
+        // a candidate the channels did not surface. Records keep their fused scores;
+        // the blend is a local sort key. Ties break by id, as the fusion does.
+        let mut blended: Vec<(f32, u64, usize)> = keyed
+          .iter()
+          .enumerate()
+          .map(|(encoder_rank, &(_, position))| {
+            let hit = &fused[position];
+            (hit.1 + 1.0 / (RRF_K + encoder_rank as f32), hit.0, position)
+          })
+          .collect();
+        blended.sort_by(|a, b| {
+          b.0
+            .partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+        });
+        blended.into_iter().map(|(_, _, position)| position).collect()
+      }
+    };
     let mut reordered = Vec::with_capacity(fused.len());
-    reordered.push(std::mem::replace(&mut fused[0], (0, 0.0, Vec::new())));
-    for &(_, position) in &keyed {
+    if first == 1 {
+      reordered.push(std::mem::replace(&mut fused[0], (0, 0.0, Vec::new())));
+    }
+    for &position in &order {
       reordered.push(std::mem::replace(&mut fused[position], (0, 0.0, Vec::new())));
     }
     reordered

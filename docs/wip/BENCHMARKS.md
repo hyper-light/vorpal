@@ -1911,6 +1911,190 @@ start 9.87 M, pre-walk-reuse 7.99 M), reallocs **3.11 M** (start 7.77 M), churn
 recorded 110.9 s floor; walls 7.9–9.1 s across a warm session — inside this file's
 standing thermal-variance law (identical builds vary 101–117 s user).
 
+## Ranking tiers re-baselined on the v0.6.1 graph + daemon memory per tier (2026-09-02)
+
+The README gained a search-quality section, so every tier was re-measured on the
+CURRENT extraction (8.89 M kernel definitions — 3.1× the graph the Stage 0–6 tables
+above were graded on, macro/union/typedef kinds included). The recorded per-stage
+deltas (learned +43 %, encoder +5 %/+8 %) do NOT transfer to this graph; the numbers
+below supersede them for README purposes, and the per-stage tables stay as the
+history of each mechanism on the graph it was measured on.
+
+Substrate: kernel `1590cf032971` (README pin), cpython `b86a41cbf63` (README pin),
+this repo at v0.6.1; per corpus one `--semantic-tier lexical` index and one
+`--semantic-tier learned` index, both `__warm-ann`'d; encoder = CodeRankEmbed pinned
+weights installed into a scratch `VORPAL_HOME` via `vorpal enable semantic-f32` then
+`semantic-f16` (f16 converted from the verified f32); tier flips via `vorpal enable`.
+Harness: `xtask searcheval` (NDCG@10 / MRR / recall@5, determinism + label-existence
+gates, `VORPAL_NO_AUTOWARM=1`).
+
+| corpus · tier | NDCG@10 | MRR | recall@5 | class detail |
+|---|---:|---:|---:|---|
+| kernel · lexical | 0.299 | 0.375 | 0.229 | short-kw 0.206/0.286/0.119; descriptive 0.947/1.0/1.0 |
+| kernel · learned | 0.295 | 0.305 | 0.250 | short-kw 0.202/0.206/0.143 ("mutex lock acquire" rank 0 → 23) |
+| kernel · learned + f16 | 0.244 | 0.288 | 0.167 | short-kw 0.143/0.186/0.048 — REGRESSION |
+| kernel · learned + f32 | 0.244 | 0.288 | 0.167 | bit-identical to f16 |
+| cpython · lexical | 0.137 | 0.208 | 0.250 | descriptive 0.036/0.062/0.125; short-kw 0.338/0.5/0.5 |
+| cpython · learned (BM25 gate ON) | 0.412 | 0.528 | 0.333 | descriptive **0.475**/0.542/0.375; short-kw 0.287/0.5/0.25 |
+| cpython · learned + f16 | 0.410 | 0.556 | 0.500 | descriptive 0.531/0.583/**0.625**; short-kw 0.169/0.5/0.25 |
+| cpython · learned + f32 | 0.410 | 0.556 | 0.500 | bit-identical to f16 |
+| vorpal · lexical | 0.571 | 0.560 | 0.550 | exact 1.0; short-kw 0.894; paraphrase 0; conjunctive 0 |
+| vorpal · learned (BM25 gate ON) | 0.559 | 0.550 | 0.550 | conjunctive 0.301/0.111/0; subset 0.500 |
+| vorpal · learned + f16 | 0.648 | 0.625 | 0.750 | descriptive 0.815/0.75/1.0; conjunctive 0.431/0.25/1.0 |
+| vorpal · learned + f32 | 0.648 | 0.625 | 0.750 | bit-identical to f16 |
+
+Reading: (1) f16 ≡ f32 in every cell, as the conversion oracle (cosine 1.000000)
+predicted — the size choice is disk/RSS only. (2) Tiers are per-corpus decisions:
+the learned tier triples cpython's descriptive class and is neutral on the kernel and
+this repo; the encoder rerank lifts recall@5 (cpython 0.33 → 0.50, vorpal 0.55 →
+0.75) but lowers the kernel's short-keyword class (0.202 → 0.143) — the subword-
+identifier answers the fused-winner pin protects only at rank 0. `vorpal tune` is the
+instrument that decides this per index. (3) The per-corpus BM25 warm gate fired ON for
+the learned warms of cpython (36 W / 19 L, mean 0.4442 vs 0.4388) and this repo
+(38/21, 0.3715 vs 0.3661) and OFF on the kernel (17/13) and on every lexical warm —
+so the cpython/vorpal learned rows carry the BM25 channel; see the attribution note
+below. (4) Tier-path latency in the graded runs (k = 25, in-process): kernel
+lexical 50.9 ms mean, learned 53.5 ms, + encoder 0.93 s (f16) / 0.97 s (f32); cpython
+1.6 / 35 / 657–693 ms; vorpal 0.9 / 14 / 639–658 ms.
+
+Daemon latency + peak RSS per tier (`mcp_bench.py`: stdio `vorpal mcp --index`,
+initialize handshake, 30 `tools/call` round-trips each of `search` (k = 10, label
+queries cycling), `callers`, `node`; RSS via `ps -o rss` after every call):
+
+| index · tier | search median | search p95 | first search | callers median | node median | peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| kernel · lexical | 58.8 ms | 64.7 ms | 210 ms | 0.11 ms | 0.10 ms | 2,101 MB |
+| kernel · learned | 60.5 ms | 63.1 ms | 243 ms | 0.12 ms | 0.11 ms | 2,638 MB |
+| kernel · learned + f16 | 90.9 ms | 476 ms | 673 ms | 0.12 ms | 0.11 ms | 3,167 MB |
+| kernel · learned + f32 | 86.6 ms | 474 ms | 583 ms | 0.12 ms | 0.11 ms | 3,081 MB |
+| cpython · lexical | 1.0 ms | 1.3 ms | 5 ms | 0.05 ms | 0.05 ms | 106 MB |
+| cpython · learned | 2.2 ms | 2.6 ms | 15 ms | 0.07 ms | 0.07 ms | 149 MB |
+| cpython · learned + f16 | 30.5 ms | 285 ms | 441 ms | 0.08 ms | 0.07 ms | 677 MB |
+| cpython · learned + f32 | 30.3 ms | 289 ms | 354 ms | 0.08 ms | 0.07 ms | 591 MB |
+| vorpal · lexical | 0.7 ms | 0.8 ms | 3 ms | 0.05 ms | 0.05 ms | 63 MB |
+| vorpal · learned | 1.6 ms | 1.9 ms | 7 ms | 0.07 ms | 0.07 ms | 81 MB |
+| vorpal · learned + f16 | 30.5 ms | 283 ms | 484 ms | 0.08 ms | 0.07 ms | 609 MB |
+| vorpal · learned + f32 | 31.4 ms | 288 ms | 385 ms | 0.07 ms | 0.07 ms | 525 MB |
+
+Encoder medians are cache-served (8–10 distinct queries cycling through the 4,096-row
+FIFO embedding cache); p95/first-search are the uncached cost. f16 RSS EXCEEDS f32 by
+~90 MB on every index: the f16 file maps at 274 MB AND decodes into a 547 MB owned f32
+arena at open (recorded caveat, models.rs) — the f16-native GEMM kernel remains the
+lead that would make f16 the memory win it looks like on disk.
+
+One-shot CLI `vorpal search` (process start + mmap, page cache warm, lexical index):
+kernel 0.19–0.20 s, cpython 0.01 s, vorpal < 0.01 s — the README's earlier 1.5–1.9 s
+kernel figure was a cold-cache-era reading and is replaced. Index on disk (one
+generation): kernel 7.6 GB lexical / 8.3 GB learned (the README's 5.5 GB dated from the
+2.85 M-node graph), cpython 200 / 267 MB, vorpal 836 / 867 MB. Encoder weights on disk
+547 MB (f32) / 274 MB (f16). Indexer peak RSS (`time -l`): kernel 5.6 GB, cpython
+0.82 GB, vorpal 12.2 GB (the 49 vendored parser.c giants).
+
+**BM25-gate attribution** (the learned rows above carry the channel where the gate
+fired; re-measured with the record forced off via a throwaway `set_bm25_override`
+helper, then restored): cpython learned BM25-off **0.390 / 0.438 / 0.417** (vs ON
+0.412 / 0.528 / 0.333) — the learned tier itself carries the cpython gain over lexical
+(0.137 → 0.390), BM25 adds MRR and costs recall; vorpal learned BM25-off **0.609 /
+0.617 / 0.550** (vs ON 0.559 / 0.550 / 0.550; subset "postings" 1.0 → 0.5 under BM25)
+— here the label-free gate's verdict (38 W / 21 L on name-token probes) DISAGREES with
+the labelled eval by −0.05 NDCG. Recorded as the gate's known limit: it measures
+known-item name-subset retrieval, not descriptive/subset intent. Open lead: feed
+`vorpal tune` labels into the gate's decision when they exist.
+
+### Rerank mode A/B — encoder as an RRF list vs tail reorder (2026-09-02, owner: "measure, don't guess")
+
+Hypothesis from the kernel regression: the encoder's cosine order REPLACES the fused
+order of the tail, discarding the lexical/graph rank evidence for ranks 1..k — so add
+it as one more reciprocal-rank list over the pool instead (same embeddings, same
+cache, zero latency delta). `RerankMode` (lib.rs) implements three: `Reorder`
+(shipped), `BlendPinned` (rank 0 pinned, tail = fused mass + 1/(K+encoder rank)),
+`Blend` (whole pool). Encoder f32, learned indexes, `VORPAL_RERANK_MODE` sweep:
+
+| corpus | no encoder | reorder (shipped) | blend-pinned | blend |
+|---|---:|---:|---:|---:|
+| kernel all | 0.295 / 0.305 / 0.250 | 0.244 / 0.288 / 0.167 | **0.279 / 0.292 / 0.167** | 0.279 / 0.291 / 0.167 |
+| kernel short-kw | 0.202 / 0.206 / 0.143 | 0.143 / 0.186 / 0.048 | 0.184 / 0.191 / 0.048 | 0.184 / 0.190 / 0.048 |
+| cpython all | 0.412 / 0.528 / 0.333 | **0.410 / 0.556 / 0.500** | 0.411 / 0.528 / 0.333 | 0.411 / 0.528 / 0.333 |
+| vorpal all | 0.559 / 0.550 / 0.550 | **0.648 / 0.625 / 0.750** | 0.605 / 0.575 / 0.550 | 0.642 / 0.625 / 0.550 |
+
+Verdict: the blends recover most of the kernel loss (0.244 → 0.279) but not to the
+no-encoder line (0.295), and they damp exactly the deep pulls that produce the recall
+gains elsewhere (cpython recall@5 0.50 → 0.33, vorpal 0.75 → 0.55; vorpal `subset`
+alone goes 0.631 → 1.0 under unpinned blend — the pin costs that one query). No mode
+dominates → `RERANK_MODE = Reorder` stays pinned; the per-index decision (`vorpal
+tune`, `encoder.dir` / `off`) remains the correct instrument. The blend mechanism
+ships behind the sweep env as the measured seam.
+
+### Learned-tier kind policy A/B — what the distributional model trains on (2026-09-02)
+
+Hypothesis from the 3.1× graph: 5.9 M of the kernel's 8.9 M definitions are `#define`s,
+so macro surfaces dominate the co-occurrence statistics the learned tier factors.
+`TrainKindPolicy` (lib.rs `train_learned_model`): `All` (shipped), `ExcludeMacros`,
+`BalanceToCallables` (every kind capped at the population of the largest callable
+kind — Function/Method/Constructor — by a deterministic id-order stride; the cap is
+read off the corpus). Fresh `--semantic-tier learned` indexes + warms per policy
+(`VORPAL_LEARNED_KIND_POLICY`), no encoder:
+
+| corpus | all (shipped) | exclude-macros | balance |
+|---|---:|---:|---:|
+| kernel all | 0.295 / 0.305 / 0.250 | 0.267 / 0.312 / 0.208 | **0.313 / 0.346 / 0.250** |
+| kernel short-kw (protected) | 0.202 / 0.206 / 0.143 | 0.170 / 0.214 / 0.095 | **0.222 / 0.253 / 0.143** |
+| cpython all | 0.412 / 0.528 / 0.333 (BM25 on) | 0.256 / 0.278 / 0.333 (BM25 gate flipped OFF) | 0.412 / 0.528 / 0.333 (identical: no kind exceeds the callable cap) |
+| vorpal all | 0.559 / 0.550 / 0.550 | 0.562 / 0.548 / 0.550 | 0.529 / 0.542 / 0.550 (conjunctive 0.301 → 0.000, one query) |
+
+Reading: excluding macros LOSES on the kernel — kernel macros (`mutex_lock` is one)
+are retrieval targets and real distributional signal. Balance is the first policy
+that puts the learned tier ABOVE the lexical tier on today's kernel graph (0.313 vs
+0.299 all; 0.222 vs 0.206 protected NDCG), at zero query-time cost (train-time only;
+kernel warm 217 s vs 224 s exclude in this contended run), bit-identical on cpython,
+and −0.03 on this repo from a single conjunctive query ("louvain community size cap"
+→ `cut`, where the tier only re-ranks a lexically-supported conjunction). Not a
+dominance; the kernel is the design-floor corpus. DISPOSITION: `LEARNED_TRAIN_KINDS`
+stays `All` pending the owner's pin decision — pinning `BalanceToCallables` also needs
+the policy label carried in `ann.model.json` so the freshness gate retrains on a flip
+(the retrofit-label precedent). Both policies ship behind the sweep env as measured
+seams.
+
+### vs codebase-memory-mcp (same machine, same checkouts, same labels, same metrics)
+
+cbm = /Users/adalundhe/Projects/codebase-memory-mcp at `997d087` (v0.10.8, "dev"
+build of the production `-O2` target, 286 MB binary, 162 grammars, SQLite+FTS5, static
+per-token nomic vectors — no inference at query time), scratch `CBM_CACHE_DIR`, `cli`
+one-shot path (its documented scriptable mode; MCP mode starts a daemon + watchers),
+`--mode full`, memory = peak RSS summed over the process tree (`psmax.py`, 50 ms
+sampling; `time -l` sees only the 3 MB launcher — the work runs in a spawned child).
+
+| corpus | tool | cold index | nodes / edges | peak RSS | on disk | no-change re-index |
+|---|---|---:|---:|---:|---:|---:|
+| kernel | vorpal | 8.2 s | 8.89 M / — | 5.6 GB | 7.6 GB | 0.12 s |
+| kernel | cbm | 265.4 s | 8.53 M / 15.98 M | 70.3 GB | 15.9 GB | 12.5 s |
+| cpython | vorpal | 1.0 s (HEAD) / 2.3 s (pin) | 162,813 | 0.82 GB | 200 MB | 0.02 s |
+| cpython | cbm | 36.2 s | 136,118 / 867,563 | 6.6 GB | 663 MB | 5.1 s |
+| vorpal repo | vorpal | 7.4 s | 78,894 | 12.2 GB | 836 MB | 0.02 s |
+| vorpal repo | cbm | 44.8 s | 66,141 / 206,085 | 32.3 GB | 291 MB | 5.3 s |
+
+Graded search over the same label sets (`cbm_grade.py`: identical NDCG@10 / MRR /
+recall@5 math, hit = name equality [+ path suffix], cbm's `search_graph` modes;
+`--semantic-query` takes a keyword ARRAY so NL queries are split on whitespace;
+`--name-pattern` given as `.*w1.*w2.*` over the query words):
+
+| corpus | cbm BM25 | cbm semantic | cbm name-regex | vorpal lexical | vorpal best tier |
+|---|---:|---:|---:|---:|---:|
+| kernel (8) | 0.116 / 0.104 / 0.167 | 0.000 | 0.000 | 0.299 / 0.375 / 0.229 | lexical |
+| cpython (6) | 0.274 / 0.246 / 0.167 | 0.000 | 0.000 | 0.137 / 0.208 / 0.250 | 0.410 / 0.556 / 0.500 (learned + encoder) |
+| vorpal (10) | 0.479 / 0.500 / 0.450 | 0.000 | 0.429 / 0.433 / 0.450 | 0.571 / 0.560 / 0.550 | 0.648 / 0.625 / 0.750 (learned + encoder) |
+
+cbm's keyword-vector semantic mode returned e.g. svelte grammar functions at cosine
+0.05 for "manifest stat" on this repo — the static-token bag composes to noise; it
+never surfaced a labelled definition on any corpus. Its BM25 beats vorpal's LEXICAL
+tier on cpython's descriptive class (the same gap the Stage-4 BM25 work measured and
+that the learned tier closes), loses on the kernel (subword identifiers) and this repo.
+
+One-shot latency (process start included — cbm's only scriptable path): cbm search
+3.3–3.5 s/query (kernel BM25 5.5 s, name-regex 4.2 s), `trace_path` callers 3.3–4.4 s;
+vorpal `search` 0.19–0.20 s kernel / 0.01 s cpython, `graph callers` 0.06 s (2.3 s on
+the first touch of a cold edge segment); daemon: 59 ms / 0.1 ms.
+
 ## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
 
 The premise: split giant C sources at proven top-level boundaries, parse slices in

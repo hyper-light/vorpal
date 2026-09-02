@@ -148,6 +148,7 @@ npm install @hyper-light/vorpal-wasm     # browser / portable
 | `vorpal run -p <pattern> [-l lang] [-r fix]` | One-off structural search/rewrite (default command) |
 | `vorpal scan [-r rule.yml] [--format github]` | Run configured YAML rules across a project |
 | `vorpal outline [paths] [--view signatures]` | File structure: symbols, members, imports/exports |
+| `vorpal enable semantic-f16\|semantic-f32` · `disable` · `tune --queries FILE` | Install/enable the encoder tier (274 MB / 547 MB), or measure every ranking tier on your own labelled queries and write the verdict |
 | `vorpal mcp [--index DIR]` | Serve the MCP server over stdio |
 | `vorpal test` · `new` · `lsp` · `grammars` · `completions` | Rule testing, scaffolding, LSP, grammar list, shell completions |
 
@@ -202,7 +203,7 @@ cold build and the no-change re-run:
 | vuejs/core `d63616c` | Vue/TS | 705 | 11,191 | 0.1 s | 0.01 s |
 
 This repository (2,815 files → 78,527 nodes, incl. the vendored tree-sitter runtime +
-49 grammars): 7.4 s cold¹, 0.02 s unchanged. Kernel peak disk is a 5.5 GB generation (the
+49 grammars): 7.4 s cold¹, 0.02 s unchanged. Kernel peak disk is a 7.6 GB generation (the
 parsed-product cache inside it is what makes sub-second edits possible); the previous
 generation is kept until the next commit, then swept.
 
@@ -236,15 +237,76 @@ by design — retention only pays when a file is parsed again. `VORPAL_TREE_CACH
 disables retention, `VORPAL_WALK_REUSE=0` just the splice; `_MIN`/`_BUDGET` tune the
 1 MiB floor and the 256 MiB retained source+snapshot budget.
 
-### Search (Linux kernel index, 8.9 M definitions, k = 10)
+### Search quality: the three ranking tiers
 
 ```
 vorpal search "socket buffer alloc" -k 10 --index <index-dir>
+vorpal index <src> --semantic-tier learned      # tier 1: trained per corpus at warm time
+vorpal enable semantic-f16                       # tier 2: 274 MB encoder (or semantic-f32, 547 MB)
+vorpal tune --queries my-queries.txt             # measure the tiers on YOUR queries, write the verdict
 ```
 
-One-shot CLI invocations pay process start + a 5.5 GB index mmap: **1.5–1.9 s** at
-kernel scale. The daemon holds all of that warm — see the MCP numbers below. Results
-are identical either way; only latency differs.
+Every index ships with the **lexical tier**: hashed name/signature/path embeddings fused
+with exact name matching and graph in-degree — no weights, nothing to download. Two
+opt-in tiers sit above it: a **learned static tier** trained from the corpus itself
+during the warm (subword co-occurrence factorization, refined over the graph's own
+edges; no download either), and a **neural encoder** (CodeRankEmbed, MIT) that reranks
+the fused top-k at query time — `semantic-f32` uses the upstream 547 MB weights,
+`semantic-f16` a locally converted 274 MB copy. **The two encoder sizes rank
+identically** (embedding drift after conversion: cosine 1.000000; the tables below are
+bit-for-bit equal between them) — they differ only in disk and resident memory.
+
+Graded retrieval on three corpora with the bundled labelled query sets
+(`xtask/labels/`, graded relevance 1–3; metrics NDCG@10 / MRR / recall@5, exact
+determinism gate on every run; `cargo xtask searcheval`):
+
+| Corpus (queries) | Lexical (default) | + learned tier | + encoder (f16 = f32) |
+|---|---:|---:|---:|
+| Linux kernel, 8.9 M defs (8) | 0.299 / 0.375 / 0.229 | 0.295 / 0.305 / 0.250 | 0.244 / 0.288 / 0.167 |
+| CPython, 163 K defs (6) | 0.137 / 0.208 / 0.250 | **0.412 / 0.528 / 0.333**¹ | **0.410 / 0.556 / 0.500** |
+| This repo, 79 K defs (10) | 0.571 / 0.560 / 0.550 | 0.559 / 0.550 / 0.550¹ | **0.648 / 0.625 / 0.750** |
+
+The tiers are **per-corpus decisions, not upgrades**: the learned tier triples
+CPython's descriptive-query quality (NDCG 0.036 → 0.475 on "bytecode evaluation loop"-
+style questions) and is neutral on the kernel and this repo; the encoder lifts recall@5
+to 0.50 on CPython and 0.75 on this repo but *lowers* the kernel's short-keyword class,
+whose answers live in subword identifiers the encoder re-orders. That is exactly what
+`vorpal tune` measures on your own queries before it writes anything — it enables a
+tier only when the mean strictly improves and wins ≥ losses, never on a tie.
+
+¹ The learned warm also runs a per-corpus BM25 gate (paired probes, enabled only on
+strong evidence); it enabled itself on CPython and this repo, not on the kernel.
+
+### Search latency and memory, per tier
+
+One-shot CLI (`vorpal search`, process start + index mmap, page cache warm): kernel
+**0.19–0.20 s**, CPython 0.01 s, this repo < 0.01 s. The daemon holds the index warm;
+measured over 30 stdio round-trips per tool from a client process, with the server's
+resident memory sampled after every call:
+
+| Index · tier | Search median | Search p95 | First search | Graph query | Peak RSS |
+|---|---:|---:|---:|---:|---:|
+| Kernel · lexical | 59 ms | 65 ms | 0.21 s | 0.11 ms | 2.1 GB |
+| Kernel · learned | 61 ms | 63 ms | 0.24 s | 0.12 ms | 2.6 GB |
+| Kernel · learned + f16 | 91 ms² | 476 ms | 0.67 s | 0.12 ms | 3.2 GB |
+| Kernel · learned + f32 | 87 ms² | 474 ms | 0.58 s | 0.12 ms | 3.1 GB |
+| CPython · lexical | 1.0 ms | 1.3 ms | 5 ms | 0.05 ms | 106 MB |
+| CPython · learned | 2.2 ms | 2.6 ms | 15 ms | 0.07 ms | 149 MB |
+| CPython · learned + f16 | 31 ms² | 285 ms | 0.44 s | 0.08 ms | 677 MB |
+| CPython · learned + f32 | 30 ms² | 289 ms | 0.35 s | 0.08 ms | 591 MB |
+| This repo · lexical | 0.7 ms | 0.8 ms | 3 ms | 0.05 ms | 63 MB |
+| This repo · learned + f32 | 31 ms² | 289 ms | 0.39 s | 0.07 ms | 525 MB |
+
+² Encoder medians are over a cycling query set, so most calls hit the 4,096-row
+embedding cache; the p95 and first-search columns are the uncached cost (0.3–0.5 s per
+new query at k = 10; 0.64–0.97 s mean at k = 25 in the graded runs). Graph queries never
+touch the encoder. f16 halves the weights on disk but decodes into an f32 arena at open,
+so its resident footprint is *not* smaller than f32's.
+
+Index on disk (one committed generation, parsed-product cache included): kernel
+**7.6 GB** lexical / 8.3 GB with the learned model; CPython 200 / 267 MB; this repo
+836 / 867 MB. Indexer peak RSS on the kernel: 5.6 GB. Encoder weights: 547 MB (f32) or
+274 MB (f16), stored once under `~/.vorpal/models`.
 
 ### Running as an MCP server
 
@@ -255,7 +317,7 @@ stdio — you never re-index by hand. Round-trip times measured from the client 
 | Operation | Time |
 |---|---|
 | Graph query (`callers`, `node`, …) | **< 1 ms** |
-| Hybrid search | **53 ms** |
+| Hybrid search (lexical tier; per-tier table above) | **59 ms** |
 | Server start → answering queries on an existing index | immediate |
 | First search after start (semantic tier warm-up, once) | 3.6 s |
 | Save a file → index current again (incremental re-index) | ~0.5 s |
@@ -277,6 +339,43 @@ rg 'kmalloc\(' -t c ~/linux             # comparison
 
 Full parsing plus AST matching of 63,775 files costs about 5× a plain text grep of the
 same tree.
+
+### Side by side: codebase-memory-mcp
+
+The closest neighbour in this space is [codebase-memory-mcp] (cbm, v0.10.8-dev built
+from source at `997d087`): also a single local binary with tree-sitter parsing, a typed
+code graph, BM25, a Cypher subset, and an MCP server — so the same corpora, the same
+labelled queries, and the same metrics run against both. Both tools indexed the same
+checkouts on the same machine; cbm in its `full` mode (the only mode with semantic
+edges), timed through its one-shot `cli` (its documented scriptable path), memory as
+peak RSS over the whole process tree.
+
+| | vorpal | codebase-memory-mcp |
+|---|---|---|
+| **Linux kernel** cold index (75,954 files) | **8.2 s** · 8.89 M nodes · peak RSS 5.6 GB · 7.6 GB on disk | 265 s · 8.53 M nodes / 16.0 M edges · peak RSS **70.3 GB** · 15.9 GB SQLite |
+| Kernel, nothing changed | **0.12 s** | 12.5 s |
+| **CPython** cold index (3,841 files) | **1.0–2.3 s** · 162,813 nodes · 0.8 GB RSS · 200 MB | 36.2 s · 136,118 nodes · 6.6 GB RSS · 663 MB |
+| **This repo** cold index (49 vendored grammar giants) | **7.4 s** · 78,894 nodes · 12.2 GB RSS · 836 MB | 44.8 s · 66,141 nodes · 32.3 GB RSS · 291 MB |
+| Search, kernel labels (NDCG@10 / MRR / recall@5) | **0.299 / 0.375 / 0.229** (lexical, no weights) | 0.116 / 0.104 / 0.167 (BM25) |
+| Search, CPython labels | 0.137 / 0.208 / 0.250 lexical · **0.410 / 0.556 / 0.500** with the learned tier + encoder | 0.274 / 0.246 / 0.167 (BM25) |
+| Search, this repo's labels | 0.571 / 0.560 / 0.550 lexical · **0.648 / 0.625 / 0.750** with the encoder | 0.479 / 0.500 / 0.450 (BM25) |
+| cbm `semantic_query` (keyword-vector mode), all three corpora | — | 0.000 on every class |
+| One search, one-shot CLI (kernel) | **0.2 s** (daemon: 59 ms) | 3.3–5.5 s |
+| Callers of a symbol, one-shot CLI (kernel) | **0.06 s** (daemon: 0.1 ms) | 3.3–4.4 s |
+| Ranking tiers | lexical · learned (trained per corpus) · neural encoder rerank (f16/f32), per-index `tune` | BM25 · regex · static per-token vectors (no inference) |
+| Languages | 49 grammars | 162 grammars |
+| Determinism | byte-identical generations, incremental ≡ scratch (release-gated) | not claimed |
+
+Where cbm is ahead: grammar count (162 vs 49), and its BM25 beats our *lexical* tier
+on CPython's descriptive queries (0.274 vs 0.137) — the gap our learned tier and
+encoder close and then invert (0.410). Its "semantic" mode is a bag of static
+per-token vectors, not a model: on the labelled sets it never surfaced a relevant
+definition. Everything else — build time, memory, incremental cost, query latency,
+ranking quality on the two large corpora — favours vorpal by one to two orders of
+magnitude; cbm's memory in particular is a design choice (RAM-first indexing budgeted
+at half the machine), not a bug.
+
+[codebase-memory-mcp]: https://github.com/DeusData/codebase-memory-mcp
 
 ### Determinism
 
