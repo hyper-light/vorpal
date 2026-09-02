@@ -23,20 +23,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Musl lanes build natively (x86_64 on ubuntu-latest, aarch64 on ubuntu-24.04-arm) with
-  # the musl.cc NATIVE toolchain installed to /opt/musl by the "Install musl toolchain"
-  # steps. It replaced musl-tools' musl-gcc when tree-sitter-vue's C++ scanner joined the
-  # build: musl-tools ships no C++ compiler, while musl.cc's gcc/g++ are full musl-target
-  # drivers with the same correct static library group ordering musl-gcc was pinned for
-  # (the default host-cc driver mislinks static musl binaries that carry tokio + jemalloc
-  # — undefined `pow`, libc.a ordered before the objects needing it). The linker is g++ so
-  # cc-rs's `-lstdc++` for C++ scanners resolves against the toolchain's static libstdc++.
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: /opt/musl/bin/aarch64-linux-musl-g++
-  CC_aarch64_unknown_linux_musl: /opt/musl/bin/aarch64-linux-musl-gcc
-  CXX_aarch64_unknown_linux_musl: /opt/musl/bin/aarch64-linux-musl-g++
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: /opt/musl/bin/x86_64-linux-musl-g++
-  CC_x86_64_unknown_linux_musl: /opt/musl/bin/x86_64-linux-musl-gcc
-  CXX_x86_64_unknown_linux_musl: /opt/musl/bin/x86_64-linux-musl-g++
+  # Musl lanes build inside official rust:alpine containers, NATIVE per arch (x86_64 on
+  # ubuntu-latest, aarch64 on ubuntu-24.04-arm) — the same proven pattern as
+  # publish-node.yml's build-musl. Alpine IS musl: apk's build-base ships a native musl
+  # gcc AND g++ (tree-sitter-vue's C++ scanner needs the latter; Debian's musl-tools has
+  # no C++ compiler, and musl.cc is unreachable from GitHub runners — both tried, both
+  # dead ends). Static libstdc++/libgcc come from the same apk toolchain, and each build
+  # proves the result with an `ldd` staticness gate.
 
 jobs:
   guard:
@@ -88,29 +81,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install musl toolchain
+      - name: Build
+        if: ${{ !matrix.musl }}
+        run: cargo build --release -p vorpal --target ${{ matrix.target }}
+      - name: Build (alpine container, native musl)
         if: matrix.musl
         run: |
-          set -euo pipefail
-          # musl.cc native toolchain for this runner's own architecture (both musl lanes
-          # build natively). Retried download; the compile smoke below is the real gate.
-          arch="$(uname -m)"
-          curl -fsSL --retry 5 --retry-delay 10 -o /tmp/musl-native.tgz \
-            "https://musl.cc/${arch}-linux-musl-native.tgz"
-          sudo mkdir -p /opt/musl
-          sudo tar -xzf /tmp/musl-native.tgz -C /opt/musl --strip-components=1
-          rm /tmp/musl-native.tgz
-          printf 'int main(void){return 0;}' > /tmp/musl-smoke.c
-          "/opt/musl/bin/${arch}-linux-musl-gcc" -static /tmp/musl-smoke.c -o /tmp/musl-smoke-c
-          printf 'int main(){return 0;}' > /tmp/musl-smoke.cc
-          "/opt/musl/bin/${arch}-linux-musl-g++" -static -static-libstdc++ /tmp/musl-smoke.cc -o /tmp/musl-smoke-cc
-          /tmp/musl-smoke-c && /tmp/musl-smoke-cc
-          rm -f /tmp/musl-smoke*
-      - name: Build
-        env:
-          # musl-gcc links against shared libgcc_s.so.1 by default, which runners lack.
-          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=+crt-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++' || '' }}
-        run: cargo build --release -p vorpal --target ${{ matrix.target }}
+          docker run --rm -v "$PWD:/w" -w /w rust:1.98-alpine sh -c '
+            set -e
+            apk add --no-cache build-base
+            export RUSTFLAGS="-C target-feature=+crt-static"
+            cargo build --release -p vorpal --target ${{ matrix.target }}
+          '
+          # The container wrote target/ as root; later steps (stage, cache) run as the
+          # runner user.
+          sudo chown -R "$(id -u):$(id -g)" target
+          # The point of the musl asset is portability: refuse to ship anything dynamic.
+          if ldd "target/${{ matrix.target }}/release/vorpal" 2>&1 | grep -vq "not a dynamic executable"; then
+            echo "musl binary is not fully static" >&2; exit 1
+          fi
       - name: Stage binary (unix)
         if: runner.os != 'Windows'
         run: cp "target/${{ matrix.target }}/release/vorpal" "${{ matrix.asset }}"
@@ -150,23 +139,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: agent-${{ matrix.target }}
-      - name: Install musl toolchain
-        run: |
-          set -euo pipefail
-          # musl.cc native toolchain for this runner's own architecture (both musl lanes
-          # build natively). Retried download; the compile smoke below is the real gate.
-          arch="$(uname -m)"
-          curl -fsSL --retry 5 --retry-delay 10 -o /tmp/musl-native.tgz \
-            "https://musl.cc/${arch}-linux-musl-native.tgz"
-          sudo mkdir -p /opt/musl
-          sudo tar -xzf /tmp/musl-native.tgz -C /opt/musl --strip-components=1
-          rm /tmp/musl-native.tgz
-          printf 'int main(void){return 0;}' > /tmp/musl-smoke.c
-          "/opt/musl/bin/${arch}-linux-musl-gcc" -static /tmp/musl-smoke.c -o /tmp/musl-smoke-c
-          printf 'int main(){return 0;}' > /tmp/musl-smoke.cc
-          "/opt/musl/bin/${arch}-linux-musl-g++" -static -static-libstdc++ /tmp/musl-smoke.cc -o /tmp/musl-smoke-cc
-          /tmp/musl-smoke-c && /tmp/musl-smoke-cc
-          rm -f /tmp/musl-smoke*
       - name: Derive the loader's embedded public key (only when a signing key is configured)
         id: pubkey
         run: |
@@ -174,15 +146,27 @@ jobs:
             pub=$(cargo run -q -p vorpal-loader --features keygen --bin vorpal-sign -- pubkey --key-hex "${SIGNING_KEY}")
             echo "hex=${pub}" >> "$GITHUB_OUTPUT"
           fi
-      - name: Build the stage-0 loader (musl; public key embedded when available)
+      - name: Build the loader + agent (alpine container, native musl; pubkey embedded when available)
         env:
           VORPAL_LOADER_PUBKEY_HEX: ${{ steps.pubkey.outputs.hex }}
-          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++
-        run: cargo build --release -p vorpal-loader --bin vorpal-loader --target ${{ matrix.target }}
-      - name: Build the agent (the musl vorpal binary, launched as `__agent`)
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++
-        run: cargo build --release -p vorpal --bin vorpal --target ${{ matrix.target }}
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e VORPAL_LOADER_PUBKEY_HEX="${VORPAL_LOADER_PUBKEY_HEX}" \
+            rust:1.98-alpine sh -c '
+              set -e
+              apk add --no-cache build-base
+              export RUSTFLAGS="-C target-feature=+crt-static"
+              cargo build --release -p vorpal-loader --bin vorpal-loader --target ${{ matrix.target }}
+              cargo build --release -p vorpal --bin vorpal --target ${{ matrix.target }}
+            '
+          # The container wrote target/ as root; the signing step runs host cargo next.
+          sudo chown -R "$(id -u):$(id -g)" target
+          # Fleet agents exec on arbitrary distros from a memfd: anything dynamic is a defect.
+          for bin in vorpal-loader vorpal; do
+            if ldd "target/${{ matrix.target }}/release/${bin}" 2>&1 | grep -vq "not a dynamic executable"; then
+              echo "${bin} is not fully static" >&2; exit 1
+            fi
+          done
       - name: Sign the agent (if keyed) and record its blake3 pin
         run: |
           set -euo pipefail
