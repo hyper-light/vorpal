@@ -1733,7 +1733,7 @@ pub(crate) struct RawRequest<'t> {
 /// A walk emission awaiting the post-pass: definite references pass through in visit order;
 /// type-use candidates wait for the complete binder set (a `type_parameters` declaration may
 /// be visited after uses of its binder, so the shadow filter can only run once the walk ends).
-enum Pending<'t> {
+pub(crate) enum Pending<'t> {
   Ready(RawRef<'t>),
   TypeUse {
     from: NodeId,
@@ -1791,18 +1791,62 @@ pub(crate) fn extract_references_with_facts<'t>(
   out: &mut Vec<RawRef<'t>>,
   bindings: &mut Vec<crate::typefacts::RawBinding<'t>>,
   requests_out: &mut Vec<RawRequest<'t>>,
+  signer: Option<&mut crate::signature::Signer>,
+) {
+  let mut walk = RefWalk::default();
+  walk_reference_tree(
+    root,
+    None,
+    resolved,
+    typefacts,
+    def_spans,
+    entities,
+    &mut walk,
+    bindings,
+    requests_out,
+    signer,
+  );
+  finalize_references(walk, out);
+}
+
+/// One reference walk's outputs BEFORE the file-global finalize laws run: emission-order
+/// rows plus the complete binder set. The split exists for walk reuse (incremental saves):
+/// a region-scoped walk produces this for the dirty region only, retained rows from the
+/// previous save merge in, and [`finalize_references`] runs once over the merged whole —
+/// the same shadow/dedup outcome a full walk computes.
+#[derive(Default)]
+pub(crate) struct RefWalk<'t> {
+  pub(crate) pending: Vec<Pending<'t>>,
+  /// Generic type-parameter binders: (declaring item's span, binder name). Mentions of a
+  /// binder inside its declaring span are local bindings, not type uses.
+  pub(crate) binders: Vec<(Range<usize>, Cow<'t, str>)>,
+}
+
+/// The walk half of [`extract_references_with_facts`]: one fused dfs over `scope`,
+/// appending into `walk` (plus bindings/requests/signature side channels). `seed` is the
+/// ancestor context for region-scoped walks — a dirty top-level subtree walks with its
+/// tree root seeded so parent-sensitive dispatch (`is_chain_link`, binder scoping) sees
+/// exactly what the full walk would see. The full walk passes `None`.
+#[allow(clippy::too_many_arguments)] // the one fused walk: every output rides the same cursor
+pub(crate) fn walk_reference_tree<'t>(
+  scope: SgNode<'t>,
+  seed: Option<SgNode<'t>>,
+  resolved: &ResolvedRefSpec,
+  typefacts: Option<&crate::typefacts::ResolvedTypeFacts>,
+  def_spans: &[(Range<usize>, NodeId)],
+  entities: &[EntityIdentity<'_>],
+  walk: &mut RefWalk<'t>,
+  bindings: &mut Vec<crate::typefacts::RawBinding<'t>>,
+  requests_out: &mut Vec<RawRequest<'t>>,
   mut signer: Option<&mut crate::signature::Signer>,
 ) {
   let spec = &*resolved.spec;
-  // Generic type-parameter binders: (declaring item's span, binder name). Mentions of a binder
-  // inside its declaring span are local bindings, not type uses.
-  let mut binders: Vec<(Range<usize>, Cow<'t, str>)> = Vec::new();
+  let binders = &mut walk.binders;
+  let pending = &mut walk.pending;
   // Definition-head calls suppressed by a SkipDefinition rule (`def foo(x)` → `foo(x)`).
+  // Emitter and consumer are parent/child within one subtree, so per-walk state suffices
+  // even when a regional caller walks dirty subtrees one call at a time.
   let mut suppressed: HashSet<usize> = HashSet::new();
-  // Dedup for implements references: one edge per (from, name) per file — borrowed keys, so
-  // deduplication itself allocates nothing.
-  let mut seen_impls: HashSet<(u64, Cow<'t, str>)> = HashSet::new();
-  let mut pending: Vec<Pending<'t>> = Vec::new();
   let mut span_cursor = SpanCursor::new(def_spans);
   // Explicit ancestor stack, driven by the walk's own depth (a truncate + push per node):
   // every parent the handlers consult reads from this stack instead of `Node::parent`,
@@ -1810,8 +1854,15 @@ pub(crate) fn extract_references_with_facts<'t>(
   // `child_with_descendant` scan per level) on every call — per-node parent queries were
   // a leading slice of the whole build's cursor churn at kernel scale.
   let mut ancestors: Vec<SgNode<'t>> = Vec::new();
-  for (node, depth) in PreWithDepth::new(&root) {
-    ancestors.truncate(depth);
+  let base = match seed {
+    Some(seed) => {
+      ancestors.push(seed);
+      1
+    }
+    None => 0,
+  };
+  for (node, depth) in PreWithDepth::new(&scope) {
+    ancestors.truncate(base + depth);
     // Near-clone signatures (v16) read every leaf token — anonymous ones included —
     // before the named-only dispatch below.
     if let Some(signer) = signer.as_deref_mut() {
@@ -1828,14 +1879,14 @@ pub(crate) fn extract_references_with_facts<'t>(
         }
       }
       if resolved.declares_type_params(kind_id) {
-        collect_binders_in(&node, ancestors.last(), &mut binders);
+        collect_binders_in(&node, ancestors.last(), binders);
       }
       // Route registrations dispatch beside the chain: their kinds are usually also call
       // kinds, and the same node legitimately yields both the framework call and the
       // route → handler reference.
       for (idx, &id) in resolved.route_kind_ids.iter().enumerate() {
         if id != 0 && id == kind_id {
-          emit_route_handler(&node, &spec.routes[idx], spec, &mut span_cursor, &mut pending);
+          emit_route_handler(&node, &spec.routes[idx], spec, &mut span_cursor, pending);
         }
       }
       for (idx, &id) in resolved.request_kind_ids.iter().enumerate() {
@@ -1848,17 +1899,17 @@ pub(crate) fn extract_references_with_facts<'t>(
         Chain::Import => {
           for (ispec, &id) in spec.imports.iter().zip(&resolved.import_kind_ids) {
             if id == kind_id {
-              emit_imports(&node, ispec, def_spans, &mut pending);
+              emit_imports(&node, ispec, def_spans, pending);
             }
           }
         }
-        Chain::Type => stage_type_use(&node, &ancestors, spec, &mut span_cursor, &mut pending),
+        Chain::Type => stage_type_use(&node, &ancestors, spec, &mut span_cursor, pending),
         Chain::Implements(idx) => emit_implements(
           &node,
           &spec.implements[idx as usize],
           spec,
           &mut span_cursor,
-          &mut pending,
+          pending,
         ),
         Chain::Call(idx) => {
           let cspec = &spec.calls[idx as usize];
@@ -1946,7 +1997,17 @@ pub(crate) fn extract_references_with_facts<'t>(
     }
     ancestors.push(node);
   }
+}
 
+/// The finalize half of [`extract_references_with_facts`]: the file-global laws — binder
+/// shadowing, per-(definition, name) type dedup, per-(definition, name) implements dedup —
+/// run once over the complete emission-order row set, whether that set came from one full
+/// walk or from a retained + regional merge.
+pub(crate) fn finalize_references<'t>(walk: RefWalk<'t>, out: &mut Vec<RawRef<'t>>) {
+  let RefWalk { pending, binders } = walk;
+  // Dedup for implements references: one edge per (from, name) per file — borrowed keys, so
+  // deduplication itself allocates nothing.
+  let mut seen_impls: HashSet<(u64, Cow<'t, str>)> = HashSet::new();
   // Post-pass in visit order: binder-shadowed type uses drop; survivors dedup per
   // (enclosing definition, name) — the same outcome the two-walk version produced.
   let mut seen_types: HashSet<(u64, Cow<'t, str>)> = HashSet::new();
