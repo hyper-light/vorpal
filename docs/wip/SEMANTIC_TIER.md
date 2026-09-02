@@ -283,7 +283,9 @@ without regressing others — else recorded as measured-and-rejected in this doc
 > rotary base 1000, SwiGLU with the fc12 gate, CLS pool) matching an independent
 > numpy reference at ≤1e-4; config-semantics mismatches refuse at open. ~90 ms
 > per short sequence correctness-first — a 1+25-candidate rerank ≈ 1–2 s/query.
-> SCALE LAW: doc-side encoding at kernel scale is ~10¹² FLOPs — the encoder can
+> SCALE LAW: doc-side encoding at kernel scale is ~2.4 × 10¹⁶ FLOPs (8.9 M definitions
+> × ~2.7 GFLOP; "~10¹²" here was an exponent slip, corrected 2026-09-02 by the encoder
+> research in ENCODER_RESEARCH.md — the conclusion is unchanged) — the encoder can
 > NEVER be the warm-time row embedder; its shape is the opt-in QUERY-TIME
 > RERANKER (prefixed query + fused top-K surfaces, nothing precomputed).
 > RERANKER SHIPPED (fused-winner pin): `<root>/encoder.dir` opt-in; stable

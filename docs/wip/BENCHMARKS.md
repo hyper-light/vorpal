@@ -838,7 +838,9 @@ activations, BLAS cross-checked against einsum at 2.8e-14):
 | 3 texts + 4 embeds, release, f64 correctness-first pass | 0.63 s (~90 ms/short seq) |
 
 The scale law that shaped the integration: doc-side encoding at kernel scale is
-~10¹² FLOPs (hours of CPU) — this encoder can never be the warm-time row
+~2.4 × 10¹⁶ FLOPs (8.9 M definitions × ~2.7 GFLOP each; the earlier "~10¹²" here was
+an arithmetic slip caught by the 2026-09-02 encoder research — the conclusion stood,
+the exponent did not; hours of CPU) — this encoder can never be the warm-time row
 embedder. Its shape is the opt-in QUERY-TIME RERANKER, shipped as
 `<root>/encoder.dir` (a local model directory; missing = off; an unopenable
 selection states itself via `Searcher::encoder_status` and searches keep
