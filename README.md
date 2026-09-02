@@ -155,68 +155,86 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 
 ## Performance
 
-All numbers below are release builds on an Apple M5 Max (18 cores, 128 GB, macOS 26.4.1,
-rustc 1.98.0), measured 2026-08-31, wall-clock for the whole CLI invocation including
-process start. Datasets are pinned so you can re-run them: Linux kernel @ `1590cf032971`
-(75,954 indexable files), CPython @ `b86a41cbf63` (3,841 files). Cold times are best of 3.
-Indexing derives the full relation set — calls, imports, types, data flow, near-clone
-pairs, request→route links, co-change history — so every number below buys the whole
-graph, not a bare symbol table.
+All numbers are release builds of **v0.4.0** on an Apple M5 Max (18 cores, 128 GB,
+macOS 26.4.1, rustc 1.98.0), measured 2026-09-02, wall-clock for the whole CLI
+invocation including process start; cold times are best of runs on a quiet machine.
+Every dataset is pinned by commit so you can re-run it. Indexing derives the full
+relation set — calls, imports, types, data flow, near-clone pairs, request→route
+links, co-change history — across **49 languages**, so every number buys the whole
+graph, not a bare symbol table. Deeper methodology and history: `docs/wip/BENCHMARKS.md`.
 
-### Indexing
+### Indexing, at scale
 
 ```
 vorpal index <source-tree> --out <index-dir>
 ```
 
-| Tree | Cold index | Edit one file, re-index | `touch` one file | Nothing changed |
-|---|---|---|---|---|
-| **Linux kernel** (75,954 files, ~30 M LOC → 2.85 M nodes, 8.9 M references) | **6.6 s** | **1.7 s** | 0.23 s | 0.13 s |
-| **CPython** (3,841 files → 151k nodes) | 0.87 s | — | — | — |
-| **This repository** (1,311 files → 64k nodes, incl. vendored tree-sitter runtime + 49 grammars) | 6.0 s¹ | 0.06 s | — | 0.06 s |
+The flagship tree, end to end:
 
-¹ Dominated by a single 33 MB generated `parser.c`; the other files parse in parallel
-underneath it.
+| Linux kernel @ `1590cf032971` (75,954 tracked files, ~30 M LOC) | |
+|---|---|
+| Cold index → **8,890,840 nodes** | **8.2 s** |
+| Edit one file, re-index | **0.6 s** |
+| `touch` one file (content unchanged) | 0.7 s |
+| Nothing changed | **0.16 s** |
 
-Peak memory for the kernel cold index is 1.9 GB. The index on disk for the kernel is a
-1.5 GB generation (the parsed-file cache inside it is what makes the 3.1 s re-index
-possible), plus an 840 MB semantic-search index once that is built; the previous
+### Indexing, across languages
+
+Same command, fourteen well-known repos, shallow-cloned at the pinned commit —
+cold build and the no-change re-run:
+
+| Repo | Language | Files | Nodes | Cold | Unchanged |
+|---|---|---:|---:|---:|---:|
+| llvm/llvm-project `d37814473` | C++ | 183,249 | 1,443,608 | 8.1 s | 0.26 s |
+| ziglang/zig `738d2be9` | Zig | 20,545 | 1,085,533 | 6.3 s | 0.03 s |
+| JetBrains/kotlin `9f27f51dd` | Kotlin | 110,106 | 795,719 | 2.7 s | 0.40 s |
+| kubernetes/kubernetes `bce953e8` | Go | 31,296 | 692,828 | 2.0 s | 0.08 s |
+| dotnet/roslyn `4cac4334` | C# | 35,125 | 490,284 | 0.6 s | 0.09 s |
+| rust-lang/rust `5db7f4be8` | Rust | 62,568 | 464,064 | 2.7 s | 0.07 s |
+| WordPress/WordPress `c195362` | PHP | 5,010 | 286,824 | 1.8 s | 0.02 s |
+| apache/spark `06539777` | Scala | 27,322 | 253,753 | 1.6 s | 0.05 s |
+| apache/kafka `6e4c555` | Java | 7,537 | 209,131 | 0.7 s | 0.03 s |
+| vercel/next.js `483f8420` | TS/JS | 31,852 | 204,754 | 1.0 s | 0.23 s |
+| ghc/ghc `44d7788f` | Haskell | 26,918 | 178,259 | 0.7 s | 0.04 s |
+| python/cpython `b86a41cbf63` | Python/C | 3,841 | 162,813 | 2.3 s | 0.02 s |
+| rails/rails `4130768` | Ruby | 4,996 | 49,635 | 0.3 s | 0.02 s |
+| neovim/neovim `d423675` | C/Lua | 3,918 | 40,507 | 0.3 s | 0.01 s |
+| vuejs/core `d63616c` | Vue/TS | 705 | 11,191 | 0.1 s | 0.01 s |
+
+This repository (2,815 files → 78,527 nodes, incl. the vendored tree-sitter runtime +
+49 grammars): 13.4 s cold¹, 0.02 s unchanged. Kernel peak disk is a 5.5 GB generation (the
+parsed-product cache inside it is what makes sub-second edits possible); the previous
 generation is kept until the next commit, then swept.
 
-### Search (Linux kernel index, k = 10)
+¹ Dominated by a single 33 MB generated `parser.c`; everything else parses in parallel
+underneath it.
+
+### Search (Linux kernel index, 8.9 M definitions, k = 10)
 
 ```
 vorpal search "socket buffer alloc" -k 10 --index <index-dir>
 ```
 
-| State | Time | What runs |
-|---|---|---|
-| First searches, before the semantic index exists | 0.28 s | exact scan of every candidate |
-| Semantic index built | **0.03 s** | accelerated lookup |
-
-The semantic index builds once in the background (19 s for the kernel) and is validated
-before every use; results are **identical** with or without it — it changes latency, never
-answers. Building it is never on your critical path: searches work immediately after
-indexing.
+One-shot CLI invocations pay process start + a 5.5 GB index mmap: **1.5–1.9 s** at
+kernel scale. The daemon holds all of that warm — see the MCP numbers below. Results
+are identical either way; only latency differs.
 
 ### Running as an MCP server
 
 `vorpal mcp` watches your tree, keeps the index fresh as you edit, and answers over
 stdio — you never re-index by hand. Round-trip times measured from the client side
-(medians of 50 calls, kernel tree):
+(medians of 30 calls, kernel index):
 
 | Operation | Time |
 |---|---|
-| Graph query (callers, references, …) | **< 1 ms** |
-| Hybrid search | **27 ms** |
-| Save a file → queries reflect the change (full relation set, kernel tree) | ~0.57 s |
-| Comment-only / metadata-only saves | ~10 ms |
-| Keeping the semantic index current after an edit | ~140 ms, in the background |
+| Graph query (`callers`, `node`, …) | **< 1 ms** |
+| Hybrid search | **53 ms** |
 | Server start → answering queries on an existing index | immediate |
-| Server start → in-memory serving tier rebuilt (background) | ~15 s |
+| First search after start (semantic tier warm-up, once) | 3.6 s |
+| Save a file → index current again (incremental re-index) | ~0.6 s |
 
-Editing never triggers index rebuilds — changes are applied incrementally, including to
-the semantic-search index.
+Editing never triggers full rebuilds — changes apply incrementally, including to the
+semantic-search tier.
 
 ### Structural scan vs. text grep (Linux kernel, 63,775 C files)
 
@@ -227,16 +245,19 @@ rg 'kmalloc\(' -t c ~/linux             # comparison
 
 | Tool | Time | What you get |
 |---|---|---|
-| `vorpal scan` | 1.4 s | 42.6k structural matches — real `call_expression` nodes, not lines that happen to contain the text |
-| `ripgrep` | 0.7 s | raw text lines |
+| `vorpal scan` | 4.8 s | 42.6k structural matches — real `call_expression` nodes, not lines that happen to contain the text |
+| `ripgrep` | 1.0 s | raw text lines |
 
-Full parsing plus AST matching of 63,775 files costs about 2× a plain text grep of the
+Full parsing plus AST matching of 63,775 files costs about 5× a plain text grep of the
 same tree.
 
 ### Determinism
 
 Indexing the same tree always produces byte-identical output — two independent cold
-builds of the kernel commit the exact same content-addressed generation. Every release
+builds commit the exact same content-addressed generation, on every corpus above.
+Incremental builds converge to the same bytes as from-scratch builds (a release-gated
+battery proves scratch-determinism plus six edit shapes across three repos, and the
+kernel's one-shot edit is verified to the same generation id). Every release
 re-verifies this.
 
 ## What it does

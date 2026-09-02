@@ -1,0 +1,47 @@
+<!doctype html>
+<!-- vorpal-wasm playground: paste code, write an ast-grep pattern, see matches.
+     Assets you provide next to this file:
+       ./vorpal-wasm/            the npm package's pkg contents (wasm_bg.wasm, wasm.js, …)
+                                 (npm pack @hyper-light/vorpal-wasm, or copy node_modules/@hyper-light/vorpal-wasm)
+       ./tree-sitter-javascript.wasm   a grammar built for web-tree-sitter
+     Then:  npx serve .   (any static server; wasm needs correct MIME, file:// will not work) -->
+<html>
+<head><meta charset="utf-8"><title>vorpal-wasm playground</title>
+<style>
+  body { font: 14px/1.4 system-ui; margin: 2rem; max-width: 60rem }
+  textarea, input { width: 100%; font: 13px/1.4 ui-monospace, monospace; box-sizing: border-box }
+  textarea { height: 10rem } pre { background: #f6f6f6; padding: .75rem; overflow-x: auto }
+</style></head>
+<body>
+<h1>vorpal-wasm</h1>
+<p>Structural matching in the browser — no server, no index.</p>
+<textarea id="code">function greet(user) {
+  console.log(user.name)
+  console.log("hi")
+}</textarea>
+<p><input id="pattern" value="console.log($ARG)"></p>
+<pre id="out">loading wasm…</pre>
+<script type="module">
+import init, { initializeTreeSitter, registerDynamicLanguage, parse }
+  from './vorpal-wasm/wasm.js'
+
+const out = document.getElementById('out')
+try {
+  await init()
+  await initializeTreeSitter()
+  await registerDynamicLanguage({ javascript: './tree-sitter-javascript.wasm' })
+  const run = () => {
+    try {
+      const root = parse('javascript', document.getElementById('code').value).root()
+      const matches = root.findAll(document.getElementById('pattern').value)
+      out.textContent = matches.length
+        ? matches.map(m => `${m.range().start.line + 1}:${m.range().start.column}  ${m.text()}`).join('\n')
+        : '(no matches)'
+    } catch (e) { out.textContent = String(e) }
+  }
+  document.getElementById('code').addEventListener('input', run)
+  document.getElementById('pattern').addEventListener('input', run)
+  run()
+} catch (e) { out.textContent = 'setup failed: ' + e }
+</script>
+</body></html>

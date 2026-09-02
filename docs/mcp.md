@@ -16,6 +16,16 @@ Claude Desktop, Claude Code, and any other MCP client.
 
 ## Setup
 
+### The fast path: `vorpal mcp install`
+
+```sh
+vorpal mcp install
+```
+
+Writes this machine's MCP client configs to launch vorpal (idempotent; backups of any
+existing config are taken). Run it once, restart your client, done. The manual routes
+below do the same thing by hand.
+
 ### Claude Code
 
 ```sh
@@ -54,13 +64,57 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 - Every result is pinned to a content-addressed *generation* of the index, so answers are
   internally consistent even while you're editing.
 
+## Tool profiles (least privilege)
+
+Agents don't always deserve the whole surface. `--profile` gates what `tools/list`
+offers:
+
+| profile | tools |
+|---|---|
+| `scout` | `node`, `search`, `snippet`, `schema`, `fetch_span` — read-only navigation |
+| `analysis` | scout + `callers`, `references`, `importers`, `implementors`, `type_users`, `similar`, `reachable`, `why`, `health`, `dead_code`, `coverage`, `impact`, `compare_generations`, `architecture`, `code_search`, `data_flow`, `observed`, `query` |
+| `full` (default) | everything: analysis + `index`, `structural_search`, `rule_search`, `ast_dump` |
+
+```json
+{ "mcpServers": { "vorpal": { "command": "vorpal", "args": ["mcp", "--profile", "analysis"] } } }
+```
+
+## One daemon, many projects
+
+Enroll source roots once, then serve them all from a single server entry:
+
+```sh
+vorpal mcp allow ~/src/app --name app   # registry: ~/.config/vorpal/projects.yml
+vorpal mcp allow ~/src/lib              # name defaults to the directory name
+vorpal mcp projects                     # list enrollments
+vorpal mcp deny lib                     # remove one
+```
+
+```json
+{ "mcpServers": { "vorpal": { "command": "vorpal", "args": ["mcp", "--projects"] } } }
+```
+
+In `--projects` mode every tool takes a project selector, and `list_projects`
+enumerates the enrollments. Only enrolled roots are servable — the registry is the
+allow-list (`VORPAL_PROJECTS_FILE` overrides its path).
+
 ## The tools
 
 **Build & health**
 | Tool | What it does |
 |---|---|
-| `index` | Build or refresh the graph index from a source directory (near-instant when unchanged), then hold it warm. |
+| `index` | Build or refresh the graph index from a source directory (near-instant when unchanged), then hold it warm. Accepts `parse_health: warn\|exclude\|fail`, `max_error_ratio`, and `semantic_tier: lexical\|learned` policy. |
 | `health` | Per-file parse damage: ERROR-node counts, affected-byte ratios, and which definitions overlap damaged regions — the difference between "no edge" and "unknowable here." |
+| `coverage` | Per-file parse-coverage overview (error bytes/ratio), worst first. |
+| `schema` | What this index contains: kinds, relations, resolution grades, and tier state, with counts — the ground truth for writing `query` patterns. |
+
+**Repo shape & planning**
+| Tool | What it does |
+|---|---|
+| `architecture` | Orientation summary: module mass, hubs by in-degree, entry-point candidates. |
+| `impact` | Blast radius of changed files: git-diff-seeded transitive inbound closure (`since` a ref, or uncommitted changes). |
+| `dead_code` | Definitions with no semantic in-edges anywhere (suppression-honest dead-code leads; `prefix`/`exported`/`exclude_tests` refinements). |
+| `compare_generations` | What changed between two index generations: files, nodes by durable eid, edge counts. |
 
 **Graph navigation** (all take a symbol `name`; ambiguous names list candidates)
 
@@ -105,6 +159,7 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 | Tool | What it does |
 |---|---|
 | `fetch_span` | The defining source of a graph node, verbatim and digest-verified — pass a node `id` from any result. |
+| `snippet` | The defining source of a symbol by name (digest-verified slice of its indexed span; `context_lines`, `max_bytes`). |
 | `why` | Evidence for the edge(s) between two nodes: edge type, resolution grade, resolver reason, and source span. |
 
 ## Example asks

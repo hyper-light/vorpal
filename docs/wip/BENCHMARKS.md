@@ -1797,6 +1797,31 @@ convergence PASS; workspace gate 140 suites / 1276 / 0.
 Remaining gap to the pass-21 line's 7.54 M is their pipeline's own share
 (worker-side writers, map_chunk streaming) — no single dominant site recorded.
 
+## v0.4.0 release benchmarks — the polyglot table + a corruption find (2026-09-02)
+
+The README performance section was re-measured end to end on the v0.4.0 binary
+(M5 Max, quiet machine, best-of runs; datasets pinned by commit). Flagship kernel:
+cold 8.19/8.24/8.96 s → **8,890,840 nodes** (3.1× the pre-merge line's 2.85 M — macro
+truth, records with members, 49 grammars), edit 0.55–0.64 s, touch 0.71 s, unchanged
+0.16 s, generation 5.5 GB. CLI one-shot search 1.5–1.9 s at that scale (process start +
+mmap); daemon medians over 30 stdio round-trips: graph <1 ms, hybrid search 53 ms,
+first-search tier warm-up 3.6 s. Scan-vs-grep: 4.83 s vs rg 1.03 s.
+
+Fourteen-repo polyglot cold table (shallow clones, commit-pinned — full rows in the
+README): llvm-project 8.1 s/1.44 M nodes, zig 6.3 s/1.09 M, kotlin 2.7 s/796 K,
+kubernetes 2.0 s/693 K, roslyn 0.6 s/490 K, rust 2.7 s/464 K, WordPress 1.8 s/287 K,
+spark 1.6 s/254 K, kafka 0.7 s/209 K, next.js 1.0 s/205 K, ghc 0.7 s/178 K, cpython
+2.3 s/163 K, rails 0.3 s/50 K, neovim 0.3 s/41 K, vuejs/core 0.1 s/11 K.
+
+**The sweep caught a real bug**: llvm-project and rust-lang/rust segfaulted the
+indexer — the children-cache claim-shape hole (exact-reserved arrays claimed by
+`ts_subtree_new_node` un-class-shaped; round-up binning over-promised; heap
+corruption). Fixed with the claim-time guard `ts_children_node_block_ok` (see
+UPSTREAM.md and the vendored `claim-shape` regression fixture); ts_allocs
+16.081 M → 16.066 M (flat), walls in band, battery PASS. The polyglot benchmark table
+is now also a standing corruption canary — the exact reason the tool is benchmarked
+wide instead of kernel-shaped.
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal
