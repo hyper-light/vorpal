@@ -2280,25 +2280,224 @@ Pre-change baseline runs (lighter load, `uptime` ~10): 625 / 687 / 1,015 ms. The
 no-rerank column is the channel's whole per-query cost (one fixed-order query forward +
 scan + rescore + the four-list fusion): ~100–120 ms contended.
 
+### Surface-recipe A/B — is the candidate SURFACE the lever? (2026-09-02, owner directive)
+
+`SurfaceRecipe` (`dense.rs`): (a) `head` = name + signature + basename; (b) `doc` = (a) +
+the contiguous comment block above the span (comment family by extension; attribute /
+decorator lines skipped; digest-verified indexed source, per-definition fallback to (a)
+when absent — counted); (c) `body` = (b) + the span's first paragraph. One recipe for
+sidecar AND rerank (label in `ann.dense.json`, demanded by freshness). Cap per surface:
+the largest token matrix the Stage-A sweep validated (101,959 tokens at batch 4096) ÷
+the 256-surface batch = **398 tokens** (truncations counted); the encoder's 2,048
+`max_trained_positions` is the hard clamp above it. Quiet machine (`uptime` 5–10),
+`VORPAL_DENSE_GATE=skip`, channel forced through the bench override.
+
+vorpal (74,474 defs; budget 1,800 s; all three recipes reach 100% coverage):
+
+| recipe | tok/def | fallbacks | truncations | warm | RSS | + rerank + channel ON | channel only | rerank only (recipe surfaces) | searcheval mean (ON) | uncached CLI k=10 / k=25 |
+|---|---:|---:|---:|---:|---:|---|---|---|---:|---:|
+| head | 24.3 | 0 | 0 | 283 s | 1.41 GB | **0.685 / 0.675 / 0.750** | 0.648 / 0.631 / 0.650 | 0.622 / 0.625 / 0.650 | 629 ms | 0.377 / 0.678 s |
+| doc | 27.9 | **66,754 (89.6%)** | 13 | 330 s | 1.97 GB | 0.573 / 0.570 / 0.550 | 0.588 / 0.554 / 0.550 | 0.608 / 0.610 / 0.550 | 906 ms | 0.540 / 1.000 s |
+| body | 86.6 | 2,291 | 2,970 | 1,356 s | 4.41 GB | 0.606 / 0.577 / 0.550 | 0.589 / 0.556 / 0.550 | 0.608 / 0.610 / 0.550 | 2,061 ms | 0.993 / 2.180 s |
+
+(Sidecar bytes are recipe-independent: 172 MB at 74 K rows.) Paraphrase dense ranks under
+`head`: `similar_pairs` 292, `Sketch` 36,910, `ObservedStore` 6,673, `ingest_traces`
+72,530; the dense top-10 for "near duplicate code detection" DOES contain
+`near_clones_are_paired_and_stated` (a test whose name carries the concept) — the
+model matches concepts, the target's surface simply has none of the words. Under `body`
+the targets move: `similar_pairs` 292 → **99**, `ObservedStore` 6,673 → **164**,
+`ingest_traces` 72,530 → 69,590 (its body head is a signature + error plumbing, no
+"runtime"), and the dense top-10 becomes `ObservedRecord`, `Observed`, `callers_of` —
+concept-right neighbours of the labelled answer. So the surface IS the lever for the
+paraphrase mechanism, but at 3.6× the tokens, 4.8× the warm and 3.3× the query latency
+it buys rank 99 (still outside the k=25 pool of 100 after fusion), while the recipe's
+noise costs every other class. Under `doc`: `similar_pairs` 304, `Sketch` 43,790,
+`ObservedStore` **212** (its doc comment carries "observed"), `ingest_traces` 72,136 —
+the comment helps exactly the definitions that have one (10% here) and changes nothing
+for the rest.
+
+cpython (145,367 defs; budget 2,400 s; quiet machine):
+
+| recipe | tok/def | coverage | fallbacks | truncations | warm | RSS | bytes | + rerank + channel ON | channel only | rerank only | searcheval mean ON / OFF | uncached CLI k=10 / k=25 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---:|---:|
+| head | 27.6 | 100% | 0 | 0 | 628 s | 1.55 GB | 337 MB | 0.426 / 0.565 / 0.417 | 0.419 / 0.544 / 0.500 | 0.410 / 0.556 / 0.500 | 580 / 584 ms | 0.347 / 0.689 s |
+| doc | 28.8 | 100% | **138,145 (95.0%)** | 8 | 657 s | 1.65 GB | 337 MB | 0.423 / 0.561 / 0.417 | 0.419 / 0.545 / 0.500 | 0.401 / 0.542 / 0.500 | 619 / 607 ms | 0.371 / 0.736 s |
+| body | — | — | — | — | (killed at ~17 min by owner decision: recipe (c) already fails the no-added-latency constraint on vorpal — 3.3× query, 4.8× warm — and loses every class except paraphrase rank movement; its vorpal row is the record) | | | | | | | |
+
+Linux kernel (8,481,757 defs; budget 300 s — hot subset; quiet machine):
+
+| recipe | tok/def | covered | fallbacks | truncations | warm | + rerank + channel ON | channel only | rerank only |
+|---|---:|---:|---:|---:|---:|---|---|---|
+| doc | 58.5 | 27,310 (0.3%) | 19,565 (72%) | 449 | 306 s | 0.337 / 0.396 / 0.250 | **0.387 / 0.440 / 0.333** | 0.218 / 0.285 / 0.167 |
+| head | 32.8 | 58,293 (0.7%) | 0 | 0 | 294 s | **0.335 / 0.382 / 0.250** | 0.312 / 0.348 / 0.229 | 0.222 / 0.294 / 0.208 |
+| head (earlier, contended rate) | 27.8 | 24,369 (0.3%) | 0 | 0 | 189 s | 0.345 / 0.406 / 0.292 | 0.374 / 0.410 / 0.333 | 0.222 / 0.294 / 0.208 |
+
+Kernel head: 135 MB, RSS 3.0 GB; searcheval mean ON 834 ms vs OFF 1,299 ms (the channel's
+candidates shorten the rerank's cache-miss batch). The kernel is CONFOUNDED by coverage
+size: the same head recipe scored 0.374 channel-only at 24 K rows and 0.312 at 58 K rows
+— a larger hot subset adds more high-in-degree distractors to the dense top-100 than it
+adds answers — so `doc`'s 0.387 at 27 K rows is a coverage-size effect, not recipe
+evidence (its 72% fallback rate says the recipe barely differs there). Every kernel
+channel-ON row clears the 0.313 gate; channel-only at 58 K sits 0.001 under it.
+
+**Recipe (b) per class — where the trade actually happens.** Definitions WITH a leading
+comment move toward concept queries (`ObservedStore` 6,673 → 212 on vorpal); every
+definition WITHOUT one is unchanged in the dense list but the rerank now scores the
+commented candidates on longer text, which dilutes name matches: vorpal `Postings`
+(subset class) drops fused#1 → #8 under doc / #6 under body, and cpython's
+`PyList_Append` / `PyArg_ParseTuple` slide the same way. Under the one-recipe law the
+rerank pays the dilution on every query while the dense channel gains only on the
+10 % (vorpal) / 5 % (cpython) / 28 % (kernel hot subset) of definitions that carry a
+comment — a losing exchange at these comment densities.
+
+**Two-field variant (rich surface for the dense channel only, rerank on head) — expected,
+not run.** From the rows above: the rerank-only columns show the dilution cost is ~0.015–
+0.05 all-NDCG (0.622 → 0.608 vorpal; 0.410 → 0.401 cpython) and the channel-only columns
+show the doc/body dense lists are NOT better than head's as candidate sources (vorpal
+0.648 head vs 0.588 doc / 0.589 body; cpython 0.419 vs 0.419) — the gain from the
+richer dense list is confined to the paraphrase ranks (292 → 99 / 6,673 → 164), which
+still sit outside the k=25 pool. So splitting the recipes would recover the rerank's
+0.015–0.05 but not surface a paraphrase answer at k ≤ 25; it would need a deeper dense
+pool (≥ 300 for `similar_pairs` at rank 99 under body's 4.8× warm, or a query-side
+expansion) to pay off. Worth a follow-up only together with a pool-depth study; not on
+its own. Kernel: the doc surface's 72 % fallback rate makes it moot there.
+
+The quiet-machine latency answers the "zero added query latency" claim exactly: with the
+rerank on, channel ON costs 580 ms vs OFF 584 ms (the query embedding is shared; the
+131 K-row int8 scan + f16 rescore is inside the noise), and channel-only is 48 ms
+(one fixed-order query forward + scan). PENDING: doc paraphrase ranks, kernel.
+
+**Shipping shape (owner decision 2026-09-02, final): ALWAYS ON, filled in the
+background.** No gate, no budget, no per-index verdict is needed: whenever an encoder is
+selected, the warm (daemon warm thread / detached autowarm / `__warm-ann`) fills the
+sidecar AFTER the core tiers commit, in coverage order over every definition something
+references (referential in-degree ≥ 1, highest first), committing checkpoints by
+geometric doubling (first after the two rate-probe batches, then whenever the rows added
+match the rows committed — rewrite volume ≤ 2× the final file, no tunable interval).
+A search never waits: it serves whatever checkpoint exists (a missing sidecar contributes
+nothing) and picks up each new one on its next open. A later warm on the same
+stamp / model / recipe RESUMES at the recorded coverage; a new generation rebuilds
+(cross-generation carry stays a recorded lead). `--dense-budget-timeout <1h|5m30s|90s|secs>`
+(and `<root>/dense.budget`) is an explicit cap on a round; `<root>/dense.channel = off` is
+the opt-out; `vorpal tune` still reports the channel's paired verdict and writes the
+override. The self-probe gate is gone. Recipe stays `head`.
+
+`vorpal tune` verdicts (labels converted to `query => best-grade name` lines, k=10, head
+sidecars at full coverage on vorpal/cpython and 58 K rows on the kernel):
+
+| corpus | reranker (mean RR, W/L) | bm25 | dense channel |
+|---|---|---|---|
+| vorpal | 0.631 → 0.675, 2W/0L → ON | no signal | 0.633 → 0.675, 1W/1L → **ON** |
+| cpython | 0.240 → 0.281, 2W/0L → ON | 0.221 → 0.281, 2W/0L → ON | 0.267 → 0.281, 1W/0L → **ON** |
+| kernel | 0.365 → 0.364, 1W/3L → OFF | 0.364 → 0.289, 1W/3L → OFF | 0.351 → 0.364, 2W/3L → OFF (mean up, wins < losses) |
+
+(Reciprocal rank of the single best-grade label at k=10 — a coarser instrument than the
+graded NDCG tables; the kernel's dense row improves the mean but loses the wins count,
+so tune's rule says OFF while NDCG@10 says +0.11. Evidence only under the always-on
+decision below; `dense.channel = off` remains the user's opt-out.)
+
+### The always-on background fill — referenced-definition stop rule (2026-09-02)
+
+| corpus | definitions | referenced (in-degree ≥ 1) | fill (uncontended, pre-utilization-pass) | checkpoints | bytes | RSS | searcheval ON + rerank | vs full-coverage row |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| vorpal | 74,474 | **11,622 (15.6%)** | 47.3 s wall / 46.0 s embed, 6,465 tok/s, 25.6 tok/def | 6 | 26.9 MB | 0.98 GB | **0.705 / 0.700 / 0.750** | 0.685 / 0.675 / 0.750 (74 K rows) |
+| cpython | 145,367 | **35,292 (24.3%)** | 137.0 s / 136.6 s, 6,555 tok/s, 25.4 tok/def | 8 | 81.7 MB | 1.10 GB | 0.396 / 0.423 / 0.333 | 0.426 / 0.565 / 0.417 (145 K rows) |
+| kernel | 8,481,757 | **716,721 (8.5%)** | 10 m round: 111,872 rows, 6,407 tok/s, 34.2 tok/def → full referenced set ≈ 716,721 × 34.5 / 6,400 ≈ **64 min** (extrapolated, not run) | 9 (+1 in the 3 m resume round → 142,592 rows) | 259 MB (330 MB at 143 K) | 3.01 GB | 0.328 / 0.372 / 0.208 at 112 K rows; **0.308 / 0.365 / 0.208 at 143 K** | 0.345 (24 K) / 0.335 (58 K) |
+
+The kernel does NOT hold the 0.313 gate as coverage grows: 24 K rows 0.345, 58 K 0.335,
+112 K 0.328, 143 K 0.308 — each doubling of the hot subset adds more high-in-degree
+distractors to the dense top-100 than answers, and the full referenced set (717 K) is
+5× further along that curve. Holding the gate on the kernel needs a size-aware fusion
+weight or a per-corpus coverage cap; the always-on rule as landed will pass 0.313 only
+while the fill is young there. Recorded, not solved here.
+
+Foreground searches issued ~25 s into each fill were served from the tiers + the latest
+checkpoint: vorpal 0.411 s, cpython 0.373 s, kernel 0.670 s (process start + open +
+query, k=10). The stop rule's cost shows on cpython: `list_append` (a static helper) and
+`PyList_Append` resolve no referential in-edge in this graph, so the referenced-only
+sidecar never embeds them and "append item to list" falls fused#1 → #7 / #3 → #10
+(0.426 → 0.396 all-NDCG); on vorpal the subset REMOVES distractors (0.685 → 0.705). The
+explicit cap and the full-coverage rows above remain the record of the alternative.
+
+### Utilization pass — where the fill's wall goes, and the AMX ceiling (2026-09-02)
+
+Owner observation: the fill ran at ~350% CPU on 18 cores. Wall-clock stage attribution
+(`VORPAL_ENCODER_TRACE`, one 256-surface batch = 4,690 tokens, quiet machine):
+
+| stage | shards = 1 (Accelerate's own threading) | shards = 18 (row-sharded `cblas_sgemm` on rayon) |
+|---|---:|---:|
+| six GEMMs × 12 layers | **0.584 s (88%)** | 0.478 s (87%) |
+| attention (f64, row-parallel) | 0.030 s | 0.030 s |
+| SwiGLU gate (throughput path: f32 `exp_fast`) | 0.013 s | 0.010 s |
+| LayerNorm (row-parallel) | 0.012 s | 0.012 s |
+| qkv unpack + rotary + residuals | 0.026 s | 0.022 s |
+| forward | 0.664 s → 6,958 tok/s | **0.552 s → 8,509 tok/s** |
+
+A `sample` profile showed `exp` as the top frame — a many-threads-in-short-phases
+artifact: the wall clock says the non-GEMM stages are 12%. GEMM shard sweep (tokens/s
+and cores busy for the whole process, `/usr/bin/time -l`):
+
+| shards | tok/s | GFLOPS | cores busy |
+|---:|---:|---:|---:|
+| 1 | 6,917 | 1,567 | 2.6 |
+| 2 | 7,074 | 1,602 | 3.5 |
+| 4 | 6,910 | 1,565 | 5.2 |
+| 8 | 8,274 | 1,874 | 8.6 |
+| 18 | **8,512** | **1,928** | 13.8 |
+
+Verdict: **AMX-bound.** 18 independent sgemm calls keep 13.8 cores busy for +23%
+throughput, and 1.93 TFLOPS matches the raw single-call `cblas_sgemm` ceiling measured
+in Stage A (1.85 TFLOPS at these shapes) — the matrix units, not the thread count, are
+the limit; the extra cores mostly wait on them. The shard count is derived from
+`available_parallelism()` (no constant) and pinned by this sweep. The fill's remaining
+non-GEMM work is now pipelined (next batch's surfaces + tokenization on a scoped producer
+thread during the current forward; int8/f16 quantization row-parallel) — worth ~2% at
+these surface lengths, kept because it is what makes richer recipes free of I/O stalls.
+Determinism statement after the pass: row shards cannot change a result (each output
+row's reduction stays inside one `cblas_sgemm`); the throughput path's SwiGLU gate moved
+from f64 libm to the deterministic f32 Cephes polynomial (`exp_fast`, ≈2e-7 relative
+error), so its rows differ from the pre-pass sidecar bits while staying inside the parity
+bound (gated oracle after the pass: min cosine 1.0000000; rayon 1 vs 18 threads
+IDENTICAL bytes) and bit-identical across thread counts. The fixed-order query path is
+untouched.
+
+Fill rates before → after the pass (same referenced sets, same recipe; quiet machine):
+
+| corpus | referenced rows | tok/s before → after | time to cover before → after | foreground search during fill | searcheval ON + rerank (after) |
+|---|---:|---:|---:|---:|---|
+| vorpal | 11,622 | 6,465 → **8,180** (+27%) | 47.3 s → **37.5 s** | 0.41 → 0.78 s (the fill now holds ~14 cores) | 0.705 / 0.700 / 0.750 (unchanged) |
+| cpython | 35,292 | 6,555 → **8,402** (+28%) | 137.0 s → **106.9 s** | 0.37 → 0.73 s | 0.396 / 0.423 / 0.333 (unchanged) |
+| kernel | 716,721 | 6,407 → **7,467** (10 m round; 8,075 in the 3 m resume round) (+17–26%) | 10 m round 111,872 → **129,280** rows; full set ≈ 64 → **≈ 51 min** (extrapolated) | 0.67 → 0.98 s | 0.308 / 0.365 / 0.208 at 129 K; 0.306 / 0.361 / 0.208 at 168 K |
+
+Peak RSS during the fills: 1.02 / 1.15 / 3.15 GB. The kernel's checkpoint after the
+pass is past the coverage where it last held 0.313 (112 K rows, 0.328) — the coverage
+curve above, not the pass, decides that; with the always-on rule the kernel channel
+needs the size-aware fusion weight or coverage cap recorded there. Cores busy during a
+fill: ~14 of 18 (from 3.5), at the measured AMX ceiling.
+
 Reproduction: `VORPAL_CODERANK_DIR=<model> cargo run --release -p vorpal-index
 --features bench-internals --example sweep_encoder -- <index> 26 256 1024` (Stage A);
-`vorpal-index __warm-ann <idx> --dense-budget-secs <N>` then `xtask searcheval` under
-`VORPAL_DENSE_CHANNEL=off|on` and `VORPAL_RERANK_MODE=off` (Stage B);
+`vorpal-index __warm-ann <idx>` (always-on fill; `--dense-budget-timeout 10m` caps a
+round) then `xtask searcheval` under `VORPAL_DENSE_CHANNEL=off|on` and
+`VORPAL_RERANK_MODE=off` (Stage B); `sweep_encoder <idx> --shards <k>` with
+`VORPAL_ENCODER_TRACE=1` for the utilization pass;
 `sweep_encoder <idx> --dense-rank <query> <name…>` for the paraphrase ranks;
 `VORPAL_SEARCHEVAL_CHANNELS=1` prints per-channel provenance of labelled hits.
-Gate: 142 suites / 1,292 tests green (`cargo test --workspace --release`), both clippy
-lanes clean.
+Gate (final, after the utilization pass): 142 suites / 1,299 tests green
+(`cargo test --workspace --release`), both clippy lanes clean, the gated encoder oracles
+re-verified on the final literals (min cosine 1.0000000; 1 vs 18 threads IDENTICAL).
 
 Not done / open: (1) the optional richer surface (leading doc comment / body head) was
 not measured — the paraphrase ranks say the surface is the lever, and it would also
 change the rerank's surface (recipe law: one recipe for sidecar and rerank), so it is a
 separate A/B; (2) the sidecar is not carried across generations (no `ann.files`-style
 reconciliation, unlike the ANN tier) — every content change rebuilds it in full, minutes
-at these budgets; (3) the default budget policy when no budget is given is "no sidecar"
-(the tier's own warm is 4–8 s on vorpal/cpython, far too small to derive a budget from);
-(4) all Stage B wall-clock rows are contended — the token-rule's N is a machine-and-load
-measurement, recorded in `ann.dense.json`; the uncontended vorpal head rate was 1.7×
-the contended one.
+at these budgets — superseded for same-generation warms by the resumable checkpoint fill
+below, still open across generations; (3) the budget requirement is gone (always-on
+fill with the referenced-definition stop rule, below); (4) the early Stage B wall-clock
+rows are contended — the uncontended rates are in the fill tables below; (5) the kernel's
+coverage/quality curve (0.345 at 24 K rows → 0.306 at 168 K) is unsolved: the always-on
+channel holds the 0.313 gate there only while the fill is young.
 
 ## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
 
