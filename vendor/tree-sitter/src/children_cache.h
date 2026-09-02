@@ -52,6 +52,12 @@ static inline void ts_children_free_node(void *ptr, size_t bytes) {
   if (ptr) ts_free(ptr);
 }
 
+static inline bool ts_children_node_block_ok(size_t physical, size_t node_bytes) {
+  (void)physical;
+  (void)node_bytes;
+  return true; /* no binning without the cache — every block is claim-safe */
+}
+
 static inline void *ts_leaf_cache_alloc(size_t bytes) {
   return ts_malloc(bytes);
 }
@@ -218,6 +224,21 @@ static inline void ts_children_free_node(void *ptr, size_t bytes) {
     return;
   }
   ts_cc_push(ts_cc_class(bytes), ptr);
+}
+
+// Claim-safety check for `ts_subtree_new_node`: may a node claim a block of
+// `physical` bytes and later be freed via `ts_children_free_node(node_bytes)`?
+// Safe iff the round-up bin that free will choose does not exceed the block's
+// physical size. Cache-born and po2-grown blocks always pass; the one shape
+// that fails is an exact-reserved array (`array_reserve(n)` → `ts_realloc`,
+// physical = n*8, not class-shaped) big enough to skip the grow branch —
+// C++/Rust parse flows produce those, and binning such a block one class up
+// hands out more bytes than it has (heap corruption; found on
+// llvm/include/llvm/CodeGen/SelectionDAG.h). Callers migrate failing blocks
+// through `ts_children_alloc` instead of claiming them.
+static inline bool ts_children_node_block_ok(size_t physical, size_t node_bytes) {
+  if (node_bytes > TS_CC_MAX_BYTES) return true; /* free_node raw-frees these */
+  return physical >= ((size_t)1 << (TS_CC_MIN_SHIFT + ts_cc_class(node_bytes)));
 }
 
 // Fixed-size leaf-header alloc/free (`bytes` is always

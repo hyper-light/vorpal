@@ -249,3 +249,20 @@ already route through Kotlin.
   regressed real CPython C at scale (ref-resolution shifted), so it was reverted; a real fix needs
   position-specific handling (leading / between-type-and-declarator / trailing) each validated on
   a large non-kernel C corpus before landing. Prototype kept in scratch.
+
+### Children-cache claim-shape hole (2026-09-02, found by the polyglot release benchmark)
+
+Indexing llvm-project (and rust-lang/rust) segfaulted inside `ts_parser_parse`: an
+exact-reserved children array (`array_reserve(n)` → `ts_realloc`, physical `n*8` bytes —
+NOT class-shaped) can be big enough to skip `ts_subtree_new_node`'s grow branch, so the
+node claims it as-is; `ts_children_free_node` then reconstructs a ROUND-UP class that
+exceeds the physical size, the short block enters a larger bin, and the next reuse
+overflows it. Pure-C corpora (the kernel, the 45-grammar battery) never produced the
+shape — C++/Rust flows do (deterministic single-file repro:
+`llvm/include/llvm/CodeGen/SelectionDAG.h`, now a vendored regression fixture at
+`crates/index/tests/fixtures/claim-shape/`). Fix: claim-time guard
+`ts_children_node_block_ok` — `ts_subtree_new_node` migrates any block whose physical
+size is below the round-up class of `alloc_size(count)` through `ts_children_alloc`
+before claiming, restoring the birth-class reconstruction invariant by construction.
+Cost at kernel scale: ts_allocs 16.081 M → 16.066 M (flat — migrations are rare), walls
+in band, battery green.

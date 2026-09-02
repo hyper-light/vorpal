@@ -509,7 +509,12 @@ MutableSubtree ts_subtree_new_node(
 
   // Allocate the node's data at the end of the array of children.
   size_t new_byte_size = ts_subtree_alloc_size(children->size);
-  if (children->capacity * sizeof(Subtree) < new_byte_size) {
+  // VORPAL: grow when capacity is short, AND when the block is not class-safe
+  // for a node claim (exact-reserved arrays are ts_realloc-shaped, not
+  // class-shaped; ts_children_free_node's round-up bin would over-promise —
+  // see ts_children_node_block_ok).
+  if (children->capacity * sizeof(Subtree) < new_byte_size ||
+      !ts_children_node_block_ok((size_t)children->capacity * sizeof(Subtree), new_byte_size)) {
     // VORPAL: grow through the thread-local cache (the realloc-storm site in
     // extras-heavy grammars); the outgrown block returns to the cache.
     size_t old_bytes = (size_t)children->capacity * sizeof(Subtree);
