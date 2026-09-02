@@ -704,11 +704,49 @@ pub struct PackMsg {
   pub body: Vec<u8>,
 }
 
+/// Worker-side handle to the pack's buffer pool: freshly-encoded bodies travel to the
+/// spool thread, which hands the emptied buffers back here — a fresh parse then starts
+/// from a warm, right-sized buffer instead of walking a file-sized doubling ladder
+/// (ledger: the encode-buffer regrow was a top-five realloc site and gigabytes of the
+/// stream phase's churn). Bounded on both axes: the channel keeps at most 64 spare
+/// buffers, and buffers over 8 MiB are dropped at the recycle point — retaining a
+/// giant's buffer costs more resident memory than the giant's rare regrow costs churn.
+#[derive(Clone)]
+pub struct PackBufPool {
+  tx: crossbeam_channel::Sender<Vec<u8>>,
+  rx: crossbeam_channel::Receiver<Vec<u8>>,
+}
+
+const POOL_SPARES: usize = 64;
+const POOL_MAX_BUF: usize = 8 << 20;
+
+impl PackBufPool {
+  fn new() -> Self {
+    let (tx, rx) = crossbeam_channel::bounded(POOL_SPARES);
+    Self { tx, rx }
+  }
+
+  /// An empty buffer, warm when a spare exists.
+  pub fn grab(&self) -> Vec<u8> {
+    self.rx.try_recv().unwrap_or_default()
+  }
+
+  /// Return a spent buffer (cleared here; dropped when oversized or the pool is full).
+  pub fn give(&self, mut buf: Vec<u8>) {
+    if buf.capacity() > POOL_MAX_BUF {
+      return;
+    }
+    buf.clear();
+    let _ = self.tx.try_send(buf);
+  }
+}
+
 /// The post-`sink` half of a [`PackWriter`]: everything `finish` needs once the append
 /// channel is dropped.
 struct FinishState {
   dir: PathBuf,
   rx: crossbeam_channel::Receiver<PackMsg>,
+  pool: PackBufPool,
   reader: Option<Arc<PackReader>>,
 }
 
@@ -758,6 +796,7 @@ pub struct PackWriter {
   dir: PathBuf,
   rx: crossbeam_channel::Receiver<PackMsg>,
   tx: crossbeam_channel::Sender<PackMsg>,
+  pool: PackBufPool,
   reader: Option<Arc<PackReader>>,
   /// The canonical tree root — the bucketed format's absolute→tree-relative conversion
   /// point. Required by [`PackFormat::Bucketed`]; ignored by the flat writer.
@@ -777,10 +816,16 @@ impl PackWriter {
       dir: dir.to_path_buf(),
       rx,
       tx,
+      pool: PackBufPool::new(),
       reader,
       root,
       format,
     }
+  }
+
+  /// The buffer pool paired with this writer's spool (see [`PackBufPool`]).
+  pub fn buf_pool(&self) -> PackBufPool {
+    self.pool.clone()
   }
 
   /// A clone of the append channel. `finish(self)` consumes the writer, so sink-after-finish
@@ -798,8 +843,8 @@ impl PackWriter {
   /// files are hard-linked — so the previous generation stays complete for any reader still
   /// holding it. Call only after every [`PackWriter::sink`] clone is dropped.
   pub fn finish(self, live: impl IntoIterator<Item = String>) -> io::Result<()> {
-    let PackWriter { dir, rx, tx, reader, root, format } = self;
-    let this = FinishState { dir, rx, reader };
+    let PackWriter { dir, rx, tx, pool, reader, root, format } = self;
+    let this = FinishState { dir, rx, pool, reader };
     drop(tx);
     // Fresh spool for this run's appended records (magic + version header first). A side
     // file, not `products.pack` itself: the reader may be mapping a same-named prior pack in
@@ -822,8 +867,11 @@ impl PackWriter {
       out.write_all(&body)?;
       let body_at = at + 4 + path.len() as u64 + 4;
       appended.insert(path.as_str().into());
-      entries.push((path, BodySource::Appended((body_at, body.len() as u32))));
-      at = body_at + body.len() as u64;
+      let body_len = body.len();
+      // Spent body back to the workers' warm-buffer pool.
+      this.pool.give(body);
+      entries.push((path, BodySource::Appended((body_at, body_len as u32))));
+      at = body_at + body_len as u64;
     }
     out.flush()?;
     drop(out);

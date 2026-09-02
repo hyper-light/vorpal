@@ -853,6 +853,7 @@ fn build_index_inner(
     format,
   );
   let pack_sink = pack_writer.sink();
+  let pack_pool = pack_writer.buf_pool();
   let live_paths: Vec<String> = manifest.entries().iter().map(|e| e.path.clone()).collect();
   let pack_thread = std::thread::spawn(move || pack_writer.finish(live_paths));
   let send_fatal =
@@ -901,7 +902,8 @@ fn build_index_inner(
   vorpal_kg::phase_stamp("stream: start");
   // Fresh-product sink: the worker hands over the encoded bytes it just applied from;
   // they travel to the pack writer by move (the canonical consolidating sort makes
-  // arrival order irrelevant).
+  // arrival order irrelevant), and the spool thread hands the emptied buffers back
+  // through `pack_pool` — fresh parses start from warm, right-sized buffers.
   let fresh_sink = |path: String, body: Vec<u8>| -> io::Result<()> {
     pack_sink
       .send(PackMsg { path, body })
@@ -999,10 +1001,9 @@ fn build_index_inner(
       // buffer reaches the pack through the fresh sink above. The buffer is taken out
       // of the scratch first (read_source's borrow spans the whole extraction) and
       // restored on the skip paths so its capacity keeps recycling.
-      let mut encode = std::mem::take(&mut scratch.encode);
-      encode.clear();
+      let mut encode = pack_pool.grab();
       let Ok(source) = scratch.read_source(Path::new(&entry.path)) else {
-        scratch.encode = encode;
+        pack_pool.give(encode);
         return Ok(StreamWork::Skipped);
       };
       let Some(stats) = extractor.extract_product_encoded(
@@ -1012,7 +1013,7 @@ fn build_index_inner(
         entry.mtime_ns,
         &mut encode,
       ) else {
-        scratch.encode = encode;
+        pack_pool.give(encode);
         return Ok(StreamWork::Skipped);
       };
       if stats.error_nodes > 0 {
