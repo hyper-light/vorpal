@@ -124,16 +124,18 @@ impl StageClock {
 /// the f64 gate — its bits are the query-side law.
 #[inline]
 fn exp_fast(x: f32) -> f32 {
-  const LOG2E: f32 = 1.442_695_04;
-  const LN2_HI: f32 = 0.693_359_375;
+  // ln 2 split into an f32-exact high part (355/512) and a low remainder, the
+  // Cephes reduction; the f32 literals below are the f32 roundings of Cephes'
+  // decimal coefficients (the last is exactly 0.5 in f32).
+  const LN2_HI: f32 = 0.693_359_4;
   const LN2_LO: f32 = -2.121_944_4e-4;
   let x = x.clamp(-87.0, 88.0);
-  let n = (x * LOG2E).round();
+  let n = (x * std::f32::consts::LOG2_E).round();
   let r = x - n * LN2_HI - n * LN2_LO;
   let p = ((((1.987_569_2e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
     + 1.666_666_5e-1)
     * r
-    + 5.000_000_1e-1;
+    + 0.5;
   let p = p * r * r + r + 1.0;
   let scale = f32::from_bits(((n as i32 + 127) as u32) << 23);
   p * scale
