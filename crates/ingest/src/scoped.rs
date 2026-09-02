@@ -1202,7 +1202,6 @@ pub struct DirtyFileInput<'a> {
 /// come back in `edited` order first, then in `dirty` order. The c2-i machinery
 /// underneath is unchanged — one session, one table, the pipeline's own kernels.
 #[allow(clippy::too_many_arguments)] // the one defs-changed entry: every input is load-bearing
-#[allow(clippy::too_many_arguments)] // the defs-changed entry: every input is load-bearing
 pub fn resolve_defs_changed(
   interner: &Interner,
   prior_kg: &Kg,

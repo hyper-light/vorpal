@@ -1110,7 +1110,6 @@ pub fn resolve_all_spilled_into<'i, T: Send>(
 /// daemon's link path. Identical pump; only the chunk source differs (alive ranges instead
 /// of the whole file).
 #[allow(clippy::too_many_arguments)] // the retained-path resolve entry: chain ledger rides with the drains
-#[allow(clippy::too_many_arguments)] // streaming API mirrors resolve_all_spilled_into.
 pub fn resolve_all_store_into<'i, T: Send>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,
@@ -1142,7 +1141,6 @@ pub fn resolve_all_store_into<'i, T: Send>(
 /// immutable table), so both sources produce output identical to an in-RAM `resolve_all`
 /// over the same reference sequence.
 #[allow(clippy::too_many_arguments)] // the shared chunk pump: decode hook + chain ledger + map/consume are load-bearing
-#[allow(clippy::too_many_arguments)] // the one shared worker-scope body behind both drains.
 fn resolve_chunks_into<'i, T: Send>(
   interner: &'i Interner,
   table: &SymbolTable<'i>,

@@ -1127,6 +1127,15 @@ pub fn link_writer_spilled_with_flows<'i>(
   ))
 }
 
+/// What [`link_resolve`] hands back beside the writer's edge log: stats, the evidence
+/// and data-flow rows, and the encoded `reach.bin` include-edge graph.
+type LinkResolution = (
+  ResolveStats,
+  Vec<vorpal_kg::EvidenceRow>,
+  Vec<vorpal_kg::DataflowRow>,
+  Vec<u8>,
+);
+
 /// The resolution half of a spilled link: load the flow spills, build the table, resolve
 /// every reference into the writer's edge log, collect evidence and data-flow rows.
 fn link_resolve<'i>(
@@ -1135,12 +1144,7 @@ fn link_resolve<'i>(
   spill: &vorpal_resolve::RefSpill<'i>,
   resolver: &Resolver,
   flow_spill: Option<FlowSpill>,
-) -> io::Result<(
-  ResolveStats,
-  Vec<vorpal_kg::EvidenceRow>,
-  Vec<vorpal_kg::DataflowRow>,
-  Vec<u8>,
-)> {
+) -> io::Result<LinkResolution> {
   let arg_join: ArgJoin = match &flow_spill {
     Some(spill) if spill.args.1 > 0 => load_arg_spill(&spill.args.0, spill.args.1)?,
     Some(spill) => {

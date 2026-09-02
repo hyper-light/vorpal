@@ -182,7 +182,7 @@ fn scoped_resolution_equals_scratch_for_a_defs_stable_edit() {
       row.candidates,
       row.span_start,
       row.span_end,
-      row.alternatives.clone(),
+      row.alternatives,
     )
   };
   let mut truth_evidence: Vec<_> = file_range

@@ -993,7 +993,8 @@ mod entity_identity_tests {
   #[test]
   fn owner_segment_matches_rendered_path_split() {
     // (owner, name, kind, signature, expected segment)
-    let cases: &[(Option<&str>, &str, SymbolKind, &str, Option<&str>)] = &[
+    type Case<'a> = (Option<&'a str>, &'a str, SymbolKind, &'a str, Option<&'a str>);
+    let cases: &[Case<'_>] = &[
       // Layout index 0: the file node — empty path, no owner.
       (None, "", SymbolKind::File, "", None),
       // Member of a plain-named item: segment = the owner.

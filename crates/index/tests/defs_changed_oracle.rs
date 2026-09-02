@@ -191,7 +191,7 @@ fn defs_changed_session_equals_scratch_for_the_closure() {
       row.candidates,
       row.span_start,
       row.span_end,
-      row.alternatives.clone(),
+      row.alternatives,
     )
   };
   for (outcome, key) in outcomes.iter().zip([b_key, key_of("a.py")]) {
