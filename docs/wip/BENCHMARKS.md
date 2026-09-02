@@ -2133,6 +2133,173 @@ One-shot latency (process start included — cbm's only scriptable path): cbm se
 vorpal `search` 0.19–0.20 s kernel / 0.01 s cpython, `graph callers` 0.06 s (2.3 s on
 the first touch of a cold edge segment); daemon: 59 ms / 0.1 ms.
 
+## Doc-side dense channel — CodeRankEmbed as a candidate generator (2026-09-02, ENCODER_RESEARCH §8.2 option 2)
+
+Two gated stages. **Stage A** lifts the encoder's doc-side throughput E; **Stage B**
+pre-embeds definition surfaces at warm time into a stamp-gated sidecar (`ann.dense` +
+`ann.dense.json`, int8 codes + per-row scale + f16 rows, keyed by node id) and fuses the
+encoder's cosine ranking as a FIFTH RRF list, the query embedding computed once and
+shared with the rerank. Machine: M5 Max (18 cores), Accelerate present; every latency and
+warm-time row below was CONTENDED (a concurrent agent's kernel warm at 15 cores + this
+gate's own test runs; `uptime` 10–39) unless marked quiet. Quality numbers are
+deterministic (searcheval's double-run gate).
+
+### Stage A — GEMM path (`GemmPath::{FixedOrder, Throughput}`, `crates/ann/src/encoder/forward.rs`)
+
+`examples/sweep_encoder.rs` (bench-internals), real vorpal-index surfaces in coverage
+order (name + signature + basename; 14–21 tok/seq), FLOPs = 2 × 113.2 M × tokens, median
+of 3, quiet machine:
+
+| batch | tokens | pre-change fixed-order | fixed-order (row-parallel passes) | Accelerate `cblas_sgemm` | speedup | min cosine | raw sgemm ceiling |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 26 | 364 | 0.356 s / 232 GFLOPS | 0.317 s / 260 | **0.088 s / 935 GFLOPS** (295 seq/s) | 3.6–4.0× | 1.000000 | 1128 GFLOPS |
+| 256 | 4690 | 4.608 s / 230 | 3.882 s / 274 | **0.706 s / 1505** (363 seq/s) | 5.5–6.5× | 1.000000 | 1854 GFLOPS |
+| 1024 | 21860 | 22.47 s / 220 | 20.33 s / 244 | **3.386 s / 1462** (302 seq/s) | 6.0–6.6× | 1.000000 | — |
+| 4096 | 101959 | — | 97.06 s / 238 | **14.70 s / 1571** (279 seq/s) | 6.6× | 1.000000 | — |
+
+The forward runs at 81–83% of the raw `cblas_sgemm` ceiling for these shapes (a C
+microbench of the six GEMM shapes × 12 layers), so the remaining ~1/5 is the f64
+attention / LayerNorm / SwiGLU passes. Determinism statement: the Accelerate path is
+run-to-run reproducible and measured **bit-identical across rayon thread counts**
+(1 vs 18) on the parity battery — Accelerate's own threading is a process-level setting
+(`VECLIB_MAXIMUM_THREADS`), not exercised here — so it is admissible for the stamp-gated
+sidecar; the query-side rerank stays on the fixed-order lanes (unchanged: the forced-off
+configuration below reproduces the pre-change rankings exactly). Parity oracle:
+cosine ≥ 0.9999 vs fixed-order (measured min 1.0000000 over the battery; gated tests
+`throughput_path_*` in `crates/ann/tests/encoder.rs`). The research doc's E ≈ 0.08
+was a whole-query figure (tokenization + reorder + the 26-sequence batch at 0.887 s);
+the kernel-only pre-change rate on this machine is 0.23 TFLOPS, post-change 0.9–1.6.
+
+### Stage B — the sidecar and the fused channel (`crates/index/src/dense.rs`)
+
+Coverage rule (no constants): the caller passes a wall-clock budget; the build measures
+this machine's seconds-per-TOKEN on the faster of its first two 256-surface batches and
+covers the longest prefix of the in-degree order whose tokens fit the budget. A
+per-DEFINITION rate was tried first and overran a 300 s budget by 43% on this repo
+(the highest-in-degree names are the shortest surfaces: 14 tok at the head vs ~24 mean).
+
+| corpus | population (non-Import) | budget | measured rate (contended) | covered | tokens | build | gate (label-free probes) | bytes | peak RSS |
+|---|---:|---:|---:|---:|---:|---:|---|---:|---:|
+| vorpal | 74,368 | 600 s | 3,320 tok/s | **74,368 (100%)** | 1.80 M | 390.6 s | OFF (wins 28 / losses 37, MRR 0.3935 vs 0.3999) | 172 MB | 1.32 GB |
+| cpython | 145,367 | 1000 s | 3,601 tok/s | 131,203 (90.3%) | 3.60 M | 1,231.9 s (+23% over budget: contention rose after the probe) | OFF (wins 32 / losses 46, MRR 0.4414 vs 0.4442) | 304 MB | 1.54 GB |
+| kernel | 8,481,757 | 300 s | 2,559 tok/s | 24,369 (0.3%) | 0.77 M | 188.5 s (probe ran under heavier load than the build) | OFF (wins 1 / losses 1 — a 0.3% hot subset rarely holds a probed node) | 56 MB | 6.17 GB (the graph itself) |
+
+Gate cost: 512 fixed-order query forwards per corpus — 19–62 s on vorpal, 29 s on
+cpython, 148 s on the kernel (all contended).
+
+(Quiet-machine vorpal rate was 305.8 defs/s ≈ 5,500 tok/s at the head; contention halved it.)
+
+Quality — vorpal (labels `xtask/labels/vorpal.json`, NDCG@10 / MRR / recall@5):
+
+| configuration | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** | mean µs (contended) |
+|---|---|---|---|---|---|---|---|---:|
+| learned tier, no encoder | 0.289/0.100/0.000 | 0.500/0.500/0.500 | 1/1/1 | 0/0/0 | 0.894/1.000/0.750 | 0.631/0.500/1.000 | 0.571/0.560/0.550 | 4,386 |
+| + rerank, channel forced OFF (= pre-change binary, bit-identical) | 0.431/0.250/1.000 | 0.500/0.500/0.500 | 1/1/1 | 0/0/0 | 0.894/1.000/0.750 | 0.631/0.500/1.000 | 0.585/0.575/0.650 | 937,663 |
+| + rerank, gate verdict (OFF) | same as above | | | | | | 0.585/0.575/0.650 | 939,074 |
+| + rerank + channel ON | 0.431/0.250/1.000 | **0.815/0.750/1.000** | 1/1/1 | 0/0/0 | 0.894/1.000/0.750 | **1.000/1.000/1.000** | **0.685/0.675/0.750** | 1,089,899 |
+| channel ON, no rerank | 0.356/0.167/0.000 | 0.500/0.528/0.500 | 1/1/1 | 0/0/0 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | 0.614/0.622/0.550 | 138,565 |
+
+Paraphrase, answered directly (`sweep_encoder --dense-rank`, full-corpus dense ranking):
+"near duplicate code detection" → `similar_pairs` at dense rank **289** of 74,368,
+`Sketch` 36,820; "who called what at runtime" → `ObservedStore` 6,669, `ingest_traces`
+72,428. The dense top-10 for the first is junk surfaces (`&nearrow;`, six `description`
+nodes). So on the rerank's surface recipe the channel does NOT surface the paraphrase
+targets at the k=25 pool (100): the mechanism exists (289 of 74 K is the top 0.4%) but
+the surface carries too little of the concept.
+
+Quality — cpython (`xtask/labels/cpython.json`; 4 descriptive + 2 short-keyword):
+
+| configuration | descriptive | short-keyword | **all** | mean µs (contended) |
+|---|---|---|---|---:|
+| learned tier, no encoder | 0.475/0.542/0.375 | 0.287/0.500/0.250 | 0.412/0.528/0.333 | 5,263 |
+| + rerank, channel forced OFF (= pre-change, bit-identical) | 0.531/0.583/0.625 | 0.169/0.500/0.250 | 0.410/0.556/0.500 | 957,810 |
+| + rerank, gate verdict (OFF) | same | same | 0.410/0.556/0.500 | 1,024,961 |
+| + rerank + channel ON | 0.489/0.562/0.500 | **0.300/0.571/0.250** | 0.426/0.565/0.417 | 1,169,715 |
+| channel ON, no rerank | 0.495/0.550/0.625 | 0.282/0.533/0.250 | 0.424/0.544/0.500 | 155,891 |
+
+Candidate generation observed: "garbage collect run" → `gc_collect_main` enters the
+fused top-25 ONLY through the dense list (dense#7; vector#56, no name/BM25 placement)
+and lands fused#7 — the mechanism the reranker cannot supply. But descriptive loses
+0.531 → 0.489 NDCG / 0.625 → 0.500 recall@5 with the channel + rerank (`PyList_Append`
+fused#3 → #6, `PyArg_ParseTuple` #3 → #4: the fifth list's RRF mass reorders the tail
+the reranker then arbitrates from), so cpython is MIXED under force-on and the gate's
+OFF keeps it exactly at baseline.
+
+Quality — Linux kernel (`xtask/labels/kernel.json`; 1 descriptive + 7 short-keyword;
+the gate is all ≥ 0.313, the learned tier's no-encoder line):
+
+| configuration | descriptive | short-keyword | **all** | mean µs (contended) |
+|---|---|---|---|---:|
+| learned tier, no encoder | 0.947/1.000/1.000 | 0.222/0.253/0.143 | 0.313/0.346/0.250 | 218,583 |
+| + rerank, channel forced OFF (= pre-change, bit-identical) | 0.905/1.000/1.000 | 0.125/0.193/0.095 | 0.222/0.294/0.208 | 1,346,043 |
+| + rerank, gate verdict (OFF) | same | same | 0.222/0.294/0.208 | 1,079,896 |
+| + rerank + channel ON | 0.608/0.500/1.000 | **0.307/0.393/0.190** | **0.345/0.406/0.292** | 1,372,622 |
+| channel ON, no rerank | 0.496/0.333/1.000 | **0.357/0.421/0.238** | **0.374/0.410/0.333** | 374,702 |
+
+With only 24,369 of 8.48 M definitions covered (the in-degree head), the channel is the
+ONLY placement for `alloc_skb` (dense#1 → fused#5), `request_irq` (dense#2 → fused#3)
+and `mutex_lock` (dense#4 → fused#8) — three of the seven short-keyword answers the
+research doc named as the subword-identifier failures — and it lifts `handle_mm_fault`
+from fused#14 to #1. It costs the single descriptive query (`pick_next_task` #1 → #2/#3).
+Both channel-on rows clear the 0.313 gate; the no-rerank row is the best all-NDCG
+measured on this graph.
+
+**Gate verdict vs labels — the finding that decides the shipping shape.** The label-free
+self-probe gate (the BM25 protocol: name-token-subset known-item queries, MRR@10) voted
+OFF on all three corpora, while the labelled harness measures the channel + rerank at
++0.100 (vorpal), +0.016 (cpython, mixed by class), +0.123 (kernel) all-NDCG. The probe
+queries are lexical by construction and the sidecar's value is on descriptive and
+subword-identifier queries the probes never ask — the same blind spot the BM25 gate
+was recorded with ("label-free probes can't see the descriptive class"). So as landed the
+channel SELF-GATES OFF everywhere (the shipping configuration is bit-identical to the
+pre-change ranking; nothing regresses) and the labelled gains are reachable only through
+the bench override. The decision — ship ON where a sidecar exists (labels: 3/3 corpora up
+on all-NDCG, cpython descriptive down), a per-index `vorpal tune`-style verdict, or a
+better label-free gate — is an owner decision recorded here, not taken unilaterally.
+
+Latency (all contended, `uptime` 20–70; k=25, searcheval mean): the channel's own cost is
+the no-rerank row minus the no-encoder row — ~135 ms on vorpal, ~150 ms on cpython,
+~155 ms on the kernel — of which one fixed-order query forward (a single ~12-token
+sequence at batch 1: 26 sequences take 88 ms on the throughput path but ~300 ms on the
+fixed path under contention) is the bulk and the int8 scan + f16 rescore the rest
+(74 K–131 K rows). With the rerank on, the rerank's own 26-sequence fixed-order batch
+dominates (0.9–1.4 s contended vs 0.63–1.0 s in the pre-change baseline runs, which ran
+under lighter load) — the "zero added latency" claim holds for the query EMBEDDING
+(computed once, shared), not for the scan, which is the ~ms–100 ms figure above.
+
+End-of-run re-measure (`uptime` 20–24 — the concurrent agent was still loading the
+machine, so these are contended too; quality identical to the tables above):
+
+| corpus | rerank, channel OFF (shipping = pre-change) | rerank + channel ON | channel ON, no rerank |
+|---|---:|---:|---:|
+| vorpal (74 K rows) | 607 ms | 720 ms | 98 ms |
+| cpython (131 K rows) | 836 ms | 930 ms | 120 ms |
+| kernel (24 K rows) | 1,135 ms | 919 ms | 118 ms |
+
+Pre-change baseline runs (lighter load, `uptime` ~10): 625 / 687 / 1,015 ms. The
+no-rerank column is the channel's whole per-query cost (one fixed-order query forward +
+scan + rescore + the four-list fusion): ~100–120 ms contended.
+
+Reproduction: `VORPAL_CODERANK_DIR=<model> cargo run --release -p vorpal-index
+--features bench-internals --example sweep_encoder -- <index> 26 256 1024` (Stage A);
+`vorpal-index __warm-ann <idx> --dense-budget-secs <N>` then `xtask searcheval` under
+`VORPAL_DENSE_CHANNEL=off|on` and `VORPAL_RERANK_MODE=off` (Stage B);
+`sweep_encoder <idx> --dense-rank <query> <name…>` for the paraphrase ranks;
+`VORPAL_SEARCHEVAL_CHANNELS=1` prints per-channel provenance of labelled hits.
+Gate: 142 suites / 1,292 tests green (`cargo test --workspace --release`), both clippy
+lanes clean.
+
+Not done / open: (1) the optional richer surface (leading doc comment / body head) was
+not measured — the paraphrase ranks say the surface is the lever, and it would also
+change the rerank's surface (recipe law: one recipe for sidecar and rerank), so it is a
+separate A/B; (2) the sidecar is not carried across generations (no `ann.files`-style
+reconciliation, unlike the ANN tier) — every content change rebuilds it in full, minutes
+at these budgets; (3) the default budget policy when no budget is given is "no sidecar"
+(the tier's own warm is 4–8 s on vorpal/cpython, far too small to derive a budget from);
+(4) all Stage B wall-clock rows are contended — the token-rule's N is a machine-and-load
+measurement, recorded in `ann.dense.json`; the uncontended vorpal head rate was 1.7×
+the contended one.
+
 ## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
 
 The premise: split giant C sources at proven top-level boundaries, parse slices in
