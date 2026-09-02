@@ -1741,6 +1741,15 @@ enum Pending<'t> {
     start: u32,
     end: u32,
   },
+  /// An `implements` candidate awaiting the post-pass (from, name) first-wins dedup —
+  /// deferred (rather than deduped at emission) so a region-scoped walk can merge its
+  /// rows with reused rows before the file-global law runs.
+  ImplUse {
+    from: NodeId,
+    name: Cow<'t, str>,
+    start: u32,
+    end: u32,
+  },
 }
 
 /// Emit `calls` and `imports` references from the parse tree — one fused traversal (§12):
@@ -1849,7 +1858,6 @@ pub(crate) fn extract_references_with_facts<'t>(
           &spec.implements[idx as usize],
           spec,
           &mut span_cursor,
-          &mut seen_impls,
           &mut pending,
         ),
         Chain::Call(idx) => {
@@ -1956,6 +1964,18 @@ pub(crate) fn extract_references_with_facts<'t>(
           .any(|(scope, binder)| *binder == name && scope.contains(&(start as usize)));
         if !shadowed && seen_types.insert((from.raw(), name.clone())) {
           out.push(RawRef::plain(from, name, RefKind::Type, start, end));
+        }
+      }
+      Pending::ImplUse {
+        from,
+        name,
+        start,
+        end,
+      } => {
+        // The (from, name) first-wins law, moved here from emission time — same rows,
+        // same order, same survivors; now a region walk can merge before the law runs.
+        if seen_impls.insert((from.raw(), name.clone())) {
+          out.push(RawRef::plain(from, name, RefKind::Implements, start, end));
         }
       }
     }
@@ -2254,7 +2274,6 @@ fn emit_implements<'t>(
   ispec: &ImplSpecData,
   spec: &RefSpecData,
   span_cursor: &mut SpanCursor<'_>,
-  seen: &mut HashSet<(u64, Cow<'t, str>)>,
   pending: &mut Vec<Pending<'t>>,
 ) {
   let range = node.range();
@@ -2278,15 +2297,12 @@ fn emit_implements<'t>(
       if spec.type_placeholders.iter().any(|t| t.as_str() == name.as_ref()) {
         continue;
       }
-      if seen.insert((from.raw(), name.clone())) {
-        pending.push(Pending::Ready(RawRef::plain(
-          from,
-          name,
-          RefKind::Implements,
-          range.start as u32,
-          range.end as u32,
-        )));
-      }
+      pending.push(Pending::ImplUse {
+        from,
+        name,
+        start: range.start as u32,
+        end: range.end as u32,
+      });
     }
   }
 }
