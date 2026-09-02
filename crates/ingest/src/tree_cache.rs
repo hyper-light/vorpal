@@ -14,25 +14,32 @@
 //! giants are single-declaration-capped, and cold builds have no idle cores to give a
 //! chunk fan-out anyway. Incremental reparse attacks the case that actually recurs.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use vorpal_core::tree_sitter::{StrDoc, TSTree};
+use vorpal_core::tree_sitter::{IncrementalDelta, StrDoc, TSTree};
 use vorpal_lang_registry::SgLang;
+
+use crate::walk_reuse::WalkSnapshot;
 
 type Root = vorpal_core::Vorpal<StrDoc<SgLang>>;
 
 /// Files below this size never cache: a small parse is cheaper than retention.
 /// `VORPAL_TREE_CACHE_MIN` overrides (bytes).
 const DEFAULT_MIN_BYTES: usize = 1 << 20;
-/// Total RETAINED SOURCE bytes across entries; retained trees cost roughly an order of
-/// magnitude more than their sources (ledger-profiled 10–40×), so this bounds resident
-/// tree mass at ~2.5 GB worst-case — one julia-parser.c-class giant, or a handful of
-/// kernel-class large files. Swept 2026-09-02 (BENCHMARKS "giant-file tree cache"):
-/// wins are 2.2–3.1× per save from 1 MB upward; the floor stays at 1 MB so cold builds
-/// (which parse each file once — retention is pure cost there) stay inert on the
-/// kernel corpus (4 files qualify). `VORPAL_TREE_CACHE_BUDGET` overrides.
-const DEFAULT_BUDGET_BYTES: usize = 64 << 20;
+/// Total entry cost across entries, where one entry costs its RETAINED SOURCE bytes
+/// plus its walk snapshot's resident mass. The snapshot measures 2.0–2.8× the source
+/// across giant classes (measured 2026-09-02, `snapshot_mass` example: tree-sitter-c
+/// parser.c 2.5×, -haskell 2.0×, -cpp 2.5×, -julia 2.8× at 54.7 MB source / 1.13 M
+/// rows), so the budget is the swept 64 MB source capacity × (1 + 3) — a ratio ceiling
+/// of 3 covers every measured class — preserving the original sweep's intent: one
+/// julia-parser.c-class giant, or a handful of kernel-class large files, with retained
+/// TREE mass (ledger-profiled 10–40× source, uncounted here) still bounded at ~2.5 GB
+/// worst-case by the same source capacity. The 1 MB floor keeps cold builds inert
+/// (they parse each file once — retention is pure cost there).
+/// `VORPAL_TREE_CACHE_BUDGET` overrides.
+const DEFAULT_BUDGET_BYTES: usize = (64 << 20) * 4;
 
 struct Policy {
   enabled: bool,
@@ -64,6 +71,18 @@ struct Entry {
   lang: SgLang,
   /// Monotonic touch stamp for LRU eviction.
   stamp: u64,
+  /// The extraction walk's snapshot for THIS source (walk reuse) — attached by
+  /// [`store_snapshot`] after extraction, consumed (moved into the reuse context) by the
+  /// next incremental parse of the same path.
+  snapshot: Option<Box<WalkSnapshot>>,
+}
+
+impl Entry {
+  /// Budget cost: retained source bytes plus the walk snapshot's resident mass — one
+  /// knob bounds both.
+  fn cost(&self) -> usize {
+    self.source.len() + self.snapshot.as_ref().map_or(0, |s| s.approx_bytes())
+  }
 }
 
 /// First-sight marker: a path parsed ONCE holds no tree — cold builds parse every file
@@ -96,7 +115,7 @@ impl Cache {
         break;
       };
       if let Some(evicted) = self.entries.remove(&oldest) {
-        self.bytes -= evicted.source.len();
+        self.bytes -= evicted.cost();
       }
     }
   }
@@ -128,7 +147,7 @@ pub(crate) fn grep_cached_unpoliced(lang: SgLang, path: &str, source: &str) -> R
       let history = cache
         .entries
         .remove(path)
-        .inspect(|entry| cache.bytes -= entry.source.len())
+        .inspect(|entry| cache.bytes -= entry.cost())
         .filter(|entry| entry.lang == lang);
       let promote = history.is_some()
         || cache.seen.get(path).is_some_and(|seen| seen.lang == lang);
@@ -145,20 +164,38 @@ pub(crate) fn grep_cached_unpoliced(lang: SgLang, path: &str, source: &str) -> R
       history.is_some()
     );
   }
-  let root = match &history {
-    Some(entry) => vorpal_core::Vorpal::try_new_incremental(
+  let parsed = match &history {
+    Some(entry) => vorpal_core::Vorpal::try_new_incremental_ranged(
       source,
       lang,
       Some((entry.source.as_str(), &entry.tree)),
     ),
-    None => vorpal_core::Vorpal::try_new_incremental(source, lang, None),
+    None => vorpal_core::Vorpal::try_new_incremental_ranged(source, lang, None),
   };
-  let root = match root {
-    Ok(root) => root,
+  let (root, delta) = match parsed {
+    Ok(parsed) => parsed,
     // A parse failure here would fail the plain path identically; surface it the same
     // way `grep` does (extraction treats the file as unparseable).
     Err(_) => return vorpal_core::tree_sitter::LanguageExt::grep(&lang, source),
   };
+  // Walk-reuse handoff: an incremental parse over history that carried a snapshot of the
+  // SAME old source arms the extraction (which runs next, on this thread) to splice
+  // retained walk rows around the edit instead of re-walking the whole file.
+  REUSE.with(|slot| {
+    let ctx = match (history, delta) {
+      (Some(entry), Some(delta)) => entry.snapshot.and_then(|snapshot| {
+        (snapshot.source_xxh3 == xxhash_rust::xxh3::xxh3_64(entry.source.as_bytes())).then(
+          || ReuseCtx {
+            path: path.to_string(),
+            snapshot,
+            delta,
+          },
+        )
+      }),
+      _ => None,
+    };
+    *slot.borrow_mut() = ctx;
+  });
   if !promote {
     return root;
   }
@@ -168,19 +205,100 @@ pub(crate) fn grep_cached_unpoliced(lang: SgLang, path: &str, source: &str) -> R
     tree: tree.clone(),
     lang,
     stamp: 0,
+    snapshot: None,
   };
   if let Ok(mut cache) = cache().lock() {
     cache.clock += 1;
     let mut entry = entry;
     entry.stamp = cache.clock;
     let budget = policy().budget_bytes;
-    cache.evict_to_fit(entry.source.len(), budget);
-    if cache.bytes + entry.source.len() <= budget {
-      cache.bytes += entry.source.len();
+    cache.evict_to_fit(entry.cost(), budget);
+    if cache.bytes + entry.cost() <= budget {
+      cache.bytes += entry.cost();
       cache.entries.insert(path.to_string(), entry);
     }
   }
   root
+}
+
+/// One armed walk-reuse context: the snapshot taken OUT of the cache entry plus the
+/// incremental parse's delta, parked between the parse and the extraction that follows
+/// it on the same thread. Thread-local because that pairing is strictly sequential —
+/// each pipeline worker parses then extracts one file at a time.
+struct ReuseCtx {
+  path: String,
+  snapshot: Box<WalkSnapshot>,
+  delta: IncrementalDelta,
+}
+
+thread_local! {
+  static REUSE: RefCell<Option<ReuseCtx>> = const { RefCell::new(None) };
+}
+
+/// Claim the walk-reuse context the immediately preceding parse of `path` armed, if any.
+/// Consuming — the snapshot moves to the caller; a second call returns `None`.
+pub(crate) fn take_reuse(path: &str) -> Option<(Box<WalkSnapshot>, IncrementalDelta)> {
+  REUSE.with(|slot| {
+    let ctx = slot.borrow_mut().take()?;
+    (ctx.path == path).then_some((ctx.snapshot, ctx.delta))
+  })
+}
+
+/// Whether extraction should capture a walk snapshot for `path`: only when the tree
+/// cache actually retained the parse (the two-touch save-loop shape) — cold single
+/// parses never pay capture.
+pub(crate) fn wants_snapshot(path: &str) -> bool {
+  cache()
+    .lock()
+    .map(|cache| cache.entries.contains_key(path))
+    .unwrap_or(false)
+}
+
+/// Attach the freshly captured walk snapshot to `path`'s cache entry, charging its mass
+/// against the byte budget (evicting colder entries to fit; if THIS entry ends up over
+/// budget on its own, the snapshot is simply not retained).
+pub(crate) fn store_snapshot(path: &str, snapshot: Box<WalkSnapshot>) {
+  let Ok(mut cache) = cache().lock() else {
+    return;
+  };
+  let budget = policy().budget_bytes;
+  let added = snapshot.approx_bytes();
+  let Some(entry) = cache.entries.get_mut(path) else {
+    return;
+  };
+  entry.snapshot = Some(snapshot);
+  cache.bytes += added;
+  if cache.bytes > budget {
+    // Evict others first; as a last resort drop the snapshot we just attached.
+    cache.evict_to_fit(0, budget);
+    if cache.bytes > budget {
+      if let Some(entry) = cache.entries.get_mut(path) {
+        if let Some(dropped) = entry.snapshot.take() {
+          cache.bytes -= dropped.approx_bytes();
+        }
+      }
+    }
+  }
+}
+
+/// Diagnostic for the `snapshot_mass` example: the stored snapshot's (approx bytes,
+/// pending rows, items) for `path`, if one is retained.
+pub(crate) fn snapshot_stats(path: &str) -> Option<(usize, usize, usize)> {
+  let cache = cache().lock().ok()?;
+  let snap = cache.entries.get(path)?.snapshot.as_ref()?;
+  Some((snap.approx_bytes(), snap.pending.len(), snap.items.len()))
+}
+
+/// Test support: drop `path`'s entry (and its byte accounting) so oracle tests that share
+/// the process-global cache leave no residue for their siblings.
+#[cfg(test)]
+pub(crate) fn evict_for_tests(path: &str) {
+  if let Ok(mut cache) = cache().lock() {
+    if let Some(entry) = cache.entries.remove(path) {
+      cache.bytes -= entry.cost();
+    }
+    cache.seen.remove(path);
+  }
 }
 
 #[cfg(test)]
@@ -223,7 +341,7 @@ mod tests {
     // Drop the entry so the next oracle starts clean.
     if let Ok(mut c) = cache().lock() {
       if let Some(e) = c.entries.remove(path) {
-        c.bytes -= e.source.len();
+        c.bytes -= e.cost();
       }
     }
   }
@@ -300,7 +418,7 @@ int main(void) {
     let _ = grep_cached_unpoliced(lang, "evict-b.c", &big_b);
     let cache = cache().lock().unwrap();
     assert!(cache.bytes <= policy().budget_bytes);
-    let total: usize = cache.entries.values().map(|e| e.source.len()).sum();
+    let total: usize = cache.entries.values().map(Entry::cost).sum();
     assert_eq!(total, cache.bytes, "byte accounting is exact");
   }
 }

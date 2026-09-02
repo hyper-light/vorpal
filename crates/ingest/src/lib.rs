@@ -13,6 +13,7 @@
 //! A single [`Ingestor`] is a single-writer-per-shard sink (§7.5); scale-out shards it by path.
 
 mod tree_cache;
+mod walk_reuse;
 mod manifest;
 mod outline_extractor;
 pub mod refspec_config;
@@ -140,6 +141,33 @@ pub use vorpal_resolve::Interner;
 /// The grammar-generation digest for the language of `path`, or `None` if the path maps to no
 /// supported language. The product-cache replay gate compares this against the digest a cached
 /// product was stamped with, so editing a grammar invalidates exactly its language's products.
+/// Diagnostic (see the `snapshot_mass` example): extract `path` three times through the
+/// tree cache so a walk snapshot is captured, then report its resident mass against the
+/// source size — the numbers that size the cache budget policy.
+pub fn snapshot_mass_probe(path: &str, source: &str) -> Option<String> {
+  let extractor = OutlineExtractor::new().ok()?;
+  for _ in 0..3 {
+    extractor.extract_product(path, source)?;
+  }
+  let product = extractor.extract_product(path, source)?;
+  let Some((bytes, rows, items)) = tree_cache::snapshot_stats(path) else {
+    return Some(format!(
+      "NO SNAPSHOT (error_nodes {}, items {}, refs {})",
+      product.error_nodes,
+      product.items.len(),
+      product.refs.len(),
+    ));
+  };
+  Some(format!(
+    "source {} B, snapshot {} B ({:.1}x), pending rows {}, items {}",
+    source.len(),
+    bytes,
+    bytes as f64 / source.len() as f64,
+    rows,
+    items,
+  ))
+}
+
 pub fn grammar_digest_for_path(path: &str) -> Option<u64> {
   vorpal_lang_registry::from_path(std::path::Path::new(path)).and_then(grammar_generation_for)
 }

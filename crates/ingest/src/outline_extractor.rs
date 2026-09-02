@@ -586,28 +586,159 @@ impl OutlineExtractor {
     } else {
       (0u32, 0u64, Vec::new())
     };
-    let mut items: Vec<OutlineItem<'_>> = combined
-      .map(|c| c.extract(grep.root()).collect())
-      .unwrap_or_default();
-    for sub in &injected {
-      let sub_lang = *sub.root().lang();
-      if let Some(sub_combined) = self.by_lang.get(sub_lang) {
-        items.extend(sub_combined.extract(sub.root()));
+    // ---- Walk reuse (incremental saves; see `walk_reuse` module docs) -----------------
+    // Claim the reuse context the parse may have armed — drained unconditionally so a
+    // stale snapshot never leaks to a later file on this worker thread.
+    let reuse = crate::tree_cache::take_reuse(path);
+    let identity = crate::extraction_identity(grammar_generation, self.rules_digest);
+    static WALK_REUSE: OnceLock<bool> = OnceLock::new();
+    let reuse_enabled = *WALK_REUSE
+      .get_or_init(|| !std::env::var_os("VORPAL_WALK_REUSE").is_some_and(|v| v == "0"));
+    let trace_reuse = std::env::var_os("VORPAL_WALK_REUSE_TRACE").is_some();
+    // Eligibility (C first): no injections in this file, no typefact captures (bindings
+    // provably stay empty), no request specs (the snapshot doesn't carry request rows),
+    // no nested item rules (their pass is full-tree by design) — exactly the shapes
+    // whose walk outputs are region-local plus globally rederivable. Parse ERRORS do
+    // not gate reuse: the incremental tree equals a fresh parse by the library contract
+    // (oracle-pinned on an error-carrying vendored giant), the error scan above already
+    // ran full-tree on the new parse, and rows near errors splice like any rows.
+    let eligible = reuse_enabled
+      && matches!(lang, SgLang::Builtin(vorpal_language::SupportLang::C))
+      && injected.is_empty()
+      && crate::references::resolved_typefacts(lang).is_none()
+      && combined.is_some_and(|c| !c.has_nested())
+      && spec.is_some_and(|s| s.spec.requests.is_empty());
+    // Whether to CAPTURE a snapshot for the next save: same shape constraints, and only
+    // for paths the tree cache actually retained (the save-loop's two-touch promotion).
+    let want_snap = eligible && crate::tree_cache::wants_snapshot(path);
+
+    // Reuse attempt, item side: resolve retained items around the dirty region and walk
+    // only the dirty top-level subtrees fresh. Any geometry violation abandons the whole
+    // attempt (`plan = None`) and the full path below runs unchanged.
+    let mut plan: Option<crate::walk_reuse::DirtyRegion> = None;
+    let mut merged_collected: Vec<(OutlineItem<'_>, Option<String>)> = Vec::new();
+    'reuse: {
+      if !eligible {
+        break 'reuse;
       }
+      let Some((snap, delta)) = reuse.as_ref() else {
+        break 'reuse;
+      };
+      if snap.identity != identity {
+        break 'reuse;
+      }
+      let Some(c) = combined else {
+        break 'reuse;
+      };
+      let Some(dirty) = crate::walk_reuse::compute_dirty(snap, delta) else {
+        break 'reuse;
+      };
+      let lines = crate::walk_reuse::LineIndex::new(source);
+      let Some((prefix_items, suffix_items)) =
+        crate::walk_reuse::split_items(snap, source, &dirty, &lines)
+      else {
+        if trace_reuse {
+          eprintln!("[walk-reuse] {path}: item split violated — full walk");
+        }
+        break 'reuse;
+      };
+      let mut fresh: Vec<(OutlineItem<'_>, Option<String>)> = Vec::new();
+      for child in grep.root().children() {
+        let range = child.range();
+        if (range.start as u32) < dirty.new.end && (range.end as u32) > dirty.new.start {
+          fresh.extend(c.extract_raw(child));
+        }
+      }
+      // Containment: every fresh item must sit inside the dirty span, or the region
+      // model missed something and reuse is off the table.
+      if fresh.iter().any(|(item, _)| {
+        (item.entry.range.byte_offset.start as u32) < dirty.new.start
+          || (item.entry.range.byte_offset.end as u32) > dirty.new.end
+      }) {
+        if trace_reuse {
+          eprintln!("[walk-reuse] {path}: fresh item escaped the dirty region — full walk");
+        }
+        break 'reuse;
+      }
+      if trace_reuse {
+        eprintln!(
+          "[walk-reuse] {path}: dirty old {}..{} new {}..{} — items {} retained + {} fresh",
+          dirty.old.start,
+          dirty.old.end,
+          dirty.new.start,
+          dirty.new.end,
+          prefix_items.len() + suffix_items.len(),
+          fresh.len(),
+        );
+      }
+      merged_collected = prefix_items;
+      merged_collected.extend(fresh);
+      merged_collected.extend(suffix_items);
+      plan = Some(dirty);
     }
-    if !injected.is_empty() {
-      // Canonical layout across trees: document order by span. Stable, so equal-start items
-      // keep host-then-injection order. Injection-free files never take this branch — their
-      // product bytes are exactly the single-tree extraction's.
-      items.sort_by_key(|item| {
-        (
-          item.entry.range.byte_offset.start,
-          item.entry.range.byte_offset.end,
-        )
-      });
+
+    // Snapshot capture, item side: the PRE-adoption pairs (either path) in owned form.
+    let mut cap_items: Option<Vec<crate::walk_reuse::SnapItem>> = None;
+    let mut items: Vec<OutlineItem<'_>>;
+    if plan.is_some() {
+      let c = combined.expect("reuse plan requires compiled outline rules");
+      if want_snap {
+        cap_items = Some(crate::walk_reuse::capture_items(&merged_collected, source));
+      }
+      items = c.adopt(merged_collected);
+    } else {
+      match (want_snap, combined) {
+        (true, Some(c)) => {
+          // `want_snap` implies `!has_nested`, so raw + adopt IS `extract`.
+          let collected = c.extract_raw(grep.root());
+          cap_items = Some(crate::walk_reuse::capture_items(&collected, source));
+          items = c.adopt(collected);
+        }
+        _ => {
+          items = combined
+            .map(|c| c.extract(grep.root()).collect())
+            .unwrap_or_default();
+        }
+      }
+      for sub in &injected {
+        let sub_lang = *sub.root().lang();
+        if let Some(sub_combined) = self.by_lang.get(sub_lang) {
+          items.extend(sub_combined.extract(sub.root()));
+        }
+      }
+      if !injected.is_empty() {
+        // Canonical layout across trees: document order by span. Stable, so equal-start items
+        // keep host-then-injection order. Injection-free files never take this branch — their
+        // product bytes are exactly the single-tree extraction's.
+        items.sort_by_key(|item| {
+          (
+            item.entry.range.byte_offset.start,
+            item.entry.range.byte_offset.end,
+          )
+        });
+      }
     }
 
     let (entities, spans) = local_layout(&items);
+
+    // Reuse attempt, row side (needs the NEW layout): remap retained attribution by
+    // definition span, split retained rows, carry retained signatures. Failure here
+    // keeps the reuse-built items (they are exact regardless) and runs the full walk.
+    let row_plan = match (&plan, reuse.as_ref()) {
+      (Some(dirty), Some((snap, _))) => {
+        let attempt = (|| {
+          let remap = crate::walk_reuse::entity_remap(snap, &spans, dirty)?;
+          let rows = crate::walk_reuse::split_rows(snap, source, dirty, &remap)?;
+          let sigs = crate::walk_reuse::retained_signatures(snap, dirty, &remap)?;
+          Some((rows, sigs))
+        })();
+        if attempt.is_none() && trace_reuse {
+          eprintln!("[walk-reuse] {path}: row split/remap violated — full reference walk");
+        }
+        attempt
+      }
+      _ => None,
+    };
 
     // Near-clone signatures (v16): every callable definition's leaf tokens stream into a
     // sketch during the reference walk. The seed is the grammar generation, so tokens of
@@ -621,7 +752,7 @@ impl OutlineExtractor {
           kinds.push(vorpal_kg::SymbolKind::from_symbol_type(member.entry.symbol_type, false));
         }
       }
-      let signable: Vec<(std::ops::Range<usize>, u32)> = spans
+      let mut signable: Vec<(std::ops::Range<usize>, u32)> = spans
         .iter()
         .filter(|(_, id)| {
           matches!(
@@ -635,24 +766,170 @@ impl OutlineExtractor {
         })
         .map(|(range, id)| (range.clone(), id.raw() as u32))
         .collect();
+      // Row reuse: retained definitions keep their snapshot sketches — the regional
+      // signer signs only the dirty region's definitions.
+      if let (Some(_), Some(dirty)) = (&row_plan, &plan) {
+        signable.retain(|(range, _)| {
+          (range.start as u32) >= dirty.new.start && (range.end as u32) <= dirty.new.end
+        });
+      }
       (!signable.is_empty()).then(|| crate::signature::Signer::new(grammar_generation, signable))
     };
 
     let mut raw = Vec::new();
     let mut bindings = Vec::new();
     let mut raw_requests = Vec::new();
+    // A walk held back from finalize: capture reads its pre-finalize rows, then the
+    // global laws run into `raw` — identical outcome to the fused entry point.
+    let mut open_walk: Option<crate::references::RefWalk<'_>> = None;
+    // Signatures resolved by the reuse path (retained + regional); `None` = the common
+    // `signer.finish()` below applies.
+    let mut reuse_sigs: Option<Vec<product::ProductSignature>> = None;
     match spec {
-      Some(spec) => extract_references_with_facts(
-        grep.root(),
-        spec,
-        crate::references::resolved_typefacts(lang),
-        &spans,
-        &entities,
-        &mut raw,
-        &mut bindings,
-        &mut raw_requests,
-        signer.as_mut(),
-      ),
+      Some(spec) => {
+        let mut spliced = false;
+        if let (Some((rows, retained_sigs)), Some(dirty)) = (row_plan, &plan) {
+          // Regional walk: fresh rows from the dirty top-level subtrees only, ancestors
+          // seeded with the tree root so parent-sensitive dispatch matches a full walk.
+          let root_node = grep.root();
+          let mut fresh = crate::references::RefWalk::default();
+          for child in root_node.children() {
+            let range = child.range();
+            if (range.start as u32) < dirty.new.end && (range.end as u32) > dirty.new.start {
+              crate::references::walk_reference_tree(
+                child,
+                Some(root_node.clone()),
+                spec,
+                crate::references::resolved_typefacts(lang),
+                &spans,
+                &entities,
+                &mut fresh,
+                &mut bindings,
+                &mut raw_requests,
+                signer.as_mut(),
+              );
+            }
+          }
+          // Splice invariants, checked before anything merges: every fresh row and
+          // binder inside the dirty span; no binding/request rows (the eligibility
+          // gates promise none exist for this language shape).
+          let contained = fresh
+            .pending
+            .iter()
+            .all(|row| row.start() >= dirty.new.start && row.end() <= dirty.new.end)
+            && fresh.binders.iter().all(|(scope, _)| {
+              (scope.start as u32) >= dirty.new.start && (scope.end as u32) <= dirty.new.end
+            })
+            && bindings.is_empty()
+            && raw_requests.is_empty();
+          if contained {
+            let mut merged = crate::references::RefWalk {
+              pending: rows.prefix_pending,
+              binders: rows.prefix_binders,
+            };
+            merged
+              .pending
+              .reserve(fresh.pending.len() + rows.suffix_pending.len());
+            merged.pending.append(&mut fresh.pending);
+            merged.pending.extend(rows.suffix_pending);
+            merged
+              .binders
+              .reserve(fresh.binders.len() + rows.suffix_binders.len());
+            merged.binders.append(&mut fresh.binders);
+            merged.binders.extend(rows.suffix_binders);
+            // Signatures: retained sketches under their new ids + the regional signer's
+            // fresh ones, in the entity order `Signer::finish` produces.
+            let mut sigs = retained_sigs;
+            if let Some(signer) = signer.take() {
+              sigs.extend(signer.finish().into_iter().map(|(entity_index, sketch)| {
+                product::ProductSignature {
+                  entity_index,
+                  shingles: sketch.shingles,
+                  sketch: sketch.bins,
+                }
+              }));
+            }
+            sigs.sort_unstable_by_key(|s| s.entity_index);
+            reuse_sigs = Some(sigs);
+            open_walk = Some(merged);
+            spliced = true;
+            crate::walk_reuse::SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+          } else {
+            // Invariant violation: rebuild a FULL signer (the regional one signed only
+            // dirty spans) and fall through to the full walk. This is the safety net —
+            // the oracle battery exists to keep it unexercised.
+            crate::walk_reuse::FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if trace_reuse {
+              eprintln!("[walk-reuse] {path}: splice invariants violated — full reference walk");
+            }
+            bindings.clear();
+            raw_requests.clear();
+            signer = {
+              let signable: Vec<(std::ops::Range<usize>, u32)> = {
+                let mut kinds: Vec<vorpal_kg::SymbolKind> = Vec::with_capacity(spans.len());
+                kinds.push(vorpal_kg::SymbolKind::File);
+                for item in &items {
+                  kinds.push(vorpal_kg::SymbolKind::from_symbol_type(
+                    item.entry.symbol_type,
+                    item.is_import,
+                  ));
+                  for member in &item.members {
+                    kinds
+                      .push(vorpal_kg::SymbolKind::from_symbol_type(member.entry.symbol_type, false));
+                  }
+                }
+                spans
+                  .iter()
+                  .filter(|(_, id)| {
+                    matches!(
+                      kinds.get(id.raw() as usize),
+                      Some(
+                        vorpal_kg::SymbolKind::Function
+                          | vorpal_kg::SymbolKind::Method
+                          | vorpal_kg::SymbolKind::Constructor
+                      )
+                    )
+                  })
+                  .map(|(range, id)| (range.clone(), id.raw() as u32))
+                  .collect()
+              };
+              (!signable.is_empty())
+                .then(|| crate::signature::Signer::new(grammar_generation, signable))
+            };
+          }
+        }
+        if !spliced {
+          if want_snap {
+            // Full walk, held open so capture can read the pre-finalize rows.
+            let mut walk = crate::references::RefWalk::default();
+            crate::references::walk_reference_tree(
+              grep.root(),
+              None,
+              spec,
+              crate::references::resolved_typefacts(lang),
+              &spans,
+              &entities,
+              &mut walk,
+              &mut bindings,
+              &mut raw_requests,
+              signer.as_mut(),
+            );
+            open_walk = Some(walk);
+          } else {
+            extract_references_with_facts(
+              grep.root(),
+              spec,
+              crate::references::resolved_typefacts(lang),
+              &spans,
+              &entities,
+              &mut raw,
+              &mut bindings,
+              &mut raw_requests,
+              signer.as_mut(),
+            );
+          }
+        }
+      }
       None => {
         // No reference spec: the signatures still need the token stream.
         if let Some(signer) = signer.as_mut() {
@@ -689,19 +966,42 @@ impl OutlineExtractor {
         }
       }
     }
-    let signatures: Vec<product::ProductSignature> = signer
-      .map(|signer| {
-        signer
-          .finish()
-          .into_iter()
-          .map(|(entity_index, sketch)| product::ProductSignature {
-            entity_index,
-            shingles: sketch.shingles,
-            sketch: sketch.bins,
-          })
-          .collect()
-      })
-      .unwrap_or_default();
+    let signatures: Vec<product::ProductSignature> = match reuse_sigs {
+      Some(sigs) => sigs,
+      None => signer
+        .map(|signer| {
+          signer
+            .finish()
+            .into_iter()
+            .map(|(entity_index, sketch)| product::ProductSignature {
+              entity_index,
+              shingles: sketch.shingles,
+              sketch: sketch.bins,
+            })
+            .collect()
+        })
+        .unwrap_or_default(),
+    };
+    // A held-open walk (capture and/or splice) finalizes here: capture the pre-finalize
+    // rows for the NEXT save, then run the file-global laws — the same laws the fused
+    // entry point runs, over the same emission-order rows.
+    if let Some(walk) = open_walk {
+      if want_snap {
+        if let Some(cap_items) = cap_items.take() {
+          let snapshot = crate::walk_reuse::WalkSnapshot {
+            source_xxh3: xxhash_rust::xxh3::xxh3_64(source.as_bytes()),
+            identity,
+            items: cap_items,
+            pending: crate::walk_reuse::capture_pending(&walk.pending, source),
+            binders: crate::walk_reuse::capture_binders(&walk.binders, source),
+            signatures: signatures.clone(),
+            spans: crate::walk_reuse::capture_spans(&spans),
+          };
+          crate::tree_cache::store_snapshot(path, Box::new(snapshot));
+        }
+      }
+      crate::references::finalize_references(walk, &mut raw);
+    }
     if !injected.is_empty() {
       // Same canonicalization for references (attribution reads spans, so order is free to
       // normalize); untouched for injection-free files.

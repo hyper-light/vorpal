@@ -144,6 +144,42 @@ impl<L: Language> CombinedExtractors<L> {
       .map(|&idx| &self.item_extractors[idx])
   }
 
+  /// The raw item traversal over one subtree: PRE-adoption `(item, memberOf owner)`
+  /// pairs in document order. [`CombinedExtractors::extract`] composes this with
+  /// [`CombinedExtractors::adopt`]; walk reuse calls it per dirty top-level subtree and
+  /// splices retained pairs around the result before adopting.
+  pub fn extract_raw<'tree>(
+    &self,
+    root: Node<'tree, StrDoc<L>>,
+  ) -> Vec<(OutlineItem<'tree>, Option<String>)>
+  where
+    L: LanguageExt,
+  {
+    OutlineItemIter {
+      combined: self,
+      traversal: Prune::new(&root),
+      scratch: MetaVarEnv::new(),
+      render_scratch: RenderScratch::<StrDoc<L>>::new(),
+    }
+    .collect()
+  }
+
+  /// The `memberOf` adoption pass over a complete file's collected pairs (see
+  /// [`adopt_members`]) — file-global by design, so a spliced collection adopts
+  /// identically to a fresh one. Takes `&self` only for inference-friendly call sites.
+  pub fn adopt<'tree>(
+    &self,
+    collected: Vec<(OutlineItem<'tree>, Option<String>)>,
+  ) -> Vec<OutlineItem<'tree>> {
+    adopt_members(collected)
+  }
+
+  /// Whether this language declares `nested: true` item rules (their dedicated full-tree
+  /// pass makes item extraction non-regional — walk reuse must fall back).
+  pub fn has_nested(&self) -> bool {
+    self.nested_kind_index.iter().any(|list| !list.is_empty())
+  }
+
   pub fn extract<'a, 'tree>(
     &'a self,
     root: Node<'tree, StrDoc<L>>,
@@ -154,13 +190,7 @@ impl<L: Language> CombinedExtractors<L> {
     // Materialize, then run the semantic-adoption pass (`memberOf` rules): items whose
     // declared owner is a same-file item become its members — Go's detached methods being
     // the motivating shape. File item counts are small; the traversal cost is identical.
-    let collected: Vec<(OutlineItem<'tree>, Option<String>)> = OutlineItemIter {
-      combined: self,
-      traversal: Prune::new(&root),
-      scratch: MetaVarEnv::new(),
-      render_scratch: RenderScratch::<StrDoc<L>>::new(),
-    }
-    .collect();
+    let collected: Vec<(OutlineItem<'tree>, Option<String>)> = self.extract_raw(root.clone());
     let mut items = adopt_members(collected);
     // Nested rules (`nested: true`): a dedicated full-tree pass, because the pruned item
     // traversal above never enters a matched item's subtree — exactly where route

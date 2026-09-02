@@ -19,6 +19,7 @@ serde.workspace = true
 serde_yaml.workspace = true
 vorpal-language.workspace = true
 vorpal-resolve.workspace = true
+memchr = "2"
 
 blake3.workspace = true
 crossbeam-channel.workspace = true

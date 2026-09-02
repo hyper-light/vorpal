@@ -4263,6 +4263,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",
  "ignore",
+ "memchr",
  "rayon",
  "serde",
  "serde_yaml",

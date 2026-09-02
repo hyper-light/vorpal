@@ -1741,6 +1741,7 @@ pub(crate) enum Pending<'t> {
     start: u32,
     end: u32,
   },
+  // (span accessors for the walk-reuse containment check live below the enum)
   /// An `implements` candidate awaiting the post-pass (from, name) first-wins dedup —
   /// deferred (rather than deduped at emission) so a region-scoped walk can merge its
   /// rows with reused rows before the file-global law runs.
@@ -1750,6 +1751,24 @@ pub(crate) enum Pending<'t> {
     start: u32,
     end: u32,
   },
+}
+
+impl Pending<'_> {
+  /// The emitting node's byte span — walk reuse verifies every fresh row lands inside
+  /// the dirty region with these.
+  pub(crate) fn start(&self) -> u32 {
+    match self {
+      Pending::Ready(r) => r.start,
+      Pending::TypeUse { start, .. } | Pending::ImplUse { start, .. } => *start,
+    }
+  }
+
+  pub(crate) fn end(&self) -> u32 {
+    match self {
+      Pending::Ready(r) => r.end,
+      Pending::TypeUse { end, .. } | Pending::ImplUse { end, .. } => *end,
+    }
+  }
 }
 
 /// Emit `calls` and `imports` references from the parse tree — one fused traversal (§12):

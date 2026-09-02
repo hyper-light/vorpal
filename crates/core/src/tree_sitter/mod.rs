@@ -113,8 +113,28 @@ impl<L: LanguageExt> StrDoc<L> {
     lang: L,
     history: Option<(&str, &Tree)>,
   ) -> Result<Self, String> {
+    Ok(Self::incremental_inner(src, lang, history, false)?.0)
+  }
+
+  /// [`StrDoc::try_new_incremental`] that also reports the reparse's delta — the spanning
+  /// textual edit plus tree-sitter's own changed-range verdict — when history was actually
+  /// used. `None` delta means a plain whole parse ran (no history).
+  pub fn try_new_incremental_ranged(
+    src: &str,
+    lang: L,
+    history: Option<(&str, &Tree)>,
+  ) -> Result<(Self, Option<IncrementalDelta>), String> {
+    Self::incremental_inner(src, lang, history, true)
+  }
+
+  fn incremental_inner(
+    src: &str,
+    lang: L,
+    history: Option<(&str, &Tree)>,
+    want_delta: bool,
+  ) -> Result<(Self, Option<IncrementalDelta>), String> {
     let Some((old_src, old_tree)) = history else {
-      return Self::try_new(src, lang);
+      return Ok((Self::try_new(src, lang)?, None));
     };
     let ts_lang = lang.get_ts_language();
     let old = old_src.as_bytes();
@@ -148,7 +168,17 @@ impl<L: LanguageExt> StrDoc<L> {
     let src = src.to_string();
     let tree = parse_lang(|p| p.parse(src.as_bytes(), Some(&seed)), ts_lang.clone())
       .map_err(|e| e.to_string())?;
-    Ok(Self { src, lang, tree })
+    let delta = want_delta.then(|| IncrementalDelta {
+      prefix,
+      suffix,
+      old_len: old.len(),
+      new_len: new.len(),
+      changed: seed
+        .changed_ranges(&tree)
+        .map(|r| r.start_byte..r.end_byte)
+        .collect(),
+    });
+    Ok((Self { src, lang, tree }, delta))
   }
   fn parse(&self, old_tree: Option<&Tree>) -> Result<Tree, TSParseError> {
     let source = self.get_source();
@@ -390,6 +420,23 @@ pub trait LanguageExt: Language {
   }
 }
 
+/// One incremental reparse's delta report: the spanning textual edit (common prefix /
+/// implied suffix over old and new lengths) plus tree-sitter's own changed-range verdict.
+/// `changed` is in NEW-source byte coordinates; everything outside those ranges is
+/// structurally identical to the old tree — only byte positions shift by the edit delta.
+#[derive(Debug, Clone)]
+pub struct IncrementalDelta {
+  /// Longest common byte prefix of old and new sources.
+  pub prefix: usize,
+  /// Longest common byte suffix of the post-prefix remainders — the spanning edit
+  /// replaced OLD `[prefix, old_len - suffix)` with NEW `[prefix, new_len - suffix)`.
+  pub suffix: usize,
+  pub old_len: usize,
+  pub new_len: usize,
+  /// Syntax-differing byte ranges of the NEW source, per `ts_tree_get_changed_ranges`.
+  pub changed: Vec<std::ops::Range<usize>>,
+}
+
 fn position_for_offset(input: &[u8], offset: usize) -> Point {
   debug_assert!(offset <= input.len());
   let (mut row, mut col) = (0, 0);
@@ -456,6 +503,16 @@ impl<L: LanguageExt> Root<StrDoc<L>> {
     Ok(Self {
       doc: StrDoc::try_new_incremental(src, lang, history)?,
     })
+  }
+
+  /// [`StrDoc::try_new_incremental_ranged`], wrapped as a root.
+  pub fn try_new_incremental_ranged(
+    src: &str,
+    lang: L,
+    history: Option<(&str, &Tree)>,
+  ) -> Result<(Self, Option<IncrementalDelta>), String> {
+    let (doc, delta) = StrDoc::try_new_incremental_ranged(src, lang, history)?;
+    Ok((Self { doc }, delta))
   }
 
   /// The parse state a tree cache retains: this root's source and its tree (clone the
