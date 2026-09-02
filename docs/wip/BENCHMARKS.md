@@ -2049,11 +2049,47 @@ that puts the learned tier ABOVE the lexical tier on today's kernel graph (0.313
 kernel warm 217 s vs 224 s exclude in this contended run), bit-identical on cpython,
 and −0.03 on this repo from a single conjunctive query ("louvain community size cap"
 → `cut`, where the tier only re-ranks a lexically-supported conjunction). Not a
-dominance; the kernel is the design-floor corpus. DISPOSITION: `LEARNED_TRAIN_KINDS`
-stays `All` pending the owner's pin decision — pinning `BalanceToCallables` also needs
-the policy label carried in `ann.model.json` so the freshness gate retrains on a flip
-(the retrofit-label precedent). Both policies ship behind the sweep env as measured
-seams.
+dominance; the kernel is the design-floor corpus. DISPOSITION (owner: "Item 2. Do
+item 2."): **`LEARNED_TRAIN_KINDS = BalanceToCallables` PINNED.** The policy label
+now rides in `ann.model.json` (`train_kinds`; pre-policy files read as `"all"`) and
+the learned freshness gate demands the active label, so every existing learned tier
+retrains under the new binary instead of serving a model the code would no longer
+produce. Proved live on cpython: fresh warm trains and stamps `balance`; a control
+re-warm no-ops (0 train starts); the same record with the field removed (a
+pre-policy file) retrains and re-stamps. Re-verified under the pinned binary (fresh
+indexes + warms): see the "pinned" rows appended below. The other two policies stay
+reachable through the sweep env as measured seams.
+
+Pinned-binary re-verification (fresh `--semantic-tier learned` index + warm per
+corpus, `train_kinds: balance` in every record, no encoder):
+
+| corpus · pinned learned | NDCG@10 | MRR | recall@5 | note |
+|---|---:|---:|---:|---|
+| kernel | **0.313** | **0.346** | **0.250** | reproduces the A/B exactly; short-kw 0.222 / 0.253 / 0.143; BM25 gate off |
+| cpython | **0.412** | **0.528** | **0.333** | identical to `All` (no kind exceeds the callable cap); BM25 gate on |
+| vorpal | **0.612** | **0.614** | **0.550** | BM25 gate OFF this warm (the A/B's 0.529 had it on); subset 1.0, conjunctive 0.333 |
+
+The vorpal row moved because its corpus is this working tree (edited between the A/B
+and the pin) and the BM25 gate's verdict flipped with it — the self-index is a
+convenience corpus, not a pinned one; kernel and cpython are the pinned truth. Net:
+on the design-floor corpus the learned tier now beats the lexical tier (0.313 vs
+0.299), and on the small corpora it matches or beats it (0.412 vs 0.137; 0.612 vs
+0.571).
+
+Encoder rows re-measured on the pinned learned base (the README's third column):
+
+| corpus · pinned learned + encoder | f32 | f16 |
+|---|---:|---:|
+| kernel | 0.222 / 0.294 / 0.208 | 0.227 / 0.294 / 0.208 |
+| cpython | 0.410 / 0.556 / 0.500 | 0.410 / 0.556 / 0.500 |
+| vorpal | 0.622 / 0.625 / 0.650 | 0.622 / 0.625 / 0.650 |
+
+The kernel verdict stands (encoder off there: 0.313 without vs 0.222 with — `vorpal
+tune` will say OFF); on this repo the encoder adds recall (0.55 → 0.65) over the
+pinned learned base. f16 vs f32: identical on two corpora, one adjacent-rank swap on
+one kernel query (NDCG 0.222 vs 0.227) — the first cell-level difference observed;
+consistent with the ≤1 % drift bar and the README now says "rank the same" rather
+than "bit-for-bit".
 
 ### vs codebase-memory-mcp (same machine, same checkouts, same labels, same metrics)
 

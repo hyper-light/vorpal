@@ -252,30 +252,34 @@ opt-in tiers sit above it: a **learned static tier** trained from the corpus its
 during the warm (subword co-occurrence factorization, refined over the graph's own
 edges; no download either), and a **neural encoder** (CodeRankEmbed, MIT) that reranks
 the fused top-k at query time — `semantic-f32` uses the upstream 547 MB weights,
-`semantic-f16` a locally converted 274 MB copy. **The two encoder sizes rank
-identically** (embedding drift after conversion: cosine 1.000000; the tables below are
-bit-for-bit equal between them) — they differ only in disk and resident memory.
+`semantic-f16` a locally converted 274 MB copy. **The two encoder sizes rank the
+same** (embedding drift after conversion: cosine 1.000000; identical tables below on
+CPython and this repo, one adjacent-rank swap on one kernel query) — they differ in
+disk and resident memory, not in quality.
 
 Graded retrieval on three corpora with the bundled labelled query sets
 (`xtask/labels/`, graded relevance 1–3; metrics NDCG@10 / MRR / recall@5, exact
 determinism gate on every run; `cargo xtask searcheval`):
 
-| Corpus (queries) | Lexical (default) | + learned tier | + encoder (f16 = f32) |
+| Corpus (queries) | Lexical (default) | + learned tier | + encoder (f16 ≈ f32) |
 |---|---:|---:|---:|
-| Linux kernel, 8.9 M defs (8) | 0.299 / 0.375 / 0.229 | 0.295 / 0.305 / 0.250 | 0.244 / 0.288 / 0.167 |
+| Linux kernel, 8.9 M defs (8) | 0.299 / 0.375 / 0.229 | **0.313 / 0.346 / 0.250** | 0.222 / 0.294 / 0.208 |
 | CPython, 163 K defs (6) | 0.137 / 0.208 / 0.250 | **0.412 / 0.528 / 0.333**¹ | **0.410 / 0.556 / 0.500** |
-| This repo, 79 K defs (10) | 0.571 / 0.560 / 0.550 | 0.559 / 0.550 / 0.550¹ | **0.648 / 0.625 / 0.750** |
+| This repo, 79 K defs (10) | 0.571 / 0.560 / 0.550 | 0.612 / 0.614 / 0.550 | **0.622 / 0.625 / 0.650** |
 
 The tiers are **per-corpus decisions, not upgrades**: the learned tier triples
 CPython's descriptive-query quality (NDCG 0.036 → 0.475 on "bytecode evaluation loop"-
-style questions) and is neutral on the kernel and this repo; the encoder lifts recall@5
-to 0.50 on CPython and 0.75 on this repo but *lowers* the kernel's short-keyword class,
-whose answers live in subword identifiers the encoder re-orders. That is exactly what
-`vorpal tune` measures on your own queries before it writes anything — it enables a
-tier only when the mean strictly improves and wins ≥ losses, never on a tie.
+style questions) and edges past lexical on the kernel and this repo — it trains on
+every kind of definition balanced to the callable population, so the kernel's 5.9 M
+macros no longer drown its 1 M functions; the
+encoder lifts recall@5 to 0.50 on CPython and 0.65 on this repo but *lowers* the
+kernel's short-keyword class, whose answers live in subword identifiers the encoder
+re-orders. That is exactly what `vorpal tune` measures on your own queries before it
+writes anything — it enables a tier only when the mean strictly improves and
+wins ≥ losses, never on a tie.
 
 ¹ The learned warm also runs a per-corpus BM25 gate (paired probes, enabled only on
-strong evidence); it enabled itself on CPython and this repo, not on the kernel.
+strong evidence); it enabled itself on CPython, not on the kernel or this repo.
 
 ### Search latency and memory, per tier
 

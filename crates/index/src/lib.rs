@@ -2281,6 +2281,11 @@ struct PersistedTierRecord {
   /// unretrofitted, and for every pre-retrofit file) — part of the tier's identity:
   /// a form change in code must retrain, never serve mixed row semantics.
   retrofit: String,
+  /// The training kind policy the learned model was fitted under ("all" for every
+  /// pre-policy file) — part of the tier's identity for the same reason: a policy
+  /// change in code retrains old tiers instead of serving a model the code would
+  /// no longer produce.
+  train_kinds: String,
   /// Per-corpus BM25 fourth-list verdict from the warm-time self-probe gate:
   /// `None` = never gated (pre-gate file, or a crash before the gate ran) — healed
   /// like calibration on the next warm; `Some(v)` = gated, `v` enables the list.
@@ -2331,6 +2336,12 @@ fn persisted_tier_record(index_dir: &Path) -> Option<PersistedTierRecord> {
   // The `bm25_gate` sibling in the file is the verdict's evidence line for humans
   // and benches — deliberately unread: a mangled evidence string must never wedge
   // an otherwise coherent tier.
+  // Pre-policy files carry no field: they were trained on every kind ("all").
+  let train_kinds = value
+    .get("train_kinds")
+    .and_then(|label| label.as_str())
+    .unwrap_or("all")
+    .to_string();
   Some(PersistedTierRecord {
     provenance,
     tier,
@@ -2338,6 +2349,7 @@ fn persisted_tier_record(index_dir: &Path) -> Option<PersistedTierRecord> {
     note,
     retrofit,
     bm25,
+    train_kinds,
   })
 }
 
@@ -2350,12 +2362,14 @@ pub fn persisted_model_provenance(index_dir: &Path) -> Option<ModelProvenance> {
 /// Persist the tier record — written before the stamp commit, so a committed stamp
 /// always implies a readable record. Canonical field order keeps the file
 /// byte-reproducible; `note` appears only on stated fallbacks.
+#[allow(clippy::too_many_arguments)] // one parameter per identity field of the tier record
 fn write_model_provenance(
   index_dir: &Path,
   provenance: &ModelProvenance,
   tier: &str,
   weights_hash: Option<u128>,
   retrofit: &str,
+  train_kinds: &str,
   bm25: Option<(bool, &str)>,
   note: Option<&str>,
 ) -> io::Result<()> {
@@ -2375,7 +2389,7 @@ fn write_model_provenance(
     None => String::new(),
   };
   let json = format!(
-    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{},\"tier\":{},\"weights_hash\":{},\"retrofit\":{}{}{}}}\n",
+    "{{\"model_id\":{},\"dim\":{},\"normalization\":{},\"version\":{},\"learned\":{},\"tier\":{},\"weights_hash\":{},\"retrofit\":{},\"train_kinds\":{}{}{}}}\n",
     serde_json::Value::String(provenance.model_id.clone()),
     provenance.dim,
     serde_json::Value::String(provenance.normalization.clone()),
@@ -2384,6 +2398,7 @@ fn write_model_provenance(
     serde_json::Value::String(tier.to_string()),
     weights,
     serde_json::Value::String(retrofit.to_string()),
+    serde_json::Value::String(train_kinds.to_string()),
     bm25_fields,
     note_field,
   );
@@ -2593,9 +2608,13 @@ fn ann_is_fresh(index_dir: &Path, current_stamp: u64, selection: SemanticTier) -
             .note
             .as_deref()
             .is_some_and(|note| note.contains("retrofit disabled")));
+      // The training kind policy is identity too: a pre-policy record reads "all",
+      // so flipping the pinned policy in code retrains every existing learned tier
+      // (the forgotten-bump lesson, applied before the fact).
       selection == SemanticTier::Learned
         && record.provenance.learned
         && retrofit_ok
+        && record.train_kinds == active_train_kinds_label()
         && record.weights_hash.is_some_and(|expected| {
           LearnedStaticEmbedder::open_mapped(&index_dir.join("ann.model.bin"))
             .is_ok_and(|(_, stored)| stored == expected)
@@ -2669,6 +2688,7 @@ fn ensure_bm25_gate(index_dir: &Path, current_stamp: u64) -> Result<(), Box<dyn 
     &record.tier,
     record.weights_hash,
     &record.retrofit,
+    &record.train_kinds,
     Some((enabled, &evidence)),
     record.note.as_deref(),
   )?;
@@ -2690,6 +2710,7 @@ pub fn set_bm25_override(index_dir: &Path, enabled: bool, evidence: &str) -> Res
     &record.tier,
     record.weights_hash,
     &record.retrofit,
+    &record.train_kinds,
     Some((enabled, evidence)),
     record.note.as_deref(),
   )
@@ -2808,6 +2829,7 @@ fn ensure_ann(index_dir: &Path, selection: SemanticTier) -> Result<(), Box<dyn E
     embedder.tier_label(),
     weights_hash,
     &retrofit_label,
+    active_train_kinds_label(),
     // The BM25 verdict gates AFTER the stamp commits (the gate probes a fully
     // servable generation); `None` = not yet gated — filled below, healed on
     // later warms if a crash lands between.
@@ -3836,7 +3858,29 @@ enum TrainKindPolicy {
   BalanceToCallables,
 }
 
-const LEARNED_TRAIN_KINDS: TrainKindPolicy = TrainKindPolicy::All;
+/// PINNED `BalanceToCallables` by measurement (owner decision 2026-09-02, BENCHMARKS
+/// "Learned-tier kind policy A/B"): kernel learned tier 0.295 → 0.313 NDCG@10 (first
+/// time above lexical on the 8.9 M-node graph), protected short-keyword 0.202 →
+/// 0.222; cpython bit-identical; this repo −0.03 on one conjunctive query (the stated
+/// exception). The label rides in `ann.model.json` (`train_kinds`) so a policy flip
+/// retrains every existing learned tier.
+const LEARNED_TRAIN_KINDS: TrainKindPolicy = TrainKindPolicy::BalanceToCallables;
+
+impl TrainKindPolicy {
+  fn label(self) -> &'static str {
+    match self {
+      TrainKindPolicy::All => "all",
+      TrainKindPolicy::ExcludeMacros => "exclude-macros",
+      TrainKindPolicy::BalanceToCallables => "balance",
+    }
+  }
+}
+
+/// The training kind policy label written into the tier record and demanded by the
+/// learned freshness gate.
+fn active_train_kinds_label() -> &'static str {
+  train_kind_policy().label()
+}
 
 fn train_kind_policy() -> TrainKindPolicy {
   #[cfg(feature = "bench-internals")]
