@@ -114,7 +114,7 @@ mod jemalloc_conf {
 use vorpal_index::search_index;
 
 const USAGE: &str = "usage:
-  vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F] [--semantic-tier lexical|learned] [--dense-budget-secs N]
+  vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F] [--semantic-tier lexical|learned] [--dense-budget-timeout 1h|5m30s|90s|<secs>]
                                                     build + persist a knowledge graph
   vorpal-index export       <index-root> <file.vidx>  pack the live generation into one shareable artifact
   vorpal-index import       <file.vidx> <index-root>  verify + install an exported generation (atomic CURRENT swap)
@@ -255,16 +255,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
               }
             });
           }
-          "--dense-budget-secs" => {
-            // The doc-side dense channel's warm budget (vorpal_index::dense — the
-            // token-based coverage rule), persisted at the ROOT like the tier
-            // selection so every later warm builds the sidecar without being told.
+          "--dense-budget-timeout" => {
+            // An explicit cap on each round of the dense channel's background fill
+            // (vorpal_index::dense), persisted at the ROOT like the tier selection.
+            // Human durations (`1h`, `5m30s`, `90s`, `2h15m`) or plain seconds;
+            // malformed input is refused with the accepted forms.
+            let text = flags
+              .next()
+              .ok_or("--dense-budget-timeout wants a duration (e.g. 1h, 5m30s, 90s)")?;
             dense_budget = Some(
-              flags
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|secs| *secs > 0.0)
-                .ok_or("--dense-budget-secs wants a positive number of seconds")?,
+              vorpal_index::duration::parse_duration(text)
+                .map_err(|err| format!("--dense-budget-timeout {err}"))?,
             );
           }
           other => return Err(format!("unknown flag '{other}'\n{USAGE}").into()),
@@ -272,7 +273,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       }
       if let Some(secs) = dense_budget {
         vorpal_index::write_dense_budget(Path::new(out), secs)?;
-        println!("dense channel warm budget: {secs} s");
+        println!(
+          "dense channel fill cap: {}",
+          vorpal_index::duration::render_duration(secs)
+        );
       }
       if let Some(tier) = semantic_tier {
         vorpal_index::write_tier_selection(Path::new(out), tier)?;

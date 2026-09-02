@@ -66,6 +66,79 @@ impl GemmPath {
   }
 }
 
+/// Wall-clock stage attribution for one forward — printed to stderr when
+/// `VORPAL_ENCODER_TRACE` is set (read once). Measurement aid only: it decides
+/// nothing and costs six `Instant::now()` calls per layer.
+#[derive(Default)]
+struct StageClock {
+  enabled: bool,
+  gemm: f64,
+  attention: f64,
+  gate: f64,
+  norm: f64,
+  other: f64,
+}
+
+impl StageClock {
+  fn new() -> StageClock {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    StageClock {
+      enabled: *ENABLED.get_or_init(|| std::env::var_os("VORPAL_ENCODER_TRACE").is_some()),
+      ..StageClock::default()
+    }
+  }
+
+  fn time<T>(&mut self, slot: fn(&mut StageClock) -> &mut f64, work: impl FnOnce() -> T) -> T {
+    if !self.enabled {
+      return work();
+    }
+    let started = std::time::Instant::now();
+    let out = work();
+    *slot(self) += started.elapsed().as_secs_f64();
+    out
+  }
+
+  fn report(&self, path: GemmPath, tokens: usize) {
+    if self.enabled {
+      let total = self.gemm + self.attention + self.gate + self.norm + self.other;
+      eprintln!(
+        "encoder trace ({}, {tokens} tokens): gemm {:.3}s attention {:.3}s gate {:.3}s norm {:.3}s other {:.3}s = {:.3}s",
+        path.label(),
+        self.gemm,
+        self.attention,
+        self.gate,
+        self.norm,
+        self.other,
+        total
+      );
+    }
+  }
+}
+
+/// A fast, deterministic f32 `exp` for the throughput path's SwiGLU gate — the
+/// Cephes `expf` polynomial (range-reduced by `ln 2`, degree-5 remainder, the
+/// exponent rebuilt from bits; relative error ≈ 2 × 10⁻⁷, below one f32 ulp at
+/// the gate's scale), written so the compiler vectorizes it across a row.
+/// Measured motivation: the f64 libm `exp` over tokens × 3072 × 12 layers was
+/// the largest single frame in the fill's profile. The fixed-order path keeps
+/// the f64 gate — its bits are the query-side law.
+#[inline]
+fn exp_fast(x: f32) -> f32 {
+  const LOG2E: f32 = 1.442_695_04;
+  const LN2_HI: f32 = 0.693_359_375;
+  const LN2_LO: f32 = -2.121_944_4e-4;
+  let x = x.clamp(-87.0, 88.0);
+  let n = (x * LOG2E).round();
+  let r = x - n * LN2_HI - n * LN2_LO;
+  let p = ((((1.987_569_2e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
+    + 1.666_666_5e-1)
+    * r
+    + 5.000_000_1e-1;
+  let p = p * r * r + r + 1.0;
+  let scale = f32::from_bits(((n as i32 + 127) as u32) << 23);
+  p * scale
+}
+
 /// Apple Accelerate's row-major `cblas_sgemm` (the framework ships with every
 /// macOS SDK; AMX-backed on Apple silicon). Linked only on macOS — nothing else
 /// in the crate references the framework.
@@ -178,8 +251,34 @@ fn gemm(
   Ok(())
 }
 
+/// How many row-shards each throughput GEMM splits into, each shard an
+/// independent `cblas_sgemm` call on a rayon worker (Accelerate is thread-safe;
+/// output rows are disjoint). 0 = derive at first use from
+/// `available_parallelism()` (the shard sweep in `examples/sweep_encoder.rs` sets
+/// it explicitly; its recorded result pins the derivation).
+static THROUGHPUT_SHARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the throughput GEMM's shard count (bench seam; 0 restores the derived
+/// default). Row shards never change a result: every output row's reduction runs
+/// inside one `cblas_sgemm` call whatever the shard boundaries are.
+pub fn set_throughput_shards(shards: usize) {
+  THROUGHPUT_SHARDS.store(shards, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The effective shard count: the explicit setting, else the machine's parallelism.
+pub fn throughput_shards() -> usize {
+  match THROUGHPUT_SHARDS.load(std::sync::atomic::Ordering::Relaxed) {
+    0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+    n => n,
+  }
+}
+
 /// The `Throughput` dispatch: Accelerate on macOS (row-major `C[rows×rows_out] =
 /// X[rows×dim_in] · Wᵀ`, W stored `[rows_out][dim_in]`), the fixed lanes elsewhere.
+/// The row range is split into [`throughput_shards`] contiguous shards, each an
+/// independent `cblas_sgemm` on its own rayon task — the measured lever when the
+/// framework's own threading leaves cores idle (the shard sweep records whether
+/// the AMX units or the thread count is the ceiling on this machine).
 #[cfg(target_os = "macos")]
 fn gemm_throughput(
   x: &[f32],
@@ -192,29 +291,47 @@ fn gemm_throughput(
   let extent = |n: usize| -> Result<i32, String> {
     i32::try_from(n).map_err(|_| "encoder: GEMM extent exceeds the BLAS interface".to_string())
   };
-  let (m, n, k) = (extent(rows)?, extent(rows_out)?, extent(dim_in)?);
-  // SAFETY: extents were validated against the slice lengths by `gemm` (x holds
-  // rows×dim_in, w holds rows_out×dim_in, out holds rows×rows_out, all
-  // row-major with leading dimensions dim_in / dim_in / rows_out), the pointers
-  // come from live slices that outlive the call, and `out` is exclusively
-  // borrowed for the duration — the framework writes only inside it.
-  unsafe {
-    accelerate::cblas_sgemm(
-      accelerate::CBLAS_ROW_MAJOR,
-      accelerate::CBLAS_NO_TRANS,
-      accelerate::CBLAS_TRANS,
-      m,
-      n,
-      k,
-      1.0,
-      x.as_ptr(),
-      k,
-      w.as_ptr(),
-      k,
-      0.0,
-      out.as_mut_ptr(),
-      n,
-    );
+  let (n, k) = (extent(rows_out)?, extent(dim_in)?);
+  let shards = throughput_shards().clamp(1, rows.max(1));
+  let shard_rows = rows.div_ceil(shards);
+  let failures: usize = out
+    .par_chunks_mut(shard_rows * rows_out)
+    .enumerate()
+    .map(|(shard, out_shard)| {
+      let first = shard * shard_rows;
+      let count = out_shard.len() / rows_out;
+      let Ok(m) = extent(count) else {
+        return 1usize;
+      };
+      let x_shard = &x[first * dim_in..(first + count) * dim_in];
+      // SAFETY: extents were validated against the slice lengths by `gemm` (x holds
+      // rows×dim_in, w holds rows_out×dim_in, out holds rows×rows_out, all
+      // row-major with leading dimensions dim_in / dim_in / rows_out); this shard's
+      // x rows and out rows are disjoint sub-slices that outlive the call, and
+      // `out_shard` is exclusively borrowed — the framework writes only inside it.
+      unsafe {
+        accelerate::cblas_sgemm(
+          accelerate::CBLAS_ROW_MAJOR,
+          accelerate::CBLAS_NO_TRANS,
+          accelerate::CBLAS_TRANS,
+          m,
+          n,
+          k,
+          1.0,
+          x_shard.as_ptr(),
+          k,
+          w.as_ptr(),
+          k,
+          0.0,
+          out_shard.as_mut_ptr(),
+          n,
+        );
+      }
+      0usize
+    })
+    .sum();
+  if failures > 0 {
+    return Err("encoder: GEMM shard extent exceeds the BLAS interface".to_string());
   }
   Ok(())
 }
@@ -398,27 +515,33 @@ pub fn forward_batch_with(
   let mut mlp_gate = vec![0.0f32; total * weights.inner];
   let mut mlp_out = vec![0.0f32; total * dim];
   let scale = 1.0 / (head_dim as f64).sqrt();
+  let mut clock = StageClock::new();
 
   for layer in &weights.layers {
     // qkv: [total][3*dim] rows (t-major, then head, then component); unpack into
     // contiguous q/k/v matrices [total][heads][head_dim] for the attention walk.
-    gemm(path, &x, dim, layer.wqkv, 3 * dim, &mut qkv)?;
-    qkv
-      .par_chunks_exact(3 * dim)
-      .zip(q.par_chunks_exact_mut(dim))
-      .zip(k.par_chunks_exact_mut(dim))
-      .zip(v.par_chunks_exact_mut(dim))
-      .for_each(|(((row, q_row), k_row), v_row)| {
-        q_row.copy_from_slice(&row[0..dim]);
-        k_row.copy_from_slice(&row[dim..2 * dim]);
-        v_row.copy_from_slice(&row[2 * dim..3 * dim]);
-      });
-    rotate(&mut q, &bounds);
-    rotate(&mut k, &bounds);
+    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.wqkv, 3 * dim, &mut qkv))?;
+    clock.time(
+      |c| &mut c.other,
+      || {
+        qkv
+          .par_chunks_exact(3 * dim)
+          .zip(q.par_chunks_exact_mut(dim))
+          .zip(k.par_chunks_exact_mut(dim))
+          .zip(v.par_chunks_exact_mut(dim))
+          .for_each(|(((row, q_row), k_row), v_row)| {
+            q_row.copy_from_slice(&row[0..dim]);
+            k_row.copy_from_slice(&row[dim..2 * dim]);
+            v_row.copy_from_slice(&row[2 * dim..3 * dim]);
+          });
+        rotate(&mut q, &bounds);
+        rotate(&mut k, &bounds);
+      },
+    );
     // Attention per (query-row, head), keys bounded to the row's OWN sequence
     // (block-diagonal): independent outputs; f64 dots, stable softmax, f64 A·V
     // accumulation in ascending key order — per-row identical to the solo run.
-    context
+    clock.time(|c| &mut c.attention, || context
       .par_chunks_mut(dim)
       .enumerate()
       .for_each(|(s, out_row)| {
@@ -461,25 +584,42 @@ pub fn forward_batch_with(
             *slot = *value as f32;
           }
         }
-      });
-    gemm(path, &context, dim, layer.out_proj, dim, &mut attn_out)?;
-    residual_add(&mut x, &attn_out);
-    layer_norm(&mut x, dim, layer.norm1_weight, layer.norm1_bias, weights.layer_norm_eps);
-    gemm(path, &x, dim, layer.fc11, weights.inner, &mut mlp_y)?;
-    gemm(path, &x, dim, layer.fc12, weights.inner, &mut mlp_gate)?;
-    mlp_y
-      .par_chunks_exact_mut(weights.inner)
-      .zip(mlp_gate.par_chunks_exact(weights.inner))
-      .for_each(|(y_row, gate_row)| {
-        for (y, gate) in y_row.iter_mut().zip(gate_row) {
-          let g = *gate as f64;
-          *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
-        }
-      });
-    gemm(path, &mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out)?;
-    residual_add(&mut x, &mlp_out);
-    layer_norm(&mut x, dim, layer.norm2_weight, layer.norm2_bias, weights.layer_norm_eps);
+      }));
+    clock.time(|c| &mut c.gemm, || gemm(path, &context, dim, layer.out_proj, dim, &mut attn_out))?;
+    clock.time(|c| &mut c.other, || residual_add(&mut x, &attn_out));
+    clock.time(|c| &mut c.norm, || {
+      layer_norm(&mut x, dim, layer.norm1_weight, layer.norm1_bias, weights.layer_norm_eps)
+    });
+    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc11, weights.inner, &mut mlp_y))?;
+    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc12, weights.inner, &mut mlp_gate))?;
+    // SwiGLU gate: f64 libm on the fixed-order path (the query-side law); the
+    // vectorizable f32 `exp_fast` on the throughput path (parity-oracle bound).
+    clock.time(|c| &mut c.gate, || {
+      mlp_y
+        .par_chunks_exact_mut(weights.inner)
+        .zip(mlp_gate.par_chunks_exact(weights.inner))
+        .for_each(|(y_row, gate_row)| match path {
+          GemmPath::FixedOrder => {
+            for (y, gate) in y_row.iter_mut().zip(gate_row) {
+              let g = *gate as f64;
+              *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
+            }
+          }
+          GemmPath::Throughput => {
+            for (y, gate) in y_row.iter_mut().zip(gate_row) {
+              let g = *gate;
+              *y *= g / (1.0 + exp_fast(-g));
+            }
+          }
+        })
+    });
+    clock.time(|c| &mut c.gemm, || gemm(path, &mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out))?;
+    clock.time(|c| &mut c.other, || residual_add(&mut x, &mlp_out));
+    clock.time(|c| &mut c.norm, || {
+      layer_norm(&mut x, dim, layer.norm2_weight, layer.norm2_bias, weights.layer_norm_eps)
+    });
   }
+  clock.report(path, total);
   Ok(
     offsets[..sequences.len()]
       .iter()

@@ -13,6 +13,7 @@
 pub mod annfiles;
 pub mod artifact;
 mod dense;
+pub mod duration;
 pub mod cochange;
 pub mod traces;
 pub mod live;
@@ -2581,7 +2582,7 @@ fn load_dense_sidecar(
   let Some(encoder) = encoder else {
     return (None, false);
   };
-  if !dense::is_fresh(generation_dir, stamp, encoder, None) {
+  if !dense::is_fresh(generation_dir, stamp, encoder) {
     return (None, false);
   }
   let Some(sidecar) = dense::DenseSidecar::load(generation_dir, stamp) else {
@@ -2619,99 +2620,49 @@ pub fn write_dense_channel_override(index_root: &Path, enabled: bool) -> io::Res
   fs::rename(tmp, index_root.join("dense.channel"))
 }
 
-/// Warm options beyond the tier selection: the dense sidecar's wall-clock
-/// budget (`dense.rs`, the coverage rule). `None` consults the root's
-/// `dense.budget` file; no budget anywhere = no sidecar (the channel is opt-in,
-/// like the encoder itself).
+/// Warm options beyond the tier selection: an explicit CAP on this round of the
+/// dense fill (`dense.rs`; seconds, from a human duration). `None` consults the
+/// root's `dense.budget` file; no cap anywhere = the fill runs to the stop rule.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WarmOptions {
   pub dense_budget_secs: Option<f64>,
 }
 
-/// The root's persisted dense budget (`<root>/dense.budget`, seconds), if any.
+/// The root's persisted dense cap (`<root>/dense.budget`, a human duration such
+/// as `5m30s` or plain seconds), if present and well-formed.
 pub fn dense_budget_selection(index_root: &Path) -> Option<f64> {
-  fs::read_to_string(index_root.join("dense.budget"))
-    .ok()?
-    .trim()
-    .parse::<f64>()
-    .ok()
-    .filter(|secs| *secs > 0.0)
+  duration::parse_duration(fs::read_to_string(index_root.join("dense.budget")).ok()?.trim()).ok()
 }
 
-/// Persist the root's dense budget (tmp + rename) — an index-shaped write, like
-/// `semantic.tier`; warms are pure readers of it.
+/// Persist the root's dense cap (tmp + rename, rendered as a canonical duration)
+/// — an index-shaped write, like `semantic.tier`; warms are pure readers of it.
 pub fn write_dense_budget(index_root: &Path, secs: f64) -> io::Result<()> {
   let tmp = index_root.join("dense.budget.tmp");
-  fs::write(&tmp, format!("{secs}\n"))?;
+  fs::write(&tmp, format!("{}\n", duration::render_duration(secs)))?;
   fs::rename(tmp, index_root.join("dense.budget"))
 }
 
-/// Build/heal the dense sidecar and its gate when a budget AND an encoder exist.
-/// Every problem is a stated degradation (phase-stamped), never a failed warm —
-/// the fusion serves its four lists until a later warm heals the sidecar.
+/// Fill (or resume) the dense sidecar whenever an encoder is selected — after
+/// the core tiers committed, so a search is served by them meanwhile and picks
+/// up each checkpoint as it lands. Every problem is a stated degradation
+/// (phase-stamped), never a failed warm.
 fn ensure_dense(
   index_dir: &Path,
   kg: &Kg,
   stamp: u64,
   encoder: Option<Box<vorpal_ann::encoder::CodeEncoder>>,
-  budget: Option<f64>,
+  cap_secs: Option<f64>,
 ) {
-  let (Some(encoder), Some(budget)) = (encoder, budget) else {
+  let Some(encoder) = encoder else {
     return;
   };
-  if !dense::is_fresh(index_dir, stamp, &encoder, Some(budget))
-    && let Err(reason) = dense::build(kg, index_dir, stamp, &encoder, budget)
-  {
-    vorpal_kg::phase_stamp(&format!("dense: build failed ({reason}) — channel stays off"));
+  if dense::fresh_record(index_dir, stamp, &encoder).is_some_and(|record| record.complete) {
     return;
   }
-  ensure_dense_gate(index_dir, stamp, encoder);
-}
-
-/// Gate the dense channel per corpus iff the record carries no verdict, and
-/// rewrite the record with one (deterministic from content + sidecar, like the
-/// BM25 gate). Probes through the encoder the warm resolved from the root.
-fn ensure_dense_gate(index_dir: &Path, stamp: u64, encoder: Box<vorpal_ann::encoder::CodeEncoder>) {
-  let Some(record) = dense::read_record(index_dir) else {
-    return;
-  };
-  if record.gate.is_some() || record.stamp != stamp {
-    return;
-  }
-  // Sweep seam (measurement builds only): the harness forces the channel through
-  // `VORPAL_DENSE_CHANNEL`, so the 512-probe gate is pure cost there.
-  #[cfg(feature = "bench-internals")]
-  if std::env::var("VORPAL_DENSE_GATE").as_deref() == Ok("skip") {
-    vorpal_kg::phase_stamp("dense: gate skipped (VORPAL_DENSE_GATE=skip)");
-    return;
-  }
-  let searcher = match Searcher::open_with_encoder(index_dir, Some(encoder), None) {
-    Ok(searcher) => searcher,
-    Err(err) => {
-      vorpal_kg::phase_stamp(&format!("dense: gate skipped (open failed: {err})"));
-      return;
-    }
-  };
-  let started = std::time::Instant::now();
-  match searcher.dense_self_probe_verdict(stamp) {
-    Ok((enabled, evidence)) => {
-      let gated = dense::DenseRecord {
-        gate: Some(enabled),
-        gate_evidence: Some(evidence.clone()),
-        ..record
-      };
-      if let Err(err) = dense::write_record(index_dir, &gated) {
-        vorpal_kg::phase_stamp(&format!("dense: gate record write failed: {err}"));
-        return;
-      }
-      vorpal_kg::phase_stamp(&format!(
-        "dense: gate {} over {} rows ({evidence}) in {:.1}s",
-        if enabled { "ON" } else { "OFF" },
-        searcher.dense.as_ref().map_or(0, |sidecar| sidecar.len()),
-        started.elapsed().as_secs_f64()
-      ));
-    }
-    Err(err) => vorpal_kg::phase_stamp(&format!("dense: gate failed ({err}) — channel stays off")),
+  if let Err(reason) = dense::fill(kg, index_dir, stamp, &encoder, cap_secs) {
+    vorpal_kg::phase_stamp(&format!(
+      "dense: fill stopped ({reason}) — the committed checkpoint keeps serving"
+    ));
   }
 }
 
@@ -2795,12 +2746,12 @@ pub fn warm_ann_with(index_dir: &Path, options: WarmOptions) -> Result<(), Box<d
   // index-shaped commands write selections, and they operate on roots.
   let selection = tier_selection(index_dir)?;
   // The dense sidecar embeds through the ROOT's encoder selection (per-index
-  // `encoder.dir`, else the global enable) — resolved only when a budget asks
-  // for a sidecar, so budget-less warms never touch the 547 MB weights.
+  // `encoder.dir`, else the global enable); no encoder selected = no sidecar.
+  // A cap (explicit option, else the root's `dense.budget`) only shortens a round.
   let dense_budget = options
     .dense_budget_secs
     .or_else(|| dense_budget_selection(index_dir));
-  let dense_encoder = dense_budget.and_then(|_| open_selected_encoder(index_dir).0);
+  let dense_encoder = open_selected_encoder(index_dir).0;
   // Warm the generation CURRENT names right now; its artifacts land inside that generation
   // (the ANN tier is the one stamp-validated sidecar an existing generation admits). If a
   // rebuild supersedes it mid-warm, the work is simply for a generation about to retire —
@@ -5385,128 +5336,6 @@ impl Searcher {
     }
     if probes == 0 {
       // Too small to measure: the fourth list stays off, and the record says why.
-      return Ok((false, "probes=0 (no eligible nodes)".to_string()));
-    }
-    mean_on /= probes as f64;
-    mean_off /= probes as f64;
-    let contested = (wins + losses) as f64;
-    let significant = wins as f64 - losses as f64 > 1.96 * contested.sqrt();
-    let enabled = significant && mean_on > mean_off;
-    let evidence = format!(
-      "probes={probes} wins={wins} losses={losses} mean_on={mean_on:.4} mean_off={mean_off:.4}"
-    );
-    Ok((enabled, evidence))
-  }
-
-  /// Label-free per-corpus DENSE-channel gate — the BM25 gate's protocol
-  /// applied to the fifth list (same content-seeded probes, same token-subset
-  /// probe queries, MRR@10 of the probe's own node, paired fusions from ONE
-  /// channel computation, same sign-test bound): enable iff the paired mean
-  /// strictly improves AND wins − losses > 1.96·√(wins+losses). What it can and
-  /// cannot see: probes are name-token queries, so the verdict measures whether
-  /// the sidecar's COVERAGE and ranking help known-item retrieval — a hot-subset
-  /// sidecar that misses most probed nodes fails the gate (and rightly stays off
-  /// where it would only add noise); the descriptive/paraphrase classes the
-  /// channel exists for are label-only evidence (the harness), recorded beside
-  /// this verdict, never inferred from it. Each probe costs one fixed-order
-  /// query forward (~tens of ms), once per generation.
-  fn dense_self_probe_verdict(&self, stamp: u64) -> Result<(bool, String), Box<dyn Error>> {
-    const PROBES: usize = 512;
-    #[cfg(feature = "bench-internals")]
-    let probe_target: usize = std::env::var("VORPAL_BM25_GATE_PROBES")
-      .ok()
-      .and_then(|v| v.parse().ok())
-      .unwrap_or(PROBES);
-    #[cfg(not(feature = "bench-internals"))]
-    let probe_target: usize = PROBES;
-    const CUTOFF: usize = 10;
-    let Some(encoder) = self.encoder.as_deref() else {
-      return Ok((false, "no encoder".to_string()));
-    };
-    if self.dense.is_none() {
-      return Ok((false, "no sidecar".to_string()));
-    }
-    let kg = &self.kg;
-    let mut order: Vec<(u64, u64)> = (0..kg.node_count() as u64)
-      .map(|id| {
-        (
-          xxhash_rust::xxh3::xxh3_64_with_seed(&id.to_le_bytes(), stamp),
-          id,
-        )
-      })
-      .collect();
-    order.sort_unstable();
-    let filter = SearchFilter::default();
-    let mut probes = 0usize;
-    let mut wins = 0usize;
-    let mut losses = 0usize;
-    let (mut mean_on, mut mean_off) = (0.0f64, 0.0f64);
-    for &(_, id) in &order {
-      if probes == probe_target {
-        break;
-      }
-      let Some(view) = kg.node(NodeId::new(id)) else {
-        continue;
-      };
-      if view.kind == vorpal_kg::SymbolKind::Import {
-        continue;
-      }
-      let tokens = tokenize(view.name);
-      let mut distinct = tokens.clone();
-      distinct.sort_unstable();
-      distinct.dedup();
-      if distinct.len() < 3 {
-        continue;
-      }
-      let take = 2 + (probes & 1);
-      let query = tokens
-        .iter()
-        .take(take)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
-      let query_vec = encoder.embed_query(&query)?;
-      let channels = self.channel_lists_with_bm25(
-        &query,
-        rerank_pool(CUTOFF),
-        &filter,
-        self.bm25_enabled,
-        None,
-        Some(&query_vec),
-      )?;
-      let rank_of = |lists: &[Vec<u64>]| -> f64 {
-        rrf_fuse_explained(lists, CUTOFF)
-          .iter()
-          .position(|hit| hit.0 == id)
-          .map_or(0.0, |rank| 1.0 / (rank as f64 + 1.0))
-      };
-      let dense = std::mem::take(&mut { channels }.dense);
-      let channels = self.channel_lists_with_bm25(
-        &query,
-        rerank_pool(CUTOFF),
-        &filter,
-        self.bm25_enabled,
-        None,
-        None,
-      )?;
-      let base = self.fused_lists(channels, false);
-      let rr_off = rank_of(&base);
-      let mut with_dense = base;
-      if !self.bm25_enabled {
-        with_dense.push(Vec::new());
-      }
-      with_dense.push(dense);
-      let rr_on = rank_of(&with_dense);
-      mean_on += rr_on;
-      mean_off += rr_off;
-      if rr_on > rr_off {
-        wins += 1;
-      } else if rr_on < rr_off {
-        losses += 1;
-      }
-      probes += 1;
-    }
-    if probes == 0 {
       return Ok((false, "probes=0 (no eligible nodes)".to_string()));
     }
     mean_on /= probes as f64;

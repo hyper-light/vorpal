@@ -39,24 +39,31 @@ pub fn run_if_sentinel() {
   if args.next().as_deref() != Some(std::ffi::OsStr::new(WARM_SENTINEL)) {
     return;
   }
-  // `__warm-ann <dir> [--dense-budget-secs <secs>]`: the dense sidecar's budget
-  // (crate::dense — the coverage rule); `VORPAL_DENSE_BUDGET_SECS` is the
-  // environment form for harness scripts. Absent both, the root's `dense.budget`
-  // decides (see `WarmOptions`).
+  // `__warm-ann <dir> [--dense-budget-timeout <duration>]`: an explicit cap on
+  // this round of the dense fill (crate::dense; `1h`, `5m30s`, `90s`, or plain
+  // seconds); `VORPAL_DENSE_BUDGET_TIMEOUT` is the environment form for harness
+  // scripts. Absent both, the root's `dense.budget` decides (see `WarmOptions`).
+  // A malformed duration is refused (exit 2 with the accepted forms), never a
+  // silent default.
   let code = match args.next() {
     Some(dir) => {
       let rest: Vec<std::ffi::OsString> = args.collect();
-      let flag_budget = rest
+      let flag_text = rest
         .iter()
-        .position(|arg| arg == "--dense-budget-secs")
+        .position(|arg| arg == "--dense-budget-timeout")
         .and_then(|at| rest.get(at + 1))
-        .and_then(|value| value.to_str())
-        .and_then(|value| value.parse::<f64>().ok());
-      let env_budget = std::env::var("VORPAL_DENSE_BUDGET_SECS")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok());
+        .and_then(|value| value.to_str().map(str::to_string));
+      let text = flag_text.or_else(|| std::env::var("VORPAL_DENSE_BUDGET_TIMEOUT").ok());
+      let cap = match text.as_deref().map(crate::duration::parse_duration) {
+        Some(Ok(secs)) => Some(secs),
+        Some(Err(err)) => {
+          eprintln!("vorpal-index __warm-ann: --dense-budget-timeout {err}");
+          std::process::exit(2);
+        }
+        None => None,
+      };
       let options = crate::WarmOptions {
-        dense_budget_secs: flag_budget.or(env_budget).filter(|secs| *secs > 0.0),
+        dense_budget_secs: cap,
       };
       match crate::warm_ann_with(Path::new(&dir), options) {
         Ok(()) => 0,

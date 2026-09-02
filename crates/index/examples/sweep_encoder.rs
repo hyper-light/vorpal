@@ -67,6 +67,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     return Ok(());
   }
+  // GEMM shard sweep: `<index-dir> --shards <k> [batch]` — one 256-surface batch
+  // (default) on the throughput path with the GEMMs split into k row-shards; prints
+  // tokens/s. Run under `/usr/bin/time -l` for the cores-busy figure.
+  if args.get(1).map(String::as_str) == Some("--shards") {
+    let shards: usize = args.get(2).ok_or("usage: --shards <k> [batch]")?.parse()?;
+    let batch: usize = args.get(3).map_or(Ok(256), |b| b.parse())?;
+    let model_dir = std::env::var_os("VORPAL_CODERANK_DIR")
+      .map(std::path::PathBuf::from)
+      .ok_or("set VORPAL_CODERANK_DIR to the model directory")?;
+    let encoder = CodeEncoder::open(&model_dir)?;
+    let kg = Kg::load(&vorpal_kg::resolve_index_dir(Path::new(index)))?;
+    let pool = surfaces(&kg, batch);
+    let texts: Vec<&str> = pool.iter().map(String::as_str).collect();
+    let tokens: usize = texts.iter().map(|t| encoder.sequence_len(t)).sum();
+    vorpal_ann::encoder::set_throughput_shards(shards);
+    // Warm-up (weights page-in), then the timed reps.
+    encoder.embed_batch_with(&texts, GemmPath::Throughput)?;
+    let started = std::time::Instant::now();
+    for _ in 0..REPS {
+      encoder.embed_batch_with(&texts, GemmPath::Throughput)?;
+    }
+    let secs = started.elapsed().as_secs_f64() / REPS as f64;
+    println!(
+      "shards {shards} (rayon threads {}): batch {batch} = {tokens} tokens, {:.3} s/batch, {:.0} tok/s, {:.0} GFLOPS",
+      rayon::current_num_threads(),
+      secs,
+      tokens as f64 / secs,
+      2.0 * encoder.non_embedding_params() as f64 * tokens as f64 / secs / 1e9,
+    );
+    return Ok(());
+  }
   let model_dir = std::env::var_os("VORPAL_CODERANK_DIR")
     .map(std::path::PathBuf::from)
     .ok_or("set VORPAL_CODERANK_DIR to the model directory")?;

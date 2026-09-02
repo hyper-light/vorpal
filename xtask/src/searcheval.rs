@@ -83,7 +83,7 @@ pub fn run(index: &Path, labels_path: &Path, overlap: bool) -> Result<()> {
   match searcher.dense_status() {
     Some((rows, on)) => println!(
       "dense sidecar: {rows} rows, channel {}",
-      if on { "ON" } else { "OFF (gate verdict)" }
+      if on { "ON" } else { "OFF (override)" }
     ),
     None => println!("dense sidecar: none for this encoder/generation"),
   }
