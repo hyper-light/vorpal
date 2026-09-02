@@ -265,11 +265,20 @@ jobs:
                          && chmod +x "npm/platforms/${platform}/vorpal" ;;
             esac
           done
+      # Auth is self-degrading: while the NPM_TOKEN secret exists (the one-time granular
+      # token that BOOTSTRAPS never-published packages — npm cannot configure a trusted
+      # publisher until a package exists, npm/cli#8544), npm uses it; once every package
+      # exists and its trusted publisher is configured on npmjs.com, DELETE the secret and
+      # these same steps publish via OIDC with no token.
       - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           for dir in npm/platforms/*/; do
             (cd "$dir" && npm publish --access public)
           done
       - name: Publish @hyper-light/vorpal-cli wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd npm && npm publish --access public
