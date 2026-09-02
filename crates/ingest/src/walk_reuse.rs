@@ -881,6 +881,17 @@ int main(void) {
   }
 
   #[test]
+  fn splice_oracle_utf8_retained_prefix() {
+    // Multi-byte comments BEFORE the retained definitions: rebuilding their positions
+    // (char columns, tree-sitter rows) from byte offsets must match the live extractor
+    // exactly, both when positions keep (prefix side) and when they shift (suffix side).
+    let v0 = format!("// café déjà-vu — überprüfung 数据 🚀\n{C_BASE}");
+    let v1 = v0.replace("return 0;", "return counter;");
+    let v2 = v1.replace("// café", "// naïveté café");
+    splice_oracle("splice-utf8.c", &[v0, v1, v2]);
+  }
+
+  #[test]
   fn splice_oracle_chained_saves() {
     // Multi-save chains: each step splices against the snapshot the PREVIOUS step
     // captured (including snapshots captured BY the splice path itself).
