@@ -155,7 +155,7 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 
 ## Performance
 
-All numbers are release builds of **v0.4.0** on an Apple M5 Max (18 cores, 128 GB,
+All numbers are release builds of **v0.6.0** on an Apple M5 Max (18 cores, 128 GB,
 macOS 26.4.1, rustc 1.98.0), measured 2026-09-02, wall-clock for the whole CLI
 invocation including process start; cold times are best of runs on a quiet machine.
 Every dataset is pinned by commit so you can re-run it. Indexing derives the full
@@ -174,9 +174,9 @@ The flagship tree, end to end:
 | Linux kernel @ `1590cf032971` (75,954 tracked files, ~30 M LOC) | |
 |---|---|
 | Cold index → **8,890,840 nodes** | **8.2 s** |
-| Edit one file, re-index | **0.6 s** |
-| `touch` one file (content unchanged) | 0.7 s |
-| Nothing changed | **0.16 s** |
+| Edit one file, re-index | **0.5 s** |
+| `touch` one file (content unchanged) | 0.5 s |
+| Nothing changed | **0.13 s** |
 
 ### Indexing, across languages
 
@@ -202,12 +202,31 @@ cold build and the no-change re-run:
 | vuejs/core `d63616c` | Vue/TS | 705 | 11,191 | 0.1 s | 0.01 s |
 
 This repository (2,815 files → 78,527 nodes, incl. the vendored tree-sitter runtime +
-49 grammars): 13.4 s cold¹, 0.02 s unchanged. Kernel peak disk is a 5.5 GB generation (the
+49 grammars): 7.4 s cold¹, 0.02 s unchanged. Kernel peak disk is a 5.5 GB generation (the
 parsed-product cache inside it is what makes sub-second edits possible); the previous
 generation is kept until the next commit, then swept.
 
 ¹ Dominated by a single 33 MB generated `parser.c`; everything else parses in parallel
 underneath it.
+
+### Editing large files (long-lived processes)
+
+A process that indexes repeatedly — the MCP daemon, a watch loop, an SDK server calling
+`indexBuild` on every save — re-parses edited multi-megabyte sources **incrementally**:
+vorpal retains parse state for files over 1 MiB and applies tree-sitter's own
+incremental reparse, with output verified byte-identical to a fresh parse on every
+measurement round below.
+
+| Edited file | Fresh parse, per save | Incremental, per save |
+|---|---:|---:|
+| 54 MB generated C (`tree-sitter-julia` parser) | 4.2 s | **1.9 s** |
+| 17 MB generated C (`tree-sitter-cpp` parser) | 1.33 s | **0.58 s** |
+| 1.4 MB hand-written C (CPython `Parser/parser.c`) | 104 ms | **34 ms** |
+
+The parse share is eliminated entirely (the residual is definition/reference
+extraction). One-shot CLI builds are unaffected by design — retention only pays when a
+file is parsed again. `VORPAL_TREE_CACHE=0` disables; `_MIN`/`_BUDGET` tune the 1 MiB
+floor and 64 MiB retained-source budget.
 
 ### Search (Linux kernel index, 8.9 M definitions, k = 10)
 
@@ -231,7 +250,7 @@ stdio — you never re-index by hand. Round-trip times measured from the client 
 | Hybrid search | **53 ms** |
 | Server start → answering queries on an existing index | immediate |
 | First search after start (semantic tier warm-up, once) | 3.6 s |
-| Save a file → index current again (incremental re-index) | ~0.6 s |
+| Save a file → index current again (incremental re-index) | ~0.5 s |
 
 Editing never triggers full rebuilds — changes apply incrementally, including to the
 semantic-search tier.
