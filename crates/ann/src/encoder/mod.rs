@@ -9,21 +9,26 @@
 //! and the reference `tokenizers` library's goldens (`tests/encoder.rs`, gated on
 //! `VORPAL_CODERANK_DIR` since the 547 MB artifact cannot live in the repo).
 //!
-//! SCALE LAW (the physics that shaped the integration): encoding a kernel-scale
-//! row population through 137M parameters is ~10¹² FLOPs — hours of CPU — so this
-//! encoder can never be the warm-time document embedder. Its shape is the opt-in
-//! QUERY-TIME RERANKER: one prefixed query plus the fused top-K candidate
-//! surfaces per search, nothing precomputed.
+//! SCALE LAW (corrected, ENCODER_RESEARCH §0/§6): a forward pass costs ≈ 2 ×
+//! 113 M non-embedding params × tokens ≈ 2.7 GFLOP per ~12-token surface, so the
+//! FULL kernel (8.9 M definitions) is ≈ 2.4 × 10¹⁶ FLOP — hours at 1 TFLOPS —
+//! and this encoder can never be the warm-time embedder for every kernel row.
+//! Two shapes coexist: the opt-in QUERY-TIME RERANKER (one prefixed query plus
+//! the fused top-K surfaces, fixed-order numerics) and the DOC-SIDE SIDECAR
+//! ([`CodeEncoder::embed_batch_with`] under [`GemmPath::Throughput`]): a
+//! budget-bounded, in-degree-ordered slice of the definitions embedded at warm
+//! time (every definition where the budget covers the corpus) — the
+//! candidate-generating channel the reranker cannot be by construction.
 
 mod f16;
 mod forward;
 mod safetensors;
 mod tokenizer;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use forward::{LayerWeights, ModelWeights};
-pub use forward::l2_normalize;
+pub use forward::{GemmPath, l2_normalize};
 pub use safetensors::{convert_safetensors_f32_to_f16, safetensors_is_f16};
 
 /// The task instruction the model card requires on every QUERY (verbatim;
@@ -41,6 +46,10 @@ pub struct CodeEncoder {
   rotary_base: f64,
   vocab_rows: usize,
   max_positions: usize,
+  /// `model.safetensors` — for the build-time full-content digest.
+  weights_path: PathBuf,
+  /// See [`CodeEncoder::model_identity`].
+  identity: u128,
 }
 
 impl CodeEncoder {
@@ -103,7 +112,22 @@ impl CodeEncoder {
     let tokenizer_bytes = std::fs::read(model_dir.join("tokenizer.json"))
       .map_err(|e| format!("tokenizer.json: {e}"))?;
     let tokenizer = tokenizer::WordPiece::from_tokenizer_json(&tokenizer_bytes)?;
-    let weights = safetensors::SafeTensors::open(&model_dir.join("model.safetensors"))?;
+    let weights_path = model_dir.join("model.safetensors");
+    let weights = safetensors::SafeTensors::open(&weights_path)?;
+    let identity = {
+      // Structural identity: the safetensors header (tensor table: names, dtypes,
+      // shapes, offsets) + file length + config + tokenizer bytes — everything
+      // that decides WHAT this forward computes short of the weight values
+      // themselves (whose full digest is build-time evidence, see
+      // `weights_content_digest`). Cheap enough for every open.
+      let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+      let (header, file_len) = safetensors::header_bytes(&weights_path)?;
+      hasher.update(&header);
+      hasher.update(&file_len.to_le_bytes());
+      hasher.update(&config_bytes);
+      hasher.update(&tokenizer_bytes);
+      hasher.digest128()
+    };
     let encoder = CodeEncoder {
       weights,
       tokenizer,
@@ -115,6 +139,8 @@ impl CodeEncoder {
       rotary_base: float("rotary_emb_base")?,
       vocab_rows,
       max_positions,
+      weights_path,
+      identity,
     };
     // Fail at open, not first embed: every tensor must exist with its exact shape.
     encoder.model_weights()?;
@@ -173,6 +199,45 @@ impl CodeEncoder {
     self.dim
   }
 
+  /// Structural model identity (header table + length + config + tokenizer
+  /// bytes; xxh3-128) — the sidecar's freshness key against the model a handle
+  /// actually opened. Two installs of the pinned weights agree; any config,
+  /// tokenizer, dtype, or shape change disagrees. Equal-shaped weight edits are
+  /// caught only by [`CodeEncoder::weights_content_digest`], recorded at build.
+  pub fn model_identity(&self) -> u128 {
+    self.identity
+  }
+
+  /// xxh3-128 over the FULL `model.safetensors` bytes — build-time provenance
+  /// evidence (one streamed pass over the ~547 MB file; never on a query path).
+  pub fn weights_content_digest(&self) -> Result<u128, String> {
+    let mut file = std::fs::File::open(&self.weights_path)
+      .map_err(|e| format!("weights {}: {e}", self.weights_path.display()))?;
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+      let read = std::io::Read::read(&mut file, &mut buffer)
+        .map_err(|e| format!("reading {}: {e}", self.weights_path.display()))?;
+      if read == 0 {
+        break;
+      }
+      hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.digest128())
+  }
+
+  /// Non-embedding parameter count — the per-token FLOP law's coefficient
+  /// (forward ≈ 2 × this × tokens): per layer 4·d² (qkv, out) + 3·d·inner
+  /// (fc11, fc12, fc2); LayerNorm/attention terms are below 1% and omitted.
+  pub fn non_embedding_params(&self) -> usize {
+    self.layers * (4 * self.dim * self.dim + 3 * self.dim * self.inner)
+  }
+
+  /// Token count of `text` as the forward will see it (template + clamp).
+  pub fn sequence_len(&self, text: &str) -> usize {
+    self.clamped_ids(text).len()
+  }
+
   /// The tokenizer's ids for `text` — exposed for the reference-parity oracle.
   pub fn token_ids(&self, text: &str) -> Vec<u32> {
     self.tokenizer.encode(text)
@@ -201,9 +266,17 @@ impl CodeEncoder {
   /// matrix). Per-text results are bitwise identical to [`Self::embed`], pinned
   /// by the gated batch oracle.
   pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+    self.embed_batch_with(texts, GemmPath::FixedOrder)
+  }
+
+  /// [`Self::embed_batch`] under a selected GEMM path. `Throughput` is the
+  /// doc-side sidecar's entry (module doc): same tokenization, same forward,
+  /// only the six GEMMs' summation order differs — parity pinned by the gated
+  /// oracle (cosine ≥ 0.9999 vs `FixedOrder` on the goldens).
+  pub fn embed_batch_with(&self, texts: &[&str], path: GemmPath) -> Result<Vec<Vec<f32>>, String> {
     let sequences: Vec<Vec<u32>> = texts.iter().map(|text| self.clamped_ids(text)).collect();
     let borrowed: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
-    let mut rows = forward::forward_batch(&self.model_weights()?, &borrowed)?;
+    let mut rows = forward::forward_batch_with(&self.model_weights()?, &borrowed, path)?;
     for row in &mut rows {
       l2_normalize(row);
     }

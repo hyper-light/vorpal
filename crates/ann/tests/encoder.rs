@@ -175,6 +175,112 @@ fn f16_conversion_round_trips_and_embeds_close_to_f32() {
   let _ = std::fs::remove_dir_all(&f16_dir);
 }
 
+/// A fixed surface battery in the doc-side shape (name + signature + basename,
+/// ~12 tokens) plus the prefixed query shape — the parity oracle's inputs when
+/// no goldens file is present beside the model.
+fn parity_battery(dir: &std::path::Path) -> Vec<String> {
+  let mut texts: Vec<String> = vec![
+    "Represent this query for searching relevant code: near duplicate code detection".into(),
+    "Represent this query for searching relevant code: alloc_skb".into(),
+    "similar_pairs pub fn similar_pairs(&self, min_similarity: f64) -> Vec<(NodeId, NodeId, f64)> kg.rs".into(),
+    "alloc_skb static inline struct sk_buff *alloc_skb(unsigned int size, gfp_t priority) skbuff.h".into(),
+    "tcp_cong_avoid_ai void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w, u32 acked) tcp_cong.c".into(),
+    "request_threaded_irq int request_threaded_irq(unsigned int irq, irq_handler_t handler) manage.c".into(),
+    "PyDict_SetItem int PyDict_SetItem(PyObject *op, PyObject *key, PyObject *value) dictobject.c".into(),
+    "ObservedStore pub struct ObservedStore traces.rs".into(),
+    "ingest_traces pub fn ingest_traces(index_dir: &Path, folded: &Path) -> Result<Report, Box<dyn Error>> traces.rs".into(),
+    "rrf_fuse_explained fn rrf_fuse_explained(lists: &[Vec<u64>], k: usize) -> Vec<FusedHit> lib.rs".into(),
+    "vx_socket_send buffer flush".into(),
+    "def factorial(n): return 1 if n <= 1 else n * factorial(n - 1)".into(),
+  ];
+  if let Ok(text) = std::fs::read_to_string(dir.join("goldens.json"))
+    && let Ok(goldens) = serde_json::from_str::<serde_json::Value>(&text)
+    && let Some(object) = goldens.as_object()
+  {
+    texts.extend(object.keys().filter(|k| !k.starts_with("__")).cloned());
+  }
+  texts
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+  a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+}
+
+fn bits(rows: &[Vec<f32>]) -> Vec<u32> {
+  rows.iter().flatten().map(|v| v.to_bits()).collect()
+}
+
+/// The doc-side parity oracle (ENCODER_RESEARCH §8.2, Stage A): the throughput
+/// GEMM path stays within cosine 0.9999 of the fixed-order path on every
+/// surface of the battery — the bound that admits its rows into a sidecar the
+/// fixed-order query embedding is scored against.
+#[test]
+fn throughput_path_matches_fixed_order_within_cosine() {
+  use vorpal_ann::encoder::GemmPath;
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  let encoder = CodeEncoder::open(&dir).unwrap();
+  let texts = parity_battery(&dir);
+  let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+  let fixed = encoder.embed_batch_with(&borrowed, GemmPath::FixedOrder).unwrap();
+  let fast = encoder.embed_batch_with(&borrowed, GemmPath::Throughput).unwrap();
+  let mut worst = 1.0f64;
+  for ((text, a), b) in texts.iter().zip(&fixed).zip(&fast) {
+    let c = cosine(a, b);
+    worst = worst.min(c);
+    assert!(c >= 0.9999, "throughput path drifted on {text:?}: cosine {c:.7}");
+  }
+  eprintln!(
+    "throughput path ({}) vs fixed-order: min cosine {worst:.7} over {} surfaces",
+    GemmPath::Throughput.label(),
+    texts.len()
+  );
+}
+
+/// Determinism statement for the sidecar law: the throughput path must be
+/// reproducible run-to-run at a fixed thread count (else a sidecar could not
+/// even be rebuilt identically in one process), and the test REPORTS whether it
+/// is also bit-stable across rayon thread counts (1 vs the default pool). The
+/// framework's own threading (`VECLIB_MAXIMUM_THREADS`) is a process-level
+/// setting, exercised by running the test under both values.
+#[test]
+fn throughput_path_reproducibility_is_stated() {
+  use vorpal_ann::encoder::GemmPath;
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  let encoder = CodeEncoder::open(&dir).unwrap();
+  let texts = parity_battery(&dir);
+  let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+  let first = encoder.embed_batch_with(&borrowed, GemmPath::Throughput).unwrap();
+  let second = encoder.embed_batch_with(&borrowed, GemmPath::Throughput).unwrap();
+  assert_eq!(bits(&first), bits(&second), "throughput path must be run-to-run reproducible");
+  let single = rayon::ThreadPoolBuilder::new()
+    .num_threads(1)
+    .build()
+    .unwrap()
+    .install(|| encoder.embed_batch_with(&borrowed, GemmPath::Throughput).unwrap());
+  let fixed_default = encoder.embed_batch_with(&borrowed, GemmPath::FixedOrder).unwrap();
+  let fixed_single = rayon::ThreadPoolBuilder::new()
+    .num_threads(1)
+    .build()
+    .unwrap()
+    .install(|| encoder.embed_batch_with(&borrowed, GemmPath::FixedOrder).unwrap());
+  assert_eq!(
+    bits(&fixed_default),
+    bits(&fixed_single),
+    "fixed-order path must be bit-stable across rayon thread counts (the query-side law)"
+  );
+  eprintln!(
+    "throughput path ({}) 1-thread vs default rayon pool: {}",
+    GemmPath::Throughput.label(),
+    if bits(&single) == bits(&first) { "IDENTICAL bytes" } else { "DIFFERENT bytes (stamp-gated sidecar only)" }
+  );
+}
+
 #[test]
 fn batched_embeddings_equal_individual_ones_bitwise() {
   let Some(dir) = model_dir() else {

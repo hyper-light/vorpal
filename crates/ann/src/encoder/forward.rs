@@ -21,8 +21,81 @@
 //! only across independent output rows, so outputs are bit-stable at any thread
 //! count; the reference-parity oracle (≤ 1e-4 vs the f64 numpy forward)
 //! re-arbitrates this numeric layout.
+//!
+//! Third pass (doc-side dense channel, ENCODER_RESEARCH §6/§8.2): the SAME forward
+//! runs under a selectable GEMM path ([`GemmPath`]). `FixedOrder` is the layout
+//! above — the query-side law. `Throughput` swaps ONLY the six GEMMs for the
+//! platform's sgemm (Apple Accelerate on macOS; elsewhere it IS the fixed lanes)
+//! and leaves every other reduction byte-identical, so the two paths differ by the
+//! GEMM's summation order alone; the gated parity oracle (`tests/encoder.rs`)
+//! pins cosine ≥ 0.9999 between them on the goldens and the bench records the
+//! measured rate. Every element-wise pass (LayerNorm rows, residual adds, the
+//! SwiGLU gate, the qkv unpack, rotary) is row-parallel under BOTH paths — each
+//! row's arithmetic is unchanged, so the fixed path stays bit-stable.
 
 use rayon::prelude::*;
+
+/// Which GEMM numerics a forward pass runs under (module doc, third pass).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GemmPath {
+  /// Eight fixed f32 lanes, fixed reduction order — bit-stable at any thread
+  /// count. The query-side rerank's law.
+  FixedOrder,
+  /// The platform's fastest sgemm — admissible only where thread-count
+  /// bit-stability is not a law (the stamp-gated doc-side sidecar), and only
+  /// within the recorded parity bound against `FixedOrder`. Where no platform
+  /// sgemm is linked this is `FixedOrder` under another name
+  /// ([`GemmPath::throughput_is_native`] says which).
+  Throughput,
+}
+
+impl GemmPath {
+  /// Whether `Throughput` actually dispatches to a platform sgemm on this build
+  /// (macOS: Accelerate `cblas_sgemm`), or falls back to the fixed lanes.
+  pub fn throughput_is_native() -> bool {
+    cfg!(target_os = "macos")
+  }
+
+  /// The path's provenance label — written into any sidecar built under it.
+  pub fn label(self) -> &'static str {
+    match self {
+      GemmPath::FixedOrder => "fixed-order",
+      GemmPath::Throughput if Self::throughput_is_native() => "accelerate-sgemm",
+      GemmPath::Throughput => "fixed-order",
+    }
+  }
+}
+
+/// Apple Accelerate's row-major `cblas_sgemm` (the framework ships with every
+/// macOS SDK; AMX-backed on Apple silicon). Linked only on macOS — nothing else
+/// in the crate references the framework.
+#[cfg(target_os = "macos")]
+mod accelerate {
+  pub const CBLAS_ROW_MAJOR: i32 = 101;
+  pub const CBLAS_NO_TRANS: i32 = 111;
+  pub const CBLAS_TRANS: i32 = 112;
+
+  #[link(name = "Accelerate", kind = "framework")]
+  unsafe extern "C" {
+    #[allow(clippy::too_many_arguments)]
+    pub fn cblas_sgemm(
+      order: i32,
+      trans_a: i32,
+      trans_b: i32,
+      m: i32,
+      n: i32,
+      k: i32,
+      alpha: f32,
+      a: *const f32,
+      lda: i32,
+      b: *const f32,
+      ldb: i32,
+      beta: f32,
+      c: *mut f32,
+      ldc: i32,
+    );
+  }
+}
 
 /// One layer's weight slices (all row-major `[out][in]`, biasless per config).
 pub struct LayerWeights<'a> {
@@ -53,9 +126,10 @@ pub struct ModelWeights<'a> {
 }
 
 /// LayerNorm over each `dim`-row of `x`, in place: f64 moments (population
-/// variance), f32 storage.
+/// variance), f32 storage. Rows are independent — row-parallel, per-row order
+/// unchanged (bit-identical to the serial loop).
 fn layer_norm(x: &mut [f32], dim: usize, weight: &[f32], bias: &[f32], eps: f64) {
-  for row in x.chunks_exact_mut(dim) {
+  x.par_chunks_exact_mut(dim).for_each(|row| {
     let mut total = 0.0f64;
     for value in row.iter() {
       total += *value as f64;
@@ -70,7 +144,7 @@ fn layer_norm(x: &mut [f32], dim: usize, weight: &[f32], bias: &[f32], eps: f64)
     for (value, (w, b)) in row.iter_mut().zip(weight.iter().zip(bias)) {
       *value = (((*value as f64 - mean) * inv) * *w as f64 + *b as f64) as f32;
     }
-  }
+  });
 }
 
 /// How many parallel f32 accumulator lanes each GEMM dot product uses — a FIXED
@@ -78,10 +152,89 @@ fn layer_norm(x: &mut [f32], dim: usize, weight: &[f32], bias: &[f32], eps: f64)
 /// parity oracle pins), sized to fill a 256-bit vector unit.
 const GEMM_LANES: usize = 8;
 
-/// `out[s][o] = Σ_d x[s][d] · w[o][d]` — w row-major `[rows_out][dim_in]`.
+/// `out[s][o] = Σ_d x[s][d] · w[o][d]` — w row-major `[rows_out][dim_in]` — under
+/// the selected path. Shapes are validated once here (the platform sgemm takes
+/// raw pointers and 32-bit extents): a mismatch is a typed error, never a
+/// silent out-of-bounds read.
+fn gemm(
+  path: GemmPath,
+  x: &[f32],
+  dim_in: usize,
+  w: &[f32],
+  rows_out: usize,
+  out: &mut [f32],
+) -> Result<(), String> {
+  if dim_in == 0 || rows_out == 0 {
+    return Err("encoder: zero-extent GEMM".to_string());
+  }
+  let rows = out.len() / rows_out;
+  if out.len() != rows * rows_out || x.len() < rows * dim_in || w.len() < rows_out * dim_in {
+    return Err("encoder: GEMM operand shapes disagree".to_string());
+  }
+  match path {
+    GemmPath::FixedOrder => gemm_fixed_order(x, dim_in, w, rows_out, out),
+    GemmPath::Throughput => gemm_throughput(x, dim_in, w, rows_out, rows, out)?,
+  }
+  Ok(())
+}
+
+/// The `Throughput` dispatch: Accelerate on macOS (row-major `C[rows×rows_out] =
+/// X[rows×dim_in] · Wᵀ`, W stored `[rows_out][dim_in]`), the fixed lanes elsewhere.
+#[cfg(target_os = "macos")]
+fn gemm_throughput(
+  x: &[f32],
+  dim_in: usize,
+  w: &[f32],
+  rows_out: usize,
+  rows: usize,
+  out: &mut [f32],
+) -> Result<(), String> {
+  let extent = |n: usize| -> Result<i32, String> {
+    i32::try_from(n).map_err(|_| "encoder: GEMM extent exceeds the BLAS interface".to_string())
+  };
+  let (m, n, k) = (extent(rows)?, extent(rows_out)?, extent(dim_in)?);
+  // SAFETY: extents were validated against the slice lengths by `gemm` (x holds
+  // rows×dim_in, w holds rows_out×dim_in, out holds rows×rows_out, all
+  // row-major with leading dimensions dim_in / dim_in / rows_out), the pointers
+  // come from live slices that outlive the call, and `out` is exclusively
+  // borrowed for the duration — the framework writes only inside it.
+  unsafe {
+    accelerate::cblas_sgemm(
+      accelerate::CBLAS_ROW_MAJOR,
+      accelerate::CBLAS_NO_TRANS,
+      accelerate::CBLAS_TRANS,
+      m,
+      n,
+      k,
+      1.0,
+      x.as_ptr(),
+      k,
+      w.as_ptr(),
+      k,
+      0.0,
+      out.as_mut_ptr(),
+      n,
+    );
+  }
+  Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gemm_throughput(
+  x: &[f32],
+  dim_in: usize,
+  w: &[f32],
+  rows_out: usize,
+  _rows: usize,
+  out: &mut [f32],
+) -> Result<(), String> {
+  gemm_fixed_order(x, dim_in, w, rows_out, out);
+  Ok(())
+}
+
 /// Eight fixed f32 lanes over ascending d, reduced pairwise in fixed order, scalar
 /// tail; rows of `out` are independent (rayon-safe, bit-stable at any thread count).
-fn gemm(x: &[f32], dim_in: usize, w: &[f32], rows_out: usize, out: &mut [f32]) {
+fn gemm_fixed_order(x: &[f32], dim_in: usize, w: &[f32], rows_out: usize, out: &mut [f32]) {
   out
     .par_chunks_mut(rows_out)
     .enumerate()
@@ -127,6 +280,16 @@ pub fn forward(weights: &ModelWeights<'_>, ids: &[u32]) -> Result<Vec<f32>, Stri
 pub fn forward_batch(
   weights: &ModelWeights<'_>,
   sequences: &[&[u32]],
+) -> Result<Vec<Vec<f32>>, String> {
+  forward_batch_with(weights, sequences, GemmPath::FixedOrder)
+}
+
+/// [`forward_batch`] under a selected GEMM path — the doc-side sidecar's entry
+/// (`Throughput`); everything outside the six GEMMs is byte-identical across paths.
+pub fn forward_batch_with(
+  weights: &ModelWeights<'_>,
+  sequences: &[&[u32]],
+  path: GemmPath,
 ) -> Result<Vec<Vec<f32>>, String> {
   let (dim, heads) = (weights.dim, weights.heads);
   if dim == 0 || heads == 0 || dim % heads != 0 {
@@ -193,22 +356,42 @@ pub fn forward_batch(
   }
   let rotate = |vectors: &mut [f32], bounds: &[(u32, u32)]| {
     // vectors: [total][heads][head_dim], rotate-half non-interleaved, f64 mid-math,
-    // positions LOCAL to each sequence.
-    for (global, &(start, _)) in bounds.iter().enumerate() {
-      let position = global - start as usize;
-      for h in 0..heads {
-        let base = (global * heads + h) * head_dim;
-        for f in 0..half {
-          let (c, n) = (cos[position * half + f], sin[position * half + f]);
-          let (a, b) = (vectors[base + f] as f64, vectors[base + half + f] as f64);
-          vectors[base + f] = (a * c - b * n) as f32;
-          vectors[base + half + f] = (b * c + a * n) as f32;
+    // positions LOCAL to each sequence. Row-parallel: each token row's math is
+    // independent and unchanged.
+    vectors
+      .par_chunks_exact_mut(dim)
+      .zip(bounds.par_iter())
+      .enumerate()
+      .for_each(|(global, (row, &(start, _)))| {
+        let position = global - start as usize;
+        for h in 0..heads {
+          let base = h * head_dim;
+          for f in 0..half {
+            let (c, n) = (cos[position * half + f], sin[position * half + f]);
+            let (a, b) = (row[base + f] as f64, row[base + half + f] as f64);
+            row[base + f] = (a * c - b * n) as f32;
+            row[base + half + f] = (b * c + a * n) as f32;
+          }
         }
-      }
-    }
+      });
+  };
+  // Element-wise passes are row-parallel too — per element the arithmetic is the
+  // serial loop's, so the fixed path stays bit-stable and the throughput path
+  // stops serializing on O(total × inner) work between its GEMMs.
+  let residual_add = |x: &mut [f32], add: &[f32]| {
+    x.par_chunks_exact_mut(dim)
+      .zip(add.par_chunks_exact(dim))
+      .for_each(|(row, add_row)| {
+        for (value, add) in row.iter_mut().zip(add_row) {
+          *value += add;
+        }
+      });
   };
 
   let mut qkv = vec![0.0f32; total * 3 * dim];
+  let mut q = vec![0.0f32; total * dim];
+  let mut k = vec![0.0f32; total * dim];
+  let mut v = vec![0.0f32; total * dim];
   let mut attn_out = vec![0.0f32; total * dim];
   let mut context = vec![0.0f32; total * dim];
   let mut mlp_y = vec![0.0f32; total * weights.inner];
@@ -219,16 +402,17 @@ pub fn forward_batch(
   for layer in &weights.layers {
     // qkv: [total][3*dim] rows (t-major, then head, then component); unpack into
     // contiguous q/k/v matrices [total][heads][head_dim] for the attention walk.
-    gemm(&x, dim, layer.wqkv, 3 * dim, &mut qkv);
-    let mut q = vec![0.0f32; total * dim];
-    let mut k = vec![0.0f32; total * dim];
-    let mut v = vec![0.0f32; total * dim];
-    for s in 0..total {
-      let row = &qkv[s * 3 * dim..(s + 1) * 3 * dim];
-      q[s * dim..(s + 1) * dim].copy_from_slice(&row[0..dim]);
-      k[s * dim..(s + 1) * dim].copy_from_slice(&row[dim..2 * dim]);
-      v[s * dim..(s + 1) * dim].copy_from_slice(&row[2 * dim..3 * dim]);
-    }
+    gemm(path, &x, dim, layer.wqkv, 3 * dim, &mut qkv)?;
+    qkv
+      .par_chunks_exact(3 * dim)
+      .zip(q.par_chunks_exact_mut(dim))
+      .zip(k.par_chunks_exact_mut(dim))
+      .zip(v.par_chunks_exact_mut(dim))
+      .for_each(|(((row, q_row), k_row), v_row)| {
+        q_row.copy_from_slice(&row[0..dim]);
+        k_row.copy_from_slice(&row[dim..2 * dim]);
+        v_row.copy_from_slice(&row[2 * dim..3 * dim]);
+      });
     rotate(&mut q, &bounds);
     rotate(&mut k, &bounds);
     // Attention per (query-row, head), keys bounded to the row's OWN sequence
@@ -278,21 +462,22 @@ pub fn forward_batch(
           }
         }
       });
-    gemm(&context, dim, layer.out_proj, dim, &mut attn_out);
-    for (value, add) in x.iter_mut().zip(&attn_out) {
-      *value += add;
-    }
+    gemm(path, &context, dim, layer.out_proj, dim, &mut attn_out)?;
+    residual_add(&mut x, &attn_out);
     layer_norm(&mut x, dim, layer.norm1_weight, layer.norm1_bias, weights.layer_norm_eps);
-    gemm(&x, dim, layer.fc11, weights.inner, &mut mlp_y);
-    gemm(&x, dim, layer.fc12, weights.inner, &mut mlp_gate);
-    for (y, gate) in mlp_y.iter_mut().zip(&mlp_gate) {
-      let g = *gate as f64;
-      *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
-    }
-    gemm(&mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out);
-    for (value, add) in x.iter_mut().zip(&mlp_out) {
-      *value += add;
-    }
+    gemm(path, &x, dim, layer.fc11, weights.inner, &mut mlp_y)?;
+    gemm(path, &x, dim, layer.fc12, weights.inner, &mut mlp_gate)?;
+    mlp_y
+      .par_chunks_exact_mut(weights.inner)
+      .zip(mlp_gate.par_chunks_exact(weights.inner))
+      .for_each(|(y_row, gate_row)| {
+        for (y, gate) in y_row.iter_mut().zip(gate_row) {
+          let g = *gate as f64;
+          *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
+        }
+      });
+    gemm(path, &mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out)?;
+    residual_add(&mut x, &mlp_out);
     layer_norm(&mut x, dim, layer.norm2_weight, layer.norm2_bias, weights.layer_norm_eps);
   }
   Ok(

@@ -109,6 +109,30 @@ fn parse_header(
   Ok((data_start, entries))
 }
 
+/// The raw header (8-byte length + JSON tensor table) and the file length — the
+/// structural identity the encoder handle hashes at open (`model_identity`).
+pub(crate) fn header_bytes(path: &Path) -> Result<(Vec<u8>, u64), String> {
+  let mut file = std::fs::File::open(path).map_err(|e| format!("weights {}: {e}", path.display()))?;
+  let file_len = file
+    .metadata()
+    .map_err(|e| format!("weights {}: {e}", path.display()))?
+    .len();
+  let mut length = [0u8; 8];
+  file
+    .read_exact(&mut length)
+    .map_err(|e| format!("weights {}: header length: {e}", path.display()))?;
+  let header_len = usize::try_from(u64::from_le_bytes(length))
+    .ok()
+    .filter(|len| (*len as u64) + 8 <= file_len)
+    .ok_or("safetensors: header length outside the file")?;
+  let mut header = vec![0u8; 8 + header_len];
+  header[..8].copy_from_slice(&length);
+  file
+    .read_exact(&mut header[8..])
+    .map_err(|e| format!("weights {}: header: {e}", path.display()))?;
+  Ok((header, file_len))
+}
+
 impl SafeTensors {
   pub fn open(path: &Path) -> Result<SafeTensors, String> {
     let file_len = std::fs::metadata(path)

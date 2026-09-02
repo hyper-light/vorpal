@@ -81,3 +81,9 @@ vorpal-dynamic.workspace = true
 [[example]]
 name = "sweep_semantic"
 required-features = ["bench-internals"]
+
+# The recorded encoder-throughput sweep (GEMM paths, parity, thread stability) —
+# same gating.
+[[example]]
+name = "sweep_encoder"
+required-features = ["bench-internals"]
