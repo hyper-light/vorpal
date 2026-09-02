@@ -66,9 +66,20 @@ struct Entry {
   stamp: u64,
 }
 
+/// First-sight marker: a path parsed ONCE holds no tree — cold builds parse every file
+/// exactly once, and retaining their trees starves the tree-sitter children-cache
+/// freelists that would otherwise recycle into the very next parse (ledger-measured:
+/// +3.05 M ts allocations on a cold kernel build from just four retained giants).
+/// Promotion to a full entry happens on the SECOND parse of the same path — the save
+/// loop's shape — so retention only ever pays where reuse is real.
+struct Seen {
+  lang: SgLang,
+}
+
 #[derive(Default)]
 struct Cache {
   entries: HashMap<String, Entry>,
+  seen: HashMap<String, Seen>,
   bytes: usize,
   clock: u64,
 }
@@ -110,16 +121,24 @@ pub(crate) fn grep_cached(lang: SgLang, path: &str, source: &str) -> Root {
 /// The policy-free body (test seam: oracles force tiny files through the cache).
 pub(crate) fn grep_cached_unpoliced(lang: SgLang, path: &str, source: &str) -> Root {
   // Take ownership of the entry so the (potentially seconds-long) parse runs unlocked
-  // and concurrent giants never serialize on the cache.
-  let history = cache()
-    .lock()
-    .ok()
-    .and_then(|mut cache| {
-      let entry = cache.entries.remove(path)?;
-      cache.bytes -= entry.source.len();
-      Some(entry)
-    })
-    .filter(|entry| entry.lang == lang);
+  // and concurrent giants never serialize on the cache. `promote` is the two-touch
+  // rule: retain a tree only for a path this process has parsed before.
+  let (history, promote) = match cache().lock() {
+    Ok(mut cache) => {
+      let history = cache
+        .entries
+        .remove(path)
+        .inspect(|entry| cache.bytes -= entry.source.len())
+        .filter(|entry| entry.lang == lang);
+      let promote = history.is_some()
+        || cache.seen.get(path).is_some_and(|seen| seen.lang == lang);
+      if !promote {
+        cache.seen.insert(path.to_string(), Seen { lang });
+      }
+      (history, promote)
+    }
+    Err(_) => (None, false),
+  };
   let root = match &history {
     Some(entry) => vorpal_core::Vorpal::try_new_incremental(
       source,
@@ -134,6 +153,9 @@ pub(crate) fn grep_cached_unpoliced(lang: SgLang, path: &str, source: &str) -> R
     // way `grep` does (extraction treats the file as unparseable).
     Err(_) => return vorpal_core::tree_sitter::LanguageExt::grep(&lang, source),
   };
+  if !promote {
+    return root;
+  }
   let (src, tree) = root.parse_state();
   let entry = Entry {
     source: src.to_string(),
@@ -167,8 +189,16 @@ mod tests {
   /// product encoder.
   fn oracle(path: &str, before: &str, after: &str) {
     let extractor = OutlineExtractor::new().expect("rules compile");
-    // Prime the cache with the BEFORE state via the unpoliced seam.
-    let _ = grep_cached_unpoliced(SgLang::from_path(path).expect("lang"), path, before);
+    // Prime TWICE: the two-touch rule marks a path on first sight and retains the tree
+    // only on the second parse — one prime would leave no history and the "incremental"
+    // leg would silently run whole (a vacuous oracle).
+    let lang = SgLang::from_path(path).expect("lang");
+    let _ = grep_cached_unpoliced(lang, path, before);
+    let _ = grep_cached_unpoliced(lang, path, before);
+    assert!(
+      cache().lock().unwrap().entries.contains_key(path),
+      "{path}: history must be retained before the incremental leg"
+    );
     // Incremental: extract AFTER through the cached history.
     let incremental = extractor
       .extract_product_via(path, after, grep_cached_unpoliced)
