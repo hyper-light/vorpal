@@ -30,12 +30,17 @@ fn main() {
     let t = Instant::now();
     let product = extractor.extract_product("bench.c", &edited).expect("edited");
     let ms = t.elapsed().as_millis();
-    // Byte-truth every round against a fresh parse of the same edited text.
-    let fresh = extractor.extract_product("fresh.c", &edited).expect("fresh");
+    // Byte-truth every round against a genuinely fresh whole-file extraction: the probe
+    // name is unique per round so the control never warms the cache itself.
+    let t = Instant::now();
+    let fresh = extractor
+      .extract_product(&format!("fresh-{round}.c"), &edited)
+      .expect("fresh");
+    let fresh_ms = t.elapsed().as_millis();
     let (mut a, mut b) = (Vec::new(), Vec::new());
     vorpal_ingest::encode_product_into(&product, &mut a);
     vorpal_ingest::encode_product_into(&fresh, &mut b);
     assert_eq!(a, b, "round {round}: divergence");
-    println!("round {round}: {} ms (byte-verified)", ms);
+    println!("round {round}: {ms} ms cached vs {fresh_ms} ms fresh (byte-verified)");
   }
 }

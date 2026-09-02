@@ -724,6 +724,7 @@ impl OutlineExtractor {
     // Reuse attempt, row side (needs the NEW layout): remap retained attribution by
     // definition span, split retained rows, carry retained signatures. Failure here
     // keeps the reuse-built items (they are exact regardless) and runs the full walk.
+    let row_split_t = std::time::Instant::now();
     let row_plan = match (&plan, reuse.as_ref()) {
       (Some(dirty), Some((snap, _))) => {
         let attempt = (|| {
@@ -732,8 +733,14 @@ impl OutlineExtractor {
           let sigs = crate::walk_reuse::retained_signatures(snap, dirty, &remap)?;
           Some((rows, sigs))
         })();
-        if attempt.is_none() && trace_reuse {
-          eprintln!("[walk-reuse] {path}: row split/remap violated — full reference walk");
+        if trace_reuse {
+          match &attempt {
+            None => eprintln!("[walk-reuse] {path}: row split/remap violated — full reference walk"),
+            Some(_) => eprintln!(
+              "[walk-reuse] {path}: row split {} ms",
+              row_split_t.elapsed().as_millis()
+            ),
+          }
         }
         attempt
       }
@@ -791,6 +798,7 @@ impl OutlineExtractor {
         if let (Some((rows, retained_sigs)), Some(dirty)) = (row_plan, &plan) {
           // Regional walk: fresh rows from the dirty top-level subtrees only, ancestors
           // seeded with the tree root so parent-sensitive dispatch matches a full walk.
+          let regional_t = std::time::Instant::now();
           let root_node = grep.root();
           let mut fresh = crate::references::RefWalk::default();
           for child in root_node.children() {
@@ -850,6 +858,12 @@ impl OutlineExtractor {
               }));
             }
             sigs.sort_unstable_by_key(|s| s.entity_index);
+            if trace_reuse {
+              eprintln!(
+                "[walk-reuse] {path}: regional walk+merge {} ms",
+                regional_t.elapsed().as_millis()
+              );
+            }
             reuse_sigs = Some(sigs);
             open_walk = Some(merged);
             spliced = true;
@@ -986,6 +1000,7 @@ impl OutlineExtractor {
     // rows for the NEXT save, then run the file-global laws — the same laws the fused
     // entry point runs, over the same emission-order rows.
     if let Some(walk) = open_walk {
+      let capture_t = std::time::Instant::now();
       if want_snap {
         if let Some(cap_items) = cap_items.take() {
           let snapshot = crate::walk_reuse::WalkSnapshot {
@@ -1000,7 +1015,20 @@ impl OutlineExtractor {
           crate::tree_cache::store_snapshot(path, Box::new(snapshot));
         }
       }
+      if trace_reuse {
+        eprintln!(
+          "[walk-reuse] {path}: capture+store {} ms",
+          capture_t.elapsed().as_millis()
+        );
+      }
+      let finalize_t = std::time::Instant::now();
       crate::references::finalize_references(walk, &mut raw);
+      if trace_reuse {
+        eprintln!(
+          "[walk-reuse] {path}: finalize {} ms",
+          finalize_t.elapsed().as_millis()
+        );
+      }
     }
     if !injected.is_empty() {
       // Same canonicalization for references (attribution reads spans, so order is free to
