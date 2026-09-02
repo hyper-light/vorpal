@@ -138,6 +138,11 @@ pub fn run_tune(arg: TuneArg) -> Result<ExitCode> {
     println!("  encoder reranker   untested{hint}");
   }
   row("bm25 channel", &report.bm25, " (override holds until the index retrains)");
+  if report.dense_present {
+    row("dense channel", &report.dense, " (per-index override: dense.channel)");
+  } else {
+    println!("  dense channel      untested (no fresh dense sidecar for this index/encoder — warm with a dense budget)");
+  }
 
   if arg.dry_run {
     println!("\n--dry-run: no switches written");
@@ -163,6 +168,17 @@ pub fn run_tune(arg: TuneArg) -> Result<ExitCode> {
       if enabled { "ON" } else { "OFF" }
     ),
     None => println!("bm25: no signal — verdict unchanged"),
+  }
+  match report.wrote_dense {
+    Some(enabled) => println!(
+      "wrote {} = {} → dense channel {} for this index (shadows the warm gate's verdict; \
+       delete the file to revert)",
+      dir.join("dense.channel").display(),
+      if enabled { "on" } else { "off" },
+      if enabled { "PINNED ON" } else { "OPTED OUT" }
+    ),
+    None if report.dense_present => println!("dense channel: no signal — verdict unchanged"),
+    None => {}
   }
   Ok(ExitCode::SUCCESS)
 }

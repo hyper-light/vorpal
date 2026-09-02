@@ -114,7 +114,7 @@ mod jemalloc_conf {
 use vorpal_index::search_index;
 
 const USAGE: &str = "usage:
-  vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F] [--semantic-tier lexical|learned]
+  vorpal-index index        <src-dir> <index-dir> [--verify] [--parse-health warn|exclude|fail] [--max-error-ratio F] [--semantic-tier lexical|learned] [--dense-budget-secs N]
                                                     build + persist a knowledge graph
   vorpal-index export       <index-root> <file.vidx>  pack the live generation into one shareable artifact
   vorpal-index import       <file.vidx> <index-root>  verify + install an exported generation (atomic CURRENT swap)
@@ -223,6 +223,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
       let mut mode = vorpal_index::CacheMode::default();
       let mut policy = vorpal_index::ParseHealthPolicy::default();
       let mut semantic_tier: Option<vorpal_index::SemanticTier> = None;
+      let mut dense_budget: Option<f64> = None;
       let mut flags = rest.iter();
       while let Some(flag) = flags.next() {
         match *flag {
@@ -254,8 +255,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
               }
             });
           }
+          "--dense-budget-secs" => {
+            // The doc-side dense channel's warm budget (vorpal_index::dense — the
+            // token-based coverage rule), persisted at the ROOT like the tier
+            // selection so every later warm builds the sidecar without being told.
+            dense_budget = Some(
+              flags
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|secs| *secs > 0.0)
+                .ok_or("--dense-budget-secs wants a positive number of seconds")?,
+            );
+          }
           other => return Err(format!("unknown flag '{other}'\n{USAGE}").into()),
         }
+      }
+      if let Some(secs) = dense_budget {
+        vorpal_index::write_dense_budget(Path::new(out), secs)?;
+        println!("dense channel warm budget: {secs} s");
       }
       if let Some(tier) = semantic_tier {
         vorpal_index::write_tier_selection(Path::new(out), tier)?;

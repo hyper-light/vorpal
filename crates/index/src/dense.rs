@@ -53,10 +53,300 @@ const MAGIC: &[u8; 4] = b"VDNS";
 const VERSION: u32 = 1;
 /// Fixed header: magic 4 + version 4 + stamp 8 + n 8 + dim 4 + pad 4.
 const HEADER_BYTES: usize = 32;
-/// The surface recipe label — the rerank's `format!("{name} {signature} {basename}")`.
-pub(crate) const SURFACE_RECIPE: &str = "name signature basename";
 /// Sequences per forward batch (module doc: the recorded sweep's saturation point).
 pub(crate) const BATCH_SEQUENCES: usize = 256;
+
+/// What text a definition presents to the encoder — ONE recipe for the sidecar
+/// build and the query-time rerank (the one-recipe law: the rerank scores
+/// candidates against the same surface the sidecar ranked them by). The label
+/// rides in `ann.dense.json` and the freshness gate demands it, so a recipe
+/// flip in code retrains every sidecar instead of serving mixed surfaces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SurfaceRecipe {
+  /// `name signature basename` — the original rerank surface.
+  Head,
+  /// Head + the contiguous comment block immediately above the definition span
+  /// (language family by extension; attribute/decorator lines between the
+  /// comment and the definition are skipped).
+  HeadDoc,
+  /// HeadDoc + the head of the body: the definition span's first paragraph
+  /// (lines up to the first blank line, or the span end) — for Python this is
+  /// where the docstring lives.
+  HeadDocBody,
+}
+
+impl SurfaceRecipe {
+  pub(crate) fn label(self) -> &'static str {
+    match self {
+      SurfaceRecipe::Head => "name signature basename",
+      SurfaceRecipe::HeadDoc => "name signature basename doc",
+      SurfaceRecipe::HeadDocBody => "name signature basename doc body",
+    }
+  }
+
+  fn reads_source(self) -> bool {
+    !matches!(self, SurfaceRecipe::Head)
+  }
+}
+
+/// The PINNED recipe (`Head`, the measured 2026-09-02 baseline) — the richer
+/// recipes are the A/B this module records. `VORPAL_SURFACE_RECIPE=head|doc|body`
+/// sweeps it under `bench-internals` only.
+const ACTIVE_SURFACE: SurfaceRecipe = SurfaceRecipe::Head;
+
+pub(crate) fn active_surface_recipe() -> SurfaceRecipe {
+  #[cfg(feature = "bench-internals")]
+  if let Ok(value) = std::env::var("VORPAL_SURFACE_RECIPE") {
+    return match value.as_str() {
+      "head" => SurfaceRecipe::Head,
+      "doc" => SurfaceRecipe::HeadDoc,
+      "body" => SurfaceRecipe::HeadDocBody,
+      _ => ACTIVE_SURFACE,
+    };
+  }
+  ACTIVE_SURFACE
+}
+
+/// Per-surface token cap for the richer recipes — DERIVED, not tuned: the largest
+/// token matrix the recorded sweep validated on this forward (batch 4096 ×
+/// 24.9 tok = 101,959 tokens, `examples/sweep_encoder.rs`) divided by the build's
+/// [`BATCH_SEQUENCES`], so a batch of capped surfaces can never exceed a matrix
+/// the path was measured on (memory law: the SwiGLU buffers are
+/// `tokens × inner × 4 B × 2`). The encoder's own `max_trained_positions`
+/// (2048) is the hard clamp above this. Truncations are counted per build.
+pub(crate) const SURFACE_TOKEN_CAP: usize = 101_959 / BATCH_SEQUENCES;
+
+/// The comment syntax a file's extension implies — the family whose line
+/// markers `leading_comment` recognizes. Unknown families yield no comment (the
+/// surface falls back to the head recipe for that definition, counted).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommentFamily {
+  Slash,
+  Hash,
+  Dash,
+  Semicolon,
+}
+
+fn comment_family(path: &str) -> Option<CommentFamily> {
+  let basename = path.rsplit('/').next().unwrap_or(path);
+  if basename == "Makefile" || basename == "CMakeLists.txt" || basename == "Dockerfile" {
+    return Some(CommentFamily::Hash);
+  }
+  let extension = basename.rsplit('.').next().filter(|ext| *ext != basename)?;
+  Some(match extension {
+    "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "rs" | "go" | "java" | "js" | "jsx"
+    | "mjs" | "cjs" | "ts" | "tsx" | "kt" | "kts" | "scala" | "swift" | "cs" | "zig" | "m" | "mm"
+    | "php" | "dart" | "groovy" | "proto" | "v" | "sv" | "vue" | "svelte" | "css" | "scss" => {
+      CommentFamily::Slash
+    }
+    "py" | "pyi" | "rb" | "sh" | "bash" | "zsh" | "pl" | "pm" | "yaml" | "yml" | "toml" | "cmake"
+    | "mk" | "r" | "jl" | "nix" | "tcl" | "ps1" | "ex" | "exs" | "cr" => CommentFamily::Hash,
+    "lua" | "hs" | "sql" | "elm" | "ada" | "adb" | "ads" => CommentFamily::Dash,
+    "lisp" | "el" | "clj" | "cljs" | "cljc" | "scm" | "rkt" => CommentFamily::Semicolon,
+    _ => return None,
+  })
+}
+
+/// Whether a trimmed line is a comment line in `family`; returns the text with
+/// the markers stripped.
+fn comment_text(line: &str, family: CommentFamily) -> Option<&str> {
+  let stripped = match family {
+    CommentFamily::Slash => line
+      .strip_prefix("///")
+      .or_else(|| line.strip_prefix("//!"))
+      .or_else(|| line.strip_prefix("//"))
+      .or_else(|| line.strip_prefix("/**"))
+      .or_else(|| line.strip_prefix("/*"))
+      .or_else(|| line.strip_prefix("*/").map(|_| ""))
+      .or_else(|| line.strip_prefix('*'))?,
+    CommentFamily::Hash => line.strip_prefix('#')?,
+    CommentFamily::Dash => line.strip_prefix("--")?,
+    CommentFamily::Semicolon => line.strip_prefix(';')?,
+  };
+  Some(
+    stripped
+      .trim_start_matches(['#', '!', '*', '-', ';', '/'])
+      .trim_end_matches("*/")
+      .trim(),
+  )
+}
+
+/// Whether a trimmed line sits legitimately between a doc comment and its
+/// definition (Rust attributes, Python/Java decorators, C# attributes) — skipped,
+/// never breaking the block's contiguity.
+fn is_attribute_line(line: &str) -> bool {
+  line.starts_with("#[") || line.starts_with('@') || (line.starts_with('[') && line.ends_with(']'))
+}
+
+/// The contiguous comment block immediately above the line containing
+/// `span_start`, markers stripped, whitespace collapsed. Empty when there is none
+/// (or the family is unknown).
+pub(crate) fn leading_comment(bytes: &[u8], span_start: usize, path: &str) -> String {
+  let Some(family) = comment_family(path) else {
+    return String::new();
+  };
+  let span_start = span_start.min(bytes.len());
+  let definition_line = bytes[..span_start]
+    .iter()
+    .rposition(|&b| b == b'\n')
+    .map_or(0, |nl| nl + 1);
+  let mut lines: Vec<String> = Vec::new();
+  let mut end = definition_line;
+  while end > 0 {
+    let start = bytes[..end - 1]
+      .iter()
+      .rposition(|&b| b == b'\n')
+      .map_or(0, |nl| nl + 1);
+    let line = String::from_utf8_lossy(&bytes[start..end - 1]);
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+      // A blank line above the definition (before any comment) breaks contiguity.
+      break;
+    }
+    if is_attribute_line(trimmed) {
+      end = start;
+      continue;
+    }
+    match comment_text(trimmed, family) {
+      Some(text) => {
+        if !text.is_empty() {
+          lines.push(text.to_string());
+        }
+      }
+      None => break,
+    }
+    end = start;
+  }
+  lines.reverse();
+  lines.join(" ")
+}
+
+/// The definition span's first paragraph: its lines up to (not including) the
+/// first blank line, or the span end.
+pub(crate) fn body_head(bytes: &[u8], span: (usize, usize)) -> String {
+  let end = span.1.min(bytes.len());
+  let start = span.0.min(end);
+  let text = String::from_utf8_lossy(&bytes[start..end]);
+  let mut out = String::new();
+  for line in text.lines() {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+      break;
+    }
+    if !out.is_empty() {
+      out.push(' ');
+    }
+    out.push_str(trimmed);
+  }
+  out
+}
+
+/// Builds candidate surfaces under the active recipe — shared by the sidecar
+/// build and the rerank. Source bytes come through the indexed-source read
+/// (digest-verified against the generation's product pack; a changed or
+/// unreadable file falls back to the head recipe for that definition, counted),
+/// cached per path for the builder's life (a build touches each covered file
+/// once per batch order; the corpus's covered files bound the cache).
+pub(crate) struct SurfaceBuilder {
+  recipe: SurfaceRecipe,
+  pack: Option<std::sync::Arc<crate::PackReader>>,
+  files: std::collections::HashMap<String, Option<Vec<u8>>>,
+  /// Definitions that fell back to the head recipe (no span, no readable/verified
+  /// source, unknown comment family AND empty body head).
+  pub fallbacks: usize,
+  /// Definitions whose extra text was cut to fit [`SURFACE_TOKEN_CAP`].
+  pub truncations: usize,
+}
+
+impl SurfaceBuilder {
+  pub(crate) fn new(generation_dir: &Path, recipe: SurfaceRecipe) -> SurfaceBuilder {
+    SurfaceBuilder {
+      recipe,
+      pack: recipe.reads_source().then(|| crate::cached_pack(generation_dir)).flatten(),
+      files: std::collections::HashMap::new(),
+      fallbacks: 0,
+      truncations: 0,
+    }
+  }
+
+  pub(crate) fn recipe(&self) -> SurfaceRecipe {
+    self.recipe
+  }
+
+  fn file_bytes(&mut self, path: &str) -> Option<&[u8]> {
+    if !self.files.contains_key(path) {
+      let read = match crate::read_indexed_source_with(self.pack.as_deref(), path) {
+        Ok(crate::IndexedRead::Verified(bytes)) | Ok(crate::IndexedRead::Unverified(bytes)) => Some(bytes),
+        Ok(crate::IndexedRead::Changed) | Err(_) => None,
+      };
+      self.files.insert(path.to_string(), read);
+    }
+    self.files.get(path).and_then(|bytes| bytes.as_deref())
+  }
+
+  /// The surface for node `id`, fitted to the token cap through `encoder`.
+  pub(crate) fn surface(&mut self, kg: &Kg, id: u64, encoder: &CodeEncoder) -> String {
+    let Some(view) = kg.node(NodeId::new(id)) else {
+      return String::new();
+    };
+    let head = surface_of(&view);
+    if !self.recipe.reads_source() {
+      return head;
+    }
+    let (start, end) = (view.span.0 as usize, view.span.1 as usize);
+    let (path, recipe) = (view.path.to_string(), self.recipe);
+    let extra = if end <= start {
+      None
+    } else {
+      self.file_bytes(&path).map(|bytes| {
+        let mut extra = leading_comment(bytes, start, &path);
+        if recipe == SurfaceRecipe::HeadDocBody {
+          let body = body_head(bytes, (start, end));
+          if !body.is_empty() {
+            if !extra.is_empty() {
+              extra.push(' ');
+            }
+            extra.push_str(&body);
+          }
+        }
+        extra
+      })
+    };
+    match extra {
+      Some(extra) if !extra.is_empty() => self.fit(encoder, head, extra),
+      _ => {
+        self.fallbacks += 1;
+        head
+      }
+    }
+  }
+
+  /// `head + extra` cut so the whole surface fits [`SURFACE_TOKEN_CAP`]: each
+  /// pass scales the extra text by the measured tokens-over-cap ratio (at a
+  /// char boundary) until it fits — converges in a few passes since the ratio
+  /// strictly shrinks the text.
+  fn fit(&mut self, encoder: &CodeEncoder, head: String, mut extra: String) -> String {
+    let mut surface = format!("{head} {extra}");
+    let mut tokens = encoder.sequence_len(&surface);
+    if tokens <= SURFACE_TOKEN_CAP {
+      return surface;
+    }
+    self.truncations += 1;
+    while tokens > SURFACE_TOKEN_CAP && !extra.is_empty() {
+      let keep = (extra.len() * SURFACE_TOKEN_CAP / tokens).min(extra.len().saturating_sub(1));
+      let boundary = extra
+        .char_indices()
+        .map(|(at, _)| at)
+        .take_while(|&at| at <= keep)
+        .last()
+        .unwrap_or(0);
+      extra.truncate(boundary);
+      surface = if extra.is_empty() { head.clone() } else { format!("{head} {extra}") };
+      tokens = encoder.sequence_len(&surface);
+    }
+    surface
+  }
+}
 
 /// The provenance record beside the sidecar. Field order is canonical (BTreeMap
 /// serialization) so rewrites are byte-reproducible.
@@ -74,6 +364,10 @@ pub(crate) struct DenseRecord {
   pub measured_s_per_token: f64,
   /// Tokens the covered rows carry in total (coverage × mean surface length).
   pub covered_tokens: u64,
+  /// Definitions that fell back to the head recipe (richer recipes only).
+  pub surface_fallbacks: u64,
+  /// Definitions whose extra text was cut to [`SURFACE_TOKEN_CAP`].
+  pub surface_truncations: u64,
   pub build_secs: f64,
   /// Per-corpus channel verdict from the warm-time self-probe gate (`None` =
   /// not yet gated — healed on the next warm, like the BM25 verdict).
@@ -104,6 +398,8 @@ pub(crate) fn read_record(dir: &Path) -> Option<DenseRecord> {
     budget_secs: f64_of("budget_secs")?,
     measured_s_per_token: f64_of("measured_s_per_token")?,
     covered_tokens: u64_of("covered_tokens")?,
+    surface_fallbacks: u64_of("surface_fallbacks").unwrap_or(0),
+    surface_truncations: u64_of("surface_truncations").unwrap_or(0),
     build_secs: f64_of("build_secs")?,
     gate,
     gate_evidence: str_of("gate_evidence"),
@@ -122,6 +418,8 @@ pub(crate) fn write_record(dir: &Path, record: &DenseRecord) -> std::io::Result<
   fields.insert("budget_secs", record.budget_secs.into());
   fields.insert("measured_s_per_token", record.measured_s_per_token.into());
   fields.insert("covered_tokens", record.covered_tokens.into());
+  fields.insert("surface_fallbacks", record.surface_fallbacks.into());
+  fields.insert("surface_truncations", record.surface_truncations.into());
   fields.insert("build_secs", record.build_secs.into());
   fields.insert("version", VERSION.into());
   if let Some(gate) = record.gate {
@@ -208,15 +506,24 @@ pub(crate) fn build(
   let mut target = population.min(2 * BATCH_SEQUENCES);
   let mut measured_s_per_token = 0.0f64;
   let mut cursor = 0usize;
-  let surface_text = |id: u64| -> String {
-    kg.node(NodeId::new(id))
-      .map(|view| surface_of(&view))
-      .unwrap_or_default()
-  };
+  let mut builder = SurfaceBuilder::new(dir, active_surface_recipe());
+  vorpal_kg::phase_stamp(&format!("dense: surface recipe {:?}", builder.recipe().label()));
+  // Surfaces the coverage walk already built (positions `prepared_from..`), consumed
+  // by the batch loop so every surface is built — and counted — exactly once.
+  let mut prepared: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+  let mut prepared_from = 0usize;
   while cursor < target {
     let end = (cursor + BATCH_SEQUENCES).min(target);
     let batch_ids = &order[cursor..end];
-    let surfaces: Vec<String> = batch_ids.iter().map(|&id| surface_text(id)).collect();
+    let surfaces: Vec<String> = (cursor..end)
+      .map(|position| {
+        if position >= prepared_from && !prepared.is_empty() {
+          prepared.pop_front().unwrap_or_default()
+        } else {
+          builder.surface(kg, order[position], encoder)
+        }
+      })
+      .collect();
     let texts: Vec<&str> = surfaces.iter().map(String::as_str).collect();
     let batch_tokens: u64 = texts.iter().map(|text| encoder.sequence_len(text) as u64).sum();
     let batch_started = std::time::Instant::now();
@@ -248,13 +555,16 @@ pub(crate) fn build(
       let affordable_tokens = (budget_secs / measured_s_per_token).floor() as u64;
       let mut prefix_tokens = covered_tokens;
       let mut prefix = cursor;
+      prepared_from = cursor;
       while prefix < population {
-        let tokens = encoder.sequence_len(&surface_text(order[prefix])) as u64;
+        let surface = builder.surface(kg, order[prefix], encoder);
+        let tokens = encoder.sequence_len(&surface) as u64;
         if prefix_tokens + tokens > affordable_tokens {
           break;
         }
         prefix_tokens += tokens;
         prefix += 1;
+        prepared.push_back(surface);
       }
       target = prefix.max(target);
       vorpal_kg::phase_stamp(&format!(
@@ -296,22 +606,30 @@ pub(crate) fn build(
     stamp,
     model_identity: encoder.model_identity(),
     weights_digest: encoder.weights_content_digest()?,
-    surface: SURFACE_RECIPE.to_string(),
+    surface: builder.recipe().label().to_string(),
     gemm_path: GemmPath::Throughput.label().to_string(),
     coverage: n,
     population,
     budget_secs,
     measured_s_per_token,
     covered_tokens,
+    // Exact: every covered surface was built once (the coverage walk's surfaces
+    // are consumed by the batch loop). The one surface past the prefix that the
+    // walk rejected is the only extra call.
+    surface_fallbacks: builder.fallbacks as u64,
+    surface_truncations: builder.truncations as u64,
     build_secs: started.elapsed().as_secs_f64(),
     gate: None,
     gate_evidence: None,
   };
   write_record(dir, &record).map_err(|e| format!("dense sidecar record: {e}"))?;
   vorpal_kg::phase_stamp(&format!(
-    "dense: committed {n} rows ({} bytes) in {:.1}s",
+    "dense: committed {n} rows ({} bytes) in {:.1}s — {:.1} tok/def, {} surface fallbacks, {} truncations",
     layout.end,
-    record.build_secs
+    record.build_secs,
+    covered_tokens as f64 / n.max(1) as f64,
+    record.surface_fallbacks,
+    record.surface_truncations,
   ));
   Ok(record)
 }
@@ -349,7 +667,7 @@ pub(crate) fn is_fresh(
   };
   record.stamp == stamp
     && record.model_identity == encoder.model_identity()
-    && record.surface == SURFACE_RECIPE
+    && record.surface == active_surface_recipe().label()
     && record.coverage == n
     && dim == encoder.dim()
     && (record.coverage == record.population
@@ -422,5 +740,50 @@ impl DenseSidecar {
       .take(pool)
       .map(|(row, _)| ids[row])
       .collect()
+  }
+}
+
+#[cfg(test)]
+mod surface_tests {
+  use super::{body_head, leading_comment};
+
+  #[test]
+  fn rust_doc_comment_block_is_collected_over_attributes() {
+    let src = b"use x;\n\n/// Detect near-duplicate code.\n/// Second line.\n#[inline]\npub fn similar_pairs() {}\n";
+    let at = String::from_utf8_lossy(src).find("pub fn").unwrap();
+    assert_eq!(leading_comment(src, at, "a/b.rs"), "Detect near-duplicate code. Second line.");
+  }
+
+  #[test]
+  fn blank_line_breaks_contiguity_and_unknown_family_yields_nothing() {
+    let src = b"// far away\n\nfn f() {}\n";
+    let at = String::from_utf8_lossy(src).find("fn f").unwrap();
+    assert_eq!(leading_comment(src, at, "a.rs"), "");
+    let py = b"# a hash comment\ndef g():\n    pass\n";
+    let at = String::from_utf8_lossy(py).find("def g").unwrap();
+    assert_eq!(leading_comment(py, at, "m.py"), "a hash comment");
+    assert_eq!(leading_comment(py, at, "m.unknownext"), "");
+    // A C preprocessor line is NOT a comment in the slash family.
+    let c = b"#define X 1\nint h(void) {}\n";
+    let at = String::from_utf8_lossy(c).find("int h").unwrap();
+    assert_eq!(leading_comment(c, at, "h.c"), "");
+  }
+
+  #[test]
+  fn c_block_comment_markers_are_stripped() {
+    let src = b"/**\n * Allocate a socket buffer.\n * @size: bytes\n */\nstruct sk_buff *alloc_skb(void);\n";
+    let at = String::from_utf8_lossy(src).find("struct sk_buff").unwrap();
+    assert_eq!(leading_comment(src, at, "skbuff.h"), "Allocate a socket buffer. @size: bytes");
+  }
+
+  #[test]
+  fn body_head_is_the_first_paragraph_of_the_span() {
+    let src = b"def ingest(path):\n    \"\"\"Load folded stacks.\"\"\"\n    x = 1\n\n    return x\n";
+    let end = src.len();
+    assert_eq!(
+      body_head(src, (0, end)),
+      "def ingest(path): \"\"\"Load folded stacks.\"\"\" x = 1"
+    );
+    assert_eq!(body_head(src, (end, end)), "");
   }
 }

@@ -2563,10 +2563,17 @@ pub fn write_encoder_opt_out(index_root: &Path) -> io::Result<()> {
 }
 
 /// The dense sidecar a handle serves, and whether its channel is ON: fresh for
-/// this generation and the OPENED encoder (else `None`), enabled by the record's
-/// per-corpus verdict. `VORPAL_DENSE_CHANNEL=on|off` overrides the verdict under
-/// `bench-internals` only (the harness's forced A/B) — never a production knob.
+/// this generation and the OPENED encoder (else `None`). ON by default wherever
+/// a fresh sidecar exists (owner decision 2026-09-02, BENCHMARKS "Doc-side dense
+/// channel": the labelled harness measured +0.100 / +0.016 / +0.123 all-NDCG on
+/// vorpal / cpython / kernel, while the warm's label-free self-probe gate voted
+/// OFF on all three — its probes are name-token queries blind to the descriptive
+/// and subword-identifier classes the channel serves; that verdict stays in the
+/// record as evidence only). The root's `dense.channel` override (`vorpal tune`'s
+/// labelled verdict) is the per-index opt-out/opt-in. `VORPAL_DENSE_CHANNEL=on|off`
+/// forces it under `bench-internals` only — never a production knob.
 fn load_dense_sidecar(
+  index_root: &Path,
   generation_dir: &Path,
   stamp: u64,
   encoder: Option<&vorpal_ann::encoder::CodeEncoder>,
@@ -2580,9 +2587,10 @@ fn load_dense_sidecar(
   let Some(sidecar) = dense::DenseSidecar::load(generation_dir, stamp) else {
     return (None, false);
   };
-  let verdict = dense::read_record(generation_dir)
-    .and_then(|record| record.gate)
-    .unwrap_or(false);
+  // Precedence: the root's `dense.channel` override (`vorpal tune`'s labelled
+  // verdict) over the default ON — the same shape as `encoder.dir` over the
+  // global enable. The record's label-free gate verdict is evidence, not a switch.
+  let verdict = dense_channel_override(index_root).unwrap_or(true);
   #[cfg(feature = "bench-internals")]
   let verdict = match std::env::var("VORPAL_DENSE_CHANNEL").as_deref() {
     Ok("on") => true,
@@ -2590,6 +2598,25 @@ fn load_dense_sidecar(
     _ => verdict,
   };
   (Some(sidecar), verdict)
+}
+
+/// The root's per-index dense-channel override (`<root>/dense.channel` = `on` |
+/// `off`), if any — written by `vorpal tune` from a labelled verdict; missing or
+/// unparseable = defer to the record's gate.
+pub fn dense_channel_override(index_root: &Path) -> Option<bool> {
+  match fs::read_to_string(index_root.join("dense.channel")).ok()?.trim() {
+    "on" => Some(true),
+    "off" => Some(false),
+    _ => None,
+  }
+}
+
+/// Persist the per-index dense-channel override (tmp + rename) — `vorpal tune`'s
+/// write path; remove the file to fall back to the warm gate's verdict.
+pub fn write_dense_channel_override(index_root: &Path, enabled: bool) -> io::Result<()> {
+  let tmp = index_root.join("dense.channel.tmp");
+  fs::write(&tmp, if enabled { "on\n" } else { "off\n" })?;
+  fs::rename(tmp, index_root.join("dense.channel"))
 }
 
 /// Warm options beyond the tier selection: the dense sidecar's wall-clock
@@ -2649,6 +2676,13 @@ fn ensure_dense_gate(index_dir: &Path, stamp: u64, encoder: Box<vorpal_ann::enco
     return;
   };
   if record.gate.is_some() || record.stamp != stamp {
+    return;
+  }
+  // Sweep seam (measurement builds only): the harness forces the channel through
+  // `VORPAL_DENSE_CHANNEL`, so the 512-probe gate is pure cost there.
+  #[cfg(feature = "bench-internals")]
+  if std::env::var("VORPAL_DENSE_GATE").as_deref() == Ok("skip") {
+    vorpal_kg::phase_stamp("dense: gate skipped (VORPAL_DENSE_GATE=skip)");
     return;
   }
   let searcher = match Searcher::open_with_encoder(index_dir, Some(encoder), None) {
@@ -4543,7 +4577,8 @@ impl Searcher {
     let bm25_enabled = persisted_tier_record(&generation_dir)
       .and_then(|record| record.bm25)
       .unwrap_or(false);
-    let (dense, dense_enabled) = load_dense_sidecar(&generation_dir, stamp, encoder.as_deref());
+    let (dense, dense_enabled) =
+      load_dense_sidecar(index_dir, &generation_dir, stamp, encoder.as_deref());
     Ok(Searcher {
       generation_dir,
       kg,
@@ -4586,7 +4621,8 @@ impl Searcher {
     // pipeline the index actually answers with — the dense channel included,
     // under the same per-corpus verdict.
     let (encoder, encoder_note) = open_selected_encoder(index_dir);
-    let (dense, dense_enabled) = load_dense_sidecar(&generation_dir, stamp, encoder.as_deref());
+    let (dense, dense_enabled) =
+      load_dense_sidecar(index_dir, &generation_dir, stamp, encoder.as_deref());
     Ok(Searcher {
       generation_dir,
       kg,
@@ -4735,6 +4771,54 @@ impl Searcher {
       self.hits_from_ranked(off, None),
       self.hits_from_ranked(on, None),
     ))
+  }
+
+  /// ONE search, dense channel off/on — `vorpal tune`'s paired view for the
+  /// fifth list: a single channel pass (with the query embedding) feeds both the
+  /// four-list and the five-list fusion; the active encoder reranks BOTH, so
+  /// this isolates exactly the dense list's effect. `None` = no fresh sidecar
+  /// or no encoder on this handle (the channel is untestable, not "off").
+  /// Conjunctions keep their contract: both sides equal.
+  #[allow(clippy::type_complexity)]
+  pub fn records_dense_pair(
+    &self,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Result<Option<(Vec<records::SearchHitRecord>, Vec<records::SearchHitRecord>)>, Box<dyn Error>> {
+    if self.dense.is_none() {
+      return Ok(None);
+    }
+    let Some(encoder) = self.encoder.as_ref() else {
+      return Ok(None);
+    };
+    if parse_and_phrases(query).is_some() {
+      return Ok(Some((self.records(query, k, filter)?, self.records(query, k, filter)?)));
+    }
+    let query_vec = encoder.embed_query(query)?;
+    let channels = self.channel_lists_with_bm25(
+      query,
+      rerank_pool(k),
+      filter,
+      self.bm25_enabled,
+      None,
+      Some(&query_vec),
+    )?;
+    let mut without = vec![
+      channels.named.clone(),
+      channels.semantic.clone(),
+      channels.by_degree.clone(),
+    ];
+    if self.bm25_enabled {
+      without.push(channels.bm25.clone());
+    }
+    let with_dense = self.fused_lists(channels, true);
+    let off = self.rerank_with_encoder(query, rrf_fuse_explained(&without, k), Some(query_vec.clone()));
+    let on = self.rerank_with_encoder(query, rrf_fuse_explained(&with_dense, k), Some(query_vec));
+    Ok(Some((
+      self.hits_from_ranked(off, None),
+      self.hits_from_ranked(on, None),
+    )))
   }
 
   /// The full typed search answer — the ONE dispatch point below every surface (CLI, MCP,
@@ -5092,15 +5176,19 @@ impl Searcher {
         }
       }
     }
+    // Candidate surfaces under the ACTIVE recipe — the same builder the sidecar
+    // used (one-recipe law); richer recipes read the candidates' source here
+    // (digest-verified; a changed file falls back to the head recipe).
     let mut miss_ids: Vec<u64> = Vec::new();
     let mut miss_surfaces: Vec<String> = Vec::new();
+    let mut builder = dense::SurfaceBuilder::new(&self.generation_dir, dense::active_surface_recipe());
     for &id in &tail_ids {
       if rows.contains_key(&id) {
         continue;
       }
-      if let Some(view) = self.kg.node(NodeId::new(id)) {
+      if self.kg.node(NodeId::new(id)).is_some() {
         miss_ids.push(id);
-        miss_surfaces.push(dense::surface_of(&view));
+        miss_surfaces.push(builder.surface(&self.kg, id, encoder));
       }
     }
     // One batch: the prefixed query (unless already embedded) plus every missed

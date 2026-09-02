@@ -89,11 +89,19 @@ pub struct TuneReport {
   pub encoder_present: bool,
   pub reranker: FeatureTally,
   pub bm25: FeatureTally,
+  /// The doc-side dense channel (`dense.rs`), paired from one channel pass with
+  /// the active encoder reranking both sides. Untested (zero queries) when the
+  /// index carries no fresh sidecar or no encoder serves the handle.
+  pub dense: FeatureTally,
+  /// Whether a fresh dense sidecar served the run (absent → the channel went untested).
+  pub dense_present: bool,
   /// What `apply` wrote for the reranker: the pinned model dir, the literal
   /// `"off"` (per-index opt-out), or `None` (no signal, untested, or not applied).
   pub wrote_encoder: Option<String>,
   /// The BM25 override written, if any.
   pub wrote_bm25: Option<bool>,
+  /// The dense-channel override written (`<root>/dense.channel`), if any.
+  pub wrote_dense: Option<bool>,
 }
 
 /// Reciprocal rank of the first hit whose name or path contains `expected`
@@ -122,7 +130,9 @@ pub fn tune_index(
   let k = k.max(1);
   let mut reranker = FeatureTally::default();
   let mut bm25 = FeatureTally::default();
+  let mut dense = FeatureTally::default();
   let mut encoder_present = false;
+  let mut dense_present = false;
   let mut labelled = 0usize;
   for entry in queries {
     let Some(expected) = &entry.expected else {
@@ -144,12 +154,24 @@ pub fn tune_index(
       reciprocal_rank(&bm25_off, &expected),
       reciprocal_rank(&bm25_on, &expected),
     );
+    if let Some((dense_off, dense_on)) = searcher
+      .records_dense_pair(&entry.query, k, &filter)
+      .map_err(|e| format!("query {:?}: {e}", entry.query))?
+    {
+      dense_present = true;
+      dense.measure(
+        reciprocal_rank(&dense_off, &expected),
+        reciprocal_rank(&dense_on, &expected),
+      );
+    }
   }
   reranker.finish();
   bm25.finish();
+  dense.finish();
 
   let mut wrote_encoder = None;
   let mut wrote_bm25 = None;
+  let mut wrote_dense = None;
   if apply && labelled > 0 {
     if encoder_present {
       match reranker.verdict {
@@ -184,13 +206,24 @@ pub fn tune_index(
       crate::set_bm25_override(index_root, enabled, &bm25.evidence("bm25"))?;
       wrote_bm25 = Some(enabled);
     }
+    // The dense verdict lands as the root's `dense.channel` override — it
+    // shadows the warm gate's label-free verdict (which cannot see descriptive
+    // queries) for as long as the file exists.
+    if dense_present && let Some(enabled) = dense.verdict {
+      crate::write_dense_channel_override(index_root, enabled)
+        .map_err(|e| format!("writing dense.channel: {e}"))?;
+      wrote_dense = Some(enabled);
+    }
   }
   Ok(TuneReport {
     labelled,
     encoder_present,
     reranker,
     bm25,
+    dense,
+    dense_present,
     wrote_encoder,
     wrote_bm25,
+    wrote_dense,
   })
 }
