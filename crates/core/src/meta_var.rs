@@ -539,7 +539,12 @@ impl<'t, D: Doc> MetaVarEnv<'t, D> {
       _ => None,
     };
     let deindented = if let Some(v) = node {
-      formatted_slice(&slice, v.get_doc().get_source(), v.range().start).to_vec()
+      // Borrowed means "unchanged": keep the caller's buffer instead of copying the
+      // whole value a second time (most single-line transforms take this arm).
+      match formatted_slice(&slice, v.get_doc().get_source(), v.range().start) {
+        std::borrow::Cow::Owned(v) => v,
+        std::borrow::Cow::Borrowed(_) => slice,
+      }
     } else {
       slice
     };

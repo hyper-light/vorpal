@@ -10,10 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use string_case::{Separator, StringCase};
 
-fn get_text_from_env<D: Doc>(var: &MetaVariable, ctx: &mut Ctx<'_, '_, D>) -> Option<String> {
+fn get_text_from_env<'c, D: Doc>(
+  var: &MetaVariable,
+  ctx: &'c mut Ctx<'_, '_, D>,
+) -> Option<std::borrow::Cow<'c, str>> {
   // TODO: check if topological sort has resolved transform dependency
   let bytes = ctx.env.get_var_bytes(var)?;
-  Some(<D::Source as Content>::encode_bytes(bytes).into_owned())
+  // Borrowed straight from the environment — each compute below reads the text and
+  // builds its own owned result exactly once (the copy-per-read here was a top-ten
+  // allocation site at kernel scale).
+  Some(<D::Source as Content>::encode_bytes(bytes))
 }
 
 /// Extracts a substring from the meta variable's text content.
@@ -34,14 +40,22 @@ pub struct Substring<T> {
 impl Substring<MetaVariable> {
   fn compute<D: Doc>(&self, ctx: &mut Ctx<'_, '_, D>) -> Option<String> {
     let text = get_text_from_env(&self.source, ctx)?;
-    let chars: Vec<_> = text.chars().collect();
-    let len = chars.len() as i32;
+    // Two-pointer char walk — the old `Vec<char>` materialized 4x the text bytes per
+    // call just to index; byte offsets index the same characters for free.
+    let len = text.chars().count() as i32;
     let start = resolve_char(&self.start_char, 0, len);
     let end = resolve_char(&self.end_char, len, len);
     if start > end || start >= len as usize || end > len as usize {
       return Some(String::new());
     }
-    Some(chars[start..end].iter().collect())
+    let mut indices = text.char_indices().map(|(i, _)| i);
+    let byte_start = indices.nth(start).unwrap_or(text.len());
+    let byte_end = if end == len as usize {
+      text.len()
+    } else {
+      text.char_indices().map(|(i, _)| i).nth(end).unwrap_or(text.len())
+    };
+    Some(text[byte_start..byte_end].to_string())
   }
 }
 
