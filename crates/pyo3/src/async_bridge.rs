@@ -407,3 +407,71 @@ pub fn graph(
       .map_err(|e| e.to_string())
   })
 }
+
+/// A serializable payload carried through [`dispatch`]: resolved on the worker under
+/// `Python::attach` by pythonizing straight into the Future — the async twin of
+/// `repo::record_to_py`.
+pub(crate) struct Pythonized<T: serde::Serialize>(pub(crate) T);
+
+impl<'py, T: serde::Serialize> pyo3::IntoPyObject<'py> for Pythonized<T> {
+  type Target = pyo3::PyAny;
+  type Output = pyo3::Bound<'py, pyo3::PyAny>;
+  type Error = PyErr;
+
+  fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+    pythonize::pythonize(py, &self.0)
+      .map_err(|err| PyRuntimeError::new_err(format!("serialize record: {err}")))
+  }
+}
+
+/// `await vorpal.search_ranked(index_dir, query, k=10)` — one search, both orderings
+/// (`{"fused": [...], "reranked": [...] | None, "encoderStatus": str | None}`).
+#[pyfunction]
+#[pyo3(signature = (index_dir, query, k=10))]
+pub fn search_ranked(
+  py: Python<'_>,
+  index_dir: String,
+  query: String,
+  k: usize,
+) -> PyResult<Py<PyAny>> {
+  dispatch(py, move || {
+    crate::repo::ranked_value(&index_dir, &query, k).map(Pythonized)
+  })
+}
+
+/// `await vorpal.tune(index_dir, queries, k=10, apply=False)` — the `vorpal tune` core
+/// as an awaitable; `queries` is a list of `(query, expected_substring_or_None)` pairs.
+#[pyfunction]
+#[pyo3(signature = (index_dir, queries, k=10, apply=false))]
+pub fn tune(
+  py: Python<'_>,
+  index_dir: String,
+  queries: Vec<(String, Option<String>)>,
+  k: usize,
+  apply: bool,
+) -> PyResult<Py<PyAny>> {
+  dispatch(py, move || {
+    let queries: Vec<vorpal_index::tune::TuneQuery> = queries
+      .into_iter()
+      .map(|(query, expected)| vorpal_index::tune::TuneQuery { query, expected })
+      .collect();
+    vorpal_index::tune::tune_index(std::path::Path::new(&index_dir), &queries, k, apply)
+      .map(Pythonized)
+  })
+}
+
+/// `await vorpal.install(variant, root=None)` — download + install the encoder weights
+/// (hundreds of megabytes) without blocking the loop; returns the model directory.
+#[pyfunction]
+#[pyo3(signature = (variant, root=None))]
+pub fn install(py: Python<'_>, variant: String, root: Option<String>) -> PyResult<Py<PyAny>> {
+  dispatch(py, move || crate::models::install_path(&variant, root))
+}
+
+/// `await vorpal.enable(variant, root=None)` — install AND enable globally; returns the
+/// model directory.
+#[pyfunction]
+#[pyo3(signature = (variant, root=None))]
+pub fn enable(py: Python<'_>, variant: String, root: Option<String>) -> PyResult<Py<PyAny>> {
+  dispatch(py, move || crate::models::enable_path(&variant, root))
+}

@@ -229,7 +229,9 @@ fn selector_target(name: String, options: &GraphOptions) -> vorpal_index::GraphT
 /// wire concern).
 #[napi]
 pub struct Index {
-  kg: vorpal_kg::Kg,
+  /// Shared, immutable, mmap-backed graph — `Arc` so async methods can run their reads
+  /// on the uv pool while the JS object stays alive (the daemon shares `Kg` the same way).
+  kg: std::sync::Arc<vorpal_kg::Kg>,
   generation_dir: std::path::PathBuf,
   generation: String,
 }
@@ -241,7 +243,7 @@ impl Index {
   pub fn open(index_dir: String) -> Result<Index> {
     let root = std::path::Path::new(&index_dir);
     let generation_dir = vorpal_kg::resolve_index_dir(root);
-    let kg = vorpal_kg::Kg::load(&generation_dir).map_err(|e| to_napi_err(Box::new(e)))?;
+    let kg = std::sync::Arc::new(vorpal_kg::Kg::load(&generation_dir).map_err(|e| to_napi_err(Box::new(e)))?);
     let generation = generation_dir
       .file_name()
       .and_then(|name| name.to_str())
@@ -263,21 +265,13 @@ impl Index {
   /// One node's typed record, or null.
   #[napi]
   pub fn node(&self, id: i64) -> Result<serde_json::Value> {
-    let raw = u64::try_from(id).map_err(|_| Error::from_reason("id must be non-negative"))?;
-    match vorpal_index::records::node_record(&self.kg, vorpal_kg::NodeId::new(raw)) {
-      Some(record) => serde_json::to_value(record).map_err(|e| Error::from_reason(e.to_string())),
-      None => Ok(serde_json::Value::Null),
-    }
+    node_core(&self.kg, id)
   }
 
   /// Typed candidate listing for a selector: every match is the answer.
   #[napi]
   pub fn nodes(&self, name: String, options: Option<GraphOptions>) -> Result<serde_json::Value> {
-    let options = options.unwrap_or_default();
-    let records =
-      vorpal_index::records::listing_records(&self.kg, &selector_target(name, &options))
-        .map_err(Error::from_reason)?;
-    serde_json::to_value(records).map_err(|e| Error::from_reason(e.to_string()))
+    nodes_core(&self.kg, name, options)
   }
 
   /// Typed edge query (callers/references/importers/implementors/typeusers):
@@ -289,14 +283,7 @@ impl Index {
     name: String,
     options: Option<GraphOptions>,
   ) -> Result<serde_json::Value> {
-    let options = options.unwrap_or_default();
-    let selected = vorpal_index::records::related_records(
-      &self.kg,
-      &verb,
-      &selector_target(name, &options),
-    )
-    .map_err(Error::from_reason)?;
-    selected_to_value(selected)
+    related_core(&self.kg, verb, name, options)
   }
 
   /// Typed relation-restricted traversal: BFS steps with depth, parent (`via`), relation,
@@ -308,6 +295,145 @@ impl Index {
     direction: String,
     options: Option<ReachOptions>,
   ) -> Result<serde_json::Value> {
+    reachable_core(&self.kg, name, direction, options)
+  }
+
+  /// Typed evidence (`why`): edge form (`toId`) or absence form (`name`).
+  #[napi]
+  pub fn why(
+    &self,
+    from_id: i64,
+    to_id: Option<i64>,
+    name: Option<String>,
+  ) -> Result<serde_json::Value> {
+    why_core(&self.kg, from_id, to_id, name)
+  }
+
+  /// Typed hybrid search over the pinned generation: hits with score and per-channel
+  /// ranking provenance. Structured filters (IMPROVEMENTS #9) apply to every channel
+  /// before ranking, so `k` results means `k` matching results.
+  #[napi]
+  pub fn search(
+    &self,
+    query: String,
+    k: Option<u32>,
+    options: Option<SearchOptions>,
+  ) -> Result<serde_json::Value> {
+    search_core(&self.generation_dir, query, k, options)
+  }
+
+  /// `node`, off the event loop.
+  #[napi]
+  pub fn node_async(&self, id: i64) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
+    let kg = self.kg.clone();
+    AsyncTask::new(crate::repo_async::RepoTask::new(move || {
+      node_core(&kg, id).map(crate::repo_async::Json)
+    }))
+  }
+
+  /// `nodes`, off the event loop.
+  #[napi]
+  pub fn nodes_async(
+    &self,
+    name: String,
+    options: Option<GraphOptions>,
+  ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
+    let kg = self.kg.clone();
+    AsyncTask::new(crate::repo_async::RepoTask::new(move || {
+      nodes_core(&kg, name, options).map(crate::repo_async::Json)
+    }))
+  }
+
+  /// `related`, off the event loop.
+  #[napi]
+  pub fn related_async(
+    &self,
+    verb: String,
+    name: String,
+    options: Option<GraphOptions>,
+  ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
+    let kg = self.kg.clone();
+    AsyncTask::new(crate::repo_async::RepoTask::new(move || {
+      related_core(&kg, verb, name, options).map(crate::repo_async::Json)
+    }))
+  }
+
+  /// `reachable`, off the event loop — deep traversals on big graphs are the class
+  /// method most worth taking off the loop.
+  #[napi]
+  pub fn reachable_async(
+    &self,
+    name: String,
+    direction: String,
+    options: Option<ReachOptions>,
+  ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
+    let kg = self.kg.clone();
+    AsyncTask::new(crate::repo_async::RepoTask::new(move || {
+      reachable_core(&kg, name, direction, options).map(crate::repo_async::Json)
+    }))
+  }
+
+  /// `why`, off the event loop.
+  #[napi]
+  pub fn why_async(
+    &self,
+    from_id: i64,
+    to_id: Option<i64>,
+    name: Option<String>,
+  ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
+    let kg = self.kg.clone();
+    AsyncTask::new(crate::repo_async::RepoTask::new(move || {
+      why_core(&kg, from_id, to_id, name).map(crate::repo_async::Json)
+    }))
+  }
+
+  /// `search`, off the event loop.
+  #[napi]
+  pub fn search_async(
+    &self,
+    query: String,
+    k: Option<u32>,
+    options: Option<SearchOptions>,
+  ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
+    let generation_dir = self.generation_dir.clone();
+    AsyncTask::new(crate::repo_async::RepoTask::new(move || {
+      search_core(&generation_dir, query, k, options).map(crate::repo_async::Json)
+    }))
+  }
+}
+
+
+// ── Shared method cores: one body per operation, called by the sync method on the
+// caller's thread and by its `*Async` twin on the uv pool. ──
+
+pub(crate) fn node_core(kg: &vorpal_kg::Kg, id: i64) -> Result<serde_json::Value> {
+    let raw = u64::try_from(id).map_err(|_| Error::from_reason("id must be non-negative"))?;
+    match vorpal_index::records::node_record(kg, vorpal_kg::NodeId::new(raw)) {
+      Some(record) => serde_json::to_value(record).map_err(|e| Error::from_reason(e.to_string())),
+      None => Ok(serde_json::Value::Null),
+    }
+  }
+
+pub(crate) fn nodes_core(kg: &vorpal_kg::Kg, name: String, options: Option<GraphOptions>) -> Result<serde_json::Value> {
+    let options = options.unwrap_or_default();
+    let records =
+      vorpal_index::records::listing_records(kg, &selector_target(name, &options))
+        .map_err(Error::from_reason)?;
+    serde_json::to_value(records).map_err(|e| Error::from_reason(e.to_string()))
+  }
+
+pub(crate) fn related_core(kg: &vorpal_kg::Kg, verb: String, name: String, options: Option<GraphOptions>) -> Result<serde_json::Value> {
+    let options = options.unwrap_or_default();
+    let selected = vorpal_index::records::related_records(
+      kg,
+      &verb,
+      &selector_target(name, &options),
+    )
+    .map_err(Error::from_reason)?;
+    selected_to_value(selected)
+  }
+
+pub(crate) fn reachable_core(kg: &vorpal_kg::Kg, name: String, direction: String, options: Option<ReachOptions>) -> Result<serde_json::Value> {
     let options = options.unwrap_or_default();
     let dir = match direction.as_str() {
       "in" => vorpal_kg::Direction::In,
@@ -344,7 +470,7 @@ impl Index {
       show_ids: true,
     };
     let selected = vorpal_index::records::reach_records(
-      &self.kg,
+      kg,
       &target,
       dir,
       &relations,
@@ -355,14 +481,7 @@ impl Index {
     selected_to_value(selected)
   }
 
-  /// Typed evidence (`why`): edge form (`toId`) or absence form (`name`).
-  #[napi]
-  pub fn why(
-    &self,
-    from_id: i64,
-    to_id: Option<i64>,
-    name: Option<String>,
-  ) -> Result<serde_json::Value> {
+pub(crate) fn why_core(kg: &vorpal_kg::Kg, from_id: i64, to_id: Option<i64>, name: Option<String>) -> Result<serde_json::Value> {
     if to_id.is_none() && name.is_none() {
       return Err(Error::from_reason(
         "pass toId (edge evidence) or name (absence evidence)",
@@ -374,20 +493,11 @@ impl Index {
       None => None,
     };
     let records =
-      vorpal_index::records::evidence_records(&self.kg, from, to, name.as_deref());
+      vorpal_index::records::evidence_records(kg, from, to, name.as_deref());
     serde_json::to_value(records).map_err(|e| Error::from_reason(e.to_string()))
   }
 
-  /// Typed hybrid search over the pinned generation: hits with score and per-channel
-  /// ranking provenance. Structured filters (IMPROVEMENTS #9) apply to every channel
-  /// before ranking, so `k` results means `k` matching results.
-  #[napi]
-  pub fn search(
-    &self,
-    query: String,
-    k: Option<u32>,
-    options: Option<SearchOptions>,
-  ) -> Result<serde_json::Value> {
+pub(crate) fn search_core(generation_dir: &std::path::Path, query: String, k: Option<u32>, options: Option<SearchOptions>) -> Result<serde_json::Value> {
     let options = options.unwrap_or_default();
     let filter = vorpal_index::SearchFilter {
       path_prefix: options.prefix,
@@ -400,7 +510,7 @@ impl Index {
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
     let records = vorpal_index::search_records_filtered(
-      &self.generation_dir,
+      generation_dir,
       &query,
       k.unwrap_or(10) as usize,
       &filter,
@@ -408,7 +518,6 @@ impl Index {
     .map_err(to_napi_err)?;
     serde_json::to_value(records).map_err(|e| Error::from_reason(e.to_string()))
   }
-}
 
 /// Structured search filters for `Index.search` (IMPROVEMENTS #9).
 #[napi(object)]

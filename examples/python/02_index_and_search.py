@@ -8,9 +8,8 @@ import vorpal_py
 SRC = "."                       # any source tree
 IDX = ".vorpal/index"           # default CLI-compatible location
 
-# Build (incremental: instant when nothing changed). Returns the generation dir.
-generation = vorpal_py.index_build(SRC, IDX)
-print("generation:", generation)
+# Build (incremental: instant when nothing changed). Returns the one-line report.
+print(vorpal_py.index_build(SRC, IDX))
 
 # Structured build report instead, when you want the numbers.
 report = vorpal_py.index_build_report(SRC, IDX)

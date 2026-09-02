@@ -35,6 +35,24 @@ fn install_impl(variant: &str, root: Option<String>) -> PyResult<PathBuf> {
   install(variant, root.as_deref(), &mut progress).map_err(PyRuntimeError::new_err)
 }
 
+/// GIL-free core for the async bridge: install, String errors.
+pub(crate) fn install_path(variant: &str, root: Option<String>) -> Result<String, String> {
+  let variant = parse_variant(variant).map_err(|e| e.to_string())?;
+  let root = root.map(PathBuf::from);
+  let mut progress = |line: &str| eprintln!("{line}");
+  install(variant, root.as_deref(), &mut progress).map(|dir| dir.display().to_string())
+}
+
+/// GIL-free core for the async bridge: install AND enable globally, String errors.
+pub(crate) fn enable_path(variant: &str, root: Option<String>) -> Result<String, String> {
+  let variant = parse_variant(variant).map_err(|e| e.to_string())?;
+  let root = root.map(PathBuf::from);
+  let mut progress = |line: &str| eprintln!("{line}");
+  let dir = install(variant, root.as_deref(), &mut progress)?;
+  enable_global(&dir)?;
+  Ok(dir.display().to_string())
+}
+
 /// Download (or reuse) the pinned weights; returns the installed model directory.
 #[pyfunction]
 #[pyo3(signature = (variant, root=None))]

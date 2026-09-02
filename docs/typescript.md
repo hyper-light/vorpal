@@ -123,3 +123,26 @@ for (const m of root.root().findAll('const $N = $V')) {
 
 The wasm build exposes `parse`, `kind`, `pattern`, `dumpPattern`, `registerDynamicLanguage`, and
 the `SgNode` / `SgRoot` / `Pos` / `Range` classes — everything except the filesystem `findInFiles`.
+
+## Async: nothing blocks the event loop
+
+Every blocking repository call has an `Async`-suffixed twin returning a `Promise` that
+computes on libuv's thread pool — `indexBuildAsync`, `indexBuildReportAsync`,
+`indexSearchAsync`, `indexSearchRankedAsync`, `indexGraphAsync`, `indexNodeAsync`,
+`indexTuneAsync`, `semanticInstallAsync`, `semanticEnableAsync` — and the pinned
+`Index` class mirrors its queries as `nodeAsync` / `nodesAsync` / `relatedAsync` /
+`reachableAsync` / `whyAsync` / `searchAsync`. Concurrency composes freely:
+
+```ts
+import { indexBuildAsync, Index } from '@hyper-light/vorpal-node'
+
+await indexBuildAsync('.', '.vorpal/index')
+const index = Index.open('.vorpal/index')
+const [callers, reach] = await Promise.all([
+  index.relatedAsync('callers', 'handleRequest'),
+  index.reachableAsync('handleRequest', 'in', { maxDepth: 3 }),
+])
+```
+
+The sync forms remain for scripts and REPLs; on the `Index` class they read from the
+pinned, mmapped generation in well under a millisecond.

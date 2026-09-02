@@ -229,7 +229,9 @@ fn target_of(
 ///   cap); slice or iterate natively. The MCP surface is where cursor pagination lives.
 #[pyclass]
 pub struct Index {
-  kg: vorpal_kg::Kg,
+  /// Shared, immutable, mmap-backed graph — `Arc` so `*_async` methods can run their
+  /// reads GIL-free on the worker pool while the Python object stays alive.
+  kg: std::sync::Arc<vorpal_kg::Kg>,
   generation_dir: std::path::PathBuf,
   generation: String,
 }
@@ -241,7 +243,7 @@ impl Index {
   pub fn open(index_dir: &str) -> PyResult<Self> {
     let root = std::path::Path::new(index_dir);
     let generation_dir = vorpal_kg::resolve_index_dir(root);
-    let kg = vorpal_kg::Kg::load(&generation_dir).map_err(|e| to_py_err(Box::new(e)))?;
+    let kg = std::sync::Arc::new(vorpal_kg::Kg::load(&generation_dir).map_err(|e| to_py_err(Box::new(e)))?);
     let generation = generation_dir
       .file_name()
       .and_then(|name| name.to_str())
@@ -416,6 +418,281 @@ impl Index {
         .map_err(to_py_err)?;
     record_to_py(py, &records)
   }
+
+  // ── Async twins: the same reads, GIL-free on the worker pool, resolved on the
+  // caller's running asyncio loop. `await index.node_async(...)`. ──
+
+  /// `node`, as an awaitable.
+  pub fn node_async(&self, py: Python<'_>, id: u64) -> PyResult<Py<PyAny>> {
+    let kg = self.kg.clone();
+    crate::async_bridge::dispatch(py, move || node_value(&kg, id).map(crate::async_bridge::Pythonized))
+  }
+
+  /// `nodes`, as an awaitable.
+  #[pyo3(signature = (name, path=None, kind=None, id=None, all=false))]
+  pub fn nodes_async(
+    &self,
+    py: Python<'_>,
+    name: String,
+    path: Option<String>,
+    kind: Option<String>,
+    id: Option<u64>,
+    all: bool,
+  ) -> PyResult<Py<PyAny>> {
+    let kg = self.kg.clone();
+    crate::async_bridge::dispatch(py, move || {
+      nodes_value(&kg, &name, path, kind, id, all).map(crate::async_bridge::Pythonized)
+    })
+  }
+
+  /// `related`, as an awaitable.
+  #[pyo3(signature = (verb, name, path=None, kind=None, id=None, all=false))]
+  #[allow(clippy::too_many_arguments)]
+  pub fn related_async(
+    &self,
+    py: Python<'_>,
+    verb: String,
+    name: String,
+    path: Option<String>,
+    kind: Option<String>,
+    id: Option<u64>,
+    all: bool,
+  ) -> PyResult<Py<PyAny>> {
+    let kg = self.kg.clone();
+    crate::async_bridge::dispatch(py, move || {
+      related_value(&kg, &verb, &name, path, kind, id, all).map(crate::async_bridge::Pythonized)
+    })
+  }
+
+  /// `reachable`, as an awaitable — the traversal most worth taking off the loop.
+  #[pyo3(signature = (name, direction, relations=None, max_depth=None, min_grade=None, path=None, kind=None, id=None, all=false))]
+  #[allow(clippy::too_many_arguments)]
+  pub fn reachable_async(
+    &self,
+    py: Python<'_>,
+    name: String,
+    direction: String,
+    relations: Option<Vec<String>>,
+    max_depth: Option<u32>,
+    min_grade: Option<String>,
+    path: Option<String>,
+    kind: Option<String>,
+    id: Option<u64>,
+    all: bool,
+  ) -> PyResult<Py<PyAny>> {
+    let kg = self.kg.clone();
+    crate::async_bridge::dispatch(py, move || {
+      reachable_value(
+        &kg,
+        &name,
+        &direction,
+        relations,
+        max_depth,
+        min_grade.as_deref(),
+        path,
+        kind,
+        id,
+        all,
+      )
+      .map(crate::async_bridge::Pythonized)
+    })
+  }
+
+  /// `why`, as an awaitable.
+  #[pyo3(signature = (from_id, to_id=None, name=None))]
+  pub fn why_async(
+    &self,
+    py: Python<'_>,
+    from_id: u64,
+    to_id: Option<u64>,
+    name: Option<String>,
+  ) -> PyResult<Py<PyAny>> {
+    let kg = self.kg.clone();
+    crate::async_bridge::dispatch(py, move || {
+      why_value(&kg, from_id, to_id, name.as_deref()).map(crate::async_bridge::Pythonized)
+    })
+  }
+
+  /// `search`, as an awaitable.
+  #[pyo3(signature = (query, k=10, path=None, prefix=None, kind=None, lang=None, exported=false, exclude_tests=false))]
+  #[allow(clippy::too_many_arguments)]
+  pub fn search_async(
+    &self,
+    py: Python<'_>,
+    query: String,
+    k: usize,
+    path: Option<String>,
+    prefix: Option<String>,
+    kind: Option<String>,
+    lang: Option<String>,
+    exported: bool,
+    exclude_tests: bool,
+  ) -> PyResult<Py<PyAny>> {
+    let generation_dir = self.generation_dir.clone();
+    crate::async_bridge::dispatch(py, move || {
+      search_value(&generation_dir, &query, k, path, prefix, kind, lang, exported, exclude_tests)
+        .map(crate::async_bridge::Pythonized)
+    })
+  }
+}
+
+
+// ── Shared Value-producing cores for the `*_async` Index methods: the same reads the
+// sync methods perform, GIL-free, serialized once to `serde_json::Value` for the
+// bridge's pythonizing resolver. ──
+
+fn selected_to_value<T: serde::Serialize>(
+  selected: vorpal_index::records::Selected<T>,
+) -> Result<serde_json::Value, String> {
+  let (outcome, records) = match selected {
+    vorpal_index::records::Selected::NoMatch => ("no-match", serde_json::json!([])),
+    vorpal_index::records::Selected::Ambiguous(candidates) => (
+      "ambiguous",
+      serde_json::to_value(candidates).map_err(|e| e.to_string())?,
+    ),
+    vorpal_index::records::Selected::Hits(hits) => (
+      "hits",
+      serde_json::to_value(hits).map_err(|e| e.to_string())?,
+    ),
+  };
+  Ok(serde_json::json!({"outcome": outcome, "records": records}))
+}
+
+pub(crate) fn node_value(kg: &vorpal_kg::Kg, id: u64) -> Result<serde_json::Value, String> {
+  match vorpal_index::records::node_record(kg, vorpal_kg::NodeId::new(id)) {
+    Some(record) => serde_json::to_value(record).map_err(|e| e.to_string()),
+    None => Ok(serde_json::Value::Null),
+  }
+}
+
+pub(crate) fn nodes_value(
+  kg: &vorpal_kg::Kg,
+  name: &str,
+  path: Option<String>,
+  kind: Option<String>,
+  id: Option<u64>,
+  all: bool,
+) -> Result<serde_json::Value, String> {
+  let records = vorpal_index::records::listing_records(kg, &target_of(name, path, kind, id, all))?;
+  serde_json::to_value(records).map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn related_value(
+  kg: &vorpal_kg::Kg,
+  verb: &str,
+  name: &str,
+  path: Option<String>,
+  kind: Option<String>,
+  id: Option<u64>,
+  all: bool,
+) -> Result<serde_json::Value, String> {
+  let selected =
+    vorpal_index::records::related_records(kg, verb, &target_of(name, path, kind, id, all))?;
+  selected_to_value(selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reachable_value(
+  kg: &vorpal_kg::Kg,
+  name: &str,
+  direction: &str,
+  relations: Option<Vec<String>>,
+  max_depth: Option<u32>,
+  min_grade: Option<&str>,
+  path: Option<String>,
+  kind: Option<String>,
+  id: Option<u64>,
+  all: bool,
+) -> Result<serde_json::Value, String> {
+  let dir = match direction {
+    "in" => vorpal_kg::Direction::In,
+    "out" => vorpal_kg::Direction::Out,
+    other => return Err(format!("direction must be \"in\" or \"out\", got '{other}'")),
+  };
+  let relations = match relations {
+    None => vec![vorpal_kg::EdgeType::CALLS],
+    Some(names) => {
+      let mut out = Vec::with_capacity(names.len());
+      for name in &names {
+        out.push(
+          vorpal_kg::EdgeType::from_name(name)
+            .ok_or_else(|| format!("unknown relation '{name}'"))?,
+        );
+      }
+      if out.is_empty() {
+        vec![vorpal_kg::EdgeType::CALLS]
+      } else {
+        out
+      }
+    }
+  };
+  let min_confidence =
+    vorpal_index::min_confidence_for_grade(min_grade).map_err(|e| e.to_string())?;
+  let selected = vorpal_index::records::reach_records(
+    kg,
+    &target_of(name, path, kind, id, all),
+    dir,
+    &relations,
+    max_depth.filter(|&d| d > 0),
+    min_confidence,
+  )?;
+  selected_to_value(selected)
+}
+
+pub(crate) fn why_value(
+  kg: &vorpal_kg::Kg,
+  from_id: u64,
+  to_id: Option<u64>,
+  name: Option<&str>,
+) -> Result<serde_json::Value, String> {
+  if to_id.is_none() && name.is_none() {
+    return Err("pass to_id (edge evidence) or name (absence evidence)".to_string());
+  }
+  let records = vorpal_index::records::evidence_records(kg, from_id, to_id, name);
+  serde_json::to_value(records).map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_value(
+  generation_dir: &std::path::Path,
+  query: &str,
+  k: usize,
+  path: Option<String>,
+  prefix: Option<String>,
+  kind: Option<String>,
+  lang: Option<String>,
+  exported: bool,
+  exclude_tests: bool,
+) -> Result<serde_json::Value, String> {
+  let filter = vorpal_index::SearchFilter {
+    path_prefix: prefix,
+    path_suffix: path,
+    kind,
+    lang,
+    exported_only: exported,
+    exclude_tests,
+  };
+  let records = vorpal_index::search_records_filtered(generation_dir, query, k, &filter)
+    .map_err(|e| e.to_string())?;
+  serde_json::to_value(records).map_err(|e| e.to_string())
+}
+
+pub(crate) fn ranked_value(
+  index_dir: &str,
+  query: &str,
+  k: usize,
+) -> Result<serde_json::Value, String> {
+  let searcher =
+    vorpal_index::open_searcher(std::path::Path::new(index_dir)).map_err(|e| e.to_string())?;
+  let (fused, reranked) = searcher
+    .records_ranked(query, k, &vorpal_index::SearchFilter::default())
+    .map_err(|e| e.to_string())?;
+  Ok(serde_json::json!({
+    "fused": serde_json::to_value(fused).map_err(|e| e.to_string())?,
+    "reranked": serde_json::to_value(reranked).map_err(|e| e.to_string())?,
+    "encoderStatus": searcher.encoder_status(),
+  }))
 }
 
 /// [`index_build`], returning the typed [`BuildReport`] instead of the rendered line.

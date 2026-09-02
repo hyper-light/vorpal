@@ -139,3 +139,28 @@ Async functions: `build`, `build_report`, `search`, `search_many`, `node`, `grap
 Case-insensitive, with common aliases: `python`/`py`, `javascript`/`js`/`jsx`, `typescript`/`ts`,
 `tsx`, `rust`/`rs`, `go`/`golang`, `c`, `cpp`/`c++`, `java`, `ruby`/`rb`, `css`, `html`, `json`,
 `yaml`, and more — see the [language matrix](./wip/LANGUAGES.md).
+
+## Async: the whole surface is awaitable
+
+The module-level awaitables (`build`, `build_report`, `search`, `search_many`, `node`,
+`graph`, `search_ranked`, `tune`, `install`, `enable`) run GIL-free on a Rust-owned
+worker pool and resolve on your running asyncio loop — N concurrent awaits do native
+work on N cores. The pinned `Index` class mirrors its queries as `node_async` /
+`nodes_async` / `related_async` / `reachable_async` / `why_async` / `search_async`:
+
+```python
+import asyncio
+import vorpal_py
+
+async def main():
+    await vorpal_py.build(".", ".vorpal/index")
+    index = vorpal_py.Index.open(".vorpal/index")
+    callers, reach = await asyncio.gather(
+        index.related_async("callers", "handle_request"),
+        index.reachable_async("handle_request", "in", max_depth=3),
+    )
+
+asyncio.run(main())
+```
+
+Sync forms remain for scripts; on `Index` they answer in well under a millisecond.

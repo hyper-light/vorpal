@@ -5,6 +5,7 @@ mod find_files;
 mod models;
 mod napi_lang;
 mod repo;
+mod repo_async;
 mod sg_node;
 
 use napi::bindgen_prelude::*;

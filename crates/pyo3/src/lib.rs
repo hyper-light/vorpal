@@ -54,6 +54,10 @@ fn vorpal_py(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
   m.add_function(wrap_pyfunction!(async_bridge::search_many, m)?)?;
   m.add_function(wrap_pyfunction!(async_bridge::node, m)?)?;
   m.add_function(wrap_pyfunction!(async_bridge::graph, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::search_ranked, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::tune, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::install, m)?)?;
+  m.add_function(wrap_pyfunction!(async_bridge::enable, m)?)?;
   // Optional-model install/enable (semantic-tier Stage 6) — see `models`.
   m.add_function(wrap_pyfunction!(models::semantic_install, m)?)?;
   m.add_function(wrap_pyfunction!(models::semantic_enable, m)?)?;
