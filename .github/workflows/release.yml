@@ -103,9 +103,15 @@ jobs:
           # runner user.
           sudo chown -R "$(id -u):$(id -g)" target
           # The point of the musl asset is portability: refuse to ship anything dynamic.
-          if ldd "target/${{ matrix.target }}/release/vorpal" 2>&1 | grep -vq "not a dynamic executable"; then
-            echo "musl binary is not fully static" >&2; exit 1
-          fi
+          # Two static shapes exist: classic static ("not a dynamic executable") and
+          # static-PIE ("statically linked") — rustc builds x86_64-musl as static-PIE
+          # since 1.85 while aarch64-musl stays classic. Anything else is a defect.
+          out=$(ldd "target/${{ matrix.target }}/release/vorpal" 2>&1 || true)
+          echo "ldd: $out"
+          case "$out" in
+            *"not a dynamic executable"*|*"statically linked"*) ;;
+            *) echo "musl binary is not fully static" >&2; exit 1 ;;
+          esac
       - name: Stage binary (unix)
         if: runner.os != 'Windows'
         run: cp "target/${{ matrix.target }}/release/vorpal" "${{ matrix.asset }}"
@@ -169,11 +175,16 @@ jobs:
             '
           # The container wrote target/ as root; the signing step runs host cargo next.
           sudo chown -R "$(id -u):$(id -g)" target
-          # Fleet agents exec on arbitrary distros from a memfd: anything dynamic is a defect.
+          # Fleet agents exec on arbitrary distros from a memfd: anything dynamic is a
+          # defect. Classic static and static-PIE both pass (rustc: x86_64-musl is
+          # static-PIE since 1.85, aarch64-musl classic).
           for bin in vorpal-loader vorpal; do
-            if ldd "target/${{ matrix.target }}/release/${bin}" 2>&1 | grep -vq "not a dynamic executable"; then
-              echo "${bin} is not fully static" >&2; exit 1
-            fi
+            out=$(ldd "target/${{ matrix.target }}/release/${bin}" 2>&1 || true)
+            echo "ldd ${bin}: $out"
+            case "$out" in
+              *"not a dynamic executable"*|*"statically linked"*) ;;
+              *) echo "${bin} is not fully static" >&2; exit 1 ;;
+            esac
           done
       - name: Sign the agent (if keyed) and record its blake3 pin
         run: |
