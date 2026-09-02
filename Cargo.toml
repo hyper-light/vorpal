@@ -10,7 +10,7 @@ resolver = "2"
 lto = true
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Herrington Darkholme <2883231+HerringtonDarkholme@users.noreply.github.com>"]
 edition = "2024"
 license = "MIT"
@@ -21,27 +21,27 @@ rust-version = "1.85"
 readme = "README.md"
 
 [workspace.dependencies]
-vorpal-core = { path = "crates/core", version = "0.4.0", default-features = false }
-vorpal-ann = { path = "crates/ann", version = "0.4.0" }
-vorpal-canonical = { path = "crates/canonical", version = "0.4.0" }
-vorpal-config = { path = "crates/config", version = "0.4.0" }
-vorpal-dynamic = { path = "crates/dynamic", version = "0.4.0" }
-vorpal-graph = { path = "crates/graph", version = "0.4.0" }
-vorpal-index = { path = "crates/index", version = "0.4.0", default-features = false }
-vorpal-ingest = { path = "crates/ingest", version = "0.4.0" }
-vorpal-kg = { path = "crates/kg", version = "0.4.0" }
-vorpal-lang-registry = { path = "crates/lang-registry", version = "0.4.0" }
-vorpal-language = { path = "crates/language", version = "0.4.0" }
-vorpal-loader = { path = "crates/loader", version = "0.4.0" }
-vorpal-lsp = { path = "crates/lsp", version = "0.4.0" }
-vorpal-mcp = { path = "crates/mcp", version = "0.4.0" }
-vorpal-mem = { path = "crates/mem", version = "0.4.0" }
-vorpal-outline = { path = "crates/outline", version = "0.4.0" }
-vorpal-query = { path = "crates/query", version = "0.4.0" }
-vorpal-resolve = { path = "crates/resolve", version = "0.4.0" }
-vorpal-segment = { path = "crates/segment", version = "0.4.0" }
-vorpal-transport = { path = "crates/transport", version = "0.4.0" }
-vorpal-wire = { path = "crates/wire", version = "0.4.0" }
+vorpal-core = { path = "crates/core", version = "0.4.1", default-features = false }
+vorpal-ann = { path = "crates/ann", version = "0.4.1" }
+vorpal-canonical = { path = "crates/canonical", version = "0.4.1" }
+vorpal-config = { path = "crates/config", version = "0.4.1" }
+vorpal-dynamic = { path = "crates/dynamic", version = "0.4.1" }
+vorpal-graph = { path = "crates/graph", version = "0.4.1" }
+vorpal-index = { path = "crates/index", version = "0.4.1", default-features = false }
+vorpal-ingest = { path = "crates/ingest", version = "0.4.1" }
+vorpal-kg = { path = "crates/kg", version = "0.4.1" }
+vorpal-lang-registry = { path = "crates/lang-registry", version = "0.4.1" }
+vorpal-language = { path = "crates/language", version = "0.4.1" }
+vorpal-loader = { path = "crates/loader", version = "0.4.1" }
+vorpal-lsp = { path = "crates/lsp", version = "0.4.1" }
+vorpal-mcp = { path = "crates/mcp", version = "0.4.1" }
+vorpal-mem = { path = "crates/mem", version = "0.4.1" }
+vorpal-outline = { path = "crates/outline", version = "0.4.1" }
+vorpal-query = { path = "crates/query", version = "0.4.1" }
+vorpal-resolve = { path = "crates/resolve", version = "0.4.1" }
+vorpal-segment = { path = "crates/segment", version = "0.4.1" }
+vorpal-transport = { path = "crates/transport", version = "0.4.1" }
+vorpal-wire = { path = "crates/wire", version = "0.4.1" }
 
 bit-set = { version = "0.10.0" }
 blake3 = "1.8"
