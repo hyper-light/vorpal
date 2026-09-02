@@ -155,7 +155,7 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 
 ## Performance
 
-All numbers are release builds of **v0.6.0** on an Apple M5 Max (18 cores, 128 GB,
+All numbers are release builds of **v0.6.1** on an Apple M5 Max (18 cores, 128 GB,
 macOS 26.4.1, rustc 1.98.0), measured 2026-09-02, wall-clock for the whole CLI
 invocation including process start; cold times are best of runs on a quiet machine.
 Every dataset is pinned by commit so you can re-run it. Indexing derives the full
@@ -220,7 +220,7 @@ save re-walks only the edited top-level region and splices the retained rows aro
 verified byte-identical to a fresh whole-file extraction on every measurement round
 below.
 
-| Edited file (per save) | Fresh | Incremental parse | + walk splice² |
+| Edited file (per save) | Fresh | Incremental parse | + walk splice |
 |---|---:|---:|---:|
 | 54 MB generated C (`tree-sitter-julia` parser), edit between definitions | 4.2 s | 1.9 s | **0.7 s** |
 | 54 MB generated C, edit *inside* its single 43 MB parse-table definition | 4.2 s | 1.9 s | **1.7 s** |
@@ -235,9 +235,6 @@ invariant violation falls back to the full walk, and one-shot CLI builds are una
 by design — retention only pays when a file is parsed again. `VORPAL_TREE_CACHE=0`
 disables retention, `VORPAL_WALK_REUSE=0` just the splice; `_MIN`/`_BUDGET` tune the
 1 MiB floor and the 256 MiB retained source+snapshot budget.
-
-² Walk-splice column measured on current `main` (post-v0.6.0); it ships in the next
-release. All other numbers are v0.6.0 as stated above.
 
 ### Search (Linux kernel index, 8.9 M definitions, k = 10)
 
