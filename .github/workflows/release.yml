@@ -7,7 +7,10 @@
 # Triggers: pushing a tag `v<version>` does the full release; workflow_dispatch runs the build
 # matrix only (a dry run — nothing is released or published without a tag).
 #
-# Required repository secrets: NPM_TOKEN (npm publish). GITHUB_TOKEN is provided automatically.
+# No repository secrets for npm: publishing is npm TRUSTED PUBLISHING (OIDC) — each package
+# was created once by a local maintainer stub publish (npm/cli#8544: a trusted publisher can
+# only be attached to an existing package), then registered on npmjs.com against this repo +
+# release.yml. GITHUB_TOKEN is provided automatically. VORPAL_AGENT_SIGNING_KEY is optional.
 #
 # Platform coverage: aarch64/arm64 + x86_64/amd64 across macOS, Linux glibc (Debian, Fedora,
 # Ubuntu, Arch, …), Linux musl (Alpine), and Windows (plus 32-bit Windows).
@@ -265,20 +268,11 @@ jobs:
                          && chmod +x "npm/platforms/${platform}/vorpal" ;;
             esac
           done
-      # Auth is self-degrading: while the NPM_TOKEN secret exists (the one-time granular
-      # token that BOOTSTRAPS never-published packages — npm cannot configure a trusted
-      # publisher until a package exists, npm/cli#8544), npm uses it; once every package
-      # exists and its trusted publisher is configured on npmjs.com, DELETE the secret and
-      # these same steps publish via OIDC with no token.
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           for dir in npm/platforms/*/; do
             (cd "$dir" && npm publish --access public)
           done
       - name: Publish @hyper-light/vorpal-cli wrapper
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd npm && npm publish --access public

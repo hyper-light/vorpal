@@ -2,11 +2,11 @@
 # per-platform packages and the main package to npm, plus @hyper-light/vorpal-wasm.
 #
 # Triggers: tag `v<version>` publishes; workflow_dispatch is a build-only dry run.
-# Publishing: npm TRUSTED PUBLISHING (OIDC) once each package exists and carries a trusted
-# publisher on npmjs.com (org hyper-light, repo vorpal, workflow publish-node.yml). npm has
-# no PyPI-style pending publishers (npm/cli#8544), so never-published packages BOOTSTRAP
-# through the NPM_TOKEN secret (granular token) wired into the publish steps — delete the
-# secret after the first publish + trusted-publisher setup and the same steps go tokenless.
+# Publishing uses npm TRUSTED PUBLISHING (OIDC) — no NPM_TOKEN anywhere. npm can only
+# attach a trusted publisher to a package that already exists (npm/cli#8544 — no
+# PyPI-style pending publishers), so each package name was created once by a local
+# maintainer stub publish (0.0.0), then given its trusted publisher on npmjs.com
+# (org hyper-light, repo vorpal, workflow publish-node.yml). Tag runs publish tokenless.
 name: Publish Node bindings
 
 on:
@@ -121,13 +121,8 @@ jobs:
       - name: Move artifacts into platform packages
         working-directory: crates/napi
         run: napi artifacts
-      # Self-degrading auth: the NPM_TOKEN secret (one-time granular bootstrap token —
-      # trusted publishers require the package to exist first, npm/cli#8544) wins while it
-      # exists; delete it after configuring trusted publishers and this publishes via OIDC.
       - name: Publish (platform packages via prepublish, then main)
         working-directory: crates/napi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
 
   wasm:
@@ -161,6 +156,4 @@ jobs:
           cd crates/wasm/pkg
           node -e "const f='package.json',p=require('./'+f);p.name='@hyper-light/vorpal-wasm';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
       - name: Publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd crates/wasm/pkg && npm publish --access public
