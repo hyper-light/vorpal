@@ -20,15 +20,20 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # aarch64-musl builds run natively on ubuntu-24.04-arm; musl-tools' musl-gcc is the
-  # correct compiler AND linker there (no triple-prefixed cross binary exists on runners).
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-  CC_aarch64_unknown_linux_musl: musl-gcc
-  # Same for x86_64: the default host-cc driver mislinks static musl binaries that carry
-  # tokio + jemalloc (undefined `pow` — libc.a ordered before the objects needing it);
-  # musl-gcc owns the correct library group ordering.
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-  CC_x86_64_unknown_linux_musl: musl-gcc
+  # Musl lanes build natively (x86_64 on ubuntu-latest, aarch64 on ubuntu-24.04-arm) with
+  # the musl.cc NATIVE toolchain installed to /opt/musl by the "Install musl toolchain"
+  # steps. It replaced musl-tools' musl-gcc when tree-sitter-vue's C++ scanner joined the
+  # build: musl-tools ships no C++ compiler, while musl.cc's gcc/g++ are full musl-target
+  # drivers with the same correct static library group ordering musl-gcc was pinned for
+  # (the default host-cc driver mislinks static musl binaries that carry tokio + jemalloc
+  # — undefined `pow`, libc.a ordered before the objects needing it). The linker is g++ so
+  # cc-rs's `-lstdc++` for C++ scanners resolves against the toolchain's static libstdc++.
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: /opt/musl/bin/aarch64-linux-musl-g++
+  CC_aarch64_unknown_linux_musl: /opt/musl/bin/aarch64-linux-musl-gcc
+  CXX_aarch64_unknown_linux_musl: /opt/musl/bin/aarch64-linux-musl-g++
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: /opt/musl/bin/x86_64-linux-musl-g++
+  CC_x86_64_unknown_linux_musl: /opt/musl/bin/x86_64-linux-musl-gcc
+  CXX_x86_64_unknown_linux_musl: /opt/musl/bin/x86_64-linux-musl-g++
 
 jobs:
   guard:
@@ -82,11 +87,26 @@ jobs:
           key: ${{ matrix.target }}
       - name: Install musl toolchain
         if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          set -euo pipefail
+          # musl.cc native toolchain for this runner's own architecture (both musl lanes
+          # build natively). Retried download; the compile smoke below is the real gate.
+          arch="$(uname -m)"
+          curl -fsSL --retry 5 --retry-delay 10 -o /tmp/musl-native.tgz \
+            "https://musl.cc/${arch}-linux-musl-native.tgz"
+          sudo mkdir -p /opt/musl
+          sudo tar -xzf /tmp/musl-native.tgz -C /opt/musl --strip-components=1
+          rm /tmp/musl-native.tgz
+          printf 'int main(void){return 0;}' > /tmp/musl-smoke.c
+          "/opt/musl/bin/${arch}-linux-musl-gcc" -static /tmp/musl-smoke.c -o /tmp/musl-smoke-c
+          printf 'int main(){return 0;}' > /tmp/musl-smoke.cc
+          "/opt/musl/bin/${arch}-linux-musl-g++" -static -static-libstdc++ /tmp/musl-smoke.cc -o /tmp/musl-smoke-cc
+          /tmp/musl-smoke-c && /tmp/musl-smoke-cc
+          rm -f /tmp/musl-smoke*
       - name: Build
         env:
           # musl-gcc links against shared libgcc_s.so.1 by default, which runners lack.
-          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=+crt-static -C link-arg=-static-libgcc' || '' }}
+          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=+crt-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++' || '' }}
         run: cargo build --release -p vorpal --target ${{ matrix.target }}
       - name: Stage binary (unix)
         if: runner.os != 'Windows'
@@ -128,7 +148,22 @@ jobs:
         with:
           key: agent-${{ matrix.target }}
       - name: Install musl toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          set -euo pipefail
+          # musl.cc native toolchain for this runner's own architecture (both musl lanes
+          # build natively). Retried download; the compile smoke below is the real gate.
+          arch="$(uname -m)"
+          curl -fsSL --retry 5 --retry-delay 10 -o /tmp/musl-native.tgz \
+            "https://musl.cc/${arch}-linux-musl-native.tgz"
+          sudo mkdir -p /opt/musl
+          sudo tar -xzf /tmp/musl-native.tgz -C /opt/musl --strip-components=1
+          rm /tmp/musl-native.tgz
+          printf 'int main(void){return 0;}' > /tmp/musl-smoke.c
+          "/opt/musl/bin/${arch}-linux-musl-gcc" -static /tmp/musl-smoke.c -o /tmp/musl-smoke-c
+          printf 'int main(){return 0;}' > /tmp/musl-smoke.cc
+          "/opt/musl/bin/${arch}-linux-musl-g++" -static -static-libstdc++ /tmp/musl-smoke.cc -o /tmp/musl-smoke-cc
+          /tmp/musl-smoke-c && /tmp/musl-smoke-cc
+          rm -f /tmp/musl-smoke*
       - name: Derive the loader's embedded public key (only when a signing key is configured)
         id: pubkey
         run: |
@@ -139,11 +174,11 @@ jobs:
       - name: Build the stage-0 loader (musl; public key embedded when available)
         env:
           VORPAL_LOADER_PUBKEY_HEX: ${{ steps.pubkey.outputs.hex }}
-          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static-libgcc
+          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++
         run: cargo build --release -p vorpal-loader --bin vorpal-loader --target ${{ matrix.target }}
       - name: Build the agent (the musl vorpal binary, launched as `__agent`)
         env:
-          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static-libgcc
+          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++
         run: cargo build --release -p vorpal --bin vorpal --target ${{ matrix.target }}
       - name: Sign the agent (if keyed) and record its blake3 pin
         run: |
