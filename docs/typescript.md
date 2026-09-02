@@ -146,3 +146,10 @@ const [callers, reach] = await Promise.all([
 
 The sync forms remain for scripts and REPLs; on the `Index` class they read from the
 pinned, mmapped generation in well under a millisecond.
+
+## Large files in long-lived processes
+
+A process that calls `indexBuildAsync` repeatedly (a dev server re-indexing on save)
+re-parses edited multi-megabyte sources **incrementally** — vorpal retains parse state
+for files over 1 MiB and applies tree-sitter's own incremental reparse, 2–3× faster per
+save on giant files, byte-identical output. Automatic; `VORPAL_TREE_CACHE=0` disables.

@@ -1822,6 +1822,63 @@ UPSTREAM.md and the vendored `claim-shape` regression fixture); ts_allocs
 is now also a standing corruption canary — the exact reason the tool is benchmarked
 wide instead of kernel-shaped.
 
+## Giant-file tree cache — incremental reparse for long-lived processes (2026-09-02)
+
+The landing of the large-file arc (the chunker below was the rejected road): a
+process-global cache retains parse state (source + tree handle) for files ≥ 1 MiB and
+re-parses edits through tree-sitter's own incremental contract (`ts_tree_edit` + reuse
+seed ⇒ identical tree, by library guarantee). One seam — `extract_with`'s parse — so
+every long-lived surface benefits transparently: the MCP overlay daemon, watch-loop
+in-process builds, and every SDK server calling `indexBuild` per save.
+
+Measured (M5 Max, cumulative-save bench, byte-verified against a fresh parse EVERY
+round): 54 MB julia parser.c **4.13–4.27 s → 1.86–1.91 s per save (2.2×)** over an
+8-round soak; 17 MB cpp parser.c 1.33 s → 0.58 s (2.3×); 1.4 MB cpython Parser/parser.c
+104 ms → 34 ms (3.1×). The residual is the extraction walk — the parse share is fully
+eliminated. Cold builds are inert by design (each file parses once; retention is pure
+cost): interleaved kernel colds 7.95/8.86 s on vs 8.57/8.88 s off (noise-law
+indistinguishable; only 4 kernel files reach the 1 MiB floor). Budget defaults 64 MiB
+of retained SOURCE (tree mass ≈ 10–40× source, ledger-profiled → ~2.5 GB worst-case),
+`VORPAL_TREE_CACHE{,_MIN,_BUDGET}` override; `=0` disables. Oracles: eight edit shapes
++ cross-language + the vendored 3.8 MB giant, products byte-identical incremental vs
+fresh; full gate 141 suites / 1280 / 0; battery PASS.
+
+## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
+
+The premise: split giant C sources at proven top-level boundaries, parse slices in
+parallel, merge products byte-identically (min 4 MiB, target 1 MiB, oracle-enforced).
+The study, so nobody re-litigates this blind:
+
+- **The mechanism works where the proof holds.** Forced-tiny-chunk oracles produced
+  byte-identical products across a trap corpus and the vendored multi-MB generated
+  `parser.c` files — after the oracle caught two real merge laws: the reference walk's
+  per-file `(entity, name)` dedup for Type/Implements must replay across chunks, and
+  interior parse errors (macro-specifier ERRORs) are tolerable exactly when they cannot
+  reach a synthetic chunk edge (clean prefix ⇒ identical parser state; the final chunk's
+  end is the real EOF).
+- **Generated giants are ceiling-capped.** tree-sitter-julia's 54 MB `parser.c` has 74
+  cut points and a 44 MB single declaration (80% max-share): chunked wall 3.63 s vs
+  whole 3.65 s — flat, by Amdahl. The kernel's only >1 MB C files are `rtw89` tables —
+  same shape. Solo wins exist only on cut-dense sources (synthetic 12×;
+  tree-sitter-c's 3.8 MB parser.c 1.5×).
+- **Hand-written giants defeat the proof.** sqlite3.c (9.4 MB, ~9,600 potential cuts):
+  a lexical scanner cannot decide brace balance under the preprocessor. Alternatives
+  double-open (`#ifdef X f(){ #else f(int){ #endif`), linkage braces close megabytes
+  away in a different `#ifdef __cplusplus`, and function bodies close inside one
+  branch (`setGetterMethod`: `#if SQLITE_MAX_MMAP_SIZE>0 } else …`). Branch-scoped
+  depth snapshots, max-across-branches at `#endif`, and an extern-"C" idiom carve-out
+  each recovered recall (0 → 9,630 cuts) and each was another epicycle: 22 opens still
+  leaked, and every added rule weakened "proven boundary" toward "heuristic the oracle
+  usually catches". Pipeline-wide, the pre-fix double-parse fallback made self-index
+  10.7–12.6 s vs 7.6–7.9 s off — chunking every parser.c in an already-saturated
+  18-worker build has no idle cores to exploit.
+
+Verdict: rejected. The habitat is empty — files that are giant AND cut-dense AND
+preprocessor-trivial barely exist. The correct mechanism for the real pain (repeated
+re-parses of edited giants in long-lived processes) is tree-sitter's own incremental
+reparse, which is sound by library contract — landed separately as the giant-file
+tree cache.
+
 ## History (earlier passes, kept for the record)
 
 - 2026-08-29 grammar Waves 1–2 (28 → 49 languages): the kernel corpus itself grew — vorpal

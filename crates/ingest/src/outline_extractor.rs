@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use vorpal_core::Language;
 use vorpal_kg::KgWriter;
 use vorpal_lang_registry::SgLang;
-use vorpal_language::LanguageExt;
 use vorpal_outline::DEFAULT_OUTLINE_RULES;
 use vorpal_outline::combined_extractor::CombinedExtractors;
 use vorpal_outline::extractor::{SerializableOutlineRule, parse_outline_rules};
@@ -143,6 +142,85 @@ pub struct OutlineExtractor {
   /// product's identity so editing an extraction rule invalidates products it produced — the
   /// grammar digest alone cannot see a rule change.
   rules_digest: u64,
+}
+
+
+/// The owning finish: one copy of every borrowed name/qualifier into the detachable
+/// product (shared by the public entry and the tree-cache oracle seam).
+fn product_from_parts(parts: product::ExtractedParts<'_>) -> FileProduct {
+  FileProduct {
+      version: product::PRODUCT_FORMAT_VERSION,
+      // The never-matching default stamp: persisting callers stat the source and stamp the
+      // product; an unstamped product can never replay. The content digest is stamped from
+      // the exact bytes extraction saw — the identity staged validation trusts.
+      source_size: 0,
+      source_mtime_ns: 0,
+      source_xxh3: parts.source_xxh3,
+      grammar_digest: parts.grammar_digest,
+      error_nodes: parts.error_nodes,
+      error_bytes: parts.error_bytes,
+      error_spans: parts.error_spans,
+      items: parts.items.into_iter().map(product::own_item).collect(),
+      // The batch-path ownership point: names/qualifiers rode through extraction as borrows
+      // of `source`; they are copied exactly once, here, into the detachable product.
+      refs: parts
+        .refs
+        .into_iter()
+        .map(|r| ProductRef {
+          from_entity_index: r.from_entity_index,
+          name: r.name.into_owned(),
+          kind: r.kind,
+          start: r.start,
+          end: r.end,
+          qualifier: r.qualifier.map(Cow::into_owned),
+          form: r.form,
+          alias: r.alias.map(Cow::into_owned),
+          receiver_type: r.receiver_type.map(str::to_string),
+          receiver_type_origin: r.receiver_type_origin,
+          receiver: r.receiver.map(Cow::into_owned),
+          args: r
+            .args
+            .into_iter()
+            .map(|arg| product::ProductArg {
+              index: arg.index,
+              class: arg.class as u8,
+              kw_name: arg.kw_name.map(Cow::into_owned),
+              expr: arg.expr.map(Cow::into_owned),
+            })
+            .collect(),
+        })
+        .collect(),
+      entity_params: parts
+        .entity_params
+        .into_iter()
+        .map(|(entity, params)| {
+          (
+            entity,
+            params
+              .into_iter()
+              .map(|(name, ty)| (name.to_string(), ty.map(str::to_string)))
+              .collect(),
+          )
+        })
+        .collect(),
+      returns: parts
+        .returns
+        .into_iter()
+        .map(|(name, ret)| (name.to_string(), ret.to_string()))
+        .collect(),
+      signatures: parts.signatures,
+      requests: parts
+        .requests
+        .into_iter()
+        .map(|r| product::ProductRequest {
+          from_entity_index: r.from.raw() as u32,
+          method: r.method,
+          path: r.path.into_owned(),
+          start: r.start,
+          end: r.end,
+        })
+        .collect(),
+    }
 }
 
 impl OutlineExtractor {
@@ -379,79 +457,7 @@ impl OutlineExtractor {
   /// batch ingest, tests, and single-file callers take it; the streaming pipeline uses
   /// [`OutlineExtractor::extract_product_encoded`] and never materializes the owned product.
   pub fn extract_product(&self, path: &str, source: &str) -> Option<FileProduct> {
-    self.extract_with(path, source, |parts| FileProduct {
-      version: product::PRODUCT_FORMAT_VERSION,
-      // The never-matching default stamp: persisting callers stat the source and stamp the
-      // product; an unstamped product can never replay. The content digest is stamped from
-      // the exact bytes extraction saw — the identity staged validation trusts.
-      source_size: 0,
-      source_mtime_ns: 0,
-      source_xxh3: parts.source_xxh3,
-      grammar_digest: parts.grammar_digest,
-      error_nodes: parts.error_nodes,
-      error_bytes: parts.error_bytes,
-      error_spans: parts.error_spans,
-      items: parts.items.into_iter().map(product::own_item).collect(),
-      // The batch-path ownership point: names/qualifiers rode through extraction as borrows
-      // of `source`; they are copied exactly once, here, into the detachable product.
-      refs: parts
-        .refs
-        .into_iter()
-        .map(|r| ProductRef {
-          from_entity_index: r.from_entity_index,
-          name: r.name.into_owned(),
-          kind: r.kind,
-          start: r.start,
-          end: r.end,
-          qualifier: r.qualifier.map(Cow::into_owned),
-          form: r.form,
-          alias: r.alias.map(Cow::into_owned),
-          receiver_type: r.receiver_type.map(str::to_string),
-          receiver_type_origin: r.receiver_type_origin,
-          receiver: r.receiver.map(Cow::into_owned),
-          args: r
-            .args
-            .into_iter()
-            .map(|arg| product::ProductArg {
-              index: arg.index,
-              class: arg.class as u8,
-              kw_name: arg.kw_name.map(Cow::into_owned),
-              expr: arg.expr.map(Cow::into_owned),
-            })
-            .collect(),
-        })
-        .collect(),
-      entity_params: parts
-        .entity_params
-        .into_iter()
-        .map(|(entity, params)| {
-          (
-            entity,
-            params
-              .into_iter()
-              .map(|(name, ty)| (name.to_string(), ty.map(str::to_string)))
-              .collect(),
-          )
-        })
-        .collect(),
-      returns: parts
-        .returns
-        .into_iter()
-        .map(|(name, ret)| (name.to_string(), ret.to_string()))
-        .collect(),
-      signatures: parts.signatures,
-      requests: parts
-        .requests
-        .into_iter()
-        .map(|r| product::ProductRequest {
-          from_entity_index: r.from.raw() as u32,
-          method: r.method,
-          path: r.path.into_owned(),
-          start: r.start,
-          end: r.end,
-        })
-        .collect(),
-    })
+    self.extract_with(path, source, product_from_parts)
   }
 
   /// [`OutlineExtractor::extract_product`] that never materializes the owned product: the
@@ -490,6 +496,28 @@ impl OutlineExtractor {
     source: &str,
     finish: impl FnOnce(product::ExtractedParts<'_>) -> R,
   ) -> Option<R> {
+    self.extract_with_parser(path, source, crate::tree_cache::grep_cached, finish)
+  }
+
+  /// [`OutlineExtractor::extract_product`] with an injected parser — the tree-cache
+  /// oracle drives extraction through the unpoliced cache seam with this.
+  #[cfg(test)]
+  pub(crate) fn extract_product_via(
+    &self,
+    path: &str,
+    source: &str,
+    parse: fn(SgLang, &str, &str) -> vorpal_core::Vorpal<vorpal_core::tree_sitter::StrDoc<SgLang>>,
+    ) -> Option<crate::FileProduct> {
+    self.extract_with_parser(path, source, parse, product_from_parts)
+  }
+
+  fn extract_with_parser<R>(
+    &self,
+    path: &str,
+    source: &str,
+    parse: fn(SgLang, &str, &str) -> vorpal_core::Vorpal<vorpal_core::tree_sitter::StrDoc<SgLang>>,
+    finish: impl FnOnce(product::ExtractedParts<'_>) -> R,
+  ) -> Option<R> {
     let lang = SgLang::from_path(path)?;
     let combined = self.by_lang.get(lang);
     // A data spec (dynamic language, or a user override) wins over the builtin const table.
@@ -505,7 +533,7 @@ impl OutlineExtractor {
     // The parse tree (`grep`) is owned locally; everything extracted is copied into the owned
     // product before it drops. Reference extraction runs even without outline rules (the file
     // node is the only definition span).
-    let grep = lang.grep(source);
+    let grep = parse(lang, path, source);
     // Injections (C3a): embedded languages parse with tree-sitter included ranges, so every
     // span below is a host-file byte offset. Hosts without injections pay nothing (the
     // injectable set is a static `None` for almost every language).

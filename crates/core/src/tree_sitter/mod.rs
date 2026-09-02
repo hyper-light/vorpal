@@ -11,7 +11,7 @@ use thiserror::Error;
 pub use traversal::{PreWithDepth, TsPre, Visitor};
 pub use tree_sitter::Language as TSLanguage;
 use tree_sitter::{InputEdit, LanguageError, Node, Parser, Point, Tree};
-pub use tree_sitter::{Point as TSPoint, Range as TSRange};
+pub use tree_sitter::{Point as TSPoint, Range as TSRange, Tree as TSTree};
 
 /// Represents tree-sitter related error
 #[derive(Debug, Error)]
@@ -101,6 +101,54 @@ impl<L: LanguageExt> StrDoc<L> {
   }
   pub fn new(src: &str, lang: L) -> Self {
     Self::try_new(src, lang).expect("Parser tree error")
+  }
+
+  /// Incremental construction from a previous parse of the SAME file: `history` is the
+  /// old source and its tree. The old tree is cloned (a refcount bump), edited with the
+  /// single spanning [`InputEdit`] between the old and new bytes, and handed to
+  /// tree-sitter as the reuse seed — the library contract guarantees the resulting tree
+  /// equals a from-scratch parse of `src`. With no history this IS `try_new`.
+  pub fn try_new_incremental(
+    src: &str,
+    lang: L,
+    history: Option<(&str, &Tree)>,
+  ) -> Result<Self, String> {
+    let Some((old_src, old_tree)) = history else {
+      return Self::try_new(src, lang);
+    };
+    let ts_lang = lang.get_ts_language();
+    let old = old_src.as_bytes();
+    let new = src.as_bytes();
+    // One spanning edit: longest common prefix, then longest common suffix of the
+    // remainders. Any number of real edits collapses into this single replacement —
+    // coarser than minimal, still exactly correct.
+    let prefix = old
+      .iter()
+      .zip(new.iter())
+      .take_while(|(a, b)| a == b)
+      .count();
+    let max_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old
+      .iter()
+      .rev()
+      .zip(new.iter().rev())
+      .take(max_suffix)
+      .take_while(|(a, b)| a == b)
+      .count();
+    let edit = InputEdit {
+      start_byte: prefix,
+      old_end_byte: old.len() - suffix,
+      new_end_byte: new.len() - suffix,
+      start_position: position_for_offset(old, prefix),
+      old_end_position: position_for_offset(old, old.len() - suffix),
+      new_end_position: position_for_offset(new, new.len() - suffix),
+    };
+    let mut seed = old_tree.clone();
+    seed.edit(&edit);
+    let src = src.to_string();
+    let tree = parse_lang(|p| p.parse(src.as_bytes(), Some(&seed)), ts_lang.clone())
+      .map_err(|e| e.to_string())?;
+    Ok(Self { src, lang, tree })
   }
   fn parse(&self, old_tree: Option<&Tree>) -> Result<Tree, TSParseError> {
     let source = self.get_source();
@@ -397,6 +445,23 @@ impl ContentExt for String {
 impl<L: LanguageExt> Root<StrDoc<L>> {
   pub fn str(src: &str, lang: L) -> Self {
     Self::try_new(src, lang).expect("should parse")
+  }
+
+  /// [`StrDoc::try_new_incremental`], wrapped as a root.
+  pub fn try_new_incremental(
+    src: &str,
+    lang: L,
+    history: Option<(&str, &Tree)>,
+  ) -> Result<Self, String> {
+    Ok(Self {
+      doc: StrDoc::try_new_incremental(src, lang, history)?,
+    })
+  }
+
+  /// The parse state a tree cache retains: this root's source and its tree (clone the
+  /// tree to keep it — a refcount bump, not a copy).
+  pub fn parse_state(&self) -> (&str, &Tree) {
+    (&self.doc.src, &self.doc.tree)
   }
   pub fn try_new(src: &str, lang: L) -> Result<Self, String> {
     let doc = StrDoc::try_new(src, lang)?;

@@ -164,3 +164,10 @@ asyncio.run(main())
 ```
 
 Sync forms remain for scripts; on `Index` they answer in well under a millisecond.
+
+## Large files in long-lived processes
+
+A process that awaits `build(...)` repeatedly (a watcher re-indexing on save) re-parses
+edited multi-megabyte sources **incrementally** — vorpal retains parse state for files
+over 1 MiB and applies tree-sitter's own incremental reparse, 2–3× faster per save on
+giant files, byte-identical output. Automatic; `VORPAL_TREE_CACHE=0` disables.

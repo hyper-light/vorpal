@@ -12,6 +12,7 @@
 //! Content-hash skip (§3.4) is the incremental spine: unchanged file bytes are never re-parsed.
 //! A single [`Ingestor`] is a single-writer-per-shard sink (§7.5); scale-out shards it by path.
 
+mod tree_cache;
 mod manifest;
 mod outline_extractor;
 pub mod refspec_config;
