@@ -55,6 +55,15 @@ impl Default for HeapStore {
 }
 
 impl HeapStore {
+  /// Clear a RAM heap keeping capacity; non-RAM stores (streaming/mapped — merged-writer
+  /// only, never per-file) become a fresh RAM store.
+  fn reset_ram(&mut self) {
+    match self {
+      HeapStore::Ram(bytes) => bytes.clear(),
+      other => *other = HeapStore::Ram(Vec::new()),
+    }
+  }
+
   fn len(&self) -> u64 {
     match self {
       HeapStore::Ram(bytes) => bytes.len() as u64,
@@ -390,7 +399,12 @@ impl KgWriter {
   /// `for_each_definition` / `edge_log` / `add_edge` / `seal`, but **must not** be used for
   /// further `define` or `entity_id` calls (its canonical index no longer covers the absorbed
   /// rows; `define` would fire the dense-assignment debug assertion).
-  pub fn absorb(&mut self, other: KgWriter) -> u64 {
+  /// Splice `other`'s rows after this writer's (additive offsets only — byte-identical
+  /// to applying the file directly at this position). Reads through a borrow so the
+  /// caller keeps the husk: [`KgWriter::reset_for_reuse`] then hands its capacity to the
+  /// next file (the per-file column/heap/map builds were the top allocation AND
+  /// reallocation sites at kernel scale).
+  pub fn absorb(&mut self, other: &mut KgWriter) -> u64 {
     let id_base = self.kind.len() as u64;
     let heap_base = self.heap.len() as u32;
     self.heap.append(other.heap.bytes());
@@ -419,6 +433,29 @@ impl KgWriter {
         .push(src + id_base as u32, dst + id_base as u32, etype);
     }
     id_base
+  }
+
+  /// Empty every store keeping allocated capacity — the husk half of the recycling
+  /// protocol (see [`KgWriter::absorb`]). The CSC law flag survives: husks circulate
+  /// within one pipeline whose format never changes mid-run.
+  pub fn reset_for_reuse(&mut self) {
+    self.canonical.clear();
+    self.shared_path = None;
+    self.edges.clear();
+    self.heap.reset_ram();
+    self.kind.clear();
+    self.name_off.clear();
+    self.name_len.clear();
+    self.path_off.clear();
+    self.path_len.clear();
+    self.sig_off.clear();
+    self.sig_len.clear();
+    self.content_hash.clear();
+    self.eid_lo.clear();
+    self.eid_hi.clear();
+    self.flags.clear();
+    self.span_start.clear();
+    self.span_end.clear();
   }
 
   /// Visit every interned definition — used to build a symbol table for reference resolution.

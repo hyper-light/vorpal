@@ -157,6 +157,15 @@ impl CanonicalIndex {
   }
 
   /// Number of distinct interned entities (each assignment consumes one dense id).
+  /// Empty the index keeping its allocated capacity — writer-husk recycling resets
+  /// per-file writers between files instead of rebuilding their maps from zero. The
+  /// id counter returns to the base, exactly a fresh `new(base)`.
+  pub fn clear(&mut self) {
+    self.hot.clear();
+    self.sealed.clear();
+    self.next_id = self.base;
+  }
+
   pub fn len(&self) -> usize {
     (self.next_id - self.base) as usize
   }

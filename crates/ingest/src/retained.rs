@@ -322,7 +322,7 @@ impl RetainedIndex {
       let rows_start = self.writer.node_count() as u32;
       let heap_start = self.writer.heap_len();
       let edges_start = self.writer.edges_len() as u32;
-      let id_base = self.writer.absorb(file_writer);
+      let id_base = self.writer.absorb(&mut { file_writer });
       for reference in &mut references {
         reference.from = vorpal_kg::NodeId::new(reference.from.raw() + id_base);
       }

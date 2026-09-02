@@ -789,7 +789,7 @@ fn absorb_shard<'i>(
   shard_references: Vec<Reference<'i>>,
   shard_flow: FlowSidecar,
 ) -> io::Result<()> {
-  let id_base = writer.absorb(shard_writer);
+  let id_base = writer.absorb(&mut { shard_writer });
   sink.consume(shard_references, shard_flow, id_base)
 }
 
@@ -1413,7 +1413,7 @@ pub fn apply_products_sharded<'i>(
   let mut writer = KgWriter::new();
   let mut references = Vec::new();
   for (shard_writer, shard_references) in shards {
-    let id_base = writer.absorb(shard_writer);
+    let id_base = writer.absorb(&mut { shard_writer });
     references.extend(shard_references.into_iter().map(|mut reference| {
       reference.from = NodeId::new(reference.from.raw() + id_base);
       reference
@@ -2400,6 +2400,10 @@ where
   let (slot_txs, slot_rxs): (Vec<_>, Vec<_>) = (0..committers)
     .map(|_| crossbeam_channel::bounded::<(usize, Slot<'i>)>(64))
     .unzip();
+  // Writer-husk recycling: committers return absorbed per-file writers (cleared, all
+  // capacity kept) and workers start the next apply from a warm husk — the per-file
+  // column/heap/canonical-map builds were the top allocation and reallocation sites.
+  let (husk_tx, husk_rx) = crossbeam_channel::bounded::<KgWriter>(threads * 2);
 
   let total_sequences = entries.len();
   let mut writer = KgWriter::new();
@@ -2423,6 +2427,7 @@ where
       .map(|(committer_index, slot_rx)| {
         let budget = &budget;
         let done_tx = done_tx.clone();
+        let husk_tx = husk_tx.clone();
         scope.spawn(move || {
           let owned_shards: Vec<usize> =
             (committer_index..num_shards).step_by(committers).collect();
@@ -2452,7 +2457,7 @@ where
               match slot {
                 Slot::Applied(applied) => {
                   let AppliedFile {
-                    writer: file_writer,
+                    writer: mut file_writer,
                     references: file_references,
                     flow: file_flow,
                     parsed: was_parsed,
@@ -2464,7 +2469,11 @@ where
                   // shard writer's bytes are unchanged. References AND flow side rows (G-M3)
                   // rebase by the same base; `rets` are entity-path keyed and never rebase.
                   let (writer, references, flow) = writers.get_mut(&shard).expect("owned shard");
-                  let id_base = writer.absorb(file_writer);
+                  let id_base = writer.absorb(&mut file_writer);
+                  // Husk back to the workers: cleared-with-capacity, so the next file's
+                  // apply allocates nothing for columns, heap, edges, or the canonical map.
+                  file_writer.reset_for_reuse();
+                  let _ = husk_tx.try_send(file_writer);
                   references.extend(file_references.into_iter().map(|mut reference| {
                     reference.from = NodeId::new(reference.from.raw() + id_base);
                     reference
@@ -2519,6 +2528,7 @@ where
         // Each worker owns clones of the committer senders; when the last worker exits, the
         // channels close and committers drain to completion.
         let slot_txs: Vec<crossbeam_channel::Sender<(usize, Slot)>> = slot_txs.clone();
+        let husk_rx = husk_rx.clone();
         let work = &work;
         let budget = &budget;
         let abort = &abort;
@@ -2542,7 +2552,7 @@ where
                              parsed_flag: bool,
                              sizes: (usize, usize, usize)| {
               let (nodes, heap_bytes, refs) = sizes;
-              let mut file_writer = KgWriter::new();
+              let mut file_writer = husk_rx.try_recv().unwrap_or_default();
               file_writer.reserve(nodes, heap_bytes);
               let mut file_references: Vec<Reference<'i>> = Vec::with_capacity(refs);
               let mut file_flow = FlowSidecar::default();
