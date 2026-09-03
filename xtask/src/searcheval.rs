@@ -6,9 +6,12 @@
 //! owner tracks (docs/wip/BENCHMARKS.md records 66/80 at kernel scale).
 //!
 //! Labels are data, not code: `xtask/labels/*.json` ship graded sets for this repo,
-//! cpython, and the Linux kernel. Every labelled name is EXISTENCE-CHECKED against the
-//! index before anything is scored — a renamed symbol fails the run loudly instead of
-//! silently scoring as a retrieval miss.
+//! cpython, and the Linux kernel (each with a `<set>.evidence.md` sidecar citing the
+//! source line that proves every grade-3 answer). Every labelled name is
+//! EXISTENCE-CHECKED against the index before anything is scored — a renamed symbol fails
+//! the run loudly instead of silently scoring as a retrieval miss. A label's optional
+//! `path` disambiguates duplicate names: a plain suffix (`ends_with`) or, with a leading
+//! `/`, a tree-root-anchored path (needs `--root <tree>`; see [`path_matches`]).
 //!
 //! Metrics are the standard IR definitions, no house variants:
 //! * NDCG@10 — graded gains (2^grade − 1), log2(rank+2) discount, ideal DCG from the
@@ -48,8 +51,11 @@ struct LabeledQuery {
 #[derive(Deserialize)]
 struct Relevant {
   name: String,
-  /// Optional path-suffix disambiguator for corpora where one name has many definitions
-  /// (kernel static functions). Matched against the hit's `path` with `ends_with`.
+  /// Optional path disambiguator for corpora where one name has many definitions
+  /// (kernel static functions). A plain value is matched against the hit's `path` with
+  /// `ends_with`; a value starting with `/` is ANCHORED at the indexed tree's root
+  /// (tree-relative equality, `--root` required) — the only form that can single out
+  /// `lib/rbtree.c` from its `tools/lib/rbtree.c` mirror.
   #[serde(default)]
   path: Option<String>,
   /// 1 = marginally relevant, 2 = relevant, 3 = the definitive answer.
@@ -64,12 +70,26 @@ struct ClassAgg {
   recall: f64,
 }
 
-pub fn run(index: &Path, labels_path: &Path, overlap: bool) -> Result<()> {
+pub fn run(index: &Path, labels_path: &Path, overlap: bool, root: Option<&Path>) -> Result<()> {
   let raw = std::fs::read_to_string(labels_path)
     .with_context(|| format!("reading {}", labels_path.display()))?;
   let labels: LabelsFile =
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", labels_path.display()))?;
   validate(&labels)?;
+  // The index stores paths under the CANONICAL root spelling (the build canonicalizes its
+  // src), so an anchored label must be resolved against the same spelling.
+  let root: Option<String> = match root {
+    Some(r) => Some(
+      r.canonicalize()
+        .with_context(|| format!("canonicalizing --root {}", r.display()))?
+        .to_string_lossy()
+        .into_owned(),
+    ),
+    None => None,
+  };
+  if root.is_none() && labels.queries.iter().flat_map(|q| &q.relevant).any(|r| is_anchored(r)) {
+    bail!("labels use an anchored path (starts with '/'); pass --root <indexed tree>");
+  }
 
   let searcher =
     Searcher::open(index).map_err(|e| anyhow::anyhow!("opening {}: {e}", index.display()))?;
@@ -114,7 +134,11 @@ pub fn run(index: &Path, labels_path: &Path, overlap: bool) -> Result<()> {
       bail!("non-deterministic ranking for {:?} (double-run mismatch)", q.query);
     }
 
-    let matches = match_labels(&hits, &q.relevant);
+    let matches = match_labels(
+      hits.iter().map(|h| (h.node.name.as_str(), h.node.path.as_str())),
+      &q.relevant,
+      root.as_deref(),
+    );
     let ndcg = ndcg_at(&matches, &q.relevant, 10);
     let mrr = matches
       .iter()
@@ -244,17 +268,38 @@ fn search(searcher: &Searcher, query: &str, k: usize) -> Result<Vec<SearchHitRec
     .map_err(|e| anyhow::anyhow!("search {query:?}: {e}"))
 }
 
+fn is_anchored(r: &Relevant) -> bool {
+  r.path.as_deref().is_some_and(|p| p.starts_with('/'))
+}
+
+/// The label-path rule: no path = any definition of the name; a plain path = `ends_with`
+/// on the hit's (canonical, absolute) path; an anchored path (`/…`) = equality with the
+/// hit's tree-relative path under `root`. An anchored label with no root never matches
+/// (`run` refuses that configuration up front, so it is unreachable there).
+fn path_matches(hit_path: &str, label_path: Option<&str>, root: Option<&str>) -> bool {
+  match label_path {
+    None => true,
+    Some(anchored) if anchored.starts_with('/') => root.is_some_and(|root| {
+      let rel = vorpal_kg::identity::tree_relative(hit_path, root);
+      rel != hit_path && anchored[1..] == *rel
+    }),
+    Some(suffix) => hit_path.ends_with(suffix),
+  }
+}
+
 /// Greedy rank-order label consumption: each hit takes the first unconsumed label it
-/// matches (name equality + optional path suffix), each label scores at its best rank only
-/// — duplicate definitions of a labelled name never double-count.
-fn match_labels(hits: &[SearchHitRecord], relevant: &[Relevant]) -> Vec<(usize, u8)> {
+/// matches (name equality + the path rule), each label scores at its best rank only —
+/// duplicate definitions of a labelled name never double-count.
+fn match_labels<'a>(
+  hits: impl Iterator<Item = (&'a str, &'a str)>,
+  relevant: &[Relevant],
+  root: Option<&str>,
+) -> Vec<(usize, u8)> {
   let mut consumed = vec![false; relevant.len()];
   let mut matches = Vec::new();
-  for (rank, hit) in hits.iter().enumerate() {
+  for (rank, (name, path)) in hits.enumerate() {
     let found = relevant.iter().enumerate().position(|(i, r)| {
-      !consumed[i]
-        && r.name == hit.node.name
-        && r.path.as_deref().is_none_or(|suffix| hit.node.path.ends_with(suffix))
+      !consumed[i] && r.name == name && path_matches(path, r.path.as_deref(), root)
     });
     if let Some(i) = found {
       consumed[i] = true;
@@ -345,4 +390,77 @@ fn check_labels_exist(index: &Path, labels: &LabelsFile) -> Result<()> {
     );
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn label(name: &str, path: Option<&str>, grade: u8) -> Relevant {
+    Relevant { name: name.into(), path: path.map(str::to_owned), grade }
+  }
+
+  #[test]
+  fn plain_path_is_a_suffix_and_anchored_path_is_tree_relative_equality() {
+    let root = "/src/linux";
+    let lib = "/src/linux/lib/rbtree.c";
+    let tools = "/src/linux/tools/lib/rbtree.c";
+    // No path: every definition of the name qualifies.
+    assert!(path_matches(lib, None, Some(root)));
+    // Plain suffix: BOTH the tree file and its tools/ mirror end with it — the
+    // ambiguity the anchored form exists to remove.
+    assert!(path_matches(lib, Some("lib/rbtree.c"), Some(root)));
+    assert!(path_matches(tools, Some("lib/rbtree.c"), Some(root)));
+    assert!(path_matches(tools, Some("/lib/rbtree.c".trim_start_matches('/')), None));
+    // Anchored: only the tree-relative equal path.
+    assert!(path_matches(lib, Some("/lib/rbtree.c"), Some(root)));
+    assert!(!path_matches(tools, Some("/lib/rbtree.c"), Some(root)));
+    // Anchored without a root never matches (run() refuses this up front).
+    assert!(!path_matches(lib, Some("/lib/rbtree.c"), None));
+    // A hit outside the root is never an anchored match, even when its tail agrees.
+    assert!(!path_matches("/elsewhere/lib/rbtree.c", Some("/lib/rbtree.c"), Some(root)));
+  }
+
+  #[test]
+  fn match_labels_consumes_each_label_once_at_its_best_rank() {
+    let relevant = vec![
+      label("rb_erase", Some("/lib/rbtree.c"), 3),
+      label("rb_erase_cached", None, 2),
+    ];
+    // tools/ mirror ranks first but is not the anchored definition; the real one is
+    // rank 2; a second copy of the real one at rank 3 must not double-count.
+    let hits = [
+      ("rb_erase", "/src/linux/tools/lib/rbtree.c"),
+      ("rb_first", "/src/linux/lib/rbtree.c"),
+      ("rb_erase", "/src/linux/lib/rbtree.c"),
+      ("rb_erase", "/src/linux/lib/rbtree.c"),
+      ("rb_erase_cached", "/src/linux/include/linux/rbtree.h"),
+    ];
+    let matches = match_labels(hits.iter().copied(), &relevant, Some("/src/linux"));
+    assert_eq!(matches, vec![(2, 3), (4, 2)]);
+    // Without a root the anchored label can never match; the plain one still does.
+    let matches = match_labels(hits.iter().copied(), &relevant, None);
+    assert_eq!(matches, vec![(4, 2)]);
+  }
+
+  #[test]
+  fn ndcg_is_one_for_the_ideal_ranking_and_zero_for_a_miss() {
+    let relevant = vec![label("a", None, 3), label("b", None, 2), label("c", None, 1)];
+    assert!((ndcg_at(&[(0, 3), (1, 2), (2, 1)], &relevant, 10) - 1.0).abs() < 1e-12);
+    assert_eq!(ndcg_at(&[], &relevant, 10), 0.0);
+    // Reversed order is strictly worse than ideal.
+    assert!(ndcg_at(&[(0, 1), (1, 2), (2, 3)], &relevant, 10) < 1.0);
+  }
+
+  #[test]
+  fn validate_rejects_vacuous_and_duplicate_labels() {
+    let file = |relevant: Vec<Relevant>| LabelsFile {
+      description: String::new(),
+      queries: vec![LabeledQuery { class: "exact".into(), query: "q".into(), relevant }],
+    };
+    assert!(validate(&file(vec![label("a", None, 1)])).is_err());
+    assert!(validate(&file(vec![label("a", None, 3), label("a", None, 2)])).is_err());
+    assert!(validate(&file(vec![label("a", None, 3), label("a", Some("x.c"), 2)])).is_ok());
+    assert!(validate(&file(vec![label("a", None, 4)])).is_err());
+  }
 }
