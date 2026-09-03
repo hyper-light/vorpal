@@ -42,6 +42,11 @@ isExported:
     has:
       kind: storage_class_specifier
       regex: ^static$
+# Parser-swallow recovery: C++ forbids nested function definitions too (lambdas are
+# `lambda_expression`, local classes' methods sit inside a `class_specifier` the walk
+# never enters), and tree-sitter-cpp shares the block-item shape — see the C rule.
+# Measured on the C corpora first; the shape is the same grammar family.
+swallowRecovery: true
 ---
 
 id: cpp-class

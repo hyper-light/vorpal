@@ -57,6 +57,24 @@ pub enum SymbolType {
   TypeAlias,
 }
 
+/// One parser-swallow recovery in a file (see
+/// [`crate::extractor::SerializableItemRule::swallow_recovery`]): the definition
+/// starting at byte `start` ran to end-of-file carrying parse errors — tree-sitter
+/// lost its closing brace and parsed the rest of the file inside its body — and the
+/// traversal lifted `lifted` definitions out of that body as top-level items. A
+/// structural coverage signal beside the byte-ratio one: the byte ratio cannot see
+/// this shape (no ERROR node ever appears at top level), yet without the lift every
+/// definition after `start` is absent from the index (cpython `Objects/object.c`: 77
+/// of 142 functions; kernel `net/core/dev.c`: 422).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwallowRecovery {
+  /// Byte offset where the swallowing definition starts.
+  pub start: u32,
+  /// Definitions lifted out of its body as top-level items.
+  pub lifted: u32,
+}
+
 /// Entry placement in the outline tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
