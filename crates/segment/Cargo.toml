@@ -20,3 +20,6 @@ blake3 = { workspace = true, features = ["rayon"] }
 rayon.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror.workspace = true
+
+[lints]
+workspace = true

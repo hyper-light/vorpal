@@ -38,3 +38,6 @@ crate-type = ["cdylib"]
 
 [build-dependencies]
 napi-build = "2.2.2"
+
+[lints]
+workspace = true

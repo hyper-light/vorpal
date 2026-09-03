@@ -25,3 +25,6 @@ default = ["tree-sitter"]
 
 [dev-dependencies]
 tree-sitter-typescript = "0.23.2"
+
+[lints]
+workspace = true

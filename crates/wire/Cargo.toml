@@ -25,3 +25,6 @@ tokio = { version = "1.37", optional = true, default-features = false, features 
 [dev-dependencies]
 # The async-IO tests need a runtime + the test macro; the library itself only needs io-util.
 tokio = { version = "1.37", features = ["io-util", "macros", "rt", "io-std"] }
+
+[lints]
+workspace = true

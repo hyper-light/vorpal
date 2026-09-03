@@ -28,3 +28,6 @@ alloc-stats = ["dep:tikv-jemalloc-ctl"]
 # counters the binary's wrapping allocator bumps, printed at every phase stamp.
 # NEVER a default — profiling builds only (the bench-internals discipline).
 alloc-ledger = ["dep:libc"]
+
+[lints]
+workspace = true

@@ -27,3 +27,6 @@ vorpal-mem.workspace = true
 # resolver unifies platform-independently.
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[lints]
+workspace = true

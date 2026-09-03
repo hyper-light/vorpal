@@ -30,3 +30,6 @@ napi-langs = ["vorpal-language/napi-lang"]
 
 [dev-dependencies]
 serde_yaml.workspace = true
+
+[lints]
+workspace = true

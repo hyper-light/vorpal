@@ -38,3 +38,6 @@ tokio = { version = "1.45.0", features = [
 ] }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.16"
+
+[lints]
+workspace = true

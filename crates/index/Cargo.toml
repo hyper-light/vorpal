@@ -87,3 +87,6 @@ required-features = ["bench-internals"]
 [[example]]
 name = "sweep_encoder"
 required-features = ["bench-internals"]
+
+[lints]
+workspace = true

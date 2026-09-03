@@ -14,3 +14,6 @@ version.workspace = true
 vorpal-segment.workspace = true
 
 blake3.workspace = true
+
+[lints]
+workspace = true

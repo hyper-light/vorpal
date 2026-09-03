@@ -21,3 +21,6 @@ vorpal-loader.workspace = true
 vorpal-index = { workspace = true, features = ["bench-internals"] }
 vorpal-kg.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

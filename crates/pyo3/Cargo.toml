@@ -41,3 +41,6 @@ python = ["pythonize", "pyo3", "pyo3/extension-module", "pyo3/abi3-py39"]
 # allocations are unaffected (they use pymalloc). MSVC keeps the system allocator.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7.0"
+
+[lints]
+workspace = true

@@ -47,3 +47,6 @@ alloc-ledger = ["vorpal-kg/alloc-ledger", "vorpal-resolve/alloc-ledger"]
 # decay-independent, which matters because batch index runs disable decay for fault
 # economics. Embedders without it keep the macOS zone-pressure call.
 jemalloc = ["dep:tikv-jemalloc-sys"]
+
+[lints]
+workspace = true

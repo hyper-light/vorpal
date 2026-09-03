@@ -31,3 +31,6 @@ js-sys = "0.3.83"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.42"
+
+[lints]
+workspace = true

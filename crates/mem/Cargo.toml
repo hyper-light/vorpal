@@ -15,3 +15,6 @@ memmap2 = "0.9.11"
 libc = "0.2"
 bumpalo = "3.20"
 bytemuck = "1.25.2"
+
+[lints]
+workspace = true

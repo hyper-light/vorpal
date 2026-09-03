@@ -26,3 +26,6 @@ tokio = { version = "1.37", features = ["full"] }
 tempfile = "3.10"
 russh = { version = "0.54", default-features = false, features = ["ring", "flate2"] }
 rand_core = { version = "0.6.4", features = ["getrandom", "std"] }
+
+[lints]
+workspace = true

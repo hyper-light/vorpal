@@ -107,3 +107,6 @@ pkg-url = "{ repo }/releases/download/v{ version }/vorpal-windows-x86.exe"
 [target.'cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))'.dependencies]
 tikv-jemallocator = "0.7.0"
 tikv-jemalloc-sys = "0.7.1"
+
+[lints]
+workspace = true

@@ -27,3 +27,6 @@ alloc-ledger = ["vorpal-kg/alloc-ledger"]
 
 [dev-dependencies]
 vorpal-outline.workspace = true
+
+[lints]
+workspace = true

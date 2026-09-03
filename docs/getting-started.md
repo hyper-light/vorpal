@@ -32,7 +32,7 @@ chmod +x vorpal && mv vorpal ~/.local/bin/    # or /usr/local/bin
 
 ### From source (any platform)
 
-Requires Rust 1.85+ ([rustup.rs](https://rustup.rs)).
+Requires Rust 1.98+ ([rustup.rs](https://rustup.rs)).
 
 ```sh
 git clone https://github.com/hyper-light/vorpal && cd vorpal
