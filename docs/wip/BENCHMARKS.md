@@ -3785,3 +3785,18 @@ function definitions in either corpus, so nothing arms there; C++ is armed by th
 grammar fact but measured only on the fixture set — the polyglot canary is the
 coordinator's at merge; the walk-reuse fast path simply excludes fired files (25 kernel
 files) rather than modelling lifted items.
+
+### Landing on main (2026-09-03, `85c14b0` merge → `603f2b5`)
+
+Coordinator's merge gates on the merged tree: workspace 143 suites / 1,321 / 0,
+all three CI clippy lanes clean; convergence battery PASS; polyglot canary 15/15
+@ HEAD (cold + unchanged exit 0 everywhere; the recovery is visible where C/C++
+lives — llvm +929 nodes, cpython 164,045 → 164,182, neovim +151, rust +136,
+roslyn +193 — and non-C corpora move only with HEAD drift); CI green on `603f2b5`
+(both jobs). Kernel walls: unchanged 0.12 s, one-shot edit 0.50 s; cold measured as
+an INTERLEAVED A/B against the pre-recovery binary (`6a1a7c0`), three rounds on a
+quiet machine — base 9.58 / 8.91 / 8.88 s vs merged 9.48 / 8.84 / 8.70 s: the
+recovery walk costs nothing cold (the day's upper-band readings were thermal). The
+first canary pass in the landing chain was VACUOUS (`export -f` + `xargs bash -c`
+does not survive this zsh shell; every clone was skipped and "0 failures" measured
+nothing) and was rerun with an inline loop — recorded so the shape is not reused.
