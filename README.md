@@ -255,7 +255,11 @@ the fused top-k at query time — `semantic-f32` uses the upstream 547 MB weight
 `semantic-f16` a locally converted 274 MB copy. **The two encoder sizes rank the
 same** (embedding drift after conversion: cosine 1.000000; identical tables below on
 CPython and this repo, one adjacent-rank swap on one kernel query) — they differ in
-disk and resident memory, not in quality.
+disk and resident memory, not in quality. With the encoder enabled, the warm also fills a
+doc-side embedding sidecar in the background; that fill runs on the GPU when one is
+present (Metal / Vulkan / DX12 through `wgpu` — Apple, NVIDIA, AMD, Intel, no driver
+beyond the OS's), else on the platform's BLAS or the portable lanes, and the search path
+never depends on which built it (`VORPAL_ENCODER_GPU=off` forces the CPU rungs).
 
 Graded retrieval on three corpora with the bundled labelled query sets
 (`xtask/labels/`, graded relevance 1–3; metrics NDCG@10 / MRR / recall@5, exact

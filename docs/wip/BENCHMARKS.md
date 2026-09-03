@@ -2300,6 +2300,170 @@ at these budgets; (3) the default budget policy when no budget is given is "no s
 measurement, recorded in `ann.dense.json`; the uncontended vorpal head rate was 1.7×
 the contended one.
 
+## Cross-platform GPU rung for the doc-side fill — `wgpu` compute GEMM (2026-09-02)
+
+ONE GPU path for the doc-side encoder fill — NVIDIA / AMD / Intel / Apple through
+`wgpu` compute shaders over Metal / Vulkan / DX12, no vendor SDK, no runtime dependency
+beyond the OS driver, inside the single binary. `GemmPath::Gpu` (`crates/ann/src/encoder/
+gemm_wgpu.rs` + `gemm_nt.wgsl` + `swiglu.wgsl`), chosen by the doc-side ladder
+`CodeEncoder::doc_side_rung()` ONCE per model open: **GPU → Accelerate (macOS) / the CPU
+throughput path → fixed-order lanes**. Doc-side ONLY: the query-side rerank stays on the
+fixed-order lanes everywhere (rankings byte-identical to before). Dependency: `wgpu
+=30.0.0` (MIT OR Apache-2.0, rust-version 1.87; 30.0.1 raised its wasm-bindgen floor past
+`crates/wasm`'s `=0.2.126` pin); `gpu-allocator` re-resolved onto `windows 0.62` so the
+DX12 backend compiles against one `windows` crate (the workspace also carries 0.59 for
+`pageant`). Machine: M5 Max (18 CPU cores, 40-core GPU, Metal 4). **Every row below was
+CONTENDED** (`uptime` load 30–95 throughout: a concurrent agent's builds and benches plus
+this branch's own builds); the GPU-only figures are the steadier ones, the CPU-side
+figures vary 2× run to run — the tables say which run each comes from.
+
+### Platform / device matrix
+
+| platform | backend | adapter (`adapter.get_info()`) | status |
+|---|---|---|---|
+| macOS arm64 (this machine) | Metal | `wgpu-metal:Apple M5 Max` (IntegratedGpu) | **measured**: GEMM oracle, parity, determinism, throughput, fill, %CPU/%GPU, RSS |
+| Linux x86_64 (Debian bookworm container, amd64 under emulation) | Vulkan | `wgpu-vulkan:llvmpipe (LLVM 15.0.6, 256 bits)` (Cpu, admitted by `VORPAL_ENCODER_GPU=software`) | **software-Vulkan correctness only**: ragged-shape GEMM oracle + gated parity (min cosine 1.0000000 vs fixed-order, 12 surfaces) + determinism (run-to-run, second device open, rayon 1 vs default: IDENTICAL bytes) — run twice, on the un-fused kernel (337 s for the two oracles) and on the shipped fused-MLP kernel (168 s); never a throughput figure |
+| Linux x86_64, hardware Vulkan | Vulkan | — | compile-verified (`cargo check --target x86_64-unknown-linux-gnu -p vorpal-ann`); pending CI / hardware |
+| Windows x86_64 | DX12 | — | compile-verified (`cargo check --target x86_64-pc-windows-msvc -p vorpal-ann`); pending CI / hardware |
+
+Device selection: discrete > integrated > virtual > other by device type; software
+adapters (`DeviceType::Cpu`) only under `VORPAL_ENCODER_GPU=software`; `=off` skips the
+rung (stated in the record). No adapter, a limit too small for the shapes, `dim % 4 ≠ 0`,
+a non-resident weight: typed refusals, never panics — `wgpu`'s default uncaptured-error
+handler (which aborts) is replaced by a recording handler + device-lost callback, and every
+submission runs under validation / OOM / internal error scopes; any fault RETIRES the rung
+and that GEMM plus every later one runs on the next rung, the sidecar record naming the
+chain (`wgpu-metal:Apple M5 Max→accelerate-sgemm (<fault>)`). Weights resident once per
+open (453.0 MB, 60 buffers); activations round-trip per GEMM through scratch buffers grown
+to the largest batch; the MLP block (fc11, fc12, SwiGLU gate, fc2) is FUSED on the device
+so its `rows × 3072` intermediates never cross the host boundary.
+
+### Parity and determinism (gated `gpu_path_*` oracles, `crates/ann/tests/encoder.rs`)
+
+| device | vs fixed-order (min cosine, 12 surfaces) | vs Accelerate | run-to-run | 2nd device open | rayon 1 vs default |
+|---|---:|---:|---|---|---|
+| Metal, Apple M5 Max (fused MLP, device `exp` gate) | **1.0000000** | 1.0000000 | IDENTICAL (asserted) | IDENTICAL | IDENTICAL |
+| Vulkan, llvmpipe (container) | **1.0000000** | — (fixed lanes) | IDENTICAL (asserted) | IDENTICAL | IDENTICAL |
+
+Determinism story, stated honestly: the shader fixes each output's summation order
+(k ascending, x/y/z/w lanes through `fma`), so two dispatches of the same compiled
+pipeline agree bitwise — measured so on both devices, including across a fresh pipeline
+compile in the same process. A different driver, device or `wgpu` release may compile a
+different order (Metal compiles with its fast-math default), so the GPU rows are
+reproducible per (device, driver) and the sidecar admits that variance (stamp-gated, never
+part of the generation id); `ann.dense.json` records `gemm_path` = the rung — re-read at
+every checkpoint, so a mid-fill retirement is recorded too.
+
+### GEMM kernel — three versions, dispatch-only (no host copies)
+
+`examples/gpu_gemm_probe.rs` (`-p vorpal-ann`, synthetic operands at the six layer
+shapes) and `sweep_encoder`'s dispatch-only line (real weights):
+
+| kernel | 21,853 rows, layer GEMMs | note |
+|---|---:|---|
+| v1: runtime-indexed `array<array<f32,4>,4>` accumulators, k-major tiles | 634 GFLOPS | naga bounds-checks every accumulator access; strided tile reads |
+| v2: four named `vec4` accumulators, A k-major, B transposed to `[k lane][column quad]` (broadcast reads) | **9,123 GFLOPS** (real weights, 64×64 / bk4 8) | 14× v1; the shipped kernel |
+| v2 under the contended final run | 4,764 GFLOPS | same binary, GPU sharing the package power budget with a loaded CPU |
+
+GPU tile sweep (`gpu_gemm_probe`, layer GFLOPS = the five shapes of one layer at once,
+mean of 20 submissions; the caps in `Tile::derive` come from this table):
+
+| tile (block, K stage in vec4) | 364 rows | 4,690 rows | 21,853 rows |
+|---|---:|---:|---:|
+| 32×32, 2 | 3,253 | 6,283 | 4,597 |
+| 32×32, 4 | 3,260 | **6,533** | 4,303 |
+| 32×32, 8 | **4,929** | 6,271 | 4,992 |
+| 32×32, 16 | 3,257 | 4,891 | 4,203 |
+| 64×64, 2 | 3,679 | 5,418 | 4,858 |
+| 64×64, 4 | 3,176 | 5,773 | 5,675 |
+| **64×64, 8 (derived)** | 4,541 | 5,183 | **6,007** |
+| 64×64, 16 | 952 | 1,263 | 1,439 |
+| 128×128, 2 | 2,791 | 5,580 | 4,298 |
+| 128×128, 4 | 2,747 | 6,434 | 5,139 |
+| 128×128, 8 | 1,443 | 2,796 | 3,465 |
+| 128×128, 16 | refused (64 KiB > the 32 KiB workgroup-memory limit) | | |
+
+Derivation (no magic numbers): the largest square workgroup the invocation and per-axis
+limits admit, capped at 16 × 16 (= 64 × 64 block: best at the fill's 21,853-row batches,
+within noise of the best at the others); the deepest K stage the workgroup-memory limit
+holds, capped at 8 vec4 (16 KiB staged) — 16 vec4 at 64 × 64 (32 KiB, one workgroup per
+core) collapses to 1.4 TFLOPS at every scale, the occupancy cliff the cap avoids.
+
+### End-to-end forward — GPU rung vs Accelerate vs fixed-order (`sweep_encoder`)
+
+Real vorpal-index surfaces in coverage order, FLOPs = 2 × 113.2 M × tokens, median of 3,
+contended (`uptime` 52–57 during this run; the quiet-machine Accelerate baseline recorded
+above was 935 / 1,505 / 1,462 GFLOPS — this run's Accelerate column is 2–12× below it):
+
+| batch | tokens | fixed-order | Accelerate `cblas_sgemm` | **GPU rung (fused MLP)** | GPU vs Accel | host copies (share of GPU wall) | device s (compute + blit) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 26 | 364 | 2.168 s / 38 GFLOPS | 1.101 s / 75 | **0.437 s / 189** (59 seq/s) | 2.5× | 2.9% (40 + 67 MB) | 0.116 |
+| 256 | 4,690 | 13.36 s / 80 | 3.099 s / 343 | **2.285 s / 465** (112 seq/s) | 1.4× | 4.5% (519 + 864 MB) | 0.299 |
+| 1,024 | 21,853 | 32.99 s / 150 | 4.137 s / 1,197 | **2.011 s / 2,461** (509 seq/s) | 2.1× | 22.0% (2,417 + 4,028 MB) | 0.756 |
+
+Same sweep one run earlier, v2 kernel WITHOUT the MLP fusion (contended, load 35–95):
+GPU 0.391 / 1.323 / 4.084 s with host copies at 7.8 / 28.5 / 32.1% (107 + 174 /
+1,383 + 2,248 / 6,445 + 10,473 MB per batch) — fusion cut the bytes 2.6× and the
+1,024-batch wall 2×. And v1 (the 634-GFLOPS kernel): 0.257 / 2.253 / 11.34 s.
+
+**Transfer share and where the time went.** With the fused MLP only `x` goes up and the
+block's output comes down: per 4,690-token batch 519 MB up + 864 MB down (qkv's 3·dim
+output is the largest remaining readback), 4.5% of the wall as host-side copies, 13% as
+device time (GEMMs + blits: pure GEMM is 12 × 0.087 s ≈ 1.0 s at 21,853 rows under
+contention, 0.54 s quiet), and the remaining ~80% is the CPU-side passes the GEMM path
+never touched — attention (f64, per row/head), LayerNorm, rotary, residual adds, the qkv
+unpack — which are now the dominant term of the GPU forward and the obvious next lever
+(attention + LayerNorm on the device would leave one upload and one readback per layer).
+
+### The fill (`vorpal __warm-ann`, this repo; `/usr/bin/time -l` + 1 s samples of `ps %cpu` and IOAccelerator "Device Utilization %")
+
+Referenced population 11,701 of 74,652 definitions, 296,683 tokens, six checkpoints,
+complete; same index, sidecar deleted between runs; contended (`uptime` 30–50):
+
+| rung (`gemm_path` in `ann.dense.json`) | fill wall | tok/s (round) | fastest batch tok/s | mean %CPU (max) | mean GPU util (max) | peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| `wgpu-metal:Apple M5 Max` | **41.0 s** | **7,240** | 8,233 | 190% (289%) | 38% (50%) | 1.02 GB |
+| `accelerate-sgemm (gpu: disabled by VORPAL_ENCODER_GPU=off)` | 74.9 s | 3,962 | 4,257 | 638% (731%) | 5% (19%) | 1.06 GB |
+
+1.83× the fill rate at 3.4× less CPU (the machine stays usable for the concurrent index
+work the daemon is doing); GPU utilisation 38% says the device idles while the CPU passes
+run — the pipelining lead (overlap batch i+1's GEMMs with batch i's attention) is the
+other half of the lever above.
+
+Kernel checkpoint round (`--dense-budget-timeout 120s`; referenced population 716,721 of
+8,481,757 definitions; seven checkpoints each; contended, `uptime` 30–46):
+
+| rung | rows covered in the round | tokens | fill s | tok/s (round) | fastest batch tok/s | process wall / %CPU / GPU util / peak RSS |
+|---|---:|---:|---:|---:|---:|---|
+| `wgpu-metal:Apple M5 Max` | **30,464** | **967,556** | 118.8 | **8,142** | 9,768 | 325.8 s / 501% mean (1473% max) / 22% mean (65% max) / 8.47 GB — this run ALSO built the kernel's ANN tier first (the graph + ANN warm own the RSS and most of the CPU), so its process-level columns are not fill-only |
+| `accelerate-sgemm (…VORPAL_ENCODER_GPU=off)` | 16,640 | 517,005 | 120.5 | 4,290 | 4,574 | 121.8 s / 727% (833%) / 7% (52%) / 2.78 GB — ANN tier already warm, so this IS the fill's own profile |
+
+1.9× the tokens per capped round on the kernel head (its surfaces are the shortest —
+31.8 tok/def here vs 25.4 on this repo — so the GPU's per-batch fixed costs weigh more).
+The record's `gemm_path` names the rung in both cases.
+
+Reproduction: `VORPAL_CODERANK_DIR=<model> cargo run --release -p vorpal-index --features
+bench-internals --example sweep_encoder -- <index> 26 256 1024` (throughput + transfer
+share + dispatch-only ceiling; `--gpu-tiles [batch]` for the end-to-end tile sweep);
+`cargo run --release -p vorpal-ann --example gpu_gemm_probe -- [rows]` (model-free kernel
+sweep); `VORPAL_CODERANK_DIR=<model> cargo test -p vorpal-ann --release --test encoder
+gpu_path -- --nocapture` (parity + determinism; `VORPAL_ENCODER_GPU=software` admits
+lavapipe); `VORPAL_HOME=<home> vorpal __warm-ann <index> [--dense-budget-timeout 120s]`
+under `/usr/bin/time -l` for the fill. Gate: 142 suites / 1,305 tests green (`cargo test
+--workspace --release`), both clippy lanes clean under rust 1.98 (which also flagged five
+pre-existing findings — the verbatim Cephes `exp` coefficients and the bench-only
+`SurfaceRecipe` / `RerankMode` / `TrainKindPolicy` variants — now carrying stated allows).
+
+Not done / open: (1) Vulkan and DX12 on hardware are compile-verified only — the parity
+oracle needs a CI runner or a machine with such an adapter (the software-Vulkan run is the
+correctness evidence for the Vulkan backend's shader path); (2) the CPU-side passes now
+dominate the GPU forward (above) — attention/LayerNorm on the device and batch pipelining
+are the next levers, not the GEMM; (3) `MAPPABLE_PRIMARY_BUFFERS` (direct mapping on
+unified-memory devices, skipping the staging blit) was not tried — host copies are 4.5%
+of the fill batch after fusion, below the noise of this contended machine; (4) every
+CPU-side number here is contended — re-measure the throughput table on a quiet machine
+before quoting it as the platform's rate.
+
 ## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
 
 The premise: split giant C sources at proven top-level boundaries, parse slices in
