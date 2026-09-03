@@ -2868,6 +2868,28 @@ per-channel migration into the weights; both need re-measuring against this bar.
 * The weights-gated real-encoder parity on x86 (`workflow_dispatch` only: it downloads the
   547 MB weights via `vorpal enable semantic-f32`).
 
+### First CI execution (2026-09-03, run 33706453902 on `004a750`, `ubuntu-latest`)
+
+Runner: AMD EPYC 9V74, 4 vCPUs, ISA **avx2 fma** only — so the AVX2+FMA lane ran and
+the AVX-512F / VNNI kernels stayed compile-verified (no AVX-512 on this runner class;
+still pending hardware). Kernel oracles: 13 tests pass. `gemm_bench`, 4,690 tokens
+(the 256-surface batch), median of 3, 4 shards / 4 rayon threads:
+
+| GEMM | shape | fixed-order lanes | AVX2+FMA throughput | int8 (avx2-madd) | throughput Δ |
+|---|---|---:|---:|---:|---:|
+| qkv | 4690 × 768 → 2304 | 6.83 s / 2 GFLOPS | 0.155 s / **107 GFLOPS** | 0.097 s / 172 | 0.00e0 |
+| out_proj | 4690 × 768 → 768 | 2.27 s / 2 | 0.051 s / **108** | 0.036 s / 154 | 0.00e0 |
+| fc11 | 4690 × 768 → 3072 | 9.11 s / 2 | 0.203 s / **109** | 0.127 s / 174 | 0.00e0 |
+| fc12 | 4690 × 768 → 3072 | 9.23 s / 2 | 0.200 s / **111** | 0.127 s / 175 | 0.00e0 |
+| fc2 | 4690 × 3072 → 768 | 9.09 s / 2 | 0.196 s / **113** | 0.134 s / 166 | 0.00e0 |
+| per-layer sum (×12 layers per forward) | | 36.5 s (438 s/forward) | **0.81 s (9.7 s/forward)** | 0.52 s (6.2 s/forward) | |
+
+Reading: on x86 the pre-lift fixed-order lanes ran at **2 GFLOPS** — the doc-side fill
+was effectively unusable there (438 s of GEMM per 256-surface batch); the AVX2+FMA
+kernels are **≈45×** that, bit-equal to the fixed lanes (Δ 0.00e0), at ~485 tokens/s
+of GEMM-bound forward on four vCPUs. int8 (avx2-madd) is a further 1.55× but stays
+OFF by the retention verdict above. AVX-512 remains the open measurement.
+
 ## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
 
 The premise: split giant C sources at proven top-level boundaries, parse slices in
