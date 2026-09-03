@@ -15,8 +15,11 @@
 //! never waits on the fill (the warm runs in the daemon's warm thread or the
 //! detached autowarm child; the fill commits AFTER the core tiers' stamp).
 //!
-//! STOP RULE (data-derived): embed every non-Import definition something
-//! references (referential in-degree ≥ 1), highest degree first, id ascending —
+//! STOP RULE (structural): embed every non-Import definition something
+//! references (referential in-degree ≥ 1) OR that the graph marks exported —
+//! public API entry points with no in-tree caller are exactly what users search
+//! for (cpython's `PyList_Append`) — highest degree first, id ascending, so the
+//! exported-but-unreferenced definitions follow every referenced one. Private,
 //! unreferenced definitions are not embedded. The fill is RESUMABLE: it commits
 //! checkpoints (`ann.dense` + `ann.dense.json`, tmp + rename each) whenever the
 //! rows added since the last checkpoint reach the rows already committed
@@ -367,11 +370,15 @@ pub(crate) struct DenseRecord {
   pub gemm_path: String,
   /// Rows committed — a prefix of the coverage order.
   pub coverage: usize,
-  /// The stop rule's population: non-Import definitions with referential in-degree ≥ 1.
+  /// The stop rule's population: referenced (in-degree ≥ 1) + exported-only definitions.
+  pub eligible: usize,
+  /// Non-Import definitions with referential in-degree ≥ 1.
   pub referenced: usize,
-  /// Every non-Import definition (the referenced fraction's denominator).
+  /// Exported definitions with no in-tree reference.
+  pub exported_only: usize,
+  /// Every non-Import definition (the fractions' denominator).
   pub population: usize,
-  /// `coverage == referenced` (or the explicit cap ended the fill — see `capped`).
+  /// `coverage == eligible`.
   pub complete: bool,
   /// The explicit cap that ended the last fill round, if any (seconds).
   pub cap_secs: Option<f64>,
@@ -398,9 +405,10 @@ pub(crate) fn read_record(dir: &Path) -> Option<DenseRecord> {
   let hex_of = |key: &str| u128::from_str_radix(value.get(key)?.as_str()?, 16).ok();
   let coverage = u64_of("coverage")? as usize;
   let population = u64_of("population")? as usize;
-  // Records written by the budgeted (pre-fill) builder carry no stop-rule fields:
-  // they stay SERVABLE (same rows, same freshness keys) and the next fill starts
-  // over because their `referenced` cannot match the stop rule's count.
+  // Records written by earlier builders carry fewer stop-rule fields: they stay
+  // SERVABLE (same rows, same freshness keys) and the next fill starts over
+  // because their `eligible` cannot match the stop rule's count.
+  let referenced = u64_of("referenced").map_or(population, |n| n as usize);
   Some(DenseRecord {
     stamp: u64_of("stamp")?,
     model_identity: hex_of("model_identity")?,
@@ -408,7 +416,9 @@ pub(crate) fn read_record(dir: &Path) -> Option<DenseRecord> {
     surface: str_of("surface")?,
     gemm_path: str_of("gemm_path")?,
     coverage,
-    referenced: u64_of("referenced").map_or(population, |n| n as usize),
+    eligible: u64_of("eligible").map_or(referenced, |n| n as usize),
+    referenced,
+    exported_only: u64_of("exported_only").unwrap_or(0) as usize,
     population,
     complete: value
       .get("complete")
@@ -432,7 +442,9 @@ pub(crate) fn write_record(dir: &Path, record: &DenseRecord) -> std::io::Result<
   fields.insert("surface", record.surface.clone().into());
   fields.insert("gemm_path", record.gemm_path.clone().into());
   fields.insert("coverage", (record.coverage as u64).into());
+  fields.insert("eligible", (record.eligible as u64).into());
   fields.insert("referenced", (record.referenced as u64).into());
+  fields.insert("exported_only", (record.exported_only as u64).into());
   fields.insert("population", (record.population as u64).into());
   fields.insert("complete", record.complete.into());
   if let Some(cap) = record.cap_secs {
@@ -458,20 +470,52 @@ pub(crate) fn surface_of(view: &vorpal_kg::NodeView<'_>) -> String {
   format!("{} {} {basename}", view.name, view.signature)
 }
 
-/// Coverage order (the stop rule): every non-Import definition that something
-/// references (referential in-degree ≥ 1), highest degree first, id ascending —
-/// deterministic for a generation, so a resumed fill continues the same prefix.
-/// Returns `(order, population)` with `population` = every non-Import definition.
-pub(crate) fn coverage_order(kg: &Kg) -> (Vec<u64>, usize) {
+/// The stop rule's population, split for the record.
+pub(crate) struct Eligible {
+  /// The coverage order: eligible ids, referential in-degree descending, id ascending.
+  pub order: Vec<u64>,
+  /// Non-Import definitions with referential in-degree ≥ 1.
+  pub referenced: usize,
+  /// Exported (public-API) definitions with no in-tree reference — eligible too:
+  /// they are exactly what users search for (cpython's `PyList_Append`).
+  pub exported_only: usize,
+  /// Every non-Import definition.
+  pub population: usize,
+}
+
+/// Coverage order (the stop rule, structural): every non-Import definition that
+/// something references (referential in-degree ≥ 1) OR that the graph marks
+/// exported, highest degree first, id ascending — so exported-but-unreferenced
+/// definitions (degree 0) follow every referenced one, in id order. Deterministic
+/// for a generation, so a resumed fill continues the same prefix.
+pub(crate) fn coverage_order(kg: &Kg) -> Eligible {
   let rows = crate::semantic_row_ids(kg);
   let population = rows.len();
-  let mut referenced: Vec<(usize, u64)> = rows
+  let mut referenced = 0usize;
+  let mut exported_only = 0usize;
+  let mut eligible: Vec<(usize, u64)> = rows
     .into_iter()
-    .map(|id| (kg.in_degree_referential(NodeId::new(id)), id))
-    .filter(|(degree, _)| *degree >= 1)
+    .filter_map(|id| {
+      let node = NodeId::new(id);
+      let degree = kg.in_degree_referential(node);
+      if degree >= 1 {
+        referenced += 1;
+        Some((degree, id))
+      } else if kg.node(node).is_some_and(|view| view.exported) {
+        exported_only += 1;
+        Some((0, id))
+      } else {
+        None
+      }
+    })
     .collect();
-  referenced.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-  (referenced.into_iter().map(|(_, id)| id).collect(), population)
+  eligible.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+  Eligible {
+    order: eligible.into_iter().map(|(_, id)| id).collect(),
+    referenced,
+    exported_only,
+    population,
+  }
 }
 
 /// Section offsets inside `ann.dense`, all 8-byte aligned.
@@ -587,14 +631,15 @@ pub(crate) fn fill(
 ) -> Result<DenseRecord, String> {
   let round_started = std::time::Instant::now();
   let dim = encoder.dim();
-  let (order, population) = coverage_order(kg);
+  let Eligible { order, referenced: referenced_count, exported_only, population } = coverage_order(kg);
+  // `referenced` below is the stop rule's whole population (referenced + exported-only).
   let referenced = order.len();
   let mut builder = SurfaceBuilder::new(dir, active_surface_recipe());
   let recipe = builder.recipe().label().to_string();
   // Resume: a coherent checkpoint on this stamp/model/recipe continues; anything
   // else (older format, other recipe, torn pair) starts over.
   let resumed = fresh_record(dir, stamp, encoder)
-    .filter(|record| record.surface == recipe && record.referenced == referenced)
+    .filter(|record| record.surface == recipe && record.eligible == referenced)
     .and_then(|record| read_rows(dir, stamp, dim, &order).map(|rows| (record, rows)));
   let (mut record, mut rows) = match resumed {
     Some((record, rows)) => (record, rows),
@@ -606,7 +651,9 @@ pub(crate) fn fill(
         surface: recipe.clone(),
         gemm_path: GemmPath::Throughput.label().to_string(),
         coverage: 0,
-        referenced,
+        eligible: referenced,
+        referenced: referenced_count,
+        exported_only,
         population,
         complete: referenced == 0,
         cap_secs: None,
@@ -621,7 +668,7 @@ pub(crate) fn fill(
     ),
   };
   vorpal_kg::phase_stamp(&format!(
-    "dense: referenced {referenced} of {population} definitions ({:.1}%), resuming at {} (recipe {recipe:?}{})",
+    "dense: eligible {referenced} of {population} definitions ({:.1}%: {referenced_count} referenced + {exported_only} exported-only), resuming at {} (recipe {recipe:?}{})",
     referenced as f64 * 100.0 / population.max(1) as f64,
     rows.len(),
     cap_secs.map_or(String::new(), |cap| format!(", cap {}", crate::duration::render_duration(cap))),
