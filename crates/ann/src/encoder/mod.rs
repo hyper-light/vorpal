@@ -22,15 +22,87 @@
 
 mod f16;
 mod forward;
+mod gemm_wgpu;
 mod safetensors;
 mod tokenizer;
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use forward::{LayerWeights, ModelWeights};
 pub use f16::{f16_bits_to_f32, f32_to_f16_bits};
 pub use forward::{GemmPath, l2_normalize, set_throughput_shards, throughput_shards};
+pub use gemm_wgpu::{GpuGemm, Tile, TransferReport};
 pub use safetensors::{convert_safetensors_f32_to_f16, safetensors_is_f16};
+
+/// The doc-side device ladder, chosen ONCE per model open (lazily, on the first
+/// doc-side use — the query-side rerank never pays for a GPU it does not use):
+/// `wgpu` compute (weights resident) → the platform sgemm (Accelerate on macOS,
+/// the fixed lanes elsewhere) → fixed-order lanes. Every rung produces
+/// embeddings inside the parity gate (cosine ≥ 0.9999 vs the fixed lanes, the
+/// gated oracles in `tests/encoder.rs`), so the sidecar's rows are admissible
+/// whichever rung built them — and its record names that rung
+/// ([`DocSideRung::label`], which also reflects a runtime retirement).
+/// `VORPAL_ENCODER_GPU=off` skips the GPU rung (operator escape hatch, stated
+/// as the refusal reason); `=software` additionally admits software adapters.
+pub struct DocSideRung {
+  gpu: Option<GpuGemm>,
+  refusal: Option<String>,
+}
+
+impl DocSideRung {
+  fn choose(encoder: &CodeEncoder) -> DocSideRung {
+    if std::env::var_os("VORPAL_ENCODER_GPU").is_some_and(|v| v == "off") {
+      return DocSideRung { gpu: None, refusal: Some("disabled by VORPAL_ENCODER_GPU=off".to_string()) };
+    }
+    match Self::open_gpu(encoder) {
+      Ok(gpu) => DocSideRung { gpu: Some(gpu), refusal: None },
+      Err(reason) => DocSideRung { gpu: None, refusal: Some(reason) },
+    }
+  }
+
+  /// Open the device and make every layer matrix resident (≈453 MB for
+  /// CodeRankEmbed — once per open, never per batch).
+  fn open_gpu(encoder: &CodeEncoder) -> Result<GpuGemm, String> {
+    encoder.open_gpu_with(None)
+  }
+
+  /// The GEMM path the fill should run under right now.
+  pub fn path(&self) -> GemmPath<'_> {
+    match &self.gpu {
+      Some(gpu) => GemmPath::Gpu(gpu),
+      None => GemmPath::Throughput,
+    }
+  }
+
+  /// The GPU handle when that rung was chosen (retired or not).
+  pub fn gpu(&self) -> Option<&GpuGemm> {
+    self.gpu.as_ref()
+  }
+
+  /// Why the GPU rung was not chosen, when it was not.
+  pub fn refusal(&self) -> Option<&str> {
+    self.refusal.as_deref()
+  }
+
+  /// Provenance label for the sidecar record — the device-qualified GPU label,
+  /// with `→<next rung> (<fault>)` appended once a runtime fault retired it, or
+  /// the CPU rung's label with the GPU refusal stated.
+  pub fn label(&self) -> String {
+    let cpu = GemmPath::Throughput.label();
+    match (&self.gpu, &self.refusal) {
+      (Some(gpu), _) => match gpu.fault() {
+        Some(fault) => format!("{}→{cpu} ({fault})", gpu.label()),
+        None => gpu.label().to_string(),
+      },
+      (None, Some(reason)) => format!("{cpu} (gpu: {reason})"),
+      (None, None) => cpu.to_string(),
+    }
+  }
+}
+
+/// One GEMM's shape: `(dim_in, weight [rows_out][dim_in], rows_out)`.
+pub type GemmShape<'a> = (usize, &'a [f32], usize);
 
 /// The task instruction the model card requires on every QUERY (verbatim;
 /// documents embed without it).
@@ -51,6 +123,8 @@ pub struct CodeEncoder {
   weights_path: PathBuf,
   /// See [`CodeEncoder::model_identity`].
   identity: u128,
+  /// The doc-side ladder, chosen on first use (see [`DocSideRung`]).
+  rung: OnceLock<DocSideRung>,
 }
 
 impl CodeEncoder {
@@ -142,6 +216,7 @@ impl CodeEncoder {
       max_positions,
       weights_path,
       identity,
+      rung: OnceLock::new(),
     };
     // Fail at open, not first embed: every tensor must exist with its exact shape.
     encoder.model_weights()?;
@@ -198,6 +273,50 @@ impl CodeEncoder {
 
   pub fn dim(&self) -> usize {
     self.dim
+  }
+
+  /// The doc-side device ladder for this open — chosen on the first call
+  /// (device open + weight residency, ≈ the model's size in bytes), then fixed
+  /// for the encoder's life. The sidecar fill's entry point.
+  pub fn doc_side_rung(&self) -> &DocSideRung {
+    self.rung.get_or_init(|| DocSideRung::choose(self))
+  }
+
+  /// A GPU rung for THIS model outside the ladder — the device opened (the
+  /// derived tile, or an explicit one: the bench sweep's seam) and every layer
+  /// matrix made resident. The gated GPU oracles and `sweep_encoder` use it;
+  /// the fill goes through [`CodeEncoder::doc_side_rung`].
+  pub fn open_gpu_with(&self, tile: Option<Tile>) -> Result<GpuGemm, String> {
+    let mut gpu = GpuGemm::open_with(&[self.dim, self.inner], tile)?;
+    let weights = self.model_weights()?;
+    for layer in &weights.layers {
+      for matrix in [layer.wqkv, layer.out_proj, layer.fc11, layer.fc12, layer.fc2] {
+        gpu.make_resident(matrix)?;
+      }
+    }
+    Ok(gpu)
+  }
+
+  /// The six GEMM shapes of one layer as `(dim_in, weight, rows_out)` — the
+  /// bench's dispatch-only ceiling walks them with the resident weights.
+  pub fn layer_gemm_shapes(&self, layer: usize) -> Result<Vec<GemmShape<'_>>, String> {
+    let weights = self.model_weights()?;
+    let layer = weights
+      .layers
+      .get(layer)
+      .ok_or_else(|| format!("encoder: layer {layer} of {}", weights.layers.len()))?;
+    Ok(vec![
+      (self.dim, layer.wqkv, 3 * self.dim),
+      (self.dim, layer.out_proj, self.dim),
+      (self.dim, layer.fc11, self.inner),
+      (self.dim, layer.fc12, self.inner),
+      (self.inner, layer.fc2, self.dim),
+    ])
+  }
+
+  /// Encoder depth (layers) — the bench scales one layer's shapes by it.
+  pub fn layers(&self) -> usize {
+    self.layers
   }
 
   /// Structural model identity (header table + length + config + tokenizer
@@ -274,7 +393,7 @@ impl CodeEncoder {
   /// doc-side sidecar's entry (module doc): same tokenization, same forward,
   /// only the six GEMMs' summation order differs — parity pinned by the gated
   /// oracle (cosine ≥ 0.9999 vs `FixedOrder` on the goldens).
-  pub fn embed_batch_with(&self, texts: &[&str], path: GemmPath) -> Result<Vec<Vec<f32>>, String> {
+  pub fn embed_batch_with(&self, texts: &[&str], path: GemmPath<'_>) -> Result<Vec<Vec<f32>>, String> {
     let sequences: Vec<Vec<u32>> = texts.iter().map(|text| self.clamped_ids(text)).collect();
     let borrowed: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
     let mut rows = forward::forward_batch_with(&self.model_weights()?, &borrowed, path)?;

@@ -15,12 +15,12 @@
 //! never waits on the fill (the warm runs in the daemon's warm thread or the
 //! detached autowarm child; the fill commits AFTER the core tiers' stamp).
 //!
-//! STOP RULE (structural): embed every non-Import definition something
-//! references (referential in-degree ≥ 1) OR that the graph marks exported —
-//! public API entry points with no in-tree caller are exactly what users search
-//! for (cpython's `PyList_Append`) — highest degree first, id ascending, so the
-//! exported-but-unreferenced definitions follow every referenced one. Private,
-//! unreferenced definitions are not embedded. The fill is RESUMABLE: it commits
+//! STOP RULE (structural, pinned by measurement — see [`CoverageRule`]): embed
+//! every non-Import definition something references (referential in-degree ≥ 1),
+//! highest degree first, id ascending; unreferenced definitions are not embedded.
+//! The "referenced OR exported" variant that would also cover public API entry
+//! points with no in-tree caller (cpython's `PyList_Append`) measured as the
+//! full-coverage regime in disguise and stays a bench-only sweep. The fill is RESUMABLE: it commits
 //! checkpoints (`ann.dense` + `ann.dense.json`, tmp + rename each) whenever the
 //! rows added since the last checkpoint reach the rows already committed
 //! (geometric doubling — total rewrite volume ≤ 2× the final file, no tunable
@@ -52,7 +52,7 @@ use std::io::Write;
 use std::path::Path;
 
 use vorpal_ann::dense::{RESCORE_OVERSAMPLE, quantize_row, rescore_f16, row_to_f16, scan_i8};
-use vorpal_ann::encoder::{CodeEncoder, GemmPath};
+use vorpal_ann::encoder::CodeEncoder;
 use vorpal_kg::{Kg, NodeId};
 
 pub(crate) const SIDECAR_FILE: &str = "ann.dense";
@@ -70,6 +70,8 @@ pub(crate) const BATCH_SEQUENCES: usize = 256;
 /// rides in `ann.dense.json` and the freshness gate demands it, so a recipe
 /// flip in code retrains every sidecar instead of serving mixed surfaces.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The richer recipes are selected only by the bench-internals sweep seam.
+#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
 pub(crate) enum SurfaceRecipe {
   /// `name signature basename` — the original rerank surface.
   Head,
@@ -127,6 +129,8 @@ pub(crate) fn active_surface_recipe() -> SurfaceRecipe {
 /// `bench-internals`. The record carries the label; a resume under a different rule
 /// starts over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The exported variant is selected only by the bench-internals sweep seam.
+#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
 pub(crate) enum CoverageRule {
   Referenced,
   ReferencedOrExported,
@@ -573,6 +577,9 @@ pub(crate) fn coverage_order(kg: &Kg, rule: CoverageRule) -> Eligible {
   }
 }
 
+/// The sidecar's four sections as typed slices: `(ids, scales, codes, halves)`.
+type Sections<'a> = (&'a [u64], &'a [f32], &'a [i8], &'a [u16]);
+
 /// Section offsets inside `ann.dense`, all 8-byte aligned.
 struct Layout {
   ids: usize,
@@ -686,6 +693,11 @@ pub(crate) fn fill(
 ) -> Result<DenseRecord, String> {
   let round_started = std::time::Instant::now();
   let dim = encoder.dim();
+  // The device ladder (GPU → platform sgemm → fixed lanes), chosen once per
+  // encoder open; `rung.label()` is re-read at every checkpoint so the record
+  // names the rung that built the rows — including a mid-fill retirement.
+  let rung = encoder.doc_side_rung();
+  vorpal_kg::phase_stamp(&format!("dense: GEMM rung {}", rung.label()));
   let rule = active_coverage_rule();
   let Eligible { order, referenced: referenced_count, exported_only, population } =
     coverage_order(kg, rule);
@@ -708,7 +720,7 @@ pub(crate) fn fill(
         model_identity: encoder.model_identity(),
         weights_digest: encoder.weights_content_digest()?,
         surface: recipe.clone(),
-        gemm_path: GemmPath::Throughput.label().to_string(),
+        gemm_path: rung.label(),
         coverage: 0,
         eligible: referenced,
         referenced: referenced_count,
@@ -737,6 +749,7 @@ pub(crate) fn fill(
   if rows.len() >= referenced {
     record.complete = true;
     record.cap_secs = cap_secs;
+    record.gemm_path = rung.label();
     checkpoint(dir, stamp, dim, &rows, &mut record)?;
     return Ok(record);
   }
@@ -775,7 +788,7 @@ pub(crate) fn fill(
         let builder = &mut builder;
         scope.spawn(move || prepare(builder, end))
       });
-      let embedded = encoder.embed_batch_with(&texts, GemmPath::Throughput);
+      let embedded = encoder.embed_batch_with(&texts, rung.path());
       let prepared = producer.map(|handle| handle.join());
       (embedded, prepared)
     });
@@ -830,6 +843,7 @@ pub(crate) fn fill(
     if exhausted || capped || due {
       record.complete = exhausted;
       record.cap_secs = if capped { cap_secs } else { None };
+      record.gemm_path = rung.label();
       let bytes = checkpoint(dir, stamp, dim, &rows, &mut record)?;
       committed = rows.len();
       vorpal_kg::phase_stamp(&format!(
@@ -884,8 +898,6 @@ pub(crate) fn is_fresh(dir: &Path, stamp: u64, encoder: &CodeEncoder) -> bool {
   fresh_record(dir, stamp, encoder).is_some()
 }
 
-/// The sidecar's four sections as typed views: `(ids, scales, codes, halves)`.
-type Sections<'a> = (&'a [u64], &'a [f32], &'a [i8], &'a [u16]);
 
 /// The mapped sidecar: sections viewed zero-copy from the mapping.
 pub(crate) struct DenseSidecar {
@@ -916,6 +928,8 @@ impl DenseSidecar {
     Some(DenseSidecar { store, n, dim, layout })
   }
 
+  /// Row count — read by the bench-internals probes.
+  #[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
   pub(crate) fn len(&self) -> usize {
     self.n
   }

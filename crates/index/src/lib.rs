@@ -3952,6 +3952,8 @@ const RRF_K: f32 = 60.0;
 /// the encoder is on at all. `VORPAL_RERANK_MODE=reorder|blend-pinned|blend` sweeps
 /// it under `bench-internals`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The non-default modes are selected only by the bench-internals sweep seam.
+#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
 enum RerankMode {
   Reorder,
   BlendPinned,
@@ -3991,6 +3993,8 @@ fn rerank_mode() -> RerankMode {
 /// `VORPAL_LEARNED_KIND_POLICY=all|exclude-macros|balance` sweeps it under
 /// `bench-internals`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The non-default policies are selected only by the bench-internals sweep seam.
+#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
 enum TrainKindPolicy {
   All,
   ExcludeMacros,

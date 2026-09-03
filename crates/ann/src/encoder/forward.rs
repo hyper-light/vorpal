@@ -35,9 +35,11 @@
 
 use rayon::prelude::*;
 
+use super::gemm_wgpu::GpuGemm;
+
 /// Which GEMM numerics a forward pass runs under (module doc, third pass).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GemmPath {
+#[derive(Clone, Copy, Debug)]
+pub enum GemmPath<'a> {
   /// Eight fixed f32 lanes, fixed reduction order — bit-stable at any thread
   /// count. The query-side rerank's law.
   FixedOrder,
@@ -47,21 +49,39 @@ pub enum GemmPath {
   /// sgemm is linked this is `FixedOrder` under another name
   /// ([`GemmPath::throughput_is_native`] says which).
   Throughput,
+  /// The six GEMMs on a `wgpu` compute device with the weights resident
+  /// (`gemm_wgpu.rs`) — the doc-side ladder's top rung, same admissibility and
+  /// parity bound as `Throughput`. A runtime fault degrades THAT call and every
+  /// later one to `Throughput` with the reason recorded on the handle.
+  Gpu(&'a GpuGemm),
 }
 
-impl GemmPath {
+impl PartialEq for GemmPath<'_> {
+  fn eq(&self, other: &Self) -> bool {
+    match (self, other) {
+      (GemmPath::FixedOrder, GemmPath::FixedOrder) | (GemmPath::Throughput, GemmPath::Throughput) => true,
+      (GemmPath::Gpu(a), GemmPath::Gpu(b)) => std::ptr::eq(*a, *b),
+      _ => false,
+    }
+  }
+}
+
+impl GemmPath<'_> {
   /// Whether `Throughput` actually dispatches to a platform sgemm on this build
   /// (macOS: Accelerate `cblas_sgemm`), or falls back to the fixed lanes.
   pub fn throughput_is_native() -> bool {
     cfg!(target_os = "macos")
   }
 
-  /// The path's provenance label — written into any sidecar built under it.
+  /// The path's provenance label — written into any sidecar built under it
+  /// (the GPU rung's device-qualified label comes from [`GpuGemm::label`];
+  /// this is its static family name).
   pub fn label(self) -> &'static str {
     match self {
       GemmPath::FixedOrder => "fixed-order",
       GemmPath::Throughput if Self::throughput_is_native() => "accelerate-sgemm",
       GemmPath::Throughput => "fixed-order",
+      GemmPath::Gpu(_) => "wgpu-compute",
     }
   }
 }
@@ -98,7 +118,7 @@ impl StageClock {
     out
   }
 
-  fn report(&self, path: GemmPath, tokens: usize) {
+  fn report(&self, path: GemmPath<'_>, tokens: usize) {
     if self.enabled {
       let total = self.gemm + self.attention + self.gate + self.norm + self.other;
       eprintln!(
@@ -123,6 +143,9 @@ impl StageClock {
 /// the largest single frame in the fill's profile. The fixed-order path keeps
 /// the f64 gate — its bits are the query-side law.
 #[inline]
+// The Cephes coefficients are quoted verbatim (their rounding IS the recorded
+// polynomial); clippy's nearest-constant / precision hints would change bits.
+#[allow(clippy::excessive_precision, clippy::approx_constant)]
 fn exp_fast(x: f32) -> f32 {
   // ln 2 split into an f32-exact high part (355/512) and a low remainder, the
   // Cephes reduction; the f32 literals below are the f32 roundings of Cephes'
@@ -232,7 +255,7 @@ const GEMM_LANES: usize = 8;
 /// raw pointers and 32-bit extents): a mismatch is a typed error, never a
 /// silent out-of-bounds read.
 fn gemm(
-  path: GemmPath,
+  path: GemmPath<'_>,
   x: &[f32],
   dim_in: usize,
   w: &[f32],
@@ -249,6 +272,15 @@ fn gemm(
   match path {
     GemmPath::FixedOrder => gemm_fixed_order(x, dim_in, w, rows_out, out),
     GemmPath::Throughput => gemm_throughput(x, dim_in, w, rows_out, rows, out)?,
+    // The ladder's runtime step: a GPU fault retires the rung (stated reason on
+    // the handle, surfaced by the sidecar record) and this GEMM — plus every
+    // later one — runs on the next rung. The fill never fails because of the GPU.
+    GemmPath::Gpu(gpu) => {
+      if let Err(reason) = gpu.gemm(x, dim_in, w, rows_out, rows, out) {
+        gpu.retire(reason);
+        gemm_throughput(x, dim_in, w, rows_out, rows, out)?;
+      }
+    }
   }
   Ok(())
 }
@@ -408,7 +440,7 @@ pub fn forward_batch(
 pub fn forward_batch_with(
   weights: &ModelWeights<'_>,
   sequences: &[&[u32]],
-  path: GemmPath,
+  path: GemmPath<'_>,
 ) -> Result<Vec<Vec<f32>>, String> {
   let (dim, heads) = (weights.dim, weights.heads);
   if dim == 0 || heads == 0 || dim % heads != 0 {
@@ -592,30 +624,43 @@ pub fn forward_batch_with(
     clock.time(|c| &mut c.norm, || {
       layer_norm(&mut x, dim, layer.norm1_weight, layer.norm1_bias, weights.layer_norm_eps)
     });
-    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc11, weights.inner, &mut mlp_y))?;
-    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc12, weights.inner, &mut mlp_gate))?;
-    // SwiGLU gate: f64 libm on the fixed-order path (the query-side law); the
-    // vectorizable f32 `exp_fast` on the throughput path (parity-oracle bound).
-    clock.time(|c| &mut c.gate, || {
-      mlp_y
-        .par_chunks_exact_mut(weights.inner)
-        .zip(mlp_gate.par_chunks_exact(weights.inner))
-        .for_each(|(y_row, gate_row)| match path {
-          GemmPath::FixedOrder => {
-            for (y, gate) in y_row.iter_mut().zip(gate_row) {
-              let g = *gate as f64;
-              *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
-            }
-          }
-          GemmPath::Throughput => {
-            for (y, gate) in y_row.iter_mut().zip(gate_row) {
-              let g = *gate;
-              *y *= g / (1.0 + exp_fast(-g));
-            }
-          }
-        })
+    // The GPU rung runs the whole MLP block fused on the device (fc11, fc12,
+    // gate, fc2 — the intermediates never cross the host boundary); a fault
+    // retires the rung and the block falls through to the per-GEMM form below,
+    // whose GEMMs then take the next rung.
+    let fused = clock.time(|c| &mut c.gemm, || match path {
+      GemmPath::Gpu(gpu) => gpu
+        .mlp(&x, dim, layer.fc11, layer.fc12, layer.fc2, weights.inner, total, &mut mlp_out)
+        .map_err(|reason| gpu.retire(reason))
+        .is_ok(),
+      GemmPath::FixedOrder | GemmPath::Throughput => false,
     });
-    clock.time(|c| &mut c.gemm, || gemm(path, &mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out))?;
+    if !fused {
+      clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc11, weights.inner, &mut mlp_y))?;
+      clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc12, weights.inner, &mut mlp_gate))?;
+      // SwiGLU gate: f64 libm on the fixed-order path (the query-side law); the
+      // vectorizable f32 `exp_fast` on the throughput path (parity-oracle bound).
+      clock.time(|c| &mut c.gate, || {
+        mlp_y
+          .par_chunks_exact_mut(weights.inner)
+          .zip(mlp_gate.par_chunks_exact(weights.inner))
+          .for_each(|(y_row, gate_row)| match path {
+            GemmPath::FixedOrder => {
+              for (y, gate) in y_row.iter_mut().zip(gate_row) {
+                let g = *gate as f64;
+                *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
+              }
+            }
+            GemmPath::Throughput | GemmPath::Gpu(_) => {
+              for (y, gate) in y_row.iter_mut().zip(gate_row) {
+                let g = *gate;
+                *y *= g / (1.0 + exp_fast(-g));
+              }
+            }
+          })
+      });
+      clock.time(|c| &mut c.gemm, || gemm(path, &mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out))?;
+    }
     clock.time(|c| &mut c.other, || residual_add(&mut x, &mlp_out));
     clock.time(|c| &mut c.norm, || {
       layer_norm(&mut x, dim, layer.norm2_weight, layer.norm2_bias, weights.layer_norm_eps)

@@ -17,4 +17,13 @@ serde_json = "1"
 unicode-normalization = "0.1"
 unicode-properties = "0.1"
 vorpal-mem.workspace = true
+# The ONE GPU path for the doc-side encoder fill (encoder/gemm_wgpu.rs): compute
+# shaders over Metal / Vulkan / DX12 through the OS driver alone — no vendor SDK,
+# nothing to install beside the binary. MIT OR Apache-2.0; rust-version 1.87 ≤
+# the workspace toolchain. Pinned exactly: the shader/pipeline contract is
+# version-specific and re-verified by the gated parity oracle. 30.0.0, not
+# 30.0.1: the patch release raised its (wasm32-only, optional) wasm-bindgen
+# floor to 0.2.127, which the workspace's `crates/wasm` pins at =0.2.126 and the
+# resolver unifies platform-independently.
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
