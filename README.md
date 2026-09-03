@@ -262,25 +262,43 @@ beyond the OS's), else on the platform's BLAS or the portable lanes, and the sea
 never depends on which built it (`VORPAL_ENCODER_GPU=off` forces the CPU rungs).
 
 Graded retrieval on three corpora with the bundled labelled query sets
-(`xtask/labels/`, graded relevance 1–3; metrics NDCG@10 / MRR / recall@5, exact
-determinism gate on every run; `cargo xtask searcheval`):
+(`xtask/labels/`: 54 / 54 / 55 queries, six classes from exact name to paraphrase,
+every grade backed by a cited source line in the `.evidence.md` sidecars; graded
+relevance 1–3; metrics NDCG@10 / MRR / recall@5, exact determinism gate on every run;
+`cargo xtask searcheval`):
 
 | Corpus (queries) | Lexical (default) | + learned tier | + encoder (f16 ≈ f32) |
 |---|---:|---:|---:|
-| Linux kernel, 8.9 M defs (8) | 0.299 / 0.375 / 0.229 | **0.313 / 0.346 / 0.250** | 0.222 / 0.294 / 0.208 |
-| CPython, 163 K defs (6) | 0.137 / 0.208 / 0.250 | **0.412 / 0.528 / 0.333**¹ | **0.410 / 0.556 / 0.500** |
-| This repo, 79 K defs (10) | 0.571 / 0.560 / 0.550 | 0.612 / 0.614 / 0.550 | **0.622 / 0.625 / 0.650** |
+| Linux kernel, 8.9 M defs (54) | 0.299 / 0.307 / 0.302 | **0.313 / 0.303 / 0.361** | 0.289 / 0.289 / 0.309 |
+| CPython, 163 K defs (54) | 0.307 / 0.292 / 0.333 | 0.340 / 0.320 / 0.389¹ | **0.350 / 0.330 / 0.426** |
+| This repo, 79 K defs (55) | 0.400 / 0.394 / 0.400 | 0.450 / 0.443 / 0.536 | **0.461 / 0.453 / 0.527** |
 
-The tiers are **per-corpus decisions, not upgrades**: the learned tier triples
-CPython's descriptive-query quality (NDCG 0.036 → 0.475 on "bytecode evaluation loop"-
-style questions) and edges past lexical on the kernel and this repo — it trains on
-every kind of definition balanced to the callable population, so the kernel's 5.9 M
-macros no longer drown its 1 M functions; the
-encoder lifts recall@5 to 0.50 on CPython and 0.65 on this repo but *lowers* the
-kernel's short-keyword class, whose answers live in subword identifiers the encoder
-re-orders. That is exactly what `vorpal tune` measures on your own queries before it
-writes anything — it enables a tier only when the mean strictly improves and
-wins ≥ losses, never on a tie.
+The tiers are **per-corpus decisions, not upgrades**: the learned tier beats the
+lexical tier on every corpus (mostly as recall — kernel recall@5 0.30 → 0.36) because
+it trains on every kind of definition balanced to the callable population, so the
+kernel's 5.9 M macros no longer drown its 1 M functions; the encoder adds recall on
+CPython and this repo but *lowers* the kernel's short-keyword class (0.276 → 0.216),
+whose answers live in subword identifiers the encoder re-orders. That is exactly what
+`vorpal tune` measures on your own queries before it writes anything — it enables a
+tier only when the mean strictly improves and wins ≥ losses, never on a tie.
+
+Two honest reads of the same table: on the kernel the *descriptive* class is 0.07 on
+every tier (12 of 13 answers never enter the top-25 — a candidate-generation gap, not
+a ranking one), and *paraphrase* queries score 0.0 on every corpus and tier (28
+queries): nothing in the stack reads doc comments unless the doc-side dense sidecar
+is filled. Earlier README numbers were measured on 8 / 6 / 10 queries and were
+flattered by single answers; the sets that replaced them are the ones any future
+claim is measured against.
+
+**The dense sidecar** (since 0.7.0): with the encoder enabled, every index also embeds
+its *referenced* definitions in the background after the core tiers commit — resumable
+across warms, never blocking a search — and fuses them as a fifth ranked list. It turns
+the encoder from a reranker that can only reorder what the lexical channels found into
+a candidate generator: on the kernel it places `alloc_skb` / `request_irq` /
+`mutex_lock` from under 1 % coverage, and it is the only mechanism that can surface a
+paraphrase target. `--dense-budget-timeout 5m30s` caps a fill round;
+`<index>/dense.channel = off` opts out. The tables above are measured with the
+sidecar absent, so they are the floor every index starts from.
 
 ¹ The learned warm also runs a per-corpus BM25 gate (paired probes, enabled only on
 strong evidence); it enabled itself on CPython, not on the kernel or this repo.

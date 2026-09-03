@@ -3028,15 +3028,17 @@ Linux kernel (`--root /path/to/linux`):
 |---|---|---|---|---|---|---|---|---|
 | lexical | old (8) | — | 0.947/1.000/1.000 | — | — | 0.206/0.286/0.119 | — | 0.299/0.375/0.229 |
 | lexical | new (54) | 0.250/0.282/0.250 | 0.073/0.077/0.077 | 0.891/0.854/1.000 | 0/0/0 | 0.250/0.308/0.141 | 0.544/0.520/0.643 | **0.299/0.307/0.302** |
-| learned | old (8) | — | 0.905/1.000/1.000 | — | — | 0.125/0.193/0.095 | — | 0.222/0.294/0.208 |
+| learned | old (8) | — | 0.947/1.000/1.000 | — | — | 0.222/0.253/0.143 | — | 0.313/0.346/0.250 |
 | learned | new (54) | 0.339/0.300/0.500 | 0.073/0.077/0.077 | 0.908/0.875/1.000 | 0/0/0 | 0.276/0.271/0.308 | 0.536/0.519/0.643 | **0.313/0.303/0.361** |
-| learned + f32 | old (8) | — | 0.947/1.000/1.000 | — | — | 0.222/0.253/0.143 | — | 0.313/0.346/0.250 |
+| learned + f32 | old (8) | — | 0.905/1.000/1.000 | — | — | 0.125/0.193/0.095 | — | 0.222/0.294/0.208 |
 | learned + f32 | new (54) | 0.395/0.375/0.500 | 0.070/0.077/0.077 | 0.908/0.875/1.000 | 0/0/0 | 0.216/0.245/0.205 | 0.438/0.416/0.429 | **0.289/0.289/0.309** |
 
 (The kernel old-set learned rows come out REVERSED from the README pin on this build —
 learned 0.222 / + f32 0.313 where the README records 0.313 / 0.222; latency proves which
 run carried the encoder (60 ms vs 1.3 s mean). Eight queries flip on one rank; the
 54-query set gives learned 0.313 > lexical 0.299 > + f32 0.289, the README's ordering.)
+
+> Correction (coordinator, same day): the kernel `old (8)` learned and learned + f32 rows above were swapped in the first draft; the coordinator's independent repro on the same binary (learned 0.313 at 0.11 s/query, + f32 rerank 0.222 at 1.85 s/query — the latency proves which run carried the encoder) matches the README pin, and the rows now read that way.
 
 ### Reading
 
