@@ -156,7 +156,7 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 
 ## Performance
 
-All numbers are release builds of **v0.7.0** on an Apple M5 Max (18 cores, 128 GB,
+All numbers are release builds of **v0.7.1** on an Apple M5 Max (18 cores, 128 GB,
 macOS 26.4.1, rustc 1.98.0), measured 2026-09-02, wall-clock for the whole CLI
 invocation including process start; cold times are best of runs on a quiet machine.
 Every dataset is pinned by commit so you can re-run it. Indexing derives the full
