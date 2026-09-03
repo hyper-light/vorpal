@@ -2475,6 +2475,39 @@ curve above, not the pass, decides that; with the always-on rule the kernel chan
 needs the size-aware fusion weight or coverage cap recorded there. Cores busy during a
 fill: ~14 of 18 (from 3.5), at the measured AMX ceiling.
 
+### Stop rule extended: referenced OR exported (2026-09-02, final)
+
+Owner decision after the cpython finding: eligible = referential in-degree ≥ 1 OR
+`exported` (a structural flag the graph carries on every definition; no constant).
+Order stays in-degree descending, id ascending — exported-but-unreferenced definitions
+(degree 0) follow every referenced one, in id order.
+
+Operational datum from the re-setup: with the channel always on, a plain `__warm-ann`
+of the kernel (no cap) proceeds from the tier commit straight into the fill; the harness's
+1 h task limit killed it ~55 min in at **checkpoint 9 = 262,144 rows**, and that checkpoint
+stayed servable (the resume design under a kill). The daemon's warm thread and the
+detached autowarm are where that hour belongs; `--dense-budget-timeout` / `dense.budget`
+bound it where it does not.
+
+| corpus | definitions | referenced | exported-only | eligible (rule) | fill (complete unless noted) | tok/s | bytes | RSS | searcheval ON + rerank | referenced-only row | full-coverage row |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| vorpal | 74,559 | 11,660 | 55,687 | **67,347 (90.3%)** | 206.6 s | 7,910 | 156 MB | 1.49 GB | 0.648 / 0.625 / 0.750 | 0.705 / 0.700 / 0.750 | 0.685 / 0.675 / 0.750 |
+| cpython | 145,367 | 35,292 | 96,686 | **131,978 (90.8%)** | 481.9 s | 7,654 | 306 MB | 1.65 GB | 0.408 / 0.436 / 0.417 | 0.396 / 0.423 / 0.333 | 0.426 / 0.565 / 0.417 |
+| kernel | 8,481,757 | 716,721 | 7,245,875 | **7,962,596 (93.9%)** | 10 m round → 143,104 rows; full ≈ 7.96 M × 35 / 8,400 ≈ **9.2 h** (extrapolated) | 8,327 (8,552 in the 3 m resume round → 183,296) | 331 MB at 143 K | 3.29 GB | 0.308 at 143 K; **0.223 / 0.243 / 0.167 at 183 K** | 0.308 (129 K) | 0.345 (24 K) |
+
+Foreground searches during these fills: 1.07 / 0.79 / 1.11 s (served). What the rule did:
+in these graphs `exported` is nearly everything — every non-`static` C symbol on the
+kernel (94% eligible), every `pub` item plus the vendored grammar tables here (90%),
+90.8% of cpython — so "referenced OR exported" is, on two of three corpora, the
+full-coverage regime with its distractors back: vorpal 0.705 → 0.648, the kernel's
+183 K-row checkpoint 0.223 (below the no-encoder 0.313 by a wide margin, on the same
+coverage curve recorded above). cpython does recover the case that motivated the change
+(`PyList_Append` is exported: dense#8, fused#10 → #7; `list_append` is a `static` helper
+and stays out), 0.396 → 0.408 — still under its 0.426 full-coverage row. Net: the
+exported flag is too coarse to be the stop rule's second clause as these graphs set it;
+a stricter notion (exported AND named from outside the file / at API depth) or the
+referenced-only rule with a per-corpus cap is the follow-up — recorded, not taken.
+
 Reproduction: `VORPAL_CODERANK_DIR=<model> cargo run --release -p vorpal-index
 --features bench-internals --example sweep_encoder -- <index> 26 256 1024` (Stage A);
 `vorpal-index __warm-ann <idx>` (always-on fill; `--dense-budget-timeout 10m` caps a
