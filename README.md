@@ -174,7 +174,7 @@ The flagship tree, end to end:
 
 | Linux kernel @ `1590cf032971` (75,954 tracked files, ~30 M LOC) | |
 |---|---|
-| Cold index → **8,890,840 nodes** | **8.2 s** |
+| Cold index → **8,891,771 nodes** | **8.2 s** |
 | Edit one file, re-index | **0.5 s** |
 | `touch` one file (content unchanged) | 0.5 s |
 | Nothing changed | **0.13 s** |
