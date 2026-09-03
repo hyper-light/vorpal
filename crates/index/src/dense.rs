@@ -1,6 +1,6 @@
 //! The doc-side dense channel sidecar (ENCODER_RESEARCH §8.2, option 2): at warm
 //! time the vendored CodeRankEmbed encoder embeds definition SURFACES (the
-//! rerank's exact recipe — [`surface_of`]) through the throughput GEMM path and
+//! sidecar's recipe of the [`SurfacePair`]) through the throughput GEMM path and
 //! persists them as int8 codes + per-row scale + f16 rows keyed by node id
 //! (`ann.dense`), with provenance beside them (`ann.dense.json`). At query time
 //! the fixed-order query embedding — computed ONCE and shared with the rerank —
@@ -8,6 +8,12 @@
 //! (`vorpal_ann::dense`), producing the FIFTH fused RRF list: the only channel
 //! that can surface a paraphrase target the lexical/learned channels never
 //! score (the coordinator's framing fact 1).
+//!
+//! TWO-FIELD SURFACES (2026-09-03, replacing the one-recipe law): the sidecar and
+//! the query-time rerank present DIFFERENT text to the encoder — see
+//! [`SurfacePair`]. The record carries both labels (`surface` = the sidecar's,
+//! `rerank_surface` = the rerank's); freshness demands both, so a flip of either
+//! in code retrains instead of serving a mismatched pair.
 //!
 //! ALWAYS ON, FILLED IN THE BACKGROUND (owner decision 2026-09-02): the channel
 //! needs no gate, budget or per-index verdict — a fresh sidecar is served at
@@ -25,7 +31,7 @@
 //! rows added since the last checkpoint reach the rows already committed
 //! (geometric doubling — total rewrite volume ≤ 2× the final file, no tunable
 //! interval; the first lands after the two rate-probe batches), and a later warm
-//! on the same stamp / model / recipe continues at the recorded coverage. A new
+//! on the same stamp / model / recipe pair continues at the recorded coverage. A new
 //! generation rebuilds (cross-generation carry is a recorded lead). An explicit
 //! cap (`--dense-budget-timeout`, `<root>/dense.budget`; human durations) ends a
 //! round early; `<root>/dense.channel = off` turns the channel off.
@@ -40,7 +46,7 @@
 //! merge order, so a given sidecar answers identically at any thread count; its
 //! COVERAGE at a given moment depends on how long the fill has run — recorded in
 //! the provenance. Freshness retrains on any stamp, model-identity,
-//! surface-recipe, or format change.
+//! surface-pair (either label), or format change.
 //!
 //! Every problem here is a stated degradation: an unreadable or stale sidecar
 //! simply leaves the channel out (the fusion serves its four lists) — never a
@@ -64,13 +70,17 @@ const HEADER_BYTES: usize = 32;
 /// Sequences per forward batch (module doc: the recorded sweep's saturation point).
 pub(crate) const BATCH_SEQUENCES: usize = 256;
 
-/// What text a definition presents to the encoder — ONE recipe for the sidecar
-/// build and the query-time rerank (the one-recipe law: the rerank scores
-/// candidates against the same surface the sidecar ranked them by). The label
-/// rides in `ann.dense.json` and the freshness gate demands it, so a recipe
-/// flip in code retrains every sidecar instead of serving mixed surfaces.
+/// What text a definition presents to the encoder. Two consumers, two fields
+/// ([`SurfacePair`]): the sidecar build embeds every covered definition once at
+/// warm time (doc-side, on the throughput rung — a richer surface costs only the
+/// background fill), while the query-time rerank re-encodes the fused pool's
+/// cache-missed candidates on every query (query-side, on the fixed lanes — a
+/// richer surface there multiplies query latency AND dilutes the exact-name
+/// evidence the rerank exists to arbitrate; measured in BENCHMARKS
+/// "Surface-recipe A/B"). Each label rides in `ann.dense.json` and the freshness
+/// gate demands both.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-// The richer recipes are selected only by the bench-internals sweep seam.
+// The unpinned recipes are selected only by the bench-internals sweep seam.
 #[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
 pub(crate) enum SurfaceRecipe {
   /// `name signature basename` — the original rerank surface.
@@ -97,24 +107,55 @@ impl SurfaceRecipe {
   fn reads_source(self) -> bool {
     !matches!(self, SurfaceRecipe::Head)
   }
+
+  /// The sweep seam's spelling of a recipe (`head` | `doc` | `body`).
+  #[cfg(feature = "bench-internals")]
+  fn parse(value: &str) -> Option<SurfaceRecipe> {
+    match value {
+      "head" => Some(SurfaceRecipe::Head),
+      "doc" => Some(SurfaceRecipe::HeadDoc),
+      "body" => Some(SurfaceRecipe::HeadDocBody),
+      _ => None,
+    }
+  }
 }
 
-/// The PINNED recipe (`Head`, the measured 2026-09-02 baseline) — the richer
-/// recipes are the A/B this module records. `VORPAL_SURFACE_RECIPE=head|doc|body`
-/// sweeps it under `bench-internals` only.
-const ACTIVE_SURFACE: SurfaceRecipe = SurfaceRecipe::Head;
+/// The two surface fields: what the SIDECAR embeds per covered definition and
+/// what the RERANK re-encodes per candidate. The measured pin (BENCHMARKS
+/// "Two-field surfaces", 2026-09-03; 55 / 54 / 54-query sets) is the rich
+/// `HeadDocBody` sidecar over the `Head` rerank: the sidecar's 4–5× tokens are
+/// paid once, doc-side, on the throughput rung; the query path encodes the same
+/// head surfaces as v0.7.0 (latency indistinguishable run to run, the exact-name
+/// evidence intact — the one-recipe rich pair cost 3.3–5.9 s/query and 0.017
+/// all-NDCG on this repo). Against head/head the pair is a wash on the shipping
+/// configuration's all-NDCG (vorpal +0.006, cpython −0.007, kernel −0.003 at
+/// matched coverage), +0.006 to +0.021 channel-only on all three corpora, and
+/// the only pair with paraphrase answers inside the dense top-100 in numbers
+/// (3 → 11 of 28) and inside the fused top-25 at all (0 → 3): the evidence the
+/// fusion's single-list ceiling (see [`DENSE_DEPTH_FACTOR`]) currently caps.
+/// Cost stated: a capped kernel round covers ~4× fewer rows under this pair.
+/// `VORPAL_SURFACE_RECIPE=<sidecar>/<rerank>` (`body/head`, `head/head`,
+/// `body/body`; a bare `<recipe>` sets both — the one-recipe sweep) selects
+/// another pair under `bench-internals` only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SurfacePair {
+  pub sidecar: SurfaceRecipe,
+  pub rerank: SurfaceRecipe,
+}
 
-pub(crate) fn active_surface_recipe() -> SurfaceRecipe {
+const ACTIVE_SURFACES: SurfacePair =
+  SurfacePair { sidecar: SurfaceRecipe::HeadDocBody, rerank: SurfaceRecipe::Head };
+
+pub(crate) fn active_surface_pair() -> SurfacePair {
   #[cfg(feature = "bench-internals")]
   if let Ok(value) = std::env::var("VORPAL_SURFACE_RECIPE") {
-    return match value.as_str() {
-      "head" => SurfaceRecipe::Head,
-      "doc" => SurfaceRecipe::HeadDoc,
-      "body" => SurfaceRecipe::HeadDocBody,
-      _ => ACTIVE_SURFACE,
+    let (sidecar, rerank) = value.split_once('/').unwrap_or((value.as_str(), value.as_str()));
+    return match (SurfaceRecipe::parse(sidecar), SurfaceRecipe::parse(rerank)) {
+      (Some(sidecar), Some(rerank)) => SurfacePair { sidecar, rerank },
+      _ => ACTIVE_SURFACES,
     };
   }
-  ACTIVE_SURFACE
+  ACTIVE_SURFACES
 }
 
 /// Which definitions the always-on fill embeds (the stop rule). Both are structural
@@ -410,7 +451,13 @@ pub(crate) struct DenseRecord {
   pub stamp: u64,
   pub model_identity: u128,
   pub weights_digest: u128,
+  /// The sidecar's surface recipe label — what every covered row embeds.
   pub surface: String,
+  /// The rerank's surface recipe label — what the query-time rerank re-encodes
+  /// per candidate. Distinct from `surface` under the two-field law; a record
+  /// written before the field existed built under the one-recipe law, so it
+  /// reads back equal to `surface`.
+  pub rerank_surface: String,
   pub gemm_path: String,
   /// Rows committed — a prefix of the coverage order.
   pub coverage: usize,
@@ -456,11 +503,15 @@ pub(crate) fn read_record(dir: &Path) -> Option<DenseRecord> {
   // SERVABLE (same rows, same freshness keys) and the next fill starts over
   // because their `eligible` cannot match the stop rule's count.
   let referenced = u64_of("referenced").map_or(population, |n| n as usize);
+  let surface = str_of("surface")?;
+  // Pre-two-field records built under the one-recipe law: rerank = sidecar.
+  let rerank_surface = str_of("rerank_surface").unwrap_or_else(|| surface.clone());
   Some(DenseRecord {
     stamp: u64_of("stamp")?,
     model_identity: hex_of("model_identity")?,
     weights_digest: hex_of("weights_digest")?,
-    surface: str_of("surface")?,
+    surface,
+    rerank_surface,
     gemm_path: str_of("gemm_path")?,
     coverage,
     eligible: u64_of("eligible").map_or(referenced, |n| n as usize),
@@ -496,6 +547,7 @@ pub(crate) fn write_record(dir: &Path, record: &DenseRecord) -> std::io::Result<
   fields.insert("model_identity", format!("{:032x}", record.model_identity).into());
   fields.insert("weights_digest", format!("{:032x}", record.weights_digest).into());
   fields.insert("surface", record.surface.clone().into());
+  fields.insert("rerank_surface", record.rerank_surface.clone().into());
   fields.insert("gemm_path", record.gemm_path.clone().into());
   fields.insert("coverage", (record.coverage as u64).into());
   fields.insert("eligible", (record.eligible as u64).into());
@@ -521,7 +573,8 @@ pub(crate) fn write_record(dir: &Path, record: &DenseRecord) -> std::io::Result<
   fs::rename(tmp, dir.join(RECORD_FILE))
 }
 
-/// The ONE surface recipe shared by the sidecar build and the query-time rerank.
+/// The head surface (`SurfaceRecipe::Head`): name, signature, basename — the
+/// rerank's pinned field and the base every richer recipe extends.
 pub(crate) fn surface_of(view: &vorpal_kg::NodeView<'_>) -> String {
   let basename = view.path.rsplit('/').next().unwrap_or(view.path);
   format!("{} {} {basename}", view.name, view.signature)
@@ -703,14 +756,14 @@ pub(crate) fn fill(
     coverage_order(kg, rule);
   // `referenced` below is the stop rule's whole population under `rule`.
   let referenced = order.len();
-  let mut builder = SurfaceBuilder::new(dir, active_surface_recipe());
+  let surfaces = active_surface_pair();
+  let mut builder = SurfaceBuilder::new(dir, surfaces.sidecar);
   let recipe = builder.recipe().label().to_string();
-  // Resume: a coherent checkpoint on this stamp/model/recipe/rule continues; anything
-  // else (older format, other recipe or rule, torn pair) starts over.
+  // Resume: a coherent checkpoint on this stamp/model/recipe-pair/rule continues
+  // (`fresh_record` demands both surface labels); anything else (older format,
+  // other recipe or rule, torn pair) starts over.
   let resumed = fresh_record(dir, stamp, encoder)
-    .filter(|record| {
-      record.surface == recipe && record.coverage_rule == rule.label() && record.eligible == referenced
-    })
+    .filter(|record| record.coverage_rule == rule.label() && record.eligible == referenced)
     .and_then(|record| read_rows(dir, stamp, dim, &order).map(|rows| (record, rows)));
   let (mut record, mut rows) = match resumed {
     Some((record, rows)) => (record, rows),
@@ -720,6 +773,7 @@ pub(crate) fn fill(
         model_identity: encoder.model_identity(),
         weights_digest: encoder.weights_content_digest()?,
         surface: recipe.clone(),
+        rerank_surface: surfaces.rerank.label().to_string(),
         gemm_path: rung.label(),
         coverage: 0,
         eligible: referenced,
@@ -740,10 +794,11 @@ pub(crate) fn fill(
     ),
   };
   vorpal_kg::phase_stamp(&format!(
-    "dense: eligible {referenced} of {population} definitions ({:.1}%: {referenced_count} referenced + {exported_only} exported-only; rule {}), resuming at {} (recipe {recipe:?}{})",
+    "dense: eligible {referenced} of {population} definitions ({:.1}%: {referenced_count} referenced + {exported_only} exported-only; rule {}), resuming at {} (sidecar recipe {recipe:?}, rerank recipe {:?}{})",
     referenced as f64 * 100.0 / population.max(1) as f64,
     rule.label(),
     rows.len(),
+    surfaces.rerank.label(),
     cap_secs.map_or(String::new(), |cap| format!(", cap {}", crate::duration::render_duration(cap))),
   ));
   if rows.len() >= referenced {
@@ -880,19 +935,42 @@ fn peek_header(path: &Path, stamp: u64) -> Option<(usize, usize)> {
 }
 
 /// The record when the sidecar on disk is coherent for this generation, encoder
-/// and recipe (stamp, model identity, recipe label, header row count = record
-/// coverage, dim) — servable as-is at whatever coverage it holds, and resumable.
+/// and surface pair (stamp, model identity, BOTH recipe labels, header row count
+/// = record coverage, dim) — servable as-is at whatever coverage it holds, and
+/// resumable. A record whose rerank label differs from the active pair's is
+/// stale even though its rows would be identical: the pair is the sidecar's
+/// identity, so a rerank-recipe flip in code retrains rather than serving a
+/// pair nobody measured.
 pub(crate) fn fresh_record(dir: &Path, stamp: u64, encoder: &CodeEncoder) -> Option<DenseRecord> {
   let record = read_record(dir)?;
   let (n, dim) = peek_header(&dir.join(SIDECAR_FILE), stamp)?;
+  let surfaces = active_surface_pair();
   (record.stamp == stamp
     && record.model_identity == encoder.model_identity()
-    && record.surface == active_surface_recipe().label()
+    && record.surface == surfaces.sidecar.label()
+    && record.rerank_surface == surfaces.rerank.label()
     && record.coverage == n
     && dim == encoder.dim())
   .then_some(record)
 }
 
+
+/// How many dense rows the fusion's dense list carries, as a multiple of the
+/// fusion pool — the candidate-generation lever measured in BENCHMARKS "Two-field
+/// surfaces" (2026-09-03) and PINNED at the pool itself. Why depth cannot lift a
+/// paraphrase answer on its own (the RRF bound, stated so the pin is not a guess):
+/// the fusion truncates to the requested k before the rerank, every list is ≥ k
+/// long, and a candidate only the dense list carries at rank r holds
+/// `1/(K + r)` of fused mass while the k-th fused hit holds ≥ `1/(K + k − 1)` —
+/// so r ≤ k − 1 is necessary, whatever the list's length. Rows beyond the pool
+/// reach the fused top-k only through candidates another list ALSO carries,
+/// which the sweep measured as a wash (vorpal / cpython, factors 1–4 and the
+/// coverage-share projection). `VORPAL_DENSE_DEPTH=<factor>|share` re-selects a
+/// sweep point under `bench-internals`: `<factor>` × pool, or `share` = pool ×
+/// ⌈population / covered rows⌉ — the depth at which the dense list, scanning
+/// only the covered share of the definition population, spends as many slots
+/// per definition as the full-population lists spend with `pool`.
+const DENSE_DEPTH_FACTOR: usize = 1;
 
 /// The mapped sidecar: sections viewed zero-copy from the mapping.
 pub(crate) struct DenseSidecar {
@@ -900,6 +978,9 @@ pub(crate) struct DenseSidecar {
   n: usize,
   dim: usize,
   layout: Layout,
+  /// The record's definition population (the `share` sweep point's numerator).
+  #[cfg(feature = "bench-internals")]
+  population: usize,
 }
 
 impl DenseSidecar {
@@ -920,13 +1001,35 @@ impl DenseSidecar {
     if store.as_bytes().len() < layout.end {
       return None;
     }
-    Some(DenseSidecar { store, n, dim, layout })
+    Some(DenseSidecar {
+      store,
+      n,
+      dim,
+      layout,
+      #[cfg(feature = "bench-internals")]
+      population: read_record(dir).map_or(n, |record| record.population),
+    })
   }
 
   /// Row count — read by the bench-internals probes.
   #[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
   pub(crate) fn len(&self) -> usize {
     self.n
+  }
+
+  /// The dense list's length for a fusion pool of `pool` rows — see
+  /// [`DENSE_DEPTH_FACTOR`].
+  pub(crate) fn depth(&self, pool: usize) -> usize {
+    #[cfg(feature = "bench-internals")]
+    if let Ok(value) = std::env::var("VORPAL_DENSE_DEPTH") {
+      if value == "share" {
+        return pool.saturating_mul(self.population.div_ceil(self.n.max(1)));
+      }
+      if let Ok(factor) = value.parse::<usize>() {
+        return pool.saturating_mul(factor);
+      }
+    }
+    pool.saturating_mul(DENSE_DEPTH_FACTOR)
   }
 
   /// The four sections as typed slices — `None` if the mapping is misaligned.
@@ -984,6 +1087,55 @@ impl DenseSidecar {
       .into_iter()
       .map(|(row, cosine)| (ids[row], cosine))
       .collect()
+  }
+}
+
+#[cfg(test)]
+mod record_tests {
+  use super::{DenseRecord, SurfaceRecipe, read_record, write_record};
+
+  fn record(surface: &str, rerank_surface: &str) -> DenseRecord {
+    DenseRecord {
+      stamp: 7,
+      model_identity: 1,
+      weights_digest: 2,
+      surface: surface.to_string(),
+      rerank_surface: rerank_surface.to_string(),
+      gemm_path: "fixed-order".to_string(),
+      coverage: 3,
+      eligible: 4,
+      referenced: 4,
+      exported_only: 0,
+      coverage_rule: "referenced".to_string(),
+      population: 10,
+      complete: false,
+      cap_secs: None,
+      measured_s_per_token: 0.5,
+      covered_tokens: 60,
+      surface_fallbacks: 1,
+      surface_truncations: 0,
+      fill_secs: 1.5,
+      checkpoints: 1,
+    }
+  }
+
+  #[test]
+  fn both_surface_labels_round_trip_and_a_pre_two_field_record_reads_one_recipe() {
+    let dir = std::env::temp_dir().join(format!("vorpal-dense-record-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let written = record(SurfaceRecipe::HeadDocBody.label(), SurfaceRecipe::Head.label());
+    write_record(&dir, &written).unwrap();
+    let read = read_record(&dir).unwrap();
+    assert_eq!(read.surface, SurfaceRecipe::HeadDocBody.label());
+    assert_eq!(read.rerank_surface, SurfaceRecipe::Head.label());
+    // A record without the field (the one-recipe era) reads rerank = sidecar.
+    let text = std::fs::read_to_string(dir.join(super::RECORD_FILE)).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value.as_object_mut().unwrap().remove("rerank_surface");
+    std::fs::write(dir.join(super::RECORD_FILE), value.to_string()).unwrap();
+    let legacy = read_record(&dir).unwrap();
+    assert_eq!(legacy.rerank_surface, legacy.surface);
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 }
 

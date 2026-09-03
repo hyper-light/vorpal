@@ -5348,12 +5348,15 @@ impl Searcher {
         }
       }
     }
-    // Candidate surfaces under the ACTIVE recipe — the same builder the sidecar
-    // used (one-recipe law); richer recipes read the candidates' source here
-    // (digest-verified; a changed file falls back to the head recipe).
+    // Candidate surfaces under the RERANK field of the surface pair (two-field
+    // law, `dense::SurfacePair`): the pinned head recipe, so the rerank's
+    // per-query encode cost and its exact-name evidence stay the shipped ones
+    // whatever the sidecar embeds; the sweep's richer rerank recipes read the
+    // candidates' source here (digest-verified; a changed file falls back to head).
     let mut miss_ids: Vec<u64> = Vec::new();
     let mut miss_surfaces: Vec<String> = Vec::new();
-    let mut builder = dense::SurfaceBuilder::new(&self.generation_dir, dense::active_surface_recipe());
+    let mut builder =
+      dense::SurfaceBuilder::new(&self.generation_dir, dense::active_surface_pair().rerank);
     for &id in &tail_ids {
       if rows.contains_key(&id) {
         continue;
@@ -5885,10 +5888,15 @@ impl Searcher {
 
   // The dense channel (`dense.rs`): int8 scan + f16 rescore over the sidecar's
   // covered definitions, filtered BEFORE ranking (exact, no overfetch slack).
+  // The list's LENGTH is the sidecar's derived depth (`DenseSidecar::depth`, the
+  // two-field surfaces' depth seam); the fusion LAW then admits from that scored
+  // list against the fusion pool (`admit_dense`, the size-aware fusion seam) —
+  // both pinned at their measured defaults (depth factor 1, `Flat`), under which
+  // this composes to the shipped fifth list.
   let law = dense_fusion();
   let dense = match (dense_query, &self.dense) {
     (Some(query_vec), Some(sidecar)) => {
-      let scored = sidecar.search_scored(query_vec, pool, &|id| {
+      let scored = sidecar.search_scored(query_vec, sidecar.depth(pool), &|id| {
         filter.is_empty() || compiled_filter.admits(kg, id)
       });
       admit_dense(law, &scored, pool)
