@@ -49,7 +49,7 @@ use std::io::Write;
 use std::path::Path;
 
 use vorpal_ann::dense::{RESCORE_OVERSAMPLE, quantize_row, rescore_f16, row_to_f16, scan_i8};
-use vorpal_ann::encoder::{CodeEncoder, GemmPath};
+use vorpal_ann::encoder::CodeEncoder;
 use vorpal_kg::{Kg, NodeId};
 
 pub(crate) const SIDECAR_FILE: &str = "ann.dense";
@@ -67,6 +67,8 @@ pub(crate) const BATCH_SEQUENCES: usize = 256;
 /// rides in `ann.dense.json` and the freshness gate demands it, so a recipe
 /// flip in code retrains every sidecar instead of serving mixed surfaces.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The richer recipes are selected only by the bench-internals sweep seam.
+#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
 pub(crate) enum SurfaceRecipe {
   /// `name signature basename` — the original rerank surface.
   Head,
@@ -474,6 +476,9 @@ pub(crate) fn coverage_order(kg: &Kg) -> (Vec<u64>, usize) {
   (referenced.into_iter().map(|(_, id)| id).collect(), population)
 }
 
+/// The sidecar's four sections as typed slices: `(ids, scales, codes, halves)`.
+type Sections<'a> = (&'a [u64], &'a [f32], &'a [i8], &'a [u16]);
+
 /// Section offsets inside `ann.dense`, all 8-byte aligned.
 struct Layout {
   ids: usize,
@@ -587,6 +592,11 @@ pub(crate) fn fill(
 ) -> Result<DenseRecord, String> {
   let round_started = std::time::Instant::now();
   let dim = encoder.dim();
+  // The device ladder (GPU → platform sgemm → fixed lanes), chosen once per
+  // encoder open; `rung.label()` is re-read at every checkpoint so the record
+  // names the rung that built the rows — including a mid-fill retirement.
+  let rung = encoder.doc_side_rung();
+  vorpal_kg::phase_stamp(&format!("dense: GEMM rung {}", rung.label()));
   let (order, population) = coverage_order(kg);
   let referenced = order.len();
   let mut builder = SurfaceBuilder::new(dir, active_surface_recipe());
@@ -604,7 +614,7 @@ pub(crate) fn fill(
         model_identity: encoder.model_identity(),
         weights_digest: encoder.weights_content_digest()?,
         surface: recipe.clone(),
-        gemm_path: GemmPath::Throughput.label().to_string(),
+        gemm_path: rung.label(),
         coverage: 0,
         referenced,
         population,
@@ -629,6 +639,7 @@ pub(crate) fn fill(
   if rows.len() >= referenced {
     record.complete = true;
     record.cap_secs = cap_secs;
+    record.gemm_path = rung.label();
     checkpoint(dir, stamp, dim, &rows, &mut record)?;
     return Ok(record);
   }
@@ -667,7 +678,7 @@ pub(crate) fn fill(
         let builder = &mut builder;
         scope.spawn(move || prepare(builder, end))
       });
-      let embedded = encoder.embed_batch_with(&texts, GemmPath::Throughput);
+      let embedded = encoder.embed_batch_with(&texts, rung.path());
       let prepared = producer.map(|handle| handle.join());
       (embedded, prepared)
     });
@@ -722,6 +733,7 @@ pub(crate) fn fill(
     if exhausted || capped || due {
       record.complete = exhausted;
       record.cap_secs = if capped { cap_secs } else { None };
+      record.gemm_path = rung.label();
       let bytes = checkpoint(dir, stamp, dim, &rows, &mut record)?;
       committed = rows.len();
       vorpal_kg::phase_stamp(&format!(
@@ -805,12 +817,14 @@ impl DenseSidecar {
     Some(DenseSidecar { store, n, dim, layout })
   }
 
+  /// Row count — read by the bench-internals probes.
+  #[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
   pub(crate) fn len(&self) -> usize {
     self.n
   }
 
   /// The four sections as typed slices — `None` if the mapping is misaligned.
-  fn sections(&self) -> Option<(&[u64], &[f32], &[i8], &[u16])> {
+  fn sections(&self) -> Option<Sections<'_>> {
     let bytes = self.store.as_bytes();
     let (n, dim) = (self.n, self.dim);
     let ids = bytemuck::try_cast_slice::<u8, u64>(&bytes[self.layout.ids..self.layout.ids + n * 8]).ok()?;

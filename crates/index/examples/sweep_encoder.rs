@@ -98,6 +98,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     return Ok(());
   }
+  // GPU tile sweep: `<index-dir> --gpu-tiles [batch]` — one batch (default 256)
+  // under every tile geometry the adapter's limits admit (workgroup side 8/16/32
+  // × K stage 2/4/8/16 vec4); prints tok/s and GFLOPS per tile. The recorded
+  // winner pins `Tile::derive`'s caps.
+  if args.get(1).map(String::as_str) == Some("--gpu-tiles") {
+    let batch: usize = args.get(2).map_or(Ok(256), |b| b.parse())?;
+    let model_dir = std::env::var_os("VORPAL_CODERANK_DIR")
+      .map(std::path::PathBuf::from)
+      .ok_or("set VORPAL_CODERANK_DIR to the model directory")?;
+    let encoder = CodeEncoder::open(&model_dir)?;
+    let kg = Kg::load(&vorpal_kg::resolve_index_dir(Path::new(index)))?;
+    let pool = surfaces(&kg, batch);
+    let texts: Vec<&str> = pool.iter().map(String::as_str).collect();
+    let tokens: usize = texts.iter().map(|t| encoder.sequence_len(t)).sum();
+    let flops = 2.0 * encoder.non_embedding_params() as f64 * tokens as f64;
+    println!("| tile (block, K stage vec4, workgroup) | s/batch | tok/s | GFLOPS | device s (compute+blit) | up+down s |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    for side in [8u32, 16, 32] {
+      for bk4 in [2u32, 4, 8, 16] {
+        let tile = vorpal_ann::encoder::Tile { bm: side * 4, bn: side * 4, bk4 };
+        let gpu = match encoder.open_gpu_with(Some(tile)) {
+          Ok(gpu) => gpu,
+          Err(reason) => {
+            println!("| {}×{} bk4 {bk4} {side}×{side} | refused: {reason} | | | | |", tile.bm, tile.bn);
+            continue;
+          }
+        };
+        encoder.embed_batch_with(&texts, GemmPath::Gpu(&gpu))?;
+        gpu.reset_transfer();
+        let mut secs = Vec::with_capacity(REPS);
+        for _ in 0..REPS {
+          let started = std::time::Instant::now();
+          encoder.embed_batch_with(&texts, GemmPath::Gpu(&gpu))?;
+          secs.push(started.elapsed().as_secs_f64());
+        }
+        let report = gpu.transfer_report();
+        let s = median(&mut secs);
+        println!(
+          "| {}×{} bk4 {bk4} {side}×{side} | {s:.3} | {:.0} | {:.0} | {:.3} | {:.3} |",
+          tile.bm,
+          tile.bn,
+          tokens as f64 / s,
+          flops / s / 1e9,
+          report.device_secs / REPS as f64,
+          (report.upload_secs + report.download_secs) / REPS as f64,
+        );
+      }
+    }
+    return Ok(());
+  }
   let model_dir = std::env::var_os("VORPAL_CODERANK_DIR")
     .map(std::path::PathBuf::from)
     .ok_or("set VORPAL_CODERANK_DIR to the model directory")?;
@@ -119,23 +169,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(dump, pool.join("\n"))?;
   }
   let params = encoder.non_embedding_params();
+  // The GPU rung (the ladder's own choice for this model), or its stated refusal.
+  let rung = encoder.doc_side_rung();
   println!(
-    "model {} — non-embedding params {:.1}M; throughput path = {}; rayon threads {}",
+    "model {} — non-embedding params {:.1}M; throughput path = {}; GPU rung = {}; rayon threads {}",
     model_dir.display(),
     params as f64 / 1e6,
     GemmPath::Throughput.label(),
+    rung.label(),
     rayon::current_num_threads(),
   );
-  println!("| batch | tokens | tok/seq | fixed-order s | GFLOPS | throughput s | GFLOPS | speedup | min cosine | seq/s (throughput) |");
-  println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+  if let Some(gpu) = rung.gpu() {
+    println!("gpu tile {:?}, resident weights {:.1} MB", gpu.tile(), gpu.resident_bytes() as f64 / 1e6);
+  }
+  println!("| batch | tokens | tok/seq | fixed-order s | GFLOPS | throughput s | GFLOPS | speedup | min cosine | seq/s (throughput) | gpu s | GFLOPS | gpu vs fixed | gpu vs throughput | seq/s (gpu) | transfer share |");
+  println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+  let min_cosine = |a: &[Vec<f32>], b: &[Vec<f32>]| -> f64 {
+    a.iter()
+      .zip(b)
+      .map(|(a, b)| a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum::<f64>())
+      .fold(1.0f64, f64::min)
+  };
   for &batch in &batches {
     let texts: Vec<&str> = pool[..batch].iter().map(String::as_str).collect();
     let tokens: usize = texts.iter().map(|t| encoder.sequence_len(t)).sum();
     let flops = 2.0 * params as f64 * tokens as f64;
     let mut fixed_s = Vec::with_capacity(REPS);
     let mut fast_s = Vec::with_capacity(REPS);
+    let mut gpu_s = Vec::with_capacity(REPS);
     let mut fixed_rows = Vec::new();
     let mut fast_rows = Vec::new();
+    let mut gpu_rows = Vec::new();
+    if let Some(gpu) = rung.gpu() {
+      // Warm-up (scratch buffers grow to this batch), then the ledger is reset
+      // so the transfer share covers the timed reps alone.
+      encoder.embed_batch_with(&texts, GemmPath::Gpu(gpu))?;
+      gpu.reset_transfer();
+    }
     for _ in 0..REPS {
       let started = std::time::Instant::now();
       fixed_rows = encoder.embed_batch_with(&texts, GemmPath::FixedOrder)?;
@@ -143,20 +213,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       let started = std::time::Instant::now();
       fast_rows = encoder.embed_batch_with(&texts, GemmPath::Throughput)?;
       fast_s.push(started.elapsed().as_secs_f64());
+      if let Some(gpu) = rung.gpu() {
+        let started = std::time::Instant::now();
+        gpu_rows = encoder.embed_batch_with(&texts, GemmPath::Gpu(gpu))?;
+        gpu_s.push(started.elapsed().as_secs_f64());
+      }
     }
-    let min_cosine = fixed_rows
-      .iter()
-      .zip(&fast_rows)
-      .map(|(a, b)| a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum::<f64>())
-      .fold(1.0f64, f64::min);
     let (fixed, fast) = (median(&mut fixed_s), median(&mut fast_s));
+    let gpu_cells = match rung.gpu() {
+      Some(gpu) => {
+        let report = gpu.transfer_report();
+        let device = median(&mut gpu_s);
+        let host_copies = (report.upload_secs + report.download_secs) / REPS as f64;
+        format!(
+          "{device:.3} | {:.1} | {:.6} | {:.6} | {:.0} | {:.1}% host copies ({:.0}+{:.0} MB/batch), device {:.3} s{}",
+          flops / device / 1e9,
+          min_cosine(&fixed_rows, &gpu_rows),
+          min_cosine(&fast_rows, &gpu_rows),
+          batch as f64 / device,
+          host_copies * 100.0 / device,
+          report.bytes_up as f64 / REPS as f64 / 1e6,
+          report.bytes_down as f64 / REPS as f64 / 1e6,
+          report.device_secs / REPS as f64,
+          gpu.fault().map_or(String::new(), |f| format!(" RETIRED: {f}")),
+        )
+      }
+      None => "— | — | — | — | — | —".to_string(),
+    };
     println!(
-      "| {batch} | {tokens} | {:.1} | {fixed:.3} | {:.1} | {fast:.3} | {:.1} | {:.2}× | {min_cosine:.6} | {:.0} |",
+      "| {batch} | {tokens} | {:.1} | {fixed:.3} | {:.1} | {fast:.3} | {:.1} | {:.2}× | {:.6} | {:.0} | {gpu_cells} |",
       tokens as f64 / batch as f64,
       flops / fixed / 1e9,
       flops / fast / 1e9,
       fixed / fast,
+      min_cosine(&fixed_rows, &fast_rows),
       batch as f64 / fast,
+    );
+  }
+  // Dispatch-only ceiling: the six shapes of one layer at the largest batch's
+  // token count, no host copies — the GPU kernel's own rate, the analogue of
+  // the raw `cblas_sgemm` ceiling column.
+  if let Some(gpu) = rung.gpu() {
+    let texts: Vec<&str> = pool[..largest].iter().map(String::as_str).collect();
+    let rows: usize = texts.iter().map(|t| encoder.sequence_len(t)).sum();
+    let reps = 20;
+    let mut layer_secs = 0.0f64;
+    let mut layer_flops = 0.0f64;
+    for (dim_in, w, rows_out) in encoder.layer_gemm_shapes(0)? {
+      gpu.dispatch_only(dim_in, w, rows_out, rows, 2)?;
+      let secs = gpu.dispatch_only(dim_in, w, rows_out, rows, reps)? / reps as f64;
+      let flops = 2.0 * rows as f64 * dim_in as f64 * rows_out as f64;
+      println!(
+        "dispatch-only {rows}×{dim_in}·({rows_out}×{dim_in})ᵀ: {:.4} s, {:.0} GFLOPS",
+        secs,
+        flops / secs / 1e9
+      );
+      layer_secs += secs;
+      layer_flops += flops;
+    }
+    println!(
+      "dispatch-only ceiling at {rows} tokens: {:.0} GFLOPS over the layer's GEMMs ({:.3} s × {} layers = {:.3} s of pure GEMM per batch)",
+      layer_flops / layer_secs / 1e9,
+      layer_secs,
+      encoder.layers(),
+      layer_secs * encoder.layers() as f64
     );
   }
   // Thread-stability verdict of the throughput path (rayon 1 vs default pool),

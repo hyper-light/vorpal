@@ -281,6 +281,115 @@ fn throughput_path_reproducibility_is_stated() {
   );
 }
 
+/// The GPU rung's parity oracle: `GemmPath::Gpu` stays within cosine 0.9999
+/// of the fixed-order path on every surface of the battery — the same bound
+/// that admits the Accelerate rows. Without an adapter the test states the
+/// typed refusal and passes (the ladder's own behaviour on such a machine).
+#[test]
+fn gpu_path_matches_fixed_order_within_cosine() {
+  use vorpal_ann::encoder::GemmPath;
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  let encoder = CodeEncoder::open(&dir).unwrap();
+  let gpu = match encoder.open_gpu_with(None) {
+    Ok(gpu) => gpu,
+    Err(reason) => {
+      eprintln!("skipped: GPU rung refused: {reason}");
+      return;
+    }
+  };
+  let texts = parity_battery(&dir);
+  let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+  let fixed = encoder.embed_batch_with(&borrowed, GemmPath::FixedOrder).unwrap();
+  let fast = encoder.embed_batch_with(&borrowed, GemmPath::Throughput).unwrap();
+  let device = encoder.embed_batch_with(&borrowed, GemmPath::Gpu(&gpu)).unwrap();
+  assert!(gpu.fault().is_none(), "GPU rung retired during the battery: {:?}", gpu.fault());
+  let (mut worst_fixed, mut worst_fast) = (1.0f64, 1.0f64);
+  for (((text, a), b), c) in texts.iter().zip(&fixed).zip(&fast).zip(&device) {
+    let vs_fixed = cosine(a, c);
+    worst_fixed = worst_fixed.min(vs_fixed);
+    worst_fast = worst_fast.min(cosine(b, c));
+    assert!(vs_fixed >= 0.9999, "GPU path drifted on {text:?}: cosine {vs_fixed:.7}");
+  }
+  eprintln!(
+    "GPU path ({}, tile {:?}) vs fixed-order: min cosine {worst_fixed:.7}; vs {}: {worst_fast:.7}; over {} surfaces",
+    gpu.label(),
+    gpu.tile(),
+    GemmPath::Throughput.label(),
+    texts.len()
+  );
+}
+
+/// Determinism statement for the GPU rung: run-to-run on one device handle
+/// must be bitwise reproducible (the sidecar-rebuild law, asserted); the test
+/// REPORTS whether a second, separately opened device (a fresh pipeline
+/// compile) and a 1-thread rayon pool (the CPU passes around the GEMMs) also
+/// agree bitwise.
+#[test]
+fn gpu_path_reproducibility_is_stated() {
+  use vorpal_ann::encoder::GemmPath;
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  let encoder = CodeEncoder::open(&dir).unwrap();
+  let gpu = match encoder.open_gpu_with(None) {
+    Ok(gpu) => gpu,
+    Err(reason) => {
+      eprintln!("skipped: GPU rung refused: {reason}");
+      return;
+    }
+  };
+  let texts = parity_battery(&dir);
+  let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+  let first = encoder.embed_batch_with(&borrowed, GemmPath::Gpu(&gpu)).unwrap();
+  let second = encoder.embed_batch_with(&borrowed, GemmPath::Gpu(&gpu)).unwrap();
+  assert_eq!(bits(&first), bits(&second), "GPU path must be run-to-run reproducible on one device");
+  let reopened = encoder.open_gpu_with(None).unwrap();
+  let third = encoder.embed_batch_with(&borrowed, GemmPath::Gpu(&reopened)).unwrap();
+  let single = rayon::ThreadPoolBuilder::new()
+    .num_threads(1)
+    .build()
+    .unwrap()
+    .install(|| encoder.embed_batch_with(&borrowed, GemmPath::Gpu(&gpu)).unwrap());
+  let verdict = |same: bool| if same { "IDENTICAL bytes" } else { "DIFFERENT bytes (stamp-gated sidecar only)" };
+  eprintln!(
+    "GPU path ({}): second device open {}; rayon 1-thread vs default pool {}",
+    gpu.label(),
+    verdict(bits(&third) == bits(&first)),
+    verdict(bits(&single) == bits(&first))
+  );
+}
+
+/// The ladder names its rung: the record label is the device-qualified GPU
+/// label when a GPU was chosen, else the CPU rung with the refusal stated.
+#[test]
+fn doc_side_rung_names_its_device() {
+  use vorpal_ann::encoder::GemmPath;
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  let encoder = CodeEncoder::open(&dir).unwrap();
+  let rung = encoder.doc_side_rung();
+  let label = rung.label();
+  match rung.gpu() {
+    Some(gpu) => {
+      assert!(label.starts_with("wgpu-"), "GPU rung label {label:?}");
+      assert!(matches!(rung.path(), GemmPath::Gpu(_)));
+      assert!(gpu.resident_bytes() > 0, "weights must be resident");
+    }
+    None => {
+      assert!(label.starts_with(GemmPath::Throughput.label()), "CPU rung label {label:?}");
+      assert!(rung.refusal().is_some(), "a CPU rung must state why the GPU was not chosen");
+      assert!(matches!(rung.path(), GemmPath::Throughput));
+    }
+  }
+  eprintln!("doc-side rung: {label}");
+}
+
 #[test]
 fn batched_embeddings_equal_individual_ones_bitwise() {
   let Some(dir) = model_dir() else {
