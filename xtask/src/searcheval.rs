@@ -87,7 +87,7 @@ pub fn run(index: &Path, labels_path: &Path, overlap: bool, root: Option<&Path>)
     ),
     None => None,
   };
-  if root.is_none() && labels.queries.iter().flat_map(|q| &q.relevant).any(|r| is_anchored(r)) {
+  if root.is_none() && labels.queries.iter().flat_map(|q| &q.relevant).any(is_anchored) {
     bail!("labels use an anchored path (starts with '/'); pass --root <indexed tree>");
   }
 
