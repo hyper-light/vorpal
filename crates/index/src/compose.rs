@@ -331,6 +331,17 @@ fn views_respan_reject(
   if old.error_spans.len() != new.error_spans.len() {
     return Some("error span count");
   }
+  // Swallow recoveries carry a byte start (shifts with the edit) and a lifted count; the
+  // count vector is the semantic gate, as for error spans.
+  if old.swallows.len() != new.swallows.len()
+    || !old
+      .swallows
+      .iter()
+      .zip(&new.swallows)
+      .all(|(a, b)| a.lifted == b.lifted)
+  {
+    return Some("swallow recoveries");
+  }
   if old.entity_params != new.entity_params {
     return Some("entity params");
   }

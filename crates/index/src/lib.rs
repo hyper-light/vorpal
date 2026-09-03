@@ -6529,11 +6529,37 @@ pub fn parse_health_report(index_dir: &Path) -> Result<String, Box<dyn Error>> {
   }
   files.sort_by(|a, b| a.1.cmp(&b.1));
 
+  // Pack keys may be tree-relative while graph paths are absolute (the bucketed pack's
+  // root is inferred at open and can decline — cpython's generation did, and this report
+  // then called a 591-damaged-file tree "clean"). Resolve the tree root once from the
+  // first graph path whose relative key the pack holds, and look every path up both ways.
+  let pack_root: Option<String> = files.iter().find_map(|(_, path)| {
+    if pack.get(path).is_some() {
+      return None;
+    }
+    path
+      .match_indices('/')
+      .map(|(at, _)| &path[..at])
+      .find(|candidate| {
+        let key = vorpal_kg::identity::tree_relative(path, candidate);
+        key != path.as_str() && pack.get(key).is_some()
+      })
+      .map(str::to_string)
+  });
+  let lookup = |path: &str| {
+    pack.get(path).or_else(|| {
+      pack_root
+        .as_deref()
+        .and_then(|root| pack.get(vorpal_kg::identity::tree_relative(path, root)))
+    })
+  };
   let mut out = String::new();
   let mut unhealthy = 0usize;
   let mut total_error_bytes = 0u64;
+  let mut recovered_files = 0usize;
+  let mut recovered_items = 0u64;
   for (_, path) in &files {
-    let Some(bytes) = pack.get(path) else {
+    let Some(bytes) = lookup(path) else {
       continue;
     };
     let Ok(product) = vorpal_ingest::decode_product_view(bytes) else {
@@ -6544,6 +6570,9 @@ pub fn parse_health_report(index_dir: &Path) -> Result<String, Box<dyn Error>> {
     }
     unhealthy += 1;
     total_error_bytes += product.error_bytes;
+    if !product.swallows.is_empty() {
+      recovered_files += 1;
+    }
     let ratio = if product.source_size == 0 {
       100.0
     } else {
@@ -6557,6 +6586,24 @@ pub fn parse_health_report(index_dir: &Path) -> Result<String, Box<dyn Error>> {
     );
     for &(start, end) in &product.error_spans {
       let _ = writeln!(out, "  error span {start}..{end}");
+    }
+    // The structural signal the byte ratio cannot see: a definition whose parse ran to
+    // end-of-file with the rest of the file inside it. The outline walk lifted the
+    // swallowed definitions back out (see `vorpal_outline::model::SwallowRecovery`);
+    // without that they would all be absent while this very report called the file clean.
+    for swallow in &product.swallows {
+      recovered_items += u64::from(swallow.lifted);
+      let owner = product
+        .items
+        .iter()
+        .find(|item| item.entry.range.byte_offset.start == swallow.start as usize)
+        .map(|item| format!("`{}` (line {})", item.entry.name, item.entry.range.start.line + 1))
+        .unwrap_or_else(|| format!("byte {}", swallow.start));
+      let _ = writeln!(
+        out,
+        "  swallowed tail recovered: {} definitions lifted from {owner}, whose body ran to end-of-file",
+        swallow.lifted
+      );
     }
     // Entities whose definition span intersects any damaged region: relations from these
     // may be incomplete — the difference between "no edge" and "unknowable here".
@@ -6584,8 +6631,15 @@ pub fn parse_health_report(index_dir: &Path) -> Result<String, Box<dyn Error>> {
   if unhealthy == 0 {
     return Ok("parse health: clean — every indexed file parsed without ERROR nodes\n".into());
   }
+  let recovered = if recovered_files > 0 {
+    format!(
+      "; parser-swallow recovery lifted {recovered_items} definitions in {recovered_files} files whose tails ran to end-of-file"
+    )
+  } else {
+    String::new()
+  };
   Ok(format!(
-    "parse health: {unhealthy} of {} files carry ERROR nodes ({total_error_bytes} damaged bytes total)\n{out}",
+    "parse health: {unhealthy} of {} files carry ERROR nodes ({total_error_bytes} damaged bytes total{recovered})\n{out}",
     files.len()
   ))
 }

@@ -91,6 +91,9 @@ pub fn views_defs_stable_reject(
   if old.error_spans.len() != new.error_spans.len() {
     return Some("error span count");
   }
+  if !swallows_equal_sans_starts(old, new) {
+    return Some("swallow recoveries");
+  }
   if !items_equal_sans_ranges(&old.items, &new.items) {
     return Some("definition set");
   }
@@ -1115,7 +1118,23 @@ pub fn views_defs_changed_reject(
   if old.error_spans.len() != new.error_spans.len() {
     return Some("error span count");
   }
+  if !swallows_equal_sans_starts(old, new) {
+    return Some("swallow recoveries");
+  }
   None
+}
+
+/// Parser-swallow recoveries agree up to their byte starts (which shift with the edit):
+/// same count, same lifted counts in order — the product-level gate beside the error-span
+/// count, so a save that changes what the recovery walk lifted never composes as a
+/// span-only or definition-set-only edit.
+fn swallows_equal_sans_starts(old: &ProductView<'_>, new: &ProductView<'_>) -> bool {
+  old.swallows.len() == new.swallows.len()
+    && old
+      .swallows
+      .iter()
+      .zip(&new.swallows)
+      .all(|(a, b)| a.lifted == b.lifted)
 }
 
 /// Every definition name of the edited file whose row EVIDENCE moved between the prior

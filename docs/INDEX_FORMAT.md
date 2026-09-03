@@ -60,7 +60,7 @@ migration, policy #1). The format is a property of a generation, never mixed wit
 <!-- BEGIN GENERATED VERSION TABLE -->
 | Artifact | Constant | Value | On mismatch |
 |---|---|---|---|
-| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 19 | cache miss → re-parse |
+| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 20 | cache miss → re-parse |
 | product pack, bucketed layout (`products/<k>.pack` + `products/toc.bin`) — the default | `BUCKET_VERSION` (crates/ingest/src/pack.rs) | 1 | pack ignored → rebuilt by next build |
 | product pack, legacy flat layout (`products.pack`/`products.idx`) — deprecated, written only under `VORPAL_FORMAT=flat`; reads retained | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
