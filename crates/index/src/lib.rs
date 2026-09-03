@@ -4048,7 +4048,21 @@ enum DenseFusion {
   Support,
 }
 
-/// The production law. `Flat` until the coverage-curve sweep pins a winner.
+/// The production law: `Flat`, PINNED by the coverage-curve measurement (BENCHMARKS
+/// "Size-aware dense fusion", 2026-09-03; kernel sidecars at 40.7 K / 99.3 K / 190.7 K
+/// of 716.7 K eligible rows, cpython and vorpal at complete referenced coverage).
+/// What the sweep established: (1) with the rerank on, the fusion decides only pool
+/// MEMBERSHIP — the encoder's cosine order over the pool sets the final positions —
+/// and under `Flat` every labelled answer is already in the pool at every coverage; the
+/// v0.7.0 8-query slide (0.345 → 0.245 all-NDCG@10) is the answers' own dense rank
+/// slipping behind newly covered, higher-cosine, lower-in-degree lookalikes. (2) `Hub`
+/// is the one derived law that repairs it (0.415 / 0.340 / 0.332, ≥ the 0.313 gate at
+/// every point) but it drops cosine-best low-in-degree answers elsewhere (vorpal all
+/// 0.685 → 0.542) and on the expanded 54-query kernel set trades the short-keyword gain
+/// for the conjunctive class (net −0.009 at every point). (3) On the 54-query set the
+/// shipped fusion does not slide at all (0.404 / 0.416 / 0.414) and no law beats it
+/// beyond one query's worth. The population-scaled, cutoff and score-gap laws are
+/// measured-and-rejected; the seam stays for the next sweep.
 const DENSE_FUSION: DenseFusion = DenseFusion::Flat;
 
 fn dense_fusion() -> DenseFusion {
