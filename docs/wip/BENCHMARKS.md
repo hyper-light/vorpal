@@ -2300,6 +2300,169 @@ at these budgets; (3) the default budget policy when no budget is given is "no s
 measurement, recorded in `ann.dense.json`; the uncontended vorpal head rate was 1.7×
 the contended one.
 
+## Cross-platform encoder throughput — x86 f32 kernels, int8 measured-and-rejected (2026-09-02)
+
+The doc-side throughput lift above was macOS-only: off macOS `GemmPath::Throughput`
+silently WAS the fixed lanes. This pass adds the missing rungs
+(`crates/ann/src/encoder/{gemm_x86,gemm_i8,cache}.rs`; branch `xplat-cpu` on the
+dense-channel seam `4d588c1`). What is local and what is not is stated per row:
+the development machine is an M5 Max, where AVX2 is reachable only under Docker's
+linux/amd64 emulation (correctness, never rate) and AVX-512 / VNNI are not reachable
+at all — those rates come from the `encoder-x86` CI job (`.github/workflows/ci.yml`,
+`ubuntu-latest`), and are PENDING until the coordinator's PR runs it.
+
+### Platform matrix — what each `GemmPath` resolves to (runtime-detected, `label()`)
+
+| OS / ISA | `Throughput` (doc-side sidecar) | `Int8` (opt-in API only) | `FixedOrder` (query-side rerank, every platform) |
+|---|---|---|---|
+| macOS, Apple silicon | Accelerate `cblas_sgemm`, row-sharded (`accelerate-sgemm`) | NEON `sdot` via inline asm (`int8-neon-sdot`) | eight fixed lanes |
+| macOS, Intel | Accelerate `cblas_sgemm` | AVX-512-VNNI / AVX-VNNI / AVX2 `pmaddwd` by CPUID | eight fixed lanes |
+| Linux / Windows, x86-64 with AVX-512F | owned AVX-512F 4×4 tiles, 16 lanes (`avx512f-sgemm`) | `int8-avx512-vnni` when VNNI is present, else `int8-avx-vnni` / `int8-avx2-madd` | eight fixed lanes |
+| Linux / Windows, x86-64 with AVX2+FMA (no AVX-512) | owned AVX2+FMA 2×4 tiles, 8 lanes (`avx2-fma-sgemm`) — **bit-identical to the fixed lanes** | `int8-avx-vnni` (Alder Lake+, Zen 4+) else `int8-avx2-madd` | eight fixed lanes |
+| x86-64 without FMA (pre-Haswell) | the fixed lanes (`fixed-order`) | `int8-portable` | eight fixed lanes |
+| Linux aarch64 (no Accelerate) | the fixed lanes (`fixed-order`; auto-vectorized NEON fma) | `int8-neon-sdot` where `dotprod` is present (ARMv8.2+), else `int8-portable` | eight fixed lanes |
+| anything else | the fixed lanes | `int8-portable` | eight fixed lanes |
+
+Row-sharding is the Accelerate path's split on every rung (`throughput_shards()` =
+`available_parallelism()`); the L2 panel size is DERIVED from the cache the platform
+enumerates (x86 CPUID leaf 4 / 0x8000001D, macOS `hw.l2cachesize`, Linux sysfs; half the
+L2 in whole tiles; no L2 figure → one tile per panel, i.e. no reuse assumed rather than a
+guessed size). Tile shapes are sized to the register file (AVX2 2×4 = 11 of 16 ymm;
+AVX-512 4×4 = 21 of 32 zmm; NEON int8 4×4 = 24 of 32 v-regs), not tuned.
+
+### Determinism statements
+
+* **AVX2+FMA f32**: the kernel is the fixed lanes' exact reduction structure (eight
+  `fma` lanes over ascending blocks, `((l0+l4)+(l1+l5))+((l2+l6)+(l3+l7))`, ascending
+  scalar tail), so on an AVX2 machine the `Throughput` GEMM reproduces the fixed-order
+  GEMM **bit for bit** — asserted by the unit oracle on six tail shapes × four shard
+  counts and shown by `gemm_bench` (Δ = 0.00e0 on all five shapes), both executed under
+  linux/amd64 emulation below. The whole forward under `Throughput` is NOT bit-equal to
+  `FixedOrder` on any platform, because the seam's throughput path also swaps the SwiGLU
+  gate for the f32 `exp_fast` — a first draft of the gated test asserted the bits and
+  failed on exactly that; the parity bound on every rung is the cosine oracle.
+* **Cross-platform bits**: no path's whole forward is bit-identical ACROSS operating
+  systems — the f64 attention softmax calls the platform libm's `exp`, which differs by an
+  ulp between Apple's libm and glibc — so every determinism statement here is within one
+  platform (the sidecar is stamp-gated per machine; the query-side law is per platform).
+* **AVX-512F f32**: sixteen lanes, a fixed fold + the same eight-lane tree, per-element
+  structure independent of tile / panel / shard → bit-identical across thread and shard
+  counts BY CONSTRUCTION; differs from the fixed lanes by summation order only (parity
+  oracle cosine ≥ 0.9999; the unit oracle bounds |Δ| ≤ 1e-5·dim_in per element). Not
+  executed locally — CI.
+* **int8 (every ISA)**: every kernel computes the same exact i32 sum, so the GEMM is
+  bit-identical across ISAs, tiles, shards and thread counts (unit oracle: every present
+  kernel vs an i64 reference, bit-equal on seven shapes × four shard counts; gated test:
+  run-to-run and rayon-1-vs-18 bit-equal on the real encoder, on NEON and on emulated AVX2). The VNNI forms multiply
+  u8×s8, so activations are sign-flipped (`+128`) and the driver subtracts `128·Σw` — the
+  per-row sum recorded at quantization; exact.
+* **Query side**: untouched — `FixedOrder` on every platform, rankings byte-identical
+  (the fixed-path thread-stability assertion still passes).
+
+### Local (M5 Max, Accelerate present) — what was measured here
+
+`gemm_bench` (weights-free, the five per-layer GEMM shapes at the recorded 256-surface
+batch, 4690 tokens, median of 3; **contended**: load average 18–22 from concurrent
+sessions):
+
+| GEMM | shape | fixed-order | Accelerate (`Throughput`) | int8 NEON `sdot` | Accelerate Δ | int8 Δ |
+|---|---|---:|---:|---:|---:|---:|
+| qkv | 4690 × 768 → 2304 | 0.0676 s / 245 GFLOPS | 0.0069 s / 2397 | 0.0073 s / 2275 | 1.4e-6 | 6.0e-3 |
+| out_proj | 4690 × 768 → 768 | 0.0215 s / 258 | 0.0026 s / 2096 | 0.0023 s / 2431 | 1.3e-6 | 5.4e-3 |
+| fc11 | 4690 × 768 → 3072 | 0.0914 s / 242 | 0.0098 s / 2250 | 0.0088 s / 2515 | 1.5e-6 | 5.8e-3 |
+| fc12 | 4690 × 768 → 3072 | 0.0989 s / 224 | 0.0092 s / 2405 | 0.0086 s / 2580 | 1.5e-6 | 5.6e-3 |
+| fc2 | 4690 × 3072 → 768 | 0.0945 s / 234 | 0.0105 s / 2109 | 0.0086 s / 2579 | 2.5e-6 | 5.6e-3 |
+| per-layer sum (×12 = GEMM per forward) | | 0.374 s (237) → 4.49 s | 0.039 s (2264) → 0.47 s | 0.036 s (2491) → 0.43 s | | |
+
+(Δ = max |out − fixed| / max |fixed| on random operands; the int8 Δ is the quantization
+itself, exact per the unit oracle.) The NEON int8 GEMM is only 1.10× Accelerate's f32 on
+this machine — the AMX units already run the f32 GEMM near the int8 dot rate, so int8 has
+no throughput case on Apple silicon whatever its retention.
+
+`sweep_encoder` on a fresh index of this repo (real surfaces in coverage order, 14–21
+tok/seq; FLOPs = 2 × 113.2 M × tokens; median of 3; **contended**: load average 20–42
+during the run — the seam's quiet-machine Accelerate rows were 935 / 1505 / 1462 GFLOPS):
+
+| batch | tokens | fixed-order | Accelerate `Throughput` | speedup | min cosine | int8 NEON forward | int8 vs fixed | int8 vs Accelerate |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 26 | 364 | 0.389 s / 212 GFLOPS | **0.136 s / 607** (191 seq/s) | 2.9× | 1.000000 | 0.074 s / 1111 | 5.2× | 1.83× |
+| 256 | 4690 | 4.679 s / 227 | **0.582 s / 1824** (440 seq/s) | 8.0× | 1.000000 | 0.485 s / 2190 | 9.6× | 1.20× |
+| 1024 | 21814 | 26.00 s / 190 | **3.389 s / 1458** (302 seq/s) | 7.7× | 1.000000 | 3.455 s / 1430 | 7.5× | 0.98× |
+
+The Accelerate path stays run-to-run reproducible and bit-identical across rayon thread
+counts (1 vs 18: "IDENTICAL bytes"), parity min cosine 1.0000000 — unchanged by this pass
+(the macOS dispatch is untouched). The whole-forward int8 advantage shrinks to nothing at
+1024 because the f64 attention / LayerNorm passes, not the GEMMs, bound the large batch.
+
+### x86 (correctness under emulation; rate PENDING CI)
+
+Method: `docker run --platform linux/amd64 rust:1.98` on the M5 Max (Rosetta-backed
+emulation, which exposes `avx2` + `fma` and nothing wider — 18 vCPUs), the worktree and
+the weights directory mounted, `cargo test -p vorpal-ann`. Emulated timings are NOT
+throughput and are not reported as such; only correctness lines are.
+
+| what ran under emulated AVX2 | result |
+|---|---|
+| `gemm_x86` unit oracle (six shapes incl. tails × shard counts 0/1/3/64) | `avx2-fma-sgemm` == fixed lanes **bit-equal** |
+| `gemm_i8` unit oracle (`Avx2Madd`, `Portable` present) | both **bit-equal** to the i64 reference on seven shapes × four shard counts |
+| `cache` L2 probe | CPUID leaf enumerated (plausibility test passed) |
+| `gemm_bench 512 1` | executed on the AVX2 rung; throughput Δ = **0.00e0** on all five shapes (int8 Δ 5.2–5.9e-3, the quantization itself) |
+| gated real-encoder `throughput_path_reproducibility_is_stated` | `avx2-fma-sgemm` run-to-run reproducible; rayon 1 vs 18: **IDENTICAL bytes** |
+| gated real-encoder `throughput_path_matches_fixed_order_within_cosine` | `avx2-fma-sgemm` vs fixed-order: **min cosine 1.0000000** over the 12-surface battery (bits differ only by the `exp_fast` gate) |
+| gated real-encoder `int8_path_…` (`int8-avx2-madd`) | deterministic (run-to-run and rayon 1 vs 18 bit-equal); functional floor held; min cosine 0.962879 ("ObservedStore …"), mean 1−cos 2.70e-2 vs bar 2.89e-5 → FAILS (same verdict as NEON) |
+
+The AVX-512F f32 kernel and the AVX-512-VNNI / AVX-VNNI int8 kernels compiled (native and
+`--target x86_64-apple-darwin` clippy lanes, `-D warnings`) but were NOT executed anywhere
+reachable from this machine — CI.
+
+### int8 retention — the derived bar, the measurement, the verdict
+
+Bar derivation: the research's published int8 datums (ENCODER_RESEARCH §6) are for int8
+OUTPUT quantization of the embedding — 97 % MTEB-retrieval retention for the best 1024-d
+model, 99 % with ×4 rescore (the sidecar's own recipe: int8 codes + f16 rescore). The
+mapping used: retention is monotone in embedding perturbation, so an int8 FORWARD whose
+mean angular deviation from the f32 embedding is no larger than the deviation int8 output
+quantization imposes on the same embeddings (`dense::quantize_row` → dequantize, measured
+on this model's own vectors) retains ≥ 97 % by the same evidence. That bar is computed per
+run beside the measurement (gated test `int8_path_is_deterministic_and_reports_retention…`,
+and the `sweep_encoder` int8 table on real surfaces).
+
+Measured on the 12-surface parity battery (gated test) and on 26 / 256 / 1024 real
+surfaces of this repo (sweep table's int8 columns), NEON `sdot` kernel, 108 MB of int8
+weights built lazily at the first `Int8` embed:
+
+| surfaces | int8 forward: min cosine vs f32 | mean 1−cos | output-int8 bar: min cosine | mean 1−cos | verdict |
+|---:|---:|---:|---:|---:|---|
+| 12 (battery), NEON `sdot` | 0.962879 ("ObservedStore pub struct …") | 2.70e-2 | 0.999960 | 2.89e-5 | FAILS (830× the bar) |
+| 12 (battery), emulated AVX2 `pmaddwd` | 0.962879 ("ObservedStore pub struct …") | 2.70e-2 | 0.999960 | 2.89e-5 | FAILS |
+| 26 | 0.970155 | 2.64e-2 | 0.999954 | 3.37e-5 | FAILS (780× the bar) |
+| 256 | 0.963265 | 2.68e-2 | 0.999924 | 3.40e-5 | FAILS |
+| 1024 | 0.957490 | 2.67e-2 | 0.999845 | 3.30e-5 | FAILS |
+
+Determinism held (int8 bits equal run-to-run and at rayon 1 vs 18), and the functional
+floor held (the int8 query embedding still ranks the factorial snippet above the unrelated
+one) — the numerics are exact; the retention is not.
+
+**Verdict: int8 FAILS the bar — and the f16 precedent floor (cosine 0.99) — so it stays
+OFF by default: `GemmPath::Int8` is an opt-in API (nothing in `dense.rs` selects it), the
+sidecar keeps `Throughput`.** The kernels are exact (unit oracles); the loss is the
+numerics of naive W8A8 on a post-norm BERT — per-token max-abs activation scales are
+dominated by outlier channels, so the bulk of each row quantizes coarsely across 12 layers.
+Recorded lead, NOT taken (no throughput case on the only machine that can measure, and
+the x86 VNNI case is pending CI): block-wise activation scales (one scale per 64-wide
+block along `dim_in`, folded as one f32 fma per block per output) or SmoothQuant-style
+per-channel migration into the weights; both need re-measuring against this bar.
+
+### What is pending CI
+
+* AVX-512F f32 rate and parity on real hardware; AVX-512-VNNI / AVX-VNNI int8 kernel
+  execution (the unit oracles run on whatever ISA `ubuntu-latest` provides — Ice Lake
+  Xeon runners have AVX-512 + VNNI, EPYC 7763 runners have AVX2 only; the job prints the
+  runner's ISA first).
+* Any x86 THROUGHPUT number: the `gemm_bench` step's log is the datum to copy here.
+* The weights-gated real-encoder parity on x86 (`workflow_dispatch` only: it downloads the
+  547 MB weights via `vorpal enable semantic-f32`).
+
 ## Chunked C parsing — measured, understood, and REJECTED (2026-09-02)
 
 The premise: split giant C sources at proven top-level boundaries, parse slices in
