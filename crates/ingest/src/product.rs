@@ -18,7 +18,8 @@ use std::io;
 use std::path::Path;
 
 use vorpal_outline::model::{
-  EntryRole, OutlineEntry, OutlineItem, OutlineMember, SourcePosition, SourceRange, SymbolType,
+  EntryRole, OutlineEntry, OutlineItem, OutlineMember, SourcePosition, SourceRange,
+  SwallowRecovery, SymbolType,
 };
 use vorpal_resolve::{RefForm, RefKind};
 
@@ -42,7 +43,11 @@ use vorpal_resolve::{RefForm, RefKind};
 // records) and 18 (the coverage kinds) carried DIFFERENT semantics under different
 // numbers, and the merged extraction differs from both; neither line's cached
 // products may replay against it.
-pub const PRODUCT_FORMAT_VERSION: u32 = 19;
+// 20: parser-swallow recoveries (`swallows`, after the error spans) — the structural
+// coverage signal beside the byte ratio. The decoders reject trailing bytes, so no
+// compatible extension existed; the bump costs nothing extra because the C rule edit
+// that arms recovery re-keys every product through the rules digest anyway.
+pub const PRODUCT_FORMAT_VERSION: u32 = 20;
 
 /// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
 pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
@@ -83,6 +88,11 @@ pub struct FileProduct {
   /// Up to eight representative merged error spans, document order — enough to LOOK at the
   /// damage without re-parsing.
   pub error_spans: Vec<(u32, u32)>,
+  /// Parser-swallow recoveries (v20): each definition whose parse ran to end-of-file with
+  /// the rest of the file inside it, and how many definitions the outline walk lifted back
+  /// out (see [`vorpal_outline::model::SwallowRecovery`]). Empty for every file where the
+  /// diagnosis did not fire — the structural coverage signal the byte ratio cannot see.
+  pub swallows: Vec<SwallowRecovery>,
   pub items: Vec<OutlineItem<'static>>,
   pub refs: Vec<ProductRef>,
   /// Per-entity parameter lists (G-M1): `(local entity index, [(name, type_text?)])`, sorted
@@ -304,6 +314,7 @@ pub(crate) struct ExtractedParts<'a> {
   pub(crate) error_nodes: u32,
   pub(crate) error_bytes: u64,
   pub(crate) error_spans: Vec<(u32, u32)>,
+  pub(crate) swallows: Vec<SwallowRecovery>,
   pub(crate) items: Vec<OutlineItem<'a>>,
   pub(crate) refs: Vec<RefParts<'a>>,
   pub(crate) entity_params: EntityParamsView<'a>,
@@ -336,6 +347,11 @@ pub(crate) fn encode_parts_into(
   for &(start, end) in &parts.error_spans {
     push_u32(buf, start);
     push_u32(buf, end);
+  }
+  push_u32(buf, parts.swallows.len() as u32);
+  for swallow in &parts.swallows {
+    push_u32(buf, swallow.start);
+    push_u32(buf, swallow.lifted);
   }
   push_u32(buf, parts.items.len() as u32);
   for item in &parts.items {
@@ -625,6 +641,11 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
     push_u32(buf, start);
     push_u32(buf, end);
   }
+  push_u32(buf, product.swallows.len() as u32);
+  for swallow in &product.swallows {
+    push_u32(buf, swallow.start);
+    push_u32(buf, swallow.lifted);
+  }
   push_u32(buf, product.items.len() as u32);
   for item in &product.items {
     if push_entry(buf, &item.entry).is_err() {
@@ -851,6 +872,8 @@ pub struct ProductView<'a> {
   pub error_nodes: u32,
   pub error_bytes: u64,
   pub error_spans: Vec<(u32, u32)>,
+  /// Parser-swallow recoveries (v20) — see `FileProduct::swallows`.
+  pub swallows: Vec<SwallowRecovery>,
   pub items: Vec<OutlineItem<'a>>,
   pub refs: Vec<RefView<'a>>,
   /// Per-entity parameter lists, borrowed (see `FileProduct::entity_params`).
@@ -1036,6 +1059,38 @@ pub fn peek_product_error_nodes(bytes: &[u8]) -> Option<u32> {
 /// falls back to a re-parse, while the (validated) real decode happens once, at apply.
 /// The affected-byte count from a v11 header (offset 44..52) — replay paths sum it into
 /// `IndexReport::error_bytes` beside the node count.
+/// The parser-swallow recoveries of a product without decoding it (v20; see
+/// `FileProduct::swallows`): skips the fixed header and the error-span list — the
+/// health report's per-file structural signal, cheap enough for a whole-pack sweep.
+pub fn peek_product_swallows(bytes: &[u8]) -> Option<Vec<SwallowRecovery>> {
+  if bytes.len() < 8 || &bytes[..4] != PRODUCT_MAGIC {
+    return None;
+  }
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
+    return None;
+  }
+  // magic 4 + version 4 + size 8 + mtime 8 + xxh3 8 + grammar 8 + error_nodes 4 + error_bytes 8
+  let mut r = Reader { bytes, off: 52 };
+  let span_count = r.count().ok()?;
+  for _ in 0..span_count {
+    r.u32().ok()?;
+    r.u32().ok()?;
+  }
+  read_swallows(&mut r).ok()
+}
+
+fn read_swallows(r: &mut Reader<'_>) -> io::Result<Vec<SwallowRecovery>> {
+  let count = r.count()?;
+  let mut swallows = Vec::with_capacity(count.min(16));
+  for _ in 0..count {
+    swallows.push(SwallowRecovery {
+      start: r.u32()?,
+      lifted: r.u32()?,
+    });
+  }
+  Ok(swallows)
+}
+
 pub fn peek_product_error_bytes(bytes: &[u8]) -> Option<u64> {
   if bytes.len() < 52 || &bytes[0..4] != PRODUCT_MAGIC {
     return None;
@@ -1077,6 +1132,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
   for _ in 0..span_count {
     error_spans.push((r.u32()?, r.u32()?));
   }
+  let swallows = read_swallows(&mut r)?;
   let item_count = r.count()?;
   let mut items = Vec::with_capacity(item_count);
   for _ in 0..item_count {
@@ -1221,6 +1277,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     error_nodes,
     error_bytes,
     error_spans,
+    swallows,
     items,
     refs,
     entity_params,
@@ -1250,6 +1307,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
   for _ in 0..span_count {
     error_spans.push((r.u32()?, r.u32()?));
   }
+  let swallows = read_swallows(&mut r)?;
   let item_count = r.count()?;
   let mut items = Vec::with_capacity(item_count);
   for _ in 0..item_count {
@@ -1379,6 +1437,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     error_nodes,
     error_bytes,
     error_spans,
+    swallows,
     items,
     refs,
     entity_params,
@@ -1399,6 +1458,8 @@ mod tests {
     assert_eq!(a.version, b.version);
     assert_eq!(a.source_size, b.source_size);
     assert_eq!(a.source_mtime_ns, b.source_mtime_ns);
+    assert_eq!(a.error_spans, b.error_spans);
+    assert_eq!(a.swallows, b.swallows);
     assert_eq!(a.refs, b.refs);
     assert_eq!(a.items.len(), b.items.len());
     for (x, y) in a.items.iter().zip(&b.items) {

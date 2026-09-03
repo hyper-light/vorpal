@@ -122,6 +122,30 @@ pub struct SerializableItemRule<L> {
   /// subtree is never re-entered (functions inside functions stay internal).
   #[serde(default)]
   pub transparent: Option<bool>,
+  /// A grammar fact that arms parser-swallow recovery: a node this rule matches can
+  /// never legitimately contain another node of the same kind (C/C++ function
+  /// definitions), so a nested one is parser RECOVERY, not nesting. tree-sitter-c
+  /// admits `function_definition` as a block item; when a bare statement-position
+  /// macro (`_Py_COMP_DIAG_PUSH`, `scoped_guard(x) { }`, `#define N(v)` + `N(UP)`)
+  /// wrecks a body, the parser loses the closing brace and parses EVERY later
+  /// definition inside that body — no top-level ERROR, the byte-ratio health policy
+  /// reports the file clean, and the pruned item traversal never looks inside. The
+  /// diagnosis is a parse shape, never unconditional: it fires only when a matched
+  /// node carries errors AND reaches end-of-file (its end is not before the end of
+  /// the tree's last non-extra top-level child) AND its body holds a nested match
+  /// of a `swallowRecovery` rule (the floor). Everything from the floor on is then
+  /// item-matched as if top-level, and the swallowing definition's own span is cut
+  /// back to its real body. See `combined_extractor::OutlineItemIter`.
+  #[serde(default)]
+  pub swallow_recovery: Option<bool>,
+  /// This rule matches ONLY at positions the swallow-recovery walk classifies as
+  /// top-level-shaped (direct block items of a swallowing definition's body, after
+  /// the floor) — never in the ordinary traversal. For rules whose ordinary form
+  /// carries a scope guard the parser's mis-nesting defeats: C's `not inside
+  /// compound_statement` (locals are not globals) is exactly what a swallowed
+  /// global declaration now sits inside.
+  #[serde(default)]
+  pub recovery_only: Option<bool>,
 }
 
 /// Member extractor for direct child structure under an item.
@@ -341,6 +365,10 @@ pub struct ItemExtractor<L: Language> {
   pub nested: bool,
   /// See [`SerializableItemRule::transparent`].
   pub transparent: bool,
+  /// See [`SerializableItemRule::swallow_recovery`].
+  pub swallow_recovery: bool,
+  /// See [`SerializableItemRule::recovery_only`].
+  pub recovery_only: bool,
 }
 
 impl<L: Language> ItemExtractor<L> {
@@ -356,6 +384,8 @@ impl<L: Language> ItemExtractor<L> {
       member_of,
       nested,
       transparent,
+      swallow_recovery,
+      recovery_only,
     } = item;
     let member_of = member_of
       .as_deref()
@@ -371,6 +401,8 @@ impl<L: Language> ItemExtractor<L> {
       member_of,
       nested: nested.unwrap_or(false),
       transparent: transparent.unwrap_or(false),
+      swallow_recovery: swallow_recovery.unwrap_or(false),
+      recovery_only: recovery_only.unwrap_or(false),
     })
   }
 
@@ -568,6 +600,19 @@ fn source_range<D: Doc>(node: &Node<D>) -> SourceRange {
       column: end.column(node),
     },
   }
+}
+
+/// Cut an entry's range back so it ends where `end_node` ends — the swallow-recovery
+/// walk's span repair for a definition whose parse ran to end-of-file (its real body
+/// ends at the last node before the floor). Byte offset and line/column move together
+/// so the two can never disagree.
+pub(crate) fn truncate_range_to<D: Doc>(range: &mut SourceRange, end_node: &Node<D>) {
+  let end = end_node.end_pos();
+  range.byte_offset.end = end_node.range().end;
+  range.end = SourcePosition {
+    line: end.line(),
+    column: end.column(end_node),
+  };
 }
 
 /// Parse a stream of YAML outline extractor documents.
@@ -883,6 +928,8 @@ name: member
       member_of: None,
       nested: None,
       transparent: None,
+      swallow_recovery: None,
+      recovery_only: None,
       common: SerializableOutlineCommon {
         id: "ts-function".into(),
         language: SupportLang::TypeScript,

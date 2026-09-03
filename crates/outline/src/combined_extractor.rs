@@ -26,7 +26,7 @@ use vorpal_core::{
 use crate::extractor::{
   ItemExtractor, MemberExtractor, OutlineRuleError, RenderScratch, SerializableOutlineRule,
 };
-use crate::model::{OutlineItem, OutlineMember};
+use crate::model::{OutlineItem, OutlineMember, SwallowRecovery};
 use crate::options::OutlineExtractorOptions;
 
 const POTENTIAL_KINDS_INVARIANT: &str =
@@ -42,6 +42,16 @@ pub struct CombinedExtractors<L: Language> {
   /// Node-kind index into `item_extractors` for `nested: true` rules (see
   /// [`crate::extractor::SerializableItemRule::nested`]); empty for almost every language.
   nested_kind_index: Vec<Vec<usize>>,
+  /// Node-kind index into `item_extractors` for `swallowRecovery: true` rules — the
+  /// definition kinds whose nesting is parser recovery (C/C++ `function_definition`).
+  /// Consulted twice per diagnosed node: to find the floor inside a swallowing body,
+  /// and to reject candidates nested under a non-swallowing node of these kinds
+  /// (the wreckage blob the parser fused around the lost brace). Empty for every
+  /// language without such rules — the whole recovery path then costs one `is_empty`.
+  swallow_root_index: Vec<Vec<usize>>,
+  /// Node-kind index into `item_extractors` for `recoveryOnly: true` rules; consulted
+  /// only for top-level-shaped candidates inside a diagnosed swallow.
+  recovery_kind_index: Vec<Vec<usize>>,
   /// Member extractors parsed once and referenced by parent-scoped groups below.
   member_extractors: Vec<MemberExtractor<L>>,
   /// Parent item extractor id to member extractors that may run inside it.
@@ -111,17 +121,48 @@ impl<L: Language> CombinedExtractors<L> {
     member_extractors: Vec<MemberExtractor<L>>,
     options: OutlineExtractorOptions,
   ) -> Self {
-    let item_kind_index = kind_index(&item_extractors, |e| !e.nested);
+    let item_kind_index = kind_index(&item_extractors, |e| !e.nested && !e.recovery_only);
     let nested_kind_index = kind_index(&item_extractors, |e| e.nested);
+    let swallow_root_index = kind_index(&item_extractors, |e| e.swallow_recovery);
+    let recovery_kind_index = kind_index(&item_extractors, |e| e.recovery_only);
     let member_index_by_parent = member_index_by_parent(&member_extractors);
     Self {
       item_extractors,
       item_kind_index,
       nested_kind_index,
+      swallow_root_index,
+      recovery_kind_index,
       member_extractors,
       member_index_by_parent,
       options,
     }
+  }
+
+  /// Whether any rule arms swallow recovery (see
+  /// [`crate::extractor::SerializableItemRule::swallow_recovery`]).
+  fn has_swallow_recovery(&self) -> bool {
+    self.swallow_root_index.iter().any(|list| !list.is_empty())
+  }
+
+  /// Whether `kind` is a swallow-root kind (a nested node of this kind is parser recovery).
+  fn is_swallow_root_kind(&self, kind: u16) -> bool {
+    self
+      .swallow_root_index
+      .get(kind as usize)
+      .is_some_and(|list| !list.is_empty())
+  }
+
+  fn extractors_in<'s>(
+    &'s self,
+    index: &'s [Vec<usize>],
+    kind: u16,
+  ) -> impl Iterator<Item = &'s ItemExtractor<L>> + 's {
+    index
+      .get(kind as usize)
+      .map(Vec::as_slice)
+      .unwrap_or(&[])
+      .iter()
+      .map(|&idx| &self.item_extractors[idx])
   }
 
   fn member_scope_for(&self, parent_id: &str) -> Option<ScopedMemberExtractors<'_, L>> {
@@ -155,11 +196,49 @@ impl<L: Language> CombinedExtractors<L> {
   where
     L: LanguageExt,
   {
+    let mut report = Vec::new();
+    self.extract_raw_with(root, &mut report)
+  }
+
+  /// [`CombinedExtractors::extract_raw`] that also reports every parser-swallow recovery
+  /// the walk performed (see [`SwallowRecovery`]) — empty for every file where the
+  /// diagnosis never fired, whose pairs are then exactly the pruned traversal's.
+  pub fn extract_raw_with<'tree>(
+    &self,
+    root: Node<'tree, StrDoc<L>>,
+    report: &mut Vec<SwallowRecovery>,
+  ) -> Vec<(OutlineItem<'tree>, Option<String>)>
+  where
+    L: LanguageExt,
+  {
+    // The end-of-file anchor for the swallow diagnosis: the end of the tree root's last
+    // non-extra child. Taken from the TREE root, not the walk root, so a walk over one
+    // top-level subtree (walk reuse) judges "reaches end-of-file" against the file.
+    // Trailing comments are extras and never move the anchor, so a definition followed
+    // only by a comment still reaches it. No percentages: a node reaches EOF iff nothing
+    // but extras follows it at any level.
+    let anchor = if self.has_swallow_recovery() {
+      root
+        .root()
+        .root()
+        .children()
+        .filter(|child| !child.is_extra())
+        .map(|child| child.range().end)
+        .max()
+        .unwrap_or(0)
+    } else {
+      0
+    };
     OutlineItemIter {
       combined: self,
       traversal: Prune::new(&root),
       scratch: MetaVarEnv::new(),
       render_scratch: RenderScratch::<StrDoc<L>>::new(),
+      anchor,
+      floor: 0,
+      swallowers: Vec::new(),
+      body_kinds: Vec::new(),
+      report,
     }
     .collect()
   }
@@ -187,10 +266,25 @@ impl<L: Language> CombinedExtractors<L> {
   where
     L: LanguageExt,
   {
+    let mut report = Vec::new();
+    self.extract_with(root, &mut report)
+  }
+
+  /// [`CombinedExtractors::extract`] that also reports parser-swallow recoveries (see
+  /// [`CombinedExtractors::extract_raw_with`]).
+  pub fn extract_with<'a, 'tree>(
+    &'a self,
+    root: Node<'tree, StrDoc<L>>,
+    report: &mut Vec<SwallowRecovery>,
+  ) -> impl Iterator<Item = OutlineItem<'tree>> + use<'a, 'tree, L>
+  where
+    L: LanguageExt,
+  {
     // Materialize, then run the semantic-adoption pass (`memberOf` rules): items whose
     // declared owner is a same-file item become its members — Go's detached methods being
     // the motivating shape. File item counts are small; the traversal cost is identical.
-    let collected: Vec<(OutlineItem<'tree>, Option<String>)> = self.extract_raw(root.clone());
+    let collected: Vec<(OutlineItem<'tree>, Option<String>)> =
+      self.extract_raw_with(root.clone(), report);
     let mut items = adopt_members(collected);
     // Nested rules (`nested: true`): a dedicated full-tree pass, because the pruned item
     // traversal above never enters a matched item's subtree — exactly where route
@@ -285,6 +379,22 @@ fn reclaim_env<'tree, D: vorpal_core::Doc>(
   *scratch = env;
 }
 
+/// The pruned item traversal, plus parser-swallow recovery (see
+/// [`crate::extractor::SerializableItemRule::swallow_recovery`]).
+///
+/// Recovery state is three values, all monotone over the walk, so it composes with
+/// nested swallows (a lifted definition that itself ran to EOF) without a stack:
+/// * `floor` — the byte where lifting starts. A diagnosed swallower's real body lies
+///   before its floor (everything there is skipped: locals are not globals); the floor
+///   is the start of the FIRST nested match of a `swallowRecovery` rule found by a
+///   pruned walk of the body — the parser's own resync point, where it began parsing
+///   top-level definitions as block items. A nested swallow can only raise it.
+/// * `swallowers` — node ids of diagnosed swallowers. A candidate is top-level-shaped
+///   iff no swallow-root-kind node (a function-shaped blob the parser fused around
+///   the lost brace: `scoped_guard(x) { … }`, `_Py_COMP_DIAG_POP if (!x) …`) sits
+///   between it and its nearest swallower — locals and loop bodies inside such
+///   wreckage are never lifted.
+/// * `anchor` — the end-of-file anchor (see [`CombinedExtractors::extract_raw_with`]).
 struct OutlineItemIter<'a, 'tree, L: LanguageExt> {
   combined: &'a CombinedExtractors<L>,
   traversal: Prune<'tree, L>,
@@ -294,6 +404,20 @@ struct OutlineItemIter<'a, 'tree, L: LanguageExt> {
   /// One template-render buffer for the file's walk — every rendered name,
   /// signature, and owner rides it (see `TemplateFix::render_into`).
   render_scratch: RenderScratch<StrDoc<L>>,
+  /// End byte of the tree's last non-extra top-level child; 0 when no rule arms recovery.
+  anchor: usize,
+  /// Lift floor (byte); 0 = no swallow diagnosed yet.
+  floor: usize,
+  /// Node ids of diagnosed swallowers AND their body nodes (a swallower's last named
+  /// child), in diagnosis order — the marks `top_level_shaped` walks up to.
+  swallowers: Vec<usize>,
+  /// Kinds of the swallowers' body nodes (`compound_statement`): a candidate under
+  /// another node of such a kind sits in a nested block (a bare `{ … }` the parser kept
+  /// after an unparseable head — `SYSCALL_DEFINE2(...) { struct timespec64 tu; }`), not
+  /// at top level.
+  body_kinds: Vec<u16>,
+  /// One entry per diagnosed swallower; the last entry counts the items lifted so far.
+  report: &'a mut Vec<SwallowRecovery>,
 }
 
 impl<'a, 'tree, L: LanguageExt> Iterator for OutlineItemIter<'a, 'tree, L> {
@@ -383,13 +507,59 @@ impl<'a, 'tree, L: LanguageExt> OutlineItemIter<'a, 'tree, L> {
     node: Node<'tree, StrDoc<L>>,
   ) -> Option<(OutlineItem<'tree>, Option<String>)> {
     let combined = self.combined;
+    let range = node.range();
+    if self.floor > 0 {
+      // Inside a diagnosed swallow. Below the floor is the swallower's real body: skip
+      // whole subtrees that end before it, descend through the ones that straddle it
+      // (the body block itself), and item-match from the floor on.
+      if range.end <= self.floor {
+        self.traversal.skip_subtree();
+        return None;
+      }
+      if range.start < self.floor {
+        self.traversal.descend();
+        return None;
+      }
+    }
     let item_subtree = self.traversal.current_subtree();
-    let Some((extractor, mut node_match)) = combined.match_item(&node, &mut self.scratch) else {
+    let Some((extractor, mut node_match)) = self.match_item_here(&node) else {
       self.traversal.descend();
       return None;
     };
     let member_of = extractor.resolve_member_of(&node_match, &mut self.render_scratch);
-    if extractor.transparent {
+    let lifted = self.floor > 0 && range.start >= self.floor;
+    if extractor.swallow_recovery && self.anchor > 0 && range.end >= self.anchor && node.has_error()
+    {
+      // The swallow diagnosis: a definition that cannot legitimately nest its own kind,
+      // carrying parse errors, reaching end-of-file. It is a swallow iff a pruned walk
+      // of its body finds a nested match of a swallow-root rule (the floor); otherwise
+      // it is just the file's last definition with a damaged body — extracted as usual.
+      if let Some((floor, real_end)) = self.find_floor(&node) {
+        let mut item = extractor.extract(&mut node_match, vec![], &mut self.render_scratch);
+        reclaim_env(&mut self.scratch, &mut node_match);
+        if let Some(real_end) = real_end {
+          crate::extractor::truncate_range_to(&mut item.entry.range, &real_end);
+        }
+        self.swallowers.push(node.node_id());
+        if let Some(body) = node.children().filter(|child| child.is_named()).last() {
+          self.swallowers.push(body.node_id());
+          if !self.body_kinds.contains(&body.kind_id()) {
+            self.body_kinds.push(body.kind_id());
+          }
+        }
+        self.floor = self.floor.max(floor);
+        self.report.push(SwallowRecovery {
+          start: range.start as u32,
+          lifted: 0,
+        });
+        self.traversal.descend();
+        return combined
+          .options
+          .keep_item(&item)
+          .then_some((item, member_of));
+      }
+    }
+    let item = if extractor.transparent {
       // Transparent containers (namespaces, ambient modules): extract the container
       // itself, then keep ITEM-matching inside its body — its contents are items in
       // their own right (classes with their own members), never members of the
@@ -397,18 +567,172 @@ impl<'a, 'tree, L: LanguageExt> OutlineItemIter<'a, 'tree, L> {
       let item = extractor.extract(&mut node_match, vec![], &mut self.render_scratch);
       reclaim_env(&mut self.scratch, &mut node_match);
       self.traversal.descend();
-      return combined
-        .options
-        .keep_item(&item)
-        .then_some((item, member_of));
+      item
+    } else {
+      let members = self.collect_members_for_item(&extractor.common.rule.id, item_subtree);
+      let item = extractor.extract(&mut node_match, members, &mut self.render_scratch);
+      reclaim_env(&mut self.scratch, &mut node_match);
+      item
+    };
+    if !combined.options.keep_item(&item) {
+      return None;
     }
-    let members = self.collect_members_for_item(&extractor.common.rule.id, item_subtree);
-    let item = extractor.extract(&mut node_match, members, &mut self.render_scratch);
-    reclaim_env(&mut self.scratch, &mut node_match);
-    combined
-      .options
-      .keep_item(&item)
-      .then_some((item, member_of))
+    if lifted {
+      // A lifted definition whose name spells a keyword of its own grammar is parser
+      // wreckage (`Py_END_ALLOW_THREADS if (rc) { … }` parses as a function named `if`)
+      // — it exists nowhere; drop it. The check is generic: the grammar's own anonymous
+      // token table says what is a keyword.
+      if Self::keyword_named(&node, &item.entry.name) {
+        return None;
+      }
+      if let Some(last) = self.report.last_mut() {
+        last.lifted += 1;
+      }
+    }
+    Some((item, member_of))
+  }
+
+  /// Whether `name` is an anonymous token (a keyword or punctuation) of the node's
+  /// grammar — a definition can never be called that; the parser produced it by
+  /// recovering a bare macro before a statement as a declaration head.
+  fn keyword_named(node: &Node<'tree, StrDoc<L>>, name: &str) -> bool {
+    !name.is_empty()
+      && node
+        .lang()
+        .get_ts_language()
+        .id_for_node_kind(name, false)
+        != 0
+  }
+
+  /// Item matching at the current node: the ordinary rules, then — only inside a
+  /// diagnosed swallow, from the floor on — the `recoveryOnly` rules. Inside a swallow
+  /// every match must also be top-level-shaped (see [`OutlineItemIter`]); a match that
+  /// is not is treated as no match, so the traversal descends through the wreckage.
+  fn match_item_here(
+    &mut self,
+    node: &Node<'tree, StrDoc<L>>,
+  ) -> Option<(&'a ItemExtractor<L>, NodeMatch<'tree, StrDoc<L>>)> {
+    let combined = self.combined;
+    let in_swallow = self.floor > 0 && node.range().start >= self.floor;
+    if in_swallow && (!self.top_level_shaped(node) || Self::stitched(node)) {
+      return None;
+    }
+    if let Some(found) = combined.match_item(node, &mut self.scratch) {
+      return Some(found);
+    }
+    if !in_swallow {
+      return None;
+    }
+    for extractor in combined.extractors_in(&combined.recovery_kind_index, node.kind_id()) {
+      if let Some(matched) = extractor.match_node_reusing(node, &mut self.scratch) {
+        return Some((extractor, matched));
+      }
+    }
+    None
+  }
+
+  /// Whether the parser stitched foreign tokens into this node's own structure: a direct
+  /// ERROR child. The fusion blob at a swallow's resync point has exactly this shape —
+  /// `_Py_COMP_DIAG_POP if (!oname) … ERROR(`} int next_fn(...)`) { body }` is a
+  /// `function_definition` named `if` whose body is the NEXT function's — and lifting it
+  /// would mint a definition that exists nowhere. Damage nested deeper (a parameter list
+  /// the grammar could not read) is the ordinary top-level case and lifts as usual.
+  fn stitched(node: &Node<'tree, StrDoc<L>>) -> bool {
+    node.has_error() && node.children().any(|child| child.is_error())
+  }
+
+  /// Whether a node inside a diagnosed swallow sits where a top-level definition would:
+  /// walking up to its nearest swallower meets no swallow-root-kind node. A node not
+  /// under any swallower (cannot happen while the floor is set — a swallower reaches
+  /// EOF — but stated) keeps ordinary semantics.
+  fn top_level_shaped(&self, node: &Node<'tree, StrDoc<L>>) -> bool {
+    // Parent steps, nearest first (`ancestors()` walks from the root and allocates).
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+      if self.swallowers.contains(&current.node_id()) {
+        return true;
+      }
+      let kind = current.kind_id();
+      if self.combined.is_swallow_root_kind(kind) || self.body_kinds.contains(&kind) {
+        return false;
+      }
+      ancestor = current.parent();
+    }
+    true
+  }
+
+  /// The floor of a diagnosed swallower: a pruned item walk of its body (never entering
+  /// a matched item — a local struct's fields or a local class's methods are that item's
+  /// members, not candidates) stops at the first match of a swallow-root rule and
+  /// returns its start byte, plus the node whose end is the latest end before the floor
+  /// (the swallower's real extent). `None` = no nested definition, so no swallow.
+  fn find_floor(
+    &mut self,
+    swallower: &Node<'tree, StrDoc<L>>,
+  ) -> Option<(usize, Option<Node<'tree, StrDoc<L>>>)> {
+    let combined = self.combined;
+    let mut walk = Prune::new(swallower);
+    walk.descend();
+    let mut floor = None;
+    while let Some(node) = walk.current_node() {
+      if combined.is_swallow_root_kind(node.kind_id()) {
+        let mut hit = None;
+        let mut wreckage = false;
+        for extractor in combined.extractors_in(&combined.swallow_root_index, node.kind_id()) {
+          if let Some(mut matched) = extractor.match_node_reusing(&node, &mut self.scratch) {
+            // A keyword-named match is the parser's fusion of a bare macro with the
+            // statement after it (`MACRO if (x) { … }`) — inside the swallower's real
+            // body it is a statement, never the resync point. Pruned like any match.
+            let item = extractor.extract(&mut matched, vec![], &mut self.render_scratch);
+            reclaim_env(&mut self.scratch, &mut matched);
+            if Self::keyword_named(&node, &item.entry.name) {
+              wreckage = true;
+            } else {
+              hit = Some(node.range().start);
+            }
+            break;
+          }
+        }
+        if hit.is_some() {
+          floor = hit;
+          break;
+        }
+        if wreckage {
+          walk.skip_subtree();
+          continue;
+        }
+      }
+      if combined.match_item(&node, &mut self.scratch).is_some_and(|(_, mut matched)| {
+        reclaim_env(&mut self.scratch, &mut matched);
+        true
+      }) {
+        walk.skip_subtree();
+      } else {
+        walk.descend();
+      }
+    }
+    let floor = floor?;
+    // The real extent: the latest-ending node that ends at or before the floor. Nodes
+    // ending before the floor need no descent (a node ends no earlier than its
+    // descendants); nodes straddling it are containers to look inside.
+    let mut real_end: Option<Node<'tree, StrDoc<L>>> = None;
+    let mut stack = vec![swallower.clone()];
+    while let Some(container) = stack.pop() {
+      for child in container.children() {
+        let range = child.range();
+        if range.start >= floor {
+          break;
+        }
+        if range.end <= floor {
+          if real_end.as_ref().is_none_or(|best| best.range().end < range.end) {
+            real_end = Some(child);
+          }
+        } else {
+          stack.push(child);
+        }
+      }
+    }
+    Some((floor, real_end))
   }
 
   fn collect_members_for_item(

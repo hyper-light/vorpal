@@ -3633,3 +3633,155 @@ never a code paragraph) would keep the C-function regressions on cpython (`mro_i
 rates are the two QUIET rows above only; (5) three kernel paraphrase answers are outside
 every 10-minute round (unreferenced or too deep in the degree order) and no surface can
 reach them — the stop rule / coverage lead recorded earlier.
+
+## Parser swallow recovery — definitions tree-sitter parsed inside an unclosed body (2026-09-03)
+
+**The bug.** tree-sitter-c admits `function_definition` as a block item. When a bare
+statement-position macro wrecks a body (`_Py_COMP_DIAG_PUSH`, `scoped_guard(x) { }`,
+`#define N(v)` + `N(UP) N(DOWN)`), the parser loses the closing brace, and every later
+definition in the file parses INSIDE that body — no ERROR node ever appears at top
+level, the byte-ratio health policy calls the file clean (`Objects/object.c`: 0.3 %),
+and the pruned item traversal never looks inside a matched item. cpython
+`Objects/object.c` was indexed only up to `_PyObject_GetAttrId` (L1267 → EOF; 65 of 142
+function heads); kernel `net/core/dev.c` lost everything after `netdev_cmd_to_name`
+(L1860 → EOF, `netif_receive_skb` among the losses), `kernel/time/hrtimer.c` everything
+after `clock_was_set` (L975: `hrtimer_interrupt`, `hrtimer_start_range_ns`).
+
+**The fix is extractor-side** (memory law: the vendored C grammar stays untouched —
+the attribute_macro fix regressed real C at scale). `crates/outline/src/combined_extractor.rs`,
+`OutlineItemIter`:
+
+* *Trigger — a parse shape, armed by a grammar fact.* A rule declares
+  `swallowRecovery: true` (C and C++ `function_definition`: a node of this kind can never
+  legitimately contain another of its kind, so a nested one is parser recovery). A match
+  of such a rule is diagnosed when it **carries errors** (`has_error`), **reaches
+  end-of-file** — its end is not before the tree root's last non-extra child's end
+  (comments are extras; no percentages), and a pruned walk of its body finds a nested
+  match of a swallow-root rule: the **floor**. No floor, no swallow — the file's last
+  definition with a damaged body extracts exactly as before.
+* *Body boundary = the floor.* The floor is the first nested swallow-root match whose
+  name is NOT a keyword of its own grammar (`id_for_node_kind(name, anonymous)`) — a
+  keyword-named match (`Py_END_ALLOW_THREADS if (x) { … }` parses as a function named
+  `if`) is the parser's fusion of a bare macro with the statement after it, a statement
+  inside the real body, never the resync point. Chosen over "first ERROR beginning with
+  `}`" because the lost brace is usually fused INTO a node (object.c: inside the `if`
+  blob's ERROR child; hrtimer: inside the `scoped_guard` blob), not a sibling ERROR. The
+  swallower's span is cut back to the latest node ending before the floor.
+* *Lifting.* From the floor on, every node is item-matched as if top-level, subject to
+  three structural tests: (1) **top-level shape** — walking up to the nearest diagnosed
+  swallower (or its body node) meets no swallow-root-kind node and no node of a
+  swallower's body kind (locals inside `scoped_guard { }` / `for_each_x(c) { }` blobs and
+  bare `{ }` blocks after unparseable heads are never lifted); (2) **not stitched** — no
+  direct ERROR child (the object.c blob: `_Py_COMP_DIAG_POP if (!oname) … ERROR(`} int
+  next(…)`) { next's body }`); (3) **not keyword-named**. `recoveryOnly: true` rules
+  match only here — `c-recovered-variable` is `c-global-variable` minus the
+  `not inside compound_statement` guard the mis-nesting defeats. Nested swallows compose
+  (the floor only rises).
+* *Products* gain `swallows: [(start, lifted)]` (`PRODUCT_FORMAT_VERSION` 19 → 20 — the
+  decoders reject trailing bytes so no compatible extension existed; the C rule edit
+  re-keys every product through the rules digest anyway, so the bump costs nothing
+  extra). `vorpal-index health` prints "swallowed tail recovered: N definitions lifted
+  from `f` (line L)" per file and a total in its header. Files where the diagnosis fires
+  never enter the walk-reuse fast path (no snapshot captured; a dirty-subtree walk that
+  reports one falls back to the full walk) — lifted items live inside a top-level
+  subtree, which the region model does not describe. Respan / defs-stable /
+  defs-changed gates compare the recovery vector (count + lifted, starts excepted).
+
+**Measurements** (this M-series, `cargo build --release`, corpora read-only, indexes in
+scratch, deleted after; base = `afffe07` built from a `git archive` into scratch).
+
+| corpus | nodes before → after | files fired | lifted | product byte-identity oracle (`crates/index/examples/product_hashes.rs`) |
+|---|---:|---:|---:|---|
+| linux kernel (75,954 files) | 8,890,840 → **8,891,771** (+931) | 25 | 906 | 75,954 bodies compared: changed = fired = 25, 0 unexplained |
+| cpython (3,841) | 162,813 → **162,945** (+132) | 3 | 132 | changed = fired = 3, 0 unexplained |
+| vorpal (self) | 79,510 → 79,576 | 1 (jemalloc `conf.c`) | 2 | changed = fired + the 12 sources this change edits |
+
+Per file: `Objects/object.c` 100 definitions lifted from `_PyObject_GetAttrId`
+(`PyObject_GetAttr` / `SetAttr` / `IsTrue` / `Not`, `PyCallable_Check`,
+`PyObject_GenericGetAttr`, `_Py_NoneStruct`, … all present; `vorpal graph callers
+PyObject_GetAttr` resolves 16 callers); `net/core/dev.c` 431 from `netdev_cmd_to_name`
+(`netif_receive_skb`, `__netif_receive_skb`; `callers netif_receive_skb` resolves);
+`kernel/time/hrtimer.c` 59 from `clock_was_set` (`hrtimer_interrupt`,
+`hrtimer_start_range_ns`). `kzalloc_noprof` (`include/linux/slab.h:1292`) is NOT a
+swallow — a variadic `#define` right after a `static inline __alloc_size(1) void *`
+definition, lost to the attribute-macro declarator shape (the closed grammar lead);
+recorded, not changed.
+
+**Coverage probe re-read** (`crates/ingest/examples/structural_coverage.rs`, now with an
+extraction-aware residual column). The parse-shape count that motivated this work (8,428
+kernel files / 5.9 % of bytes; 256 cpython / 18.4 %) over-counts: by swallowing-node
+kind the kernel is 5,069 `preproc_ifdef` (header guards with an error inside — the
+traversal descends through them, definitions inside were always reached), 2,457
+`function_definition`, 349 ERROR, 227 `declaration`, …; of the 2,457 function shapes
+2,396 hold no nested function at all (the file's LAST function, damaged, nothing after
+it), 29 hold only parenthesized-declarator macro loops (`for_each_x(c) { }`, legit body
+constructs), 7 are function-shaped nodes `c-function` never matched (an ERROR `enum`
+before the name — the traversal descended into them all along), and 25 fired. The
+`declaration`-kind swallows (227 / 12) hold no nested function definition. Extraction-aware
+residual after the fix: kernel **0.48 %** of bytes past a swallow start with no item
+(from 5.88 % under the parse-shape count), cpython **8.39 %** (from 18.39 %) — the
+cpython residual is `Python/generated_cases.c.h` (587 KB of `TARGET()` case blocks, a
+file included inside a function) and the `_ssl_data_*.h` tables: no definitions to lift.
+
+**False-positive oracle** (kernel and cpython put every top-level definition at column
+0, so a lifted item off column 0 is a candidate false positive): kernel 6 of 906 — all six
+real definitions whose `static __always_inline struct sk_buff *` head the parser split
+(`sch_handle_ingress`, `tcx_run`, `clock_base_next_timer_safe`), cpython **0 of 132**.
+Before the keyword-floor and body-kind rules landed the count was 20 / 966 (kernel) and
+69 / 276 (cpython): `Py_END_ALLOW_THREADS if (…)` blobs lifted as functions named `if`,
+their followers' locals lifted as globals, `SYSCALL_DEFINE2(…) { struct timespec64 tu; }`
+leaking `tu` — the two rules removed every one, and five cpython files that had "fired"
+on nothing but such blobs (`_winapi.c`, `timemodule.c`, …) now correctly do not fire.
+Parity note: `static DECLARE_WORK(a, b);` mints an empty-named variable in the lift
+exactly as the ordinary traversal does at top level (a MISSING identifier) — pre-existing,
+recorded.
+
+**Walls** (kernel, quiet machine, `uptime` load < 4 at the cold runs; edit walls on a
+scratch copy of the tree): cold **8.24 / 8.83 s** (base 8.21 / 9.05; band 7.9–9.5);
+unchanged **0.13 s**; one-shot body edit `kernel/sched/fair.c` **0.51 s**, touch 0.56 s;
+body-comment edit inside the LIFTED `netif_receive_skb` (`net/core/dev.c`, a fired file
+on the full-walk path) **0.75 s** (base 0.74 s). A head edit that changes a lifted
+definition's signature takes 4.25 s — the defs-changed lane declining scoped resolution
+("session imports diverge from the carried reach graph") and running the full pipeline;
+the control (the same edit on `update_curr_fair` in fair.c) costs 4.18 s on the fix and
+4.23 s on base: the lane's own cost for these files, not the recovery's. Under base the
+dev.c head edit was 0.76 s only because the definition did not exist.
+
+**Battery** (`scripts/convergence_battery.sh`, ast-grep + cpython, next lane): **PASS**
+(scratch determinism + S1–S6 on both). **Ledger** (`--features alloc-ledger`,
+`VORPAL_PHASE_TRACE=1`, kernel cold, allocs at `commit: content-id hash start`): fix
+7.61 / 7.86 / 8.00 M over three runs, base 7.78 / 7.78 M — within the run-to-run spread
+(rayon scheduling), within the ≤ 8.5 M band; `ts_allocs` 16.12 M both.
+
+**Retrieval** (`xtask searcheval`, fresh `--semantic-tier learned` + `__warm-ann`, no
+encoder, `VORPAL_NO_AUTOWARM=1`; all-NDCG@10 / MRR / recall@5):
+
+| corpus | base | fix |
+|---|---|---|
+| cpython (54) | 0.340 / 0.320 / 0.389 | 0.341 / 0.322 / 0.389 (conjunctive 0.157 → 0.176) |
+| kernel (54) | 0.313 / 0.303 / 0.361 | 0.315 / 0.304 / 0.361 (short-kw 0.276 → 0.282, subset 0.536 → 0.542) |
+
+The label sets cannot show the recovered symbols: `hrtimer_interrupt`,
+`hrtimer_start_range_ns`, `netif_receive_skb`, `PyObject_GenericGetAttr`,
+`PyCallable_Check` were DROPPED from the sets because the existence gate failed
+(`xtask/labels/*.evidence.md`); every one of them now exists in the index and the label
+owner can re-admit them. `kzalloc_noprof` stays absent (above).
+
+**Gates:** `cargo test --workspace --release` green; `cargo clippy --workspace
+--all-targets -- -D warnings`, its `--release` twin, and `-p vorpal-py --features python`
+clean; outline unit tests pin the object.c shape, the hrtimer macro-block shape, and the
+no-swallow last-definition case (`crates/outline/tests/c_family_outline_rules.rs`); the
+index-level fixture `crates/index/tests/fixtures/swallow-shape/object_tail.c` +
+`tests/swallow_recovery.rs` pins graph presence, call resolution INTO and FROM lifted
+definitions, the swallower's cut span, and the health lines. Also fixed on the way:
+`vorpal-index health` reported cpython "clean" (591 damaged files) because the bucketed
+pack's inferred root declined and absolute graph paths missed relative pack keys — the
+report now resolves the root from the graph's paths.
+
+**Not achieved / open:** definitions fused INTO the parser's resync blob (object.c's
+`_PyObject_SetAttributeErrorContext`, whose head sits inside an ERROR node) have no node
+to lift; swallows rooted in a `declaration` or `struct_specifier` carry no nested
+function definitions in either corpus, so nothing arms there; C++ is armed by the same
+grammar fact but measured only on the fixture set — the polyglot canary is the
+coordinator's at merge; the walk-reuse fast path simply excludes fired files (25 kernel
+files) rather than modelling lifted items.

@@ -55,6 +55,15 @@ isExported:
     has:
       kind: storage_class_specifier
       regex: ^static$
+# Parser-swallow recovery (grammar fact): C forbids nested function definitions, yet
+# tree-sitter-c admits `function_definition` as a block item — so once a bare
+# statement-position macro wrecks a body and the closing brace is lost, every later
+# definition in the file parses INSIDE that body with no top-level ERROR (cpython
+# `Objects/object.c` from `_PyObject_GetAttrId`: 77 of 142 functions absent; kernel
+# `net/core/dev.c`: 422; 8,428 kernel files carried the shape). A nested function
+# definition is therefore parser recovery, and the traversal lifts the swallowed
+# definitions as top-level items. See `SerializableItemRule::swallow_recovery`.
+swallowRecovery: true
 ---
 id: c-struct
 language: C
@@ -165,6 +174,61 @@ name: $NAME
 # fake cross-file edges to it, AND it sat in the global symbol table as a candidate that
 # call/type resolution could tie against or mispick. Direct-child check only (locals are
 # already excluded by the compound_statement guard above).
+isExported:
+  not:
+    has:
+      kind: storage_class_specifier
+      regex: ^static$
+---
+id: c-recovered-variable
+language: C
+role: item
+symbolType: variable
+# `c-global-variable` for the swallow-recovery walk only: identical, minus the
+# `not inside compound_statement` guard — a global declaration the parser swallowed
+# into a definition's body IS inside a compound_statement (`PyTypeObject _PyNone_Type
+# = { … }` after the `_PyObject_GetAttrId` swallow). The walk itself supplies the
+# scope discipline this guard encoded: it matches only from the floor on, only at
+# top-level shape (never inside the function-shaped wreckage or a lifted body), so a
+# local can never reach this rule. See `SerializableItemRule::recovery_only`.
+recoveryOnly: true
+rule:
+  all:
+    - kind: declaration
+    - has:
+        field: declarator
+        any:
+          - kind: identifier
+            pattern: $NAME
+          - has:
+              kind: identifier
+              stopBy: end
+              pattern: $NAME
+    - not:
+        has:
+          field: declarator
+          any:
+            - kind: function_declarator
+            - has:
+                kind: function_declarator
+                stopBy: end
+    - not:
+        has:
+          field: type
+          any:
+            - all:
+                - kind: struct_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: union_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: field_declaration_list }
+            - all:
+                - kind: enum_specifier
+                - has: { field: name, kind: type_identifier }
+                - has: { field: body, kind: enumerator_list }
+name: $NAME
 isExported:
   not:
     has:

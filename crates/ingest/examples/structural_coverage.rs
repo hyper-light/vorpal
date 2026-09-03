@@ -26,6 +26,12 @@ fn main() {
   let mut swallowed_bytes = 0u64;
   let mut total_bytes = 0u64;
   let mut below = 0usize;
+  // Extraction-aware residual: of a file's swallowed tail, the bytes past the END of the
+  // last outline item extraction produced there (the tail extraction never reached).
+  let mut residual_bytes = 0u64;
+  let mut residual_files = 0usize;
+  let mut recovered_files = 0usize;
+  let extractor = vorpal_ingest::OutlineExtractor::new().expect("bundled rules compile");
   let out = std::io::stdout();
   let mut out = out.lock();
   for f in &files {
@@ -45,6 +51,7 @@ fn main() {
     // rest of the file. Coverage = the start of the FIRST such swallowing node
     // (the tail from there is inside it), else full.
     let mut reached = src.len();
+    let mut kind = String::new();
     let eof = src.len();
     for c in r.children() {
       let range = c.range();
@@ -54,6 +61,7 @@ fn main() {
       let spans_tail = (eof - range.start) as f64 / eof as f64 > 0.05;
       if ends_at_eof && spans_tail && (c.is_error() || c.has_error()) {
         reached = range.start;
+        kind = c.kind().into_owned();
         break;
       }
     }
@@ -63,11 +71,32 @@ fn main() {
     if cov < 0.999 {
       below += 1;
       swallowed_bytes += (src.len() - reached) as u64;
+      let product = extractor.extract_product(&path, &src);
+      let last_item_end = product
+        .as_ref()
+        .map(|p| {
+          p.items
+            .iter()
+            .filter(|i| i.entry.range.byte_offset.start > reached)
+            .map(|i| i.entry.range.byte_offset.end)
+            .max()
+            .unwrap_or(reached)
+        })
+        .unwrap_or(reached);
+      let residual = (src.len() - last_item_end) as u64;
+      residual_bytes += residual;
+      if last_item_end > reached {
+        recovered_files += 1;
+      } else {
+        residual_files += 1;
+      }
+      let fired = product.as_ref().is_some_and(|p| !p.swallows.is_empty());
       let line = src[..reached].matches('\n').count() + 1;
       let total = src.matches('\n').count() + 1;
-      let _ = writeln!(out, "{:.3}\t{}\t{}\t{}", cov, line, total, path.strip_prefix(root.to_string_lossy().as_ref()).unwrap_or(&path));
+      let _ = writeln!(out, "{:.3}\t{}\t{}\t{}\t{}\t{}\t{}", cov, line, total, kind, residual, fired, path.strip_prefix(root.to_string_lossy().as_ref()).unwrap_or(&path));
     }
   }
   let _ = writeln!(out, "SUMMARY files={} below_full={} swallowed_bytes={} of {} ({:.2}%)", files.len(), below, swallowed_bytes, total_bytes, swallowed_bytes as f64 * 100.0 / total_bytes.max(1) as f64);
+  let _ = writeln!(out, "EXTRACTION residual_bytes={} ({:.2}%) files_with_items_past_swallow_start={} files_with_none={}", residual_bytes, residual_bytes as f64 * 100.0 / total_bytes.max(1) as f64, recovered_files, residual_files);
   let _ = writeln!(out, "HISTOGRAM(coverage decile: files) {:?}", buckets);
 }

@@ -160,6 +160,7 @@ fn product_from_parts(parts: product::ExtractedParts<'_>) -> FileProduct {
       error_nodes: parts.error_nodes,
       error_bytes: parts.error_bytes,
       error_spans: parts.error_spans,
+      swallows: parts.swallows,
       items: parts.items.into_iter().map(product::own_item).collect(),
       // The batch-path ownership point: names/qualifiers rode through extraction as borrows
       // of `source`; they are copied exactly once, here, into the detachable product.
@@ -614,6 +615,15 @@ impl OutlineExtractor {
       && crate::tree_cache::retainable(source.len())
       && crate::tree_cache::wants_snapshot(path);
 
+    // Parser-swallow recoveries this extraction performed (see
+    // `vorpal_outline::model::SwallowRecovery`). A file where the diagnosis fires never
+    // enters the walk-reuse fast path, on either side: no snapshot is captured for it and
+    // a fresh dirty-subtree walk that reports one abandons the splice. Lifted items live
+    // INSIDE a top-level subtree, so the region model's "items are top-level children"
+    // geometry does not describe them; the full walk is exact and the shape is rare
+    // (5.9 % of kernel bytes before the fix, all of it now recovered by the full walk).
+    let mut swallows: Vec<vorpal_outline::model::SwallowRecovery> = Vec::new();
+
     // Reuse attempt, item side: resolve retained items around the dirty region and walk
     // only the dirty top-level subtrees fresh. Any geometry violation abandons the whole
     // attempt (`plan = None`) and the full path below runs unchanged.
@@ -648,8 +658,15 @@ impl OutlineExtractor {
       for child in grep.root().children() {
         let range = child.range();
         if (range.start as u32) < dirty.new.end && (range.end as u32) > dirty.new.start {
-          fresh.extend(c.extract_raw(child));
+          fresh.extend(c.extract_raw_with(child, &mut swallows));
         }
+      }
+      if !swallows.is_empty() {
+        swallows.clear();
+        if trace_reuse {
+          eprintln!("[walk-reuse] {path}: swallow recovery fired in the dirty region — full walk");
+        }
+        break 'reuse;
       }
       // Containment: every fresh item must sit inside the dirty span, or the region
       // model missed something and reuse is off the table.
@@ -692,13 +709,15 @@ impl OutlineExtractor {
       match (want_snap, combined) {
         (true, Some(c)) => {
           // `want_snap` implies `!has_nested`, so raw + adopt IS `extract`.
-          let collected = c.extract_raw(grep.root());
-          cap_items = Some(crate::walk_reuse::capture_items(&collected, source));
+          let collected = c.extract_raw_with(grep.root(), &mut swallows);
+          if swallows.is_empty() {
+            cap_items = Some(crate::walk_reuse::capture_items(&collected, source));
+          }
           items = c.adopt(collected);
         }
         _ => {
           items = combined
-            .map(|c| c.extract(grep.root()).collect())
+            .map(|c| c.extract_with(grep.root(), &mut swallows).collect())
             .unwrap_or_default();
         }
       }
@@ -1128,6 +1147,7 @@ impl OutlineExtractor {
       error_nodes,
       error_bytes,
       error_spans,
+      swallows,
       items,
       refs,
       entity_params,
