@@ -3069,3 +3069,336 @@ run carried the encoder (60 ms vs 1.3 s mean). Eight queries flip on one rank; t
   `alloc_skb`, `tcp_cong_avoid_ai`, `mutex_lock`, `request_threaded_irq`. Seven of thirteen
   short-keyword answers are absent from the top 25 on the learned tier; the class's
   verdicts now move on several queries, not one.
+
+## Two-field surfaces — rich sidecar, head rerank (2026-09-03)
+
+The "Surface-recipe A/B" above ran under the one-recipe law (sidecar and rerank share one
+`SurfaceRecipe`), so the richer recipes paid twice: the sidecar gained paraphrase rank
+while the rerank re-encoded longer candidate surfaces on every query (3.3× latency) and
+diluted its exact-name evidence (`Postings` fused #1 → #6–8). This pass breaks the law
+deliberately: `dense::SurfacePair { sidecar, rerank }` — the SIDECAR embeds
+`HeadDocBody` (head + leading doc comment + body head; comment family by extension,
+attribute lines skipped, the derived 398-token cap, per-definition fallback to head with
+counts), the RERANK keeps `Head` (`name signature basename`). `ann.dense.json` carries
+both labels (`surface`, `rerank_surface`); freshness demands both, a pre-two-field record
+reads `rerank_surface = surface`; a resume under another pair starts over.
+`VORPAL_SURFACE_RECIPE=<sidecar>/<rerank>` sweeps the pair under `bench-internals`
+(`body/head` is the pin, `head/head` the shipped v0.7.0 pair, `body/body` the one-recipe
+rich reference; a bare `<recipe>` sets both). The dense list's LENGTH is the second seam:
+`DenseSidecar::depth(pool)` = `DENSE_DEPTH_FACTOR × pool` (pinned 1) with
+`VORPAL_DENSE_DEPTH=<factor>|share` (`share` = pool × ⌈population / covered⌉).
+
+Substrate: fresh `--semantic-tier learned` indexes of the worktree at v0.7.0 + this
+branch (79,431 nodes), cpython (162,813) and the kernel (8.89 M), tier-warmed with the
+shipped v0.7.0 binary, sidecars filled by this branch's binary under the pinned
+referenced-only rule; encoder f32 via `vorpal enable semantic-f32` into a scratch
+`VORPAL_HOME`; `VORPAL_NO_AUTOWARM=1`. "Shipped" = a pristine release build of `eaa0f7e`
+(same target dir, sources stashed) reading the `head/head` sidecar — its freshness ignores
+`rerank_surface`, so the same files serve both binaries. **The whole pass was CONTENDED**
+(`uptime` load 25–90 throughout: two concurrent agents' builds and fills on this machine);
+every wall-clock / tok/s / latency figure below says so, the ranking figures are
+deterministic (double-run gate) and unaffected. Label sets: the OLD v0.7.0 sets (10 / 6 /
+8 queries) and the NEW 55 / 54 / 54 sets (`labels-50`, `5444b71`, cherry-picked onto this
+branch; kernel with `--root`).
+
+### vorpal (self-index) — per class, NDCG@10 / MRR / recall@5
+
+OLD set (10 queries):
+
+| pair (sidecar / rerank) | binary | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** | searcheval mean |
+|---|---|---|---|---|---|---|---|---|---:|
+| head / head | shipped | 0.500/0.333/1.000 | 0.815/0.750/1.000 | 1/1/1 | 0/0/0 | 0.894/1.000/0.750 | 1/1/1 | **0.692/0.683/0.750** | 1.05–1.51 s |
+| head / head | this branch | 0.500/0.333/1.000 | 0.815/0.750/1.000 | 1/1/1 | 0/0/0 | 0.894/1.000/0.750 | 1/1/1 | **0.692/0.683/0.750** (= shipped) | 1.13–1.57 s |
+| **body / head (pin)** | this branch | 0.500/0.333/1.000 | 0.815/0.750/1.000 | 1/1/1 | 0/**0.025**/0 | 0.894/1.000/0.750 | 1/1/1 | **0.692/0.688/0.750** | 0.88–0.92 s |
+| body / head, channel only | this branch | 0.631/0.500/1.000 | 0.693/0.600/1.000 | 1/1/1 | 0/0.026/0 | 0.947/1.000/0.750 | 1/1/1 | 0.691/0.675/0.750 | 0.07–0.11 s |
+| body / head, depth ×2 / ×4 / share (×7) | this branch | 0.500/0.333/1.000 | 0.815/0.750/1.000 | 1/1/1 | 0/0.024/0 | 0.894/1.000/0.750 | 1/1/1 | 0.692/0.688/0.750 | 0.93–1.17 s |
+| body / body (one-recipe rich) | this branch | 0.333/0.143/0 | 0.815/0.750/1.000 | 1/1/1 | 0/0.036/0 | 0.894/1.000/0.750 | 1/1/1 | 0.675/0.671/0.650 | 3.3–3.8 s |
+
+NEW set (55 queries; 10 paraphrase, 13 descriptive):
+
+| pair (sidecar / rerank) | binary | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** | searcheval mean |
+|---|---|---|---|---|---|---|---|---|---:|
+| head / head | shipped | 0.506/0.573/0.800 | 0.393/0.323/0.423 | 0.986/1/1 | 0/0/0 | 0.876/0.896/0.917 | 0.763/0.676/0.857 | **0.571/0.555/0.627** | 1.91 s |
+| head / head | this branch | 0.506/0.573/0.800 | 0.393/0.323/0.423 | 0.986/1/1 | 0/0/0 | 0.876/0.896/0.917 | 0.763/0.676/0.857 | **0.571/0.555/0.627** (= shipped) | 0.87 s |
+| head / head, channel only | shipped | 0.520/0.600/0.700 | 0.296/0.242/0.308 | 0.990/1/1 | 0/0/0 | 0.888/0.892/0.958 | 0.797/0.726/0.929 | 0.556/0.544/0.609 | 0.07 s |
+| **body / head (pin)** | this branch | 0.505/0.573/0.800 | **0.429/0.357/0.423** | 0.986/1/1 | 0/**0.009**/0 | 0.877/0.896/0.917 | 0.750/0.676/0.857 | **0.577/0.565/0.627** | 1.06 s |
+| body / head, channel only | this branch | 0.529/0.600/0.900 | 0.322/0.259/0.308 | 0.990/1/1 | **0.032/0.018/0** | 0.888/0.892/0.958 | 0.797/0.750/0.929 | 0.569/0.554/0.627 | 0.10 s |
+| body / head, depth ×2 = ×4 = share (×7) | this branch | 0.506/0.573/0.800 | 0.428/0.355/0.423 | 0.986/1/1 | 0/0.009/0 | 0.877/0.896/0.917 | 0.763/0.676/0.857 | 0.579/0.565/0.627 | 0.68–0.84 s |
+| body / body (one-recipe rich) | this branch | 0.619/0.595/0.700 | 0.485/0.412/0.654 | 0.990/1/1 | 0.067/0.057/0.100 | 0.896/0.917/0.917 | 0.736/0.665/0.786 | 0.616/0.592/0.682 | **5.89 s** |
+
+### vorpal — the paraphrase targets: dense rank (1-based, over the 11,751 covered rows) and fused rank (k = 25, 0-based)
+
+| query | answer (grade) | dense rank, head sidecar | dense rank, body sidecar | fused, head/head | fused, body/head | fused, body/body |
+|---|---|---:|---:|---|---|---|
+| near duplicate code detection | `similar_pairs` (3) | 490 | **8** | — | **19** | 14 |
+| who called what at runtime | `ObservedStore` (2) | 1,758 | **41** | — | — | — |
+| definition text presented to encoder | `SurfaceRecipe` (3) | 3,120 | 2,861 | — | — | — |
+| which definitions the fill embeds | `CoverageRule` (3) | 5,640 | 5,438 | — | — | — |
+| run indexer as child process | `Supervisor` (3) | 721 | **25** | — | — | — |
+| why no edge to a name | `explain_absence_on` (3) | not covered (unreferenced) | not covered | — | — | — |
+| skip entity whose content hash matches | `is_unchanged` (3) | not covered | not covered | — | — | — |
+| files edited together in git history | `Cochange` (3) / `CochangeEdge` (2) | 171 / 119 | 261 / **90** | — | — | — |
+| serialize a reference to fixed width bytes | `encode_record` (3) | 28 | **18** | — | — | 1 |
+| greedy longest match segmentation | `word_pieces` (3) | 3,298 | **1** | — | **23** | — |
+
+Grade-3 answers inside the dense top-100: **1 → 4** of 10 (any grade ≥ 2 label: 1 → 6);
+inside the fused top-25: 0 → 2 (body/head) / 2 (body/body). Two answers are unreferenced
+in this graph and outside the stop rule's population under every recipe. The old two
+probe targets (BENCHMARKS "Surface-recipe A/B": `similar_pairs` 292 → 99, `ObservedStore`
+6,673 → 164 at full coverage) move much further under the referenced-only rule — the
+11.7 K-row population has fewer distractors — to **8** and **41**.
+
+**Why depth cannot finish the job, and what can.** `word_pieces` is dense #1 under the
+body sidecar and lands at fused #24 with score 0.0167 = 1/60: `channels [dense#1]`, a
+single-list candidate, and RRF(K = 60) ranks every two-list pair with both ranks < 60
+(2/(60+r) > 1/60) above it. The fusion truncates to k BEFORE the rerank, so a candidate
+only the dense list carries at rank r needs r ≤ k − 1 to be seen at all, and even at r = 0
+it sits behind every consensus pair. Deeper dense lists (×2, ×4, ×7 = the coverage-share
+projection 74,859 / 11,751) change the pinned all-NDCG by +0.002 on the new set (through
+candidates another list also carries) and move no paraphrase answer — as the bound says
+they cannot. `DENSE_DEPTH_FACTOR` is therefore pinned at 1 (the sweep and the bound, not a
+guess). The remaining lever is the FUSION's treatment of single-list dense evidence (K,
+per-channel weight, or a dense-only reserve slot) — the fusion owner's seam, outside this
+pass; with the body sidecar it now has 4 of 10 vorpal answers inside the dense top-25 to
+work with, where the head sidecar gave it one.
+
+### cpython — per class, NDCG@10 / MRR / recall@5
+
+OLD set (6 queries: 4 descriptive, 2 short-keyword):
+
+| pair (sidecar / rerank) | binary | descriptive | short-kw | **all** | searcheval mean |
+|---|---|---|---|---|---:|
+| head / head | shipped | 0.420/0.348/0.375 | 0.349/0.571/0.250 | **0.396/0.423/0.333** | 1.30 s |
+| head / head | this branch | 0.420/0.348/0.375 | 0.349/0.571/0.250 | **0.396/0.423/0.333** (= shipped) | 1.59 s |
+| head / head, channel only | shipped | 0.540/0.500/0.625 | 0.407/0.550/0.250 | 0.496/0.517/0.500 | 0.25 s |
+| **body / head (pin)** | this branch | 0.361/0.344/0.375 | 0.349/0.571/0.250 | 0.357/0.420/0.333 | 1.17 s |
+| body / head, channel only | this branch | 0.540/0.500/0.625 | 0.424/0.571/0.250 | **0.502/0.524/0.500** | 0.18 s |
+| body / head, depth ×4 | this branch | 0.420/0.348/0.375 | 0.349/0.571/0.250 | 0.396/0.423/0.333 | 1.18 s |
+| body / body | this branch | 0.388/0.331/0.375 | 0.391/0.625/0.500 | 0.389/0.429/0.417 | 3.06 s |
+
+NEW set (54 queries; 9 paraphrase, 13 descriptive):
+
+| pair (sidecar / rerank) | binary | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** | searcheval mean |
+|---|---|---|---|---|---|---|---|---|---:|
+| head / head | shipped | 0.347/0.415/0.300 | 0.254/0.197/0.269 | 0.938/0.917/1 | 0/0/0 | 0.555/0.578/0.654 | 0.498/0.480/0.500 | **0.421/0.414/0.454** | 1.93 s |
+| head / head | this branch | 0.347/0.415/0.300 | 0.254/0.197/0.269 | 0.938/0.917/1 | 0/0/0 | 0.555/0.578/0.654 | 0.498/0.480/0.500 | **0.421/0.414/0.454** (= shipped) | 1.13 s |
+| head / head, channel only | shipped | 0.410/0.422/0.200 | 0.238/0.204/0.269 | 0.929/0.906/1 | 0/0/0 | 0.607/0.589/0.692 | 0.460/0.417/0.500 | 0.430/0.411/0.454 | 0.45 s |
+| **body / head (pin)** | this branch | 0.390/0.420/0.300 | 0.208/0.187/0.269 | 0.938/0.917/1 | 0/0/0 | 0.555/0.578/0.654 | 0.498/0.481/0.500 | 0.414/0.412/0.454 | 1.15 s |
+| body / head, channel only | this branch | 0.420/0.433/0.200 | 0.253/0.223/0.346 | 0.929/0.906/1 | 0/0/0 | 0.601/0.577/0.692 | 0.481/0.445/0.417 | **0.436/0.417/0.463** | 0.15 s |
+| body / head, depth ×2 | this branch | 0.390/0.420/0.300 | 0.208/0.188/0.269 | 0.938/0.917/1 | 0/0/0 | 0.563/0.578/0.654 | 0.498/0.481/0.500 | 0.416/0.412/0.454 | 1.16 s |
+| body / head, depth ×4 = share (×5) | this branch | 0.390/0.420/0.300 | 0.226/0.189/0.269 | 0.938/0.917/1 | 0/0/0 | 0.563/0.578/0.654 | 0.498/0.481/0.500 | 0.420/0.413/0.454 | 0.71–1.09 s |
+| body / body | this branch | 0.451/0.467/0.400 | 0.255/0.204/0.346 | 0.929/0.906/1 | 0/0/0 | 0.552/0.551/0.615 | 0.503/0.483/0.583 | 0.430/0.413/0.481 | 3.53 s |
+
+cpython paraphrase targets (dense rank, 1-based, over 35,292 covered rows; NO pair puts any
+of the 9 into the fused top-25):
+
+| query | answer (grade) | dense rank, head | dense rank, body |
+|---|---|---:|---:|
+| release the interpreter lock | `drop_gil` (3) / `PyEval_ReleaseThread` (2) | 2,352 / 326 | **96** / **76** |
+| C3 linearization of base classes | `mro_implementation` (3) | 290 | 2,333 |
+| run handlers for delivered interrupts | `PyErr_CheckSignals` (3) | 1,135 | 622 |
+| binary search for where a key belongs in a sorted run | `gallop_left` (3) / `gallop_right` (2) | 6,194 / 1,741 | 276 / 121 |
+| memoize call results | `cache` (3) / `lru_cache` (2) | 224 / 1,211 | 450 / 3,579 |
+| clone object recursively | `deepcopy` (3) | 13 | **2** |
+| ignore given errors inside with statement | `suppress` (3) | 2,089 | 1,667 |
+| turn an error into printable lines | `format_exception` (3) / `format_exc` (2) | 277 / 96 | 866 / 90 |
+| recursively list every subfolder | `walk` (3) | 81 | 69 |
+
+Grade-3 answers inside the dense top-100: 2 → 3 of 9 (any grade ≥ 2: 3 → 4). The body
+recipe is NOT monotone here: it lifts the definitions whose first paragraph is a
+docstring or a doc comment (`deepcopy` 13 → 2, `drop_gil` 2,352 → 96, `gallop_left`
+6,194 → 276) and sinks the C functions whose body head is code (`mro_implementation`
+290 → 2,333, `cache` 224 → 450, `format_exception` 277 → 866) — the body clause is a
+docstring proxy that pays off per language, which is why the recipe's per-corpus effect
+on the rerank-on all-NDCG is a wash (vorpal +0.006, cpython −0.007 on the new sets; the
+old cpython set's −0.039 is one conjunctive query, 0.420 → 0.361) while channel-only
+improves on both (vorpal 0.556 → 0.569, cpython 0.430 → 0.436).
+
+### Linux kernel — per class, NDCG@10 / MRR / recall@5 (10-minute rounds: head 112,896 rows, body 26,368 rows)
+
+OLD set (8 queries: 1 descriptive, 7 short-keyword; gate ≥ 0.313 all-NDCG):
+
+| pair (sidecar / rerank) | binary | descriptive | short-kw | **all** | gate | searcheval mean |
+|---|---|---|---|---|---|---:|
+| head / head | shipped | 0.608/0.500/1.000 | 0.288/0.354/0.095 | **0.328/0.372/0.208** | pass | 2.44 s |
+| head / head | this branch | 0.608/0.500/1.000 | 0.288/0.354/0.095 | **0.328/0.372/0.208** (= shipped) | pass | 2.24 s |
+| head / head, channel only | shipped | 0.402/0.200/0.500 | 0.257/0.343/0.095 | 0.276/0.325/0.146 | — | 0.40 s |
+| **body / head (pin)** | this branch | 0.608/0.500/1.000 | **0.306/0.390/0.190** | **0.344/0.403/0.292** | **pass** | 2.27 s |
+| body / head, channel only | this branch | 0.496/0.333/1.000 | 0.347/0.402/0.238 | 0.366/0.393/0.333 | — | 0.41 s |
+| body / head, depth ×2 = ×4 = share (×322) | this branch | 0.608/0.500/1.000 | 0.306/0.390/0.190 | 0.344/0.403/0.292 | pass | 2.23–2.42 s |
+| body / body | this branch | 0.445/0.250/1.000 | 0.296/0.371/0.143 | 0.314/0.356/0.250 | pass (0.001) | 3.90 s |
+
+NEW set (54 queries; 9 paraphrase, 13 descriptive; `--root`; the no-encoder learned tier
+measures 0.313/0.303/0.361 and the rerank without the channel 0.289/0.289/0.309 on this set):
+
+| pair (sidecar / rerank) | rows | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** | gate | searcheval mean |
+|---|---:|---|---|---|---|---|---|---|---|---:|
+| head / head (= shipped) | 112,896 | 0.502/0.458/0.750 | **0.250/0.237/0.269** | 0.908/0.875/1 | 0/0/0 | **0.483/0.556/0.397** | 0.508/0.530/0.429 | **0.414/0.423/0.420** | pass | 2.06 s |
+| head / head, channel only | 112,896 | — | — | — | 0/0/0 | — | — | 0.402/0.406/0.429 | — | 0.33 s |
+| **body / head (pin candidate)** | 26,368 | 0.479/0.500/0.500 | 0.234/0.257/0.269 | 0.862/0.812/1 | 0/0.005/0 | 0.467/0.529/0.333 | 0.508/0.530/0.429 | 0.398/0.416/0.386 | pass | 2.14 s |
+| body / head, channel only | 26,368 | 0.500/0.500/0.500 | 0.283/0.268/0.308 | 0.862/0.812/1 | **0.043/0.022/0.111** | 0.519/0.562/0.436 | 0.623/0.618/0.714 | **0.446/0.441/0.475** | — | 0.44 s |
+| body / head, depth ×2 = ×4 = share (×322) | 26,368 | 0.479/0.500/0.500 | 0.235/0.264/0.269 | 0.862/0.812/1 | 0/0.005/0 | 0.467/0.529/0.333 | 0.508/0.530/0.429 | 0.398/0.418/0.386 | pass | 1.7–2.0 s |
+| body / body | 26,368 | 0.490/0.500/0.500 | 0.249/0.249/0.308 | 0.820/0.760/1 | 0.070/0.056/0.111 | 0.453/0.517/0.308 | 0.490/0.527/0.429 | 0.402/0.412/0.407 | pass | 3.42 s |
+| head / head, **coverage-matched** (`head26k`: 140 s cap on a quieter GPU → 39,680 rows) | 39,680 | — | — | — | 0/0/0 | — | — | 0.401/0.412/0.404 | pass | 5.13 s (contended by the latency runs) |
+| head / head, coverage-matched, channel only | 39,680 | — | — | — | 0/0/0 | — | — | 0.425/0.424/0.441 | — | 0.32 s |
+| head / head, coverage-matched, OLD set | 39,680 | | | | | | | 0.345/0.403/0.292 | pass | 1.86 s |
+
+Kernel paraphrase answers in the fused top-25: head/head 0 of 9; body/head 1 (fused #23,
+0-based 22); body/head channel-only 1 (fused **#5**); body/body 1 (fused **#2**). The
+head sidecar alone is the kernel's biggest lever on this set — the channel takes the
+learned tier from 0.313 to 0.414 (descriptive 0.073 → 0.250, short-kw 0.276 → 0.483) —
+and the rerank is the kernel's known loss (channel-only 0.446 > +rerank 0.398 under the
+body sidecar), the same direction as the "+f32 rerank loses on the kernel" reading above.
+The body / head row is CONFOUNDED by coverage (26 K vs 113 K rows); the isolating
+experiment is the `head26k` row: a head fill capped at 140 s so it commits ≈ the body
+round's row count, evaluated under the same pair.
+
+Coverage-matched, the recipe's own effect on the kernel is: rerank ON 0.401 (head, 39.7 K)
+vs 0.398 (body, 26.4 K) — a wash; channel only 0.425 vs **0.446** (+0.021, body); OLD set
+0.345 vs 0.344. (Coverage itself: head 39.7 K → 113 K rows moves the new set 0.401 → 0.414
+with the rerank and 0.425 → 0.402 channel-only, the old set 0.345 → 0.328 — the
+"always-on fill" coverage curve, now visible on 54 queries as a rerank-dependent sign.)
+
+Kernel paraphrase targets (dense rank, 1-based; the body and head26k sidecars are prefixes
+of the same coverage order, so their covered sets nest):
+
+| query | answer (grade) | head, 112,896 rows | head, 39,680 rows | body, 26,368 rows |
+|---|---|---:|---:|---:|
+| place page array in contiguous kernel virtual range | `vmap` (3) | 28,499 | 10,316 | 10,748 |
+| defer a job to the system per-cpu pool | `schedule_work` (3) / `queue_work` (2) | 8,396 / 20,842 | 3,257 / 7,887 | 1,835 / 5,437 |
+| register attribute directory under kobject | `sysfs_create_group` (3) | 605 | 237 | **2** |
+| block until all pre-existing readers finish | `synchronize_rcu` (3) | 2,531 | 707 | **56** |
+| make a task runnable | `wake_up_process` (3) | 588 | 192 | **41** |
+| write out all cached changes of a mounted volume | `sync_filesystem` (3) | 8,422 | 2,985 | **70** |
+| background page reclaim daemon thread | `kswapd` (3) | not covered (unreferenced / beyond the round) | not covered | not covered |
+| pick victim task when memory exhausted | `select_bad_process` (3) | not covered | not covered | not covered |
+| run function across all processors | `on_each_cpu` (3) | not covered | not covered | not covered |
+
+Grade-3 answers inside the dense top-100: head 0 of 9 at either coverage → **body 4 of 9**
+(the kerneldoc block above each of these four is exactly what the body recipe embeds);
+three targets sit outside every 10-minute round's coverage. Across the three corpora the
+28 paraphrase answers inside the dense top-100 go 3 → **11** (vorpal 1 → 4, cpython 2 → 3,
+kernel 0 → 4), inside the fused top-25 (rerank ON, k = 25) 0 → 3 (vorpal 2, kernel 1),
+and the first non-zero paraphrase recall@5 on any corpus is the kernel channel-only row
+(0.111: `sysfs_create_group` dense #2 → fused #5).
+
+### Fill cost (doc-side only) — head vs body sidecar under the pinned referenced-only rule
+
+| corpus | rows (share of defs) | recipe | tok/def | tokens | fallbacks | truncations | fill wall (CONTENDED, load) | tok/s (contended) | bytes | peak RSS |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| vorpal | 11,751 (15.7%) | head | 25.3 | 297,478 | 0 | 0 | 35.0 s (load 37–48) | 8,642 | 27.2 MB | 0.91 GB |
+| vorpal | 11,751 | **body** | **121.0 (4.8×)** | 1,421,674 | 534 (4.5%) | 591 | 261.7 s (7.5×; load 32–44) | 5,444 | 27.2 MB (recipe-independent) | 2.80 GB |
+| cpython | 35,292 (24.3%) | head | 25.4 | 895,515 | 0 | 0 | 439 s (load 75–86) | 2,052 | 81.7 MB | 1.01 GB |
+| cpython | 35,292 | **body** | **107.2 (4.2×)** | 3,784,562 | 579 (1.6%) | 1,094 | 1,013.6 s (2.3×; load 75–122) | 3,741 | 81.7 MB | 5.07 GB |
+| kernel | 10-minute round: **112,896** of 716,721 referenced (15.8%; 1.3% of 8.48 M defs) | head | 34.3 | 3,867,967 | 0 | 0 | 604.5 s (cap; load 32–47) | 6,515 | 261 MB | 2.92 GB |
+| kernel | 10-minute round: **26,368** of 716,721 (3.7%) — **4.3× fewer rows per round** | **body** | **125.5 (3.7×)** | 3,307,072 | 1,514 (5.7%) | 1,336 | 605.9 s (cap; load 50–52) | 5,479 | 61 MB | 4.42 GB |
+
+Time-to-cover the referenced population, extrapolated from each round's rate (contended
+GPU rung, so upper bounds): kernel head ≈ 716,721 × 34.3 / 6,515 ≈ **63 min**, kernel
+body ≈ 716,721 × 125.5 / 5,479 ≈ **4.6 h**; cpython head 107 s uncontended (recorded
+above) → body ≈ 4.2× ≈ 7.5 min; vorpal head 37.5 s → body ≈ 3 min. On the kernel the
+body recipe therefore also changes WHAT a 10-minute round serves: a quarter of the
+rows, drawn from the same degree-descending order — the kernel rows below are measured
+at those coverages (112,896 head vs 26,368 body), which the earlier coverage curve
+(0.345 at 24 K → 0.306 at 168 K, "always-on fill") says is itself a quality variable.
+
+### Query latency vs the shipped binary (uncached one-shot CLI: process start + open + query; median of 3 per query, mean over the NEW set's queries; CONTENDED, load stated)
+
+| corpus | binary / pair | k=10 mean (max) | k=25 mean (max) | load |
+|---|---|---:|---:|---:|
+| vorpal | shipped, head/head | 0.909 s (1.256) | 1.336 s (1.935) | 46 |
+| vorpal | this branch, head/head | 0.895 s (1.252) | 2.051 s (2.788) | 57 |
+| vorpal | **this branch, body/head (pin candidate)** | 1.237 s (1.791) | 1.896 s (2.793) | 48 |
+| vorpal | shipped, head/head (again, after the above) | 0.767 s (1.324) | 1.358 s (2.104) | 44 |
+| cpython | shipped, head/head (during the kernel evals) | 1.152 s (4.404) | 2.160 s (5.690) | 39 |
+| cpython | this branch, head/head | 0.386 s (0.667) | 0.831 s (1.293) | 25 |
+| cpython | **this branch, body/head (pin)** | 0.358 s (0.537) | 0.722 s (1.032) | 20 |
+| cpython | shipped, head/head (again, back-to-back with the pin row) | 0.347 s (0.514) | 0.717 s (1.026) | 19 |
+| cpython | shipped with the BODY sidecar in place (stale for it → channel OFF) | 0.326 s (0.493) | 0.713 s (1.016) | 19 |
+
+The same binary and pair measures 0.77–0.91 s (k=10) and 1.34–2.05 s (k=25) run to run
+under this load, which is the resolution of the comparison; within it the two-field pair
+and the shipped pair are indistinguishable, as the construction says they must be: the
+query path encodes ONE prefixed query on the fixed lanes plus the head surfaces of the
+cache-missed fused candidates in both cases, and the dense scan is the same int8 scan over
+the same row count (the sidecar's bytes are recipe-independent). searcheval's in-process
+means (above; the encoder open amortized) agree: vorpal 0.87–1.57 s head/head vs
+0.88–1.06 s body/head; cpython 1.13–1.59 s vs 1.15–1.17 s; kernel 2.06–2.24 s vs
+2.14–2.27 s. The one-recipe rich pair (body/body) is the latency regression the two-field
+split removes: 3.3–5.9 s per query (re-encoding 100–400-token candidate surfaces).
+
+The body recipe's tokens/def is 4.8× head's on the referenced population (the previous
+full-coverage A/B measured 3.6×: referenced definitions carry more documentation than the
+average definition). Every fill ran on the GPU rung (`wgpu-metal:Apple M5 Max`) — the
+extra tokens cost the background fill only; the query path encodes the same head
+surfaces as v0.7.0. Sidecar bytes are recipe-independent (rows × (8 + 4 + dim × 3)).
+
+QUIET re-fills of the vorpal sidecar once the other agents' load had dropped (load 11–13,
+same rows, same GPU rung; the head row matches the 2026-09-02 "always-on fill" 37.5 s
+uncontended figure in tokens/s terms):
+
+| corpus | recipe | fill wall | tok/s | tok/def | peak RSS | wall ratio body/head |
+|---|---|---:|---:|---:|---:|---:|
+| vorpal (11,751 rows) | head | **19.1 s** | **15,842** | 25.3 | 0.91 GB | — |
+| vorpal (11,751 rows) | body | **171.5 s** | 8,275 | 120.6 | 2.80 GB | **9.0×** (4.8× tokens × ~1.9× lower tok/s: attention is quadratic in the sequence, and the 398-token cap lets body surfaces run 4–16× longer than head's) |
+
+
+### Verdict — the pair pinned, and why
+
+**Pinned: `SurfacePair { sidecar: HeadDocBody, rerank: Head }`** (`body/head`);
+`DENSE_DEPTH_FACTOR = 1`. What the measurement says, in the order the brief asked:
+
+1. **The split recovers the rerank's dilution and the latency, exactly.** body/head keeps
+   the rerank's surfaces, cache and batch identical to v0.7.0: same exact/subset/short-kw
+   rows as shipped on every corpus (vorpal `Postings` stays fused #1), searcheval means
+   and one-shot CLI walls indistinguishable from the shipped binary within the run-to-run
+   spread of this machine, while the one-recipe rich pair costs 3.3–5.9 s per query.
+2. **Paraphrase into k ≤ 25 — partly, and the ceiling is now the fusion's.** Under
+   body/head 3 of the 28 answers enter the fused top-25 (vorpal #19, #23; kernel #22),
+   against 0 under any head pair; 11 of 28 are inside the dense top-100 (3 before), five
+   of them inside the dense top-10 (`word_pieces` #1, `deepcopy` #2, `sysfs_create_group`
+   #2, `similar_pairs` #8, `encode_record` #18 → the rerank window). None reaches the
+   fused top-10 because a single-list candidate holds at most 1/60 of RRF mass and every
+   two-list pair with both ranks < 60 outranks it — proven on `word_pieces` (dense #1 →
+   fused #24, `channels [dense#1]`). Dense-list depth cannot change that (bound + sweep:
+   ×2 / ×4 / share = +0.002, +0.004, 0.000 all-NDCG on vorpal / cpython / kernel, no
+   paraphrase movement); the fusion's handling of single-list dense evidence can.
+3. **Kernel gate:** 0.344 (old set) / 0.398 (new set) with the channel ON + rerank at the
+   10-minute round's coverage — ≥ 0.313 in both; the coverage-matched head pair is 0.345 /
+   0.401 (a wash), channel-only body is +0.021 over channel-only head.
+4. **All-NDCG on the shipping configuration is a wash** (vorpal +0.006, cpython −0.007,
+   kernel −0.003 coverage-matched; old sets 0.000 / −0.039 on one conjunctive query /
+   +0.001) and **channel-only improves on all three** (+0.013 / +0.006 / +0.021). The
+   pair is pinned on (1)–(3) plus this: it is the only configuration that gives the fusion
+   paraphrase evidence to work with at zero query-side cost.
+5. **The cost is doc-side and stated:** 4.2–4.8× tokens per definition, ~4× fewer rows
+   per capped kernel round (26 K vs 113 K in 10 minutes; the full referenced population
+   extrapolates to ≈ 1.5 h on a quiet GPU rung vs ≈ 25 min under head), peak fill RSS
+   2.8 / 5.1 / 4.4 GB vs 0.9 / 1.0 / 2.9 GB. The body clause is a docstring proxy that
+   pays per language (Python docstrings and kerneldoc blocks move 10–100×; C functions
+   whose first paragraph is code move the other way) — a `HeadDoc`-only sidecar or a
+   language-aware body clause is the recorded follow-up if the fill cost matters more
+   than the paraphrase evidence on a given corpus. `head/head` remains one env var away
+   under `bench-internals`, and a record written under it is served by both binaries.
+
+Reproduction: fill under a pair with `VORPAL_SURFACE_RECIPE=<sidecar>/<rerank> vorpal
+__warm-ann <idx> [--dense-budget-timeout 10m]` (the record's `surface` /
+`rerank_surface` name the pair; a stash of `ann.dense` + `ann.dense.json` per pair swaps
+in without refilling — the rows depend on the sidecar recipe only, so a body/body record
+is a body/head sidecar with `rerank_surface` rewritten); `xtask searcheval <idx>
+xtask/labels/<corpus>.json [--root <tree>]` under `VORPAL_SURFACE_RECIPE`,
+`VORPAL_RERANK_MODE=off` (channel only) and `VORPAL_DENSE_DEPTH=2|4|share`; dense ranks
+via `sweep_encoder <idx> --dense-rank <query> <name…>` (bench-internals) under the same
+pair env; one-shot walls with `vorpal search <q> -k 10|25 --index <idx>` per binary.
+Gate: `cargo test --workspace --release` green (0 failures), both clippy lanes clean.
+
+Not done / open: (1) the fusion-side lever this pass exposes (single-list dense evidence
+capped at 1/K) is the fusion owner's — K, a per-channel weight, or a dense-only reserve
+slot are the candidates; (2) the kernel's per-round coverage under the rich sidecar is
+4× smaller — a per-corpus recipe choice or a `HeadDoc`-only sidecar is the lead if the
+fill budget binds there; (3) a language-aware body clause (docstring / kerneldoc only,
+never a code paragraph) would keep the C-function regressions on cpython (`mro_implementation`
+290 → 2,333) out; (4) every wall-clock figure here is contended — the quiet-machine fill
+rates are the two QUIET rows above only; (5) three kernel paraphrase answers are outside
+every 10-minute round (unreferenced or too deep in the degree order) and no surface can
+reach them — the stop rule / coverage lead recorded earlier.
