@@ -22,6 +22,9 @@ enum Task {
     index: String,
     labels: String,
     overlap: bool,
+    /// The indexed tree's directory — required only when a label's `path` is anchored
+    /// (starts with `/`, i.e. tree-relative equality rather than `ends_with`).
+    root: Option<String>,
   },
 }
 
@@ -34,11 +37,18 @@ fn get_task() -> Result<Task> {
     });
   }
   if arg == "searcheval" {
-    let usage = "usage: cargo xtask searcheval <index-dir> <labels.json> [--overlap]";
+    let usage = "usage: cargo xtask searcheval <index-dir> <labels.json> [--overlap] [--root <tree>]";
+    let rest: Vec<String> = args().skip(4).collect();
+    let root = rest
+      .iter()
+      .position(|a| a == "--root")
+      .map(|i| rest.get(i + 1).cloned().context("--root wants the indexed tree's directory"))
+      .transpose()?;
     return Ok(Task::SearchEval {
       index: args().nth(2).context(usage)?,
       labels: args().nth(3).context(usage)?,
-      overlap: args().skip(4).any(|a| a == "--overlap"),
+      overlap: rest.iter().any(|a| a == "--overlap"),
+      root,
     });
   }
   if arg == "schema" {
@@ -63,7 +73,8 @@ fn main() -> Result<()> {
       index,
       labels,
       overlap,
-    } => searcheval::run(Path::new(&index), Path::new(&labels), overlap),
+      root,
+    } => searcheval::run(Path::new(&index), Path::new(&labels), overlap, root.as_deref().map(Path::new)),
   }
 }
 

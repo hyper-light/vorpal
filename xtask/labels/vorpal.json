@@ -1,5 +1,5 @@
 {
-  "description": "Self-index graded set (index this repo into target/eval-index first), graded 2026-08-30.",
+  "description": "Self-index graded set (index this repo into target/eval-index first): the 10 original queries graded 2026-08-30 + 45 evidence-backed queries added 2026-09-03 against v0.7.0 (source citations in vorpal.evidence.md).",
   "queries": [
     {
       "class": "exact",
@@ -59,6 +59,303 @@
       "class": "conjunctive",
       "query": "louvain community size cap",
       "relevant": [{ "name": "cut", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "calibrate_semantic_cutover",
+      "relevant": [{ "name": "calibrate_semantic_cutover", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "coherent_persisted_embedder",
+      "relevant": [{ "name": "coherent_persisted_embedder", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "generation_content_id_full",
+      "relevant": [
+        { "name": "generation_content_id_full", "grade": 3 },
+        { "name": "generation_content_id", "grade": 1 }
+      ]
+    },
+    {
+      "class": "exact",
+      "query": "compile_match_regex",
+      "relevant": [{ "name": "compile_match_regex", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "verify_and_extract",
+      "relevant": [
+        { "name": "verify_and_extract", "grade": 3 },
+        { "name": "sign_payload", "grade": 1 }
+      ]
+    },
+    {
+      "class": "exact",
+      "query": "scc_sizes",
+      "relevant": [{ "name": "scc_sizes", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "bm25 inverse document frequency",
+      "relevant": [{ "name": "bm25_idf", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "bm25 term frequency saturation",
+      "relevant": [{ "name": "bm25_term", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "louvain local move",
+      "relevant": [
+        { "name": "local_moving", "grade": 3 },
+        { "name": "gain", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "greedy beam search",
+      "relevant": [{ "name": "greedy_search", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "ed25519 sign payload",
+      "relevant": [
+        { "name": "sign_payload", "grade": 3 },
+        { "name": "sign_bytes_hex", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "wordpiece tokenizer from json",
+      "relevant": [
+        { "name": "from_tokenizer_json", "grade": 3 },
+        { "name": "WordPiece", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "canary extraction verify",
+      "relevant": [
+        { "name": "verify_extraction", "grade": 3 },
+        { "name": "verify_default_extraction", "grade": 2 },
+        { "name": "CANARIES", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "compute dirty region",
+      "relevant": [
+        { "name": "compute_dirty", "grade": 3 },
+        { "name": "DirtyRegion", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "nearest index root ancestor",
+      "relevant": [{ "name": "find_index_root", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "checksum pinned download",
+      "relevant": [{ "name": "fetch_pinned", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "parse health",
+      "relevant": [{ "name": "parse_health_report", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "include reach",
+      "relevant": [{ "name": "IncludeReach", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "dataflow",
+      "relevant": [
+        { "name": "DataflowStore", "grade": 3 },
+        { "name": "load_dataflow", "grade": 2 },
+        { "name": "DataflowRow", "grade": 1 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "bm25 override",
+      "relevant": [{ "name": "set_bm25_override", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "content id",
+      "relevant": [
+        { "name": "generation_content_id", "grade": 3 },
+        { "name": "generation_content_id_full", "grade": 2 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "gen diff",
+      "relevant": [
+        { "name": "GenDiff", "grade": 3 },
+        { "name": "diff", "path": "crates/index/src/gendiff.rs", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "process unique staging suffix",
+      "relevant": [{ "name": "staging_nonce", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "per row int8 codes with scale",
+      "relevant": [
+        { "name": "quantize_row", "path": "crates/ann/src/dense.rs", "grade": 3 },
+        { "name": "quantize_row", "path": "crates/ann/src/qmatrix.rs", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "alpha dominated neighbor pruning",
+      "relevant": [{ "name": "robust_prune", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "first paragraph of definition body",
+      "relevant": [{ "name": "body_head", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "comment block above definition",
+      "relevant": [{ "name": "leading_comment", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "can this file event change the index",
+      "relevant": [
+        { "name": "event_is_relevant", "grade": 3 },
+        { "name": "path_is_relevant", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "build symbol table from graph",
+      "relevant": [
+        { "name": "from_kg", "grade": 3 },
+        { "name": "SymbolTable", "grade": 1 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "total order for evidence rows",
+      "relevant": [{ "name": "sort_canonical", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "files that mention a name hash",
+      "relevant": [{ "name": "files_referencing", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "remove the global encoder enable",
+      "relevant": [
+        { "name": "disable_global", "grade": 3 },
+        { "name": "disable_variant", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "spawn detached background warm",
+      "relevant": [
+        { "name": "maybe_spawn", "grade": 3 },
+        { "name": "run_if_sentinel", "grade": 1 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "definition text presented to encoder",
+      "relevant": [
+        { "name": "SurfaceRecipe", "grade": 3 },
+        { "name": "SurfaceBuilder", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "which definitions the fill embeds",
+      "relevant": [{ "name": "CoverageRule", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "run indexer as child process",
+      "relevant": [
+        { "name": "Supervisor", "grade": 3 },
+        { "name": "BuildOutcome", "grade": 1 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "why no edge to a name",
+      "relevant": [{ "name": "explain_absence_on", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "skip entity whose content hash matches",
+      "relevant": [{ "name": "is_unchanged", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "files edited together in git history",
+      "relevant": [
+        { "name": "Cochange", "path": "crates/index/src/cochange.rs", "grade": 3 },
+        { "name": "CochangeEdge", "grade": 2 },
+        { "name": "count_pairs", "grade": 1 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "serialize a reference to fixed width bytes",
+      "relevant": [
+        { "name": "encode_record", "grade": 3 },
+        { "name": "decode_record", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "greedy longest match segmentation",
+      "relevant": [{ "name": "word_pieces", "grade": 3 }]
+    },
+    {
+      "class": "conjunctive",
+      "query": "gpu weights resident once",
+      "relevant": [
+        { "name": "make_resident", "grade": 3 },
+        { "name": "GpuGemm", "grade": 2 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "bm25 ranking without posting index",
+      "relevant": [
+        { "name": "bm25_exhaustive", "grade": 3 },
+        { "name": "bm25_ranked", "grade": 2 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "f16 model variant install",
+      "relevant": [
+        { "name": "install", "path": "crates/index/src/models.rs", "grade": 3 },
+        { "name": "ModelVariant", "grade": 2 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "retrofit edges from graph relations",
+      "relevant": [
+        { "name": "build_retro_edges", "grade": 3 },
+        { "name": "retrofit_into", "grade": 1 }
+      ]
     }
   ]
 }
