@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual runs also exercise the weights-gated encoder parity on x86 (below).
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,3 +34,39 @@ jobs:
         run: cargo clippy -p vorpal-py --features python --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # The encoder's x86 GEMM rungs (crates/ann/src/encoder/{gemm_x86,gemm_i8}.rs) can
+  # only be MEASURED on x86 hardware: the development machine is Apple silicon, where
+  # Rosetta/QEMU emulation proves AVX2 correctness but no rate, and AVX-512 / VNNI are
+  # not reachable at all. This job is the x86 datum: it prints the runner's ISA, runs
+  # every present kernel against the exact reference / the fixed lanes (weights-free
+  # unit oracles), and records the GEMM rate at the recorded 256-surface batch —
+  # docs/wip/BENCHMARKS.md ("Cross-platform encoder") cites its log.
+  encoder-x86:
+    name: encoder x86 kernels (parity + GEMM rate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Runner ISA
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)' || true
+          grep -o -w 'avx2\|fma\|avx512f\|avx512bw\|avx512_vnni\|avx_vnni' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+      - name: Kernel oracles (every present ISA vs the exact reference and the fixed lanes)
+        run: cargo test --release -p vorpal-ann --lib encoder -- --nocapture
+      - name: GEMM rate at the 256-surface batch (4690 tokens, median of 3)
+        run: cargo run --release -p vorpal-ann --example gemm_bench -- 4690 3
+      # Weights-gated parity on the real encoder (547 MB download): manual runs only.
+      - name: Install the pinned encoder weights (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          cargo build --release -p vorpal
+          VORPAL_HOME="$RUNNER_TEMP/vhome" target/release/vorpal enable semantic-f32
+      - name: Real-encoder parity (throughput / int8 vs the fixed lanes; workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VORPAL_CODERANK_DIR: ${{ runner.temp }}/vhome/models/coderankembed-f32
+        run: cargo test --release -p vorpal-ann --test encoder -- --nocapture --test-threads 1 throughput_path int8_path

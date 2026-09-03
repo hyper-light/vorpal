@@ -20,8 +20,15 @@
 //! time (every definition where the budget covers the corpus) — the
 //! candidate-generating channel the reranker cannot be by construction.
 
+mod cache;
 mod f16;
 mod forward;
+/// Compiled on every x86-64 target so the darwin cross-check covers it; the
+/// dispatch prefers Accelerate on macOS, where these kernels stay unused.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+mod gemm_x86;
+mod gemm_i8;
 mod gemm_wgpu;
 mod safetensors;
 mod tokenizer;
@@ -30,8 +37,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use forward::{LayerWeights, ModelWeights};
+use gemm_i8::Int8Layer;
 pub use f16::{f16_bits_to_f32, f32_to_f16_bits};
-pub use forward::{GemmPath, l2_normalize, set_throughput_shards, throughput_shards};
+pub use forward::{GemmPath, bench_gemm, l2_normalize, set_throughput_shards, throughput_shards};
+pub use gemm_i8::{
+  Int8Isa, QuantizedMatrix, detect as int8_kernel, gemm_i8, gemm_i8_under,
+  present_kernels as int8_kernels_present,
+};
 pub use gemm_wgpu::{GpuGemm, Tile, TransferReport};
 pub use safetensors::{convert_safetensors_f32_to_f16, safetensors_is_f16};
 
@@ -125,6 +137,9 @@ pub struct CodeEncoder {
   identity: u128,
   /// The doc-side ladder, chosen on first use (see [`DocSideRung`]).
   rung: OnceLock<DocSideRung>,
+  /// The int8 projections, quantized at the first [`GemmPath::Int8`] embed
+  /// (≈113 MB beside the mapped f32 weights); an error there is stable.
+  int8: OnceLock<Result<Vec<Int8Layer>, String>>,
 }
 
 impl CodeEncoder {
@@ -217,17 +232,47 @@ impl CodeEncoder {
       weights_path,
       identity,
       rung: OnceLock::new(),
+      int8: OnceLock::new(),
     };
     // Fail at open, not first embed: every tensor must exist with its exact shape.
-    encoder.model_weights()?;
+    encoder.model_weights(None)?;
     Ok(encoder)
   }
 
-  fn model_weights(&self) -> Result<ModelWeights<'_>, String> {
+  /// The int8 projections (module doc of `gemm_i8`), quantized once per handle
+  /// at first use — rows in parallel; ~113 M weights.
+  fn int8_layers(&self) -> Result<&[Int8Layer], String> {
+    let built = self.int8.get_or_init(|| {
+      let weights = self.model_weights(None)?;
+      let (dim, inner) = (self.dim, self.inner);
+      weights
+        .layers
+        .iter()
+        .map(|layer| {
+          Ok(Int8Layer {
+            wqkv: QuantizedMatrix::quantize(layer.wqkv, 3 * dim, dim)?,
+            out_proj: QuantizedMatrix::quantize(layer.out_proj, dim, dim)?,
+            fc11: QuantizedMatrix::quantize(layer.fc11, inner, dim)?,
+            fc12: QuantizedMatrix::quantize(layer.fc12, inner, dim)?,
+            fc2: QuantizedMatrix::quantize(layer.fc2, dim, inner)?,
+          })
+        })
+        .collect::<Result<Vec<_>, String>>()
+    });
+    built.as_deref().map_err(Clone::clone)
+  }
+
+  /// Bytes the int8 projections hold once built (0 before the first `Int8` embed).
+  pub fn int8_bytes(&self) -> usize {
+    self.int8.get().and_then(|r| r.as_ref().ok()).map_or(0, |layers| layers.iter().map(Int8Layer::bytes).sum())
+  }
+
+  fn model_weights<'a>(&'a self, int8: Option<&'a [Int8Layer]>) -> Result<ModelWeights<'a>, String> {
     let mut layers = Vec::with_capacity(self.layers);
     for layer in 0..self.layers {
       let prefix = format!("encoder.layers.{layer}.");
       layers.push(LayerWeights {
+        int8: int8.and_then(|layers| layers.get(layer)),
         wqkv: self
           .weights
           .matrix(&format!("{prefix}attn.Wqkv.weight"), 3 * self.dim, self.dim)?,
@@ -288,7 +333,7 @@ impl CodeEncoder {
   /// the fill goes through [`CodeEncoder::doc_side_rung`].
   pub fn open_gpu_with(&self, tile: Option<Tile>) -> Result<GpuGemm, String> {
     let mut gpu = GpuGemm::open_with(&[self.dim, self.inner], tile)?;
-    let weights = self.model_weights()?;
+    let weights = self.model_weights(None)?;
     for layer in &weights.layers {
       for matrix in [layer.wqkv, layer.out_proj, layer.fc11, layer.fc12, layer.fc2] {
         gpu.make_resident(matrix)?;
@@ -300,7 +345,7 @@ impl CodeEncoder {
   /// The six GEMM shapes of one layer as `(dim_in, weight, rows_out)` — the
   /// bench's dispatch-only ceiling walks them with the resident weights.
   pub fn layer_gemm_shapes(&self, layer: usize) -> Result<Vec<GemmShape<'_>>, String> {
-    let weights = self.model_weights()?;
+    let weights = self.model_weights(None)?;
     let layer = weights
       .layers
       .get(layer)
@@ -378,7 +423,7 @@ impl CodeEncoder {
 
   /// CLS embedding BEFORE normalization — the reference-parity surface.
   pub fn embed_raw(&self, text: &str) -> Result<Vec<f32>, String> {
-    forward::forward(&self.model_weights()?, &self.clamped_ids(text))
+    forward::forward(&self.model_weights(None)?, &self.clamped_ids(text))
   }
 
   /// L2-normalized embeddings for a BATCH of texts in ONE forward pass (the
@@ -392,11 +437,16 @@ impl CodeEncoder {
   /// [`Self::embed_batch`] under a selected GEMM path. `Throughput` is the
   /// doc-side sidecar's entry (module doc): same tokenization, same forward,
   /// only the six GEMMs' summation order differs — parity pinned by the gated
-  /// oracle (cosine ≥ 0.9999 vs `FixedOrder` on the goldens).
+  /// oracle (cosine ≥ 0.9999 vs `FixedOrder` on the goldens). `Int8` swaps the
+  /// GEMMs for the int8 forms (weights quantized here at first use).
   pub fn embed_batch_with(&self, texts: &[&str], path: GemmPath<'_>) -> Result<Vec<Vec<f32>>, String> {
     let sequences: Vec<Vec<u32>> = texts.iter().map(|text| self.clamped_ids(text)).collect();
     let borrowed: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
-    let mut rows = forward::forward_batch_with(&self.model_weights()?, &borrowed, path)?;
+    let int8 = match path {
+      GemmPath::Int8 => Some(self.int8_layers()?),
+      _ => None,
+    };
+    let mut rows = forward::forward_batch_with(&self.model_weights(int8)?, &borrowed, path)?;
     for row in &mut rows {
       l2_normalize(row);
     }
