@@ -2508,6 +2508,15 @@ exported flag is too coarse to be the stop rule's second clause as these graphs 
 a stricter notion (exported AND named from outside the file / at API depth) or the
 referenced-only rule with a per-corpus cap is the follow-up — recorded, not taken.
 
+DISPOSITION (coordinator, on this evidence): **`CoverageRule::Referenced` is PINNED**
+as the always-on stop rule — the measured-best regime (vorpal 0.705, cpython 0.396,
+kernel 0.308 @ 129 K); `ReferencedOrExported` stays reachable through
+`VORPAL_DENSE_COVERAGE` under `bench-internals` as the measured seam. The rule label
+now rides in `ann.dense.json` (`coverage_rule`; pre-label records infer it from their
+`exported_only` count), and a resume under a different rule starts over. Open leads
+unchanged: a size-aware fusion weight or per-corpus coverage cap for the kernel's
+coverage/quality slide, and a stricter "exported" notion for API entry points.
+
 Reproduction: `VORPAL_CODERANK_DIR=<model> cargo run --release -p vorpal-index
 --features bench-internals --example sweep_encoder -- <index> 26 256 1024` (Stage A);
 `vorpal-index __warm-ann <idx>` (always-on fill; `--dense-budget-timeout 10m` caps a

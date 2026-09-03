@@ -115,6 +115,46 @@ pub(crate) fn active_surface_recipe() -> SurfaceRecipe {
   ACTIVE_SURFACE
 }
 
+/// Which definitions the always-on fill embeds (the stop rule). Both are structural
+/// — no size constant — and both were measured (BENCHMARKS "always-on fill", 2026-09-02):
+/// `Referenced` (referential in-degree ≥ 1, highest degree first) held vorpal 0.705 /
+/// cpython 0.396 / kernel 0.308 @129 K rows; `ReferencedOrExported` recovered cpython's
+/// unreferenced public API (+0.012) but "exported" is nearly every non-`static` C
+/// symbol and every `pub` item (90–94 % of these graphs), which brought the
+/// full-coverage distractors back: vorpal 0.705 → 0.648, kernel 0.223 @183 K rows
+/// (under the 0.313 gate), and a 9-hour kernel fill. `Referenced` is PINNED;
+/// `VORPAL_DENSE_COVERAGE=referenced|referenced-or-exported` sweeps it under
+/// `bench-internals`. The record carries the label; a resume under a different rule
+/// starts over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CoverageRule {
+  Referenced,
+  ReferencedOrExported,
+}
+
+impl CoverageRule {
+  pub(crate) fn label(self) -> &'static str {
+    match self {
+      CoverageRule::Referenced => "referenced",
+      CoverageRule::ReferencedOrExported => "referenced-or-exported",
+    }
+  }
+}
+
+const ACTIVE_COVERAGE: CoverageRule = CoverageRule::Referenced;
+
+pub(crate) fn active_coverage_rule() -> CoverageRule {
+  #[cfg(feature = "bench-internals")]
+  if let Ok(value) = std::env::var("VORPAL_DENSE_COVERAGE") {
+    return match value.as_str() {
+      "referenced" => CoverageRule::Referenced,
+      "referenced-or-exported" => CoverageRule::ReferencedOrExported,
+      _ => ACTIVE_COVERAGE,
+    };
+  }
+  ACTIVE_COVERAGE
+}
+
 /// Per-surface token cap for the richer recipes — DERIVED, not tuned: the largest
 /// token matrix the recorded sweep validated on this forward (batch 4096 ×
 /// 24.9 tok = 101,959 tokens, `examples/sweep_encoder.rs`) divided by the build's
@@ -376,6 +416,9 @@ pub(crate) struct DenseRecord {
   pub referenced: usize,
   /// Exported definitions with no in-tree reference.
   pub exported_only: usize,
+  /// The [`CoverageRule`] label the order was built under — a resume under another
+  /// rule starts over (the population differs by construction).
+  pub coverage_rule: String,
   /// Every non-Import definition (the fractions' denominator).
   pub population: usize,
   /// `coverage == eligible`.
@@ -419,6 +462,15 @@ pub(crate) fn read_record(dir: &Path) -> Option<DenseRecord> {
     eligible: u64_of("eligible").map_or(referenced, |n| n as usize),
     referenced,
     exported_only: u64_of("exported_only").unwrap_or(0) as usize,
+    // Records written before the label existed built under whichever rule their
+    // `exported_only` count betrays (the referenced-only rule never counts one).
+    coverage_rule: str_of("coverage_rule").unwrap_or_else(|| {
+      if u64_of("exported_only").unwrap_or(0) > 0 {
+        CoverageRule::ReferencedOrExported.label().to_string()
+      } else {
+        CoverageRule::Referenced.label().to_string()
+      }
+    }),
     population,
     complete: value
       .get("complete")
@@ -445,6 +497,7 @@ pub(crate) fn write_record(dir: &Path, record: &DenseRecord) -> std::io::Result<
   fields.insert("eligible", (record.eligible as u64).into());
   fields.insert("referenced", (record.referenced as u64).into());
   fields.insert("exported_only", (record.exported_only as u64).into());
+  fields.insert("coverage_rule", record.coverage_rule.clone().into());
   fields.insert("population", (record.population as u64).into());
   fields.insert("complete", record.complete.into());
   if let Some(cap) = record.cap_secs {
@@ -483,12 +536,12 @@ pub(crate) struct Eligible {
   pub population: usize,
 }
 
-/// Coverage order (the stop rule, structural): every non-Import definition that
-/// something references (referential in-degree ≥ 1) OR that the graph marks
-/// exported, highest degree first, id ascending — so exported-but-unreferenced
+/// Coverage order under `rule` (structural, see [`CoverageRule`]): every non-Import
+/// definition that something references (referential in-degree ≥ 1), highest degree
+/// first, id ascending; under `ReferencedOrExported` the exported-but-unreferenced
 /// definitions (degree 0) follow every referenced one, in id order. Deterministic
 /// for a generation, so a resumed fill continues the same prefix.
-pub(crate) fn coverage_order(kg: &Kg) -> Eligible {
+pub(crate) fn coverage_order(kg: &Kg, rule: CoverageRule) -> Eligible {
   let rows = crate::semantic_row_ids(kg);
   let population = rows.len();
   let mut referenced = 0usize;
@@ -501,7 +554,9 @@ pub(crate) fn coverage_order(kg: &Kg) -> Eligible {
       if degree >= 1 {
         referenced += 1;
         Some((degree, id))
-      } else if kg.node(node).is_some_and(|view| view.exported) {
+      } else if rule == CoverageRule::ReferencedOrExported
+        && kg.node(node).is_some_and(|view| view.exported)
+      {
         exported_only += 1;
         Some((0, id))
       } else {
@@ -631,15 +686,19 @@ pub(crate) fn fill(
 ) -> Result<DenseRecord, String> {
   let round_started = std::time::Instant::now();
   let dim = encoder.dim();
-  let Eligible { order, referenced: referenced_count, exported_only, population } = coverage_order(kg);
-  // `referenced` below is the stop rule's whole population (referenced + exported-only).
+  let rule = active_coverage_rule();
+  let Eligible { order, referenced: referenced_count, exported_only, population } =
+    coverage_order(kg, rule);
+  // `referenced` below is the stop rule's whole population under `rule`.
   let referenced = order.len();
   let mut builder = SurfaceBuilder::new(dir, active_surface_recipe());
   let recipe = builder.recipe().label().to_string();
-  // Resume: a coherent checkpoint on this stamp/model/recipe continues; anything
-  // else (older format, other recipe, torn pair) starts over.
+  // Resume: a coherent checkpoint on this stamp/model/recipe/rule continues; anything
+  // else (older format, other recipe or rule, torn pair) starts over.
   let resumed = fresh_record(dir, stamp, encoder)
-    .filter(|record| record.surface == recipe && record.eligible == referenced)
+    .filter(|record| {
+      record.surface == recipe && record.coverage_rule == rule.label() && record.eligible == referenced
+    })
     .and_then(|record| read_rows(dir, stamp, dim, &order).map(|rows| (record, rows)));
   let (mut record, mut rows) = match resumed {
     Some((record, rows)) => (record, rows),
@@ -654,6 +713,7 @@ pub(crate) fn fill(
         eligible: referenced,
         referenced: referenced_count,
         exported_only,
+        coverage_rule: rule.label().to_string(),
         population,
         complete: referenced == 0,
         cap_secs: None,
@@ -668,8 +728,9 @@ pub(crate) fn fill(
     ),
   };
   vorpal_kg::phase_stamp(&format!(
-    "dense: eligible {referenced} of {population} definitions ({:.1}%: {referenced_count} referenced + {exported_only} exported-only), resuming at {} (recipe {recipe:?}{})",
+    "dense: eligible {referenced} of {population} definitions ({:.1}%: {referenced_count} referenced + {exported_only} exported-only; rule {}), resuming at {} (recipe {recipe:?}{})",
     referenced as f64 * 100.0 / population.max(1) as f64,
+    rule.label(),
     rows.len(),
     cap_secs.map_or(String::new(), |cap| format!(", cap {}", crate::duration::render_duration(cap))),
   ));
