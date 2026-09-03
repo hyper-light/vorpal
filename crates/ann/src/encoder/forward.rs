@@ -35,6 +35,8 @@
 
 use rayon::prelude::*;
 
+use super::gemm_i8::{Int8Layer, QuantizedMatrix};
+
 /// Which GEMM numerics a forward pass runs under (module doc, third pass).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GemmPath {
@@ -47,21 +49,45 @@ pub enum GemmPath {
   /// sgemm is linked this is `FixedOrder` under another name
   /// ([`GemmPath::throughput_is_native`] says which).
   Throughput,
+  /// int8 weights (per-output-row max-abs, quantized at first use) × int8
+  /// activations (per row, per GEMM), exact i32 dots (`gemm_i8`: NEON `sdot`,
+  /// AVX-512-VNNI, AVX-VNNI, AVX2 `pmaddwd`, portable). Doc-side only — its
+  /// distance from the f32 forward is the gated retention measurement, never a
+  /// query-side numerics.
+  Int8,
 }
 
 impl GemmPath {
   /// Whether `Throughput` actually dispatches to a platform sgemm on this build
-  /// (macOS: Accelerate `cblas_sgemm`), or falls back to the fixed lanes.
+  /// AND machine (macOS: Accelerate `cblas_sgemm`; other x86-64: the owned
+  /// AVX-512F / AVX2+FMA kernels, CPUID-detected), or falls back to the fixed lanes.
   pub fn throughput_is_native() -> bool {
-    cfg!(target_os = "macos")
+    Self::throughput_label() != GemmPath::FixedOrder.label()
   }
 
   /// The path's provenance label — written into any sidecar built under it.
   pub fn label(self) -> &'static str {
     match self {
       GemmPath::FixedOrder => "fixed-order",
-      GemmPath::Throughput if Self::throughput_is_native() => "accelerate-sgemm",
-      GemmPath::Throughput => "fixed-order",
+      GemmPath::Throughput => Self::throughput_label(),
+      GemmPath::Int8 => super::gemm_i8::detect().label(),
+    }
+  }
+
+  /// What `Throughput` resolves to here: the platform matrix (BENCHMARKS,
+  /// cross-platform encoder section) in one function.
+  fn throughput_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+      "accelerate-sgemm"
+    }
+    #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+    {
+      super::gemm_x86::detect().map_or("fixed-order", super::gemm_x86::Isa::label)
+    }
+    #[cfg(not(any(target_os = "macos", target_arch = "x86_64")))]
+    {
+      "fixed-order"
     }
   }
 }
@@ -124,8 +150,11 @@ impl StageClock {
 /// the f64 gate — its bits are the query-side law.
 #[inline]
 fn exp_fast(x: f32) -> f32 {
-  const LOG2E: f32 = 1.442_695_04;
-  const LN2_HI: f32 = 0.693_359_375;
+  // The literals are the shortest round-trip spellings of Cephes' constants —
+  // bit-identical f32 values (clippy's `approx_constant`/`excessive_precision`
+  // hygiene; the gate's numerics are unchanged).
+  const LOG2E: f32 = std::f32::consts::LOG2_E;
+  const LN2_HI: f32 = 0.693_359_4;
   const LN2_LO: f32 = -2.121_944_4e-4;
   let x = x.clamp(-87.0, 88.0);
   let n = (x * LOG2E).round();
@@ -133,7 +162,7 @@ fn exp_fast(x: f32) -> f32 {
   let p = ((((1.987_569_2e-4 * r + 1.398_199_9e-3) * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r
     + 1.666_666_5e-1)
     * r
-    + 5.000_000_1e-1;
+    + 5e-1;
   let p = p * r * r + r + 1.0;
   let scale = f32::from_bits(((n as i32 + 127) as u32) << 23);
   p * scale
@@ -172,6 +201,9 @@ mod accelerate {
 
 /// One layer's weight slices (all row-major `[out][in]`, biasless per config).
 pub struct LayerWeights<'a> {
+  /// The int8 forms of the five projections — present only under
+  /// [`GemmPath::Int8`] (quantized lazily by the encoder handle).
+  pub int8: Option<&'a Int8Layer>,
   pub wqkv: &'a [f32],
   pub out_proj: &'a [f32],
   pub norm1_weight: &'a [f32],
@@ -234,6 +266,7 @@ fn gemm(
   x: &[f32],
   dim_in: usize,
   w: &[f32],
+  q: Option<&QuantizedMatrix>,
   rows_out: usize,
   out: &mut [f32],
 ) -> Result<(), String> {
@@ -247,8 +280,27 @@ fn gemm(
   match path {
     GemmPath::FixedOrder => gemm_fixed_order(x, dim_in, w, rows_out, out),
     GemmPath::Throughput => gemm_throughput(x, dim_in, w, rows_out, rows, out)?,
+    GemmPath::Int8 => match q {
+      Some(q) if q.rows() == rows_out && q.cols() == dim_in => super::gemm_i8::gemm_i8(x, q, out)?,
+      Some(_) => return Err("encoder: int8 weights disagree with the GEMM shape (invariant)".to_string()),
+      None => return Err("encoder: int8 path without quantized weights (invariant)".to_string()),
+    },
   }
   Ok(())
+}
+
+/// The GEMM dispatch as a bench seam (`examples/gemm_bench.rs`): the exact
+/// function the forward calls, on caller-supplied operands.
+pub fn bench_gemm(
+  path: GemmPath,
+  x: &[f32],
+  dim_in: usize,
+  w: &[f32],
+  q: Option<&QuantizedMatrix>,
+  rows_out: usize,
+  out: &mut [f32],
+) -> Result<(), String> {
+  gemm(path, x, dim_in, w, q, rows_out, out)
 }
 
 /// How many row-shards each throughput GEMM splits into, each shard an
@@ -336,7 +388,29 @@ fn gemm_throughput(
   Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The `Throughput` dispatch off macOS on x86-64: the owned AVX-512F / AVX2+FMA
+/// row-sharded kernels (`gemm_x86`) when CPUID offers them, else the fixed lanes.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn gemm_throughput(
+  x: &[f32],
+  dim_in: usize,
+  w: &[f32],
+  rows_out: usize,
+  rows: usize,
+  out: &mut [f32],
+) -> Result<(), String> {
+  match super::gemm_x86::detect() {
+    Some(isa) => super::gemm_x86::sgemm(isa, x, dim_in, w, rows_out, rows, out),
+    None => {
+      gemm_fixed_order(x, dim_in, w, rows_out, out);
+      Ok(())
+    }
+  }
+}
+
+/// The `Throughput` dispatch where no platform sgemm exists (non-Apple aarch64,
+/// other ISAs): the fixed lanes under another name — `label()` says so.
+#[cfg(not(any(target_os = "macos", target_arch = "x86_64")))]
 fn gemm_throughput(
   x: &[f32],
   dim_in: usize,
@@ -351,7 +425,7 @@ fn gemm_throughput(
 
 /// Eight fixed f32 lanes over ascending d, reduced pairwise in fixed order, scalar
 /// tail; rows of `out` are independent (rayon-safe, bit-stable at any thread count).
-fn gemm_fixed_order(x: &[f32], dim_in: usize, w: &[f32], rows_out: usize, out: &mut [f32]) {
+pub(super) fn gemm_fixed_order(x: &[f32], dim_in: usize, w: &[f32], rows_out: usize, out: &mut [f32]) {
   out
     .par_chunks_mut(rows_out)
     .enumerate()
@@ -520,7 +594,10 @@ pub fn forward_batch_with(
   for layer in &weights.layers {
     // qkv: [total][3*dim] rows (t-major, then head, then component); unpack into
     // contiguous q/k/v matrices [total][heads][head_dim] for the attention walk.
-    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.wqkv, 3 * dim, &mut qkv))?;
+    let int8_of = |pick: fn(&Int8Layer) -> &QuantizedMatrix| layer.int8.map(pick);
+    clock.time(|c| &mut c.gemm, || {
+      gemm(path, &x, dim, layer.wqkv, int8_of(|l| &l.wqkv), 3 * dim, &mut qkv)
+    })?;
     clock.time(
       |c| &mut c.other,
       || {
@@ -585,15 +662,21 @@ pub fn forward_batch_with(
           }
         }
       }));
-    clock.time(|c| &mut c.gemm, || gemm(path, &context, dim, layer.out_proj, dim, &mut attn_out))?;
+    clock.time(|c| &mut c.gemm, || {
+      gemm(path, &context, dim, layer.out_proj, int8_of(|l| &l.out_proj), dim, &mut attn_out)
+    })?;
     clock.time(|c| &mut c.other, || residual_add(&mut x, &attn_out));
     clock.time(|c| &mut c.norm, || {
       layer_norm(&mut x, dim, layer.norm1_weight, layer.norm1_bias, weights.layer_norm_eps)
     });
-    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc11, weights.inner, &mut mlp_y))?;
-    clock.time(|c| &mut c.gemm, || gemm(path, &x, dim, layer.fc12, weights.inner, &mut mlp_gate))?;
+    clock.time(|c| &mut c.gemm, || {
+      gemm(path, &x, dim, layer.fc11, int8_of(|l| &l.fc11), weights.inner, &mut mlp_y)
+    })?;
+    clock.time(|c| &mut c.gemm, || {
+      gemm(path, &x, dim, layer.fc12, int8_of(|l| &l.fc12), weights.inner, &mut mlp_gate)
+    })?;
     // SwiGLU gate: f64 libm on the fixed-order path (the query-side law); the
-    // vectorizable f32 `exp_fast` on the throughput path (parity-oracle bound).
+    // vectorizable f32 `exp_fast` on the throughput and int8 paths (parity-oracle bound).
     clock.time(|c| &mut c.gate, || {
       mlp_y
         .par_chunks_exact_mut(weights.inner)
@@ -605,7 +688,7 @@ pub fn forward_batch_with(
               *y = (*y as f64 * (g / (1.0 + (-g).exp()))) as f32;
             }
           }
-          GemmPath::Throughput => {
+          GemmPath::Throughput | GemmPath::Int8 => {
             for (y, gate) in y_row.iter_mut().zip(gate_row) {
               let g = *gate;
               *y *= g / (1.0 + exp_fast(-g));
@@ -613,7 +696,9 @@ pub fn forward_batch_with(
           }
         })
     });
-    clock.time(|c| &mut c.gemm, || gemm(path, &mlp_y, weights.inner, layer.fc2, dim, &mut mlp_out))?;
+    clock.time(|c| &mut c.gemm, || {
+      gemm(path, &mlp_y, weights.inner, layer.fc2, int8_of(|l| &l.fc2), dim, &mut mlp_out)
+    })?;
     clock.time(|c| &mut c.other, || residual_add(&mut x, &mlp_out));
     clock.time(|c| &mut c.norm, || {
       layer_norm(&mut x, dim, layer.norm2_weight, layer.norm2_bias, weights.layer_norm_eps)

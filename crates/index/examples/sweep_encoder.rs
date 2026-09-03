@@ -128,14 +128,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   );
   println!("| batch | tokens | tok/seq | fixed-order s | GFLOPS | throughput s | GFLOPS | speedup | min cosine | seq/s (throughput) |");
   println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+  // The int8 path's rows (rate + the derived retention bar — the gated test's
+  // statistic on the production surface distribution), printed after the table.
+  let mut int8_rows: Vec<String> = Vec::new();
   for &batch in &batches {
     let texts: Vec<&str> = pool[..batch].iter().map(String::as_str).collect();
     let tokens: usize = texts.iter().map(|t| encoder.sequence_len(t)).sum();
     let flops = 2.0 * params as f64 * tokens as f64;
     let mut fixed_s = Vec::with_capacity(REPS);
     let mut fast_s = Vec::with_capacity(REPS);
+    let mut int8_s = Vec::with_capacity(REPS);
     let mut fixed_rows = Vec::new();
     let mut fast_rows = Vec::new();
+    let mut int8_rows_out = Vec::new();
     for _ in 0..REPS {
       let started = std::time::Instant::now();
       fixed_rows = encoder.embed_batch_with(&texts, GemmPath::FixedOrder)?;
@@ -143,6 +148,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       let started = std::time::Instant::now();
       fast_rows = encoder.embed_batch_with(&texts, GemmPath::Throughput)?;
       fast_s.push(started.elapsed().as_secs_f64());
+      let started = std::time::Instant::now();
+      int8_rows_out = encoder.embed_batch_with(&texts, GemmPath::Int8)?;
+      int8_s.push(started.elapsed().as_secs_f64());
+    }
+    {
+      // int8 vs fixed-order, and the output-int8 bar (the sidecar's own
+      // quantizer dequantized) on the same fixed-order embeddings.
+      let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum::<f64>();
+      let (mut min_int8, mut min_bar, mut dev_int8, mut dev_bar) = (1.0f64, 1.0f64, 0.0f64, 0.0f64);
+      for (f, q) in fixed_rows.iter().zip(&int8_rows_out) {
+        let c = cos(f, q);
+        let mut codes = vec![0i8; f.len()];
+        let scale = vorpal_ann::dense::quantize_row(f, &mut codes);
+        let deq: Vec<f32> = codes.iter().map(|&c| c as f32 * scale).collect();
+        let norm = deq.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
+        let bar = if norm > 0.0 { cos(f, &deq) / norm } else { 0.0 };
+        min_int8 = min_int8.min(c);
+        min_bar = min_bar.min(bar);
+        dev_int8 += 1.0 - c;
+        dev_bar += 1.0 - bar;
+      }
+      let n = batch as f64;
+      let int8 = median(&mut int8_s.clone());
+      int8_rows.push(format!(
+        "| {batch} | {tokens} | {int8:.3} | {:.1} | {:.2}× | {:.2}× | {min_int8:.6} | {:.2e} | {min_bar:.6} | {:.2e} | {} |",
+        flops / int8 / 1e9,
+        median(&mut fixed_s.clone()) / int8,
+        median(&mut fast_s.clone()) / int8,
+        dev_int8 / n,
+        dev_bar / n,
+        if dev_int8 <= dev_bar { "MEETS" } else { "FAILS" },
+      ));
     }
     let min_cosine = fixed_rows
       .iter()
@@ -158,6 +195,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       fixed / fast,
       batch as f64 / fast,
     );
+  }
+  println!();
+  println!(
+    "int8 path = {} ({} MB of int8 weights); bar = output-int8 quantization of the same fixed-order embeddings (the published ≥ 97 % retention's perturbation); verdict MEETS ⇔ mean 1-cos(int8) ≤ mean 1-cos(bar)",
+    GemmPath::Int8.label(),
+    encoder.int8_bytes() / (1 << 20),
+  );
+  println!("| batch | tokens | int8 s | GOPS | vs fixed | vs throughput | min cos (int8) | mean 1-cos (int8) | min cos (bar) | mean 1-cos (bar) | verdict |");
+  println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+  for row in &int8_rows {
+    println!("{row}");
   }
   // Thread-stability verdict of the throughput path (rayon 1 vs default pool),
   // on the smallest batch — the same statement the gated test prints.

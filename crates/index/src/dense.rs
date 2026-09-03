@@ -776,6 +776,9 @@ pub(crate) fn is_fresh(dir: &Path, stamp: u64, encoder: &CodeEncoder) -> bool {
   fresh_record(dir, stamp, encoder).is_some()
 }
 
+/// The sidecar's four sections (ids, scales, codes, f16 rows) as viewed slices.
+type Sections<'a> = (&'a [u64], &'a [f32], &'a [i8], &'a [u16]);
+
 /// The mapped sidecar: sections viewed zero-copy from the mapping.
 pub(crate) struct DenseSidecar {
   store: vorpal_mem::MappedStore,
@@ -810,7 +813,7 @@ impl DenseSidecar {
   }
 
   /// The four sections as typed slices — `None` if the mapping is misaligned.
-  fn sections(&self) -> Option<(&[u64], &[f32], &[i8], &[u16])> {
+  fn sections(&self) -> Option<Sections<'_>> {
     let bytes = self.store.as_bytes();
     let (n, dim) = (self.n, self.dim);
     let ids = bytemuck::try_cast_slice::<u8, u64>(&bytes[self.layout.ids..self.layout.ids + n * 8]).ok()?;

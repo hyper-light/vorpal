@@ -232,10 +232,111 @@ fn throughput_path_matches_fixed_order_within_cosine() {
     worst = worst.min(c);
     assert!(c >= 0.9999, "throughput path drifted on {text:?}: cosine {c:.7}");
   }
+  // The AVX2+FMA kernel is the fixed lanes' exact reduction structure
+  // (`gemm_x86` module doc) — on that rung parity is bitwise, not cosine.
+  if GemmPath::Throughput.label() == "avx2-fma-sgemm" {
+    assert_eq!(
+      bits(&fixed),
+      bits(&fast),
+      "the AVX2 throughput kernel must reproduce the fixed lanes bit for bit"
+    );
+  }
   eprintln!(
-    "throughput path ({}) vs fixed-order: min cosine {worst:.7} over {} surfaces",
+    "throughput path ({}) vs fixed-order: min cosine {worst:.7} over {} surfaces{}",
     GemmPath::Throughput.label(),
-    texts.len()
+    texts.len(),
+    if GemmPath::Throughput.label() == "avx2-fma-sgemm" { " (bit-identical)" } else { "" }
+  );
+}
+
+/// The deviation int8 OUTPUT quantization (the sidecar's own `quantize_row`,
+/// dequantized) imposes on a unit embedding — the perturbation under which the
+/// published int8 retention (ENCODER_RESEARCH §6: 97 % MTEB retrieval for the
+/// best-in-class 1024-d model, 99 % with ×4 rescore) was measured.
+fn output_quantization_cosine(row: &[f32]) -> f64 {
+  let mut codes = vec![0i8; row.len()];
+  let scale = vorpal_ann::dense::quantize_row(row, &mut codes);
+  let dequantized: Vec<f32> = codes.iter().map(|&c| c as f32 * scale).collect();
+  let norm = dequantized.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>().sqrt();
+  if norm == 0.0 {
+    return 0.0;
+  }
+  cosine(row, &dequantized) / norm
+}
+
+/// The int8 doc-side path (`GemmPath::Int8`): determinism by construction
+/// (exact i32 dots — run-to-run AND thread-count bit-stable), a functional
+/// floor (it must still rank the obvious pair), and its retention against the
+/// DERIVED bar: the int8 forward's mean angular deviation from the f32
+/// fixed-order embedding must not exceed the deviation int8 output quantization
+/// imposes on the same embeddings — the perturbation the published ≥ 97 %
+/// retention was measured under — so by that mapping (retention is monotone in
+/// embedding perturbation) the int8 forward retains ≥ 97 %. The verdict is
+/// REPORTED, not asserted: it decides the doc-side DEFAULT (recorded in
+/// BENCHMARKS — measured FAILS on 2026-09-02: min cosine 0.971 on the
+/// query-shaped surface, so the sidecar keeps `Throughput`), and a numerics
+/// that fails a default-selection bar is not a broken kernel — the unit
+/// oracles pin the kernels exactly.
+#[test]
+fn int8_path_is_deterministic_and_reports_retention_against_the_derived_bar() {
+  use vorpal_ann::encoder::GemmPath;
+  let Some(dir) = model_dir() else {
+    eprintln!("skipped: VORPAL_CODERANK_DIR unset");
+    return;
+  };
+  let encoder = CodeEncoder::open(&dir).unwrap();
+  let texts = parity_battery(&dir);
+  let borrowed: Vec<&str> = texts.iter().map(String::as_str).collect();
+  let fixed = encoder.embed_batch_with(&borrowed, GemmPath::FixedOrder).unwrap();
+  let first = encoder.embed_batch_with(&borrowed, GemmPath::Int8).unwrap();
+  let second = encoder.embed_batch_with(&borrowed, GemmPath::Int8).unwrap();
+  assert_eq!(bits(&first), bits(&second), "int8 path must be run-to-run reproducible");
+  let single = rayon::ThreadPoolBuilder::new()
+    .num_threads(1)
+    .build()
+    .unwrap()
+    .install(|| encoder.embed_batch_with(&borrowed, GemmPath::Int8).unwrap());
+  assert_eq!(bits(&single), bits(&first), "int8 path must be bit-stable across rayon thread counts (exact i32 dots)");
+  // Functional floor: an int8 query embedding still ranks the factorial
+  // snippet above the unrelated one (the battery's last two surfaces).
+  let (hit, miss) = (&first[texts.len() - 1], &first[texts.len() - 2]);
+  assert!(
+    texts[texts.len() - 1].starts_with("def factorial") && texts[texts.len() - 2].starts_with("vx_socket"),
+    "battery layout changed under the functional floor"
+  );
+  let factorial_query = encoder
+    .embed_batch_with(&["Represent this query for searching relevant code: Calculate the n-th factorial"], GemmPath::Int8)
+    .unwrap();
+  assert!(
+    cosine(&factorial_query[0], hit) > cosine(&factorial_query[0], miss),
+    "int8 path must still rank the factorial snippet above the unrelated one"
+  );
+  let (mut min_int8, mut min_bar) = (1.0f64, 1.0f64);
+  let (mut dev_int8, mut dev_bar) = (0.0f64, 0.0f64);
+  let mut worst_text = "";
+  for ((text, f), q) in texts.iter().zip(&fixed).zip(&first) {
+    let c = cosine(f, q);
+    let bar = output_quantization_cosine(f);
+    if c < min_int8 {
+      worst_text = text;
+    }
+    min_int8 = min_int8.min(c);
+    min_bar = min_bar.min(bar);
+    dev_int8 += 1.0 - c;
+    dev_bar += 1.0 - bar;
+  }
+  let n = texts.len() as f64;
+  let meets = dev_int8 / n <= dev_bar / n;
+  eprintln!(
+    "int8 path ({}) vs fixed-order over {} surfaces: min cosine {min_int8:.6} ({worst_text:?}), mean 1-cos {:.2e}; \
+     output-int8 bar on the same embeddings: min cosine {min_bar:.6}, mean 1-cos {:.2e}; \
+     verdict: {} the derived ≥ 97 % retention bar; int8 weights {} MB",
+    GemmPath::Int8.label(),
+    texts.len(),
+    dev_int8 / n,
+    dev_bar / n,
+    if meets { "MEETS" } else { "FAILS" },
+    encoder.int8_bytes() / (1 << 20),
   );
 }
 
