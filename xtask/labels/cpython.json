@@ -1,5 +1,5 @@
 {
-  "description": "cpython graded set, graded 2026-08-30 against cpython main (labels are tree-dependent; the existence gate re-verifies every run).",
+  "description": "cpython graded set: the 6 original queries graded 2026-08-30 + 48 evidence-backed queries added 2026-09-03, all against cpython b86a41cbf63 (labels are tree-dependent; the existence gate re-verifies every run; source citations in cpython.evidence.md).",
   "queries": [
     {
       "class": "short-keyword",
@@ -42,6 +42,309 @@
         { "name": "_find_spec", "grade": 3 },
         { "name": "find_spec", "grade": 2 }
       ]
+    },
+    {
+      "class": "exact",
+      "query": "PyUnicode_FromFormat",
+      "relevant": [{ "name": "PyUnicode_FromFormat", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "PyLong_AsLongAndOverflow",
+      "relevant": [{ "name": "PyLong_AsLongAndOverflow", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "PyErr_WarnEx",
+      "relevant": [{ "name": "PyErr_WarnEx", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "PyModule_AddObjectRef",
+      "relevant": [{ "name": "PyModule_AddObjectRef", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "cached_property",
+      "relevant": [{ "name": "cached_property", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "_find_and_load",
+      "relevant": [{ "name": "_find_and_load", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "PathFinder",
+      "relevant": [{ "name": "PathFinder", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "getmembers",
+      "relevant": [{ "name": "getmembers", "path": "Lib/inspect.py", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "unicode concat",
+      "relevant": [{ "name": "PyUnicode_Concat", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "integer from string",
+      "relevant": [{ "name": "PyLong_FromString", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "allocate new tuple",
+      "relevant": [
+        { "name": "PyTuple_New", "grade": 3 },
+        { "name": "PyTuple_Pack", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "error set string",
+      "relevant": [
+        { "name": "PyErr_SetString", "grade": 3 },
+        { "name": "PyErr_Format", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "merge mapping into dict",
+      "relevant": [
+        { "name": "PyDict_Merge", "grade": 3 },
+        { "name": "PyDict_Update", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "list sort in place",
+      "relevant": [
+        { "name": "PyList_Sort", "grade": 3 },
+        { "name": "list_sort_impl", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "object repr",
+      "relevant": [
+        { "name": "PyObject_Repr", "grade": 3 },
+        { "name": "PyObject_Str", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "type ready",
+      "relevant": [{ "name": "PyType_Ready", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "least recently used cache",
+      "relevant": [
+        { "name": "lru_cache", "grade": 3 },
+        { "name": "cache", "path": "Lib/functools.py", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "weak key dict",
+      "relevant": [{ "name": "WeakKeyDictionary", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "coroutine threadsafe submit",
+      "relevant": [{ "name": "run_coroutine_threadsafe", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "AsUTF8",
+      "relevant": [
+        { "name": "PyUnicode_AsUTF8", "grade": 3 },
+        { "name": "PyUnicode_AsUTF8AndSize", "grade": 2 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "intern",
+      "relevant": [
+        { "name": "PyUnicode_InternInPlace", "grade": 3 },
+        { "name": "PyUnicode_InternFromString", "grade": 2 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "richcompare",
+      "relevant": [
+        { "name": "PyObject_RichCompare", "grade": 3 },
+        { "name": "PyObject_RichCompareBool", "grade": 2 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "unraisable",
+      "relevant": [
+        { "name": "PyErr_WriteUnraisable", "grade": 3 },
+        { "name": "PyErr_FormatUnraisable", "grade": 2 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "generic alias",
+      "relevant": [{ "name": "Py_GenericAlias", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "from file location",
+      "relevant": [{ "name": "spec_from_file_location", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "call str on a value",
+      "relevant": [{ "name": "PyObject_Str", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "resize list storage capacity",
+      "relevant": [{ "name": "list_resize", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "dict grow hash table",
+      "relevant": [{ "name": "dictresize", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "raise exception with format string",
+      "relevant": [
+        { "name": "PyErr_Format", "grade": 3 },
+        { "name": "PyErr_SetString", "grade": 1 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "hash a str object",
+      "relevant": [{ "name": "unicode_hash", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "store value under string key",
+      "relevant": [
+        { "name": "PyDict_SetItemString", "grade": 3 },
+        { "name": "PyDict_SetItem", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "schedule callback soon on event loop",
+      "relevant": [{ "name": "call_soon", "path": "Lib/asyncio/base_events.py", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "parse json text into python object",
+      "relevant": [{ "name": "loads", "path": "Lib/json/__init__.py", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "resolve symlinks in path",
+      "relevant": [{ "name": "resolve", "path": "Lib/pathlib/__init__.py", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "release the interpreter lock",
+      "relevant": [
+        { "name": "drop_gil", "grade": 3 },
+        { "name": "PyEval_ReleaseThread", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "C3 linearization of base classes",
+      "relevant": [
+        { "name": "mro_implementation", "grade": 3 },
+        { "name": "mro_implementation_unlocked", "grade": 2 },
+        { "name": "mro_internal", "grade": 1 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "run handlers for delivered interrupts",
+      "relevant": [{ "name": "PyErr_CheckSignals", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "binary search for where a key belongs in a sorted run",
+      "relevant": [
+        { "name": "gallop_left", "grade": 3 },
+        { "name": "gallop_right", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "memoize call results",
+      "relevant": [
+        { "name": "cache", "path": "Lib/functools.py", "grade": 3 },
+        { "name": "lru_cache", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "clone object recursively",
+      "relevant": [{ "name": "deepcopy", "path": "Lib/copy.py", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "ignore given errors inside with statement",
+      "relevant": [{ "name": "suppress", "path": "Lib/contextlib.py", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "turn an error into printable lines",
+      "relevant": [
+        { "name": "format_exception", "grade": 3 },
+        { "name": "format_exc", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "recursively list every subfolder",
+      "relevant": [{ "name": "walk", "path": "Lib/os.py", "grade": 3 }]
+    },
+    {
+      "class": "conjunctive",
+      "query": "list slice assignment",
+      "relevant": [
+        { "name": "list_ass_slice", "grade": 3 },
+        { "name": "list_ass_slice_lock_held", "grade": 2 },
+        { "name": "list_ass_subscript", "grade": 1 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "utf-8 decode incremental consumed",
+      "relevant": [
+        { "name": "PyUnicode_DecodeUTF8Stateful", "grade": 3 },
+        { "name": "PyUnicode_DecodeUTF8", "grade": 2 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "rotating log file by size",
+      "relevant": [
+        { "name": "RotatingFileHandler", "grade": 3 },
+        { "name": "BaseRotatingHandler", "grade": 2 },
+        { "name": "TimedRotatingFileHandler", "grade": 1 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "regex compile with cache",
+      "relevant": [{ "name": "_compile", "path": "Lib/re/__init__.py", "grade": 3 }]
+    },
+    {
+      "class": "conjunctive",
+      "query": "asyncio wait with timeout",
+      "relevant": [{ "name": "wait_for", "path": "Lib/asyncio/tasks.py", "grade": 3 }]
     }
   ]
 }

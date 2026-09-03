@@ -1,5 +1,5 @@
 {
-  "description": "Linux kernel graded set — the 8 tier-vs-exact queries from docs/wip/BENCHMARKS.md, graded 2026-08-30 against Linux 7.2-rc4 (labels are tree-dependent; the existence gate re-verifies every run).",
+  "description": "Linux kernel graded set: the 8 original tier-vs-exact queries from docs/wip/BENCHMARKS.md graded 2026-08-30 + 46 evidence-backed queries added 2026-09-03, all against Linux 7.2-rc4 1590cf032971 (labels are tree-dependent; the existence gate re-verifies every run; anchored '/…' paths need --root; source citations in kernel.evidence.md).",
   "queries": [
     {
       "class": "short-keyword",
@@ -74,6 +74,315 @@
         { "name": "pick_next_task", "grade": 3 },
         { "name": "__pick_next_task", "grade": 2 },
         { "name": "pick_next_entity", "grade": 1 }
+      ]
+    },
+    {
+      "class": "exact",
+      "query": "bio_add_page",
+      "relevant": [{ "name": "bio_add_page", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "d_splice_alias",
+      "relevant": [{ "name": "d_splice_alias", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "update_load_avg",
+      "relevant": [{ "name": "update_load_avg", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "device_link_add",
+      "relevant": [{ "name": "device_link_add", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "tcp_ack_update_rtt",
+      "relevant": [{ "name": "tcp_ack_update_rtt", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "wq_worker_sleeping",
+      "relevant": [{ "name": "wq_worker_sleeping", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "amdgpu_device_init",
+      "relevant": [{ "name": "amdgpu_device_init", "grade": 3 }]
+    },
+    {
+      "class": "exact",
+      "query": "xas_nomem",
+      "relevant": [{ "name": "xas_nomem", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "delayed work queue",
+      "relevant": [
+        { "name": "queue_delayed_work", "grade": 3 },
+        { "name": "queue_delayed_work_on", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "virtual memory area find",
+      "relevant": [
+        { "name": "find_vma", "path": "mm/mmap.c", "grade": 3 },
+        { "name": "vma_lookup", "path": "include/linux/mm.h", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "socket buffer clone",
+      "relevant": [{ "name": "skb_clone", "grade": 3 }]
+    },
+    {
+      "class": "short-keyword",
+      "query": "workqueue alloc",
+      "relevant": [
+        { "name": "alloc_workqueue", "grade": 3 },
+        { "name": "alloc_workqueue_noprof", "grade": 2 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "dentry alloc",
+      "relevant": [
+        { "name": "d_alloc", "grade": 3 },
+        { "name": "d_alloc_parallel", "grade": 1 }
+      ]
+    },
+    {
+      "class": "short-keyword",
+      "query": "block io alloc bioset",
+      "relevant": [{ "name": "bio_alloc_bioset", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "kmap local",
+      "relevant": [
+        { "name": "kmap_local_page", "grade": 3 },
+        { "name": "kmap_local_folio", "grade": 2 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "rb insert",
+      "relevant": [{ "name": "rb_insert_color", "path": "/lib/rbtree.c", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "try to wake",
+      "relevant": [{ "name": "try_to_wake_up", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "generic file read",
+      "relevant": [{ "name": "generic_file_read_iter", "grade": 3 }]
+    },
+    {
+      "class": "subset",
+      "query": "kthread should",
+      "relevant": [
+        { "name": "kthread_should_stop", "grade": 3 },
+        { "name": "kthread_should_park", "grade": 2 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "iget",
+      "relevant": [
+        { "name": "iget_locked", "grade": 3 },
+        { "name": "iget5_locked", "grade": 2 },
+        { "name": "ilookup", "grade": 1 }
+      ]
+    },
+    {
+      "class": "subset",
+      "query": "unmap mapping",
+      "relevant": [
+        { "name": "unmap_mapping_range", "path": "mm/memory.c", "grade": 3 },
+        { "name": "unmap_mapping_pages", "path": "mm/memory.c", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "rcu callback after grace period",
+      "relevant": [{ "name": "call_rcu", "path": "kernel/rcu/tree.c", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "allocate zeroed kernel memory",
+      "relevant": [{ "name": "kzalloc", "path": "/include/linux/slab.h", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "copy buffer out of userland",
+      "relevant": [
+        { "name": "copy_from_user", "path": "include/linux/uaccess.h", "grade": 3 },
+        { "name": "_copy_from_user", "path": "lib/usercopy.c", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "remove node from red black tree",
+      "relevant": [{ "name": "rb_erase", "path": "/lib/rbtree.c", "grade": 3 }]
+    },
+    {
+      "class": "descriptive",
+      "query": "flag folio as modified",
+      "relevant": [
+        { "name": "folio_mark_dirty", "grade": 3 },
+        { "name": "__folio_mark_dirty", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "cancel pending timer and wait for handler",
+      "relevant": [
+        { "name": "timer_delete_sync", "grade": 3 },
+        { "name": "timer_delete", "path": "kernel/time/timer.c", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "resolve a string filename to a path struct",
+      "relevant": [
+        { "name": "kern_path", "grade": 3 },
+        { "name": "filename_lookup", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "submit block io request",
+      "relevant": [
+        { "name": "submit_bio", "path": "block/blk-core.c", "grade": 3 },
+        { "name": "submit_bio_noacct", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "compute message digest in one shot",
+      "relevant": [
+        { "name": "crypto_shash_digest", "grade": 3 },
+        { "name": "crypto_shash_tfm_digest", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "register a new device with the system",
+      "relevant": [
+        { "name": "device_register", "grade": 3 },
+        { "name": "device_add", "path": "drivers/base/core.c", "grade": 2 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "smoothed round trip time estimate",
+      "relevant": [
+        { "name": "tcp_rtt_estimator", "grade": 3 },
+        { "name": "tcp_set_rto", "grade": 1 }
+      ]
+    },
+    {
+      "class": "descriptive",
+      "query": "search parent dentry children for name",
+      "relevant": [
+        { "name": "d_lookup", "grade": 3 },
+        { "name": "__d_lookup", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "place page array in contiguous kernel virtual range",
+      "relevant": [{ "name": "vmap", "path": "mm/vmalloc.c", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "defer a job to the system per-cpu pool",
+      "relevant": [
+        { "name": "schedule_work", "path": "include/linux/workqueue.h", "grade": 3 },
+        { "name": "queue_work", "path": "include/linux/workqueue.h", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "register attribute directory under kobject",
+      "relevant": [{ "name": "sysfs_create_group", "path": "fs/sysfs/group.c", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "block until all pre-existing readers finish",
+      "relevant": [{ "name": "synchronize_rcu", "path": "kernel/rcu/tree.c", "grade": 3 }]
+    },
+    {
+      "class": "paraphrase",
+      "query": "make a task runnable",
+      "relevant": [
+        { "name": "wake_up_process", "grade": 3 },
+        { "name": "try_to_wake_up", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "write out all cached changes of a mounted volume",
+      "relevant": [
+        { "name": "sync_filesystem", "grade": 3 },
+        { "name": "sync_inodes_sb", "grade": 2 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "background page reclaim daemon thread",
+      "relevant": [
+        { "name": "kswapd", "path": "mm/vmscan.c", "grade": 3 },
+        { "name": "kswapd_run", "grade": 2 },
+        { "name": "balance_pgdat", "grade": 1 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "pick victim task when memory exhausted",
+      "relevant": [
+        { "name": "select_bad_process", "grade": 3 },
+        { "name": "oom_badness", "grade": 2 },
+        { "name": "oom_kill_process", "grade": 1 }
+      ]
+    },
+    {
+      "class": "paraphrase",
+      "query": "run function across all processors",
+      "relevant": [{ "name": "on_each_cpu", "grade": 3 }]
+    },
+    {
+      "class": "conjunctive",
+      "query": "tcp sack reordering detection",
+      "relevant": [{ "name": "tcp_check_sack_reordering", "grade": 3 }]
+    },
+    {
+      "class": "conjunctive",
+      "query": "expedited rcu grace period",
+      "relevant": [
+        { "name": "synchronize_rcu_expedited", "path": "kernel/rcu/tree_exp.h", "grade": 3 },
+        { "name": "synchronize_rcu", "path": "kernel/rcu/tree.c", "grade": 1 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "killable rwsem write lock",
+      "relevant": [
+        { "name": "down_write_killable", "grade": 3 },
+        { "name": "down_write", "path": "kernel/locking/rwsem.c", "grade": 1 }
+      ]
+    },
+    {
+      "class": "conjunctive",
+      "query": "synchronous readahead on cache miss",
+      "relevant": [
+        { "name": "page_cache_sync_ra", "grade": 3 },
+        { "name": "page_cache_sync_readahead", "grade": 2 },
+        { "name": "page_cache_async_ra", "grade": 1 }
       ]
     }
   ]

@@ -279,8 +279,13 @@ determinism gate and a tier-vs-exact top-10 overlap mode:
 ```
 cargo build --release -p xtask
 vorpal-index index <tree> <idx> && vorpal-index __warm-ann <idx>
-target/release/xtask searcheval <idx> xtask/labels/<set>.json [--overlap]
+target/release/xtask searcheval <idx> xtask/labels/<set>.json [--overlap] [--root <tree>]
 ```
+
+(`--root` is required for the kernel set since 2026-09-03: labels whose `path` starts with
+`/` are anchored at the tree root, the only way to tell `lib/rbtree.c` from its
+`tools/lib/rbtree.c` mirror. Every set ships a `<set>.evidence.md` sidecar citing the
+source line behind each grade-3 answer.)
 
 2026-08-30 lexical-fusion baselines (pre-semantic-tier — the "before" every stage of the
 semantic-tier plan measures against):
@@ -2949,3 +2954,118 @@ tree cache.
   of inherently ordered link tail; inspect with `VORPAL_PHASE_TRACE=1`.
 - Wall-clock deltas below ~0.5 s are unresolvable on this hardware: user CPU for identical
   cold builds varies 101–117 s with thermal state across a session.
+
+## Graded label sets expanded to ~50 queries per corpus (2026-09-03)
+
+Every pinning decision above moved on one query per class, so the three sets were
+expanded from 8 / 6 / 10 to **54 / 54 / 55** (kernel / cpython / vorpal), class-balanced,
+with every original query kept verbatim. Each set now ships a sidecar
+`xtask/labels/<set>.evidence.md` citing the source line (kerneldoc, `Doc/c-api`,
+docstring, `///` doc, or body) that proves each grade-3 answer — grading is from the
+source, never from what search returns; paraphrase queries share no token with the
+identifier or its file, descriptive queries at most one. Two harness additions:
+`--root <tree>` and anchored label paths (`"path": "/lib/rbtree.c"` = tree-relative
+equality; a plain suffix stays `ends_with`), because the kernel mirrors `lib/rbtree.c`,
+`include/linux/slab.h`, `include/linux/spinlock.h` under `tools/` and no suffix can
+single the tree copy out. Unit tests cover the path rule, the greedy matcher, NDCG and
+`validate` (`cargo test -p xtask`).
+
+| corpus | exact | short-kw | subset | descriptive | paraphrase | conjunctive | total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| kernel `1590cf032971` | 8 | 13 | 7 | 13 | 9 | 4 | **54** |
+| cpython `b86a41cbf63` | 8 | 13 | 6 | 13 | 9 | 5 | **54** |
+| vorpal v0.7.0 | 8 | 12 | 7 | 13 | 10 | 5 | **55** |
+
+Candidates dropped because the symbol is in source but NOT in the index (the existence
+gate would fail the run): kernel `hrtimer_interrupt` (kernel/time/hrtimer.c:2185),
+`hrtimer_start_range_ns` (:1493), `netif_receive_skb` / `__netif_receive_skb`
+(net/core/dev.c:6464 / :6305), `kzalloc_noprof` (include/linux/slab.h:1292); cpython
+`PyObject_GenericGetAttr` (Objects/object.c:2010) and `PyCallable_Check` (:2178).
+The cpython pair is an extraction gap, not a label problem: `Objects/object.c` is
+indexed only through `PyObject_Hash` (:1158) — `PyObject_GetAttr` (:1310),
+`PyObject_SetAttr` (:1508), `PyObject_IsTrue` (:2138), `PyObject_Not` (:2166) and
+everything after are absent, while `vorpal-index health` reports the file clean.
+Open lead for the extraction owner. Also recorded, not changed: the original
+cpython `list_append` label (no `path`) is satisfied by the clinic wrapper and a
+`Modules/_testlimitedcapi/list.c` helper, and `gc_collect_main` / `PyGC_Collect`
+exist in both `gc.c` and `gc_free_threading.c`.
+
+Substrate: fresh `--semantic-tier lexical` and `learned` indexes per corpus (kernel
+8,890,840 nodes, cpython 162,813, vorpal 79,431), `__warm-ann`'d, `VORPAL_NO_AUTOWARM=1`;
+encoder = `vorpal enable semantic-f32` into a scratch `VORPAL_HOME` (no dense sidecar —
+searcheval prints "dense sidecar: none", so "+ encoder" is the rerank only, the README's
+configuration). Old-set rows reproduce the README pins bit-for-bit on cpython and vorpal
+(cpython 0.137 / 0.412 / 0.410; vorpal 0.572 / 0.572 / 0.585 all-NDCG) and on kernel
+lexical (0.299); the kernel learned rows are recorded below as measured on this build.
+
+### Before/after, NDCG@10 / MRR / recall@5
+
+vorpal (self-index):
+
+| configuration | set | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** |
+|---|---|---|---|---|---|---|---|---|
+| lexical | old (10) | 0/0/0 | 0.651/0.556/0.500 | 1/1/1 | 0/0/0 | 0.894/1.000/0.750 | 0.631/0.500/1.000 | 0.572/0.561/0.550 |
+| lexical | new (55) | 0.067/0.208/0.100 | 0.129/0.099/0.077 | 0.990/1.000/1.000 | 0/0/0 | 0.590/0.568/0.542 | 0.710/0.648/0.857 | **0.400/0.394/0.400** |
+| learned | old (10) | 0.301/0.111/0 | 0.500/0.500/0.500 | 0.815/0.750/1.000 | 0/0/0 | 0.894/1.000/0.750 | 1/1/1 | 0.572/0.561/0.550 |
+| learned | new (55) | 0.381/0.529/0.600 | 0.173/0.148/0.192 | 0.944/0.938/1.000 | 0/0/0 | 0.643/0.618/0.792 | 0.763/0.695/0.929 | **0.450/0.443/0.536** |
+| learned + f32 | old (10) | 0.431/0.250/1.000 | 0.500/0.500/0.500 | 0.815/0.750/1.000 | 0/0/0 | 0.894/1.000/0.750 | 1/1/1 | 0.585/0.575/0.650 |
+| learned + f32 | new (55) | 0.442/0.525/0.700 | 0.191/0.170/0.192 | 0.940/0.938/1.000 | 0/0/0 | 0.664/0.653/0.750 | 0.743/0.676/0.857 | **0.461/0.453/0.527** |
+
+cpython:
+
+| configuration | set | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** |
+|---|---|---|---|---|---|---|---|---|
+| lexical | old (6) | — | 0.036/0.062/0.125 | — | — | 0.338/0.500/0.500 | — | 0.137/0.208/0.250 |
+| lexical | new (54) | 0.119/0.100/0.200 | 0.088/0.096/0.115 | 0.938/0.917/1.000 | 0/0/0 | 0.365/0.332/0.423 | 0.435/0.396/0.333 | **0.307/0.292/0.333** |
+| learned | old (6) | — | 0.475/0.542/0.375 | — | — | 0.287/0.500/0.250 | — | 0.412/0.528/0.333 |
+| learned | new (54) | 0.157/0.133/0.200 | 0.195/0.205/0.192 | 0.954/0.938/1.000 | 0/0/0 | 0.386/0.310/0.538 | 0.401/0.400/0.417 | **0.340/0.320/0.389** |
+| learned + f32 | old (6) | — | 0.531/0.583/0.625 | — | — | 0.169/0.500/0.250 | — | 0.410/0.556/0.500 |
+| learned + f32 | new (54) | 0.135/0.100/0.200 | 0.212/0.218/0.269 | 0.938/0.917/1.000 | 0/0/0 | 0.388/0.339/0.577 | 0.488/0.458/0.500 | **0.350/0.330/0.426** |
+
+Linux kernel (`--root /path/to/linux`):
+
+| configuration | set | conjunctive | descriptive | exact | paraphrase | short-kw | subset | **all** |
+|---|---|---|---|---|---|---|---|---|
+| lexical | old (8) | — | 0.947/1.000/1.000 | — | — | 0.206/0.286/0.119 | — | 0.299/0.375/0.229 |
+| lexical | new (54) | 0.250/0.282/0.250 | 0.073/0.077/0.077 | 0.891/0.854/1.000 | 0/0/0 | 0.250/0.308/0.141 | 0.544/0.520/0.643 | **0.299/0.307/0.302** |
+| learned | old (8) | — | 0.905/1.000/1.000 | — | — | 0.125/0.193/0.095 | — | 0.222/0.294/0.208 |
+| learned | new (54) | 0.339/0.300/0.500 | 0.073/0.077/0.077 | 0.908/0.875/1.000 | 0/0/0 | 0.276/0.271/0.308 | 0.536/0.519/0.643 | **0.313/0.303/0.361** |
+| learned + f32 | old (8) | — | 0.947/1.000/1.000 | — | — | 0.222/0.253/0.143 | — | 0.313/0.346/0.250 |
+| learned + f32 | new (54) | 0.395/0.375/0.500 | 0.070/0.077/0.077 | 0.908/0.875/1.000 | 0/0/0 | 0.216/0.245/0.205 | 0.438/0.416/0.429 | **0.289/0.289/0.309** |
+
+(The kernel old-set learned rows come out REVERSED from the README pin on this build —
+learned 0.222 / + f32 0.313 where the README records 0.313 / 0.222; latency proves which
+run carried the encoder (60 ms vs 1.3 s mean). Eight queries flip on one rank; the
+54-query set gives learned 0.313 > lexical 0.299 > + f32 0.289, the README's ordering.)
+
+### Reading
+
+- **Paraphrase is 0.000 everywhere** — 28 queries across three corpora, no configuration
+  surfaces a single answer in the top 25 (lexical, learned, learned + encoder rerank). The
+  original sets had two such queries, both on this repo, both already zero; the expanded
+  sets show it is the class, not the corpus. Without the doc-side dense channel (which
+  self-gates OFF on every corpus, §"Doc-side dense channel") nothing in the stack reads
+  the doc comment, and every paraphrase answer lives only there. This is the strongest
+  case yet for revisiting the channel's gate on labelled evidence.
+- **Descriptive collapses at scale.** The single kernel descriptive query (`pick_next_task`,
+  0.947) was the exception: over 13 queries the class is 0.073 on every kernel tier, and
+  on cpython the learned tier's celebrated 0.036 → 0.475 shrinks to 0.088 → 0.195 (still
+  a 2.2× lift, and still the reason to prefer learned there). Twelve of the thirteen
+  kernel descriptive answers are not in the top 25 on any tier.
+- **The per-corpus verdicts survive with smaller margins.** learned > lexical on all-NDCG
+  for every corpus (kernel 0.313 vs 0.299, cpython 0.340 vs 0.307, vorpal 0.450 vs
+  0.400) — and on recall@5 by more (0.361 vs 0.302, 0.389 vs 0.333, 0.536 vs 0.400). The
+  encoder rerank edges learned on cpython (0.350 / recall 0.426) and vorpal (0.461) but
+  loses on the kernel (0.289; short-kw 0.276 → 0.216, subset 0.536 → 0.438) — the same
+  direction the README pins, now on 54 queries instead of 8.
+- **Exact is not 1.0 once names repeat.** `getmembers` (labelled `Lib/inspect.py`) ranks
+  behind `tarfile.py`'s method (rank 2); `update_load_avg` rank 1; `amdgpu_device_init`
+  rank 2 — the exact class now measures duplicate-name tie-breaking, which is what the
+  `path` disambiguator exists for.
+- **Short-keyword on the kernel is 0.25–0.28**, not the 0.13–0.21 the 7-query set showed,
+  but the added six split the same way the original seven do (learned tier, best rank of
+  the grade-3 answer): `queue_delayed_work` 0, `bio_alloc_bioset` 1, `alloc_workqueue` 4;
+  `skb_clone`, `d_alloc`, `find_vma` not in the top 25 — alongside the original misses
+  `alloc_skb`, `tcp_cong_avoid_ai`, `mutex_lock`, `request_threaded_irq`. Seven of thirteen
+  short-keyword answers are absent from the top 25 on the learned tier; the class's
+  verdicts now move on several queries, not one.
