@@ -26,9 +26,11 @@
 //! kernel) — so results are bit-identical across thread counts and shard counts
 //! BY CONSTRUCTION. The AVX2 kernel's structure is exactly the fixed-order lanes'
 //! (eight `fma` lanes, `((l0+l4)+(l1+l5))+((l2+l6)+(l3+l7))`, ascending tail), so
-//! on an AVX2 machine `Throughput` reproduces `FixedOrder` bit for bit (the unit
-//! test below asserts it; the gated x86 parity test asserts it on the real
-//! encoder). AVX-512 accumulates sixteen lanes and differs from the fixed lanes
+//! on an AVX2 machine the `Throughput` GEMM reproduces the fixed-order GEMM bit
+//! for bit (the unit test below asserts it; `gemm_bench` reports Δ = 0). The
+//! whole forward under `Throughput` still differs from `FixedOrder` by the SwiGLU
+//! gate's f32 `exp_fast` (forward.rs), so the real-encoder parity remains the
+//! cosine oracle. AVX-512 accumulates sixteen lanes and differs from the fixed lanes
 //! by summation order alone — the parity oracle (cosine ≥ 0.9999) is its bound,
 //! and its throughput is a CI datum (no AVX-512 hardware or emulation reaches
 //! the development machine; BENCHMARKS records what ubuntu-latest measured).

@@ -232,20 +232,15 @@ fn throughput_path_matches_fixed_order_within_cosine() {
     worst = worst.min(c);
     assert!(c >= 0.9999, "throughput path drifted on {text:?}: cosine {c:.7}");
   }
-  // The AVX2+FMA kernel is the fixed lanes' exact reduction structure
-  // (`gemm_x86` module doc) — on that rung parity is bitwise, not cosine.
-  if GemmPath::Throughput.label() == "avx2-fma-sgemm" {
-    assert_eq!(
-      bits(&fixed),
-      bits(&fast),
-      "the AVX2 throughput kernel must reproduce the fixed lanes bit for bit"
-    );
-  }
+  // The AVX2+FMA GEMM is the fixed lanes' exact reduction (unit oracle:
+  // bit-equal), but the throughput FORWARD also runs the f32 `exp_fast` gate,
+  // so whole-embedding parity stays the cosine bound on every rung; whether
+  // the bits happen to agree is reported, never asserted.
   eprintln!(
-    "throughput path ({}) vs fixed-order: min cosine {worst:.7} over {} surfaces{}",
+    "throughput path ({}) vs fixed-order: min cosine {worst:.7} over {} surfaces ({})",
     GemmPath::Throughput.label(),
     texts.len(),
-    if GemmPath::Throughput.label() == "avx2-fma-sgemm" { " (bit-identical)" } else { "" }
+    if bits(&fixed) == bits(&fast) { "bit-identical" } else { "bits differ: the throughput gate is exp_fast" }
   );
 }
 
