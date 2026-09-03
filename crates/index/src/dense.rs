@@ -893,11 +893,6 @@ pub(crate) fn fresh_record(dir: &Path, stamp: u64, encoder: &CodeEncoder) -> Opt
   .then_some(record)
 }
 
-/// Freshness — [`fresh_record`] as a predicate.
-pub(crate) fn is_fresh(dir: &Path, stamp: u64, encoder: &CodeEncoder) -> bool {
-  fresh_record(dir, stamp, encoder).is_some()
-}
-
 
 /// The mapped sidecar: sections viewed zero-copy from the mapping.
 pub(crate) struct DenseSidecar {
@@ -951,7 +946,29 @@ impl DenseSidecar {
 
   /// The channel's ranked node ids for a fixed-order query embedding: int8 scan
   /// over `admit`ted rows to `RESCORE_OVERSAMPLE × pool`, f16 rescore, top `pool`.
+  /// Serving cuts through [`DenseSidecar::search_scored`]; the bench-internals dense
+  /// probe ranks the whole sidecar through this.
+  #[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
   pub(crate) fn search(&self, query: &[f32], pool: usize, admit: &(dyn Fn(u64) -> bool + Sync)) -> Vec<u64> {
+    self
+      .search_scored(query, pool, admit)
+      .into_iter()
+      .take(pool)
+      .map(|(id, _)| id)
+      .collect()
+  }
+
+  /// [`DenseSidecar::search`] before the final `pool` cut, with each candidate's
+  /// f16-rescored cosine: the whole rescored oversample (`RESCORE_OVERSAMPLE × pool`
+  /// rows, cosine descending, row order breaking ties exactly as the rescore does).
+  /// The fusion's dense-list laws (`DenseFusion` in `lib.rs`) decide the cut from
+  /// these scores; taking the first `pool` ids reproduces `search` byte for byte.
+  pub(crate) fn search_scored(
+    &self,
+    query: &[f32],
+    pool: usize,
+    admit: &(dyn Fn(u64) -> bool + Sync),
+  ) -> Vec<(u64, f32)> {
     if query.len() != self.dim || pool == 0 {
       return Vec::new();
     }
@@ -965,8 +982,7 @@ impl DenseSidecar {
     let candidates = scan_i8(codes, scales, dim, &q_codes, q_scale, take, |row| admit(ids[row]));
     rescore_f16(halves, dim, query, &candidates)
       .into_iter()
-      .take(pool)
-      .map(|(row, _)| ids[row])
+      .map(|(row, cosine)| (ids[row], cosine))
       .collect()
   }
 }
