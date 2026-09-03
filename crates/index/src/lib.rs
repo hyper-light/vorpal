@@ -2578,16 +2578,19 @@ fn load_dense_sidecar(
   generation_dir: &Path,
   stamp: u64,
   encoder: Option<&vorpal_ann::encoder::CodeEncoder>,
-) -> (Option<dense::DenseSidecar>, bool) {
+) -> (Option<dense::DenseSidecar>, bool, usize) {
   let Some(encoder) = encoder else {
-    return (None, false);
+    return (None, false, 0);
   };
-  if !dense::is_fresh(generation_dir, stamp, encoder) {
-    return (None, false);
-  }
+  // The fresh record carries the sidecar's own eligible population (the fill's stop
+  // rule's whole set) — the denominator of the population-scaled fusion laws.
+  let Some(record) = dense::fresh_record(generation_dir, stamp, encoder) else {
+    return (None, false, 0);
+  };
   let Some(sidecar) = dense::DenseSidecar::load(generation_dir, stamp) else {
-    return (None, false);
+    return (None, false, 0);
   };
+  let eligible = record.eligible;
   // Precedence: the root's `dense.channel` override (`vorpal tune`'s labelled
   // verdict) over the default ON — the same shape as `encoder.dir` over the
   // global enable. The record's label-free gate verdict is evidence, not a switch.
@@ -2598,7 +2601,7 @@ fn load_dense_sidecar(
     Ok("off") => false,
     _ => verdict,
   };
-  (Some(sidecar), verdict)
+  (Some(sidecar), verdict, eligible)
 }
 
 /// The root's per-index dense-channel override (`<root>/dense.channel` = `on` |
@@ -3980,6 +3983,130 @@ fn rerank_mode() -> RerankMode {
   RERANK_MODE
 }
 
+/// The dense list's position in [`SEARCH_CHANNELS`] — the one list the
+/// [`DenseFusion`] laws touch.
+const DENSE_LIST: usize = 4;
+
+/// How the doc-side dense list fuses. RRF is scale-free: a list's rank-r mass is
+/// 1/(K + r) whether the list was drawn from 25 K rows or 700 K, so as the sidecar's
+/// coverage grows, the dense head fills with high-cosine lookalikes that carry the same
+/// mass as the exact-name and graph evidence — measured on the kernel as a quality slide
+/// with coverage (all-NDCG@10 0.345 at 24 K rows → 0.308 at 143 K; BENCHMARKS "Doc-side
+/// dense channel", "always-on fill"). Each law below is DERIVED from the sidecar's own
+/// counts or the query's own scores — no tuned constant — and every law leaves the other
+/// four lists at the fusion's K and is byte-identical to the plain fusion when no dense
+/// list is present. `VORPAL_DENSE_FUSION=flat|quantile|subset|cutoff|gap|degree` sweeps
+/// them under `bench-internals`; production pins [`DENSE_FUSION`] by the coverage-curve
+/// measurement recorded in BENCHMARKS "Size-aware dense fusion".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The non-default laws are selected only by the bench-internals sweep seam.
+#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
+enum DenseFusion {
+  /// The shipped fusion: one more reciprocal-rank list at K, full pool depth.
+  Flat,
+  /// (a) Population-scaled RANK — the independent-prefilter law. A rank r in a list
+  /// drawn from n_c covered rows is the quantile r/n_c; its rank-equivalent in the
+  /// list's own eligible population n_e is r·n_e/n_c, and that is the rank K sees:
+  /// mass 1/(K + r·n_e/n_c). Units: rows/rows. The head keeps 1/K, the tail damps by
+  /// the coverage fraction, and at complete coverage the law is `Flat`.
+  Quantile,
+  /// (a') Population-scaled K — the prefix-conjunction law. A sidecar filled in
+  /// coverage order is the conjunction of two rankings (referential in-degree, then
+  /// cosine), so a list drawn from the fraction φ = n_c/n_e of its population has a
+  /// rank offset that shrinks with it: K_dense = K·φ. At complete coverage `Flat`.
+  Subset,
+  /// (b) Rank cutoff — the equal-share law. The pool depth (`rerank_pool(k)`) is
+  /// shared equally among the non-empty lists; the dense list nominates at most its
+  /// share m = pool / lists, and nothing below rank m adds mass.
+  Cutoff,
+  /// (c) Score-gap admission — self-referenced. Over the dense list's own rescored
+  /// candidates (`RESCORE_OVERSAMPLE × pool` rows), a row is admitted only when its
+  /// cosine sits closer to the query's best row than to the candidates' median:
+  /// c ≥ (c_max + c_median)/2 — the upper half of the query's own score range.
+  Gap,
+  /// (e) Degree support. The graph list (the in-degree disambiguator) ranks the union
+  /// of the name-matched and dense candidates, so a dense nominee that is a referenced
+  /// hub earns graph mass and a lookalike nobody calls does not — the fusion's own
+  /// graph evidence applied to the dense list instead of a weight on it.
+  Degree,
+  /// (f) Hub admission — the coverage order made explicit. The fill covers
+  /// definitions in referential in-degree order, so every row a later checkpoint adds
+  /// has in-degree ≤ every row before it: the lookalikes that pile into the dense head
+  /// as coverage grows are, by construction, the least-referenced covered rows. The
+  /// dense list keeps, of its cosine top-pool, the equal share m = pool / lists with the
+  /// highest referential in-degree (cosine order preserved among them) — at any
+  /// coverage, the dense list a young fill would have produced.
+  Hub,
+  /// (g) Support admission — the conjunction support law applied to the dense list.
+  /// A dense row is admitted when a SIBLING list also surfaces it (independent
+  /// evidence: name, semantic, graph or BM25 at pool depth) or when it falls in the
+  /// dense channel's equal share of most-referenced rows (`Hub`). A single-source
+  /// nomination needs the structural evidence; a corroborated one does not — so the
+  /// cosine-best answers of a small corpus keep their place (vorpal: `Hub` alone
+  /// dropped `ingest_traces` at dense#1, in-degree 1, vector#85) while a large
+  /// corpus's dense-only lookalikes, uncorroborated and unreferenced, stay out.
+  Support,
+}
+
+/// The production law: `Flat`, PINNED by the coverage-curve measurement (BENCHMARKS
+/// "Size-aware dense fusion", 2026-09-03; kernel sidecars at 40.7 K / 99.3 K / 190.7 K
+/// of 716.7 K eligible rows, cpython and vorpal at complete referenced coverage).
+/// What the sweep established: (1) with the rerank on, the fusion decides only pool
+/// MEMBERSHIP — the encoder's cosine order over the pool sets the final positions —
+/// and under `Flat` every labelled answer is already in the pool at every coverage; the
+/// v0.7.0 8-query slide (0.345 → 0.245 all-NDCG@10) is the answers' own dense rank
+/// slipping behind newly covered, higher-cosine, lower-in-degree lookalikes. (2) `Hub`
+/// is the one derived law that repairs it (0.415 / 0.340 / 0.332, ≥ the 0.313 gate at
+/// every point) but it drops cosine-best low-in-degree answers elsewhere (vorpal all
+/// 0.685 → 0.542) and on the expanded 54-query kernel set trades the short-keyword gain
+/// for the conjunctive class (net −0.009 at every point). (3) On the 54-query set the
+/// shipped fusion does not slide at all (0.404 / 0.416 / 0.414) and no law beats it
+/// beyond one query's worth. The population-scaled, cutoff and score-gap laws are
+/// measured-and-rejected; the seam stays for the next sweep.
+const DENSE_FUSION: DenseFusion = DenseFusion::Flat;
+
+fn dense_fusion() -> DenseFusion {
+  #[cfg(feature = "bench-internals")]
+  if let Ok(value) = std::env::var("VORPAL_DENSE_FUSION") {
+    return match value.as_str() {
+      "flat" => DenseFusion::Flat,
+      "quantile" => DenseFusion::Quantile,
+      "subset" => DenseFusion::Subset,
+      "cutoff" => DenseFusion::Cutoff,
+      "gap" => DenseFusion::Gap,
+      "degree" => DenseFusion::Degree,
+      "hub" => DenseFusion::Hub,
+      "support" => DenseFusion::Support,
+      _ => DENSE_FUSION,
+    };
+  }
+  DENSE_FUSION
+}
+
+/// The dense list's cut under `law` from its rescored candidates (cosine descending),
+/// `pool` deep at most: `Gap` admits the upper half of the query's own score range,
+/// `[c_median, c_max]`; every other law takes the first `pool` — byte-identical to
+/// [`dense::DenseSidecar::search`].
+fn admit_dense(law: DenseFusion, scored: &[(u64, f32)], pool: usize) -> Vec<u64> {
+  let admitted = if law == DenseFusion::Gap && !scored.is_empty() {
+    let top = scored[0].1;
+    let median = if scored.len() % 2 == 1 {
+      scored[scored.len() / 2].1
+    } else {
+      (scored[scored.len() / 2 - 1].1 + scored[scored.len() / 2].1) / 2.0
+    };
+    let floor = (top + median) / 2.0;
+    scored.iter().take_while(|(_, cosine)| *cosine >= floor).count()
+  } else {
+    scored.len()
+  };
+  scored
+    .iter()
+    .take(admitted.min(pool))
+    .map(|(id, _)| *id)
+    .collect()
+}
+
 /// Which definitions feed the learned tier's distributional training corpus
 /// (`train_learned_model`): every non-import node; every non-import node except
 /// macros; or every kind capped at the population of the largest CALLABLE kind
@@ -4043,6 +4170,17 @@ fn train_kind_policy() -> TrainKindPolicy {
 /// [`rrf_fuse`] with provenance: each fused hit carries its per-channel rank (0-based;
 /// `None` where a channel did not surface it) — §11's "expose which rankers contributed".
 fn rrf_fuse_explained(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32, Vec<Option<usize>>)> {
+  rrf_fuse_with(lists, k, |_, rank| 1.0 / (RRF_K + rank as f32))
+}
+
+/// [`rrf_fuse_explained`] with the per-placement mass supplied by `mass(channel, rank)`
+/// — the seam the dense-list laws weight one list through; the plain fusion passes the
+/// standard `1/(K + rank)` for every channel.
+fn rrf_fuse_with(
+  lists: &[Vec<u64>],
+  k: usize,
+  mass: impl Fn(usize, usize) -> f32,
+) -> Vec<(u64, f32, Vec<Option<usize>>)> {
   let mut scores: std::collections::HashMap<u64, (f32, Vec<Option<usize>>)> =
     std::collections::HashMap::new();
   for (channel, list) in lists.iter().enumerate() {
@@ -4050,7 +4188,7 @@ fn rrf_fuse_explained(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32, Vec<Option
       let entry = scores
         .entry(id)
         .or_insert_with(|| (0.0, vec![None; lists.len()]));
-      entry.0 += 1.0 / (RRF_K + rank as f32);
+      entry.0 += mass(channel, rank);
       entry.1[channel] = Some(rank);
     }
   }
@@ -4481,6 +4619,10 @@ pub struct Searcher {
   dense: Option<dense::DenseSidecar>,
   /// The sidecar record's per-corpus verdict (`None`/absent → off).
   dense_enabled: bool,
+  /// The sidecar's eligible population (the fill's stop-rule set, `DenseRecord::eligible`)
+  /// — with `dense.len()` (rows covered), the coverage fraction the population-scaled
+  /// [`DenseFusion`] laws derive their weight from. 0 without a sidecar.
+  dense_eligible: usize,
   /// Eval/measurement seam: refuse every approximate tier (base ANN, overlay) and every side
   /// effect (autowarm) so queries take the exact reference paths only. Set by
   /// [`Searcher::open_exact`]; never used in serving.
@@ -4532,7 +4674,7 @@ impl Searcher {
     let bm25_enabled = persisted_tier_record(&generation_dir)
       .and_then(|record| record.bm25)
       .unwrap_or(false);
-    let (dense, dense_enabled) =
+    let (dense, dense_enabled, dense_eligible) =
       load_dense_sidecar(index_dir, &generation_dir, stamp, encoder.as_deref());
     Ok(Searcher {
       generation_dir,
@@ -4547,6 +4689,7 @@ impl Searcher {
       encoder_cache: Mutex::new(EncoderCache::default()),
       dense,
       dense_enabled,
+      dense_eligible,
       exact_only: false,
     })
   }
@@ -4576,7 +4719,7 @@ impl Searcher {
     // pipeline the index actually answers with — the dense channel included,
     // under the same per-corpus verdict.
     let (encoder, encoder_note) = open_selected_encoder(index_dir);
-    let (dense, dense_enabled) =
+    let (dense, dense_enabled, dense_eligible) =
       load_dense_sidecar(index_dir, &generation_dir, stamp, encoder.as_deref());
     Ok(Searcher {
       generation_dir,
@@ -4591,6 +4734,7 @@ impl Searcher {
       encoder_cache: Mutex::new(EncoderCache::default()),
       dense,
       dense_enabled,
+      dense_eligible,
       exact_only: true,
     })
   }
@@ -4599,15 +4743,88 @@ impl Searcher {
   /// the three always-on channels; BM25 where the record enabled it; and, when a
   /// query embedding produced a dense list, that list — behind an EMPTY BM25
   /// placeholder if BM25 is off (an empty list adds no RRF mass).
-  fn fused_lists(&self, channels: Channels, dense_on: bool) -> Vec<Vec<u64>> {
+  fn fused_lists(&self, channels: Channels, dense_on: bool, k: usize) -> Vec<Vec<u64>> {
     let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
     if self.bm25_enabled || dense_on {
       lists.push(channels.bm25);
     }
     if dense_on {
-      lists.push(channels.dense);
+      let mut dense = channels.dense;
+      let law = dense_fusion();
+      if matches!(law, DenseFusion::Cutoff | DenseFusion::Hub | DenseFusion::Support) {
+        // The equal-share cut: the pool depth divided among the lists that actually
+        // nominate (the dense list itself counted).
+        let nominating = lists.iter().filter(|list| !list.is_empty()).count() + usize::from(!dense.is_empty());
+        let share = rerank_pool(k) / nominating.max(1);
+        if law == DenseFusion::Cutoff {
+          dense.truncate(share);
+        } else if dense.len() > share {
+          // The `share` most-referenced positions of the cosine top-pool: rank the
+          // positions by (in-degree desc, cosine position asc) and take the share.
+          let mut by_hub: Vec<(std::cmp::Reverse<usize>, usize)> = dense
+            .iter()
+            .enumerate()
+            .map(|(position, &id)| (std::cmp::Reverse(self.kg.in_degree_referential(NodeId::new(id))), position))
+            .collect();
+          by_hub.sort_unstable();
+          let mut keep: Vec<bool> = vec![false; dense.len()];
+          for &(_, position) in by_hub.iter().take(share) {
+            keep[position] = true;
+          }
+          if law == DenseFusion::Support {
+            // Corroborated rows are admitted regardless of degree.
+            let supported: std::collections::HashSet<u64> = lists.iter().flatten().copied().collect();
+            for (position, id) in dense.iter().enumerate() {
+              if supported.contains(id) {
+                keep[position] = true;
+              }
+            }
+          }
+          // Cosine order is preserved among the admitted rows.
+          dense = dense
+            .iter()
+            .zip(&keep)
+            .filter_map(|(&id, &kept)| kept.then_some(id))
+            .collect();
+        }
+      }
+      lists.push(dense);
     }
     lists
+  }
+
+  /// [`rrf_fuse_explained`] with the dense list ([`DENSE_LIST`]) weighted by the active
+  /// [`DenseFusion`] law: `Quantile` scales its ranks by n_eligible/n_covered, `Subset`
+  /// scales its K by n_covered/n_eligible; every other law (and any list set without a
+  /// dense list, or a sidecar without a population) is the plain fusion, byte for byte.
+  fn fuse(&self, lists: &[Vec<u64>], k: usize) -> Vec<FusedHit> {
+    let covered = self.dense.as_ref().map_or(0, dense::DenseSidecar::len);
+    if lists.len() <= DENSE_LIST || covered == 0 || self.dense_eligible == 0 {
+      return rrf_fuse_explained(lists, k);
+    }
+    let fraction = covered as f32 / self.dense_eligible as f32;
+    match dense_fusion() {
+      DenseFusion::Quantile => rrf_fuse_with(lists, k, |channel, rank| {
+        if channel == DENSE_LIST {
+          1.0 / (RRF_K + rank as f32 / fraction)
+        } else {
+          1.0 / (RRF_K + rank as f32)
+        }
+      }),
+      DenseFusion::Subset => rrf_fuse_with(lists, k, |channel, rank| {
+        if channel == DENSE_LIST {
+          1.0 / (RRF_K * fraction + rank as f32)
+        } else {
+          1.0 / (RRF_K + rank as f32)
+        }
+      }),
+      DenseFusion::Flat
+      | DenseFusion::Cutoff
+      | DenseFusion::Gap
+      | DenseFusion::Degree
+      | DenseFusion::Hub
+      | DenseFusion::Support => rrf_fuse_explained(lists, k),
+    }
   }
 
   /// The fixed-order QUERY embedding for the dense channel — computed ONCE per
@@ -4677,8 +4894,8 @@ impl Searcher {
       None,
       dense_query.as_deref(),
     )?;
-    let lists = self.fused_lists(channels, dense_query.is_some());
-    let fused = rrf_fuse_explained(&lists, k);
+    let lists = self.fused_lists(channels, dense_query.is_some(), k);
+    let fused = self.fuse(&lists, k);
     let reranked = self
       .encoder
       .is_some()
@@ -4720,8 +4937,8 @@ impl Searcher {
       without.push(channels.dense.clone());
       with_bm25.push(channels.dense);
     }
-    let off = self.rerank_with_encoder(query, rrf_fuse_explained(&without, k), dense_query.clone());
-    let on = self.rerank_with_encoder(query, rrf_fuse_explained(&with_bm25, k), dense_query);
+    let off = self.rerank_with_encoder(query, self.fuse(&without, k), dense_query.clone());
+    let on = self.rerank_with_encoder(query, self.fuse(&with_bm25, k), dense_query);
     Ok((
       self.hits_from_ranked(off, None),
       self.hits_from_ranked(on, None),
@@ -4767,9 +4984,9 @@ impl Searcher {
     if self.bm25_enabled {
       without.push(channels.bm25.clone());
     }
-    let with_dense = self.fused_lists(channels, true);
-    let off = self.rerank_with_encoder(query, rrf_fuse_explained(&without, k), Some(query_vec.clone()));
-    let on = self.rerank_with_encoder(query, rrf_fuse_explained(&with_dense, k), Some(query_vec));
+    let with_dense = self.fused_lists(channels, true, k);
+    let off = self.rerank_with_encoder(query, self.fuse(&without, k), Some(query_vec.clone()));
+    let on = self.rerank_with_encoder(query, self.fuse(&with_dense, k), Some(query_vec));
     Ok(Some((
       self.hits_from_ranked(off, None),
       self.hits_from_ranked(on, None),
@@ -5067,8 +5284,8 @@ impl Searcher {
       None,
       dense_query.as_deref(),
     )?;
-    let lists = self.fused_lists(channels, dense_query.is_some());
-    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k), dense_query))
+    let lists = self.fused_lists(channels, dense_query.is_some(), k);
+    Ok(self.rerank_with_encoder(query, self.fuse(&lists, k), dense_query))
   }
 
   /// The stated reason a configured encoder is NOT active (`None` = active, or no
@@ -5387,8 +5604,8 @@ impl Searcher {
       Some(semantic_pool),
       dense_query.as_deref(),
     )?;
-    let lists = self.fused_lists(channels, dense_query.is_some());
-    Ok(self.rerank_with_encoder(query, rrf_fuse_explained(&lists, k), dense_query))
+    let lists = self.fused_lists(channels, dense_query.is_some(), k);
+    Ok(self.rerank_with_encoder(query, self.fuse(&lists, k), dense_query))
   }
 
   /// [`Searcher::channel_lists`] with the BM25 list computed on demand — the serving
@@ -5668,12 +5885,23 @@ impl Searcher {
 
   // The dense channel (`dense.rs`): int8 scan + f16 rescore over the sidecar's
   // covered definitions, filtered BEFORE ranking (exact, no overfetch slack).
+  let law = dense_fusion();
   let dense = match (dense_query, &self.dense) {
-    (Some(query_vec), Some(sidecar)) => sidecar.search(query_vec, pool, &|id| {
-      filter.is_empty() || compiled_filter.admits(kg, id)
-    }),
+    (Some(query_vec), Some(sidecar)) => {
+      let scored = sidecar.search_scored(query_vec, pool, &|id| {
+        filter.is_empty() || compiled_filter.admits(kg, id)
+      });
+      admit_dense(law, &scored, pool)
+    }
     _ => Vec::new(),
   };
+  if law == DenseFusion::Degree && !dense.is_empty() {
+    // Degree support: the in-degree disambiguator ranks the name-matched AND the
+    // dense candidates (union, deduplicated), by the same referential-degree key.
+    let mut seen: std::collections::HashSet<u64> = by_degree.iter().copied().collect();
+    by_degree.extend(dense.iter().copied().filter(|id| seen.insert(*id)));
+    by_degree.sort_by_key(|&id| (std::cmp::Reverse(kg.in_degree_referential(NodeId::new(id))), id));
+  }
 
     Ok(Channels {
       named,
@@ -6789,7 +7017,7 @@ pub fn format_nodes(kg: &Kg, ids: &[NodeId]) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::rrf_fuse_explained;
+  use super::{DENSE_LIST, DenseFusion, RRF_K, admit_dense, rrf_fuse_explained, rrf_fuse_with};
 
   fn rrf_fuse(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32)> {
     rrf_fuse_explained(lists, k)
@@ -6813,5 +7041,75 @@ mod tests {
     // Exact ties break by id.
     let ranked = rrf_fuse(&[vec![5], vec![4]], 10);
     assert_eq!(ranked[0].0, 4, "{ranked:?}");
+  }
+
+  /// The plain fusion through the mass seam is the standard formula, bit for bit, on
+  /// every list — the byte-identity the dense laws promise for absent dense lists.
+  #[test]
+  fn mass_seam_reproduces_the_standard_fusion_bitwise() {
+    let lists = [vec![7, 3, 11], vec![7, 9], vec![3, 7, 9, 11], vec![], vec![11, 2]];
+    let plain = rrf_fuse_explained(&lists, 10);
+    let seamed = rrf_fuse_with(&lists, 10, |_, rank| 1.0 / (RRF_K + rank as f32));
+    assert_eq!(plain.len(), seamed.len());
+    for (a, b) in plain.iter().zip(&seamed) {
+      assert_eq!(a.0, b.0);
+      assert_eq!(a.1.to_bits(), b.1.to_bits(), "{a:?} vs {b:?}");
+      assert_eq!(a.2, b.2);
+    }
+    // Hand-checked masses: 7 sits at rank 0 in lists 0 and 1 and rank 1 in list 2.
+    let seven = plain.iter().find(|hit| hit.0 == 7).expect("7 fused");
+    assert_eq!(seven.1.to_bits(), (1.0 / 60.0 + 1.0 / 60.0 + 1.0 / 61.0f32).to_bits());
+  }
+
+  /// The population-scaled laws touch only the dense list's mass: `Quantile` scales
+  /// its ranks by 1/fraction, `Subset` scales its K by fraction — and both are the
+  /// plain fusion at complete coverage (fraction = 1).
+  #[test]
+  fn population_laws_weight_only_the_dense_list() {
+    let lists = [vec![1], vec![2], vec![3], vec![], vec![4, 5]];
+    let fraction = 0.25f32;
+    let quantile = rrf_fuse_with(&lists, 10, |channel, rank| {
+      if channel == DENSE_LIST { 1.0 / (RRF_K + rank as f32 / fraction) } else { 1.0 / (RRF_K + rank as f32) }
+    });
+    let subset = rrf_fuse_with(&lists, 10, |channel, rank| {
+      if channel == DENSE_LIST { 1.0 / (RRF_K * fraction + rank as f32) } else { 1.0 / (RRF_K + rank as f32) }
+    });
+    let mass = |fused: &[(u64, f32, Vec<Option<usize>>)], id: u64| fused.iter().find(|h| h.0 == id).map(|h| h.1);
+    // Non-dense placements are untouched under both laws.
+    for id in [1u64, 2, 3] {
+      assert_eq!(mass(&quantile, id), Some(1.0 / 60.0));
+      assert_eq!(mass(&subset, id), Some(1.0 / 60.0));
+    }
+    // Quantile: dense rank 0 keeps 1/K; dense rank 1 reads as rank 4.
+    assert_eq!(mass(&quantile, 4), Some(1.0 / 60.0));
+    assert_eq!(mass(&quantile, 5), Some(1.0 / 64.0));
+    // Subset: K_dense = 15 — the head outweighs every other list's head.
+    assert_eq!(mass(&subset, 4), Some(1.0 / 15.0));
+    assert_eq!(mass(&subset, 5), Some(1.0 / 16.0));
+    assert_eq!(subset[0].0, 4, "{subset:?}");
+    // Complete coverage collapses both to the plain fusion, bitwise.
+    let plain = rrf_fuse_explained(&lists, 10);
+    let complete = rrf_fuse_with(&lists, 10, |channel, rank| {
+      if channel == DENSE_LIST { 1.0 / (RRF_K + rank as f32 / 1.0) } else { 1.0 / (RRF_K + rank as f32) }
+    });
+    for (a, b) in plain.iter().zip(&complete) {
+      assert_eq!((a.0, a.1.to_bits()), (b.0, b.1.to_bits()));
+    }
+  }
+
+  /// Score-gap admission keeps the rows in the upper half of the query's own score
+  /// range, `[median, max]`, and never more than the pool; every other law takes the
+  /// first `pool` ids exactly as the sidecar's own cut does.
+  #[test]
+  fn gap_admission_is_self_referenced() {
+    // Cosines descending; median of the 6 = (0.70 + 0.50)/2 = 0.60; floor = (0.90 + 0.60)/2 = 0.75.
+    let scored = [(10u64, 0.90f32), (11, 0.80), (12, 0.70), (13, 0.50), (14, 0.40), (15, 0.10)];
+    assert_eq!(admit_dense(DenseFusion::Gap, &scored, 4), vec![10, 11]);
+    assert_eq!(admit_dense(DenseFusion::Gap, &scored, 1), vec![10], "pool still caps");
+    assert_eq!(admit_dense(DenseFusion::Flat, &scored, 4), vec![10, 11, 12, 13]);
+    assert_eq!(admit_dense(DenseFusion::Cutoff, &scored, 10), vec![10, 11, 12, 13, 14, 15]);
+    // Odd count: the middle element is the median; floor = (0.9 + 0.7)/2 = 0.8 admits two.
+    assert_eq!(admit_dense(DenseFusion::Gap, &scored[..5], 10), vec![10, 11]);
+    assert!(admit_dense(DenseFusion::Gap, &[], 10).is_empty());
   }
 }

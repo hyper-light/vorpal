@@ -3069,3 +3069,233 @@ run carried the encoder (60 ms vs 1.3 s mean). Eight queries flip on one rank; t
   `alloc_skb`, `tcp_cong_avoid_ai`, `mutex_lock`, `request_threaded_irq`. Seven of thirteen
   short-keyword answers are absent from the top 25 on the learned tier; the class's
   verdicts now move on several queries, not one.
+
+
+## Size-aware dense fusion — the coverage→quality curve and the laws that bend it (2026-09-03)
+
+**The measured problem** ("Doc-side dense channel", "always-on fill" above): the dense
+sidecar list fuses as one more reciprocal-rank list at the fusion's single K = 60, and on
+the kernel its quality SLIDES as the fill grows — all-NDCG@10 with the channel ON + rerank
+0.345 at 24 K rows, 0.335 at 58 K, 0.328 at 112 K, 0.308 at 143 K — against the
+no-encoder learned tier's 0.313 (the gate). RRF is scale-free: a list drawn from 700 K
+candidates hands its arbitrary top the same 1/(60 + rank) mass as a list drawn from 25 K,
+so as coverage grows the dense head fills with high-cosine lookalikes that outvote the
+exact-name and graph evidence for the subword-identifier answers (the Stage-4 BM25 lesson
+in SEMANTIC_TIER.md — "wrong evidence that scale-free RRF rewards anyway").
+
+**Candidates** (`DenseFusion` in `crates/index/src/lib.rs`; `VORPAL_DENSE_FUSION=
+flat|quantile|subset|cutoff|gap|degree` under `bench-internals`; every law leaves the other
+four lists at K = 60 and is byte-identical to the plain fusion when no dense list is
+present — `mass_seam_reproduces_the_standard_fusion_bitwise`). Each is DERIVED from the
+sidecar's own counts (`n_c` = rows covered, `n_e` = the fill's eligible population from
+`ann.dense.json`) or the query's own scores; none carries a tuned constant:
+
+| law | what changes | derivation |
+|---|---|---|
+| `flat` | nothing (shipped) | one more list at K, full pool depth |
+| `quantile` (a) | dense mass = 1/(K + r·n_e/n_c) | independent-prefilter law: rank r among n_c covered rows is the quantile r/n_c; its rank-equivalent in the list's own population is r·n_e/n_c. Head keeps 1/K; the tail damps by the coverage fraction; `flat` at complete coverage |
+| `subset` (a') | dense mass = 1/(K·n_c/n_e + r) | prefix-conjunction law: a sidecar filled in in-degree order is the conjunction of two rankings, so a list drawn from the fraction φ = n_c/n_e of its population has a rank offset K·φ; `flat` at complete coverage |
+| `cutoff` (b) | dense list truncated to m = rerank_pool(k) / (non-empty lists) | equal-share law: the pool depth divided among the lists that actually nominate (k = 25 → pool 100; kernel 4 nominating lists → m = 25) |
+| `gap` (c) | dense rows admitted only while cosine ≥ (c_max + c_median)/2 over the rescored oversample (4 × pool) | self-referenced score-gap: the upper half of the query's own score range; the analogue of the conjunction support law |
+| `degree` (e) | the graph list ranks named ∪ dense candidates by referential in-degree | the fusion's own graph evidence applied to the dense nominees: a referenced hub earns graph mass, a lookalike nobody calls does not |
+| `hub` (f) | of the dense cosine top-pool, keep the equal share m = pool / lists with the highest referential in-degree (cosine order preserved) | the coverage order made explicit: the fill covers in in-degree order, so every row a later checkpoint adds has in-degree ≤ every earlier row — the lookalikes that pile into the dense head are, by construction, the least-referenced covered rows; at any coverage this is the dense list a young fill would have produced |
+| `support` (g) | a dense row is admitted if a SIBLING list also surfaces it (name / semantic / graph / BM25 at pool depth) or it is in the `hub` share | the conjunction support law on the dense list: a single-source nomination needs structural evidence, a corroborated one does not |
+
+**Protocol.** One resumable kernel fill (`vorpal-index __warm-ann --dense-budget-timeout`),
+searcheval at successive checkpoints (the fill commits at every cap), the same binary and
+labels at every point; `VORPAL_NO_AUTOWARM=1`; k = 25; searcheval's double-run
+determinism gate on every row. Arms per checkpoint: no encoder (`VORPAL_HOME` without
+weights = the learned tier's gate line), channel forced OFF + rerank (the pre-change
+shipping), and for each law channel ON + rerank and channel ON without rerank
+(`VORPAL_RERANK_MODE=off`). Machine: M5 Max, CONTENDED throughout (two concurrent agents;
+`uptime` 15–35) — latencies are relative within a checkpoint only; quality is
+deterministic.
+
+### Kernel coverage curve — v0.7.0 8-query set, all-NDCG@10 (exploration: every law, every checkpoint)
+
+One fill (`__warm-ann --dense-budget-timeout 150s / 75s / 270s / 460s`, resumed round to round; 34.2 GB peak RSS on the first round which also built the learned tier), checkpoints copied aside and restored for the later confirmation runs. The no-encoder line (0.313) is the gate.
+
+| arm | 40 K rows | 51 K rows | 99 K rows | 190 K rows |
+|---|---:|---:|---:|---:|
+| noenc | 0.313 | 0.313 | 0.313 | 0.313 |
+| off | 0.222 | 0.222 | 0.222 | 0.222 |
+| flat-on | 0.345 | 0.340 | 0.332 | 0.245 |
+| quantile-on | 0.277 | 0.211 | 0.208 | 0.200 |
+| subset-on | 0.239 | 0.202 | 0.173 | 0.153 |
+| cutoff-on | 0.345 | 0.340 | 0.332 | 0.243 |
+| gap-on | 0.345 | 0.337 | 0.246 | 0.242 |
+| degree-on | 0.291 | 0.291 | 0.280 | 0.209 |
+| hub-on | 0.415 | — | 0.340 | 0.332 |
+| support-on | 0.378 | — | 0.342 | 0.275 |
+| flat-only | 0.358 | 0.322 | 0.280 | 0.251 |
+| cutoff-only | 0.365 | 0.330 | 0.280 | 0.251 |
+| gap-only | 0.388 | 0.352 | 0.202 | 0.232 |
+| degree-only | 0.298 | 0.295 | 0.259 | 0.279 |
+| hub-only | 0.441 | — | 0.330 | 0.280 |
+| support-only | 0.345 | — | 0.318 | 0.278 |
+
+`noenc` and `off` carry no dense list and are constant by construction (the byte-identity the laws promise). Per class, the three laws that matter:
+
+Kernel, v0.7.0 8-query set (1 descriptive + 7 short-keyword; NDCG@10 / MRR / recall@5), channel ON + rerank unless `-only`:
+
+| arm | rows | descriptive | short-keyword | **all** |
+|---|---:|---|---|---|
+| noenc | — | 0.947/1.000/1.000 | 0.222/0.253/0.143 | **0.313**/0.346/0.250 |
+| off | 40704 | 0.905/1.000/1.000 | 0.125/0.193/0.095 | **0.222**/0.294/0.208 |
+| flat-on | 40704 | 0.608/0.500/1.000 | 0.307/0.389/0.190 | **0.345**/0.403/0.292 |
+| hub-on | 40704 | 0.905/1.000/1.000 | 0.345/0.418/0.190 | **0.415**/0.491/0.292 |
+| support-on | 40704 | 0.608/0.500/1.000 | 0.345/0.418/0.190 | **0.378**/0.428/0.292 |
+| flat-only | 40704 | 0.608/0.500/1.000 | 0.322/0.416/0.190 | **0.358**/0.426/0.292 |
+| hub-only | 40704 | 0.905/1.000/1.000 | 0.375/0.456/0.238 | **0.441**/0.524/0.333 |
+| support-only | 40704 | 0.496/0.333/1.000 | 0.323/0.424/0.190 | **0.345**/0.413/0.292 |
+| noenc | — | 0.947/1.000/1.000 | 0.222/0.253/0.143 | **0.313**/0.346/0.250 |
+| off | 99328 | 0.905/1.000/1.000 | 0.125/0.193/0.095 | **0.222**/0.294/0.208 |
+| flat-on | 99328 | 0.608/0.500/1.000 | 0.292/0.361/0.095 | **0.332**/0.378/0.208 |
+| hub-on | 99328 | 0.608/0.500/1.000 | 0.302/0.378/0.190 | **0.340**/0.393/0.292 |
+| support-on | 99328 | 0.608/0.500/1.000 | 0.304/0.379/0.190 | **0.342**/0.394/0.292 |
+| flat-only | 99328 | 0.402/0.200/0.500 | 0.263/0.355/0.095 | **0.280**/0.335/0.146 |
+| hub-only | 99328 | 0.435/0.250/0.500 | 0.315/0.397/0.238 | **0.330**/0.378/0.271 |
+| support-only | 99328 | 0.435/0.250/0.500 | 0.301/0.379/0.238 | **0.318**/0.363/0.271 |
+| noenc | — | 0.947/1.000/1.000 | 0.222/0.253/0.143 | **0.313**/0.346/0.250 |
+| off | 190720 | 0.905/1.000/1.000 | 0.125/0.193/0.095 | **0.222**/0.294/0.208 |
+| flat-on | 190720 | 0.790/1.000/1.000 | 0.168/0.206/0.048 | **0.245**/0.306/0.167 |
+| hub-on | 190720 | 0.608/0.500/1.000 | 0.292/0.361/0.095 | **0.332**/0.378/0.208 |
+| support-on | 190720 | 0.790/1.000/1.000 | 0.201/0.234/0.095 | **0.275**/0.330/0.208 |
+| flat-only | 190720 | 0.585/1.000/0.500 | 0.203/0.270/0.143 | **0.251**/0.361/0.188 |
+| hub-only | 190720 | 0.402/0.200/0.500 | 0.263/0.356/0.095 | **0.280**/0.337/0.146 |
+| support-only | 190720 | 0.568/1.000/0.500 | 0.236/0.299/0.143 | **0.278**/0.386/0.188 |
+
+**What the per-query provenance shows (`VORPAL_SEARCHEVAL_CHANNELS=1`, `flat`).** Every labelled answer is in the fused top-25 at every coverage; what moves is each answer's rank INSIDE the dense list as newly covered rows with higher cosine land above it — `alloc_skb` dense#1 → #2 → #8 (fused#5 → #6 → #10), `request_irq` dense#2 → #7 → #13 (fused#3 → #8 → #14), `handle_mm_fault` dense#7 → #19 → #42 (fused#1 → #1 → #17: it loses the pinned rank-0 it held while its dense mass made it the fused winner). With the rerank on, the fusion decides only pool MEMBERSHIP; the encoder's cosine order over the pool sets the final positions, and every lookalike the dense list admits above an answer has, by construction, the higher cosine and wins the reorder. That is why `flat`, `cutoff` and `gap` give identical final positions for pool members (their dense lists differ only below the answers or as prefixes that cut answers and lookalikes at the same rate), why the population-scaled laws can only lose (a monotone rank→mass map cannot reorder a list), and why `degree`/`subset` sink the descriptive query (giving every dense candidate a second placement floods the pool and pushes a vector-only answer out). The in-degree of the newly covered rows is the one signal that separates the lookalikes from the answers — under `hub` at 190 K rows: `alloc_skb` dense#2 (fused#6), `request_irq` dense#7 (fused#8), `handle_mm_fault` fused#1 again — and `hub` is the only law ≥ 0.313 at every point (0.415 / 0.340 / 0.332). `tcp_cong_avoid_ai` enters the pool only from 99 K rows on (dense#12, fused#23): coverage also ADDS answers, which is the argument for the always-on fill.
+
+### Kernel coverage curve — expanded 54-query set (`6e048ee`; confirmation, trimmed to `off` / `flat` / the two candidates)
+
+| arm | 40 K rows | 99 K rows | 190 K rows |
+|---|---:|---:|---:|
+| noenc | 0.313 | — | — |
+| off | 0.289 | 0.289 | 0.289 |
+| flat-on | 0.404 | 0.416 | 0.414 |
+| quantile-on | 0.415 | — | — |
+| cutoff-on | — | — | — |
+| gap-on | — | — | — |
+| degree-on | — | — | — |
+| hub-on | 0.397 | 0.410 | 0.405 |
+| support-on | 0.406 | 0.421 | 0.403 |
+| flat-only | 0.427 | — | — |
+| hub-only | 0.422 | 0.421 | 0.411 |
+| support-only | 0.424 | 0.415 | 0.402 |
+
+54-query set (`6e048ee`; `--root`), same arms:
+
+| arm | rows | conjunctive | descriptive | exact | paraphrase | short-keyword | subset | **all** |
+|---|---:|---|---|---|---|---|---|---|
+| noenc | — | 0.339/0.300/0.500 | 0.073/0.077/0.077 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.276/0.271/0.308 | 0.536/0.519/0.643 | **0.313**/0.303/0.361 |
+| off | 40704 | 0.395/0.375/0.500 | 0.070/0.077/0.077 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.216/0.245/0.205 | 0.438/0.416/0.429 | **0.289**/0.289/0.309 |
+| flat-on | 40704 | 0.594/0.583/0.750 | 0.216/0.231/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.446/0.490/0.333 | 0.507/0.530/0.429 | **0.404**/0.415/0.404 |
+| hub-on | 40704 | 0.395/0.375/0.500 | 0.245/0.273/0.231 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.489/0.544/0.333 | 0.439/0.416/0.429 | **0.397**/0.408/0.377 |
+| support-on | 40704 | 0.594/0.583/0.750 | 0.205/0.212/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.466/0.505/0.333 | 0.508/0.530/0.429 | **0.406**/0.414/0.404 |
+| flat-only | 40704 | 0.624/0.625/0.750 | 0.228/0.214/0.308 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.467/0.506/0.372 | 0.613/0.603/0.643 | **0.427**/0.427/0.451 |
+| hub-only | 40704 | 0.327/0.275/0.250 | 0.271/0.288/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.536/0.592/0.436 | 0.536/0.519/0.643 | **0.422**/0.429/0.420 |
+| support-only | 40704 | 0.624/0.625/0.750 | 0.210/0.186/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.468/0.510/0.372 | 0.615/0.606/0.643 | **0.424**/0.422/0.441 |
+| off | 99328 | 0.395/0.375/0.500 | 0.070/0.077/0.077 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.216/0.245/0.205 | 0.438/0.416/0.429 | **0.289**/0.289/0.309 |
+| flat-on | 99328 | 0.502/0.458/0.750 | 0.260/0.240/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.482/0.556/0.397 | 0.508/0.530/0.429 | **0.416**/0.424/0.420 |
+| hub-on | 99328 | 0.502/0.458/0.750 | 0.274/0.259/0.308 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.443/0.484/0.333 | 0.508/0.530/0.429 | **0.410**/0.411/0.414 |
+| support-on | 99328 | 0.502/0.458/0.750 | 0.274/0.259/0.308 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.489/0.566/0.449 | 0.508/0.530/0.429 | **0.421**/0.431/0.441 |
+| hub-only | 99328 | 0.499/0.458/0.750 | 0.253/0.231/0.308 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.472/0.508/0.436 | 0.577/0.590/0.643 | **0.421**/0.418/0.466 |
+| support-only | 99328 | 0.482/0.438/0.750 | 0.240/0.208/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.467/0.543/0.436 | 0.575/0.572/0.643 | **0.415**/0.417/0.457 |
+| off | 190720 | 0.395/0.375/0.500 | 0.070/0.077/0.077 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.216/0.245/0.205 | 0.438/0.416/0.429 | **0.289**/0.289/0.309 |
+| flat-on | 190720 | 0.697/0.667/0.875 | 0.260/0.260/0.308 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.410/0.464/0.372 | 0.510/0.527/0.429 | **0.414**/0.421/0.432 |
+| hub-on | 190720 | 0.502/0.458/0.750 | 0.260/0.240/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.438/0.474/0.282 | 0.508/0.530/0.429 | **0.405**/0.404/0.392 |
+| support-on | 190720 | 0.594/0.583/0.750 | 0.274/0.279/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.385/0.426/0.321 | 0.510/0.527/0.429 | **0.403**/0.411/0.401 |
+| hub-only | 190720 | 0.463/0.417/0.500 | 0.230/0.197/0.269 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.444/0.487/0.359 | 0.619/0.603/0.643 | **0.411**/0.403/0.420 |
+| support-only | 190720 | 0.624/0.625/0.750 | 0.218/0.234/0.192 | 0.908/0.875/1.000 | 0.000/0.000/0.000 | 0.395/0.460/0.385 | 0.567/0.547/0.643 | **0.402**/0.414/0.426 |
+
+**The confirmation contradicts the exploration in two places, stated rather than reconciled.** (1) On the 54-query set the shipped fusion does NOT slide — 0.404 / 0.416 / 0.414 — and `hub` sits 0.007–0.009 BELOW it at every point: the short-keyword gain the 8-query set measured is real on this set too (0.410 → 0.438 at 190 K) but the same admission costs the conjunctive class (0.697 → 0.502, one query's worth) and the two cancel. `support` is +0.002 / +0.005 / −0.011 — inside one query. The 8-query slide was carried by three dense-only hub answers of one class; six classes and 54 queries dilute it to nothing. (2) `quantile` — the worst law on the 8-query set (0.277 vs 0.345 at 40 K) — measures 0.415 vs 0.404 at 40 K on the 54-query set (its conjunctive 0.709 vs 0.594). Not pursued further under the trim; recorded as a contradiction, not as evidence for the law.
+
+### cpython and vorpal — complete referenced coverage
+
+cpython, v0.7.0 6-query set, complete referenced coverage (35,292 rows):
+
+| arm | descriptive | short-keyword | **all** |
+|---|---|---|---|
+| noenc | 0.475/0.542/0.375 | 0.287/0.500/0.250 | **0.412**/0.528/0.333 |
+| off | 0.531/0.583/0.625 | 0.169/0.500/0.250 | **0.410**/0.556/0.500 |
+| flat-on | 0.420/0.348/0.375 | 0.349/0.571/0.250 | **0.396**/0.423/0.333 |
+| quantile-on | 0.420/0.348/0.375 | 0.349/0.571/0.250 | **0.396**/0.423/0.333 |
+| subset-on | 0.420/0.348/0.375 | 0.349/0.571/0.250 | **0.396**/0.423/0.333 |
+| cutoff-on | 0.361/0.344/0.375 | 0.349/0.571/0.250 | **0.357**/0.420/0.333 |
+| gap-on | 0.558/0.562/0.500 | 0.300/0.571/0.250 | **0.472**/0.565/0.417 |
+| degree-on | 0.670/0.750/0.500 | 0.467/0.571/0.250 | **0.602**/0.690/0.417 |
+| hub-on | 0.676/0.750/0.625 | 0.338/0.625/0.500 | **0.564**/0.708/0.583 |
+| support-on | 0.420/0.348/0.375 | 0.360/0.583/0.250 | **0.400**/0.427/0.333 |
+| flat-only | 0.540/0.500/0.625 | 0.407/0.550/0.250 | **0.496**/0.517/0.500 |
+| cutoff-only | 0.540/0.500/0.625 | 0.417/0.562/0.250 | **0.499**/0.521/0.500 |
+| gap-only | 0.607/0.625/0.625 | 0.417/0.562/0.250 | **0.544**/0.604/0.500 |
+| degree-only | 0.686/0.750/0.625 | 0.529/0.583/0.500 | **0.634**/0.694/0.583 |
+| hub-only | 0.680/0.750/0.625 | 0.557/0.583/0.500 | **0.639**/0.694/0.583 |
+| support-only | 0.540/0.500/0.625 | 0.407/0.550/0.250 | **0.496**/0.517/0.500 |
+
+vorpal (this worktree), v0.7.0 10-query set, complete referenced coverage (11,751 rows):
+
+| arm | conjunctive | descriptive | exact | paraphrase | short-keyword | subset | **all** |
+|---|---|---|---|---|---|---|---|
+| noenc | 0.000/0.043/0.000 | 0.500/0.500/0.500 | 0.815/0.750/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 0.500/0.333/1.000 | **0.492**/0.488/0.550 |
+| off | 0.431/0.250/1.000 | 0.500/0.500/0.500 | 0.815/0.750/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 0.631/0.500/1.000 | **0.548**/0.525/0.650 |
+| flat-on | 0.431/0.250/1.000 | 0.815/0.750/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | **0.685**/0.675/0.750 |
+| quantile-on | 0.431/0.250/1.000 | 0.815/0.750/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | **0.685**/0.675/0.750 |
+| subset-on | 0.431/0.250/1.000 | 0.815/0.750/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | **0.685**/0.675/0.750 |
+| cutoff-on | 0.431/0.250/1.000 | 0.815/0.750/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | **0.685**/0.675/0.750 |
+| gap-on | 0.431/0.250/1.000 | 0.815/0.750/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | **0.685**/0.675/0.750 |
+| degree-on | 0.631/0.500/1.000 | 0.815/0.750/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 0.631/0.500/1.000 | **0.668**/0.650/0.750 |
+| hub-on | 0.000/0.000/0.000 | 0.500/0.500/0.500 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 0.631/0.500/1.000 | **0.542**/0.550/0.550 |
+| support-on | 0.431/0.250/1.000 | 0.815/0.750/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | **0.685**/0.675/0.750 |
+| flat-only | 0.500/0.333/1.000 | 0.500/0.545/0.500 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.944/1.000/0.750 | 1.000/1.000/1.000 | **0.639**/0.642/0.650 |
+| cutoff-only | 0.500/0.333/1.000 | 0.500/0.545/0.500 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.944/1.000/0.750 | 1.000/1.000/1.000 | **0.639**/0.642/0.650 |
+| gap-only | 0.631/0.500/1.000 | 0.693/0.600/1.000 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 1.000/1.000/1.000 | **0.680**/0.670/0.750 |
+| degree-only | 0.631/0.500/1.000 | 0.500/0.542/0.500 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 0.631/0.500/1.000 | **0.605**/0.608/0.650 |
+| hub-only | 0.000/0.000/0.000 | 0.500/0.500/0.500 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.894/1.000/0.750 | 0.500/0.333/1.000 | **0.529**/0.533/0.550 |
+| support-only | 0.500/0.333/1.000 | 0.500/0.545/0.500 | 1.000/1.000/1.000 | 0.000/0.000/0.000 | 0.942/1.000/0.750 | 1.000/1.000/1.000 | **0.638**/0.642/0.650 |
+
+cpython, expanded 54-query set (35,292 rows):
+
+| arm | conjunctive | descriptive | exact | paraphrase | short-keyword | subset | **all** |
+|---|---|---|---|---|---|---|---|
+| noenc | 0.157/0.133/0.200 | 0.195/0.205/0.192 | 0.954/0.938/1.000 | 0.000/0.000/0.000 | 0.386/0.310/0.538 | 0.401/0.400/0.417 | **0.340**/0.320/0.389 |
+| off | 0.135/0.100/0.200 | 0.212/0.218/0.269 | 0.938/0.917/1.000 | 0.000/0.000/0.000 | 0.388/0.339/0.577 | 0.488/0.458/0.500 | **0.350**/0.330/0.426 |
+| flat-on | 0.347/0.415/0.300 | 0.254/0.197/0.269 | 0.938/0.917/1.000 | 0.000/0.000/0.000 | 0.555/0.578/0.654 | 0.498/0.480/0.500 | **0.421**/0.414/0.454 |
+| quantile-on | 0.347/0.415/0.300 | 0.254/0.197/0.269 | 0.938/0.917/1.000 | 0.000/0.000/0.000 | 0.555/0.578/0.654 | 0.498/0.480/0.500 | **0.421**/0.414/0.454 |
+| cutoff-on | — | — | — | — | — | — | — |
+| gap-on | — | — | — | — | — | — | — |
+| hub-on | 0.296/0.270/0.200 | 0.295/0.295/0.346 | 0.857/0.812/0.875 | 0.032/0.011/0.000 | 0.659/0.695/0.769 | 0.484/0.458/0.500 | **0.443**/0.436/0.472 |
+| support-on | 0.406/0.420/0.300 | 0.226/0.184/0.269 | 0.938/0.917/1.000 | 0.032/0.011/0.000 | 0.557/0.580/0.654 | 0.498/0.480/0.500 | **0.426**/0.414/0.454 |
+| flat-only | 0.410/0.422/0.200 | 0.238/0.204/0.269 | 0.929/0.906/1.000 | 0.000/0.000/0.000 | 0.607/0.589/0.692 | 0.460/0.417/0.500 | **0.430**/0.411/0.454 |
+| hub-only | 0.312/0.273/0.200 | 0.258/0.274/0.269 | 0.908/0.875/1.000 | 0.000/0.007/0.000 | 0.704/0.705/0.692 | 0.441/0.487/0.583 | **0.444**/0.446/0.463 |
+| support-only | 0.410/0.422/0.200 | 0.237/0.200/0.269 | 0.929/0.906/1.000 | 0.000/0.005/0.000 | 0.611/0.593/0.692 | 0.460/0.418/0.500 | **0.431**/0.411/0.454 |
+
+vorpal, expanded 55-query set (11,751 rows):
+
+| arm | conjunctive | descriptive | exact | paraphrase | short-keyword | subset | **all** |
+|---|---|---|---|---|---|---|---|
+| off | 0.520/0.590/0.800 | 0.192/0.171/0.192 | 0.940/0.938/1.000 | 0.000/0.000/0.000 | 0.701/0.694/0.750 | 0.690/0.605/0.857 | **0.470**/0.459/0.536 |
+| flat-on | 0.494/0.557/0.800 | 0.320/0.260/0.346 | 0.986/1.000/1.000 | 0.000/0.000/0.000 | 0.848/0.854/0.917 | 0.832/0.790/0.857 | **0.555**/0.544/0.609 |
+| hub-on | 0.456/0.507/0.600 | 0.239/0.200/0.346 | 0.986/1.000/1.000 | 0.000/0.000/0.000 | 0.695/0.688/0.750 | 0.704/0.605/0.857 | **0.483**/0.466/0.555 |
+| support-on | 0.494/0.557/0.800 | 0.329/0.263/0.385 | 0.986/1.000/1.000 | 0.000/0.000/0.000 | 0.848/0.854/0.917 | 0.832/0.790/0.857 | **0.557**/0.545/0.618 |
+| hub-only | 0.367/0.509/0.500 | 0.243/0.185/0.308 | 0.990/1.000/1.000 | 0.000/0.000/0.000 | 0.703/0.708/0.750 | 0.673/0.600/0.857 | **0.474**/0.466/0.536 |
+| support-only | 0.483/0.562/0.700 | 0.259/0.195/0.231 | 0.990/1.000/1.000 | 0.000/0.000/0.000 | 0.862/0.854/0.958 | 0.849/0.810/0.929 | **0.545**/0.532/0.591 |
+
+`hub` is the lesson in corpus dependence: +0.168 (6-query) / +0.022 (54-query) on cpython, −0.143 / −0.072 on vorpal, where it drops cosine-best answers with in-degree 1 (`ingest_traces` dense#1, `cut` dense#2 — both corroborated by the vector list, which is what `support` reads). `support` never regresses an all-NDCG on the v0.7.0 sets (kernel 0.378 / 0.342 / 0.275 vs 0.345 / 0.332 / 0.245; cpython 0.400 vs 0.396; vorpal 0.685 bit-identical per class) and on the expanded sets is +0.005 (cpython, but descriptive 0.254 → 0.226) and +0.002 (vorpal, no class down); its kernel curve still slides and still fails the 0.313 gate at 190 K on the 8-query set.
+
+### Latency (paired, interleaved; contended, `uptime` 48–52)
+
+Kernel, 190,720 rows, expanded 54-query set, k = 25, searcheval mean; two interleaved reps of `flat` / `hub` / `support`, channel ON, rerank on (`reorder`) and off:
+
+| law | rerank on, rep 1 | rep 2 | channel only, rep 1 | rep 2 |
+|---|---:|---:|---:|---:|
+| `flat` | 2,562 ms | 2,163 ms | 490 ms | 332 ms |
+| `hub` | 2,351 ms | 1,981 ms | 420 ms | 374 ms |
+| `support` | 2,471 ms | 2,826 ms | 435 ms | 541 ms |
+
+Rep-to-rep spread of the SAME law is ±30 % (the machine carried two other agents' builds and fills, load 42–53), and the laws' own work — a sort of the 100-row dense pool by in-degree, a set of ≤ 400 sibling ids — is microseconds against the 4-list channel pass, so query latency is unchanged within what this machine could resolve; the sweep tables' `mean µs` columns above are contended the same way and comparable only within a checkpoint.
+
+### Verdict
+
+**`DENSE_FUSION = Flat` stays pinned.** The acceptance criterion was a coverage→quality curve made flat by a derived law with no class regression elsewhere: no law meets it. `hub` flattens the 8-query curve and fails vorpal; `support` regresses nothing on the v0.7.0 sets but does not hold the 8-query gate at 190 K and is inside one query of `flat` everywhere else; on the 54-query kernel set the shipped fusion is already flat from 40 K to 190 K rows. Under the no-dominance rule (the rerank-mode precedent) the pin does not move. The seam and all eight laws stay under `bench-internals` for the next sweep; the constructive leads are (a) `support` as a per-corpus verdict the way `encoder.dir` is (it is the only non-regressing candidate), and (b) the mechanism itself — the rerank's cosine order over the pool, not the fusion, sets the positions the slide is measured on, so a size-aware answer to the 8-query slide lives in the rerank's pool/pin law, which was out of scope here. Housekeeping: the first `cargo test --workspace --release` run exited 101 with every captured `test result` ok while sharing cargo's target lock with a concurrent build; the clean re-run is green (60 suites), and both CI clippy lanes are green after fixing a redundant closure in the cherry-picked `--root` check (`xtask/src/searcheval.rs:90`).
