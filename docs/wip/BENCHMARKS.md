@@ -3800,3 +3800,61 @@ recovery walk costs nothing cold (the day's upper-band readings were thermal). T
 first canary pass in the landing chain was VACUOUS (`export -f` + `xargs bash -c`
 does not survive this zsh shell; every clone was skipped and "0 failures" measured
 nothing) and was rerun with an inline loop — recorded so the shape is not reused.
+
+## v0.7.1 README restamp — the polyglot table, and a "regression" that was a crash (2026-09-03)
+
+The README performance section was re-measured on the v0.7.1 binary against the SAME
+pinned commits as the v0.4.0 table (fresh shallow clones fetched by full SHA — GitHub
+refuses `--depth 1` fetches of abbreviated ones, which is why an earlier pass silently
+drifted every row to HEAD). Quiet machine, cold best of three, load printed beside every
+timing. Every row held or moved with the swallow recovery: llvm 8.4 s / 1,444,028 nodes
+(+420 at the same pin — C++ sources), zig 6.3 s (+34), kotlin 2.7, kubernetes 2.1, rust
+2.7, WordPress 1.9, spark 1.6, kafka 0.7, next.js 1.0, ghc 0.7, rails 0.4, neovim 0.3,
+vue 0.1 (all node counts identical to the v0.4.0 table); cpython 1.0 s / 162,945 (+132,
+the recorded recovery delta); this repo 7.8 s cold / 79,567 nodes. Self-index parsed
+files 1,884 of 2,868 tracked.
+
+**Column semantics fixed.** The old table mixed two counts: cpython's "3,841" and the
+kernel's "75,954" were files a grammar PARSED, every other row was `git ls-files`
+(so the apparent cpython jump to 6,212 was the tracked count, not a corpus change:
+2,343 py + 1,228 rst + 635 h + 479 c + …). The table now reports "Files parsed" for all
+rows, read from the indexer's own `parsed N files` line (llvm 86,124 of 183,249 tracked;
+kotlin 75,448 of 110,106; roslyn 19,522 of 35,125; kernel 75,954 of 94,843).
+
+**dotnet/roslyn "0.6 s → 2.2 s" — falsified as a regression, and the 0.6 s was never a
+build.** Interleaved cold at the exact pin (`4cac4334`): v0.7.1 2.03–2.11 s, v0.7.0
+2.10–2.17 s, HEAD-of-roslyn 2.14–2.27 s — flat across releases. A bisect against the
+v0.4.0 table's binary named the FIRST commit after v0.4.0, the children-cache
+claim-shape guard (`60fdd1f`, 28 lines of C), as "first bad" at 2.15 s vs v0.4.0's
+0.55 s. An instrumented build then showed the guard's migration path fires **2 times in
+81,009,378 nodes** on roslyn (0 on cpython and the kernel) — it cannot cost anything.
+The resolution is the exit code: `/usr/bin/time -l` on v0.4.0 and on HEAD-with-the-
+guard-deleted gives **rc=139/138 (SIGSEGV/SIGBUS) at 0.54 s with 6.7 s user CPU** on
+5 of 6 runs; the one run that completes takes **2.07 s / 25.1 s user** — identical to
+v0.7.1. The v0.4.0 table's 0.6 s was a heap-corruption crash a quarter of the way
+through the corpus, recorded by a bench script whose `time -p` wrapper never checked
+the exit status (the same bug the guard fixed on llvm/rust, where it was noticed only
+because those crashed deterministically). Bisect is only as good as its "good" end:
+v0.4.0 was never good on roslyn, it was fast because it died.
+
+Lessons, standing: (1) every timed invocation in a bench harness asserts `rc == 0` and
+prints it beside the wall — a crash is faster than any build; (2) confirm the "good" end
+of a bisect by running it, not by assuming the recorded number; (3) recorded polyglot
+rows carry the count rule they use. Cleanup: five bench worktrees + target dirs and the
+15 corpus clones removed; memory notes updated.
+
+**Daemon rows re-measured WITH the always-on dense sidecar** (the README latency table's
+encoder rows were the pre-sidecar floor). Protocol: fresh index per (corpus, tier) with
+`semantic.tier = learned` and a per-index `encoder.dir`, `__warm-ann --dense-budget-timeout
+10m` (wgpu-metal GEMM; cpython 35,364/35,364 and this repo 11,785/11,785 referenced filled
+to completion in 6.6 / 2.9 min, kernel 40,704–44,800 of 717,369 at the cap), then 30
+stdio round-trips per tool on a quiet machine. Kernel f16 96 ms median / 485 p95 /
+first 0.69 s / 2.8 GB; f32 94 / 356 / 0.62 / 2.7 GB; cpython f16 36 / 263 / 0.38 s /
+719 MB, f32 35 / 245 / 0.40 / 677 MB; this repo f16 35 / 276 / 0.42 / 623 MB, f32 34 /
+244 / 0.42 / 603 MB. Versus the no-sidecar rows: +3–5 ms median, p95 flat-to-lower,
++40–80 MB RSS on the small corpora. Two harness lessons: (1) the learned tier is selected
+by `<root>/semantic.tier` (written by `semanticTier:` in vorpalconfig.yml) and a warm
+without it silently builds the lexical tier under a "learned" label — the first pass of
+this bench did exactly that and was discarded; (2) the very first daemon process pays a
+one-time page-in of weights + index (kernel f16 "first search" 4.8–5.3 s on two separate
+first-of-batch runs, 0.69 s on every rerun) — order the batch or state the cache state.

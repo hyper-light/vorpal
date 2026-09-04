@@ -157,7 +157,7 @@ Full walkthrough with examples: **[docs/getting-started.md](docs/getting-started
 ## Performance
 
 All numbers are release builds of **v0.7.1** on an Apple M5 Max (18 cores, 128 GB,
-macOS 26.4.1, rustc 1.98.0), measured 2026-09-02, wall-clock for the whole CLI
+macOS 26.4.1, rustc 1.98.0), measured 2026-09-03, wall-clock for the whole CLI
 invocation including process start; cold times are best of runs on a quiet machine.
 Every dataset is pinned by commit so you can re-run it. Indexing derives the full
 relation set — calls, imports, types, data flow, near-clone pairs, request→route
@@ -172,7 +172,7 @@ vorpal index <source-tree> --out <index-dir>
 
 The flagship tree, end to end:
 
-| Linux kernel @ `1590cf032971` (75,954 tracked files, ~30 M LOC) | |
+| Linux kernel @ `1590cf032971` (75,954 files parsed of 94,843 tracked, ~30 M LOC) | |
 |---|---|
 | Cold index → **8,891,771 nodes** | **8.2 s** |
 | Edit one file, re-index | **0.5 s** |
@@ -181,34 +181,36 @@ The flagship tree, end to end:
 
 ### Indexing, across languages
 
-Same command, fourteen well-known repos, shallow-cloned at the pinned commit —
-cold build and the no-change re-run:
+Same command, fifteen well-known repos, shallow-cloned at the pinned commit —
+cold build (best of three) and the no-change re-run. "Files parsed" counts the files a
+grammar handled, not everything tracked (the kernel row above uses the same rule):
 
-| Repo | Language | Files | Nodes | Cold | Unchanged |
+| Repo | Language | Files parsed | Nodes | Cold | Unchanged |
 |---|---|---:|---:|---:|---:|
-| llvm/llvm-project `d37814473` | C++ | 183,249 | 1,443,608 | 8.1 s | 0.26 s |
-| ziglang/zig `738d2be9` | Zig | 20,545 | 1,085,533 | 6.3 s | 0.03 s |
-| JetBrains/kotlin `9f27f51dd` | Kotlin | 110,106 | 795,719 | 2.7 s | 0.40 s |
-| kubernetes/kubernetes `bce953e8` | Go | 31,296 | 692,828 | 2.0 s | 0.08 s |
-| dotnet/roslyn `4cac4334` | C# | 35,125 | 490,284 | 0.6 s | 0.09 s |
-| rust-lang/rust `5db7f4be8` | Rust | 62,568 | 464,064 | 2.7 s | 0.07 s |
-| WordPress/WordPress `c195362` | PHP | 5,010 | 286,824 | 1.8 s | 0.02 s |
-| apache/spark `06539777` | Scala | 27,322 | 253,753 | 1.6 s | 0.05 s |
-| apache/kafka `6e4c555` | Java | 7,537 | 209,131 | 0.7 s | 0.03 s |
-| vercel/next.js `483f8420` | TS/JS | 31,852 | 204,754 | 1.0 s | 0.23 s |
-| ghc/ghc `44d7788f` | Haskell | 26,918 | 178,259 | 0.7 s | 0.04 s |
-| python/cpython `b86a41cbf63` | Python/C | 3,841 | 162,813 | 2.3 s | 0.02 s |
-| rails/rails `4130768` | Ruby | 4,996 | 49,635 | 0.3 s | 0.02 s |
-| neovim/neovim `d423675` | C/Lua | 3,918 | 40,507 | 0.3 s | 0.01 s |
-| vuejs/core `d63616c` | Vue/TS | 705 | 11,191 | 0.1 s | 0.01 s |
+| llvm/llvm-project `d37814473` | C++ | 86,124 | 1,444,028 | 8.4 s | 0.30 s |
+| ziglang/zig `738d2be9` | Zig | 17,025 | 1,085,567 | 6.3 s | 0.03 s |
+| JetBrains/kotlin `9f27f51dd` | Kotlin | 75,448 | 795,719 | 2.7 s | 0.40 s |
+| kubernetes/kubernetes `bce953e8` | Go | 26,641 | 692,828 | 2.1 s | 0.08 s |
+| dotnet/roslyn `4cac4334` | C# | 19,522 | 490,284 | 2.2 s | 0.07 s |
+| rust-lang/rust `5db7f4be8` | Rust | 41,607 | 464,064 | 2.7 s | 0.08 s |
+| WordPress/WordPress `c195362` | PHP | 4,195 | 286,824 | 1.9 s | 0.02 s |
+| apache/spark `06539777` | Scala | 11,512 | 253,753 | 1.6 s | 0.05 s |
+| apache/kafka `6e4c555` | Java | 7,246 | 209,131 | 0.7 s | 0.03 s |
+| vercel/next.js `483f8420` | TS/JS | 27,216 | 204,754 | 1.0 s | 0.23 s |
+| ghc/ghc `44d7788f` | Haskell | 15,837 | 178,259 | 0.7 s | 0.04 s |
+| python/cpython `b86a41cbf63` | Python/C | 3,841 | 162,945 | 1.0 s | 0.01 s |
+| rails/rails `4130768` | Ruby | 3,952 | 49,635 | 0.4 s | 0.02 s |
+| neovim/neovim `d423675` | C/Lua | 1,476 | 40,507 | 0.3 s | 0.01 s |
+| vuejs/core `d63616c` | Vue/TS | 626 | 11,191 | 0.1 s | 0.01 s |
 
-This repository (2,815 files → 78,527 nodes, incl. the vendored tree-sitter runtime +
-49 grammars): 7.4 s cold¹, 0.02 s unchanged. Kernel peak disk is a 7.6 GB generation (the
-parsed-product cache inside it is what makes sub-second edits possible); the previous
-generation is kept until the next commit, then swept.
+This repository (1,884 files parsed of 2,868 tracked → 79,567 nodes, incl. the vendored
+tree-sitter runtime + 49 grammars): 7.8 s cold¹, 0.01 s unchanged. Kernel peak disk is a
+7.6 GB generation (the parsed-product cache inside it is what makes sub-second edits
+possible); the previous generation is kept until the next commit, then swept.
 
 ¹ Dominated by a single 33 MB generated `parser.c`; everything else parses in parallel
-underneath it.
+underneath it. To re-run a pinned row, fetch by the full SHA
+(`git fetch --depth 1 origin <sha>`); GitHub refuses abbreviated ones.
 
 ### Editing large files (long-lived processes)
 
@@ -314,20 +316,27 @@ resident memory sampled after every call:
 |---|---:|---:|---:|---:|---:|
 | Kernel · lexical | 59 ms | 65 ms | 0.21 s | 0.11 ms | 2.1 GB |
 | Kernel · learned | 61 ms | 63 ms | 0.24 s | 0.12 ms | 2.6 GB |
-| Kernel · learned + f16 | 91 ms² | 476 ms | 0.67 s | 0.12 ms | 3.2 GB |
-| Kernel · learned + f32 | 87 ms² | 474 ms | 0.58 s | 0.12 ms | 3.1 GB |
+| Kernel · learned + f16 · sidecar | 96 ms² | 485 ms | 0.69 s³ | 0.12 ms | 2.8 GB |
+| Kernel · learned + f32 · sidecar | 94 ms² | 356 ms | 0.62 s³ | 0.11 ms | 2.7 GB |
 | CPython · lexical | 1.0 ms | 1.3 ms | 5 ms | 0.05 ms | 106 MB |
 | CPython · learned | 2.2 ms | 2.6 ms | 15 ms | 0.07 ms | 149 MB |
-| CPython · learned + f16 | 31 ms² | 285 ms | 0.44 s | 0.08 ms | 677 MB |
-| CPython · learned + f32 | 30 ms² | 289 ms | 0.35 s | 0.08 ms | 591 MB |
+| CPython · learned + f16 · sidecar | 36 ms² | 263 ms | 0.38 s | 0.07 ms | 719 MB |
+| CPython · learned + f32 · sidecar | 35 ms² | 245 ms | 0.40 s | 0.08 ms | 677 MB |
 | This repo · lexical | 0.7 ms | 0.8 ms | 3 ms | 0.05 ms | 63 MB |
-| This repo · learned + f32 | 31 ms² | 289 ms | 0.39 s | 0.07 ms | 525 MB |
+| This repo · learned + f16 · sidecar | 35 ms² | 276 ms | 0.42 s | 0.07 ms | 623 MB |
+| This repo · learned + f32 · sidecar | 34 ms² | 244 ms | 0.42 s | 0.07 ms | 603 MB |
 
 ² Encoder medians are over a cycling query set, so most calls hit the 4,096-row
 embedding cache; the p95 and first-search columns are the uncached cost (0.3–0.5 s per
 new query at k = 10; 0.64–0.97 s mean at k = 25 in the graded runs). Graph queries never
 touch the encoder. f16 halves the weights on disk but decodes into an f32 arena at open,
-so its resident footprint is *not* smaller than f32's.
+so its resident footprint is *not* smaller than f32's. "Sidecar" rows are measured with
+the doc-side dense sidecar filled as it ships by default: CPython and this repo to
+completion, the kernel at the 10-minute cap (40,704 of 717,369 referenced definitions).
+
+³ Weights and index already in the page cache. The very first process after a reboot
+(or after the weights are installed) pays a one-time ~4.8 s first search on the kernel
+while the OS pages them in.
 
 Index on disk (one committed generation, parsed-product cache included): kernel
 **7.6 GB** lexical / 8.3 GB with the learned model; CPython 200 / 267 MB; this repo
@@ -380,7 +389,7 @@ peak RSS over the whole process tree.
 |---|---|---|
 | **Linux kernel** cold index (75,954 files) | **8.2 s** · 8.89 M nodes · peak RSS 5.6 GB · 7.6 GB on disk | 265 s · 8.53 M nodes / 16.0 M edges · peak RSS **70.3 GB** · 15.9 GB SQLite |
 | Kernel, nothing changed | **0.12 s** | 12.5 s |
-| **CPython** cold index (3,841 files) | **1.0–2.3 s** · 162,813 nodes · 0.8 GB RSS · 200 MB | 36.2 s · 136,118 nodes · 6.6 GB RSS · 663 MB |
+| **CPython** cold index (3,841 files) | **1.0 s** · 162,945 nodes · 0.8 GB RSS · 200 MB | 36.2 s · 136,118 nodes · 6.6 GB RSS · 663 MB |
 | **This repo** cold index (49 vendored grammar giants) | **7.4 s** · 78,894 nodes · 12.2 GB RSS · 836 MB | 44.8 s · 66,141 nodes · 32.3 GB RSS · 291 MB |
 | Search, kernel labels (NDCG@10 / MRR / recall@5) | **0.299 / 0.375 / 0.229** (lexical, no weights) | 0.116 / 0.104 / 0.167 (BM25) |
 | Search, CPython labels | 0.137 / 0.208 / 0.250 lexical · **0.410 / 0.556 / 0.500** with the learned tier + encoder | 0.274 / 0.246 / 0.167 (BM25) |
