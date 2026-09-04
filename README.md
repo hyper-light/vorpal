@@ -86,9 +86,18 @@ $ vorpal graph callers handle_request   # who calls this?
 
 ## Use it with an AI agent (MCP)
 
-`vorpal mcp` is a [Model Context Protocol] server over stdio. It gives Claude, Codex, Cursor,
-and other agents tools for callers, references, reachability, semantic and structural search,
-and verbatim source. It builds the index if needed and keeps it current while it runs.
+`vorpal mcp` is a [Model Context Protocol] server over stdio (revision 2026-07-28, with the
+`initialize` handshake kept for older clients). It gives Claude, Codex, Cursor, and other
+agents tools for callers, references, reachability, semantic and structural search, and
+verbatim source. It builds the index if needed and keeps it current while it runs.
+
+The short route, from your project root, writes the config for every client it finds:
+
+```sh
+vorpal mcp install            # or --client claude-code|claude-desktop|codex|cursor|vscode|windsurf
+```
+
+By hand:
 
 **Claude Code**
 ```sh
@@ -120,9 +129,10 @@ it from `.cursor/mcp.json`).
 Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
 `compare_generations`, `impact`, `dead_code`, `node`, `callers`, `references`, `importers`,
 `implementors`, `type_users`, `similar`, `reachable`, `data_flow`, `observed`, `query`, `structural_search`,
-`rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. Tools that return records
-page with cursors and accept `format: "toon" | "lean" | "ids"` for smaller output.
-`--profile scout|analysis|full` limits the tool set for read-only agents. Full descriptions:
+`rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. Every tool carries
+annotations and an output schema; tools that return records page with cursors and accept
+`format: "toon" | "lean" | "ids"` for smaller output. `--profile scout|analysis|full` limits
+the tool set for read-only agents. Full descriptions and the wire contract:
 **[docs/mcp.md](docs/mcp.md)**.
 
 ## Language packages

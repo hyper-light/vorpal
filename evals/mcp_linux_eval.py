@@ -26,8 +26,13 @@ def rpc(method, params=None):
     dt = (time.perf_counter() - t0) * 1000
     return json.loads(line), dt
 
+# MCP 2026-07-28: stateless — probe once, then every request self-describes in _meta.
+META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "mcp_linux_eval", "version": "0"}}
+
 def tool(name, args):
-    resp, dt = rpc("tools/call", {"name": name, "arguments": args})
+    resp, dt = rpc("tools/call", {"name": name, "arguments": args, "_meta": META})
     try:
         text = resp["result"]["content"][0]["text"]
     except Exception:
@@ -43,9 +48,8 @@ rows = []
 def grade(task, ok, latency, evidence):
     rows.append((task, "PASS" if ok else "FAIL", f"{latency:.0f} ms", evidence))
 
-rpc("initialize", {"protocolVersion": "2024-11-05"})
-p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
-p.stdin.flush()
+discover, _ = rpc("server/discover", {"_meta": META})
+assert "2026-07-28" in discover.get("result", {}).get("supportedVersions", []), discover
 tool("health", {})  # first call absorbs boot work
 
 # ---- 1. the no-fake-edges contract: kmalloc_slab is `static inline` in mm/slab.h, so

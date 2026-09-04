@@ -7,7 +7,9 @@ and pull the exact source behind any result — all backed by vorpal's knowledge
 index of your repository.
 
 It speaks MCP over **stdio** (the standard for local servers), so it plugs directly into
-Claude Desktop, Claude Code, and any other MCP client.
+Claude Desktop, Claude Code, Codex, Cursor, and any other MCP client. The server implements
+protocol revision **2026-07-28** and keeps the `initialize`-era envelope for clients on
+2025-11-25 and earlier; see [Protocol](#protocol) below.
 
 ## Prerequisites
 
@@ -22,14 +24,28 @@ Claude Desktop, Claude Code, and any other MCP client.
 vorpal mcp install
 ```
 
-Writes this machine's MCP client configs to launch vorpal (idempotent; backups of any
-existing config are taken). Run it once, restart your client, done. The manual routes
-below do the same thing by hand.
+Run it from the project root you want served. It writes an entry for every client it can
+find (`--client claude-code|claude-desktop|codex|cursor|vscode|windsurf|all`, default all)
+that launches this binary by absolute path with `mcp --index <project>/.vorpal/index`,
+also absolute. Edits are idempotent; a file that is modified is backed up first
+(`*.bak-vorpal-<epoch>`), a file that already holds the entry is left untouched, and a
+file that is not valid JSON or TOML aborts the run unchanged. `--dry-run` prints what
+would be written. Restart your client afterwards. The manual routes below do the same
+thing by hand.
 
 ### Claude Code
 
 ```sh
 claude mcp add vorpal -- vorpal mcp --index /absolute/path/to/your/project/.vorpal/index
+```
+
+### Codex CLI
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.vorpal]
+command = "vorpal"
+args = ["mcp", "--index", "/absolute/path/to/your/project/.vorpal/index"]
 ```
 
 ### Claude Desktop (and other clients that use a JSON config)
@@ -64,6 +80,56 @@ index path (default `.vorpal/index`) is resolved relative to that — so spell i
 - Every result is pinned to a content-addressed *generation* of the index, so answers are
   internally consistent even while you're editing.
 
+## Protocol
+
+The server speaks JSON-RPC 2.0, one message per line, over stdio. It implements MCP
+revision **2026-07-28** and serves the earlier `initialize` handshake alongside it, deciding
+per request from the message itself (the versioning page permits a dual-era server):
+
+- **2026-07-28 clients** send `params._meta` with `io.modelcontextprotocol/protocolVersion`
+  and `io.modelcontextprotocol/clientCapabilities` on every request. `server/discover`
+  answers with the supported versions (`["2026-07-28"]`), capabilities (`tools`),
+  `instructions`, and `io.modelcontextprotocol/serverInfo`; every result carries
+  `resultType: "complete"` and the server identity in `_meta`; `tools/list` and
+  `server/discover` carry `ttlMs` and `cacheScope: "public"` (the tool set is fixed for
+  the life of the process). A request naming another version is refused with `-32022`
+  and `data.supported`; a request missing the required `_meta` fields is `-32602`.
+- **2025-11-25, 2025-06-18, and 2025-03-26 clients** open with `initialize` and get the
+  requested version echoed (any other version gets `2025-11-25`), plus `ping`. Claude Code
+  2.1 opens this way. `2024-11-05` is not offered: it requires JSON-RPC batching.
+- **Methods**: `server/discover`, `tools/list`, `tools/call`, and, for legacy clients,
+  `initialize` and `ping`. Everything else is `-32601`, including the removed
+  `logging/setLevel` and `resources/subscribe`. The server never sends requests of its own
+  and uses none of the deprecated Roots, Sampling, or Logging features; diagnostics go to
+  stderr. `notifications/cancelled` is accepted and logged; nothing is cancellable yet, so
+  the reply still arrives (a supervised build ends at `VORPAL_MCP_BUILD_TIMEOUT_S`).
+- **Framing**: a JSON array (batch) or a non-object message is `-32600`; a request id must
+  be a string or an integer; messages without an id are notifications and are never
+  answered.
+- **Errors**: an unknown tool name, a missing tool `name`, non-object `arguments`, or a
+  `tools/list` cursor (the list is one page and issues none) is a protocol error
+  (`-32602`). Everything that goes wrong *inside* a tool is an in-band result with
+  `isError: true`, a message in `content`, and a stable `code` in `structuredContent`:
+  `bad-argument`, `bad-query`, `index-unavailable`, `no-watch`, `stale-source`,
+  `internal`, `tool-error`.
+
+### Tool declarations and results
+
+Every tool declares a `title`, `annotations` (`readOnlyHint` is true for everything but
+`index`; `destructiveHint` false, `idempotentHint` true, `openWorldHint` false), an
+`inputSchema`, and an `outputSchema` for its `structuredContent`. Results always carry
+both a text rendering in `content` and `structuredContent`:
+
+- `generation`: the content id of the index generation the answer was read from (`null`
+  before any graph is loaded, e.g. `ast_dump`), so ids and spans are attributable to one
+  index state.
+- Record-bearing tools (everything that lists results) page deterministically:
+  `outcome`, `records`, `total`, `truncated`, and `nextCursor` when more remain. Pass
+  `cursor` (opaque, from a previous `nextCursor`) and `limit` (default 100, max 1000) as
+  arguments. These tools also accept `format: "lean" | "toon" | "ids"` to shrink the text
+  rendering: `lean` is minimal columns, `toon` a lossless tab grid grouped by directory,
+  `ids` durable handles only.
+
 ## Tool profiles (least privilege)
 
 Agents don't always deserve the whole surface. `--profile` gates what `tools/list`
@@ -94,8 +160,8 @@ vorpal mcp deny lib                     # remove one
 { "mcpServers": { "vorpal": { "command": "vorpal", "args": ["mcp", "--projects"] } } }
 ```
 
-In `--projects` mode every tool takes a project selector, and `list_projects`
-enumerates the enrollments. Only enrolled roots are servable — the registry is the
+In `--projects` mode every tool takes a `project` argument (optional when one project is
+enrolled), and `list_projects` enumerates the enrollments. Only enrolled roots are servable — the registry is the
 allow-list (`VORPAL_PROJECTS_FILE` overrides its path).
 
 ## The tools

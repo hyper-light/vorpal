@@ -4451,6 +4451,7 @@ dependencies = [
  "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
+ "toml_edit",
  "tracing-subscriber",
  "tree-sitter",
  "vorpal-config",

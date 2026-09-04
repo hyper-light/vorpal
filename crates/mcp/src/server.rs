@@ -23,10 +23,7 @@ use vorpal_kg::Kg;
 
 use crate::watch::SourceWatch;
 
-/// Protocol revisions this server can speak; a client asking for one of these gets it echoed,
-/// anything else is answered with the oldest (most widely supported) revision.
-const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
-const FALLBACK_PROTOCOL_VERSION: &str = "2024-11-05";
+use crate::protocol::{Handler, RpcError, decorate_tools};
 
 /// The warm-index MCP server: one persisted index directory, its graph held in memory across
 /// calls (lazily cold-opened via mmap on first query, reloaded after each `index` tool call).
@@ -227,6 +224,31 @@ fn autowarm_enabled() -> bool {
 /// A clean shutdown lets in-flight committers finish their (short) tails rather than
 /// abandoning staged generations to GC. The ANN warm is deliberately NOT joined: it can run
 /// for seconds and is stamp-validated + lazily rebuilt, so losing it costs nothing.
+impl Handler for Server {
+  fn tools(&self) -> Vec<Value> {
+    tool_declarations(self.profile)
+  }
+
+  fn call_tool(&mut self, name: &str, params: &Value) -> Result<Value, RpcError> {
+    if !self.serves(name) {
+      return Err(RpcError::invalid_params(format!("Unknown tool: {name}")));
+    }
+    Ok(self.tool_result(name, params))
+  }
+
+  fn instructions(&self) -> Option<String> {
+    Some(INSTRUCTIONS.to_string())
+  }
+}
+
+/// Guidance a client may show its model once; the tool descriptions carry the details.
+pub(crate) const INSTRUCTIONS: &str = "vorpal serves a knowledge graph of one indexed \
+repository. Start with `search` or `node` to find a definition, then `callers`, \
+`references`, `reachable`, or `why` to follow edges, and `snippet` or `fetch_span` to read \
+the verbatim source behind any result. Record-bearing tools page with `cursor`/`limit` and \
+accept `format: lean|toon|ids` for smaller output. Every result names the index generation \
+it was read from.";
+
 impl Drop for Server {
   fn drop(&mut self) {
     if let Some(handle) = self.canonicalizing.take() {
@@ -1186,46 +1208,29 @@ impl Server {
     }
   }
 
-  /// Handle one JSON-RPC message line. Requests return a response line; notifications (no `id`)
-  /// and unparseable-but-ignorable input return `None` where the protocol says to stay silent.
+  /// Handle one JSON-RPC message line (see [`crate::protocol`] for every framing and era
+  /// rule): requests return a response line; notifications and blank lines return `None`.
   pub fn handle_line(&mut self, line: &str) -> Option<String> {
-    let msg: Value = match serde_json::from_str(line) {
-      Ok(v) => v,
-      Err(_) => return Some(error_response(Value::Null, -32700, "parse error")),
-    };
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    // No id → a notification (e.g. notifications/initialized): never answered.
-    let id = msg.get("id").cloned()?;
-
-    let result = match method {
-      "initialize" => initialize(&params),
-      "ping" => json!({}),
-      "tools/list" => tools_list(self.profile),
-      "tools/call" => self.tools_call(&params),
-      _ => return Some(error_response(id, -32601, "method not found")),
-    };
-    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+    crate::protocol::handle_line(self, line)
   }
 
-  /// `tools/call`: run a tool, wrapping success and failure as MCP tool results (`isError`
-  /// carries tool-level failures in-band, per spec; JSON-RPC errors are protocol-level only).
+  /// The `CallToolResult` body for one tool run. Tool-level failures ride in-band (`isError`
+  /// with a stable `code`); the caller has already established that the tool exists.
   ///
   /// Every result carries `structuredContent` (IMPROVEMENTS #7): successes state the pinned
   /// **generation** content id the answer came from (`null` before any graph is loaded, e.g.
   /// pure-parse tools like `ast_dump`), so ids and spans are attributable to exactly one
   /// index state; failures state a **stable machine-readable code** alongside the message.
-  pub(crate) fn tools_call(&mut self, params: &Value) -> Value {
-    let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
+  pub(crate) fn tool_result(&mut self, tool: &str, params: &Value) -> Value {
     let args = params
       .get("arguments")
       .cloned()
       .unwrap_or_else(|| json!({}));
     match self.run_tool(tool, &args) {
       Ok((text, mut data)) => {
-        // Token-oriented text: `format: "toon" | "ids"` rewrites the rendered half from
-        // this page's records — one renderer for every record-bearing tool; tools without
-        // records keep their prose.
+        // Token-oriented text: `format: "toon" | "lean" | "ids"` rewrites the rendered half
+        // from this page's records — one renderer for every record-bearing tool; tools
+        // without records keep their prose.
         let text = match (
           args.get("format").and_then(Value::as_str),
           data.get("records").and_then(Value::as_array),
@@ -1250,6 +1255,12 @@ impl Server {
         "isError": true
       }),
     }
+  }
+
+  /// Is `tool` one this daemon serves? Unknown names and names outside the profile are the
+  /// same answer to a client: the tool is not on the list it was given.
+  pub(crate) fn serves(&self, tool: &str) -> bool {
+    self.profile.allows(tool) && ALL_TOOL_NAMES.contains(&tool)
   }
 
   /// The content id of the generation the pinned graph was loaded from.
@@ -1277,7 +1288,7 @@ impl Server {
     };
     if !self.profile.allows(tool) {
       return Err(ToolError::coded(
-        "bad-argument",
+        "internal",
         format!("tool '{tool}' is not in this daemon's '{}' profile", self.profile.label()),
       ));
     }
@@ -1734,9 +1745,11 @@ impl Server {
           .as_ref()
           .map(|w| w.src().to_path_buf())
           .ok_or_else(|| {
-            "structural_search needs a watched source tree (daemon started on a default \
-             <src>/.vorpal/index location)"
-              .to_string()
+            ToolError::coded(
+              "no-watch",
+              "structural_search needs a watched source tree (daemon started on a default \
+               <src>/.vorpal/index location)",
+            )
           })?;
         crate::tools::structural_search(&root, &pattern, &lang, path, limit.clamp(1, 1000))
           .map_err(ToolError::from)
@@ -1772,9 +1785,11 @@ impl Server {
           .as_ref()
           .map(|w| w.src().to_path_buf())
           .ok_or_else(|| {
-            "rule_search needs a watched source tree (daemon started on a default \
-             <src>/.vorpal/index location)"
-              .to_string()
+            ToolError::coded(
+              "no-watch",
+              "rule_search needs a watched source tree (daemon started on a default \
+               <src>/.vorpal/index location)",
+            )
           })?;
         crate::tools::rule_search(&root, &rule, path, limit.clamp(1, 1000))
           .map_err(ToolError::from)
@@ -2168,7 +2183,9 @@ impl Server {
         };
         Ok((text, data))
       }
-      other => Err(ToolError::coded("bad-argument", format!("unknown tool '{other}'"))),
+      // `serves` gates every entry, so an unknown name here is a drift between the
+      // declarations and this match — report it as such rather than as the caller's fault.
+      other => Err(ToolError::coded("internal", format!("tool '{other}' is declared but has no implementation"))),
     }
   }
 
@@ -2192,24 +2209,18 @@ impl Server {
   }
 }
 
-pub(crate) fn initialize(params: &Value) -> Value {
-  let requested = params
-    .get("protocolVersion")
-    .and_then(Value::as_str)
-    .unwrap_or("");
-  let version = if PROTOCOL_VERSIONS.contains(&requested) {
-    requested
-  } else {
-    FALLBACK_PROTOCOL_VERSION
-  };
-  json!({
-    "protocolVersion": version,
-    "capabilities": {"tools": {}},
-    "serverInfo": {"name": "vorpal-mcp", "version": env!("CARGO_PKG_VERSION")}
-  })
-}
+/// Every tool name this server can ever serve (the full profile), in listing order — the
+/// membership authority behind [`Server::serves`].
+const ALL_TOOL_NAMES: &[&str] = &[
+  "index", "health", "schema", "coverage", "code_search", "architecture", "compare_generations",
+  "impact", "dead_code", "node", "callers", "references", "importers", "implementors",
+  "type_users", "similar", "reachable", "structural_search", "rule_search", "ast_dump",
+  "fetch_span", "data_flow", "observed", "query", "snippet", "why", "search",
+];
 
-pub(crate) fn tools_list(profile: Profile) -> Value {
+/// The tool declarations `tools/list` returns for `profile`: filtered by the one membership
+/// authority, then decorated (titles, annotation hints, `format`, output schemas).
+pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
   let name_only = json!({
     "name": {"type": "string", "description": "Exact symbol name"},
     "path": {"type": "string", "description": "Refine: definition file path must end with this suffix"},
@@ -2554,12 +2565,13 @@ pub(crate) fn tools_list(profile: Profile) -> Value {
       &["query"],
     ),
   ];
-  // Advertise exactly what run_tool will accept: one membership authority.
-  let tools: Vec<Value> = tools
+  // Advertise exactly what call_tool will accept: one membership authority.
+  let mut tools: Vec<Value> = tools
     .into_iter()
     .filter(|t| profile.allows(t["name"].as_str().unwrap_or("")))
     .collect();
-  json!({"tools": tools})
+  decorate_tools(&mut tools);
+  tools
 }
 
 /// The cursor/pagination contract shared by every record-returning tool (IMPROVEMENTS #7):
@@ -2596,10 +2608,12 @@ fn selected_data<T: serde::Serialize>(
 }
 
 /// A tool failure with a stable machine-readable code (IMPROVEMENTS #7). Codes are part of
-/// the MCP contract: `bad-argument` (caller passed something unusable), `index-unavailable`
-/// (no graph to answer from — build/revalidate failed), `no-watch` (a source-tree tool on a
-/// custom index location), `stale-source` (file changed since the pinned generation indexed
-/// it), and `tool-error` (everything else, message-only).
+/// the MCP contract (and enumerated in every tool's `outputSchema`): `bad-argument` (caller
+/// passed something unusable), `bad-query` (a `query` the engine refuses by name — a work
+/// ceiling or unsupported clause), `index-unavailable` (no graph to answer from —
+/// build/revalidate failed), `no-watch` (a source-tree tool on a custom index location),
+/// `stale-source` (file changed since the pinned generation indexed it), `internal` (a
+/// server-side invariant broke), and `tool-error` (everything else, message-only).
 struct ToolError {
   code: &'static str,
   message: String,
@@ -2677,6 +2691,3 @@ fn watch_root(index_dir: &Path) -> Option<PathBuf> {
 }
 
 
-pub(crate) fn error_response(id: Value, code: i64, message: &str) -> String {
-  json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
-}
