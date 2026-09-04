@@ -89,7 +89,9 @@ $ vorpal graph callers handle_request   # who calls this?
 `vorpal mcp` is a [Model Context Protocol] server over stdio (revision 2026-07-28, with the
 `initialize` handshake kept for older clients). It gives Claude, Codex, Cursor, and other
 agents tools for callers, references, reachability, semantic and structural search, and
-verbatim source. It builds the index if needed and keeps it current while it runs.
+verbatim source. It builds the index if needed and keeps it current while it runs. What
+it saves an agent against plain grep and read, in turns and tokens, is measured under
+[How does it compare?](#how-does-it-compare).
 
 The short route, from your project root, writes the config for every client it finds:
 
@@ -355,6 +357,52 @@ rg 'kmalloc\(' -t c ~/linux             # comparison
 | `ripgrep` | 1.0 s | text lines containing `kmalloc(` |
 
 Parsing and AST-matching 63,775 files costs about 5× a text grep of the same tree.
+
+**Against an agent's built-in tools.** An agent already has grep and read. Measured
+2026-09-04 with the v0.8.0 binary: the same question answered by a warm vorpal daemon
+(one MCP call) and by the ripgrep-plus-read pipeline Claude Code's Grep and Read tools
+run, on this repo and on the Linux kernel. Wall time is the tool's own work; "output" is
+what the model then has to read.
+
+| Question | vorpal | rg + read | Output the model reads |
+|---|---:|---:|---|
+| This repo: callers of `tool_result` | 11 ms | 41 ms | 2 typed records vs 3 text lines |
+| This repo: what `run_install` reaches | 11 ms, 1 call | 79 ms, 5 commands | 4 records vs 307 lines (36 KB) |
+| This repo: source of `render_toml` | 0.7 ms | 17 ms, 2 commands | verified body vs 57 lines |
+| Kernel: callers of `kmalloc` | 0.1 ms | 759 ms | 6 resolved records vs 3,387 lines (392 KB) |
+| Kernel: find `schedule_timeout` | 0.2 ms | 677 ms | 1 record vs 2 lines |
+| Kernel: source of `vfs_read` | 12 ms | 667 ms, then a read | verified body vs 1 line |
+| Kernel: what `vfs_read` reaches, depth 2 | 0.2 ms | no equivalent | 3 records |
+
+On a small repo both are far under a model turn; the difference is round trips. On the
+kernel every grep rescans 75,954 files (about 0.7 s) while the graph answers in
+microseconds, and grep's 392 KB of `kmalloc` mentions includes definitions, comments,
+and macros the model must sift, where the graph returns the six call edges it can prove
+and says the rest are masked. The first call in a fresh daemon pays a cold open (126 ms
+on this repo, 58 ms on the kernel).
+
+**What that costs end to end.** The same questions put to Claude Code (Sonnet), once
+with only vorpal's tools allowed and once with only Grep, Glob, and Read. Tokens are
+everything the model processed, cache reads included; cost is what the API billed.
+
+| Question | Tools | Turns | Tokens | Cost | Wall |
+|---|---|---:|---:|---:|---:|
+| This repo: who calls `tool_result` | vorpal | 3 | 84 K | $0.134 | 10.0 s |
+| | grep + read | 8 | 270 K | $0.131 | 15.8 s |
+| This repo: what `run_install` reaches | vorpal | 7 | 216 K | $0.136 | 26.9 s |
+| | grep + read | 4 | 143 K | $0.102 | 14.6 s |
+| Kernel: who calls `vfs_read` | vorpal | 3 | 72 K | $0.072 | 7.7 s |
+| | grep + read | 4 | 90 K | $0.076 | 10.3 s |
+| Kernel: what `vfs_read` calls | vorpal | 6 | 156 K | $0.083 | 10.6 s |
+| | grep + read | 4 | 118 K | $0.056 | 7.0 s |
+
+Read it plainly: the graph wins when the answer is spread across files (callers,
+reachability), by fewer turns and a third of the tokens on the small repo; grep wins
+when reading one function body answers the question (direct callees), because that is
+one read. Dollar cost barely moves on questions this small since most tokens are cache
+reads. The per-call gap above compounds as the questions get harder and the tree gets
+larger; both answers were correct in every run (the graph's callee list also named the
+macros `unlikely` and `add_rchar`, which the read missed).
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,

@@ -3872,3 +3872,44 @@ the v0.7.1 binary was run on the same machine: v0.7.1 8.63 / 9.36 / 9.79 s vs v0
 the rounds after a day of compiles); the difference is ambient, not the release. The
 rule stands: a flagship reading outside the band is answered with an interleaved A/B
 against the previous binary, never with a restamp.
+
+## vorpal MCP vs an agent's grep/read — per-call and end-to-end (2026-09-04, v0.8.0)
+
+Two measurements behind the README's "Against an agent's built-in tools" block.
+
+**Per call** (python stdio client against a warm `vorpal mcp` daemon, `VORPAL_NO_AUTOWARM=1`,
+versus the `rg`/`sed` pipeline Claude Code's Grep/Read tools run; this repo at `.vorpal/index`,
+kernel index built to scratch in 7.97 s): repo callers `tool_result` 10.8 ms / 1,422 B / 2 rec
+vs rg 41.2 ms / 365 B / 3 lines; repo reachable `run_install` (exact) 11.0 ms / 4 rec vs
+`rg -A 75` + 4 greps 79.1 ms / 35,625 B / 307 lines; repo snippet `render_toml` 0.7 ms vs
+rg + sed 17.1 ms; repo search "stdio pump reader thread" 4.1 ms / 5 hits vs `rg -i` 19.0 ms /
+15 lines; kernel callers `kmalloc` (page 100) 0.1 ms / 2,702 B / 6 resolved vs `rg 'kmalloc\('
+-t c` 758.5 ms / 392,251 B / 3,387 lines; kernel callers `kmalloc_slab` 0.1 ms / 0 (masked)
+vs 668 ms / 7 lines; kernel node `schedule_timeout` 0.2 ms vs 677 ms; kernel snippet
+`vfs_read` 12.5 ms vs 666.5 ms (+ a read); kernel reachable `vfs_read` out depth 2 exact
+0.2 ms / 3 rec, no grep equivalent. Cold-open first call: repo 126 ms, kernel 58 ms.
+
+**End to end** (`claude -p … --output-format json --model sonnet`, the vorpal arm with
+`--mcp-config … --strict-mcp-config --allowedTools mcp__vorpal__{search,node,callers,
+reachable,snippet,why,references,query} --disallowedTools Grep,Glob,Read,Bash`, the grep arm
+with `--allowedTools Grep,Glob,Read,Bash(rg:*),Bash(grep:*)`; tokens = input + cache-read +
+cache-creation; one run each):
+
+| corpus / question | arm | turns | tokens | $ | wall |
+|---|---|---:|---:|---:|---:|
+| repo: who calls tool_result | vorpal | 3 | 83,687 | 0.134 | 10.0 s |
+| | grep | 8 | 269,778 | 0.131 | 15.8 s |
+| repo: what run_install reaches | vorpal | 7 | 216,123 | 0.136 | 26.9 s |
+| | grep | 4 | 142,514 | 0.102 | 14.6 s |
+| kernel: who calls vfs_read | vorpal | 3 | 71,798 | 0.072 | 7.7 s |
+| | grep | 4 | 89,792 | 0.076 | 10.3 s |
+| kernel: what vfs_read calls directly | vorpal | 6 | 156,057 | 0.083 | 10.6 s |
+| | grep | 4 | 117,994 | 0.056 | 7.0 s |
+
+Reading: graph tools win the cross-file questions (callers) on turns and tokens; a single
+function read wins the direct-callee questions because the answer is one file. Cost is flat
+at this size (cache reads dominate). Both arms answered correctly in all eight runs; the
+graph's callee list included the macros `unlikely`/`add_rchar` the read omitted. Single
+runs — model variance is real; the per-call table is the stable measurement, the end-to-end
+table is the honest one. Not measured: larger multi-hop tasks where the per-call gap
+compounds.
