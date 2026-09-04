@@ -68,10 +68,9 @@ impl Profile {
   fn allows(self, tool: &str) -> bool {
     const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
-      "callers", "references", "importers", "implementors", "type_users", "similar", "reachable",
-      "why",
+      "graph", "reachable", "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
-      "code_search", "data_flow", "observed", "query",
+      "code_search", "data_flow", "query",
     ];
     match self {
       Profile::Full => true,
@@ -243,11 +242,16 @@ impl Handler for Server {
 
 /// Guidance a client may show its model once; the tool descriptions carry the details.
 pub(crate) const INSTRUCTIONS: &str = "vorpal serves a knowledge graph of one indexed \
-repository. Start with `search` or `node` to find a definition, then `callers`, \
-`references`, `reachable`, or `why` to follow edges, and `snippet` or `fetch_span` to read \
-the verbatim source behind any result. Record-bearing tools page with `cursor`/`limit` and \
-accept `format: lean|toon|ids` for smaller output. Every result names the index generation \
-it was read from.";
+repository. Start with `search` or `node` to find a definition, then `graph` (relation: \
+callers, references, importers, implementors, type_users, similar, observed), `reachable`, \
+or `why` to follow edges, and `snippet` or `fetch_span` to read the verbatim source behind \
+any result. Graph answers are complete: a `graph`, `reachable`, or `why` result is the full \
+resolved set at the grade each row states — do not confirm it with search, code_search, or \
+grep. If your client defers these tools, load every one you will need in a single \
+ToolSearch call (for example select:mcp__vorpal__search,mcp__vorpal__node,mcp__vorpal__graph,\
+mcp__vorpal__snippet) rather than one per turn. Record-bearing tools page with \
+`cursor`/`limit` and accept `format: lean|toon|ids` for smaller output (`lean` is right for \
+almost every question). Every result names the index generation it was read from.";
 
 impl Drop for Server {
   fn drop(&mut self) {
@@ -1296,6 +1300,28 @@ impl Server {
         format!("tool '{tool}' is not in this daemon's '{}' profile", self.profile.label()),
       ));
     }
+    // `graph` is one tool over seven relations (one schema for a client to load, one
+    // description to read); the relation names the arm below exactly as the former
+    // per-relation tools did.
+    let tool: &str = if tool == "graph" {
+      match args.get("relation").and_then(Value::as_str) {
+        Some(relation) if GRAPH_RELATIONS.contains(&relation) => relation,
+        Some(other) => {
+          return Err(ToolError::coded(
+            "bad-argument",
+            format!("unknown relation '{other}' (one of: {})", GRAPH_RELATIONS.join(", ")),
+          ));
+        }
+        None => {
+          return Err(ToolError::coded(
+            "bad-argument",
+            format!("graph needs `relation` (one of: {})", GRAPH_RELATIONS.join(", ")),
+          ));
+        }
+      }
+    } else {
+      tool
+    };
     // Query tools serve from a graph the watch keeps fresh; the explicit `index` tool builds
     // from its own `src` argument and needs no pre-validation.
     if tool != "index" {
@@ -2217,9 +2243,14 @@ impl Server {
 /// membership authority behind [`Server::serves`].
 const ALL_TOOL_NAMES: &[&str] = &[
   "index", "health", "schema", "coverage", "code_search", "architecture", "compare_generations",
-  "impact", "dead_code", "node", "callers", "references", "importers", "implementors",
-  "type_users", "similar", "reachable", "structural_search", "rule_search", "ast_dump",
-  "fetch_span", "data_flow", "observed", "query", "snippet", "why", "search",
+  "impact", "dead_code", "node", "graph", "reachable", "structural_search", "rule_search",
+  "ast_dump", "fetch_span", "data_flow", "query", "snippet", "why", "search",
+];
+
+/// The relations `graph` serves — each was a tool of its own before 2026-09-04, and the
+/// arm names below are still theirs.
+const GRAPH_RELATIONS: &[&str] = &[
+  "callers", "references", "importers", "implementors", "type_users", "similar", "observed",
 ];
 
 /// The tool declarations `tools/list` returns for `profile`: filtered by the one membership
@@ -2235,6 +2266,17 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
     "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
   });
+  let mut graph_props = name_only.clone();
+  if let Some(props) = graph_props.as_object_mut() {
+    props.insert(
+      "relation".to_string(),
+      json!({
+        "type": "string",
+        "enum": GRAPH_RELATIONS,
+        "description": "Which edge set to return: callers, references, importers, implementors, type_users, similar, observed"
+      }),
+    );
+  }
   let tools: Vec<Value> = vec![
     tool(
       "index",
@@ -2371,23 +2413,27 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
       },
       &[],
     ),
-    tool("callers", "Direct callers of a symbol (incoming `calls` edges).", name_only.clone(), &["name"]),
-    tool("references", "Direct referrers of a symbol (incoming `references` edges).", name_only.clone(), &["name"]),
-    tool("importers", "Files importing a symbol (incoming `imports` edges).", name_only.clone(), &["name"]),
-    tool("implementors", "Types implementing/extending a trait, interface, or base type (incoming `implements` edges).", name_only.clone(), &["name"]),
-    tool("type_users", "Definitions using a type in fields, params, returns, or annotations (incoming `of_type` edges).", name_only.clone(), &["name"]),
     tool(
-      "similar",
-      "Near-clones of a definition: `similar_to` edges from extraction-time MinHash sketches \
-       over token shingles (≥ 0.7 estimated Jaccard; confidence = similarity × 100; each \
-       definition keeps its 8 most similar partners, a clone family's representative links \
-       to every member). Definitions under 32 tokens are never signed.",
-      name_only.clone(),
-      &["name"],
+      "graph",
+      "The direct neighbours of a definition over one relation. `callers`: incoming \
+       `calls` edges. `references`: incoming `references` edges. `importers`: files \
+       importing it. `implementors`: types implementing/extending a trait, interface, or \
+       base type. `type_users`: definitions using a type in fields, params, returns, or \
+       annotations. `similar`: near-clones (`similar_to` edges from MinHash sketches over \
+       token shingles, ≥ 0.7 estimated Jaccard; confidence = similarity × 100; each \
+       definition keeps its 8 most similar partners). `observed`: runtime-observed calls \
+       in both directions from traces ingested with `vorpal-index ingest-traces`, each row \
+       flagged with whether the static graph has the edge. The result IS the complete set \
+       of resolved edges of that relation, at the grade each row states — it needs no \
+       confirmation by search, code_search, or grep. Ambiguous names return the candidate \
+       list to refine (path/kind/id), never a guessed merge.",
+      graph_props,
+      &["relation", "name"],
     ),
     tool(
       "reachable",
-      "Relation-specific transitive traversal from a symbol, returning each reached node WITH \
+      "Relation-specific transitive traversal from a symbol — the complete closure at the stated \
+       grade floor, needing no confirmation by search — returning each reached node WITH \
        its path back to the seed (per-edge relation names). direction \"in\" = everything \
        reaching it, \"out\" = everything it reaches; `relations` restricts edge types (default \
        [\"calls\"]); `min_grade` sets a resolution-grade floor; the seed uses the same selector \
@@ -2479,17 +2525,6 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
       &["name"],
     ),
     tool(
-      "observed",
-      "Runtime-observed calls for a symbol, both directions, from traces ingested with \
-       `vorpal-index ingest-traces` (folded stacks: perf, py-spy, inferno). Each row \
-       carries its sample count and whether the static graph already has the edge — \
-       `false` means dynamic dispatch or a function pointer that static resolution can \
-       never prove. A rebuild invalidates the sidecar until traces are re-ingested; \
-       absence is stated, never silent.",
-      name_only.clone(),
-      &["name"],
-    ),
-    tool(
       "query",
       "Cypher-shaped READ-ONLY graph query (openCypher read subset). MATCH a linear \
        pattern — (var:Kind|Kind2 {name: \"x\", path: \"suffix\"}) chained through up to 8 \
@@ -2535,9 +2570,10 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "why",
-      "Evidence for the edge(s) from one node to another: each retained occurrence's edge \
-       type, resolution grade, resolver reason, candidate count, and source span — why does \
-       this relation exist?",
+      "Evidence for the edge(s) from one node to another: every retained occurrence's edge \
+       type, resolution grade, resolver reason, candidate count, and source span — the \
+       complete record of why this relation exists (or, with `name`, why no edge to that \
+       name exists).",
       json!({
         "from_id": {"type": "integer", "description": "Source node id (from any graph tool's id output)"},
         "to_id": {"type": "integer", "description": "Target node id (edge form: why does this edge exist?)"},

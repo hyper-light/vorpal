@@ -36,7 +36,11 @@ fn battery(server: &mut Server, id: &mut u64, probes: &[&str]) -> String {
   for name in probes {
     for tool in ["node", "callers", "references", "importers", "similar"] {
       *id += 1;
-      let (text, _) = call_tool(server, *id, tool, json!({"name": name}));
+      let (text, _) = if tool == "node" {
+        call_tool(server, *id, "node", json!({"name": name}))
+      } else {
+        call_tool(server, *id, "graph", json!({"relation": tool, "name": name}))
+      };
       out.push_str(&format!("== {tool} {name}\n{text}\n"));
     }
   }
@@ -228,7 +232,7 @@ fn watched_daemon_answers_equal_scratch_after_every_edit_class() {
   fs::write(src.join("g.py"), "def probe_8a():\n    return alpha()\n").unwrap();
   let (_, is_error) = {
     id += 1;
-    call_tool(&mut daemon, id, "callers", json!({"name": "beta2"}))
+    call_tool(&mut daemon, id, "graph", json!({"relation": "callers", "name": "beta2"}))
   };
   assert!(!is_error, "daemon must stay live mid-burst");
   fs::write(src.join("h.py"), "def probe_8b():\n    return probe_8a()\n").unwrap();

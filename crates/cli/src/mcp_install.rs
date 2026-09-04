@@ -203,6 +203,13 @@ pub fn run_install(client: Client, command_override: Option<&str>, dry_run: bool
   } else if wrote == 0 {
     println!("nothing to do — every selected client is configured or not present");
   }
+  if matches!(client, Client::All | Client::ClaudeCode) {
+    println!(
+      "note  claude-code    defers MCP tool schemas behind ToolSearch (one model turn per \
+       tool); set ENABLE_TOOL_SEARCH=false in Claude Code's env (e.g. .claude/settings.json \
+       \"env\") to keep vorpal's schemas resident — see docs/mcp.md"
+    );
+  }
   Ok(())
 }
 

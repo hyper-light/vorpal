@@ -99,19 +99,13 @@ fn initialize_handshake_and_tool_listing() {
       "impact",
       "dead_code",
       "node",
-      "callers",
-      "references",
-      "importers",
-      "implementors",
-      "type_users",
-      "similar",
+      "graph",
       "reachable",
       "structural_search",
       "rule_search",
       "ast_dump",
       "fetch_span",
       "data_flow",
-      "observed",
       "query",
       "snippet",
       "why",
@@ -182,7 +176,7 @@ fn modern_era_is_served_statelessly() {
     &mut server,
     4,
     "tools/call",
-    json!({"name": "callers", "arguments": {"name": "target"}, "_meta": modern_meta()}),
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target"}, "_meta": modern_meta()}),
   );
   assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("caller"));
 
@@ -221,7 +215,7 @@ fn modern_era_is_served_statelessly() {
     json!({"protocolVersion": "2025-11-25", "capabilities": {}}),
   );
   assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
-  let (text, is_err) = call_tool(&mut server, 11, "callers", json!({"name": "target"}));
+  let (text, is_err) = call_tool(&mut server, 11, "graph", json!({"relation": "callers", "name": "target"}));
   assert!(!is_err);
   assert!(text.contains("caller"));
 
@@ -303,13 +297,13 @@ fn toon_format_rewrites_record_tool_text() {
   let (text, is_err) = call_tool(
     &mut server,
     2,
-    "callers",
-    json!({"name": "target", "format": "toon"}),
+    "graph",
+    json!({"relation": "callers", "name": "target", "format": "toon"}),
   );
   assert!(!is_err);
   assert!(text.starts_with("cols: "), "{text}");
   assert!(text.contains("caller"), "{text}");
-  let (ids, _) = call_tool(&mut server, 3, "callers", json!({"name": "target", "format": "ids"}));
+  let (ids, _) = call_tool(&mut server, 3, "graph", json!({"relation": "callers", "name": "target", "format": "ids"}));
   assert!(ids.starts_with("eid:") || ids.starts_with("id:"), "{ids}");
 }
 
@@ -384,11 +378,11 @@ fn warm_index_tools_answer_graph_queries() {
   assert!(!is_err, "{text}");
   assert!(text.contains("indexed 2 files"), "{text}");
 
-  let (text, is_err) = call_tool(&mut server, 2, "callers", json!({"name": "target"}));
+  let (text, is_err) = call_tool(&mut server, 2, "graph", json!({"relation": "callers", "name": "target"}));
   assert!(!is_err, "{text}");
   assert!(text.contains("caller"), "callers of target: {text}");
 
-  let (text, is_err) = call_tool(&mut server, 3, "importers", json!({"name": "target"}));
+  let (text, is_err) = call_tool(&mut server, 3, "graph", json!({"relation": "importers", "name": "target"}));
   assert!(!is_err, "{text}");
   assert!(text.contains("a.rs"), "importers of target: {text}");
 
@@ -651,7 +645,7 @@ fn typed_records_and_cursor_pagination() {
     &mut server,
     3,
     "tools/call",
-    json!({"name": "callers", "arguments": {"name": "target"}}),
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target"}}),
   );
   let data = &response["result"]["structuredContent"];
   assert_eq!(data["outcome"], "hits");
@@ -755,7 +749,7 @@ fn protocol_and_tool_errors_are_explicit() {
   assert!(response["error"]["message"].as_str().unwrap().contains("Unknown tool: explode"));
   let response = request(&mut server, 21, "tools/call", json!({"arguments": {}}));
   assert_eq!(response["error"]["code"], -32602);
-  let response = request(&mut server, 22, "tools/call", json!({"name": "callers", "arguments": 5}));
+  let response = request(&mut server, 22, "tools/call", json!({"name": "graph", "arguments": 5}));
   assert_eq!(response["error"]["code"], -32602);
 
   // Framing: batches and null ids are invalid requests; unknown notifications are silent.
@@ -775,12 +769,20 @@ fn protocol_and_tool_errors_are_explicit() {
   assert_eq!(response["error"]["code"], -32602);
 
   // Query before any index exists → helpful in-band error.
-  let (text, is_err) = call_tool(&mut server, 3, "callers", json!({"name": "x"}));
+  let (text, is_err) = call_tool(&mut server, 3, "graph", json!({"relation": "callers", "name": "x"}));
   assert!(is_err);
   assert!(text.contains("'index' tool"), "{text}");
 
+  // `graph` validates its relation in-band (an execution error the model can correct).
+  let (text, is_err) = call_tool(&mut server, 30, "graph", json!({"name": "x"}));
+  assert!(is_err);
+  assert!(text.contains("relation"), "{text}");
+  let (text, is_err) = call_tool(&mut server, 31, "graph", json!({"relation": "sideways", "name": "x"}));
+  assert!(is_err);
+  assert!(text.contains("unknown relation"), "{text}");
+
   // Missing / invalid arguments.
-  let (text, is_err) = call_tool(&mut server, 4, "callers", json!({}));
+  let (text, is_err) = call_tool(&mut server, 4, "graph", json!({"relation": "callers", }));
   assert!(is_err);
   assert!(text.contains("missing required argument"), "{text}");
   let (text, is_err) = call_tool(

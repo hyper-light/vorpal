@@ -58,7 +58,7 @@ tool("health", {})  # first call absorbs boot work
 # it means edges are being faked.
 text, dt = tool("node", {"name": "kmalloc_slab"})
 node_ok = "slab.h" in text and "static inline" in text
-text, dt = tool("callers", {"name": "kmalloc_slab", "limit": 50})
+text, dt = tool("graph", {"relation": "callers", "name": "kmalloc_slab", "limit": 50})
 grade("static-inline masking honest (kmalloc_slab)", node_ok and "no results" in text,
       dt, "node exists, cross-file calls masked" if node_ok else text[:80])
 
@@ -72,7 +72,7 @@ grade("snippet(vfs_read) is byte-faithful", hits >= 4 and "read_write.c" in text
       dt, f"{hits}/5 exact source lines present")
 
 # ---- 3. type_users: who defines a struct file_operations? ----
-text, dt = tool("type_users", {"name": "file_operations", "limit": 200})
+text, dt = tool("graph", {"relation": "type_users", "name": "file_operations", "limit": 200})
 ok = text.count("[Variable]") >= 20 and "dir" in text
 grade("type_users(file_operations) finds instances", ok,
       dt, f"{text.count(chr(91))} typed instances in first page")
@@ -90,7 +90,7 @@ grade("search('socket buffer allocation') hits skbuff", ok, dt,
       "found alloc_skb family" if ok else text[:80])
 
 # ---- 6. callers: schedule_timeout_interruptible (moderate fan-in) ----
-text, dt = tool("callers", {"name": "schedule_timeout_interruptible", "limit": 200})
+text, dt = tool("graph", {"relation": "callers", "name": "schedule_timeout_interruptible", "limit": 200})
 gt = set()
 for line in rg(r"\bschedule_timeout_interruptible\(", "-t", "c"):
     path, lineno, code = line.split(":", 2)

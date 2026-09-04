@@ -35,7 +35,11 @@ fn battery(server: &mut Server, id: &mut u64, probes: &[&str]) -> String {
   for name in probes {
     for tool in ["node", "callers", "references", "importers", "similar"] {
       *id += 1;
-      let (text, _) = call_tool(server, *id, tool, json!({"name": name}));
+      let (text, _) = if tool == "node" {
+        call_tool(server, *id, "node", json!({"name": name}))
+      } else {
+        call_tool(server, *id, "graph", json!({"relation": tool, "name": name}))
+      };
       out.push_str(&format!("== {tool} {name}\n{text}\n"));
     }
   }

@@ -67,7 +67,7 @@ fn binary_serves_mcp_over_stdio() {
   assert_eq!(response["result"]["isError"], false);
 
   send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-              "params": {"name": "callers", "arguments": {"name": "target"},
+              "params": {"name": "graph", "arguments": {"relation": "callers", "name": "target"},
                          "_meta": {"progressToken": 2}}}));
   let response = recv();
   let text = response["result"]["content"][0]["text"].as_str().unwrap();
@@ -76,7 +76,7 @@ fn binary_serves_mcp_over_stdio() {
 
   // The modern client reads the same graph through its own envelope.
   send(json!({"jsonrpc": "2.0", "id": 102, "method": "tools/call",
-              "params": {"name": "callers", "arguments": {"name": "target"}, "_meta": meta}}));
+              "params": {"name": "graph", "arguments": {"relation": "callers", "name": "target"}, "_meta": meta}}));
   let response = recv();
   assert_eq!(response["result"]["resultType"], "complete");
   assert!(
