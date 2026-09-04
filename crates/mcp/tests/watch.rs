@@ -41,7 +41,7 @@ fn watched_daemon_serves_changes_it_was_never_told_about() {
   let mut server = Server::new(index);
 
   // First query self-validates (the flag starts dirty: pre-startup changes have no events).
-  let (text, is_error) = call_tool(&mut server, 1, "callers", json!({"name": "target"}));
+  let (text, is_error) = call_tool(&mut server, 1, "graph", json!({"relation": "callers", "name": "target"}));
   assert!(!is_error, "{text}");
   assert!(text.contains("caller"), "{text}");
 
@@ -70,7 +70,7 @@ fn watched_daemon_serves_changes_it_was_never_told_about() {
   assert!(found, "watched daemon never picked up the new file");
 
   // And the new symbol participates in the graph, not just the node list.
-  let (text, is_error) = call_tool(&mut server, id, "callers", json!({"name": "target"}));
+  let (text, is_error) = call_tool(&mut server, id, "graph", json!({"relation": "callers", "name": "target"}));
   assert!(!is_error, "{text}");
   assert!(
     text.contains("brand_new_symbol"),
@@ -134,13 +134,13 @@ fn bench_steady_state_query_latency() {
   vorpal_index::build_index(&src, &index).expect("initial index");
 
   let mut server = Server::new(index);
-  let (text, is_error) = call_tool(&mut server, 1, "callers", json!({"name": "target"}));
+  let (text, is_error) = call_tool(&mut server, 1, "graph", json!({"relation": "callers", "name": "target"}));
   assert!(!is_error, "{text}");
 
   let rounds = 10_000u64;
   let start = Instant::now();
   for i in 0..rounds {
-    let (_, is_error) = call_tool(&mut server, 2 + i, "callers", json!({"name": "target"}));
+    let (_, is_error) = call_tool(&mut server, 2 + i, "graph", json!({"relation": "callers", "name": "target"}));
     assert!(!is_error);
   }
   let elapsed = start.elapsed();

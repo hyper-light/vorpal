@@ -3970,3 +3970,54 @@ dominated by the model's confirmation calls and deferred-tool loads, not payload
 stay grep's. Single runs; both arms correct in all eight. Standing leads: fewer, denser
 tools for the deferred-schema turns; multi-hop tasks (impact, why-chains, depth-3
 reachability) as the set where the graph should dominate — unmeasured.
+
+## One `graph` tool, finality wording, and the deferred-schema turns measured (2026-09-04)
+
+**Cause of the end-to-end gap, from traces.** Claude Code defers every MCP tool's schema
+behind its own `ToolSearch` tool by default — a stub server with ONE tool still costs a
+`ToolSearch` turn (tool counts 1/5/8/10/12/16/20/27 and 3 KB / 12 KB descriptions all
+identical: 3 turns, one `ToolSearch`). There is no count threshold. The client knob is
+`ENABLE_TOOL_SEARCH`: `false` makes schemas resident (2 turns, direct call); `auto` and
+`auto:N` are an optimistic prefetch (sometimes resident, sometimes not — 0 or 1
+`ToolSearch` across identical runs) and are not a remedy. The v0.8.0 Opus trace for
+"who calls vfs_read" was 7 turns: 3 `ToolSearch` loads, `callers`, then `references` and
+`code_search` as confirmation, then the answer; tool time < 50 ms.
+
+**Changes.** (1) `callers`/`references`/`importers`/`implementors`/`type_users`/`similar`/
+`observed` → one `graph` tool with a `relation` enum (27 → 21 tools; one schema load
+covers every relation); (2) `graph`/`reachable`/`why` descriptions and the server
+`instructions` state the result is the complete resolved set at the stated grade and
+needs no confirmation by search/grep, and tell a deferring client to load every needed
+tool in ONE `ToolSearch` call; (3) docs + installer hint for `ENABLE_TOOL_SEARCH=false`.
+Resident cost measured: 21 schemas = 43,608 B ≈ 11 K tokens per turn (cache-read).
+
+**End to end, Opus, `CLAUDE_EFFORT` unset** (the earlier tables inherited `CLAUDE_EFFORT=high`
+from the shell on both arms), one run each; TS = `ToolSearch` turns:
+
+| corpus / question | arm | turns | TS | tokens | $ | wall | calls |
+|---|---|---:|---:|---:|---:|---:|---|
+| repo: who calls tool_result | grep | 5 | 0 | 98,313 | 0.213 | 13.9 | Grep Read Read Grep |
+| | vorpal deferred | 3 | 1 | 67,035 | 0.164 | 6.6 | ToolSearch graph |
+| | vorpal auto | 2 | 0 | 93,299 | 0.502 | 7.2 | graph |
+| | vorpal resident | 3 | 0 | 138,678 | 0.175 | 6.3 | node graph |
+| repo: what run_install reaches | grep | 4 | 0 | 77,114 | 0.212 | 14.2 | Grep Grep Read |
+| | vorpal deferred | 4 | 1 | 93,612 | 0.207 | 16.9 | ToolSearch node reachable |
+| | vorpal auto | 4 | 1 | 187,433 | 0.223 | 12.8 | ToolSearch node reachable |
+| | vorpal resident | 4 | 0 | 187,184 | 0.232 | 15.4 | node reachable reachable |
+| kernel: who calls vfs_read | grep | 3 | 0 | 62,177 | 0.066 | 11.8 | Grep Bash |
+| | vorpal deferred | 4 | 1 | 78,677 | 0.155 | 14.4 | ToolSearch graph snippet |
+| | vorpal auto | 6 | 1 | 261,355 | 0.271 | 20.5 | ToolSearch node graph node node |
+| | vorpal resident | 5 | 0 | 215,235 | 0.203 | 17.5 | node graph graph search |
+| kernel: what vfs_read calls | grep | 3 | 0 | 60,202 | 0.053 | 8.2 | Grep Read |
+| | vorpal deferred | 6 | 2 | 81,974 | 0.197 | 20.3 | ToolSearch node ToolSearch reachable snippet |
+| | vorpal auto | 4 | 1 | 173,056 | 0.183 | 16.7 | ToolSearch node reachable |
+| | vorpal resident | 4 | 0 | 171,127 | 0.119 | 15.0 | index node reachable |
+
+Versus the 27-tool surface (same day, effort high): kernel callers 8 turns / 161 K →
+4 / 79 K deferred; the confirmation calls (`references`, `code_search`) are gone, and the
+remaining gap to grep is the one schema load. Resident schemas remove that turn but
+double tokens (44 KB per turn), so cost does not fall; the model still spends turns it
+does not need (a `node` before `graph`, a second `reachable`), which no server-side
+change controls. Standing: the per-call table is the stable measurement; end-to-end is
+one run per cell and moves with the model. Next lead: multi-hop tasks (impact, why
+chains, depth-3 reachability) where one graph call replaces many greps — unmeasured.

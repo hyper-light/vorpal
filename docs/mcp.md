@@ -134,6 +134,33 @@ both a text rendering in `content` and `structuredContent`:
   `signature`, `span`, and `external_id`; `ids` keeps `id` and `external_id` only;
   `toon` is a lossless tab grid grouped by directory with every column intact.
 
+## Claude Code defers MCP tool schemas
+
+Claude Code keeps only the *names* of MCP tools in context by default and loads a tool's
+schema through its own `ToolSearch` tool the first time the model wants it. That load is
+a model turn: every distinct vorpal tool a task needs costs one extra round trip before
+the first real call, whatever the tool count (measured 2026-09-04: a server with one tool
+still pays it). Three things reduce that cost:
+
+- **Fewer distinct tools per task.** The seven relation tools are now one `graph` tool
+  with a `relation` argument, so callers, references, importers, implementors, and the
+  rest share a single schema load.
+- **One load, not one per turn.** The server's instructions tell the model to load every
+  vorpal tool it will need in a single `ToolSearch` call.
+- **Keep the schemas resident.** Claude Code's `ENABLE_TOOL_SEARCH=false` setting puts
+  MCP schemas in context up front, and the `ToolSearch` turns disappear altogether
+  (measured 2026-09-04: a direct call in 2 turns instead of 3; `auto` and `auto:N` still
+  defer). Set it in Claude Code's environment, for example in `.claude/settings.json`:
+
+  ```json
+  { "env": { "ENABLE_TOOL_SEARCH": "false" } }
+  ```
+
+  This is a Claude Code setting and applies to every MCP server it loads, which is why
+  `vorpal mcp install` mentions it rather than writing it. vorpal's 21 schemas are 44 KB
+  of JSON, roughly 11 K tokens of context when resident (cache-read on every turn after
+  the first), against one model turn per distinct tool when deferred.
+
 ## Tool profiles (least privilege)
 
 Agents don't always deserve the whole surface. `--profile` gates what `tools/list`
@@ -142,7 +169,7 @@ offers:
 | profile | tools |
 |---|---|
 | `scout` | `node`, `search`, `snippet`, `schema`, `fetch_span` — read-only navigation |
-| `analysis` | scout + `callers`, `references`, `importers`, `implementors`, `type_users`, `similar`, `reachable`, `why`, `health`, `dead_code`, `coverage`, `impact`, `compare_generations`, `architecture`, `code_search`, `data_flow`, `observed`, `query` |
+| `analysis` | scout + `graph`, `reachable`, `why`, `health`, `dead_code`, `coverage`, `impact`, `compare_generations`, `architecture`, `code_search`, `data_flow`, `observed`, `query` |
 | `full` (default) | everything: analysis + `index`, `structural_search`, `rule_search`, `ast_dump` |
 
 ```json
@@ -206,15 +233,9 @@ allow-list (`VORPAL_PROJECTS_FILE` overrides its path).
 | Tool | What it does |
 |---|---|
 | `node` | Nodes matching an exact symbol name. |
-| `callers` | Direct callers of a symbol (incoming `calls` edges). |
-| `references` | Direct referrers (incoming `references` edges). |
-| `importers` | Files importing a symbol (incoming `imports` edges). |
-| `implementors` | Types implementing/extending a trait, interface, or base type. |
-| `type_users` | Definitions using a type in fields, params, returns, or annotations. |
-| `similar` | Near-clones of a definition (`similar_to` edges): extraction-time MinHash sketches over token shingles, paired at link when the estimated Jaccard similarity is ≥ 0.7 — confidence is that similarity × 100. Each definition keeps its 8 most similar partners (a clone family's representative links to every member); definitions under 32 tokens are never signed. |
+| `graph` | The direct neighbours of a symbol over one `relation`: `callers` (incoming `calls`), `references`, `importers` (files importing it), `implementors` (types implementing/extending a trait, interface, or base type), `type_users` (definitions using a type in fields, params, returns, or annotations), `similar` (near-clones from extraction-time MinHash sketches, ≥ 0.7 estimated Jaccard, confidence = similarity × 100, 8 partners kept per definition, nothing under 32 tokens signed), `observed` (runtime-observed calls from traces ingested with `vorpal-index ingest-traces <index> <folded-stacks>`, each row flagged with whether the static graph has the edge; a rebuild invalidates the sidecar until traces are re-ingested). The result is the complete set of resolved edges at the stated grade and needs no confirmation by search. |
 | `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`; add `"data_flows"` to follow argument flow, `"changes_with"` for git co-change, `"similar_to"` for near-clones). |
 | `data_flow` | Where a symbol's arguments flow: per-argument rows (`arg#i` → callee `param#j`, with the argument expression when traceable) joined from the `dataflow.bin` sidecar. Captured for Rust/Python/TypeScript/TSX call sites; older generations without the sidecar answer empty. |
-| `observed` | Runtime-observed calls for a symbol (both directions), from traces ingested with `vorpal-index ingest-traces <index> <folded-stacks>` (perf/py-spy/inferno collapsed format). Each row carries its sample count and whether the static graph already has the edge — `false` means dynamic dispatch or a function pointer static resolution can never prove. A rebuild renumbers nodes and invalidates the sidecar until traces are re-ingested; absence is always stated. |
 | `query` | Cypher-shaped read-only queries (openCypher read subset): `MATCH (f:Function)-[:calls]->(g) WITH g, count(*) AS n WHERE n >= 20 AND NOT EXISTS { (g)-[:calls]->() } RETURN g.name, n ORDER BY n DESC LIMIT 20`. Linear patterns up to 8 segments with var-length paths and grade floors; `WHERE` trees with `=~`, `IN`, `IS NULL`, `n:Label`, `EXISTS {…}`; `WITH`/`UNWIND` stages; `RETURN [DISTINCT]` of expressions — properties, arithmetic, string/list functions, `CASE`, `count/sum/avg/min/max/collect` with implicit grouping; `ORDER BY`/`SKIP`/`LIMIT`; `UNION [ALL]`. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, 100k rows) and refuses by naming the ceiling instead of truncating. Not supported, by name: `OPTIONAL MATCH`, a second `MATCH`, `XOR`, map literals, path/relationship variables. |
 
 **Search**

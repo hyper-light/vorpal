@@ -438,19 +438,13 @@ fn title_of(name: &str) -> String {
     "impact" => "Change impact",
     "dead_code" => "Dead code",
     "node" => "Find node",
-    "callers" => "Callers",
-    "references" => "References",
-    "importers" => "Importers",
-    "implementors" => "Implementors",
-    "type_users" => "Type users",
-    "similar" => "Near-clones",
+    "graph" => "Graph neighbours",
     "reachable" => "Reachability",
     "structural_search" => "Structural search",
     "rule_search" => "Rule search",
     "ast_dump" => "AST dump",
     "fetch_span" => "Fetch source span",
     "data_flow" => "Data flow",
-    "observed" => "Observed calls",
     "query" => "Graph query",
     "snippet" => "Snippet",
     "why" => "Edge evidence",
@@ -653,12 +647,12 @@ mod tests {
   fn decoration() {
     let mut tools = vec![
       json!({"name": "index", "description": "d", "inputSchema": {"type": "object", "properties": {"src": {}}, "required": ["src"]}}),
-      json!({"name": "callers", "description": "d", "inputSchema": {"type": "object", "properties": {"name": {}, "cursor": {}}, "required": ["name"]}}),
+      json!({"name": "graph", "description": "d", "inputSchema": {"type": "object", "properties": {"relation": {}, "name": {}, "cursor": {}}, "required": ["relation", "name"]}}),
     ];
     decorate_tools(&mut tools);
     assert_eq!(tools[0]["annotations"]["readOnlyHint"], false);
     assert_eq!(tools[1]["annotations"]["readOnlyHint"], true);
-    assert_eq!(tools[1]["title"], "Callers");
+    assert_eq!(tools[1]["title"], "Graph neighbours");
     assert!(tools[1]["inputSchema"]["properties"]["format"].is_object());
     assert!(
       tools[0]["inputSchema"]["properties"]

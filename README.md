@@ -127,10 +127,12 @@ it from `.cursor/mcp.json`).
 
 > Use an absolute index path: MCP clients launch the server without a working directory. If
 > `vorpal` is not on the client's `PATH`, use the binary's absolute path as `command`.
+> Claude Code loads each MCP tool's schema in a turn of its own unless
+> `ENABLE_TOOL_SEARCH=false` is set in its environment; see [docs/mcp.md](docs/mcp.md).
 
 Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
-`compare_generations`, `impact`, `dead_code`, `node`, `callers`, `references`, `importers`,
-`implementors`, `type_users`, `similar`, `reachable`, `data_flow`, `observed`, `query`, `structural_search`,
+`compare_generations`, `impact`, `dead_code`, `node`, `graph` (callers, references, importers,
+implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
 `rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. Every tool carries
 annotations and an output schema; tools that return records page with cursors and accept
 `format: "toon" | "lean" | "ids"` for smaller output. `--profile scout|analysis|full` limits
@@ -230,7 +232,7 @@ index):
 
 | Operation | Time |
 |---|---|
-| Graph query (`callers`, `node`, …) | **< 1 ms** |
+| Graph query (`graph`, `node`, …) | **< 1 ms** |
 | Hybrid search (default tier; per-tier table below) | **59 ms** |
 | Server start → answering queries on an existing index | immediate |
 | First search after start (ranking tier warm-up, once) | 3.6 s |
@@ -388,31 +390,37 @@ tool's `structuredContent`, so `format` shapes that too: for the three callers o
 field. Before this was measured (v0.8.0), all three were 1,065 B.
 
 **What that costs end to end.** The same questions put to Claude Code on Opus at its
-default reasoning, once with only vorpal's tools allowed and once with only Grep, Glob,
-and Read. Tokens are everything the model processed, cache reads included; cost is what
-the API billed; one run each, on the server with the `format`-shaped structured results.
+default reasoning (effort unset), once with only Grep, Glob, and Read, once with only
+vorpal's tools as Claude Code ships them (schemas deferred: each distinct tool costs one
+`ToolSearch` turn to load), and once with `ENABLE_TOOL_SEARCH=false` (schemas resident).
+Tokens are everything the model processed, cache reads included; cost is what the API
+billed; one run each.
 
-| Question | Tools | Turns | Tokens | Cost | Wall |
-|---|---|---:|---:|---:|---:|
-| This repo: who calls `tool_result` | vorpal | 3 | 66 K | $0.188 | 7.1 s |
-| | grep + read | 5 | 98 K | $0.210 | 24.0 s |
-| This repo: what `run_install` reaches | vorpal | 5 | 117 K | $0.229 | 15.7 s |
-| | grep + read | 5 | 109 K | $0.253 | 19.1 s |
-| Kernel: who calls `vfs_read` | vorpal | 8 | 161 K | $0.168 | 23.1 s |
-| | grep + read | 6 | 83 K | $0.091 | 15.3 s |
-| Kernel: what `vfs_read` calls | vorpal | 6 | 104 K | $0.141 | 18.9 s |
-| | grep + read | 3 | 60 K | $0.052 | 7.9 s |
+| Question | Tools | Turns | of which `ToolSearch` | Tokens | Cost | Wall |
+|---|---|---:|---:|---:|---:|---:|
+| This repo: who calls `tool_result` | grep + read | 5 | 0 | 98 K | $0.213 | 13.9 s |
+| | vorpal, deferred | 3 | 1 | 67 K | $0.164 | 6.6 s |
+| | vorpal, resident | 3 | 0 | 139 K | $0.175 | 6.3 s |
+| This repo: what `run_install` reaches | grep + read | 4 | 0 | 77 K | $0.212 | 14.2 s |
+| | vorpal, deferred | 4 | 1 | 94 K | $0.207 | 16.9 s |
+| | vorpal, resident | 4 | 0 | 187 K | $0.232 | 15.4 s |
+| Kernel: who calls `vfs_read` | grep + read | 3 | 0 | 62 K | $0.066 | 11.8 s |
+| | vorpal, deferred | 4 | 1 | 79 K | $0.155 | 14.4 s |
+| | vorpal, resident | 5 | 0 | 215 K | $0.203 | 17.5 s |
+| Kernel: what `vfs_read` calls | grep + read | 3 | 0 | 60 K | $0.053 | 8.2 s |
+| | vorpal, deferred | 6 | 2 | 82 K | $0.197 | 20.3 s |
+| | vorpal, resident | 4 | 0 | 171 K | $0.119 | 15.0 s |
 
-Read it plainly. On this repo the graph wins or ties: fewer turns, fewer tokens, and
-less wall on the callers question, a wash on reachability. On the kernel a strong model
-with grep is hard to beat on single-hop questions: it runs one search, reads one
-function, and answers, while with graph tools it spends extra calls confirming an answer
-it already had, and Claude Code loads each deferred tool schema in a turn of its own.
-Both arms were correct in all eight runs, and the graph's callee list named the macros
-`unlikely` and `access_ok` the read glossed. The per-call gap is real and grows with the
-tree; it pays off on questions that span files and hops, which these single-hop
-questions were chosen not to be. The v0.8.0 run of this table, before the structured
-results were shaped, is in `docs/wip/BENCHMARKS.md`.
+Read it plainly. Where the answer spans files, the graph wins: the small-repo callers
+question is 3 turns, 67 K tokens, and 6.6 s against grep's 5, 98 K, and 13.9 s, and
+reachability is a tie. Where reading one function answers the question, a strong model
+with grep is one search and one read, and the graph's extra turn is the schema load
+Claude Code charges for each MCP tool it touches. Making the schemas resident removes
+that turn but puts 44 KB of tool schema into every turn's input, so tokens roughly
+double and cost does not fall; it is documented, not recommended. Every arm answered
+correctly in all sixteen runs. The per-call gap above compounds on questions that span
+files and hops, which these single-hop questions were chosen not to be; earlier runs of
+this table (v0.8.0's 27-tool surface, and Sonnet) are in `docs/wip/BENCHMARKS.md`.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,

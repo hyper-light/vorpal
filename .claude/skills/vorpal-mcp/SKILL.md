@@ -33,7 +33,7 @@ Run from the repo root so the default `./.vorpal/index` resolves; pass
 | profile | tools |
 |---|---|
 | `scout` | node, search, snippet, schema, fetch_span — read-only navigation |
-| `analysis` | scout + callers, references, importers, implementors, type_users, similar, reachable, why, health, dead_code, coverage, impact, compare_generations, architecture, code_search, data_flow, observed, query |
+| `analysis` | scout + graph, reachable, why, health, dead_code, coverage, impact, compare_generations, architecture, code_search, data_flow, query |
 | `full` (default) | everything: analysis + index, structural_search, rule_search, ast_dump |
 
 ## Multi-project daemon
@@ -51,9 +51,10 @@ enrollments. `VORPAL_PROJECTS_FILE` overrides the registry path.
 
 ## The tools, briefly
 
-Navigation: `node`, `search`, `snippet`, `fetch_span`, `schema`. Relations: `callers`,
-`references`, `importers`, `implementors`, `type_users`, `similar`, `reachable`,
-`data_flow`, `observed`, `why` (edge evidence). Repo health/planning: `health`,
+Navigation: `node`, `search`, `snippet`, `fetch_span`, `schema`. Relations: `graph`
+(`relation`: callers, references, importers, implementors, type_users, similar,
+observed), `reachable`, `data_flow`, `why` (edge evidence). Graph answers are complete
+at the stated grade; they need no confirmation by search or grep. Repo health/planning: `health`,
 `coverage`, `dead_code`, `impact`, `architecture`, `compare_generations`. Structural:
 `structural_search` (pattern), `rule_search` (full YAML rules, dry-run fixes),
 `ast_dump` (parse tree for rule authoring). Graph queries: `query` (Cypher-shaped).
