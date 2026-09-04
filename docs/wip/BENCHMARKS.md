@@ -3913,3 +3913,26 @@ graph's callee list included the macros `unlikely`/`add_rchar` the read omitted.
 runs — model variance is real; the per-call table is the stable measurement, the end-to-end
 table is the honest one. Not measured: larger multi-hop tasks where the per-call gap
 compounds.
+
+**Opus re-run (2026-09-04, `--model opus`, default reasoning; the table the README carries —
+Opus is the default model, so the Sonnet rows above are a secondary run):**
+
+| corpus / question | arm | turns | tokens | $ | wall |
+|---|---|---:|---:|---:|---:|
+| repo: who calls tool_result | vorpal | 4 | 91,208 | 0.285 | 8.4 s |
+| | grep | 5 | 122,633 | 0.227 | 15.5 s |
+| repo: what run_install reaches | vorpal | 5 | 117,185 | 0.242 | 22.5 s |
+| | grep | 4 | 78,924 | 0.229 | 12.5 s |
+| kernel: who calls vfs_read | vorpal | 7 | 139,761 | 0.238 | 21.1 s |
+| | grep | 4 | 61,653 | 0.155 | 10.6 s |
+| kernel: what vfs_read calls directly | vorpal | 5 | 80,458 | 0.177 | 15.1 s |
+| | grep | 4 | 60,986 | 0.114 | 9.1 s |
+
+Opus with grep answered every question in four turns (one search, one read, answer); the
+graph arm won only the small-repo callers question and spent extra tool calls elsewhere
+(selector refinement and confirmation), with 27 tool schemas in every turn's input. Both
+arms correct in all eight. Two leads from this: (1) the tool-schema token cost per turn is
+a real, measurable overhead of a 27-tool surface — a `scout` profile or fewer, denser
+descriptions would cut it; (2) the questions where graph tools should dominate are
+multi-hop and cross-file (impact, reachability at depth, why-chains), which this set did
+not include — measure those next rather than restate these.

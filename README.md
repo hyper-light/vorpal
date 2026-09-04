@@ -381,28 +381,30 @@ and macros the model must sift, where the graph returns the six call edges it ca
 and says the rest are masked. The first call in a fresh daemon pays a cold open (126 ms
 on this repo, 58 ms on the kernel).
 
-**What that costs end to end.** The same questions put to Claude Code (Sonnet), once
-with only vorpal's tools allowed and once with only Grep, Glob, and Read. Tokens are
-everything the model processed, cache reads included; cost is what the API billed.
+**What that costs end to end.** The same questions put to Claude Code on Opus at its
+default reasoning, once with only vorpal's tools allowed and once with only Grep, Glob,
+and Read. Tokens are everything the model processed, cache reads included; cost is what
+the API billed; one run each.
 
 | Question | Tools | Turns | Tokens | Cost | Wall |
 |---|---|---:|---:|---:|---:|
-| This repo: who calls `tool_result` | vorpal | 3 | 84 K | $0.134 | 10.0 s |
-| | grep + read | 8 | 270 K | $0.131 | 15.8 s |
-| This repo: what `run_install` reaches | vorpal | 7 | 216 K | $0.136 | 26.9 s |
-| | grep + read | 4 | 143 K | $0.102 | 14.6 s |
-| Kernel: who calls `vfs_read` | vorpal | 3 | 72 K | $0.072 | 7.7 s |
-| | grep + read | 4 | 90 K | $0.076 | 10.3 s |
-| Kernel: what `vfs_read` calls | vorpal | 6 | 156 K | $0.083 | 10.6 s |
-| | grep + read | 4 | 118 K | $0.056 | 7.0 s |
+| This repo: who calls `tool_result` | vorpal | 4 | 91 K | $0.285 | 8.4 s |
+| | grep + read | 5 | 123 K | $0.227 | 15.5 s |
+| This repo: what `run_install` reaches | vorpal | 5 | 117 K | $0.242 | 22.5 s |
+| | grep + read | 4 | 79 K | $0.229 | 12.5 s |
+| Kernel: who calls `vfs_read` | vorpal | 7 | 140 K | $0.238 | 21.1 s |
+| | grep + read | 4 | 62 K | $0.155 | 10.6 s |
+| Kernel: what `vfs_read` calls | vorpal | 5 | 80 K | $0.177 | 15.1 s |
+| | grep + read | 4 | 61 K | $0.114 | 9.1 s |
 
-Read it plainly: the graph wins when the answer is spread across files (callers,
-reachability), by fewer turns and a third of the tokens on the small repo; grep wins
-when reading one function body answers the question (direct callees), because that is
-one read. Dollar cost barely moves on questions this small since most tokens are cache
-reads. The per-call gap above compounds as the questions get harder and the tree gets
-larger; both answers were correct in every run (the graph's callee list also named the
-macros `unlikely` and `add_rchar`, which the read missed).
+Read it plainly: on questions this targeted, a strong model with grep is hard to beat.
+It ran one search, read one function, and answered, in four turns every time. The graph
+won only the small-repo callers question, on turns, tokens, and wall; on the other three
+it spent extra calls confirming what one read would have shown, and its 27 tool schemas
+ride along in every turn's input. Both arms were correct in all eight runs, and the
+graph's callee list included the macros `unlikely` and `access_ok` the read glossed. The
+per-call gap above is real and grows with the tree; it pays off on questions that span
+files and hops, which these single-hop questions were chosen not to be.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,
