@@ -380,7 +380,7 @@ pub fn decorate_tools(tools: &mut [Value]) {
           json!({
             "type": "string",
             "enum": ["toon", "lean", "ids"],
-            "description": "Text rendering of the records page: lean = minimal columns (cheapest structured form), toon = lossless tab-grid grouped by directory, ids = durable handles only"
+            "description": "Rendering of the records page, text AND structuredContent: lean = identity and ranking columns only (cheapest), toon = lossless tab-grid grouped by directory, ids = durable handles only"
           })
         });
       }
@@ -407,7 +407,8 @@ fn output_schema(record_bearing: bool) -> Value {
   if record_bearing {
     let extra = json!({
       "outcome": {"type": "string", "description": "Selector outcome: found, no-match, ambiguous, …"},
-      "records": {"type": "array", "items": {"type": "object"}, "description": "One page of typed records in deterministic order"},
+      "base": {"type": "string", "description": "Absolute directory prefix every record's `path` is relative to; absent when paths share none"},
+      "records": {"type": "array", "items": {"type": "object"}, "description": "One page of typed records in deterministic order; `format` shapes these too: lean drops signature/span/external_id, ids keeps id/external_id only"},
       "total": {"type": "integer", "minimum": 0},
       "truncated": {"type": "boolean"},
       "nextCursor": {"type": "string", "description": "Pass as `cursor` to fetch the next page; absent on the last page"}

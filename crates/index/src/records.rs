@@ -1610,6 +1610,46 @@ pub fn lean_from_values(rows: &[serde_json::Value]) -> String {
   out
 }
 
+/// Shape the STRUCTURED half of a paged result the way the text renderers shape the text.
+/// Clients such as Claude Code hand the model `structuredContent` when a tool returns
+/// it, so a `format` that only reshaped the text never reached the model (measured
+/// 2026-09-04: three kernel callers = 1,065 bytes of JSON carrying signatures, spans,
+/// eids, and an absolute path per row). Rules, every format: the page's common absolute
+/// directory prefix moves to one `base` field and `path` becomes relative to it
+/// (lossless, one prefix instead of N). `lean` additionally drops the fat columns the
+/// lean text omits (`signature`, `span`, `external_id`); `ids` keeps only `id` and
+/// `external_id`; the default and `toon` keep every column.
+pub fn shape_structured(data: &mut serde_json::Value, format: Option<&str>) {
+  let Some(rows) = data.get_mut("records").and_then(serde_json::Value::as_array_mut) else {
+    return;
+  };
+  let base = common_abs_root(rows);
+  for row in rows.iter_mut() {
+    let Some(map) = row.as_object_mut() else { continue };
+    if let Some(base) = &base
+      && let Some(rel) = map
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|p| p.strip_prefix(base.as_str()))
+        .map(str::to_string)
+    {
+      map.insert("path".to_string(), serde_json::Value::String(rel));
+    }
+    match format {
+      Some("lean") => {
+        for fat in ["signature", "span", "external_id"] {
+          map.remove(fat);
+        }
+      }
+      Some("ids") => map.retain(|key, _| key == "id" || key == "external_id"),
+      _ => {}
+    }
+  }
+  if let Some(base) = base {
+    data["base"] = serde_json::Value::String(base);
+  }
+}
+
 /// The bare-identity rendering: one durable id per line (`eid:<hex>`, falling back to the
 /// dense id) — for piping into further queries.
 pub fn ids_from_values(rows: &[serde_json::Value]) -> String {
@@ -2266,6 +2306,33 @@ mod paging_tests {
     // Relative paths (tests, non-canonical callers): no root line, cells untouched.
     let rel = vec![serde_json::json!({"name": "n", "path": "src/x.rs"})];
     assert!(!lean_from_values(&rel).contains("root:"));
+  }
+
+  #[test]
+  fn shape_structured_factors_base_and_slims_by_format() {
+    let make = || serde_json::json!({"outcome": "hits", "records": [
+      {"name": "a", "kind": "Function", "path": "/repo/src/fs/x.c", "signature": "int a(void)", "span": [1, 2], "external_id": "eid:ff", "id": 1, "grade": "exact"},
+      {"name": "b", "kind": "Function", "path": "/repo/src/mm/y.c", "signature": "int b(void)", "span": [3, 4], "external_id": "eid:aa", "id": 2, "grade": "exact"}
+    ], "total": 2, "truncated": false});
+    let mut full = make();
+    shape_structured(&mut full, None);
+    assert_eq!(full["base"], "/repo/src/");
+    assert_eq!(full["records"][0]["path"], "fs/x.c");
+    assert_eq!(full["records"][0]["signature"], "int a(void)", "default keeps every column");
+    let mut lean = make();
+    shape_structured(&mut lean, Some("lean"));
+    let row = &lean["records"][1];
+    assert_eq!(row["path"], "mm/y.c");
+    assert!(row.get("signature").is_none() && row.get("span").is_none() && row.get("external_id").is_none());
+    assert_eq!(row["grade"], "exact", "lean keeps the ranking columns");
+    let mut ids = make();
+    shape_structured(&mut ids, Some("ids"));
+    assert_eq!(ids["records"][0], serde_json::json!({"id": 1, "external_id": "eid:ff"}));
+    // Relative or mixed paths: no base, paths untouched.
+    let mut rel = serde_json::json!({"records": [{"name": "n", "path": "src/x.rs"}]});
+    shape_structured(&mut rel, Some("lean"));
+    assert!(rel.get("base").is_none());
+    assert_eq!(rel["records"][0]["path"], "src/x.rs");
   }
 
   #[test]
