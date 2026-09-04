@@ -126,9 +126,13 @@ both a text rendering in `content` and `structuredContent`:
 - Record-bearing tools (everything that lists results) page deterministically:
   `outcome`, `records`, `total`, `truncated`, and `nextCursor` when more remain. Pass
   `cursor` (opaque, from a previous `nextCursor`) and `limit` (default 100, max 1000) as
-  arguments. These tools also accept `format: "lean" | "toon" | "ids"` to shrink the text
-  rendering: `lean` is minimal columns, `toon` a lossless tab grid grouped by directory,
-  `ids` durable handles only.
+  arguments. Every page carries `base`, the absolute directory prefix its records share,
+  and each record's `path` is relative to it (one prefix instead of one per row).
+- `format: "lean" | "toon" | "ids"` shapes both the text and `structuredContent`,
+  because clients such as Claude Code hand the model the structured half. `lean` keeps
+  identity and ranking columns (`name`, `kind`, `path`, `id`, `grade`, …) and drops
+  `signature`, `span`, and `external_id`; `ids` keeps `id` and `external_id` only;
+  `toon` is a lossless tab grid grouped by directory with every column intact.
 
 ## Tool profiles (least privilege)
 

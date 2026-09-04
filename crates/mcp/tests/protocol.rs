@@ -612,6 +612,33 @@ fn typed_records_and_cursor_pagination() {
   assert_eq!(record["name"], "target");
   assert_eq!(record["kind"], "Function");
   assert!(record["path"].as_str().unwrap().ends_with("b.rs"));
+  // Paths are relative to one `base` (the page's common absolute prefix); the default
+  // keeps every column.
+  assert!(data["base"].as_str().is_some_and(|b| b.starts_with('/') && b.ends_with('/')));
+  assert!(!record["path"].as_str().unwrap().starts_with('/'));
+  assert!(record["signature"].is_string() && record["external_id"].is_string());
+
+  // `format` shapes structuredContent, not just the text — the client may feed the
+  // model the structured half.
+  let response = request(
+    &mut server,
+    20,
+    "tools/call",
+    json!({"name": "node", "arguments": {"name": "target", "format": "lean"}}),
+  );
+  let lean = &response["result"]["structuredContent"]["records"][0];
+  assert_eq!(lean["name"], "target");
+  assert_eq!(lean["kind"], "Function");
+  assert!(lean.get("signature").is_none() && lean.get("span").is_none() && lean.get("external_id").is_none());
+  let response = request(
+    &mut server,
+    21,
+    "tools/call",
+    json!({"name": "node", "arguments": {"name": "target", "format": "ids"}}),
+  );
+  let ids = &response["result"]["structuredContent"]["records"][0];
+  assert!(ids["id"].is_u64() && ids["external_id"].is_string());
+  assert_eq!(ids.as_object().unwrap().len(), 2);
   assert!(record["id"].as_u64().is_some());
   assert!(
     record["external_id"].as_str().unwrap().starts_with("eid:"),

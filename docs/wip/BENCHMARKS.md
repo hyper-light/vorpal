@@ -3936,3 +3936,37 @@ a real, measurable overhead of a 27-tool surface — a `scout` profile or fewer,
 descriptions would cut it; (2) the questions where graph tools should dominate are
 multi-hop and cross-file (impact, reachability at depth, why-chains), which this set did
 not include — measure those next rather than restate these.
+
+## `format` shapes structuredContent; Opus re-run on the fixed server (2026-09-04)
+
+Trace of the v0.8.0 Opus run for "who calls vfs_read" (`--output-format stream-json`):
+Opus requested `format: lean` on every call and never saw it — Claude Code hands the model
+`structuredContent`, and `format` reshaped only the `content` text. Three of seven turns
+were Claude Code's ToolSearch loading deferred tool schemas; two were confirmation calls
+(`references`, `code_search`) after `callers` had already answered.
+
+Fix (`shape_structured` in crates/index/src/records.rs, applied in `tool_result`): every
+page factors its common absolute directory into one `base` field with relative `path`s
+(lossless); `lean` drops `signature`/`span`/`external_id` from the structured records as
+the lean text does; `ids` keeps `id`/`external_id` only. Kernel callers `vfs_read`, three
+records, structuredContent bytes: v0.8.0 1,065 for every format; fixed 1,005 default /
+523 lean / 355 ids.
+
+End to end on the fixed server (`claude -p --model opus`, same harness as above, one run each):
+
+| corpus / question | arm | turns | tokens | $ | wall |
+|---|---|---:|---:|---:|---:|
+| repo: who calls tool_result | vorpal | 3 | 65,971 | 0.188 | 7.1 s |
+| | grep | 5 | 97,797 | 0.210 | 24.0 s |
+| repo: what run_install reaches | vorpal | 5 | 117,034 | 0.229 | 15.7 s |
+| | grep | 5 | 109,208 | 0.253 | 19.1 s |
+| kernel: who calls vfs_read | vorpal | 8 | 161,393 | 0.168 | 23.1 s |
+| | grep | 6 | 82,586 | 0.091 | 15.3 s |
+| kernel: what vfs_read calls directly | vorpal | 6 | 103,586 | 0.141 | 18.9 s |
+| | grep | 3 | 60,194 | 0.052 | 7.9 s |
+
+Versus v0.8.0: repo callers 91K → 66K tokens and 4 → 3 turns; the kernel questions are
+dominated by the model's confirmation calls and deferred-tool loads, not payload size, and
+stay grep's. Single runs; both arms correct in all eight. Standing leads: fewer, denser
+tools for the deferred-schema turns; multi-hop tasks (impact, why-chains, depth-3
+reachability) as the set where the graph should dominate — unmeasured.

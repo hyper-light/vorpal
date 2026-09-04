@@ -1240,6 +1240,10 @@ impl Server {
           (Some("ids"), Some(rows)) => vorpal_index::records::ids_from_values(rows),
           _ => text,
         };
+        // The structured half follows the same format: `base` + relative paths on every
+        // page, fat columns dropped under `lean`, identity only under `ids` — because the
+        // client may feed the model structuredContent rather than the text.
+        vorpal_index::records::shape_structured(&mut data, args.get("format").and_then(Value::as_str));
         // Typed tools return their records/pagination here; text-only tools return `{}`.
         // Generation identity rides every success either way.
         data["generation"] = self.generation_id();

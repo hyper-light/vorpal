@@ -381,30 +381,38 @@ and macros the model must sift, where the graph returns the six call edges it ca
 and says the rest are masked. The first call in a fresh daemon pays a cold open (126 ms
 on this repo, 58 ms on the kernel).
 
+What the model is handed matters as much as the latency. Claude Code feeds the model a
+tool's `structuredContent`, so `format` shapes that too: for the three callers of
+`vfs_read`, the structured result is 1,005 B by default, 523 B with `format: lean`, and
+355 B with `format: ids`, every page factoring its common directory into one `base`
+field. Before this was measured (v0.8.0), all three were 1,065 B.
+
 **What that costs end to end.** The same questions put to Claude Code on Opus at its
 default reasoning, once with only vorpal's tools allowed and once with only Grep, Glob,
 and Read. Tokens are everything the model processed, cache reads included; cost is what
-the API billed; one run each.
+the API billed; one run each, on the server with the `format`-shaped structured results.
 
 | Question | Tools | Turns | Tokens | Cost | Wall |
 |---|---|---:|---:|---:|---:|
-| This repo: who calls `tool_result` | vorpal | 4 | 91 K | $0.285 | 8.4 s |
-| | grep + read | 5 | 123 K | $0.227 | 15.5 s |
-| This repo: what `run_install` reaches | vorpal | 5 | 117 K | $0.242 | 22.5 s |
-| | grep + read | 4 | 79 K | $0.229 | 12.5 s |
-| Kernel: who calls `vfs_read` | vorpal | 7 | 140 K | $0.238 | 21.1 s |
-| | grep + read | 4 | 62 K | $0.155 | 10.6 s |
-| Kernel: what `vfs_read` calls | vorpal | 5 | 80 K | $0.177 | 15.1 s |
-| | grep + read | 4 | 61 K | $0.114 | 9.1 s |
+| This repo: who calls `tool_result` | vorpal | 3 | 66 K | $0.188 | 7.1 s |
+| | grep + read | 5 | 98 K | $0.210 | 24.0 s |
+| This repo: what `run_install` reaches | vorpal | 5 | 117 K | $0.229 | 15.7 s |
+| | grep + read | 5 | 109 K | $0.253 | 19.1 s |
+| Kernel: who calls `vfs_read` | vorpal | 8 | 161 K | $0.168 | 23.1 s |
+| | grep + read | 6 | 83 K | $0.091 | 15.3 s |
+| Kernel: what `vfs_read` calls | vorpal | 6 | 104 K | $0.141 | 18.9 s |
+| | grep + read | 3 | 60 K | $0.052 | 7.9 s |
 
-Read it plainly: on questions this targeted, a strong model with grep is hard to beat.
-It ran one search, read one function, and answered, in four turns every time. The graph
-won only the small-repo callers question, on turns, tokens, and wall; on the other three
-it spent extra calls confirming what one read would have shown, and its 27 tool schemas
-ride along in every turn's input. Both arms were correct in all eight runs, and the
-graph's callee list included the macros `unlikely` and `access_ok` the read glossed. The
-per-call gap above is real and grows with the tree; it pays off on questions that span
-files and hops, which these single-hop questions were chosen not to be.
+Read it plainly. On this repo the graph wins or ties: fewer turns, fewer tokens, and
+less wall on the callers question, a wash on reachability. On the kernel a strong model
+with grep is hard to beat on single-hop questions: it runs one search, reads one
+function, and answers, while with graph tools it spends extra calls confirming an answer
+it already had, and Claude Code loads each deferred tool schema in a turn of its own.
+Both arms were correct in all eight runs, and the graph's callee list named the macros
+`unlikely` and `access_ok` the read glossed. The per-call gap is real and grows with the
+tree; it pays off on questions that span files and hops, which these single-hop
+questions were chosen not to be. The v0.8.0 run of this table, before the structured
+results were shaped, is in `docs/wip/BENCHMARKS.md`.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,
