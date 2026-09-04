@@ -66,7 +66,11 @@ fn initialize_handshake_and_tool_listing() {
     "initialize",
     json!({"protocolVersion": "9999-01-01"}),
   );
-  assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+  assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
+  assert_eq!(response["result"]["serverInfo"]["title"], "vorpal");
+  assert!(response["result"]["instructions"].as_str().is_some_and(|t| !t.is_empty()));
+  // Legacy results carry no modern envelope fields.
+  assert!(response["result"].get("resultType").is_none());
 
   // notifications get no response.
   assert!(
@@ -117,7 +121,111 @@ fn initialize_handshake_and_tool_listing() {
   for tool in tools {
     assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
     assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
+    assert!(tool["title"].as_str().is_some_and(|t| !t.is_empty()), "{}", tool["name"]);
+    let read_only = tool["annotations"]["readOnlyHint"].as_bool().expect("readOnlyHint");
+    assert_eq!(read_only, tool["name"] != "index", "{}", tool["name"]);
+    assert_eq!(tool["annotations"]["openWorldHint"], false);
+    assert_eq!(tool["outputSchema"]["type"], "object", "{}", tool["name"]);
+    // Every record-bearing tool declares the `format` switch it honours.
+    if tool["inputSchema"]["properties"].get("cursor").is_some() {
+      assert!(
+        tool["inputSchema"]["properties"]["format"].is_object(),
+        "{} pages records but does not declare format",
+        tool["name"]
+      );
+      assert!(tool["outputSchema"]["properties"]["records"].is_object());
+    }
   }
+}
+
+/// `params._meta` every 2026-07-28 request carries.
+fn modern_meta() -> Value {
+  json!({
+    "io.modelcontextprotocol/protocolVersion": vorpal_mcp::protocol::MODERN_VERSION,
+    "io.modelcontextprotocol/clientCapabilities": {},
+    "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "0"}
+  })
+}
+
+#[test]
+fn modern_era_is_served_statelessly() {
+  let (src, idx) = temp_tree("modern");
+  let mut server = Server::new(idx);
+
+  // No handshake: discover first (or not at all), every request self-describing.
+  let response = request(&mut server, 1, "server/discover", json!({"_meta": modern_meta()}));
+  let result = &response["result"];
+  assert_eq!(result["resultType"], "complete");
+  assert_eq!(result["supportedVersions"], json!([vorpal_mcp::protocol::MODERN_VERSION]));
+  assert!(result["capabilities"]["tools"].is_object());
+  assert_eq!(result["cacheScope"], "public");
+  assert!(result["ttlMs"].as_u64().is_some());
+  assert_eq!(result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "vorpal-mcp");
+  assert!(result["instructions"].as_str().is_some());
+
+  let response = request(&mut server, 2, "tools/list", json!({"_meta": modern_meta()}));
+  assert_eq!(response["result"]["resultType"], "complete");
+  assert!(response["result"]["ttlMs"].as_u64().is_some());
+  assert_eq!(response["result"]["cacheScope"], "public");
+  assert_eq!(response["result"]["tools"][0]["name"], "index");
+
+  let response = request(
+    &mut server,
+    3,
+    "tools/call",
+    json!({"name": "index", "arguments": {"src": src.to_str().unwrap()}, "_meta": modern_meta()}),
+  );
+  assert_eq!(response["result"]["resultType"], "complete");
+  assert_eq!(response["result"]["isError"], false);
+  assert_eq!(response["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["title"], "vorpal");
+  let response = request(
+    &mut server,
+    4,
+    "tools/call",
+    json!({"name": "callers", "arguments": {"name": "target"}, "_meta": modern_meta()}),
+  );
+  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("caller"));
+
+  // Removed methods are unknown under the modern era.
+  let response = request(&mut server, 5, "ping", json!({"_meta": modern_meta()}));
+  assert_eq!(response["error"]["code"], -32601);
+  let response = request(&mut server, 6, "initialize", json!({"_meta": modern_meta()}));
+  assert_eq!(response["error"]["code"], -32601);
+
+  // Version mismatch names what we speak; missing capabilities is malformed.
+  let mut wrong = modern_meta();
+  wrong["io.modelcontextprotocol/protocolVersion"] = json!("2025-11-25");
+  let response = request(&mut server, 7, "tools/list", json!({"_meta": wrong}));
+  assert_eq!(response["error"]["code"], -32022);
+  assert_eq!(
+    response["error"]["data"]["supported"],
+    json!([vorpal_mcp::protocol::MODERN_VERSION])
+  );
+  assert_eq!(response["error"]["data"]["requested"], "2025-11-25");
+  let response = request(
+    &mut server,
+    8,
+    "tools/list",
+    json!({"_meta": {"io.modelcontextprotocol/protocolVersion": vorpal_mcp::protocol::MODERN_VERSION}}),
+  );
+  assert_eq!(response["error"]["code"], -32602);
+  // A bare discover (no _meta) is malformed too — the probe must carry the fields.
+  let response = request(&mut server, 9, "server/discover", Value::Null);
+  assert_eq!(response["error"]["code"], -32602);
+
+  // Both eras on one process, interleaved: the legacy client still works.
+  let response = request(
+    &mut server,
+    10,
+    "initialize",
+    json!({"protocolVersion": "2025-11-25", "capabilities": {}}),
+  );
+  assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
+  let (text, is_err) = call_tool(&mut server, 11, "callers", json!({"name": "target"}));
+  assert!(!is_err);
+  assert!(text.contains("caller"));
+
+  let _ = fs::remove_dir_all(src.parent().unwrap());
 }
 
 #[test]
@@ -139,8 +247,8 @@ fn profiles_gate_both_the_listing_and_the_calls() {
     .collect();
   assert_eq!(names, ["schema", "node", "fetch_span", "snippet", "search"]);
 
-  // Advertised tools answer; unlisted tools refuse with the stable code — the listing and
-  // the gate can never drift apart.
+  // Advertised tools answer; unlisted tools are unknown to this daemon — a protocol error,
+  // exactly as for a name that exists nowhere — so the listing and the gate never drift.
   let (_, is_err) = call_tool(&mut scout, 3, "node", json!({"name": "target"}));
   assert!(!is_err);
   let response = request(
@@ -149,8 +257,8 @@ fn profiles_gate_both_the_listing_and_the_calls() {
     "tools/call",
     json!({"name": "index", "arguments": {"src": src.to_str().unwrap()}}),
   );
-  assert_eq!(response["result"]["isError"], true);
-  assert_eq!(response["result"]["structuredContent"]["code"], "bad-argument");
+  assert_eq!(response["error"]["code"], -32602);
+  assert!(response["error"]["message"].as_str().unwrap().contains("Unknown tool: index"));
 }
 
 #[test]
@@ -613,10 +721,31 @@ fn protocol_and_tool_errors_are_explicit() {
   assert_eq!(response["error"]["code"], -32700);
   assert!(response["id"].is_null());
 
-  // Unknown tool → in-band tool error, not a protocol error.
-  let (text, is_err) = call_tool(&mut server, 2, "explode", json!({}));
-  assert!(is_err);
-  assert!(text.contains("unknown tool"), "{text}");
+  // Unknown tool → protocol error (-32602), the tools page's rule; execution failures
+  // below stay in-band.
+  let response = request(&mut server, 2, "tools/call", json!({"name": "explode", "arguments": {}}));
+  assert_eq!(response["error"]["code"], -32602);
+  assert!(response["error"]["message"].as_str().unwrap().contains("Unknown tool: explode"));
+  let response = request(&mut server, 21, "tools/call", json!({"arguments": {}}));
+  assert_eq!(response["error"]["code"], -32602);
+  let response = request(&mut server, 22, "tools/call", json!({"name": "callers", "arguments": 5}));
+  assert_eq!(response["error"]["code"], -32602);
+
+  // Framing: batches and null ids are invalid requests; unknown notifications are silent.
+  let response: Value = serde_json::from_str(&server.handle_line("[]").unwrap()).unwrap();
+  assert_eq!(response["error"]["code"], -32600);
+  let response: Value = serde_json::from_str(
+    &server
+      .handle_line(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#)
+      .unwrap(),
+  )
+  .unwrap();
+  assert_eq!(response["error"]["code"], -32600);
+  assert!(server
+    .handle_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"test"}}"#)
+    .is_none());
+  let response = request(&mut server, 23, "tools/list", json!({"cursor": "o:5"}));
+  assert_eq!(response["error"]["code"], -32602);
 
   // Query before any index exists → helpful in-band error.
   let (text, is_err) = call_tool(&mut server, 3, "callers", json!({"name": "x"}));

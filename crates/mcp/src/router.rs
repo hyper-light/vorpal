@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::registry::Projects;
-use crate::server::{Server, error_response, initialize, tools_list};
 use crate::Profile;
+use crate::protocol::{Handler, RpcError, decorate_tools};
+use crate::registry::Projects;
+use crate::server::{Server, tool_declarations};
 
 pub struct MultiServer {
   servers: BTreeMap<String, Server>,
@@ -61,65 +62,54 @@ impl MultiServer {
   }
 
   pub fn handle_line(&mut self, line: &str) -> Option<String> {
-    let msg: Value = match serde_json::from_str(line) {
-      Ok(v) => v,
-      Err(_) => return Some(error_response(Value::Null, -32700, "parse error")),
-    };
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = msg.get("params").cloned().unwrap_or(Value::Null);
-    let id = msg.get("id").cloned()?;
-
-    let result = match method {
-      "initialize" => initialize(&params),
-      "ping" => json!({}),
-      "tools/list" => self.tools_list_multi(),
-      "tools/call" => self.tools_call_multi(&params),
-      _ => return Some(error_response(id, -32601, "method not found")),
-    };
-    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+    crate::protocol::handle_line(self, line)
   }
 
   /// The single-project tool list, with a `project` selector injected into every tool's
   /// schema, plus the registry-listing tool.
-  fn tools_list_multi(&self) -> Value {
-    let mut listing = tools_list(self.profile);
+  fn tools_list_multi(&self) -> Vec<Value> {
+    let mut tools = tool_declarations(self.profile);
     let names: Vec<&str> = self.projects.keys().map(String::as_str).collect();
-    if let Some(tools) = listing.get_mut("tools").and_then(Value::as_array_mut) {
-      for tool in tools.iter_mut() {
-        if let Some(props) = tool
-          .pointer_mut("/inputSchema/properties")
-          .and_then(Value::as_object_mut)
-        {
-          props.insert(
-            "project".to_string(),
-            json!({
-              "type": "string",
-              "description": format!(
-                "Enrolled project to serve this call from (default: the sole enrolled \
-                 project). Enrolled: {}.",
-                names.join(", ")
-              ),
-            }),
-          );
-        }
+    for tool in tools.iter_mut() {
+      if let Some(props) = tool
+        .pointer_mut("/inputSchema/properties")
+        .and_then(Value::as_object_mut)
+      {
+        props.insert(
+          "project".to_string(),
+          json!({
+            "type": "string",
+            "description": format!(
+              "Enrolled project to serve this call from (default: the sole enrolled \
+               project). Enrolled: {}.",
+              names.join(", ")
+            ),
+          }),
+        );
       }
-      tools.push(json!({
-        "name": "list_projects",
-        "description": "The projects this daemon is enrolled to serve: name, source root, \
-          index root, and whether an index exists yet. Enrollment itself is human-only — it \
-          happens via the `vorpal mcp allow` CLI a person types, never through this surface, \
-          because a confirmation delivered through MCP would be answered by the same agent \
-          that may have been influenced.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []}
-      }));
     }
-    listing
+    let mut extra = vec![json!({
+      "name": "list_projects",
+      "description": "The projects this daemon is enrolled to serve: name, source root, \
+        index root, and whether an index exists yet. Enrollment itself is human-only — it \
+        happens via the `vorpal mcp allow` CLI a person types, never through this surface, \
+        because a confirmation delivered through MCP would be answered by the same agent \
+        that may have been influenced.",
+      "inputSchema": {"type": "object", "properties": {}, "required": []}
+    })];
+    decorate_tools(&mut extra);
+    tools.extend(extra);
+    tools
   }
 
-  fn tools_call_multi(&mut self, params: &Value) -> Value {
-    let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
+  fn tools_call_multi(&mut self, tool: &str, params: &Value) -> Result<Value, RpcError> {
     if tool == "list_projects" {
-      return self.list_projects_result();
+      return Ok(self.list_projects_result());
+    }
+    // Unknown names are protocol errors (the tools page's split); the profile is the
+    // same for every enrolled project, so any server's answer is the daemon's answer.
+    if !self.servers.values().next().is_some_and(|s| s.serves(tool)) {
+      return Err(RpcError::invalid_params(format!("Unknown tool: {tool}")));
     }
     // Route by the `project` argument (removed before delegation — per-project servers know
     // nothing of routing), defaulting to the sole enrolled project.
@@ -133,27 +123,30 @@ impl MultiServer {
       Some(name) => name,
       None if self.servers.len() == 1 => match self.servers.keys().next() {
         Some(sole) => sole.clone(),
-        None => return tool_error("no projects are enrolled"),
+        None => return Ok(tool_error("no projects are enrolled")),
       },
       None => {
-        return tool_error(&format!(
+        return Ok(tool_error(&format!(
           "this daemon serves {} projects — pass \"project\" (one of: {})",
           self.servers.len(),
           self.projects.keys().cloned().collect::<Vec<_>>().join(", ")
-        ));
+        )));
       }
     };
     let Some(entry) = self.projects.get(&name) else {
-      return tool_error(&format!(
+      return Ok(tool_error(&format!(
         "no enrolled project named '{name}' (enrolled: {}) — enrollment is human-only, via \
          `vorpal mcp allow <path>` typed on the CLI",
         self.projects.keys().cloned().collect::<Vec<_>>().join(", ")
-      ));
+      )));
     };
     // The index tool serves ONLY the enrolled root: an explicit src is honored only when it
     // is exactly that root; anything else is the un-enrolled-source refusal.
     if tool == "index" {
-      if let Some(args) = params.pointer_mut("/arguments").and_then(Value::as_object_mut) {
+      if let Some(args) = params
+        .pointer_mut("/arguments")
+        .and_then(Value::as_object_mut)
+      {
         match args.get("src").and_then(Value::as_str) {
           None => {
             args.insert("src".into(), json!(entry.src.to_string_lossy()));
@@ -164,19 +157,19 @@ impl MultiServer {
               .map(|p| p == entry.src)
               .unwrap_or(false);
             if !matches {
-              return tool_error(&format!(
+              return Ok(tool_error(&format!(
                 "'{explicit}' is not the enrolled source of project '{name}' — this surface \
                  cannot index un-enrolled roots; a person can enroll it with `vorpal mcp \
                  allow {explicit}`"
-              ));
+              )));
             }
           }
         }
       }
     }
     match self.servers.get_mut(&name) {
-      Some(server) => server.tools_call(&params),
-      None => tool_error(&format!("project '{name}' has no server state")),
+      Some(server) => Ok(server.tool_result(tool, &params)),
+      None => Ok(tool_error(&format!("project '{name}' has no server state"))),
     }
   }
 
@@ -208,6 +201,24 @@ impl MultiServer {
       "structuredContent": {"records": records},
       "isError": false,
     })
+  }
+}
+
+impl Handler for MultiServer {
+  fn tools(&self) -> Vec<Value> {
+    self.tools_list_multi()
+  }
+
+  fn call_tool(&mut self, name: &str, params: &Value) -> Result<Value, RpcError> {
+    self.tools_call_multi(name, params)
+  }
+
+  fn instructions(&self) -> Option<String> {
+    Some(format!(
+      "{} This daemon serves several enrolled projects: pass `project` on every call (see \
+       `list_projects`).",
+      crate::server::INSTRUCTIONS
+    ))
   }
 }
 

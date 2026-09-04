@@ -36,9 +36,27 @@ fn binary_serves_mcp_over_stdio() {
     serde_json::from_str::<Value>(&line).expect("response line is JSON")
   };
 
-  send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-              "params": {"protocolVersion": "2024-11-05", "capabilities": {}}}));
+  // A 2026-07-28 client: probe with server/discover, then self-describing requests.
+  let meta = json!({
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {}
+  });
+  send(
+    json!({"jsonrpc": "2.0", "id": 100, "method": "server/discover", "params": {"_meta": meta}}),
+  );
   let response = recv();
+  assert_eq!(response["result"]["resultType"], "complete");
+  assert_eq!(response["result"]["supportedVersions"][0], "2026-07-28");
+  send(json!({"jsonrpc": "2.0", "id": 101, "method": "tools/list", "params": {"_meta": meta}}));
+  let response = recv();
+  assert!(response["result"]["ttlMs"].as_u64().is_some());
+
+  // A 2025-11-25 client (Claude Code 2.1.260's handshake, captured 2026-09-04) on the same
+  // process: the legacy envelope, interleaved.
+  send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2025-11-25", "capabilities": {"roots": {"listChanged": true}, "elicitation": {}}}}));
+  let response = recv();
+  assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
   assert_eq!(response["result"]["serverInfo"]["name"], "vorpal-mcp");
 
   send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
@@ -49,10 +67,24 @@ fn binary_serves_mcp_over_stdio() {
   assert_eq!(response["result"]["isError"], false);
 
   send(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-              "params": {"name": "callers", "arguments": {"name": "target"}}}));
+              "params": {"name": "callers", "arguments": {"name": "target"},
+                         "_meta": {"progressToken": 2}}}));
   let response = recv();
   let text = response["result"]["content"][0]["text"].as_str().unwrap();
   assert!(text.contains("caller"), "callers over stdio: {text}");
+  assert!(response["result"].get("resultType").is_none());
+
+  // The modern client reads the same graph through its own envelope.
+  send(json!({"jsonrpc": "2.0", "id": 102, "method": "tools/call",
+              "params": {"name": "callers", "arguments": {"name": "target"}, "_meta": meta}}));
+  let response = recv();
+  assert_eq!(response["result"]["resultType"], "complete");
+  assert!(
+    response["result"]["content"][0]["text"]
+      .as_str()
+      .unwrap()
+      .contains("caller")
+  );
 
   // Closing stdin ends the session; the server exits cleanly.
   drop(stdin);
