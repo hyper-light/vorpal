@@ -3858,3 +3858,17 @@ without it silently builds the lexical tier under a "learned" label — the firs
 this bench did exactly that and was discarded; (2) the very first daemon process pays a
 one-time page-in of weights + index (kernel f16 "first search" 4.8–5.3 s on two separate
 first-of-batch runs, 0.69 s on every rerun) — order the batch or state the cache state.
+
+## v0.8.0 — MCP revision 2026-07-28; flagship parity check (2026-09-04)
+
+v0.8.0 is the MCP landing (`1a7890a`: dual-era stdio server — 2026-07-28 served
+statelessly, the `initialize` era kept for 2025-11-25/2025-06-18/2025-03-26 clients —
+plus the installer's absolute `--index` and Codex target). Nothing on the index or
+search path changed, and the README's measured numbers are left stamped at v0.7.1. The
+release binary was still checked on the flagship: kernel cold 9.35 / 9.21 / 9.50 s,
+8,891,771 nodes, unchanged 0.12 s — above the 8.2 s line, so an INTERLEAVED A/B against
+the v0.7.1 binary was run on the same machine: v0.7.1 8.63 / 9.36 / 9.79 s vs v0.8.0
+9.10 / 9.46 / 9.45 s. Both binaries sit in the same upper band (load rose 7.6 → 18 across
+the rounds after a day of compiles); the difference is ambient, not the release. The
+rule stands: a flagship reading outside the band is answered with an interleaved A/B
+against the previous binary, never with a restamp.
