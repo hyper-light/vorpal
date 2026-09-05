@@ -365,11 +365,12 @@ rg 'kmalloc\(' -t c ~/linux             # comparison
 
 Parsing and AST-matching 63,775 files costs about 5× a text grep of the same tree.
 
-**Against an agent's built-in tools.** An agent already has grep and read. Measured
-2026-09-05 with the v0.8.2 binary: the same question answered by a warm vorpal daemon
-(one MCP call, median of five after a first call) and by the ripgrep-plus-read pipeline
-Claude Code's Grep and Read tools run, on this repo and on the Linux kernel. Wall time is
-the tool's own work; "output" is what the model then has to read.
+**Against an agent's built-in tools.** An agent already has grep and read, so we
+measured vorpal against them, on this repo and on the Linux kernel, with the v0.8.2
+binary on 2026-09-05. Each row asks one question of a warm vorpal daemon (one MCP call,
+median of five after a first call) and of the ripgrep-plus-read pipeline behind Claude
+Code's Grep and Read tools. Wall time is the tool's own work. The last column is what
+the model then has to read.
 
 | Question | vorpal | rg + read | Output the model reads |
 |---|---:|---:|---|
@@ -392,21 +393,21 @@ and says the rest are masked. The first call in a fresh daemon pays a cold open 
 tree revalidation sweep (114 ms on this repo, 278 ms on the kernel); a kernel tree that
 changed since its generation pays a rebuild on that first call instead (9.4 s measured).
 
-What the model is handed matters as much as the latency. Claude Code feeds the model a
-tool's `structuredContent`, so `format` shapes that too: for the three callers of
-`vfs_read`, the structured result is 817 B by default (lean, call sites included),
-377 B with `format: ids`, and 1,320 B with `toon`, every page factoring its common
-directory into one `base` field. Before this was measured (v0.8.0), it was 1,065 B in
-every format.
+Claude Code feeds the model a tool's `structuredContent`, so `format` decides how much
+the model reads. For the three callers of `vfs_read`, the structured result is 817 B by
+default (lean, with call sites), 377 B with `format: ids`, and 1,320 B with `toon`; each
+page puts its common directory in one `base` field. Before we measured this (v0.8.0),
+it was 1,065 B in every format.
 
-**What that costs end to end.** The same questions put to Claude Code 2.1.261 on Opus
-at effort high, three ways: only Grep, Glob, and Read; only vorpal's MCP tools as Claude
-Code ships them (schemas deferred, so the first use of a tool costs a `ToolSearch` turn);
-and vorpal with the shell allowed too, where the server's own instructions carry the
-exact CLI one-liner for its index and the shell tool is never deferred (allow the
-executable by the path the note prints: `Bash(/path/to/vorpal:*)`). Tokens are
-everything the model processed, cache reads included; cost is what the API billed; one
-run each, 2026-09-05, v0.8.2.
+**What that costs end to end.** We tested Claude Code 2.1.261 using Opus at high
+effort on the same four questions, three ways. The first run could only use Grep, Glob,
+and Read. The second could only use vorpal's MCP tools as Claude Code ships them, with
+schemas deferred, so the first use of each tool costs a `ToolSearch` turn. The third
+could also run the vorpal CLI from the shell; the server's instructions include the
+exact command for its index, and the shell tool is never deferred. For that run, allow
+the executable by the path the server prints, for example `Bash(/path/to/vorpal:*)`.
+Tokens count everything the model processed, cache reads included. Cost is what the API
+billed. One run per cell, measured 2026-09-05 with v0.8.2.
 
 | Question | Tools | Turns | Tokens | Cost | Wall |
 |---|---|---:|---:|---:|---:|
