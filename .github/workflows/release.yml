@@ -224,9 +224,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           # The CLI binaries, plus the fleet stage-0 loaders, signed agents, and blake3 pins.
+          # One pattern per asset: `vorpal-*` already matches the loaders, and a file
+          # matched twice is uploaded twice concurrently — the second upload's metadata
+          # update 404s (the first replaced it) and the release stays a draft short one
+          # asset (v0.8.1: the aarch64 loader).
           files: |
             artifacts/**/vorpal-*
-            artifacts/**/vorpal-loader-*
             artifacts/**/agent-*.json
             artifacts/**/agent-*.vld
           generate_release_notes: true
