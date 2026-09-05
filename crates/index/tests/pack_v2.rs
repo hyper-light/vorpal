@@ -554,8 +554,10 @@ fn bucketed_pack_end_to_end() {
 
   // P4.5b: the RESPAN compose — a comment inserted INSIDE a function body shifts spans
   // without changing any name, signature, reference, sketch, or return: the compose must
-  // fire (graph carried, edges/usage/caches hard-linked) and the committed generation
-  // must equal a scratch build of the same tree BYTE-FOR-BYTE.
+  // fire (edges/usage/caches hard-linked; node rows respanned) and the committed generation
+  // must equal a scratch build of the same tree BYTE-FOR-BYTE. The report says which lane
+  // ran through its carry notes; it must NOT claim `graph_reused` — the node store moved,
+  // and a daemon that trusted that flag kept stale spans (2026-09-05).
   let respan_rel = "core/mod_03.rs";
   fs::write(
     src.join(respan_rel),
@@ -572,8 +574,16 @@ fn bucketed_pack_end_to_end() {
   .unwrap();
   let report = build_index(&src, &out_a).unwrap();
   assert!(
-    report.graph_reused && !report.reused,
+    report
+      .cochange_note
+      .as_deref()
+      .is_some_and(|note| note.starts_with("respan compose"))
+      && !report.reused,
     "span-only edit must take the respan compose: {report:?}"
+  );
+  assert!(
+    !report.graph_reused,
+    "a respan moves node rows: the graph must not be reported as reused: {report:?}"
   );
   let gen_a4 = live(&out_a);
   assert_ne!(gen_a3.file_name(), gen_a4.file_name());

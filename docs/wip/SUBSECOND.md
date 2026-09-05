@@ -250,6 +250,21 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   `live.rs::probe_measures_unchanged_against_the_serving_overlay_not_the_committed_pack`
   (both verdicts, side by side), `watch.rs::a_generation_committed_behind_the_daemon_never_masks_an_edit`
   (deterministic on the old code), the live_differential loop (see BENCHMARKS).
+- **`graph_reused` means the NODE STORE too — respan reports false; the no-overlay daemon
+  keeps its backstop (2026-09-05).** The respan compose rewrote node spans but reported
+  `graph_reused: true` because the edges were carried; the daemon's sync path trusted the
+  flag, kept its loaded rows, repointed `kg_dir` to the new generation, and `snippet` then
+  sliced the OLD span out of the NEW file and verified it against the new pack's digest —
+  "verified", wrong body (the profile pass reproduced it on `sched/fair.c`: span
+  `[53835,53978]` vs `[53835,53923]`). Now `IndexReport::graph_reused` is documented as
+  "node store and edge families byte-identical", the respan lane reports `false`, and the
+  daemon reloads (the pack test detects the lane by its carry note instead of the flag).
+  Found while testing: the stat backstop was gated on the overlay FEATURE flag, so a daemon
+  running with `VORPAL_NO_LIVE_OVERLAY=1` had no liveness backstop at all and waited on
+  FSEvents delivery (15 s and counting in the test); the sweep never needed the overlay —
+  ungated. Oracle: `crates/mcp/tests/respan_live.rs` (overlay off, comment inserted above a
+  function: the served span must move and the snippet body must be exact; fails on the old
+  flag in 15 s, passes in 0.6 s).
 - **ANN warm hygiene — LANDED 2026-08-30**: eager warms are now single-flight and
   coalescing (an edit burst costs at most one running + one trailing warm, not one
   9-second, core-saturating build per commit), `VORPAL_NO_AUTOWARM=1` actually disables
@@ -727,6 +742,19 @@ enumeration (`Graph::compact_src_major`) — exactly the slab concatenation — 
 slab-rebuilt graph is bit-identical to the sealed one and the daemon's in-RAM graph
 equals the loaded one. E2E: cache delete → identical answers → lazy re-cache, proven.
 dataflow.bin stays global and in-identity (0.8 MB; bucketing buys nothing measurable).
+
+**CSC law, one producer law (2026-09-05).** The writer's src-major seal was behind a flag
+(`csc_src_major`) that nothing ever set: cold builds sealed the CSC in raw edge-log order
+while every incremental lane (`Graph::from_parts` over slab order, the lazy rebuild from
+the edge slabs) enumerated src-major. Same edge multisets, different per-destination
+order — 718 incoming rows on ast-grep (the other session's read-only profile pass,
+`compare_graph_cache.py`, exit 2). The flag is gone; `KgWriter::seal` and
+`seal_canonical_with` always compact src-major. Oracles: `crates/kg/tests/csc_order.rs`
+(a writer sealed over an interleaved log lists a destination's sources ascending, and
+`compact_src_major` ≡ `from_parts` over the src-major enumeration byte for byte), the
+differential harness's third oracle (incremental vs scratch `graph.bin` bytes, materialized
+by `Kg::load`), and the profile pass's own comparator re-run against a cold build from the
+fixed binary: `all_graph_bytes_and_adjacency_equal`.
 
 #### P4.4 results (2026-08-31) — the Merkle commit
 

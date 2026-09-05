@@ -2024,6 +2024,11 @@ pub(crate) fn walk_reference_tree<'t>(
 /// walk or from a retained + regional merge.
 pub(crate) fn finalize_references<'t>(walk: RefWalk<'t>, out: &mut Vec<RawRef<'t>>) {
   let RefWalk { pending, binders } = walk;
+  // Every pending entry yields at most one output row, so the pending count bounds the
+  // rows this pass appends: reserve them once instead of walking the doubling ladder
+  // (the jemalloc profile put ~4 GB of a kernel build's cumulative allocation in this
+  // vector's regrowth). Suppressed entries make the bound loose by exactly their count.
+  out.reserve(pending.len());
   // Dedup for implements references: one edge per (from, name) per file — borrowed keys, so
   // deduplication itself allocates nothing.
   let mut seen_impls: HashSet<(u64, Cow<'t, str>)> = HashSet::new();

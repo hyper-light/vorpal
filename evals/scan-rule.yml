@@ -1,0 +1,6 @@
+id: profile-readme-kmalloc
+language: C
+rule:
+  all:
+    - kind: call_expression
+    - regex: kmalloc

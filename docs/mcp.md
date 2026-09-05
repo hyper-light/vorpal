@@ -352,3 +352,11 @@ Two rules keep the served graph truthful when the tree and the index move indepe
   the retained tiers from it. Running `vorpal index` beside a live daemon is therefore
   always safe: the daemon converges on the newest committed generation, then keeps
   absorbing edits from there.
+- **A generation whose node rows moved is reloaded, never carried.** A span-only edit
+  (a comment above a function) is composed into a new generation by rewriting spans; the
+  daemon reloads that generation rather than keeping its rows under the new pin, so a
+  `snippet` never slices a stale span out of a fresh file and calls it verified (fixed
+  2026-09-05; `crates/mcp/tests/respan_live.rs`).
+- **The stat backstop does not depend on the overlay.** With `VORPAL_NO_LIVE_OVERLAY=1`
+  the daemon still re-verifies the tree against the committed manifest on its amortized
+  cadence, so a stalled FSEvents stream cannot starve freshness in that mode either.

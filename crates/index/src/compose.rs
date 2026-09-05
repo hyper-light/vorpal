@@ -280,10 +280,15 @@ pub(crate) fn try_respan_compose(
   commit_generation(out, prior, staging)?;
   let nodes = vorpal_kg::Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
   Ok(Some(IndexReport {
-    // The compose re-extracted the changed files and committed a NEW generation; the
-    // GRAPH (edges) is a proven byte-identical carry — only spans and stamps moved.
+    // The compose re-extracted the changed files and committed a NEW generation. The
+    // edges are a byte-identical carry, but the NODE STORE is not: every respanned row
+    // has new span columns. `graph_reused` promises a serving daemon that its loaded
+    // graph — node rows included — is exact for the new generation, and here it is not:
+    // a daemon that kept its rows would slice snippets at the old offsets and verify
+    // them against the new pack ("verified", wrong body — reproduced on the kernel's
+    // sched/fair.c). So this lane reports `false` and the daemon reloads.
     reused: false,
-    graph_reused: true,
+    graph_reused: false,
     cache_mode: cache_mode_label,
     error_files: 0,
     error_nodes: 0,

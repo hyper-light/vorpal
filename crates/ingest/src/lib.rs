@@ -39,7 +39,7 @@ pub mod typefacts;
 
 pub use manifest::{FileStat, Manifest};
 pub use vorpal_outline::model::OutlineItem;
-pub use outline_extractor::{OutlineExtractor, RuleSource};
+pub use outline_extractor::{OutlineExtractor, ParsedRoot, RuleSource};
 
 /// The extraction environment an index build runs under (F-M3): everything beyond the bundled
 /// defaults that shapes what extraction sees. Today that is extra outline-rule sources

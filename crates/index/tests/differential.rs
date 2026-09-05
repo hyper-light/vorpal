@@ -222,6 +222,21 @@ fn random_edit_sequences_converge_to_scratch_builds() {
       battery(&scratch, &probes),
       "step {step}: query battery diverged"
     );
+
+    // Oracle 3: the derived adjacency cache. `graph.bin` is outside the content id under
+    // the bucketed format (a rebuildable cache), but its bytes obey one law — the CSC is
+    // scattered over the src-major enumeration — whichever producer wrote it: the cold
+    // seal, a compose lane, or the lazy rebuild from the edge slabs. Loading materializes
+    // the cache when a lane left it absent; then the bytes must agree.
+    let incremental_gen = vorpal_index::resolve_index_dir(&incremental);
+    let scratch_gen = vorpal_index::resolve_index_dir(&scratch);
+    vorpal_index::Kg::load(&incremental_gen).expect("incremental generation loads");
+    vorpal_index::Kg::load(&scratch_gen).expect("scratch generation loads");
+    assert_eq!(
+      fs::read(incremental_gen.join("graph.bin")).expect("incremental graph.bin"),
+      fs::read(scratch_gen.join("graph.bin")).expect("scratch graph.bin"),
+      "step {step}: derived adjacency cache diverged (CSC order law)"
+    );
     let _ = fs::remove_dir_all(&scratch);
   }
 
