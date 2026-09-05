@@ -168,7 +168,10 @@ still pays it). Three things reduce that cost:
 - **The server hands the model a schema-free path.** Its `instructions` (which every
   client shows the model once, in context) end with the exact CLI one-liner for this
   daemon's own index: `<vorpal> graph callers <name> --index <abs index> --format lean`,
-  with `callees` in the verb position for what a symbol calls (both carry call sites). A
+  with `callees` in the verb position for what a symbol calls (both carry call sites).
+  The note names the executable by its absolute path, so a client's shell allowlist
+  must match that spelling (`Bash(/path/to/vorpal:*)`; `Bash(vorpal:*)` alone denies the
+  command and the model falls back to the MCP tool — measured 2026-09-05). A
   client's shell tool is never deferred, so a single lookup that way is two model turns
   (one command, one answer) instead of three. Measured 2026-09-04 on Opus: callers of
   `vfs_read` in the kernel, 2 turns, 37 K tokens, 8.6 s; through the MCP tool, 3 turns,

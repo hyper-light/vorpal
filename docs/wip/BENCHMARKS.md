@@ -4194,3 +4194,71 @@ v0.8.2 is `b8e7e2c`: navigation lists default to lean on the wire and in the lis
 (`5ccba18`), and the served graph carries its generation's evidence so call sites answer
 from the overlay-served graph and survive stamp-only edits (`b8e7e2c`). Nothing on the
 index build or search path changed; measured numbers stay as stamped.
+
+## Full MCP re-bench on v0.8.2 — per call and end to end, Opus at effort high (2026-09-05)
+
+Harness committed: `evals/mcp_percall.py` (per call) and `evals/mcp_agent_e2e.py` (end to
+end). Binary `~/.local/bin/vorpal` 0.8.2 (release asset), Claude Code 2.1.261, `--model
+opus`, `CLAUDE_EFFORT=high` (the shell exports `max`; the harness pins `high`). Kernel
+index at `~/Projects/linux/.vorpal/index` (rebuilt on first contact by the 0.8.2 daemon:
+9.4 s, the tree had moved since its generation); this repo at `.vorpal/index`.
+
+**Per call** (warm daemon, median of 5 after one first call; rg pipelines as listed, run
+with stdin=/dev/null — with an inherited pipe and no path argument `rg` searches STDIN and
+waits for EOF forever, which cost a 21-minute hang before it was understood):
+
+| corpus | question | vorpal | bytes | rec | pipeline | bytes | lines |
+|---|---|---:|---:|---:|---:|---:|---:|
+| repo | callers tool_result | 0.09 ms | 597 | 2 | `rg -n 'tool_result\(' crates` 14.4 ms | 266 | 3 |
+| repo | callees tool_result | 0.16 ms | 1,857 | 7 | — | | |
+| repo | reachable run_install out (exact) | 0.04 ms | 1,019 | 4 | `rg -n -A 75 'fn run_install' crates/cli/src/mcp_install.rs` 6.2 ms | 3,021 | 76 |
+| repo | snippet render_toml | 0.04 ms | 2,140 | 1 | rg + sed 38.6 ms | 1,673 | 58 |
+| repo | search "stdio pump reader thread" | 4.40 ms | 1,425 | 5 | `rg -n -i 'stdio.*pump\|reader thread' crates` 14.4 ms | 244 | 2 |
+| kernel | callers kmalloc (limit 100) | 0.16 ms | 936 | 6 | `rg -n 'kmalloc\(' -t c` 720.7 ms | 283,867 | 3,387 |
+| kernel | callers vfs_read | 0.10 ms | 817 | 3 | `rg -n 'vfs_read\(' -t c` 675.4 ms | 1,208 | 13 |
+| kernel | callees vfs_read | 0.07 ms | 1,041 | 4 | `rg -n -A 40 '^ssize_t vfs_read\(' -t c` 685.2 ms | 1,781 | 41 |
+| kernel | node schedule_timeout | 0.06 ms | 335 | 1 | `rg -n '^signed long __sched schedule_timeout\(' -t c` 685.5 ms | 89 | 1 |
+| kernel | snippet vfs_read | 0.05 ms | 1,266 | 1 | rg + sed 688.0 ms | 1,062 | 42 |
+| kernel | reachable vfs_read out depth 2 (exact) | 0.07 ms | 812 | 3 | — | | |
+
+Cold open (first call in a fresh daemon, including the boot revalidation sweep): repo
+114 ms, kernel 278 ms. The 2026-09-04 table's repo numbers (10–11 ms) were first-call
+figures; the warm medians above are the steady state.
+
+Structured result for the three callers of `vfs_read`: default = lean 817 B (call sites
+included), ids 377 B, toon 1,320 B (text 448 / 111 / 838 B). The README's earlier
+1,005 / 523 / 355 B predate lean-by-default and the site fields.
+
+**End to end** (one run each; TS = ToolSearch turns; prompts in the harness):
+
+| corpus / question | arm | turns | TS | tokens | $ | wall | calls |
+|---|---|---:|---:|---:|---:|---:|---|
+| repo: who calls tool_result | grep | 4 | 0 | 71,137 | 0.284 | 8.4 | Grep Read Read |
+| | vorpal MCP | 3 | 1 | 62,412 | 0.177 | 5.0 | ToolSearch graph(callers) |
+| | vorpal CLI | 2 | 0 | 43,194 | 0.031 | 4.7 | Bash(vorpal graph callers …) |
+| repo: what run_install reaches | grep | 4 | 0 | 76,148 | 0.214 | 12.0 | Grep Grep Read |
+| | vorpal MCP | 3 | 1 | 62,941 | 0.158 | 7.1 | ToolSearch reachable |
+| | vorpal CLI | 2 | 0 | 43,441 | 0.040 | 7.3 | Bash(vorpal graph reachable … --direction out) |
+| kernel: who calls vfs_read | grep | 6 | 0 | 92,924 | 0.291 | 15.4 | Grep Grep Read Bash(rg) Read |
+| | vorpal MCP | 3 | 1 | 51,367 | 0.136 | 4.5 | ToolSearch graph(callers) |
+| | vorpal CLI | 2 | 0 | 35,895 | 0.030 | 7.2 | Bash(vorpal graph callers …) |
+| kernel: what vfs_read calls | grep | 3 | 0 | 58,900 | 0.106 | 6.7 | Bash(grep) Read |
+| | vorpal MCP | 3 | 1 | 51,501 | 0.107 | 5.9 | ToolSearch graph(callees) |
+| | vorpal CLI | 2 | 0 | 35,940 | 0.031 | 6.6 | Bash(vorpal graph callees …) |
+
+All twelve answers correct. The MCP path is now three turns on every row (schema load +
+one `graph` call): `callees` removed the `reachable` + `snippet` detour (4 turns / 55 K /
+13.4 s on 2026-09-04 → 3 / 52 K / 5.9 s). The CLI path is the two-turn floor on every row.
+Grep's kernel-callees read also listed the inline helpers `fsnotify_access` / `add_rchar`,
+which the graph does not resolve as call edges — verified NOT a regression: scratch kernel
+indexes built by the v0.8.0 and v0.8.2 release binaries are identical (8,891,771 nodes;
+5,269,765 resolved / 2,408,362 ambiguous / 258,762 external / 974,949 masked; 8.9 / 9.0 s)
+and both give the same four callees (unlikely, access_ok, rw_verify_area, new_sync_read).
+
+Harness incident: the first CLI arm ran with `--allowedTools Bash(vorpal:*)`; the server's
+note names the executable by absolute path, so every command came back "This command
+requires approval" and the model fell back to the MCP tool (4 turns / 73–88 K). Re-run
+with `Bash(<abs path>:*)` added; recorded in docs/mcp.md. Costs on the CLI rows (3–4 ¢
+vs 11–29 ¢) are as billed for these single runs; prompt-cache hits vary between runs and
+are not controlled here.
+

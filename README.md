@@ -134,7 +134,7 @@ Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architec
 `compare_generations`, `impact`, `dead_code`, `node`, `graph` (callers, callees, references,
 importers, implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
 `rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. The whole listing is
-under 11 KB on the wire (a test keeps it there), because a client either loads each schema
+under 12 KB on the wire (11.7 KB; a test gates it), because a client either loads each schema
 in a model turn or carries the listing in every turn's input; the server's instructions
 also carry the CLI one-liner for its index, so a client with a shell can answer a single
 lookup in two turns with no schema load at all. Tools that return records
@@ -366,68 +366,78 @@ rg 'kmalloc\(' -t c ~/linux             # comparison
 Parsing and AST-matching 63,775 files costs about 5× a text grep of the same tree.
 
 **Against an agent's built-in tools.** An agent already has grep and read. Measured
-2026-09-04 with the v0.8.0 binary: the same question answered by a warm vorpal daemon
-(one MCP call) and by the ripgrep-plus-read pipeline Claude Code's Grep and Read tools
-run, on this repo and on the Linux kernel. Wall time is the tool's own work; "output" is
-what the model then has to read.
+2026-09-05 with the v0.8.2 binary: the same question answered by a warm vorpal daemon
+(one MCP call, median of five after a first call) and by the ripgrep-plus-read pipeline
+Claude Code's Grep and Read tools run, on this repo and on the Linux kernel. Wall time is
+the tool's own work; "output" is what the model then has to read.
 
 | Question | vorpal | rg + read | Output the model reads |
 |---|---:|---:|---|
-| This repo: callers of `tool_result` | 11 ms | 41 ms | 2 typed records vs 3 text lines |
-| This repo: what `run_install` reaches | 11 ms, 1 call | 79 ms, 5 commands | 4 records vs 307 lines (36 KB) |
-| This repo: source of `render_toml` | 0.7 ms | 17 ms, 2 commands | verified body vs 57 lines |
-| Kernel: callers of `kmalloc` | 0.1 ms | 759 ms | 6 resolved records vs 3,387 lines (392 KB) |
-| Kernel: find `schedule_timeout` | 0.2 ms | 677 ms | 1 record vs 2 lines |
-| Kernel: source of `vfs_read` | 12 ms | 667 ms, then a read | verified body vs 1 line |
-| Kernel: what `vfs_read` reaches, depth 2 | 0.2 ms | no equivalent | 3 records |
+| This repo: callers of `tool_result` | 0.09 ms | 14 ms | 2 records with call sites vs 3 text lines |
+| This repo: callees of `tool_result` | 0.16 ms | no equivalent | 7 records with call sites |
+| This repo: what `run_install` reaches | 0.04 ms, 1 call | 6 ms, `rg -A 75` | 4 records vs 76 lines (3 KB) |
+| This repo: source of `render_toml` | 0.04 ms | 39 ms, 2 commands | verified body vs 58 lines |
+| Kernel: callers of `kmalloc` (page of 100) | 0.16 ms | 721 ms | 6 resolved records vs 3,387 lines (284 KB) |
+| Kernel: callers of `vfs_read` | 0.10 ms | 675 ms | 3 records with call sites vs 13 lines |
+| Kernel: callees of `vfs_read` | 0.07 ms | 685 ms, then the body | 4 records with call sites vs 41 lines |
+| Kernel: find `schedule_timeout` | 0.06 ms | 686 ms | 1 record vs 1 line |
+| Kernel: source of `vfs_read` | 0.05 ms | 688 ms, then a read | verified body vs 42 lines |
+| Kernel: what `vfs_read` reaches, depth 2 | 0.07 ms | no equivalent | 3 records |
 
 On a small repo both are far under a model turn; the difference is round trips. On the
 kernel every grep rescans 75,954 files (about 0.7 s) while the graph answers in
-microseconds, and grep's 392 KB of `kmalloc` mentions includes definitions, comments,
+microseconds, and grep's 284 KB of `kmalloc` mentions includes definitions, comments,
 and macros the model must sift, where the graph returns the six call edges it can prove
-and says the rest are masked. The first call in a fresh daemon pays a cold open (126 ms
-on this repo, 58 ms on the kernel).
+and says the rest are masked. The first call in a fresh daemon pays a cold open plus the
+tree revalidation sweep (114 ms on this repo, 278 ms on the kernel); a kernel tree that
+changed since its generation pays a rebuild on that first call instead (9.4 s measured).
 
 What the model is handed matters as much as the latency. Claude Code feeds the model a
 tool's `structuredContent`, so `format` shapes that too: for the three callers of
-`vfs_read`, the structured result is 1,005 B by default, 523 B with `format: lean`, and
-355 B with `format: ids`, every page factoring its common directory into one `base`
-field. Before this was measured (v0.8.0), all three were 1,065 B.
+`vfs_read`, the structured result is 817 B by default (lean, call sites included),
+377 B with `format: ids`, and 1,320 B with `toon`, every page factoring its common
+directory into one `base` field. Before this was measured (v0.8.0), it was 1,065 B in
+every format.
 
-**What that costs end to end.** The same questions put to Claude Code on Opus at its
-default reasoning (effort unset), three ways: only Grep, Glob, and Read; only vorpal's
-MCP tools as Claude Code ships them (schemas deferred, so the first use of a tool costs a
-`ToolSearch` turn); and vorpal with the shell allowed too, where the server's own
-instructions carry the exact CLI one-liner for its index and the shell tool is never
-deferred. Tokens are everything the model processed, cache reads included; cost is what
-the API billed; one run each.
+**What that costs end to end.** The same questions put to Claude Code 2.1.261 on Opus
+at effort high, three ways: only Grep, Glob, and Read; only vorpal's MCP tools as Claude
+Code ships them (schemas deferred, so the first use of a tool costs a `ToolSearch` turn);
+and vorpal with the shell allowed too, where the server's own instructions carry the
+exact CLI one-liner for its index and the shell tool is never deferred (allow the
+executable by the path the note prints: `Bash(/path/to/vorpal:*)`). Tokens are
+everything the model processed, cache reads included; cost is what the API billed; one
+run each, 2026-09-05, v0.8.2.
 
 | Question | Tools | Turns | Tokens | Cost | Wall |
 |---|---|---:|---:|---:|---:|
-| This repo: who calls `tool_result` | grep + read | 5 | 98 K | $0.213 | 13.9 s |
-| | vorpal MCP tool | 3 | 63 K | $0.144 | 6.3 s |
-| | vorpal CLI via shell | 2 | 44 K | $0.130 | 6.3 s |
-| This repo: what `run_install` reaches | grep + read | 4 | 77 K | $0.212 | 14.2 s |
-| | vorpal MCP tool | 3 | 64 K | $0.160 | 14.4 s |
-| | vorpal CLI via shell | 2 | 45 K | $0.146 | 12.9 s |
-| Kernel: who calls `vfs_read` | grep + read | 3 | 62 K | $0.066 | 11.8 s |
-| | vorpal MCP tool | 3 | 52 K | $0.137 | 7.3 s |
-| | vorpal CLI via shell | 2 | 37 K | $0.090 | 8.6 s |
-| Kernel: what `vfs_read` calls | grep + read | 3 | 60 K | $0.053 | 8.2 s |
-| | vorpal MCP tool | 4 | 55 K | $0.133 | 13.4 s |
-| | vorpal CLI via shell | 2 | 37 K | $0.097 | 8.9 s |
+| This repo: who calls `tool_result` | grep + read | 4 | 71 K | $0.284 | 8.4 s |
+| | vorpal MCP tool | 3 | 62 K | $0.177 | 5.0 s |
+| | vorpal CLI via shell | 2 | 43 K | $0.031 | 4.7 s |
+| This repo: what `run_install` reaches | grep + read | 4 | 76 K | $0.214 | 12.0 s |
+| | vorpal MCP tool | 3 | 63 K | $0.158 | 7.1 s |
+| | vorpal CLI via shell | 2 | 43 K | $0.040 | 7.3 s |
+| Kernel: who calls `vfs_read` | grep + read | 6 | 93 K | $0.291 | 15.4 s |
+| | vorpal MCP tool | 3 | 51 K | $0.136 | 4.5 s |
+| | vorpal CLI via shell | 2 | 36 K | $0.030 | 7.2 s |
+| Kernel: what `vfs_read` calls | grep + read | 3 | 59 K | $0.106 | 6.7 s |
+| | vorpal MCP tool | 3 | 52 K | $0.107 | 5.9 s |
+| | vorpal CLI via shell | 2 | 36 K | $0.031 | 6.6 s |
 
 Read it plainly. A model turn costs about 20 K tokens of context and a few seconds on
 Opus before any tool does anything, so an answer is priced by its turns. Two turns, one
 command and one reply, is the floor any tool can reach in an agent, and vorpal reaches it
-on every row through the shell: 37 K to 45 K tokens against grep's 60 K to 98 K, and
-less wall on three of four. The MCP tool path is one turn more, the schema load, and
-still fewer tokens than grep on every row. Every arm answered correctly; the graph
-answers cite call-site lines and edge grades. What this took: a 21-tool listing under
-11 KB, one `graph` tool for all seven relations, call sites on its rows, instructions
-that say the answer is complete and that carry the CLI command for the index, and
-`format: lean`. Earlier runs of this table, from the 27-tool surface at 8 turns and
-161 K on the kernel callers question down to here, are in `docs/wip/BENCHMARKS.md`.
+on every row through the shell: 36 K to 43 K tokens against grep's 59 K to 93 K, and
+less wall on three of four. The MCP tool path is one turn more, the schema load, then a
+single `graph` call on every row (`callees` replaced the old `reachable`-plus-`snippet`
+detour for "what does X call"), with fewer tokens and less wall than grep on every row.
+Every arm answered correctly; the graph answers cite call-site lines and edge grades,
+and on the kernel callees question grep's read also listed the inline helpers
+(`fsnotify_access`, `add_rchar`) the graph does not resolve as call edges. What this
+took: a 21-tool listing under 12 KB, one `graph` tool for eight relations, call sites on
+its rows, lean records by default, and instructions that say the answer is complete and
+carry the CLI command for the index. Earlier runs of this table, from the 27-tool
+surface at 8 turns and 161 K on the kernel callers question down to here, are in
+`docs/wip/BENCHMARKS.md`.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,
