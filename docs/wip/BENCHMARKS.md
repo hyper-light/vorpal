@@ -4162,3 +4162,12 @@ per-edit path, and the bit-reproducibility gates are untouched by construction.
 
 The end-to-end agent rows for "what vfs_read calls" in the README were measured through
 `reachable`; they are not restamped here (a `callees` re-run is a lead, not a claim).
+
+## v0.8.1 — daemon freshness law + `callees` (2026-09-04)
+
+v0.8.1 is `60aa57e`: the served-state freshness fix (the probe measures "unchanged"
+against the overlay's own products; a canonicalizer that sealed a graph adopts it; a
+generation committed behind the daemon's back is adopted) and the `callees` relation with
+call sites on the `graph` tool and the CLI. Nothing on the index build or search path
+changed; the README's measured numbers stay stamped at v0.7.1 (indexing) and 2026-09-04
+(agent end-to-end), and no flagship re-run is claimed for this release.

@@ -1,6 +1,6 @@
 {
   "name": "@hyper-light/vorpal-node-win32-ia32-msvc",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "os": [
     "win32"
   ],
