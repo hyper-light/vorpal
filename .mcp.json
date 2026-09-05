@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "vorpal": {
+      "args": [
+        "mcp",
+        "--index",
+        "/Users/adalundhe/Projects/vorpal/.vorpal/index"
+      ],
+      "command": "/usr/local/bin/vorpal"
+    }
+  }
+}
