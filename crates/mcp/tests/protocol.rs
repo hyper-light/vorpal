@@ -68,7 +68,11 @@ fn initialize_handshake_and_tool_listing() {
   );
   assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
   assert_eq!(response["result"]["serverInfo"]["title"], "vorpal");
-  assert!(response["result"]["instructions"].as_str().is_some_and(|t| !t.is_empty()));
+  let instructions = response["result"]["instructions"].as_str().expect("instructions");
+  assert!(!instructions.is_empty());
+  // The fast-path note names THIS index, absolute, so a shell client can go straight there.
+  assert!(instructions.contains("--index /"), "{instructions}");
+  assert!(instructions.contains("graph callers <name>"), "{instructions}");
   // Legacy results carry no modern envelope fields.
   assert!(response["result"].get("resultType").is_none());
 

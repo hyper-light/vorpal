@@ -4065,3 +4065,35 @@ wall on three; `auto` is inconsistent (0 or 1 loads) and pays Claude Code's own 
 tools, so the default is the recommendation. Remaining gap: the one-file question, where
 the schema load is the extra turn; and dollar cost on the kernel, where Opus prices the
 loaded schema above a cheap grep. Unmeasured, still: multi-hop questions.
+
+## The shell fast path: the server's instructions carry its own CLI one-liner (2026-09-04)
+
+Claude Code never defers its shell tool, and the MCP server's `instructions` are shown
+to the model in every turn's context. `Server::fast_path_note` appends, per index, the
+exact commands: `<exe> graph callers <name> --index <abs> --format lean` (verbs: refs,
+importers, implementors, typeusers, similar, node, snippet) and `<exe> graph reachable
+<name> --direction out --depth 1 --index <abs> --format lean`. A single lookup is then
+two turns: the command and the answer. First attempt at the note wrote `reachable <name>`
+without the `graph` word and cost the model 4 and 6 turns of `--help` on the two
+reachability questions — the commands must be complete and literal; fixed and re-run.
+
+Opus, effort unset, MCP tools AND `Bash(vorpal:*)` allowed, prompt "use vorpal (MCP or
+CLI, whichever is cheaper)": the model chose the shell every time.
+
+| corpus / question | turns | tokens | $ | wall | command |
+|---|---:|---:|---:|---:|---|
+| repo: who calls tool_result | 2 | 44,031 | 0.130 | 6.3 | graph callers tool_result --index … --format lean |
+| repo: what run_install reaches | 2 | 44,535 | 0.146 | 12.9 | graph reachable run_install --direction out … |
+| kernel: who calls vfs_read | 2 | 36,914 | 0.090 | 8.6 | graph callers vfs_read --index … --format lean |
+| kernel: what vfs_read calls | 2 | 37,293 | 0.097 | 8.9 | graph reachable vfs_read --direction out --depth 1 … |
+
+Against grep (5/98 K/13.9, 4/77 K/14.2, 3/62 K/11.8, 3/60 K/8.2) and the MCP tool path
+(3/63 K/6.3, 3/64 K/14.4, 3/52 K/7.3, 4/55 K/13.4). Two turns is the floor for any tool
+in an agent loop; the remaining ~40 K is Claude Code's own per-turn context.
+
+Incident while measuring: overwriting /usr/local/bin/vorpal in place with `cp` produced a
+binary macOS kills on launch (exit 137: the vnode's cached code-signature state), and the
+directory is root-owned so the file cannot be replaced without sudo; the first experiment
+ran against that dead binary (13–20 turns of the model probing `--version`). Installed to
+~/.local/bin (first on PATH) as a new file instead. Lesson: install binaries by creating a
+new file and renaming, never by writing over one that has been executed.

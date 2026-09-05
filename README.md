@@ -135,7 +135,9 @@ Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architec
 implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
 `rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. The whole listing is
 under 11 KB on the wire (a test keeps it there), because a client either loads each schema
-in a model turn or carries the listing in every turn's input. Tools that return records
+in a model turn or carries the listing in every turn's input; the server's instructions
+also carry the CLI one-liner for its index, so a client with a shell can answer a single
+lookup in two turns with no schema load at all. Tools that return records
 page with cursors and accept `format: "lean" | "toon" | "ids"`; `graph` callers rows carry
 the call-site line so "who calls X" is one call. `--profile scout|analysis|full` limits the
 tool set for read-only agents. Full descriptions and the wire contract:
@@ -392,33 +394,39 @@ tool's `structuredContent`, so `format` shapes that too: for the three callers o
 field. Before this was measured (v0.8.0), all three were 1,065 B.
 
 **What that costs end to end.** The same questions put to Claude Code on Opus at its
-default reasoning (effort unset), once with only Grep, Glob, and Read, once with only
-vorpal's tools exactly as Claude Code ships them (schemas deferred: the first use of a tool
-costs one `ToolSearch` turn to load it). Tokens are everything the model processed, cache
-reads included; cost is what the API billed; one run each.
+default reasoning (effort unset), three ways: only Grep, Glob, and Read; only vorpal's
+MCP tools as Claude Code ships them (schemas deferred, so the first use of a tool costs a
+`ToolSearch` turn); and vorpal with the shell allowed too, where the server's own
+instructions carry the exact CLI one-liner for its index and the shell tool is never
+deferred. Tokens are everything the model processed, cache reads included; cost is what
+the API billed; one run each.
 
-| Question | Tools | Turns | of which `ToolSearch` | Tokens | Cost | Wall |
-|---|---|---:|---:|---:|---:|---:|
-| This repo: who calls `tool_result` | grep + read | 5 | 0 | 98 K | $0.213 | 13.9 s |
-| | vorpal | 3 | 1 | 63 K | $0.144 | 6.3 s |
-| This repo: what `run_install` reaches | grep + read | 4 | 0 | 77 K | $0.212 | 14.2 s |
-| | vorpal | 3 | 1 | 64 K | $0.160 | 14.4 s |
-| Kernel: who calls `vfs_read` | grep + read | 3 | 0 | 62 K | $0.066 | 11.8 s |
-| | vorpal | 3 | 1 | 52 K | $0.137 | 7.3 s |
-| Kernel: what `vfs_read` calls | grep + read | 3 | 0 | 60 K | $0.053 | 8.2 s |
-| | vorpal | 4 | 1 | 55 K | $0.133 | 13.4 s |
+| Question | Tools | Turns | Tokens | Cost | Wall |
+|---|---|---:|---:|---:|---:|
+| This repo: who calls `tool_result` | grep + read | 5 | 98 K | $0.213 | 13.9 s |
+| | vorpal MCP tool | 3 | 63 K | $0.144 | 6.3 s |
+| | vorpal CLI via shell | 2 | 44 K | $0.130 | 6.3 s |
+| This repo: what `run_install` reaches | grep + read | 4 | 77 K | $0.212 | 14.2 s |
+| | vorpal MCP tool | 3 | 64 K | $0.160 | 14.4 s |
+| | vorpal CLI via shell | 2 | 45 K | $0.146 | 12.9 s |
+| Kernel: who calls `vfs_read` | grep + read | 3 | 62 K | $0.066 | 11.8 s |
+| | vorpal MCP tool | 3 | 52 K | $0.137 | 7.3 s |
+| | vorpal CLI via shell | 2 | 37 K | $0.090 | 8.6 s |
+| Kernel: what `vfs_read` calls | grep + read | 3 | 60 K | $0.053 | 8.2 s |
+| | vorpal MCP tool | 4 | 55 K | $0.133 | 13.4 s |
+| | vorpal CLI via shell | 2 | 37 K | $0.097 | 8.9 s |
 
-Read it plainly. A model turn costs about 20 K tokens of context and about 3 s on Opus
-before any tool does anything, so an answer is priced by its turns. vorpal now answers
-each of these in one call: the turns are the schema load, the call, and the reply. That
-is fewer tokens than grep on every row, and less wall on three of four; the exception is
-the one question a single file read answers, where the graph's extra turn is the load.
-Every arm answered correctly; the graph answers cite the call-site lines. What this took:
-a 21-tool listing under 11 KB, one `graph` tool for all seven relations, call sites on its
-rows, and instructions that say the answer is complete. Per-dollar the API still favours
-grep on the kernel because Opus prices the loaded schema; per-token and per-second it
-does not. Earlier runs of this table, including the 27-tool surface at 8 turns and
-161 K on the kernel callers question, are in `docs/wip/BENCHMARKS.md`.
+Read it plainly. A model turn costs about 20 K tokens of context and a few seconds on
+Opus before any tool does anything, so an answer is priced by its turns. Two turns, one
+command and one reply, is the floor any tool can reach in an agent, and vorpal reaches it
+on every row through the shell: 37 K to 45 K tokens against grep's 60 K to 98 K, and
+less wall on three of four. The MCP tool path is one turn more, the schema load, and
+still fewer tokens than grep on every row. Every arm answered correctly; the graph
+answers cite call-site lines and edge grades. What this took: a 21-tool listing under
+11 KB, one `graph` tool for all seven relations, call sites on its rows, instructions
+that say the answer is complete and that carry the CLI command for the index, and
+`format: lean`. Earlier runs of this table, from the 27-tool surface at 8 turns and
+161 K on the kernel callers question down to here, are in `docs/wip/BENCHMARKS.md`.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,
