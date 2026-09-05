@@ -148,6 +148,12 @@ fn watched_daemon_answers_equal_scratch_after_every_edit_class() {
   // change at ANY point, window or no window.
   let converge_and_compare = |daemon: &mut Server, id: &mut u64, step: &mut usize, marker: Option<&str>| {
     let strict = marker.is_none();
+    // Trace alignment (VORPAL_PHASE_TRACE): the daemon's decision stamps and the test's
+    // edits share one stderr; these mark where each step's writes ended.
+    vorpal_kg::phase_stamp(&format!(
+      "test: step {} written (marker {marker:?}) — converging",
+      *step + 1
+    ));
     if let Some(marker) = marker {
       wait_for_marker(daemon, id, marker);
     }
@@ -157,6 +163,7 @@ fn watched_daemon_answers_equal_scratch_after_every_edit_class() {
     loop {
       let live = battery(daemon, id, PROBES);
       if live == scratch {
+        vorpal_kg::phase_stamp(&format!("test: step {step} converged"));
         return;
       }
       if strict || Instant::now() > deadline {

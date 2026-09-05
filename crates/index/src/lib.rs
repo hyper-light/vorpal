@@ -6951,22 +6951,12 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
     ));
   }
 
-  let edge = match verb {
-    "callers" => Some(vorpal_kg::EdgeType::CALLS),
-    "refs" | "references" => Some(vorpal_kg::EdgeType::REFERENCES),
-    "importers" => Some(vorpal_kg::EdgeType::IMPORTS),
-    "implementors" => Some(vorpal_kg::EdgeType::IMPLEMENTS),
-    "typeusers" => Some(vorpal_kg::EdgeType::OF_TYPE),
-    "similar" => Some(vorpal_kg::EdgeType::SIMILAR_TO),
-    "node" => None,
-    other => return Err(format!("unknown graph verb '{other}'").into()),
-  };
-
   // `node` is a listing verb: every match IS the answer (ids attached — this verb exists to
   // discover identities for refinement).
-  let Some(edge) = edge else {
+  if verb == "node" {
     return Ok(render_candidates(kg, &matches));
-  };
+  }
+  let (edge, outgoing) = records::verb_edge(verb)?;
 
   if matches.len() > 1 && !target.merge_all {
     let mut out = format!(
@@ -6980,9 +6970,12 @@ pub fn graph_query_on(kg: &Kg, verb: &str, target: &GraphTarget) -> Result<Strin
 
   let mut hits: Vec<(NodeId, u8)> = Vec::new();
   for &target_id in &matches {
-    for (from, confidence) in kg.incoming_with_confidence(target_id, edge) {
-      hits.push((from, confidence));
-    }
+    let joined = if outgoing {
+      kg.outgoing_with_confidence(target_id, edge)
+    } else {
+      kg.incoming_with_confidence(target_id, edge)
+    };
+    hits.extend(joined);
   }
   hits.sort_unstable_by_key(|&(n, c)| (n.raw(), std::cmp::Reverse(c)));
   hits.dedup_by_key(|&mut (n, _)| n);

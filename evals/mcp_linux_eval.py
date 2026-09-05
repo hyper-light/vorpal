@@ -116,6 +116,12 @@ ok = "rw_verify_area" in text
 grade("reachable(vfs_write, out) includes rw_verify_area", ok, dt,
       "direct callee present" if ok else text[:80])
 
+# ---- 8b. callees: the same question as one graph call, with the call site on the row ----
+text, dt = tool("graph", {"relation": "callees", "name": "vfs_write", "limit": 100})
+ok = "rw_verify_area" in text
+grade("graph callees(vfs_write) includes rw_verify_area", ok, dt,
+      "direct callee present" if ok else text[:80])
+
 # ---- 9. EDIT FRESHNESS: new symbol visible after a save, gone after revert ----
 probe = "\nvoid vorpal_eval_probe(void) { kfree((void *)0); }\n"
 with open(f"{LINUX}/mm/slab_common.c", "a") as f:

@@ -131,15 +131,16 @@ it from `.cursor/mcp.json`).
 > used; the trade-offs of keeping them resident are in [docs/mcp.md](docs/mcp.md).
 
 Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
-`compare_generations`, `impact`, `dead_code`, `node`, `graph` (callers, references, importers,
-implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
+`compare_generations`, `impact`, `dead_code`, `node`, `graph` (callers, callees, references,
+importers, implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
 `rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. The whole listing is
 under 11 KB on the wire (a test keeps it there), because a client either loads each schema
 in a model turn or carries the listing in every turn's input; the server's instructions
 also carry the CLI one-liner for its index, so a client with a shell can answer a single
 lookup in two turns with no schema load at all. Tools that return records
-page with cursors and accept `format: "lean" | "toon" | "ids"`; `graph` callers rows carry
-the call-site line so "who calls X" is one call. `--profile scout|analysis|full` limits the
+page with cursors and accept `format: "lean" | "toon" | "ids"`; `graph` callers and callees
+rows carry the call-site line so "who calls X" and "what does X call" are one call each.
+`--profile scout|analysis|full` limits the
 tool set for read-only agents. Full descriptions and the wire contract:
 **[docs/mcp.md](docs/mcp.md)**.
 
@@ -161,7 +162,7 @@ npm install @hyper-light/vorpal-wasm     # browser / portable
 |---|---|
 | `vorpal index [src] [--out DIR] [--verify]` | Build/refresh the knowledge-graph index |
 | `vorpal search <query> [-k N] [--index DIR]` | Hybrid (name + semantic + graph) search |
-| `vorpal graph <verb> [name] [--index DIR]` | `callers` `refs` `importers` `implementors` `typeusers` `similar` `observed` `node` `reachable` `flows` `snippet` `schema` `dead` `coverage` `impact` `diff` `architecture` |
+| `vorpal graph <verb> [name] [--index DIR]` | `callers` `callees` `refs` `importers` `implementors` `typeusers` `similar` `observed` `node` `reachable` `flows` `snippet` `schema` `dead` `coverage` `impact` `diff` `architecture` |
 | `vorpal query '<cypher>' [--index DIR]` | Cypher-shaped read-only graph queries (`MATCH … WHERE … RETURN … LIMIT`) |
 | `vorpal run -p <pattern> [-l lang] [-r fix]` | One-off structural search/rewrite (default command) |
 | `vorpal scan [-r rule.yml] [--format github]` | Run configured YAML rules across a project |

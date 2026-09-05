@@ -80,6 +80,86 @@ fn watched_daemon_serves_changes_it_was_never_told_about() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// Poll `node <name>` until the daemon serves it from `path` (or the deadline passes).
+fn served_from(server: &mut Server, id: &mut u64, name: &str, path: &str, within: Duration) -> bool {
+  let deadline = Instant::now() + within;
+  loop {
+    *id += 1;
+    let (text, is_error) = call_tool(server, *id, "node", json!({"name": name}));
+    if !is_error && text.contains(path) {
+      return true;
+    }
+    if Instant::now() > deadline {
+      eprintln!("last response for {name}: {text}");
+      return false;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+}
+
+/// The freshness law: "unchanged" is measured against the SERVED state, never against the
+/// generation on disk. A generation committed behind the daemon's back — here a plain
+/// `build_index` beside it, standing in for an external `vorpal index` run or the daemon's
+/// own background canonicalizer reading a tree that moved after the probe — puts `CURRENT`
+/// ahead of the served graph. Before the fix the next probe of the moved file compared its
+/// extraction against that newer pack, judged it "unchanged", noted the fresh stamps into
+/// the overlay's manifest, and the daemon served the pre-edit graph indefinitely.
+#[test]
+fn a_generation_committed_behind_the_daemon_never_masks_an_edit() {
+  let base = std::env::temp_dir().join(format!("vorpal-mcp-ahead-{}", std::process::id()));
+  let src = base.join("repo");
+  let index: PathBuf = src.join(".vorpal").join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(&src).unwrap();
+  fs::write(src.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+  fs::write(src.join("b.py"), "def beta_v1():\n    return alpha()\n").unwrap();
+  vorpal_index::build_index(&src, &index).expect("initial index");
+
+  let mut server = Server::new(index.clone());
+  let mut id = 0u64;
+  assert!(served_from(&mut server, &mut id, "beta_v1", "b.py", Duration::from_secs(10)));
+  let before = fs::read_to_string(index.join("CURRENT")).unwrap_or_default();
+
+  // v2 arrives through the live path: served from the overlay, persisted in the background.
+  fs::write(src.join("b.py"), "def beta_v2():\n    return alpha()\n").unwrap();
+  assert!(
+    served_from(&mut server, &mut id, "beta_v2", "b.py", Duration::from_secs(10)),
+    "live path must serve v2"
+  );
+  // Let the served persist land and be reaped, so the daemon's own committers are idle and
+  // the next commit is unmistakably somebody else's.
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while fs::read_to_string(index.join("CURRENT")).unwrap_or_default() == before {
+    assert!(Instant::now() < deadline, "served persist never landed");
+    id += 1;
+    let _ = call_tool(&mut server, id, "node", json!({"name": "alpha"}));
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  for _ in 0..3 {
+    id += 1;
+    let _ = call_tool(&mut server, id, "node", json!({"name": "alpha"}));
+    std::thread::sleep(Duration::from_millis(50));
+  }
+
+  // v3 is written AND committed by someone else before the daemon looks again.
+  fs::write(src.join("b.py"), "def beta_v3():\n    return alpha()\n").unwrap();
+  vorpal_index::build_index(&src, &index).expect("external index run");
+
+  assert!(
+    served_from(&mut server, &mut id, "beta_v3", "b.py", Duration::from_secs(10)),
+    "the daemon must serve v3: the committed generation is not the served state, so the \
+     edit is judged against what the daemon actually serves"
+  );
+  id += 1;
+  let (text, is_error) = call_tool(&mut server, id, "node", json!({"name": "beta_v2"}));
+  assert!(
+    is_error || !text.contains("b.py"),
+    "v2 must be gone from the served graph: {text}"
+  );
+
+  let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn unwatchable_layout_keeps_explicit_index_semantics() {
   let base = std::env::temp_dir().join(format!("vorpal-mcp-nowatch-{}", std::process::id()));

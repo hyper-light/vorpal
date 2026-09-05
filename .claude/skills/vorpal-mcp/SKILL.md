@@ -52,8 +52,9 @@ enrollments. `VORPAL_PROJECTS_FILE` overrides the registry path.
 ## The tools, briefly
 
 Navigation: `node`, `search`, `snippet`, `fetch_span`, `schema`. Relations: `graph`
-(`relation`: callers, references, importers, implementors, type_users, similar,
-observed), `reachable`, `data_flow`, `why` (edge evidence). Graph answers are complete
+(`relation`: callers, callees, references, importers, implementors, type_users, similar,
+observed; callers and callees rows carry the call-site line), `reachable`, `data_flow`,
+`why` (edge evidence). Graph answers are complete
 at the stated grade; they need no confirmation by search or grep. Repo health/planning: `health`,
 `coverage`, `dead_code`, `impact`, `architecture`, `compare_generations`. Structural:
 `structural_search` (pattern), `rule_search` (full YAML rules, dry-run fixes),

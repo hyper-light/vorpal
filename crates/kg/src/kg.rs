@@ -1229,6 +1229,20 @@ impl Kg {
     found
   }
 
+  /// [`Kg::incoming_with_confidence`] over out-edges — the id-precise form of `callees`
+  /// (what `id` calls), each out-edge carrying its packed resolution confidence.
+  pub fn outgoing_with_confidence(&self, id: NodeId, edge: EdgeType) -> Vec<(NodeId, u8)> {
+    let mut found: Vec<(NodeId, u8)> = self
+      .out_neighbors(id)
+      .into_iter()
+      .filter(|&(_, kind)| kind.base() == edge.base())
+      .map(|(to, kind)| (to, kind.confidence()))
+      .collect();
+    found.sort_unstable_by_key(|&(n, _)| n.raw());
+    found.dedup();
+    found
+  }
+
   pub fn incoming_of(&self, id: NodeId, edge: EdgeType) -> Vec<NodeId> {
     let mut found: Vec<NodeId> = self
       .in_neighbors(id)

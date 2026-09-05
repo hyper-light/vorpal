@@ -157,7 +157,7 @@ still pays it). Three things reduce that cost:
 - **The server hands the model a schema-free path.** Its `instructions` (which every
   client shows the model once, in context) end with the exact CLI one-liner for this
   daemon's own index: `<vorpal> graph callers <name> --index <abs index> --format lean`,
-  and the `graph reachable … --direction out --depth 1` form for what a symbol calls. A
+  with `callees` in the verb position for what a symbol calls (both carry call sites). A
   client's shell tool is never deferred, so a single lookup that way is two model turns
   (one command, one answer) instead of three. Measured 2026-09-04 on Opus: callers of
   `vfs_read` in the kernel, 2 turns, 37 K tokens, 8.6 s; through the MCP tool, 3 turns,
@@ -244,7 +244,7 @@ allow-list (`VORPAL_PROJECTS_FILE` overrides its path).
 | Tool | What it does |
 |---|---|
 | `node` | Nodes matching an exact symbol name. |
-| `graph` | The direct neighbours of a symbol over one `relation`: `callers` (incoming `calls`), `references`, `importers` (files importing it), `implementors` (types implementing/extending a trait, interface, or base type), `type_users` (definitions using a type in fields, params, returns, or annotations), `similar` (near-clones from extraction-time MinHash sketches, ≥ 0.7 estimated Jaccard, confidence = similarity × 100, 8 partners kept per definition, nothing under 32 tokens signed), `observed` (runtime-observed calls from traces ingested with `vorpal-index ingest-traces <index> <folded-stacks>`, each row flagged with whether the static graph has the edge; a rebuild invalidates the sidecar until traces are re-ingested). The result is the complete set of resolved edges at the stated grade and needs no confirmation by search. |
+| `graph` | The direct neighbours of a symbol over one `relation`: `callers` (incoming `calls`, each row with the call-site line in the caller), `callees` (outgoing `calls` — what the symbol calls — each row with the call-site line inside the symbol's own body), `references`, `importers` (files importing it), `implementors` (types implementing/extending a trait, interface, or base type), `type_users` (definitions using a type in fields, params, returns, or annotations), `similar` (near-clones from extraction-time MinHash sketches, ≥ 0.7 estimated Jaccard, confidence = similarity × 100, 8 partners kept per definition, nothing under 32 tokens signed), `observed` (runtime-observed calls from traces ingested with `vorpal-index ingest-traces <index> <folded-stacks>`, each row flagged with whether the static graph has the edge; a rebuild invalidates the sidecar until traces are re-ingested). The result is the complete set of resolved edges at the stated grade and needs no confirmation by search. |
 | `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`; add `"data_flows"` to follow argument flow, `"changes_with"` for git co-change, `"similar_to"` for near-clones). |
 | `data_flow` | Where a symbol's arguments flow: per-argument rows (`arg#i` → callee `param#j`, with the argument expression when traceable) joined from the `dataflow.bin` sidecar. Captured for Rust/Python/TypeScript/TSX call sites; older generations without the sidecar answer empty. |
 | `query` | Cypher-shaped read-only queries (openCypher read subset): `MATCH (f:Function)-[:calls]->(g) WITH g, count(*) AS n WHERE n >= 20 AND NOT EXISTS { (g)-[:calls]->() } RETURN g.name, n ORDER BY n DESC LIMIT 20`. Linear patterns up to 8 segments with var-length paths and grade floors; `WHERE` trees with `=~`, `IN`, `IS NULL`, `n:Label`, `EXISTS {…}`; `WITH`/`UNWIND` stages; `RETURN [DISTINCT]` of expressions — properties, arithmetic, string/list functions, `CASE`, `count/sum/avg/min/max/collect` with implicit grouping; `ORDER BY`/`SKIP`/`LIMIT`; `UNION [ALL]`. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, 100k rows) and refuses by naming the ceiling instead of truncating. Not supported, by name: `OPTIONAL MATCH`, a second `MATCH`, `XOR`, map literals, path/relationship variables. |
@@ -320,3 +320,21 @@ server. The served graph keeps answering from the committed generation throughou
 atomic `CURRENT` swap publishes new work, and `index` responses are prefixed `(supervised)`
 when a child ran. Without a discoverable binary the build runs in-process and says so.
 Child builds are killed after `VORPAL_MCP_BUILD_TIMEOUT_S` (default 1800).
+
+Two rules keep the served graph truthful when the tree and the index move independently:
+
+- **"Unchanged" is measured against what is served, never against what is on disk.** When
+  a save re-extracts byte-identical to the product the served graph was built from, the
+  daemon answers as is and only canonicalizes the file's stamps in the background. That
+  comparison uses the daemon's own retained products, not the committed generation's pack:
+  a generation can be committed from a tree that had already moved on (the background
+  canonicalizer's own read, or a `vorpal index` run beside the daemon), and measuring
+  against it would let a real edit pass as "unchanged" and the pre-edit graph serve
+  indefinitely. (Fixed 2026-09-04; the regression tests are
+  `crates/mcp/tests/watch.rs` and the `live_differential` oracle.)
+- **A generation committed behind the daemon's back is adopted.** If `CURRENT` names a
+  generation none of the daemon's own committers wrote — an external `vorpal index`, a
+  second daemon on the same tree — the next dirty or backstop pass loads it and rebuilds
+  the retained tiers from it. Running `vorpal index` beside a live daemon is therefore
+  always safe: the daemon converges on the newest committed generation, then keeps
+  absorbing edits from there.
