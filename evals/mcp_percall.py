@@ -29,7 +29,11 @@ def med_call(d, tool, args, n=5):
   dts = [d.call(tool, args)[0] for _ in range(n)]
   sc = r.get("structuredContent", {}) or {}
   recs = sc.get("records") or sc.get("hits") or []
-  return statistics.median(dts), len(json.dumps(sc)), (len(recs) if isinstance(recs, list) else "?"), first_dt
+  n = len(recs) if isinstance(recs, list) else "?"
+  # An ambiguous selector returns candidate definitions, not relation hits — say so.
+  if sc.get("outcome") not in (None, "hits"):
+    n = f"{n} ({sc.get('outcome')})"
+  return statistics.median(dts), len(json.dumps(sc)), n, first_dt
 def med_cmd(cmd, cwd, n=5):
   # stdin must be /dev/null: with an inherited pipe and no path argument, rg searches STDIN
   # and waits for EOF forever (the 21-minute hang of 2026-09-05).
@@ -49,7 +53,9 @@ for corpus, root in (("repo", REPO), ("kernel", KERNEL)):
               ("snippet render_toml", "snippet", {"name":"render_toml"}, "rg -n 'fn render_toml' crates && sed -n \"$(rg -n 'fn render_toml' crates | head -1 | cut -d: -f2),+56p\" \"$(rg -l 'fn render_toml' crates | head -1)\""),
               ("search 'stdio pump reader thread'", "search", {"query":"stdio pump reader thread","k":5}, r"rg -n -i 'stdio.*pump|reader thread' crates")]
   else:
-    probes = [("callers kmalloc (limit 100)", "graph", {"relation":"callers","name":"kmalloc","limit":100}, r"rg -n 'kmalloc\(' -t c"),
+    # `kmalloc` is ambiguous in the kernel (six definitions; its macro resolves no call edges), so
+    # its "6 records" are candidates, not callers — use a function with real fan-in instead.
+    probes = [("callers schedule_timeout_interruptible (limit 100)", "graph", {"relation":"callers","name":"schedule_timeout_interruptible","limit":100}, r"rg -n 'schedule_timeout_interruptible\(' -t c"),
               ("callers vfs_read", "graph", {"relation":"callers","name":"vfs_read"}, r"rg -n 'vfs_read\(' -t c"),
               ("callees vfs_read", "graph", {"relation":"callees","name":"vfs_read"}, "rg -n -A 40 '^ssize_t vfs_read\\(' -t c"),
               ("node schedule_timeout", "node", {"name":"schedule_timeout"}, r"rg -n '^signed long __sched schedule_timeout\(' -t c"),

@@ -4262,3 +4262,16 @@ with `Bash(<abs path>:*)` added; recorded in docs/mcp.md. Costs on the CLI rows 
 vs 11–29 ¢) are as billed for these single runs; prompt-cache hits vary between runs and
 are not controlled here.
 
+### Erratum: the `kmalloc` callers row was never callers (2026-09-05)
+
+The independent read-only profile pass (REPORT.md, other session) noticed what our
+harness did not: `graph callers kmalloc` on the kernel returns `outcome: ambiguous` with
+the six definitions named `kmalloc` (a Field, four Functions under tools/, and the
+include/linux/slab.h Macro), and the disambiguated macro (`--path include/linux/slab.h`)
+has zero resolved call edges. Every table since 2026-09-04 that showed "6 resolved
+records" for `kmalloc` was counting candidates. Replaced with a function that has real
+fan-in: `callers schedule_timeout_interruptible` → outcome hits, 140 callers, page of 100
+in 3.36 ms warm (24,709 B structured) against `rg -n 'schedule_timeout_interruptible\('
+-t c` 930 ms / 164 lines / 13,489 B. `evals/mcp_percall.py` now labels non-`hits`
+outcomes instead of counting their records.
+

@@ -378,7 +378,7 @@ the model then has to read.
 | This repo: callees of `tool_result` | 0.16 ms | no equivalent | 7 records with call sites |
 | This repo: what `run_install` reaches | 0.04 ms, 1 call | 6 ms, `rg -A 75` | 4 records vs 76 lines (3 KB) |
 | This repo: source of `render_toml` | 0.04 ms | 39 ms, 2 commands | verified body vs 58 lines |
-| Kernel: callers of `kmalloc` (page of 100) | 0.16 ms | 721 ms | 6 resolved records vs 3,387 lines (284 KB) |
+| Kernel: callers of `schedule_timeout_interruptible` (page of 100) | 3.4 ms | 930 ms | 100 of 140 resolved records (25 KB) vs 164 lines (13 KB) |
 | Kernel: callers of `vfs_read` | 0.10 ms | 675 ms | 3 records with call sites vs 13 lines |
 | Kernel: callees of `vfs_read` | 0.07 ms | 685 ms, then the body | 4 records with call sites vs 41 lines |
 | Kernel: find `schedule_timeout` | 0.06 ms | 686 ms | 1 record vs 1 line |
@@ -386,10 +386,13 @@ the model then has to read.
 | Kernel: what `vfs_read` reaches, depth 2 | 0.07 ms | no equivalent | 3 records |
 
 On a small repo both are far under a model turn; the difference is round trips. On the
-kernel every grep rescans 75,954 files (about 0.7 s) while the graph answers in
-microseconds, and grep's 284 KB of `kmalloc` mentions includes definitions, comments,
-and macros the model must sift, where the graph returns the six call edges it can prove
-and says the rest are masked. The first call in a fresh daemon pays a cold open plus the
+kernel every grep rescans 75,954 files (0.7 to 0.9 s) while the graph answers in
+microseconds to milliseconds, and grep's lines include definitions, comments, and
+macros the model must sift, where the graph returns resolved call edges with their
+grades. A name with several definitions comes back as the list of candidates rather
+than a merged answer: `kmalloc` has six in the kernel tree, and its macro form resolves
+no call edges at all, so an earlier version of this table that counted those six
+candidates as callers was wrong. The first call in a fresh daemon pays a cold open plus the
 tree revalidation sweep (114 ms on this repo, 278 ms on the kernel); a kernel tree that
 changed since its generation pays a rebuild on that first call instead (9.4 s measured).
 
