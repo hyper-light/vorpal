@@ -105,7 +105,7 @@ pub struct Server {
   /// The in-flight restamp-class background canonicalization, if any (serve-immediately
   /// probe). The synchronous rebuild path drains this first so an older stamp-only commit
   /// can never land after — and regress — a newer semantic one.
-  canonicalizing: Option<std::thread::JoinHandle<bool>>,
+  canonicalizing: Option<std::thread::JoinHandle<CanonicalizeOutcome>>,
   /// The in-flight PROACTIVE full rebuild (`tick`'s heavy tier): a supervised child indexer
   /// — or an in-process background thread when none is discoverable — committing a
   /// generation while the daemon keeps serving. One more drain-ordered committer: every
@@ -173,6 +173,15 @@ pub struct Server {
 /// Retained persistence (a served build commits its own generation — no replay pipeline in
 /// the background) is on by default; `VORPAL_NO_RETAINED_PERSIST=1` restores the full
 /// hinted canonicalizer build behind every overlay serve.
+/// What a background canonicalization reports back. `None`: the build failed (the watch
+/// re-arms). `Some(true)`: the committed generation carries the served graph's bytes — the
+/// daemon keeps serving it and repoints its artifact pin. `Some(false)`: the build sealed a
+/// graph the daemon never served — the tree moved between the probe that judged it
+/// unchanged and the build's own read — so the committed generation is adopted outright.
+/// Before this distinction the second case was silent: `CURRENT` ran ahead of the served
+/// graph and every later probe of the moved file measured "unchanged" against it.
+type CanonicalizeOutcome = Option<bool>;
+
 fn retained_persist_enabled() -> bool {
   !matches!(
     std::env::var("VORPAL_NO_RETAINED_PERSIST").ok().as_deref(),
@@ -763,20 +772,42 @@ impl Server {
     // Reap a finished background canonicalization (non-blocking): a failure re-arms the
     // dirty flag; a success is the overlay builder's green light (spawn_overlay_build
     // itself re-checks every committer, so this can never read a mid-write generation).
-    if self.canonicalizing.as_ref().is_some_and(|h| h.is_finished()) {
-      let ok = self
-        .canonicalizing
-        .take()
-        .expect("checked above")
-        .join()
-        .unwrap_or(false);
-      if ok {
-        self.spawn_overlay_build();
-      } else if let Some(watch) = &self.watch {
-        watch.mark_dirty();
-      }
+    if self.canonicalizing.as_ref().is_some_and(|h| h.is_finished())
+      && let Some(handle) = self.canonicalizing.take()
+    {
+      let outcome = handle.join().unwrap_or(None);
+      self.absorb_canonicalize_outcome(outcome);
     }
     self.reap_rebuilding(false);
+  }
+
+  /// Act on a finished canonicalization (see [`CanonicalizeOutcome`]) — shared by the
+  /// non-blocking reap and the generation-bound drain, so both sites obey the same law.
+  fn absorb_canonicalize_outcome(&mut self, outcome: CanonicalizeOutcome) {
+    match outcome {
+      Some(true) => {
+        // The commit carries the served graph's bytes under fresh stamps: repoint the
+        // artifact pin so generation-bound reads (snippets, call sites) verify sources
+        // against the stamps the tree now has, not a superseded generation's.
+        if self.persisting.is_none() {
+          self.kg_dir = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
+        }
+        self.spawn_overlay_build();
+      }
+      Some(false) => {
+        vorpal_kg::phase_stamp(
+          "canonicalize: the tree moved under the probe — adopting the committed generation",
+        );
+        if let Err(err) = self.adopt_committed_generation() {
+          eprintln!("vorpal-mcp: canonicalized generation could not be adopted: {err}");
+        }
+      }
+      None => {
+        if let Some(watch) = &self.watch {
+          watch.mark_dirty();
+        }
+      }
+    }
   }
 
   /// Between-requests freshness pulse (D1, re-homed): reap background work, debounce the
@@ -870,6 +901,27 @@ impl Server {
       }
       backstop = true;
     }
+    // Truth on disk: `CURRENT` names a generation none of this daemon's committers wrote
+    // (an external `vorpal index`, another daemon on the same tree). The served graph is
+    // not that generation's, so every "unchanged" verdict below would be measured against
+    // products the daemon never served — adopt it first; the retained tiers rebuild from
+    // it in the background. Checked only on dirty or backstop-due passes: the quiet query
+    // above stays one atomic load + one clock read.
+    if self.canonicalizing.is_none()
+      && self.persisting.is_none()
+      && self.rebuilding.is_none()
+      && self.kg_dir.as_ref().is_some_and(|pinned| {
+        *pinned != vorpal_kg::resolve_index_dir(&self.index_dir)
+      })
+    {
+      vorpal_kg::phase_stamp(
+        "refresh: CURRENT moved under the daemon — adopting the committed generation",
+      );
+      self.adopt_committed_generation()?;
+    }
+    let Some(watch) = &self.watch else {
+      return Ok(());
+    };
     // Hinted revalidation: a COMPLETE captured change set patches the prior manifest in
     // place of the stat sweep (SUBSECOND.md 1c). Certainty gaps (`None`) and every 64th
     // hinted rebuild (belt-and-braces reconciliation) take the full sweep; the committed
@@ -962,10 +1014,51 @@ impl Server {
       && self.env.is_default()
       && let Some(watch_src) = self.watch.as_ref().map(|watch| watch.src().to_path_buf())
     {
-      vorpal_index::live::probe_extraction(&self.index_dir, &watch_src, paths).ok()
+      vorpal_index::live::probe_extraction(
+        &self.index_dir,
+        &watch_src,
+        paths,
+        self.overlay.as_ref(),
+      )
+      .ok()
     } else {
       None
     };
+    // Decision telemetry: the per-path verdicts the routing below keys on. Formatting is
+    // gated on the trace flag — a quiet daemon pays one branch.
+    if vorpal_kg::phase_trace_enabled()
+      && let Some(probe) = probe.as_ref()
+    {
+      use vorpal_index::live::ProbedPath;
+      const SHOWN: usize = 8;
+      for (path, probed) in probe.per_path.iter().take(SHOWN) {
+        let verdict = match probed {
+          ProbedPath::Extracted {
+            matches_cache,
+            size,
+            mtime_ns,
+            ..
+          } => format!(
+            "{} size={size} mtime_ns={mtime_ns}",
+            if *matches_cache { "unchanged" } else { "changed" }
+          ),
+          ProbedPath::Vanished => "vanished".to_string(),
+          ProbedPath::Unhandled => "unhandled".to_string(),
+          ProbedPath::Failed => "failed".to_string(),
+        };
+        let shown = path
+          .strip_prefix(&src)
+          .unwrap_or(path.as_path())
+          .display();
+        vorpal_kg::phase_stamp(&format!("refresh: probe {shown}: {verdict}"));
+      }
+      if probe.per_path.len() > SHOWN {
+        vorpal_kg::phase_stamp(&format!(
+          "refresh: probe … {} more path(s)",
+          probe.per_path.len() - SHOWN
+        ));
+      }
+    }
     if probe.as_ref().is_some_and(vorpal_index::live::ExtractionProbe::all_unchanged) {
       if self.canonicalizing.is_some() || self.persisting.is_some() || self.rebuilding.is_some()
       {
@@ -987,8 +1080,17 @@ impl Server {
       if let (Some(overlay), Some(probe)) = (self.overlay.as_mut(), probe.as_ref()) {
         overlay.note_stamps(probe);
       }
+      vorpal_kg::phase_stamp(&format!(
+        "refresh: extraction unchanged — serving as is, canonicalizing stamps for {} path(s)",
+        paths.len()
+      ));
       self.canonicalizing = Some(std::thread::spawn(move || {
-        vorpal_index::build_index_watched(&src, &index_dir, &paths, &env).is_ok()
+        // The canonicalizer re-reads the tree. `graph_reused` is its own proof that what it
+        // read is what the probe read (whole-tree reuse or the stamp-only cutoff); a sealed
+        // graph means the tree moved in between — the reap adopts it.
+        vorpal_index::build_index_watched(&src, &index_dir, &paths, &env)
+          .ok()
+          .map(|report| report.graph_reused)
       }));
       return Ok(());
     }
@@ -1061,7 +1163,13 @@ impl Server {
             let canon_src = src.clone();
             let env = self.env.clone();
             self.canonicalizing = Some(std::thread::spawn(move || {
-              vorpal_index::build_index_watched(&canon_src, &index_dir, &paths, &env).is_ok()
+              // This build seals the served change's own generation, so a fresh graph is
+              // the expected outcome, not evidence the tree moved: a move past the served
+              // state surfaces on the next pass as a stat change against the overlay's
+              // manifest, probed against the overlay's own products.
+              vorpal_index::build_index_watched(&canon_src, &index_dir, &paths, &env)
+                .ok()
+                .map(|_| true)
             }));
             if stale {
               // Tombstone debt crossed the line: retire this overlay and rebuild it from
@@ -1379,10 +1487,8 @@ impl Server {
       // the served graph was sealed from. A failed canonicalization leaves `kg_dir` unpinned
       // (the tool reports unavailable) and re-arms the watch.
       if let Some(handle) = self.canonicalizing.take() {
-        let ok = handle.join().unwrap_or(false);
-        if !ok && let Some(watch) = &self.watch {
-          watch.mark_dirty();
-        }
+        let outcome = handle.join().unwrap_or(None);
+        self.absorb_canonicalize_outcome(outcome);
       }
       if self.kg_dir.is_none() && self.kg.is_some() {
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);

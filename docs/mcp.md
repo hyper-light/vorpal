@@ -320,3 +320,21 @@ server. The served graph keeps answering from the committed generation throughou
 atomic `CURRENT` swap publishes new work, and `index` responses are prefixed `(supervised)`
 when a child ran. Without a discoverable binary the build runs in-process and says so.
 Child builds are killed after `VORPAL_MCP_BUILD_TIMEOUT_S` (default 1800).
+
+Two rules keep the served graph truthful when the tree and the index move independently:
+
+- **"Unchanged" is measured against what is served, never against what is on disk.** When
+  a save re-extracts byte-identical to the product the served graph was built from, the
+  daemon answers as is and only canonicalizes the file's stamps in the background. That
+  comparison uses the daemon's own retained products, not the committed generation's pack:
+  a generation can be committed from a tree that had already moved on (the background
+  canonicalizer's own read, or a `vorpal index` run beside the daemon), and measuring
+  against it would let a real edit pass as "unchanged" and the pre-edit graph serve
+  indefinitely. (Fixed 2026-09-04; the regression tests are
+  `crates/mcp/tests/watch.rs` and the `live_differential` oracle.)
+- **A generation committed behind the daemon's back is adopted.** If `CURRENT` names a
+  generation none of the daemon's own committers wrote — an external `vorpal index`, a
+  second daemon on the same tree — the next dirty or backstop pass loads it and rebuilds
+  the retained tiers from it. Running `vorpal index` beside a live daemon is therefore
+  always safe: the daemon converges on the newest committed generation, then keeps
+  absorbing edits from there.

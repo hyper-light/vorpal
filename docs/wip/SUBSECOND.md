@@ -228,6 +228,28 @@ The daemon's RAM becomes the source of truth; disk becomes a cache of memory.
   the sealed graph instead of re-`Kg::load`ing saved only ~30ms (mmap load was never the
   cost), and the deferred tail bought ~110ms — the remaining ~950ms is compute
   (replay+link), which is exactly the Phase-3 overlay's target, not a persistence problem.
+- **Freshness law: the served state is the reference — LANDED 2026-09-04.** The
+  serve-immediately probe judged "extraction unchanged" against `CURRENT`'s pack. That is
+  the wrong reference whenever `CURRENT` runs ahead of the served graph, and two things
+  make it run ahead: the stamp canonicalizer re-reads the tree (any lane past the cutoff —
+  a write landing between the probe's read and the build's read commits a generation the
+  daemon never served), and an external `vorpal index` beside the daemon. Trace-proven
+  failure shape (live_differential step 10, 1/6–1/30 locally, once in CI at step 8): late
+  watcher hint for the PREVIOUS step's file → probe reads pre-edit content → "unchanged"
+  → canonicalizer's full pipeline reads the post-edit content and commits it → next sweep
+  finds the file changed against the overlay's manifest → probe measures against the new
+  pack → "unchanged" → `note_stamps` → the overlay serves the pre-edit graph forever.
+  Fix: (1) `LiveOverlay` keeps one u64 body digest per retained product;
+  `probe_extraction` takes the serving overlay and measures against THAT (the committed
+  pack stays the reference only when no overlay serves, where served ≡ committed);
+  (2) the canonicalizer reports `graph_reused` — a sealed graph means the tree moved under
+  the probe and the committed generation is adopted, and a stamp-only carry repoints
+  `kg_dir` so generation-bound reads verify against the stamps the tree now has;
+  (3) on dirty/backstop passes, `CURRENT` ≠ the pinned generation with no own committer in
+  flight ⇒ adopt (external index runs converge instead of masking edits). Oracles:
+  `live.rs::probe_measures_unchanged_against_the_serving_overlay_not_the_committed_pack`
+  (both verdicts, side by side), `watch.rs::a_generation_committed_behind_the_daemon_never_masks_an_edit`
+  (deterministic on the old code), the live_differential loop (see BENCHMARKS).
 - **ANN warm hygiene — LANDED 2026-08-30**: eager warms are now single-flight and
   coalescing (an edit burst costs at most one running + one trailing warm, not one
   9-second, core-saturating build per commit), `VORPAL_NO_AUTOWARM=1` actually disables

@@ -9,7 +9,7 @@
 //! crates/kg/tests/canonical_seal.rs), so the daemon's background canonicalizer commits the
 //! very generation these answers came from.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -62,14 +62,39 @@ impl ExtractionProbe {
   }
 }
 
-/// Extract every hinted path once, comparing against the committed generation's cached
-/// products. The decision logic mirrors `vorpal_index::extraction_unchanged`; the extracted
-/// bytes ride along for [`LiveOverlay::apply_and_link_probed`]. `src` is the watched tree
-/// root — the bucketed pack's stripping root for the absolute paths probed here.
+/// Identity of a product's BODY: every byte outside the stamp window `[8..32)` (source
+/// size, mtime, and source xxh3 at fixed offsets after magic+version). Determinism makes
+/// "equal body digests ⇒ byte-identical graph rows" a theorem, so one u64 per file is the
+/// whole serve-immediately criterion. `None` for a product too short to carry a stamp
+/// window — never a match.
+fn product_body_digest(bytes: &[u8]) -> Option<u64> {
+  if bytes.len() < 32 {
+    return None;
+  }
+  let head = xxhash_rust::xxh3::xxh3_64(&bytes[0..8]);
+  Some(xxhash_rust::xxh3::xxh3_64_with_seed(&bytes[32..], head))
+}
+
+/// Extract every hinted path once, deciding per path whether its extraction is byte-
+/// identical to the product the SERVED graph was built from. The decision logic mirrors
+/// `vorpal_index::extraction_unchanged`; the extracted bytes ride along for
+/// [`LiveOverlay::apply_and_link_probed`]. `src` is the watched tree root — the bucketed
+/// pack's stripping root for the absolute paths probed here.
+///
+/// The freshness law this encodes: **"unchanged" is measured against what is being
+/// served, never against what is on disk.** With a serving overlay (`served`), the
+/// comparison is the overlay's retained product identities — the products its graph
+/// holds. Without one, the served graph IS the committed generation's, so its pack is the
+/// reference. Measuring against `CURRENT` while an overlay serves was the stale-daemon
+/// bug: a background canonicalizer (or an external `vorpal index`) can commit a generation
+/// read from a tree that moved after the overlay absorbed it; from then on every probe of
+/// the moved file judged it "unchanged" against that newer pack, the overlay noted the
+/// fresh stamps, and the daemon served the pre-edit graph indefinitely.
 pub fn probe_extraction(
   index_dir: &Path,
   src: &Path,
   paths: &HashSet<PathBuf>,
+  served: Option<&LiveOverlay>,
 ) -> Result<ExtractionProbe, String> {
   let generation = vorpal_kg::resolve_index_dir(index_dir);
   let tree_root = src
@@ -77,7 +102,11 @@ pub fn probe_extraction(
     .unwrap_or_else(|_| src.to_path_buf())
     .to_string_lossy()
     .into_owned();
-  let pack = PackReader::open_rooted(&generation, Some(&tree_root));
+  // The committed pack is the reference only when no overlay serves.
+  let pack = match served {
+    Some(_) => None,
+    None => PackReader::open_rooted(&generation, Some(&tree_root)),
+  };
   let extractor =
     OutlineExtractor::new().map_err(|err| format!("probe: extractor init failed: {err}"))?;
   let mut ordered: Vec<&PathBuf> = paths.iter().collect();
@@ -107,15 +136,18 @@ pub fn probe_extraction(
             Some(product) => {
               let mut bytes = Vec::new();
               encode_product_into(&product, &mut bytes);
-              let matches_cache = pack
-                .as_ref()
-                .and_then(|p| p.get(&key))
-                .is_some_and(|cached| {
-                  bytes.len() == cached.len()
-                    && bytes.len() >= 32
-                    && bytes[0..8] == cached[0..8]
-                    && bytes[32..] == cached[32..]
-                });
+              let matches_cache = match served {
+                Some(overlay) => overlay.product_matches(&key, &bytes),
+                None => pack
+                  .as_ref()
+                  .and_then(|p| p.get(&key))
+                  .is_some_and(|cached| {
+                    bytes.len() == cached.len()
+                      && bytes.len() >= 32
+                      && bytes[0..8] == cached[0..8]
+                      && bytes[32..] == cached[32..]
+                  }),
+              };
               ProbedPath::Extracted {
                 bytes,
                 matches_cache,
@@ -141,6 +173,13 @@ pub struct LiveOverlay {
   /// build's persistence writes it verbatim, byte-equal to what the pipeline's
   /// `patch_manifest` would produce from the same stats.
   manifest: Manifest,
+  /// Path → identity of the product body the retained graph holds for it (see
+  /// [`product_body_digest`]). The serve-immediately probe measures "unchanged" against
+  /// THIS — the served state — never against the committed pack, which a background
+  /// committer or an external indexer may have moved past the served graph. Maintained
+  /// beside the manifest: replaced on absorb, dropped on retract, untouched by
+  /// stamp-only notes (content unchanged by definition).
+  products: HashMap<String, u64>,
   /// The watched source root — the co-change pass consults its git history per link (the
   /// HEAD-keyed cache makes that a file read between commits).
   src: PathBuf,
@@ -207,6 +246,7 @@ impl LiveOverlay {
     // manifest order — the same bytes a serial pass produces, minutes faster at scale.
     const BATCH: usize = 1024;
     let entries = manifest.entries();
+    let mut products: HashMap<String, u64> = HashMap::with_capacity(entries.len());
     let mut loose: Vec<(usize, Vec<u8>)> = Vec::new();
     for chunk in entries.chunks(BATCH) {
       loose.clear();
@@ -250,6 +290,9 @@ impl LiveOverlay {
           vorpal_kg::phase_stamp(&msg);
           return Err(msg);
         }
+        if let Some(digest) = product_body_digest(bytes) {
+          products.insert((*path).to_owned(), digest);
+        }
       }
       index.apply_files_parallel(&interner, &batch).map_err(|err| {
         let msg = format!("overlay: batch apply failed: {err}");
@@ -268,9 +311,17 @@ impl LiveOverlay {
       index,
       extractor,
       manifest,
+      products,
       src: src.to_path_buf(),
       index_dir: index_dir.to_path_buf(),
     })
+  }
+
+  /// Is `bytes` (a freshly encoded product) body-identical to the product the retained
+  /// graph holds for `key`? False for a path the graph never held and for a product too
+  /// short to carry a stamp window — both route to the absorb, never to "serve as is".
+  pub fn product_matches(&self, key: &str, bytes: &[u8]) -> bool {
+    product_body_digest(bytes).is_some_and(|digest| self.products.get(key) == Some(&digest))
   }
 
   /// Recover the exact change set by stat-diffing the live tree against the retained
@@ -334,6 +385,7 @@ impl LiveOverlay {
           .apply_file(&self.interner, &key, None)
           .map_err(|err| format!("overlay: retract {key} failed: {err}"))?;
         self.manifest.remove(&key);
+        self.products.remove(key.as_ref());
         continue;
       }
       let stat = fs::metadata(path).ok().map(|meta| {
@@ -365,6 +417,7 @@ impl LiveOverlay {
       let Some((size, mtime_ns)) = stat else {
         return Err(format!("overlay: stat {key} failed"));
       };
+      self.record_product(&key, &bytes);
       self.manifest.upsert(FileStat {
         path: key.into_owned(),
         size,
@@ -372,6 +425,18 @@ impl LiveOverlay {
       });
     }
     Ok(())
+  }
+
+  /// Track the product identity the retained graph now holds for `key` (see `products`).
+  fn record_product(&mut self, key: &str, bytes: &[u8]) {
+    match product_body_digest(bytes) {
+      Some(digest) => {
+        self.products.insert(key.to_owned(), digest);
+      }
+      None => {
+        self.products.remove(key);
+      }
+    }
   }
 
   /// [`LiveOverlay::absorb`] from a probe's already-extracted products — the serve path
@@ -386,6 +451,7 @@ impl LiveOverlay {
             .apply_file(&self.interner, &key, None)
             .map_err(|err| format!("overlay: retract {key} failed: {err}"))?;
           self.manifest.remove(&key);
+          self.products.remove(key.as_ref());
         }
         ProbedPath::Unhandled => {
           if self.index.contains(&key) {
@@ -402,6 +468,7 @@ impl LiveOverlay {
             .index
             .apply_file(&self.interner, &key, Some(bytes))
             .map_err(|err| format!("overlay: apply {key} failed: {err}"))?;
+          self.record_product(&key, bytes);
           self.manifest.upsert(FileStat {
             path: key.into_owned(),
             size: *size,
@@ -418,7 +485,8 @@ impl LiveOverlay {
 
   /// Record probe-time stats for a stamp-preserving serve (content unchanged, stamps moved):
   /// no graph work, but the retained manifest must track the tree or a LATER served
-  /// persistence would commit stale stamps and fork the generation id.
+  /// persistence would commit stale stamps and fork the generation id. Product identities
+  /// stay as they are — the probe proved them equal to what this overlay holds.
   pub fn note_stamps(&mut self, probe: &ExtractionProbe) {
     for (path, probed) in &probe.per_path {
       if let ProbedPath::Extracted { size, mtime_ns, .. } = probed {
@@ -703,5 +771,74 @@ impl ServedPersist {
       .map_err(|err| format!("served persist: commit: {err}"))?;
     vorpal_kg::phase_stamp("served persist: committed");
     Ok(out.join("gen").join(id))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn write(path: &Path, text: &str) {
+    fs::write(path, text).unwrap();
+  }
+
+  /// The probe's reference is the served state: with an overlay, its retained products;
+  /// without one, the committed pack. When a generation committed behind the overlay's
+  /// back already holds the new content, the two verdicts differ — and only the overlay's
+  /// ("changed") keeps the served graph truthful.
+  #[test]
+  fn probe_measures_unchanged_against_the_serving_overlay_not_the_committed_pack() {
+    let base = std::env::temp_dir().join(format!("vorpal-live-probe-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let src = base.join("repo");
+    fs::create_dir_all(&src).unwrap();
+    let src = src.canonicalize().unwrap();
+    let index = base.join("index");
+    write(&src.join("a.py"), "def alpha():\n    return 1\n");
+    write(&src.join("b.py"), "def beta_v1():\n    return alpha()\n");
+    crate::build_index(&src, &index).expect("initial index");
+    let mut overlay = LiveOverlay::build(&index, &src).expect("overlay");
+    let b = src.join("b.py");
+    let paths: HashSet<PathBuf> = [b.clone()].into_iter().collect();
+
+    // Same content, either reference: unchanged.
+    let probe = probe_extraction(&index, &src, &paths, Some(&overlay)).unwrap();
+    assert!(probe.all_unchanged(), "v1 against the overlay that holds v1");
+    let probe = probe_extraction(&index, &src, &paths, None).unwrap();
+    assert!(probe.all_unchanged(), "v1 against the pack that holds v1");
+
+    // The overlay absorbs v2 (the served graph now holds v2); the pack still holds v1.
+    write(&b, "def beta_v2():\n    return alpha()\n");
+    overlay.absorb(&paths).expect("absorb v2");
+    let probe = probe_extraction(&index, &src, &paths, Some(&overlay)).unwrap();
+    assert!(probe.all_unchanged(), "v2 against the overlay that absorbed v2");
+    let probe = probe_extraction(&index, &src, &paths, None).unwrap();
+    assert!(!probe.all_unchanged(), "v2 against the pack that holds v1");
+
+    // A generation committed behind the overlay's back holds v3; the served graph holds v2.
+    write(&b, "def beta_v3():\n    return alpha()\n");
+    crate::build_index(&src, &index).expect("external index run");
+    let probe = probe_extraction(&index, &src, &paths, None).unwrap();
+    assert!(
+      probe.all_unchanged(),
+      "against the committed pack v3 looks unchanged — the verdict that served stale graphs"
+    );
+    let probe = probe_extraction(&index, &src, &paths, Some(&overlay)).unwrap();
+    assert!(
+      !probe.all_unchanged(),
+      "against the serving overlay v3 is a change — the verdict that routes to the absorb"
+    );
+
+    // Stamp-only notes keep identities; a retract drops them.
+    overlay.note_stamps(&probe);
+    let probe = probe_extraction(&index, &src, &paths, Some(&overlay)).unwrap();
+    assert!(!probe.all_unchanged(), "noting stamps must not forge a product identity");
+    fs::remove_file(&b).unwrap();
+    overlay.absorb(&paths).expect("retract");
+    write(&b, "def beta_v3():\n    return alpha()\n");
+    let probe = probe_extraction(&index, &src, &paths, Some(&overlay)).unwrap();
+    assert!(!probe.all_unchanged(), "a retracted path has no identity to match");
+
+    let _ = fs::remove_dir_all(&base);
   }
 }
