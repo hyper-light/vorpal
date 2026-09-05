@@ -236,7 +236,33 @@ impl Handler for Server {
   }
 
   fn instructions(&self) -> Option<String> {
-    Some(INSTRUCTIONS.to_string())
+    Some(format!("{INSTRUCTIONS} {}", self.fast_path_note()))
+  }
+}
+
+impl Server {
+  /// The CLI one-liner for THIS index, carried in the server instructions: a client that
+  /// loads tool schemas lazily (Claude Code) spends a model turn per tool it loads, while
+  /// its shell tool is always resident — so a single lookup through `vorpal graph` is one
+  /// turn cheaper than the same lookup through the MCP tool. The path is this daemon's own
+  /// index, absolute, and the binary is the one serving (or `vorpal` on PATH).
+  fn fast_path_note(&self) -> String {
+    let index = std::fs::canonicalize(&self.index_dir).unwrap_or_else(|_| self.index_dir.clone());
+    let bin = std::env::current_exe()
+      .ok()
+      .filter(|exe| exe.file_name().is_some_and(|n| n == "vorpal"))
+      .map(|exe| exe.to_string_lossy().into_owned())
+      .unwrap_or_else(|| "vorpal".to_string());
+    let index = index.display();
+    format!(
+      "Fast path when this client loads tool schemas lazily: the same graph answers from \
+       the shell without a schema load. Exact commands: `{bin} graph callers <name> --index \
+       {index} --format lean` (other verbs in that position: refs, importers, implementors, \
+       typeusers, similar, node, snippet); what a symbol calls: `{bin} graph reachable <name> \
+       --direction out --depth 1 --index {index} --format lean` (--direction in for what \
+       reaches it; omit --depth for the full closure). Always the `graph` word, always \
+       --index. Prefer it for a single lookup; use the MCP tools for several calls."
+    )
   }
 }
 

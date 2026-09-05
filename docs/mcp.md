@@ -154,6 +154,15 @@ still pays it). Three things reduce that cost:
   rest share a single schema load.
 - **One load, not one per turn.** The server's instructions tell the model to load every
   vorpal tool it will need in a single `ToolSearch` call.
+- **The server hands the model a schema-free path.** Its `instructions` (which every
+  client shows the model once, in context) end with the exact CLI one-liner for this
+  daemon's own index: `<vorpal> graph callers <name> --index <abs index> --format lean`,
+  and the `graph reachable … --direction out --depth 1` form for what a symbol calls. A
+  client's shell tool is never deferred, so a single lookup that way is two model turns
+  (one command, one answer) instead of three. Measured 2026-09-04 on Opus: callers of
+  `vfs_read` in the kernel, 2 turns, 37 K tokens, 8.6 s; through the MCP tool, 3 turns,
+  52 K, 7.3 s; through grep, 3 turns, 62 K, 11.8 s. The note tells the model to prefer
+  the shell for one lookup and the MCP tools when it will make several calls.
 - **Keeping the schemas resident is possible but not recommended.** Claude Code's
   `ENABLE_TOOL_SEARCH=false` puts MCP schemas in context up front and removes the
   `ToolSearch` turn, but it also makes Claude Code's own deferred tools resident: measured
