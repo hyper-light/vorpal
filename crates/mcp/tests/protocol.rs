@@ -119,7 +119,6 @@ fn initialize_handshake_and_tool_listing() {
     let read_only = tool["annotations"]["readOnlyHint"].as_bool().expect("readOnlyHint");
     assert_eq!(read_only, tool["name"] != "index", "{}", tool["name"]);
     assert_eq!(tool["annotations"]["openWorldHint"], false);
-    assert_eq!(tool["outputSchema"]["type"], "object", "{}", tool["name"]);
     // Every record-bearing tool declares the `format` switch it honours.
     if tool["inputSchema"]["properties"].get("cursor").is_some() {
       assert!(
@@ -127,9 +126,13 @@ fn initialize_handshake_and_tool_listing() {
         "{} pages records but does not declare format",
         tool["name"]
       );
-      assert!(tool["outputSchema"]["properties"]["records"].is_object());
     }
   }
+  // The listing is a per-call token cost for every client; it is size-gated here. The
+  // 44 KB listing of 2026-09-04 cost ~12 K tokens per turn when resident; the diet
+  // landed at 10.8 KB. Descriptions live in docs/mcp.md, not on the wire.
+  let bytes = serde_json::to_string(&response["result"]["tools"]).unwrap().len();
+  assert!(bytes <= 12_000, "tools/list is {bytes} B; keep it under 12 KB");
 }
 
 /// `params._meta` every 2026-07-28 request carries.
@@ -622,6 +625,17 @@ fn typed_records_and_cursor_pagination() {
   );
   let lean = &response["result"]["structuredContent"]["records"][0];
   assert_eq!(lean["name"], "target");
+  // Callers rows carry the call site, so "who calls X" needs no snippet follow-up.
+  let response = request(
+    &mut server,
+    22,
+    "tools/call",
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target", "format": "lean"}}),
+  );
+  let caller = &response["result"]["structuredContent"]["records"][0];
+  assert_eq!(caller["name"], "caller");
+  assert_eq!(caller["site_line"], 4, "{caller}");
+  assert_eq!(caller["site"], "target()");
   assert_eq!(lean["kind"], "Function");
   assert!(lean.get("signature").is_none() && lean.get("span").is_none() && lean.get("external_id").is_none());
   let response = request(

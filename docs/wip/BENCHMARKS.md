@@ -4021,3 +4021,47 @@ does not need (a `node` before `graph`, a second `reachable`), which no server-s
 change controls. Standing: the per-call table is the stable measurement; end-to-end is
 one run per cell and moves with the model. Next lead: multi-hop tasks (impact, why
 chains, depth-3 reachability) where one graph call replaces many greps — unmeasured.
+
+## Schema diet + call sites on graph rows + direct-call instructions (2026-09-04)
+
+Where a Claude Code turn's tokens go (first-turn input, same prompt, this repo): 20.1 K with
+no MCP server; 20.6 K with vorpal deferred (names + instructions only); 36.2 K with no MCP
+server but `ENABLE_TOOL_SEARCH=false` (Claude Code's own deferred tools resident); 48.4 K
+vorpal resident on the 27-tool / 44 KB listing; **41.1 K** vorpal resident on the new
+21-tool / 10,950 B listing (our share 12 K → ~4.5 K). A tool result is < 1 K. Wall is
+~3 s per Opus turn. Tokens and wall are the turn count.
+
+Changes: (1) listing 43,608 → 10,950 B (outputSchema dropped — the envelope is documented,
+not declared; two annotation hints; terse tool and property descriptions; prose in
+docs/mcp.md; test gate 12 KB); (2) `related_records_with_sites`: callers/references/
+importers/implementors/type_users rows carry `site_line` + `site` (first retained
+occurrence span in the caller's own source, read from the generation's pack); (3)
+instructions: call graph/reachable/snippet directly by name, `node`/`search` only for
+unknown or ambiguous names, results are complete, one ToolSearch load, `format: lean`.
+
+End to end, Opus, `CLAUDE_EFFORT` unset, one run each (TS = ToolSearch turns; the CLI-via-
+Bash arm from the same day: 2 turns / 43 K / 8.7 s when the model knew the command, 8–12
+turns when it did not):
+
+| corpus / question | arm | turns | TS | tokens | $ | wall | calls |
+|---|---|---:|---:|---:|---:|---:|---|
+| repo: who calls tool_result | grep | 5 | 0 | 98,313 | 0.213 | 13.9 | Grep Read Read Grep |
+| | vorpal deferred | 3 | 1 | 63,269 | 0.144 | 6.3 | ToolSearch graph |
+| | vorpal auto | 2 | 0 | 82,926 | 0.153 | 7.5 | graph |
+| repo: what run_install reaches | grep | 4 | 0 | 77,114 | 0.212 | 14.2 | Grep Grep Read |
+| | vorpal deferred | 3 | 1 | 63,796 | 0.160 | 14.4 | ToolSearch reachable |
+| | vorpal auto | 4 | 1 | 167,387 | 0.216 | 13.8 | ToolSearch reachable node |
+| kernel: who calls vfs_read | grep | 3 | 0 | 62,177 | 0.066 | 11.8 | Grep Bash |
+| | vorpal deferred | 3 | 1 | 52,410 | 0.137 | 7.3 | ToolSearch graph |
+| | vorpal auto | 3 | 1 | 113,414 | 0.165 | 8.6 | ToolSearch graph |
+| kernel: what vfs_read calls | grep | 3 | 0 | 60,202 | 0.053 | 8.2 | Grep Read |
+| | vorpal deferred | 4 | 1 | 54,892 | 0.133 | 13.4 | ToolSearch snippet graph |
+| | vorpal auto | 5 | 1 | 191,729 | 0.202 | 18.0 | ToolSearch node reachable snippet |
+
+The day's arc on "who calls vfs_read" (Opus): 8 turns / 161 K / 23 s (27 tools, effort
+high) → 4 / 79 K / 14.4 s (graph tool, finality wording) → 3 / 52 K / 7.3 s (diet, call
+sites, direct-call instructions). Deferred now beats grep on tokens on every row and on
+wall on three; `auto` is inconsistent (0 or 1 loads) and pays Claude Code's own resident
+tools, so the default is the recommendation. Remaining gap: the one-file question, where
+the schema load is the extra turn; and dollar cost on the kernel, where Opus prices the
+loaded schema above a cheap grep. Unmeasured, still: multi-hop questions.

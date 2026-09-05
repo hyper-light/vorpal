@@ -48,6 +48,13 @@ pub struct RelatedRecord {
   /// Estimated Jaccard similarity x 100 (`similar_to` edges only).
   #[serde(skip_serializing_if = "Option::is_none")]
   pub similarity: Option<u8>,
+  /// 1-based line of the first retained occurrence of the edge inside THIS node's source
+  /// (the call site for `callers`), when the generation's pack can supply it.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub site_line: Option<u32>,
+  /// That line's text, trimmed and capped — the evidence a follow-up `snippet` would fetch.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub site: Option<String>,
 }
 
 /// One step of a relation-restricted traversal: the reached node, its BFS depth, the node it
@@ -1034,10 +1041,100 @@ pub fn related_records(
           node: node_record(kg, id)?,
           grade: crate::confidence_label(confidence).to_string(),
           similarity: (edge.base() == vorpal_kg::EdgeType::SIMILAR_TO).then_some(confidence),
+          site_line: None,
+          site: None,
         })
       })
       .collect(),
   ))
+}
+
+/// [`related_records`] plus the call site: for every hit, the line (1-based) and text of
+/// the first retained occurrence of the edge inside the hit's own source, read from the
+/// generation's pack so offsets and bytes agree with the graph. "Who calls X" then needs
+/// no follow-up `snippet` — the evidence rides on the row (measured 2026-09-04: the
+/// follow-up was one of the two model turns separating the graph from a single grep).
+/// Files that changed since the generation, or edges without retained occurrences,
+/// leave the fields absent; `similar` rows never carry them.
+pub fn related_records_with_sites(
+  kg: &Kg,
+  artifacts_dir: Option<&std::path::Path>,
+  verb: &str,
+  target: &GraphTarget,
+) -> Result<Selected<RelatedRecord>, String> {
+  let mut selected = related_records(kg, verb, target)?;
+  let Selected::Hits(hits) = &mut selected else {
+    return Ok(selected);
+  };
+  if verb == "similar" || hits.is_empty() {
+    return Ok(selected);
+  }
+  let Some(edge) = (match verb {
+    "callers" => Some(vorpal_kg::EdgeType::CALLS),
+    "refs" | "references" => Some(vorpal_kg::EdgeType::REFERENCES),
+    "importers" => Some(vorpal_kg::EdgeType::IMPORTS),
+    "implementors" => Some(vorpal_kg::EdgeType::IMPLEMENTS),
+    "typeusers" => Some(vorpal_kg::EdgeType::OF_TYPE),
+    _ => None,
+  }) else {
+    return Ok(selected);
+  };
+  let targets: Vec<u64> = resolve_target(kg, target)
+    .map_err(|err| err.to_string())?
+    .into_iter()
+    .map(|id| id.raw())
+    .collect();
+  let pack = artifacts_dir.and_then(crate::cached_pack);
+  // One read per distinct file; hits arrive in ascending id order (file-grouped).
+  let mut cached: Option<(String, Option<Vec<u8>>)> = None;
+  for hit in hits.iter_mut() {
+    let from = NodeId::new(hit.node.id);
+    let Some(start) = kg
+      .evidence_from(from)
+      .into_iter()
+      .filter(|row| {
+        row.outcome == vorpal_kg::EvidenceOutcome::Edge
+          && targets.contains(&(row.to as u64))
+          && vorpal_kg::EdgeType(row.etype).base() == edge.base()
+      })
+      .map(|row| row.span_start as usize)
+      .min()
+    else {
+      continue;
+    };
+    if cached.as_ref().map(|(path, _)| path.as_str()) != Some(hit.node.path.as_str()) {
+      let read = crate::read_indexed_source_with(pack.as_deref(), &hit.node.path)
+        .ok()
+        .and_then(|read| match read {
+          crate::IndexedRead::Verified(bytes) | crate::IndexedRead::Unverified(bytes) => Some(bytes),
+          crate::IndexedRead::Changed => None,
+        });
+      cached = Some((hit.node.path.clone(), read));
+    }
+    let Some((_, Some(bytes))) = cached.as_ref() else {
+      continue;
+    };
+    if start >= bytes.len() {
+      continue;
+    }
+    let line_start = bytes[..start].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let line_end = bytes[start..]
+      .iter()
+      .position(|&b| b == b'\n')
+      .map_or(bytes.len(), |i| start + i);
+    let text = String::from_utf8_lossy(&bytes[line_start..line_end]).trim().to_string();
+    const CAP: usize = 160;
+    let text = if text.chars().count() > CAP {
+      let mut cut: String = text.chars().take(CAP).collect();
+      cut.push('…');
+      cut
+    } else {
+      text
+    };
+    hit.site_line = Some(bytes[..line_start].iter().filter(|&&b| b == b'\n').count() as u32 + 1);
+    hit.site = Some(text);
+  }
+  Ok(selected)
 }
 
 /// One page of a selector-driven query whose full record set would be expensive to

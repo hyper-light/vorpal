@@ -241,17 +241,15 @@ impl Handler for Server {
 }
 
 /// Guidance a client may show its model once; the tool descriptions carry the details.
-pub(crate) const INSTRUCTIONS: &str = "vorpal serves a knowledge graph of one indexed \
-repository. Start with `search` or `node` to find a definition, then `graph` (relation: \
-callers, references, importers, implementors, type_users, similar, observed), `reachable`, \
-or `why` to follow edges, and `snippet` or `fetch_span` to read the verbatim source behind \
-any result. Graph answers are complete: a `graph`, `reachable`, or `why` result is the full \
-resolved set at the grade each row states — do not confirm it with search, code_search, or \
-grep. If your client defers these tools, load every one you will need in a single \
-ToolSearch call (for example select:mcp__vorpal__search,mcp__vorpal__node,mcp__vorpal__graph,\
-mcp__vorpal__snippet) rather than one per turn. Record-bearing tools page with \
-`cursor`/`limit` and accept `format: lean|toon|ids` for smaller output (`lean` is right for \
-almost every question). Every result names the index generation it was read from.";
+pub(crate) const INSTRUCTIONS: &str = "Knowledge graph of one indexed repository. Call `graph` \
+(relation: callers | references | importers | implementors | type_users | similar | \
+observed), `reachable`, `snippet`, or `why` DIRECTLY with the exact symbol name; use `node` \
+or `search` only when the name is unknown or ambiguous. Every graph, reachable, and why \
+result is the complete resolved set at the grade each row states — never confirm it with \
+search, code_search, or grep; callers rows already carry the call-site line. Pass \
+`format: \"lean\"` unless you need signatures. If your client defers these tools, load all \
+you will need in ONE ToolSearch call. Results page with cursor/limit and name the index \
+generation they were read from.";
 
 impl Drop for Server {
   fn drop(&mut self) {
@@ -1679,14 +1677,17 @@ impl Server {
         };
         // `self.kg()` keeps the daemon contract: freshness revalidation, the warm cached
         // graph, and the "run the 'index' tool first" error when nothing is indexed yet.
+        let dir = self.kg_dir.clone();
         let kg = self.kg()?;
         let data = if tool == "node" {
           let records =
             vorpal_index::records::listing_records(kg, &target).map_err(ToolError::from)?;
           paged(records, args, "hits")?
         } else {
+          // Rows carry the call site (line + text) so "who calls X" needs no snippet.
           let selected =
-            vorpal_index::records::related_records(kg, verb, &target).map_err(ToolError::from)?;
+            vorpal_index::records::related_records_with_sites(kg, dir.as_deref(), verb, &target)
+              .map_err(ToolError::from)?;
           selected_data(selected, args)?
         };
         let text = vorpal_index::graph_query_on(kg, verb, &target)
@@ -2256,352 +2257,210 @@ const GRAPH_RELATIONS: &[&str] = &[
 /// The tool declarations `tools/list` returns for `profile`: filtered by the one membership
 /// authority, then decorated (titles, annotation hints, `format`, output schemas).
 pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
-  let name_only = json!({
-    "name": {"type": "string", "description": "Exact symbol name"},
-    "path": {"type": "string", "description": "Refine: definition file path must end with this suffix"},
-    "kind": {"type": "string", "description": "Refine: symbol kind (function, method, struct, field, …)"},
-    "id": {"type": "integer", "description": "Query exactly this node id (from `node` output or an ambiguity listing)"},
-    "eid": {"type": "string", "description": "Durable external id (32 hex chars from `node` output) — survives rebuilds; also accepted as a `name` of the form eid:<hex>"},
-    "all": {"type": "boolean", "description": "Merge results across ALL same-named definitions instead of listing candidates"},
-    "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-    "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
+  // Every description is terse ON PURPOSE: a client such as Claude Code either loads a
+  // tool's schema in a model turn of its own or carries the whole listing in every turn's
+  // input, so bytes here are tokens per call. The prose lives in docs/mcp.md; the
+  // listing is size-gated by a test (tests/protocol.rs) so it cannot silently re-bloat.
+  let sel = json!({
+    "name": {"type": "string"},
+    "path": {"type": "string", "description": "suffix"},
+    "kind": {"type": "string"},
+    "id": {"type": "integer"},
+    "eid": {"type": "string"},
+    "all": {"type": "boolean", "description": "merge same-named"},
+    "cursor": {"type": "string"},
+    "limit": {"type": "integer", "description": "max 1000"}
   });
-  let mut graph_props = name_only.clone();
-  if let Some(props) = graph_props.as_object_mut() {
-    props.insert(
-      "relation".to_string(),
-      json!({
-        "type": "string",
-        "enum": GRAPH_RELATIONS,
-        "description": "Which edge set to return: callers, references, importers, implementors, type_users, similar, observed"
-      }),
-    );
-  }
+  let page = json!({
+    "cursor": {"type": "string"},
+    "limit": {"type": "integer", "description": "max 1000"}
+  });
+  let with = |base: &Value, extra: Value| -> Value {
+    let mut props = base.clone();
+    if let (Some(p), Some(e)) = (props.as_object_mut(), extra.as_object()) {
+      for (k, v) in e {
+        p.insert(k.clone(), v.clone());
+      }
+    }
+    props
+  };
   let tools: Vec<Value> = vec![
     tool(
       "index",
-      "Build or refresh the knowledge-graph index from a source directory (near-instant when \
-       the tree is unchanged), then hold it warm for queries.",
+      "Build or refresh the index from a source directory; near-instant when unchanged.",
       json!({
-        "src": {"type": "string", "description": "Source directory to index"},
-        "verify": {"type": "boolean", "description": "Content-authoritative cache validation: verify every replay against current file bytes (default fast-stat trusts size+mtime outside the racy window)"},
-        "parse_health": {"type": "string", "enum": ["warn", "exclude", "fail"], "description": "Policy for files whose parse produced ERROR nodes: warn reports (default), exclude drops them from the graph, fail aborts before committing"},
-        "max_error_ratio": {"type": "number", "description": "Unhealthy threshold: error bytes / file size above this ratio (default 0.0 = any error byte)"},
-        "semantic_tier": {"type": "string", "enum": ["lexical", "learned"], "description": "Embedding tier for this index: lexical (default surface hashing) or learned (embeddings trained on this corpus at warm time; small corpora state a lexical fallback in provenance). Omit to keep the index's current selection."}
+        "src": {"type": "string"},
+        "verify": {"type": "boolean", "description": "by content"},
+        "parse_health": {"type": "string", "enum": ["warn", "exclude", "fail"]},
+        "max_error_ratio": {"type": "number", "description": "error-byte ratio"},
+        "semantic_tier": {"type": "string", "enum": ["lexical", "learned"]}
       }),
       &["src"],
     ),
-    tool(
-      "health",
-      "Per-file parse damage in the pinned generation: ERROR-node counts, covered-byte \
-       ratios, representative error spans, language + extraction-identity context, and the \
-       graph entities whose definitions overlap damaged regions — the difference between \
-       'no edge' and 'unknowable here'.",
-      json!({}),
-      &[],
-    ),
-    tool(
-      "schema",
-      "What this graph contains, by vocabulary: node kinds, edge relations, and resolution \
-       grades — each with counts — plus generation id and warm-tier state. Call this before \
-       forming queries; it is the authority on which kind/relation/grade names exist.",
-      json!({}),
-      &[],
-    ),
-    tool(
-      "coverage",
-      "Per-file parse-coverage overview from the product bank: error nodes/bytes and damage \
-       ratio per file, worst first (clean files counted, not listed). The cheap first stop \
-       before trusting absence anywhere; `health` has span/entity detail. No bank → says \
-       coverage is UNAVAILABLE, never that parses were clean.",
-      json!({
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
-      &[],
-    ),
+    tool("health", "Per-file parse damage: ERROR nodes, affected bytes, definitions in damaged regions.", json!({}), &[]),
+    tool("schema", "Kinds, relations, grades, and tier state in this index, with counts.", json!({}), &[]),
+    tool("coverage", "Per-file parse coverage (error bytes and ratio), worst first.", page.clone(), &[]),
     tool(
       "code_search",
-      "Structural pattern search fused with the graph: run an ast-grep pattern over the \
-       generation's own files (digest-verified — changed files are counted stale and \
-       skipped), attribute matches to their enclosing definitions, rank by semantic \
-       in-degree. Whole-tree parse: seconds at monorepo scale — scope with lang/prefix. \
-       C/C++ gotcha (grammar ambiguity): bare `f($A)` parses as a declaration — write call \
-       patterns in statement form, `f($A);`.",
-      json!({
-        "pattern": {"type": "string", "description": "ast-grep pattern (e.g. 'kfree($X)')"},
-        "lang": {"type": "string", "description": "Restrict to one language (rust, c, py, …)"},
-        "prefix": {"type": "string", "description": "Restrict to paths starting with this prefix"},
-        "k": {"type": "integer", "description": "Top definitions to return (default 20, max 1000)"},
-        "format": {"type": "string", "enum": ["toon", "lean", "ids"], "description": "Text rendering: lean = minimal columns (cheapest structured form), toon = lossless tab-grid grouped by directory, ids = durable handles only"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+      "ast-grep pattern search ranked by graph importance.",
+      with(&page, json!({
+        "pattern": {"type": "string", "description": "ast-grep pattern"},
+        "lang": {"type": "string"},
+        "prefix": {"type": "string"},
+        "k": {"type": "integer", "description": "top-k"}
+      })),
       &["pattern"],
     ),
-    tool(
-      "architecture",
-      "Orientation summary: modules by definition mass with cross-module import margins, \
-       hub definitions by semantic in-degree, entry-point candidates (exported, \
-       semantically unreached), and calls-graph clusters (Louvain communities from the \
-       warm-time sidecar: size, representative, dominant module; stated as not built when \
-       the sidecar is absent). The first call to make in an unfamiliar codebase.",
-      json!({
-        "top": {"type": "integer", "description": "Rows per section (default 20, max 500)"}
-      }),
-      &[],
-    ),
+    tool("architecture", "Orientation summary: module mass, hubs by in-degree, entry-point candidates.", json!({"top": {"type": "integer", "description": "rows per section"}}), &[]),
     tool(
       "compare_generations",
-      "What changed between two retained generations of this index: files added/removed/\
-       changed (unchanged files skip by digest), node-level adds/removes/modifications \
-       aligned by durable eid, and per-relation edge-count deltas. A signature change on an \
-       overloadable definition is an identity transition (removed + added) by the eid \
-       contract; body-only edits alter no semantic content and diff as unchanged.",
-      json!({
-        "from": {"type": "string", "description": "Older generation: content id, path, or 'prev' (default)"},
-        "to": {"type": "string", "description": "Newer generation: content id, path, or 'CURRENT' (default)"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+      "What changed between two index generations: files, nodes by durable eid, edge counts.",
+      with(&page, json!({
+        "from": {"type": "string", "description": "generation id"},
+        "to": {"type": "string", "description": "generation id"}
+      })),
       &[],
     ),
     tool(
       "impact",
-      "Blast radius of changed files: git-diff-seeded (merge-base vs `since`, or the \
-       uncommitted worktree) transitive INBOUND closure over the chosen relations — every \
-       impacted node with its minimum hop distance. Changed files missing from the index \
-       are counted in missingFiles, never silently dropped.",
-      json!({
-        "since": {"type": "string", "description": "Git ref to diff against (merge-base semantics). Absent = uncommitted changes only"},
-        "relations": {"type": "array", "items": {"type": "string"}, "description": "Edge types to follow (default [calls])"},
-        "max_depth": {"type": "integer", "description": "Hop bound (0/absent = unbounded)"},
-        "min_grade": {"type": "string", "description": "Only traverse edges at this grade or better (exact|constrained|heuristic)"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+      "Blast radius of changed files: git-diff-seeded transitive inbound closure.",
+      with(&page, json!({
+        "since": {"type": "string", "description": "git ref"},
+        "relations": {"type": "array", "items": {"type": "string"}},
+        "max_depth": {"type": "integer", "description": "0 = unbounded"},
+        "min_grade": {"type": "string"}
+      })),
       &[],
     ),
     tool(
       "dead_code",
-      "Definitions with no semantic in-edges anywhere in the graph (calls/references/\
-       imports/implements/of_type/overrides — containment doesn't count), with honest \
-       suppression: candidates whose name appears in ANY evidence occurrence (fn-pointer \
-       tables, dynamic dispatch, namesake ties) and candidates in parse-damaged files are \
-       counted out, not listed. Leads, not verdicts: absence of an edge is not proof of \
-       death — check `coverage`/`health` before deleting anything.",
-      json!({
-        "kind": {"type": "string", "description": "One symbol kind (default set: function, method, class, struct, enum, interface, constructor)"},
-        "prefix": {"type": "string", "description": "Filter: definition file path starts with this prefix"},
-        "path": {"type": "string", "description": "Filter: definition file path ends with this suffix"},
-        "exported": {"type": "boolean", "description": "Only exported definitions"},
-        "exclude_tests": {"type": "boolean", "description": "Exclude test-classified paths (tests/, __tests__/, *_test.*, …)"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+      "Definitions with no semantic in-edges anywhere (suppression-honest dead-code leads).",
+      with(&page, json!({
+        "prefix": {"type": "string"},
+        "path": {"type": "string", "description": "suffix"},
+        "kind": {"type": "string"},
+        "exported": {"type": "boolean"},
+        "exclude_tests": {"type": "boolean"}
+      })),
       &[],
     ),
     tool(
       "node",
-      "Nodes matching an exact symbol name — or, with `pattern`, every node whose name \
-       matches a regex (a listing; refine from its ids).",
-      {
-        let mut props = name_only.clone();
-        props["pattern"] =
-          json!({"type": "string", "description": "Regex over names (replaces `name`)"});
-        props
-      },
+      "Definitions by exact name or regex `pattern`. Only needed when a name is unknown or ambiguous; graph/reachable/snippet take names directly.",
+      with(&sel, json!({"pattern": {"type": "string", "description": "ast-grep pattern"}})),
       &[],
     ),
     tool(
       "graph",
-      "The direct neighbours of a definition over one relation. `callers`: incoming \
-       `calls` edges. `references`: incoming `references` edges. `importers`: files \
-       importing it. `implementors`: types implementing/extending a trait, interface, or \
-       base type. `type_users`: definitions using a type in fields, params, returns, or \
-       annotations. `similar`: near-clones (`similar_to` edges from MinHash sketches over \
-       token shingles, ≥ 0.7 estimated Jaccard; confidence = similarity × 100; each \
-       definition keeps its 8 most similar partners). `observed`: runtime-observed calls \
-       in both directions from traces ingested with `vorpal-index ingest-traces`, each row \
-       flagged with whether the static graph has the edge. The result IS the complete set \
-       of resolved edges of that relation, at the grade each row states — it needs no \
-       confirmation by search, code_search, or grep. Ambiguous names return the candidate \
-       list to refine (path/kind/id), never a guessed merge.",
-      graph_props,
+      "Direct neighbours of a symbol over one relation: the COMPLETE resolved set at the stated grade, no confirmation needed. callers/references rows carry the call-site line.",
+      with(&sel, json!({"relation": {"type": "string", "enum": GRAPH_RELATIONS}})),
       &["relation", "name"],
     ),
     tool(
       "reachable",
-      "Relation-specific transitive traversal from a symbol — the complete closure at the stated \
-       grade floor, needing no confirmation by search — returning each reached node WITH \
-       its path back to the seed (per-edge relation names). direction \"in\" = everything \
-       reaching it, \"out\" = everything it reaches; `relations` restricts edge types (default \
-       [\"calls\"]); `min_grade` sets a resolution-grade floor; the seed uses the same selector \
-       contract as the direct graph tools (ambiguous names list candidates).",
-      json!({
-        "name": {"type": "string", "description": "Exact symbol name"},
+      "Transitive closure from a symbol over `relations` (default calls), each row with its path to the seed. Complete; no confirmation needed.",
+      with(&sel, json!({
         "direction": {"type": "string", "enum": ["in", "out", "both"]},
-        "relations": {"type": "array", "items": {"type": "string"},
-          "description": "Edge types to follow: calls, references, imports, implements, of_type, defines, has_method, has_field, overrides, data_flows, changes_with, similar_to, requests, notifies (default [\"calls\"])"},
-        "max_depth": {"type": "integer", "description": "Maximum hops (0 or absent = unbounded)"},
-        "min_grade": {"type": "string", "enum": ["exact", "constrained", "heuristic"],
-          "description": "Only traverse edges at this resolution grade or better (absent = include structural edges too)"},
-        "path": {"type": "string", "description": "Refine: seed's file path must end with this suffix"},
-        "kind": {"type": "string", "description": "Refine: seed's symbol kind"},
-        "id": {"type": "integer", "description": "Seed exactly this node id"},
-        "eid": {"type": "string", "description": "Seed by durable external id (32 hex chars)"},
-        "all": {"type": "boolean", "description": "Merge across ALL same-named seeds instead of listing candidates"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+        "relations": {"type": "array", "items": {"type": "string"}},
+        "max_depth": {"type": "integer", "description": "0 = unbounded"},
+        "min_grade": {"type": "string", "enum": ["exact", "constrained", "heuristic"]}
+      })),
       &["name", "direction"],
     ),
     tool(
       "structural_search",
-      "ast-grep-style structural pattern search over the watched source tree: real code with \
-       metavariables ($X, $$$ARGS), matched on the AST — returns path:line + matched text.",
+      "ast-grep pattern over the watched source tree: path:line + matched text.",
       json!({
-        "pattern": {"type": "string", "description": "Structural pattern (e.g. 'foo($A, $B)')"},
-        "lang": {"type": "string", "description": "Language of the pattern (rust, c, python, …)"},
-        "path": {"type": "string", "description": "Only search files whose path ends with this suffix"},
-        "limit": {"type": "integer", "description": "Max matches (default 100, cap 1000)"}
+        "pattern": {"type": "string", "description": "ast-grep pattern"},
+        "lang": {"type": "string"},
+        "path": {"type": "string", "description": "suffix"},
+        "limit": {"type": "integer", "description": "max 1000"}
       }),
       &["pattern", "lang"],
     ),
     tool(
       "rule_search",
-      "Run full YAML rule(s) over the watched source tree — the complete rule model \
-       (composite/relational rules, constraints, utils, transform), not just a bare pattern. \
-       Rules with `fix` render each match's dry-run replacement; nothing on disk changes. \
-       Separate multiple rule documents with `---`.",
+      "Run YAML rule(s), constraints and fix dry-run included, over the watched tree.",
       json!({
-        "rule": {"type": "string", "description": "YAML rule document(s): id, language, rule, and optionally constraints/utils/transform/fix"},
-        "path": {"type": "string", "description": "Only search files whose path ends with this suffix"},
-        "limit": {"type": "integer", "description": "Max matches (default 100, cap 1000)"}
+        "rule": {"type": "string", "description": "YAML"},
+        "path": {"type": "string", "description": "suffix"},
+        "limit": {"type": "integer", "description": "max 1000"}
       }),
       &["rule"],
     ),
     tool(
       "ast_dump",
-      "Parse source and print the named-node tree (kind, byte span, leaf text) — the ground \
-       truth for choosing pattern/kind targets when authoring rules. Pass inline source+lang, \
-       or a file path (language inferred from the extension).",
+      "Named-node parse tree (kind, span, leaf text) for a file or inline source.",
       json!({
-        "source": {"type": "string", "description": "Inline source text (requires lang)"},
-        "lang": {"type": "string", "description": "Language of the source (rust, c, python, …)"},
-        "path": {"type": "string", "description": "File to parse instead of inline source"},
-        "max_nodes": {"type": "integer", "description": "Cap printed nodes (default 500, max 5000)"}
+        "path": {"type": "string", "description": "suffix"},
+        "source": {"type": "string", "description": "inline source"},
+        "lang": {"type": "string"},
+        "max_nodes": {"type": "integer"}
       }),
       &[],
     ),
     tool(
       "fetch_span",
-      "The defining source of a graph node, verbatim: pass a node id (from any graph tool's \
-       output or an ambiguity listing) and get back path:line plus the definition's bytes, \
-       digest-verified against the pinned generation (stale files refuse rather than return \
-       inconsistent bytes).",
+      "Verbatim, digest-verified source of a node by id.",
       json!({
-        "id": {"type": "integer", "description": "Node id"},
-        "max_bytes": {"type": "integer", "description": "Clamp returned source (default 16384)"}
+        "id": {"type": "integer"},
+        "max_bytes": {"type": "integer"}
       }),
       &["id"],
     ),
     tool(
       "data_flow",
-      "Outgoing data flows for a definition: which call-site arguments (bound positionally \
-       or by Python keyword name — param#? marks a keyword no parameter matched, with \
-       the expression for variables and field accesses) flow into which callees, from the \
-       dataflow sidecar. Coverage note: flows are recorded for the typed-capture languages \
-       (Rust, Python, TypeScript, TSX) at resolved calls with traceable arguments — absence \
-       of rows is NOT proof no data flows; generations built before flows existed say so \
-       explicitly.",
+      "Where a symbol's arguments flow: arg→param rows (Rust, Python, TypeScript).",
       json!({
-        "name": {"type": "string", "description": "Exact symbol name (or eid:<hex>)"},
-        "path": {"type": "string", "description": "Refine: definition file path ends with this suffix"},
-        "kind": {"type": "string", "description": "Refine: symbol kind"},
-        "id": {"type": "integer", "description": "Refine: exactly this node id"},
-        "eid": {"type": "string", "description": "Refine: durable external id (32 hex chars)"}
+        "name": {"type": "string"},
+        "path": {"type": "string", "description": "suffix"},
+        "kind": {"type": "string"},
+        "id": {"type": "integer"},
+        "eid": {"type": "string"}
       }),
       &["name"],
     ),
     tool(
       "query",
-      "Cypher-shaped READ-ONLY graph query (openCypher read subset). MATCH a linear \
-       pattern — (var:Kind|Kind2 {name: \"x\", path: \"suffix\"}) chained through up to 8 \
-       segments like -[:calls|data_flows*1..5 {grade: constrained}]-> — then WHERE with \
-       AND/OR/NOT over =, <>, <, <=, >, >=, =~ (bounded regex), STARTS/ENDS WITH, CONTAINS, \
-       IN [..], IS [NOT] NULL, n:Label, and EXISTS { (n)-[:calls]->() }; WITH / UNWIND \
-       pipeline stages; RETURN [DISTINCT] any expression: properties (name, path, kind, \
-       exported, id, eid, signature, in_degree, out_degree, scc_size, community), \
-       arithmetic, string \
-       and list functions (toLower, toUpper, size, trim, replace, substring, split, \
-       coalesce, …), CASE, and count/sum/avg/min/max/collect with implicit grouping; \
-       ORDER BY / SKIP / LIMIT; UNION [ALL]. Runs under explicit work ceilings (16KiB text, \
-       depth 10, 5M edge visits, 100k rows) and refuses with the ceiling's name rather \
-       than truncate. Example: MATCH (f:Function)-[:calls]->(g) WITH g, count(*) AS n \
-       WHERE n >= 20 AND NOT EXISTS { (g)-[:calls]->() } RETURN g.name, n ORDER BY n DESC \
-       LIMIT 20",
+      "Read-only Cypher-shaped graph query: MATCH (a:Kind {name: \"x\"})-[:calls*1..3]->(b) WHERE … WITH/UNWIND … RETURN [DISTINCT] properties or count/sum/avg/min/max/collect ORDER BY/SKIP/LIMIT, UNION. Refuses unsupported clauses and work ceilings by name.",
       json!({
-        "text": {"type": "string", "description": "The query text"},
-        "ir": {"type": "object", "description": "Alternative: a typed IR document (the parsed form; see the vorpal-query crate docs)"}
+        "text": {"type": "string"},
+        "ir": {"type": "object", "description": "typed IR"}
       }),
       &[],
     ),
     tool(
       "snippet",
-      "The defining source of a symbol by NAME (or id/eid): the selector-driven sibling of \
-       fetch_span — same digest verification, plus whole-line context expansion. Ambiguous \
-       names return the candidate list to refine (path/kind/id), never a guessed snippet. \
-       Absence of a match is not proof the symbol doesn't exist: check `coverage` for parse \
-       damage in its file.",
-      json!({
-        "name": {"type": "string", "description": "Exact symbol name (or eid:<hex>)"},
-        "path": {"type": "string", "description": "Refine: definition file path ends with this suffix"},
-        "kind": {"type": "string", "description": "Refine: symbol kind (function, method, struct, …)"},
-        "id": {"type": "integer", "description": "Refine: exactly this node id"},
-        "eid": {"type": "string", "description": "Refine: durable external id (32 hex chars)"},
-        "all": {"type": "boolean", "description": "Return a snippet for every same-named match instead of an ambiguity listing"},
-        "context_lines": {"type": "integer", "description": "Whole context lines around the span (default 0)"},
-        "max_bytes": {"type": "integer", "description": "Byte cap per snippet body (default 16384, clamp 64..262144)"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+      "Verbatim, digest-verified source of a symbol by name, whole lines, with context.",
+      with(&sel, json!({
+        "context_lines": {"type": "integer"},
+        "max_bytes": {"type": "integer"}
+      })),
       &["name"],
     ),
     tool(
       "why",
-      "Evidence for the edge(s) from one node to another: every retained occurrence's edge \
-       type, resolution grade, resolver reason, candidate count, and source span — the \
-       complete record of why this relation exists (or, with `name`, why no edge to that \
-       name exists).",
-      json!({
-        "from_id": {"type": "integer", "description": "Source node id (from any graph tool's id output)"},
-        "to_id": {"type": "integer", "description": "Target node id (edge form: why does this edge exist?)"},
-        "name": {"type": "string", "description": "Referenced name (absence form: why is there NO edge to anything with this name?)"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+      "Evidence for the edge from_id→to_id, or with `name` why no edge to that name exists: type, grade, reason, candidates, span.",
+      with(&page, json!({
+        "from_id": {"type": "integer"},
+        "to_id": {"type": "integer"},
+        "name": {"type": "string"}
+      })),
       &["from_id"],
     ),
     tool(
       "search",
-      "Hybrid search over definitions: exact/token name matches, lexical-embedding similarity, \
-       and graph in-degree fused by reciprocal rank fusion; returns the top-k matches with \
-       scores. Two or more double-quoted phrases joined by literal AND (\"retry logic\" AND \
-       \"connection pool\") intersect per-phrase results (conjunction, min-of-scores) and \
-       report which phrase eliminated everything when the intersection is empty.",
-      json!({
-        "query": {"type": "string", "description": "Free-text query, or a conjunction: \"phrase one\" AND \"phrase two\""},
-        "k": {"type": "integer", "description": "Max results (default 10)"},
-        "path": {"type": "string", "description": "Filter: definition file path must end with this suffix"},
-        "prefix": {"type": "string", "description": "Filter: definition file path must start with this prefix (package/subtree scoping)"},
-        "kind": {"type": "string", "description": "Filter: symbol kind (function, method, struct, …)"},
-        "lang": {"type": "string", "description": "Filter: language name or alias (rust, py, ts, …)"},
-        "exported": {"type": "boolean", "description": "Filter: only exported definitions"},
-        "exclude_tests": {"type": "boolean", "description": "Filter: exclude test-classified paths"},
-        "cursor": {"type": "string", "description": "Opaque page cursor from a previous result's nextCursor (structuredContent records only)"},
-        "limit": {"type": "integer", "description": "Records per page in structuredContent (default 100, max 1000)"}
-      }),
+      "Hybrid search over definitions: name match + embedding similarity + graph in-degree.",
+      with(&page, json!({
+        "query": {"type": "string", "description": "text, or phrase AND phrase"},
+        "k": {"type": "integer", "description": "top-k"},
+        "kind": {"type": "string"},
+        "lang": {"type": "string"},
+        "path": {"type": "string", "description": "suffix"},
+        "prefix": {"type": "string"},
+        "exported": {"type": "boolean"},
+        "exclude_tests": {"type": "boolean"}
+      })),
       &["query"],
     ),
   ];
