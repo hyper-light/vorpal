@@ -89,8 +89,11 @@ pub struct IndexArg {
 
 #[derive(Copy, Clone, ValueEnum)]
 enum GraphVerb {
-  /// Direct callers of a symbol (incoming `calls` edges).
+  /// Direct callers of a symbol (incoming `calls` edges), each with its call site.
   Callers,
+  /// Direct callees of a symbol (outgoing `calls` edges), each with the call site inside
+  /// the symbol's own body.
+  Callees,
   /// Direct referrers of a symbol (incoming `references` edges).
   Refs,
   /// Files importing a symbol (incoming `imports` edges).
@@ -129,6 +132,7 @@ impl GraphVerb {
   fn as_str(self) -> &'static str {
     match self {
       GraphVerb::Callers => "callers",
+      GraphVerb::Callees => "callees",
       GraphVerb::Refs => "refs",
       GraphVerb::Importers => "importers",
       GraphVerb::Implementors => "implementors",
@@ -1148,9 +1152,16 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
           "hits",
         )
         .map_err(anyhow::Error::msg)?,
+        // Rows carry the call site, exactly as the MCP `graph` tool's do — the shell fast
+        // path answers "who calls X" / "what does X call" in one command.
         (None, verb) => vorpal_index::records::selected_value(
-          vorpal_index::records::related_records(&kg, verb.as_str(), &target)
-            .map_err(anyhow::Error::msg)?,
+          vorpal_index::records::related_records_with_sites(
+            &kg,
+            Some(vorpal_index::resolve_index_dir(&dir)).as_deref(),
+            verb.as_str(),
+            &target,
+          )
+          .map_err(anyhow::Error::msg)?,
           cursor,
           arg.page.limit,
         )

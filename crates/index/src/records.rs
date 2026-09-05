@@ -998,24 +998,32 @@ pub fn listing_records(kg: &Kg, target: &GraphTarget) -> Result<Vec<NodeRecord>,
   )
 }
 
-/// The typed twin of the edge verbs (`callers`/`references`/`importers`/`implementors`/
-/// `typeusers`): nodes with an incoming edge of the verb's relation to the selected target,
-/// each carrying its edge grade. Ordering matches the rendered surface (ascending node id,
-/// best grade per node).
+/// The edge type behind a graph verb, and whether the verb walks out-edges (`callees`: what
+/// the target calls) rather than in-edges (everything else: what reaches the target).
+pub(crate) fn verb_edge(verb: &str) -> Result<(vorpal_kg::EdgeType, bool), String> {
+  Ok(match verb {
+    "callers" => (vorpal_kg::EdgeType::CALLS, false),
+    "callees" => (vorpal_kg::EdgeType::CALLS, true),
+    "refs" | "references" => (vorpal_kg::EdgeType::REFERENCES, false),
+    "importers" => (vorpal_kg::EdgeType::IMPORTS, false),
+    "implementors" => (vorpal_kg::EdgeType::IMPLEMENTS, false),
+    "typeusers" => (vorpal_kg::EdgeType::OF_TYPE, false),
+    "similar" => (vorpal_kg::EdgeType::SIMILAR_TO, false),
+    other => return Err(format!("unknown graph verb '{other}'")),
+  })
+}
+
+/// The typed twin of the edge verbs (`callers`/`callees`/`references`/`importers`/
+/// `implementors`/`typeusers`): nodes joined to the selected target by one edge of the
+/// verb's relation — inbound for every verb but `callees`, which lists the target's
+/// out-edges — each carrying its edge grade. Ordering matches the rendered surface
+/// (ascending node id, best grade per node).
 pub fn related_records(
   kg: &Kg,
   verb: &str,
   target: &GraphTarget,
 ) -> Result<Selected<RelatedRecord>, String> {
-  let edge = match verb {
-    "callers" => vorpal_kg::EdgeType::CALLS,
-    "refs" | "references" => vorpal_kg::EdgeType::REFERENCES,
-    "importers" => vorpal_kg::EdgeType::IMPORTS,
-    "implementors" => vorpal_kg::EdgeType::IMPLEMENTS,
-    "typeusers" => vorpal_kg::EdgeType::OF_TYPE,
-    "similar" => vorpal_kg::EdgeType::SIMILAR_TO,
-    other => return Err(format!("unknown graph verb '{other}'")),
-  };
+  let (edge, outgoing) = verb_edge(verb)?;
   let matches = resolve_target(kg, target).map_err(|err| err.to_string())?;
   if matches.is_empty() {
     return Ok(Selected::NoMatch);
@@ -1027,9 +1035,12 @@ pub fn related_records(
   }
   let mut hits: Vec<(NodeId, u8)> = Vec::new();
   for &target_id in &matches {
-    for (from, confidence) in kg.incoming_with_confidence(target_id, edge) {
-      hits.push((from, confidence));
-    }
+    let joined = if outgoing {
+      kg.outgoing_with_confidence(target_id, edge)
+    } else {
+      kg.incoming_with_confidence(target_id, edge)
+    };
+    hits.extend(joined);
   }
   hits.sort_unstable_by_key(|&(n, c)| (n.raw(), std::cmp::Reverse(c)));
   hits.dedup_by_key(|&mut (n, _)| n);
@@ -1050,12 +1061,15 @@ pub fn related_records(
 }
 
 /// [`related_records`] plus the call site: for every hit, the line (1-based) and text of
-/// the first retained occurrence of the edge inside the hit's own source, read from the
-/// generation's pack so offsets and bytes agree with the graph. "Who calls X" then needs
-/// no follow-up `snippet` — the evidence rides on the row (measured 2026-09-04: the
-/// follow-up was one of the two model turns separating the graph from a single grep).
-/// Files that changed since the generation, or edges without retained occurrences,
-/// leave the fields absent; `similar` rows never carry them.
+/// the first retained occurrence of the edge in the source that holds it, read from the
+/// generation's pack so offsets and bytes agree with the graph. For the inbound verbs that
+/// is the hit's own source (the caller's body holds the call); for `callees` it is the
+/// TARGET's source (its body holds every call it makes) — one evidence read per target
+/// instead of one per hit. "Who calls X" and "what does X call" then need no follow-up
+/// `snippet` — the evidence rides on the row (measured 2026-09-04: the follow-up was one of
+/// the two model turns separating the graph from a single grep). Files that changed since
+/// the generation, or edges without retained occurrences, leave the fields absent;
+/// `similar` rows never carry them.
 pub fn related_records_with_sites(
   kg: &Kg,
   artifacts_dir: Option<&std::path::Path>,
@@ -1066,50 +1080,84 @@ pub fn related_records_with_sites(
   let Selected::Hits(hits) = &mut selected else {
     return Ok(selected);
   };
-  if verb == "similar" || hits.is_empty() {
+  if hits.is_empty() {
     return Ok(selected);
   }
-  let Some(edge) = (match verb {
-    "callers" => Some(vorpal_kg::EdgeType::CALLS),
-    "refs" | "references" => Some(vorpal_kg::EdgeType::REFERENCES),
-    "importers" => Some(vorpal_kg::EdgeType::IMPORTS),
-    "implementors" => Some(vorpal_kg::EdgeType::IMPLEMENTS),
-    "typeusers" => Some(vorpal_kg::EdgeType::OF_TYPE),
-    _ => None,
-  }) else {
+  let (edge, outgoing) = verb_edge(verb)?;
+  if edge.base() == vorpal_kg::EdgeType::SIMILAR_TO {
     return Ok(selected);
-  };
+  }
   let targets: Vec<u64> = resolve_target(kg, target)
     .map_err(|err| err.to_string())?
     .into_iter()
     .map(|id| id.raw())
     .collect();
-  let pack = artifacts_dir.and_then(crate::cached_pack);
-  // One read per distinct file; hits arrive in ascending id order (file-grouped).
-  let mut cached: Option<(String, Option<Vec<u8>>)> = None;
-  for hit in hits.iter_mut() {
-    let from = NodeId::new(hit.node.id);
-    let Some(start) = kg
-      .evidence_from(from)
-      .into_iter()
-      .filter(|row| {
-        row.outcome == vorpal_kg::EvidenceOutcome::Edge
-          && targets.contains(&(row.to as u64))
-          && vorpal_kg::EdgeType(row.etype).base() == edge.base()
+  // Where each hit's site lives: (source path, byte offset of the first retained occurrence).
+  let sites: Vec<Option<(String, usize)>> = if outgoing {
+    // The target's evidence rows fan out to every callee hit; keep the earliest per callee.
+    let mut by_callee: std::collections::HashMap<u64, (String, usize)> =
+      std::collections::HashMap::with_capacity(hits.len());
+    for &target_id in &targets {
+      let Some(path) = kg
+        .node(NodeId::new(target_id))
+        .map(|view| view.path.to_string())
+      else {
+        continue;
+      };
+      for row in kg.evidence_from(NodeId::new(target_id)) {
+        if row.outcome != vorpal_kg::EvidenceOutcome::Edge
+          || vorpal_kg::EdgeType(row.etype).base() != edge.base()
+        {
+          continue;
+        }
+        let start = row.span_start as usize;
+        by_callee
+          .entry(row.to as u64)
+          .and_modify(|site| {
+            if start < site.1 {
+              *site = (path.clone(), start);
+            }
+          })
+          .or_insert_with(|| (path.clone(), start));
+      }
+    }
+    hits
+      .iter()
+      .map(|hit| by_callee.get(&hit.node.id).cloned())
+      .collect()
+  } else {
+    hits
+      .iter()
+      .map(|hit| {
+        kg.evidence_from(NodeId::new(hit.node.id))
+          .into_iter()
+          .filter(|row| {
+            row.outcome == vorpal_kg::EvidenceOutcome::Edge
+              && targets.contains(&(row.to as u64))
+              && vorpal_kg::EdgeType(row.etype).base() == edge.base()
+          })
+          .map(|row| row.span_start as usize)
+          .min()
+          .map(|start| (hit.node.path.clone(), start))
       })
-      .map(|row| row.span_start as usize)
-      .min()
-    else {
+      .collect()
+  };
+  let pack = artifacts_dir.and_then(crate::cached_pack);
+  // One read per distinct file; inbound hits arrive in ascending id order (file-grouped),
+  // callee sites all live in the target's file.
+  let mut cached: Option<(String, Option<Vec<u8>>)> = None;
+  for (hit, site) in hits.iter_mut().zip(sites) {
+    let Some((path, start)) = site else {
       continue;
     };
-    if cached.as_ref().map(|(path, _)| path.as_str()) != Some(hit.node.path.as_str()) {
-      let read = crate::read_indexed_source_with(pack.as_deref(), &hit.node.path)
+    if cached.as_ref().map(|(cached_path, _)| cached_path.as_str()) != Some(path.as_str()) {
+      let read = crate::read_indexed_source_with(pack.as_deref(), &path)
         .ok()
         .and_then(|read| match read {
           crate::IndexedRead::Verified(bytes) | crate::IndexedRead::Unverified(bytes) => Some(bytes),
           crate::IndexedRead::Changed => None,
         });
-      cached = Some((hit.node.path.clone(), read));
+      cached = Some((path, read));
     }
     let Some((_, Some(bytes))) = cached.as_ref() else {
       continue;

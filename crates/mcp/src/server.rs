@@ -266,22 +266,22 @@ impl Server {
     format!(
       "Fast path when this client loads tool schemas lazily: the same graph answers from \
        the shell without a schema load. Exact commands: `{bin} graph callers <name> --index \
-       {index} --format lean` (other verbs in that position: refs, importers, implementors, \
-       typeusers, similar, node, snippet); what a symbol calls: `{bin} graph reachable <name> \
-       --direction out --depth 1 --index {index} --format lean` (--direction in for what \
-       reaches it; omit --depth for the full closure). Always the `graph` word, always \
-       --index. Prefer it for a single lookup; use the MCP tools for several calls."
+       {index} --format lean` (other verbs in that position: callees, refs, importers, \
+       implementors, typeusers, similar, node, snippet); transitive closure: `{bin} graph \
+       reachable <name> --direction out --index {index} --format lean` (--direction in for \
+       what reaches it; --depth N to bound it). Always the `graph` word, always --index. \
+       Prefer it for a single lookup; use the MCP tools for several calls."
     )
   }
 }
 
 /// Guidance a client may show its model once; the tool descriptions carry the details.
 pub(crate) const INSTRUCTIONS: &str = "Knowledge graph of one indexed repository. Call `graph` \
-(relation: callers | references | importers | implementors | type_users | similar | \
+(relation: callers | callees | references | importers | implementors | type_users | similar | \
 observed), `reachable`, `snippet`, or `why` DIRECTLY with the exact symbol name; use `node` \
 or `search` only when the name is unknown or ambiguous. Every graph, reachable, and why \
 result is the complete resolved set at the grade each row states — never confirm it with \
-search, code_search, or grep; callers rows already carry the call-site line. Pass \
+search, code_search, or grep; callers and callees rows already carry the call-site line. Pass \
 `format: \"lean\"` unless you need signatures. If your client defers these tools, load all \
 you will need in ONE ToolSearch call. Results page with cursor/limit and name the index \
 generation they were read from.";
@@ -1432,7 +1432,7 @@ impl Server {
         format!("tool '{tool}' is not in this daemon's '{}' profile", self.profile.label()),
       ));
     }
-    // `graph` is one tool over seven relations (one schema for a client to load, one
+    // `graph` is one tool over eight relations (one schema for a client to load, one
     // description to read); the relation names the arm below exactly as the former
     // per-relation tools did.
     let tool: &str = if tool == "graph" {
@@ -1781,8 +1781,8 @@ impl Server {
         data["totalErrorBytes"] = report.total_error_bytes.into();
         Ok((text, data))
       }
-      "node" | "callers" | "references" | "importers" | "implementors" | "type_users"
-      | "similar" => {
+      "node" | "callers" | "callees" | "references" | "importers" | "implementors"
+      | "type_users" | "similar" => {
         // Pattern listing (node only): regex over names, matches ARE the answer.
         if tool == "node" {
           if let Some(pattern) = args.get("pattern").and_then(Value::as_str) {
@@ -1816,7 +1816,8 @@ impl Server {
             vorpal_index::records::listing_records(kg, &target).map_err(ToolError::from)?;
           paged(records, args, "hits")?
         } else {
-          // Rows carry the call site (line + text) so "who calls X" needs no snippet.
+          // Rows carry the call site (line + text) so "who calls X" and "what does X
+          // call" need no snippet.
           let selected =
             vorpal_index::records::related_records_with_sites(kg, dir.as_deref(), verb, &target)
               .map_err(ToolError::from)?;
@@ -2380,10 +2381,13 @@ const ALL_TOOL_NAMES: &[&str] = &[
   "ast_dump", "fetch_span", "data_flow", "query", "snippet", "why", "search",
 ];
 
-/// The relations `graph` serves — each was a tool of its own before 2026-09-04, and the
-/// arm names below are still theirs.
+/// The relations `graph` serves — each but `callees` was a tool of its own before
+/// 2026-09-04, and the arm names below are still theirs. `callees` (what a symbol calls,
+/// with the call site inside its body) replaced the `reachable … direction: out,
+/// max_depth: 1` detour for the most basic outbound question.
 const GRAPH_RELATIONS: &[&str] = &[
-  "callers", "references", "importers", "implementors", "type_users", "similar", "observed",
+  "callers", "callees", "references", "importers", "implementors", "type_users", "similar",
+  "observed",
 ];
 
 /// The tool declarations `tools/list` returns for `profile`: filtered by the one membership
@@ -2484,7 +2488,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "graph",
-      "Direct neighbours of a symbol over one relation: the COMPLETE resolved set at the stated grade, no confirmation needed. callers/references rows carry the call-site line.",
+      "Direct neighbours of a symbol over one relation: the COMPLETE resolved set at the stated grade, no confirmation needed. callers/callees/references rows carry the call-site line.",
       with(&sel, json!({"relation": {"type": "string", "enum": GRAPH_RELATIONS}})),
       &["relation", "name"],
     ),

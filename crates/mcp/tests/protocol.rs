@@ -640,6 +640,20 @@ fn typed_records_and_cursor_pagination() {
   assert_eq!(caller["name"], "caller");
   assert_eq!(caller["site_line"], 4, "{caller}");
   assert_eq!(caller["site"], "target()");
+  // Callees rows carry the site inside the caller's own body — "what does X call" is one
+  // call too, no `reachable` detour, no snippet.
+  let response = request(
+    &mut server,
+    23,
+    "tools/call",
+    json!({"name": "graph", "arguments": {"relation": "callees", "name": "caller", "format": "lean"}}),
+  );
+  let callee = &response["result"]["structuredContent"]["records"][0];
+  assert_eq!(callee["name"], "target", "{callee}");
+  assert!(callee["path"].as_str().unwrap().ends_with("b.rs"));
+  assert_eq!(callee["site_line"], 4, "{callee}");
+  assert_eq!(callee["site"], "target()");
+  assert_eq!(response["result"]["structuredContent"]["total"], 1);
   assert_eq!(lean["kind"], "Function");
   assert!(lean.get("signature").is_none() && lean.get("span").is_none() && lean.get("external_id").is_none());
   let response = request(

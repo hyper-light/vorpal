@@ -4097,3 +4097,68 @@ directory is root-owned so the file cannot be replaced without sudo; the first e
 ran against that dead binary (13–20 turns of the model probing `--version`). Installed to
 ~/.local/bin (first on PATH) as a new file instead. Lesson: install binaries by creating a
 new file and renaming, never by writing over one that has been executed.
+
+## Daemon freshness: the served state is the reference (2026-09-04)
+
+The `live_differential` oracle failed on the fast-path merge in CI (step 8: both probe
+nodes present, the edge between them missing for the whole 20 s window) and locally at
+step 10 (`probe_10` never served; 1 failure in 6 runs, then 1 in 30). The step-10 trace
+(`VORPAL_PHASE_TRACE=1`, decision stamps added for this investigation) reads:
+
+1. `366.165` stat sweep recovers 2 paths (step 9's `broken.py` + `m9.py`) → overlay
+   serves → served persist commits.
+2. `366.364` the watcher's LATE hint for step 9's file arrives after step 10 already
+   rewrote it: the probe reads the pre-edit content, judges it "unchanged" against
+   CURRENT's pack, notes the stamps, and spawns the stamp canonicalizer.
+3. `366.366–366.405` the canonicalizer's full pipeline reads the file again — now the
+   post-edit content — and commits a generation holding `probe_10` that the daemon never
+   served.
+4. `366.645` the next sweep sees the file changed against the overlay's manifest; the
+   probe re-extracts it and compares against CURRENT's pack — the generation from step 3
+   — "unchanged"; `note_stamps`; canonicalizer (stamp-only cutoff, no link). From here
+   every sweep recovers 0 paths and the pre-edit graph serves until the deadline.
+
+Root cause: "unchanged" was measured against what is on disk, while the answer comes from
+what is served. The same shape is reachable without any race by committing a generation
+beside the daemon (an external `vorpal index`).
+
+Fix (`d0fa9e0`): the overlay keeps one u64 body digest per retained product and the probe
+measures against it (the pack only when no overlay serves); the canonicalizer reports
+`graph_reused` and a sealed graph — the tree moved under the probe — adopts the committed
+generation; a CURRENT that none of the daemon's committers wrote is adopted on the next
+dirty/backstop pass.
+
+| oracle | before | after |
+|---|---|---|
+| `watch.rs::a_generation_committed_behind_the_daemon_never_masks_an_edit` (deterministic) | fails in 10.8 s (v2 served, v3 masked) | passes (0.9 s) |
+| `live.rs::probe_measures_unchanged_against_the_serving_overlay_not_the_committed_pack` | — | passes; holds both verdicts side by side |
+| `live_differential` loop, same machine, phase tracing on | 1/6 and 1/30 failures | 40/40 pass (`scratchpad/loop-live-diff.sh`) |
+| `cargo test -p vorpal-mcp`, `-p vorpal-index` | — | all green |
+
+Cost: one xxh3 per product at overlay build (inside a pass that already decodes every
+product) and one u64 per file retained; the probe no longer opens the pack when an overlay
+serves. The quiet query path is unchanged (the truth-on-disk check runs only on dirty or
+backstop-due passes and is one small file read).
+
+## `callees` on the graph tool, with call sites (2026-09-04)
+
+"What does X call" was the one basic question that needed the `reachable` detour
+(`direction: out, max_depth: 1`), and the fast-path experiment above showed the model
+flailing on exactly that command. `graph` now takes `relation: callees`: the target's
+out-edges of `calls`, each row carrying the call site inside the target's own body — one
+`evidence_from` read on the target (callers pays one per hit) and one source read (the
+target's file), so a callees lookup is at most a callers lookup and usually cheaper. The
+CLI gained the same verb, and its machine formats now carry call sites for every
+relation, so the shell fast path answers both questions in one command.
+
+Nothing in the generation moves: no extraction, no artifact, no stamp — indexing, the
+per-edit path, and the bit-reproducibility gates are untouched by construction.
+
+| measure | before | after |
+|---|---:|---:|
+| `tools/list` bytes (same probe, 0.8.0 binary vs this branch, legacy handshake) | 11,700 | 11,719 |
+| `vorpal graph callees vfs_write` on the kernel index, debug CLI, whole process | — | 0.03 s wall, 3 rows with sites |
+| `vorpal graph callees tool_result` on this repo | — | 7 rows, sites at server.rs:1257–1281 |
+
+The end-to-end agent rows for "what vfs_read calls" in the README were measured through
+`reachable`; they are not restamped here (a `callees` re-run is a lead, not a claim).
