@@ -128,10 +128,16 @@ both a text rendering in `content` and `structuredContent`:
   `cursor` (opaque, from a previous `nextCursor`) and `limit` (default 100, max 1000) as
   arguments. Every page carries `base`, the absolute directory prefix its records share,
   and each record's `path` is relative to it (one prefix instead of one per row).
-- `graph` rows for `callers`, `references`, `importers`, `implementors`, and `type_users`
-  carry `site_line` and `site`: the line number and text of the first retained occurrence
-  of the edge in the caller's own source, read from the generation's pack. "Who calls X"
-  needs no follow-up `snippet`.
+- `graph` rows for `callers`, `callees`, `references`, `importers`, `implementors`, and
+  `type_users` carry `site_line` and `site`: the line number and text of the first retained
+  occurrence of the edge — in the caller's own source for the inbound relations, inside the
+  symbol's own body for `callees` — read from the generation's pack. "Who calls X" and
+  "what does X call" need no follow-up `snippet`. The live daemon keeps the sites truthful
+  across edits: a graph it serves straight from the overlay gains the committed
+  generation's evidence the moment that generation lands (rows omit sites only in that
+  window), and a file whose stamp outran the pinned generation is re-extracted and used
+  only if it still matches the served product (a comment-only edit keeps its sites; a
+  semantic edit's sites wait for the served graph to absorb it).
 - Tool descriptions on the wire are deliberately terse: a client either loads a schema in
   a model turn or carries the whole listing in every turn, so the listing is kept under
   10 KB (a test enforces it). The prose is here.

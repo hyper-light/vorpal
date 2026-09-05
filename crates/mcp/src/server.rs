@@ -623,7 +623,7 @@ impl Server {
     };
     match handle.join() {
       Ok(Ok(dir)) => {
-        self.kg_dir = Some(dir);
+        self.pin_served_generation(dir);
         // Adoption first, warm second: with an adopt task in flight the warm request
         // defers (its gate treats the task as tier-present), and a failed adopt requests
         // the warm itself — so the ~full-build rebuild only runs when reconciliation
@@ -781,6 +781,17 @@ impl Server {
     self.reap_rebuilding(false);
   }
 
+  /// Pin the served graph to the committed generation that holds its bytes, and give a
+  /// graph sealed in memory that generation's evidence family: call sites and `why`
+  /// then answer from the served graph without a reload. Every site that pins `kg_dir`
+  /// for an in-memory graph goes through here.
+  fn pin_served_generation(&mut self, dir: PathBuf) {
+    if let Some(kg) = &self.kg {
+      kg.attach_evidence(&dir);
+    }
+    self.kg_dir = Some(dir);
+  }
+
   /// Act on a finished canonicalization (see [`CanonicalizeOutcome`]) — shared by the
   /// non-blocking reap and the generation-bound drain, so both sites obey the same law.
   fn absorb_canonicalize_outcome(&mut self, outcome: CanonicalizeOutcome) {
@@ -790,7 +801,8 @@ impl Server {
         // artifact pin so generation-bound reads (snippets, call sites) verify sources
         // against the stamps the tree now has, not a superseded generation's.
         if self.persisting.is_none() {
-          self.kg_dir = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
+          let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+          self.pin_served_generation(dir);
         }
         self.spawn_overlay_build();
       }
@@ -1297,7 +1309,8 @@ impl Server {
             self.kg_dir = None;
             self.persisting = Some(std::thread::spawn(move || pending.persist()));
           } else {
-            self.kg_dir = Some(vorpal_kg::resolve_index_dir(&self.index_dir));
+            let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
+            self.pin_served_generation(dir);
             // Adoption before warm at every kg-servable site — see `reap_persist`.
             self.spawn_live_ann_adopt();
             self.request_warm();
@@ -1496,8 +1509,8 @@ impl Server {
       }
       if self.kg_dir.is_none() && self.kg.is_some() {
         let dir = vorpal_kg::resolve_index_dir(&self.index_dir);
-        if dir.join("nodes.vseg").exists() {
-          self.kg_dir = Some(dir);
+        if dir.join("nodes.vseg").exists() || dir.join(vorpal_kg::NODES_TOC).is_file() {
+          self.pin_served_generation(dir);
         }
       }
     }
@@ -1814,17 +1827,28 @@ impl Server {
         // `self.kg()` keeps the daemon contract: freshness revalidation, the warm cached
         // graph, and the "run the 'index' tool first" error when nothing is indexed yet.
         let dir = self.kg_dir.clone();
-        let kg = self.kg()?;
+        self.kg()?;
+        let Some(kg) = self.kg.as_deref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
         let data = if tool == "node" {
           let records =
             vorpal_index::records::listing_records(kg, &target).map_err(ToolError::from)?;
           paged(records, args, "hits")?
         } else {
           // Rows carry the call site (line + text) so "who calls X" and "what does X
-          // call" need no snippet.
-          let selected =
-            vorpal_index::records::related_records_with_sites(kg, dir.as_deref(), verb, &target)
-              .map_err(ToolError::from)?;
+          // call" need no snippet. A file whose stamp outran the pinned generation is
+          // verified against the served extraction (overlay) before its line is sliced.
+          let overlay = self.overlay.as_ref();
+          let verify = move |path: &str| overlay.and_then(|overlay| overlay.verified_source(path));
+          let selected = vorpal_index::records::related_records_with_sites(
+            kg,
+            dir.as_deref(),
+            verb,
+            &target,
+            Some(&verify),
+          )
+          .map_err(ToolError::from)?;
           selected_data(selected, args)?
         };
         let text = vorpal_index::graph_query_on(kg, verb, &target)

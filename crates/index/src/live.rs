@@ -324,6 +324,21 @@ impl LiveOverlay {
     product_body_digest(bytes).is_some_and(|digest| self.products.get(key) == Some(&digest))
   }
 
+  /// The current bytes of `key` when they extract to exactly the product the served graph
+  /// holds — the source a call site may be sliced from although the file's stamp no longer
+  /// matches the pinned generation (a comment-only edit, a touch, the canonicalization
+  /// window). Product-identical means span-identical, so the graph's evidence offsets are
+  /// valid against these bytes. `None` when the file moved semantically or cannot be
+  /// read: the caller leaves the site absent rather than guess.
+  pub fn verified_source(&self, key: &str) -> Option<Vec<u8>> {
+    let bytes = fs::read(key).ok()?;
+    let source = std::str::from_utf8(&bytes).ok()?;
+    let product = self.extractor.extract_product(key, source)?;
+    let mut encoded = Vec::new();
+    encode_product_into(&product, &mut encoded);
+    self.product_matches(key, &encoded).then_some(bytes)
+  }
+
   /// Recover the exact change set by stat-diffing the live tree against the retained
   /// manifest — the overlay's answer to watcher capture loss. Same walker, same
   /// handled-filter, same (size, mtime) trust model as the pipeline's own sweep, so the

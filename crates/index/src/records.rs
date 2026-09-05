@@ -998,6 +998,11 @@ pub fn listing_records(kg: &Kg, target: &GraphTarget) -> Result<Vec<NodeRecord>,
   )
 }
 
+/// A caller-supplied source oracle for [`related_records_with_sites`]: given a path whose
+/// stamp no longer matches the pinned generation, the file's current bytes when they still
+/// extract to the served product, else `None`.
+pub type VerifiedSource<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
+
 /// The edge type behind a graph verb, and whether the verb walks out-edges (`callees`: what
 /// the target calls) rather than in-edges (everything else: what reaches the target).
 pub(crate) fn verb_edge(verb: &str) -> Result<(vorpal_kg::EdgeType, bool), String> {
@@ -1070,11 +1075,17 @@ pub fn related_records(
 /// the two model turns separating the graph from a single grep). Files that changed since
 /// the generation, or edges without retained occurrences, leave the fields absent;
 /// `similar` rows never carry them.
+///
+/// `verified_source` is the live daemon's answer for a file whose stamp no longer matches
+/// the pinned generation: bytes that extract to exactly the served product (see
+/// `LiveOverlay::verified_source`), against which the evidence offsets are still exact.
+/// Without it (the CLI, a daemon with no overlay) such a file's sites stay absent.
 pub fn related_records_with_sites(
   kg: &Kg,
   artifacts_dir: Option<&std::path::Path>,
   verb: &str,
   target: &GraphTarget,
+  verified_source: Option<VerifiedSource<'_>>,
 ) -> Result<Selected<RelatedRecord>, String> {
   let mut selected = related_records(kg, verb, target)?;
   let Selected::Hits(hits) = &mut selected else {
@@ -1155,7 +1166,7 @@ pub fn related_records_with_sites(
         .ok()
         .and_then(|read| match read {
           crate::IndexedRead::Verified(bytes) | crate::IndexedRead::Unverified(bytes) => Some(bytes),
-          crate::IndexedRead::Changed => None,
+          crate::IndexedRead::Changed => verified_source.and_then(|verify| verify(&path)),
         });
       cached = Some((path, read));
     }

@@ -505,7 +505,10 @@ pub struct Kg {
   /// Per-edge evidence sidecar (`evidence.bin`), mapped zero-copy. `None` for in-RAM graphs
   /// and generations written before the sidecar existed — queries answer "no evidence
   /// recorded", never an error.
-  evidence: Option<crate::evidence::EvidenceStore>,
+  /// The retained evidence family. `Kg::load` opens it with the generation; a graph sealed
+  /// in memory (the daemon's served overlay graph) attaches it once its own generation is
+  /// committed — see [`Kg::attach_evidence`].
+  evidence: std::sync::OnceLock<crate::evidence::EvidenceStore>,
   graph: Graph,
   directory: SegmentDirectory,
   /// The community sidecar (`communities.bin`), loaded on first use and validated against
@@ -571,7 +574,7 @@ impl Kg {
       heap_file,
       home_dir,
       names: None,
-      evidence: None,
+      evidence: std::sync::OnceLock::new(),
       graph,
       directory,
       communities: std::sync::OnceLock::new(),
@@ -668,7 +671,7 @@ impl Kg {
   /// Returns `false` when the generation carries no sidecar — callers must then treat
   /// name-based suppression as unavailable, not as "nothing was referenced".
   pub fn for_each_evidence_name_hash(&self, f: impl FnMut(u32)) -> bool {
-    match &self.evidence {
+    match self.evidence.get() {
       Some(store) => {
         store.for_each_name_hash(f);
         true
@@ -751,7 +754,7 @@ impl Kg {
   pub fn edge_evidence(&self, from: NodeId, to: NodeId) -> Vec<crate::evidence::EvidenceRow> {
     self
       .evidence
-      .as_ref()
+      .get()
       .map(|store| store.edges_between(from.raw() as u32, to.raw() as u32))
       .unwrap_or_default()
   }
@@ -762,7 +765,7 @@ impl Kg {
   pub fn all_evidence(&self) -> Vec<crate::evidence::EvidenceRow> {
     self
       .evidence
-      .as_ref()
+      .get()
       .map(|store| store.rows().collect())
       .unwrap_or_default()
   }
@@ -772,16 +775,31 @@ impl Kg {
   pub fn evidence_absences(&self, from: NodeId, name_hash: u32) -> Vec<crate::evidence::EvidenceRow> {
     self
       .evidence
-      .as_ref()
+      .get()
       .map(|store| store.absences_from(from.raw() as u32, name_hash))
       .unwrap_or_default()
+  }
+
+  /// Attach the evidence family committed under `dir` to a graph sealed in memory. The
+  /// daemon serves the overlay's sealed graph the moment it links and commits its
+  /// generation in the background; the committed evidence rows are in that graph's own
+  /// sealed-id space (the generation's bytes are the ones the served graph was sealed
+  /// from), so attaching them makes call sites and `why` answer from the served graph
+  /// without a reload. One-shot: a graph that already carries evidence keeps it (`false`).
+  pub fn attach_evidence(&self, dir: &Path) -> bool {
+    crate::evidence::EvidenceStore::open(dir).is_some_and(|store| self.evidence.set(store).is_ok())
+  }
+
+  /// Whether this graph carries an evidence family (loaded or attached).
+  pub fn has_evidence(&self) -> bool {
+    self.evidence.get().is_some()
   }
 
   /// Every retained evidence occurrence originating at `from` — the one-sided form.
   pub fn evidence_from(&self, from: NodeId) -> Vec<crate::evidence::EvidenceRow> {
     self
       .evidence
-      .as_ref()
+      .get()
       .map(|store| store.edges_from(from.raw() as u32))
       .unwrap_or_default()
   }
@@ -1929,7 +1947,9 @@ impl Kg {
       ));
     }
     kg.names = open_names_index(dir, &policy, kg.node_count());
-    kg.evidence = crate::evidence::EvidenceStore::open(dir);
+    if let Some(store) = crate::evidence::EvidenceStore::open(dir) {
+      let _ = kg.evidence.set(store);
+    }
     Ok(kg)
   }
 

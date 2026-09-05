@@ -4171,3 +4171,19 @@ generation committed behind the daemon's back is adopted) and the `callees` rela
 call sites on the `graph` tool and the CLI. Nothing on the index build or search path
 changed; the README's measured numbers stay stamped at v0.7.1 (indexing) and 2026-09-04
 (agent end-to-end), and no flagship re-run is claimed for this release.
+
+### Follow-up: call sites on the served graph (2026-09-05)
+
+Lean-by-default (`5ccba18`) made the differential oracle compare the site columns in the
+rendered text, and it failed at step 2: overlay-served `callers` rows carried no site
+while the scratch build's did. Cause: only `Kg::load` attached the evidence family, so a
+graph sealed in memory (the served overlay graph) answered `evidence_from` empty. Fix:
+`Kg::attach_evidence` (one-shot, `OnceLock`) — the daemon attaches the committed
+generation's evidence the moment its served persistence lands (`pin_served_generation`),
+in the sealed-id space the generation was written from. Second gap the strict steps
+exposed: a comment-only edit or touch changes the file's stamp, so the pinned pack's
+digest check refused the read and the sites went absent until the canonicalizer's
+generation was reaped. `LiveOverlay::verified_source` re-extracts the current file and
+hands its bytes over only when the product is byte-identical to the served one — spans
+identical by construction, so the evidence offsets stay exact. `cargo test -p vorpal-mcp`
+green; live_differential looped (see below).

@@ -1160,6 +1160,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
             Some(vorpal_index::resolve_index_dir(&dir)).as_deref(),
             verb.as_str(),
             &target,
+            None,
           )
           .map_err(anyhow::Error::msg)?,
           cursor,
