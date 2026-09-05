@@ -395,7 +395,7 @@ fn warm_index_tools_answer_graph_queries() {
 
   let (text, is_err) = call_tool(&mut server, 4, "node", json!({"name": "target"}));
   assert!(!is_err, "{text}");
-  assert!(text.contains("target [Function]"), "{text}");
+  assert!(text.contains("target\tFunction"), "{text}");
 
   let (text, is_err) = call_tool(
     &mut server,
@@ -408,7 +408,7 @@ fn warm_index_tools_answer_graph_queries() {
 
   let (text, is_err) = call_tool(&mut server, 6, "node", json!({"name": "missing"}));
   assert!(!is_err, "{text}");
-  assert!(text.contains("no results"), "{text}");
+  assert!(text.contains("records[0]:"), "{text}");
 
   // Re-index of the unchanged tree is the near-instant reuse path.
   let (text, is_err) = call_tool(
@@ -491,14 +491,14 @@ fn fetch_span_is_digest_verified_and_refuses_stale_files() {
   );
   assert!(!is_err, "{text}");
 
-  let (text, is_err) = call_tool(&mut server, 2, "node", json!({"name": "target"}));
-  assert!(!is_err, "{text}");
-  let id: u64 = text
-    .split("id ")
-    .nth(1)
-    .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-    .and_then(|digits| digits.parse().ok())
-    .unwrap_or_else(|| panic!("no node id in: {text}"));
+  let response = request(
+    &mut server,
+    2,
+    "tools/call",
+    json!({"name": "node", "arguments": {"name": "target"}}),
+  );
+  assert_eq!(response["result"]["isError"], false);
+  let id = response["result"]["structuredContent"]["records"][0]["id"].as_u64().unwrap();
 
   let (text, is_err) = call_tool(&mut server, 3, "fetch_span", json!({"id": id}));
   assert!(!is_err, "{text}");
@@ -560,13 +560,13 @@ fn results_carry_generation_identity_and_stable_error_codes() {
   );
 
   // The stale-source refusal carries its own code.
-  let (text, _) = call_tool(&mut server, 4, "node", json!({"name": "target"}));
-  let id: u64 = text
-    .split("id ")
-    .nth(1)
-    .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-    .and_then(|digits| digits.parse().ok())
-    .unwrap_or_else(|| panic!("no node id in: {text}"));
+  let response = request(
+    &mut server,
+    4,
+    "tools/call",
+    json!({"name": "node", "arguments": {"name": "target"}}),
+  );
+  let id = response["result"]["structuredContent"]["records"][0]["id"].as_u64().unwrap();
   let b_rs = src.join("b.rs");
   let mut content = fs::read_to_string(&b_rs).unwrap();
   content.insert_str(0, "// shifted\n");
@@ -598,7 +598,7 @@ fn typed_records_and_cursor_pagination() {
   );
   assert!(!is_err, "{text}");
 
-  // `node` returns typed records: full identity (dense id, durable eid, kind, path, span).
+  // `node` returns compact typed records by default (dense id, kind, path).
   let response = request(
     &mut server,
     2,
@@ -613,11 +613,10 @@ fn typed_records_and_cursor_pagination() {
   assert_eq!(record["name"], "target");
   assert_eq!(record["kind"], "Function");
   assert!(record["path"].as_str().unwrap().ends_with("b.rs"));
-  // Paths are relative to one `base` (the page's common absolute prefix); the default
-  // keeps every column.
+  // Paths are relative to one `base`; bulky node metadata is omitted by default.
   assert!(data["base"].as_str().is_some_and(|b| b.starts_with('/') && b.ends_with('/')));
   assert!(!record["path"].as_str().unwrap().starts_with('/'));
-  assert!(record["signature"].is_string() && record["external_id"].is_string());
+  assert!(record.get("signature").is_none() && record.get("external_id").is_none());
 
   // `format` shapes structuredContent, not just the text — the client may feed the
   // model the structured half.
@@ -666,11 +665,8 @@ fn typed_records_and_cursor_pagination() {
   assert!(ids["id"].is_u64() && ids["external_id"].is_string());
   assert_eq!(ids.as_object().unwrap().len(), 2);
   assert!(record["id"].as_u64().is_some());
-  assert!(
-    record["external_id"].as_str().unwrap().starts_with("eid:"),
-    "{record}"
-  );
-  assert!(record["span"][1].as_u64().unwrap() > 0);
+  assert!(record.get("external_id").is_none());
+  assert!(record.get("span").is_none());
 
   // `callers` records carry the edge grade; `reachable` steps carry relation + via.
   let response = request(

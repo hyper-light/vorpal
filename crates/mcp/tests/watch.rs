@@ -178,7 +178,7 @@ fn unwatchable_layout_keeps_explicit_index_semantics() {
   fs::write(src.join("late.rs"), "pub fn late_symbol() {}\n").unwrap();
   std::thread::sleep(Duration::from_millis(300));
   let (text, _) = call_tool(&mut server, 2, "node", json!({"name": "late_symbol"}));
-  assert!(text.contains("no results"), "{text}");
+  assert!(text.contains("records[0]:"), "{text}");
 
   // …until the explicit `index` tool runs, exactly as before.
   let (text, is_error) = call_tool(

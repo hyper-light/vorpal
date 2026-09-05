@@ -146,7 +146,7 @@ fn per_project_dynamic_language_envs_route() {
     json!({"project": "plain", "name": "gadget_knob"}),
   );
   assert!(
-    text.contains("no results"),
+    text.contains("records[0]:"),
     "plain (default env) must not walk jsonx: {text}"
   );
   for project in ["plain", "dynp"] {

@@ -23,7 +23,7 @@ use vorpal_kg::Kg;
 
 use crate::watch::SourceWatch;
 
-use crate::protocol::{Handler, RpcError, decorate_tools};
+use crate::protocol::{Handler, RpcError, decorate_tools, default_record_format};
 
 /// The warm-index MCP server: one persisted index directory, its graph held in memory across
 /// calls (lazily cold-opened via mmap on first query, reloaded after each `index` tool call).
@@ -281,8 +281,8 @@ pub(crate) const INSTRUCTIONS: &str = "Knowledge graph of one indexed repository
 observed), `reachable`, `snippet`, or `why` DIRECTLY with the exact symbol name; use `node` \
 or `search` only when the name is unknown or ambiguous. Every graph, reachable, and why \
 result is the complete resolved set at the grade each row states — never confirm it with \
-search, code_search, or grep; callers and callees rows already carry the call-site line. Pass \
-`format: \"lean\"` unless you need signatures. If your client defers these tools, load all \
+search, code_search, or grep; callers and callees rows already carry the call-site line. \
+Navigation lists default to lean. If your client defers these tools, load all \
 you will need in ONE ToolSearch call. Results page with cursor/limit and name the index \
 generation they were read from.";
 
@@ -1364,11 +1364,15 @@ impl Server {
       .unwrap_or_else(|| json!({}));
     match self.run_tool(tool, &args) {
       Ok((text, mut data)) => {
+        let format = args
+          .get("format")
+          .and_then(Value::as_str)
+          .or_else(|| default_record_format(tool));
         // Token-oriented text: `format: "toon" | "lean" | "ids"` rewrites the rendered half
         // from this page's records — one renderer for every record-bearing tool; tools
         // without records keep their prose.
         let text = match (
-          args.get("format").and_then(Value::as_str),
+          format,
           data.get("records").and_then(Value::as_array),
         ) {
           (Some("toon"), Some(rows)) => vorpal_index::records::toon_from_values(rows),
@@ -1379,7 +1383,7 @@ impl Server {
         // The structured half follows the same format: `base` + relative paths on every
         // page, fat columns dropped under `lean`, identity only under `ids` — because the
         // client may feed the model structuredContent rather than the text.
-        vorpal_index::records::shape_structured(&mut data, args.get("format").and_then(Value::as_str));
+        vorpal_index::records::shape_structured(&mut data, format);
         // Typed tools return their records/pagination here; text-only tools return `{}`.
         // Generation identity rides every success either way.
         data["generation"] = self.generation_id();
@@ -2724,5 +2728,4 @@ fn watch_root(index_dir: &Path) -> Option<PathBuf> {
   };
   src.is_dir().then(|| src.to_path_buf())
 }
-
 

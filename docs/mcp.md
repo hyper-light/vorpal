@@ -140,6 +140,11 @@ both a text rendering in `content` and `structuredContent`:
   identity and ranking columns (`name`, `kind`, `path`, `id`, `grade`, …) and drops
   `signature`, `span`, and `external_id`; `ids` keeps `id` and `external_id` only;
   `toon` is a lossless tab grid grouped by directory with every column intact.
+- `node`, `graph`, `reachable`, `search`, `code_search`, `dead_code`, `impact`, and
+  `compare_generations` default to `lean`, including when `format` is omitted. Source,
+  evidence, and diagnostic tools keep their detailed defaults: for example, `snippet`
+  preserves source formatting, `why` preserves its explanation, and `data_flow` preserves
+  argument spans and sidecar availability information.
 
 ## Claude Code defers MCP tool schemas
 

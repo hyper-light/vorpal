@@ -353,6 +353,16 @@ pub fn error_line(id: Value, err: RpcError) -> String {
   json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string()
 }
 
+/// Navigation lists default to compact records. Source, evidence, and diagnostic tools
+/// keep their native rendering: their spans and explanatory prose are part of the answer.
+pub(crate) fn default_record_format(name: &str) -> Option<&'static str> {
+  match name {
+    "node" | "graph" | "reachable" | "search" | "code_search" | "dead_code"
+    | "impact" | "compare_generations" => Some("lean"),
+    _ => None,
+  }
+}
+
 /// Tool-declaration decoration shared by both handlers: a display title, the annotation
 /// hints a client acts on, and the `format` switch on every record-bearing tool. Nothing
 /// else — every byte of the listing is a token per call in a client that keeps schemas
@@ -376,6 +386,9 @@ pub fn decorate_tools(tools: &mut [Value]) {
       props.entry("format").or_insert_with(|| {
         json!({"type": "string", "enum": ["lean", "toon", "ids"]})
       });
+      if let Some(format) = default_record_format(&name) {
+        props["format"]["default"] = json!(format);
+      }
     }
   }
 }

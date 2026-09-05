@@ -64,7 +64,7 @@ fn wait_for_marker(server: &mut Server, id: &mut u64, marker: &str) {
   loop {
     *id += 1;
     let (text, is_error) = call_tool(server, *id, "node", json!({"name": marker}));
-    if !is_error && text.contains(&format!("{marker} [Function]")) {
+    if !is_error && text.contains(&format!("{marker}\tFunction\t")) {
       return;
     }
     assert!(

@@ -67,9 +67,8 @@ fn wait_for_marker(server: &mut Server, id: &mut u64, marker: &str) {
   loop {
     *id += 1;
     let (text, is_error) = call_tool(server, *id, "node", json!({"name": marker}));
-    // Match the definition line, not the name alone — the "(no results for '<name>')"
-    // message contains the name too.
-    if !is_error && text.contains(&format!("{marker} [Function]")) {
+    // Match the definition's name and kind in the default lean row.
+    if !is_error && text.contains(&format!("{marker}\tFunction\t")) {
       return;
     }
     assert!(
