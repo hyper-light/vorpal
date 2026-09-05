@@ -353,77 +353,31 @@ pub fn error_line(id: Value, err: RpcError) -> String {
   json!({"jsonrpc": "2.0", "id": id, "error": error}).to_string()
 }
 
-/// Tool-declaration decoration shared by both handlers: display titles, annotation hints,
-/// the `format` switch on every record-bearing tool, and an output schema for the structured
-/// half of every result. Applied once at listing time so the declarations stay in one place
-/// (the per-tool `tool(...)` calls) and the cross-cutting facts in another (here).
+/// Tool-declaration decoration shared by both handlers: a display title, the annotation
+/// hints a client acts on, and the `format` switch on every record-bearing tool. Nothing
+/// else — every byte of the listing is a token per call in a client that keeps schemas
+/// resident, or a model turn to load in one that defers them. The structured envelope
+/// (`generation`, `outcome`, `records`, `base`, `total`, `truncated`, `nextCursor`, `code`)
+/// is documented in docs/mcp.md rather than declared per tool.
 pub fn decorate_tools(tools: &mut [Value]) {
   for tool in tools.iter_mut() {
     let name = tool["name"].as_str().unwrap_or("").to_string();
     tool["title"] = json!(title_of(&name));
     let read_only = name != "index";
-    tool["annotations"] = json!({
-      "title": title_of(&name),
-      "readOnlyHint": read_only,
-      // `index` rewrites nothing a user wrote: it (re)builds the derived index directory.
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-    });
-    let record_bearing = tool.pointer("/inputSchema/properties/cursor").is_some();
-    if record_bearing {
-      if let Some(props) = tool
+    // `index` rewrites nothing a user wrote: it (re)builds the derived index directory.
+    // Two hints, not four: `readOnlyHint` is what clients gate on, `openWorldHint: false`
+    // says the tool never leaves the repository; the other defaults are acceptable.
+    tool["annotations"] = json!({"readOnlyHint": read_only, "openWorldHint": false});
+    if tool.pointer("/inputSchema/properties/cursor").is_some()
+      && let Some(props) = tool
         .pointer_mut("/inputSchema/properties")
         .and_then(Value::as_object_mut)
-      {
-        props.entry("format").or_insert_with(|| {
-          json!({
-            "type": "string",
-            "enum": ["toon", "lean", "ids"],
-            "description": "Rendering of the records page, text AND structuredContent: lean = identity and ranking columns only (cheapest), toon = lossless tab-grid grouped by directory, ids = durable handles only"
-          })
-        });
-      }
-    }
-    tool["outputSchema"] = output_schema(record_bearing);
-  }
-}
-
-/// The structured half of every result. Successes carry `generation` and, for record
-/// tools, the paged envelope; failures (`isError: true`) carry the stable `code`. One schema
-/// admits both so a validating client never rejects a well-formed failure.
-fn output_schema(record_bearing: bool) -> Value {
-  let mut properties = json!({
-    "generation": {
-      "type": ["string", "null"],
-      "description": "Content id of the index generation this answer was read from (null before any graph is loaded)"
-    },
-    "code": {
-      "type": "string",
-      "enum": ["bad-argument", "bad-query", "index-unavailable", "no-watch", "stale-source", "internal", "tool-error"],
-      "description": "Stable failure class; present only when isError is true"
-    }
-  });
-  if record_bearing {
-    let extra = json!({
-      "outcome": {"type": "string", "description": "Selector outcome: found, no-match, ambiguous, …"},
-      "base": {"type": "string", "description": "Absolute directory prefix every record's `path` is relative to; absent when paths share none"},
-      "records": {"type": "array", "items": {"type": "object"}, "description": "One page of typed records in deterministic order; `format` shapes these too: lean drops signature/span/external_id, ids keeps id/external_id only"},
-      "total": {"type": "integer", "minimum": 0},
-      "truncated": {"type": "boolean"},
-      "nextCursor": {"type": "string", "description": "Pass as `cursor` to fetch the next page; absent on the last page"}
-    });
-    if let (Some(props), Some(extra)) = (properties.as_object_mut(), extra.as_object()) {
-      for (key, value) in extra {
-        props.insert(key.clone(), value.clone());
-      }
+    {
+      props.entry("format").or_insert_with(|| {
+        json!({"type": "string", "enum": ["lean", "toon", "ids"]})
+      });
     }
   }
-  json!({
-    "type": "object",
-    "properties": properties,
-    "additionalProperties": true
-  })
 }
 
 fn title_of(name: &str) -> String {
@@ -659,11 +613,7 @@ mod tests {
         .get("format")
         .is_none()
     );
-    assert!(tools[1]["outputSchema"]["properties"]["records"].is_object());
-    assert!(
-      tools[0]["outputSchema"]["properties"]
-        .get("records")
-        .is_none()
-    );
+    assert!(tools[0].get("outputSchema").is_none(), "the listing carries no output schemas");
+    assert!(tools[0]["annotations"].get("title").is_none());
   }
 }

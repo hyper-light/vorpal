@@ -128,6 +128,13 @@ both a text rendering in `content` and `structuredContent`:
   `cursor` (opaque, from a previous `nextCursor`) and `limit` (default 100, max 1000) as
   arguments. Every page carries `base`, the absolute directory prefix its records share,
   and each record's `path` is relative to it (one prefix instead of one per row).
+- `graph` rows for `callers`, `references`, `importers`, `implementors`, and `type_users`
+  carry `site_line` and `site`: the line number and text of the first retained occurrence
+  of the edge in the caller's own source, read from the generation's pack. "Who calls X"
+  needs no follow-up `snippet`.
+- Tool descriptions on the wire are deliberately terse: a client either loads a schema in
+  a model turn or carries the whole listing in every turn, so the listing is kept under
+  10 KB (a test enforces it). The prose is here.
 - `format: "lean" | "toon" | "ids"` shapes both the text and `structuredContent`,
   because clients such as Claude Code hand the model the structured half. `lean` keeps
   identity and ranking columns (`name`, `kind`, `path`, `id`, `grade`, …) and drops
@@ -147,19 +154,14 @@ still pays it). Three things reduce that cost:
   rest share a single schema load.
 - **One load, not one per turn.** The server's instructions tell the model to load every
   vorpal tool it will need in a single `ToolSearch` call.
-- **Keep the schemas resident.** Claude Code's `ENABLE_TOOL_SEARCH=false` setting puts
-  MCP schemas in context up front, and the `ToolSearch` turns disappear altogether
-  (measured 2026-09-04: a direct call in 2 turns instead of 3; `auto` and `auto:N` still
-  defer). Set it in Claude Code's environment, for example in `.claude/settings.json`:
-
-  ```json
-  { "env": { "ENABLE_TOOL_SEARCH": "false" } }
-  ```
-
-  This is a Claude Code setting and applies to every MCP server it loads, which is why
-  `vorpal mcp install` mentions it rather than writing it. vorpal's 21 schemas are 44 KB
-  of JSON, roughly 11 K tokens of context when resident (cache-read on every turn after
-  the first), against one model turn per distinct tool when deferred.
+- **Keeping the schemas resident is possible but not recommended.** Claude Code's
+  `ENABLE_TOOL_SEARCH=false` puts MCP schemas in context up front and removes the
+  `ToolSearch` turn, but it also makes Claude Code's own deferred tools resident: measured
+  2026-09-04, a turn costs about 20 K tokens deferred and about 41 K resident, of which
+  vorpal's listing is about 4.5 K. One schema load per distinct tool is cheaper than that
+  on every question measured. `auto` and `auto:N` are an optimistic prefetch that sometimes
+  defers and sometimes does not. Leave the default unless wall time matters more than
+  tokens.
 
 ## Tool profiles (least privilege)
 
