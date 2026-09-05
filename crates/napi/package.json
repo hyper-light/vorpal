@@ -1,6 +1,6 @@
 {
   "name": "@hyper-light/vorpal-node",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Search and Rewrite code at large scale using precise AST pattern",
   "homepage": "https://vorpal.github.io",
   "main": "index.js",

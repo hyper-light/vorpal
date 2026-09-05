@@ -4187,3 +4187,10 @@ generation was reaped. `LiveOverlay::verified_source` re-extracts the current fi
 hands its bytes over only when the product is byte-identical to the served one — spans
 identical by construction, so the evidence offsets stay exact. `cargo test -p vorpal-mcp`
 green; live_differential looped (see below).
+
+## v0.8.2 — lean-by-default lists; served graphs carry evidence (2026-09-05)
+
+v0.8.2 is `b8e7e2c`: navigation lists default to lean on the wire and in the listing
+(`5ccba18`), and the served graph carries its generation's evidence so call sites answer
+from the overlay-served graph and survive stamp-only edits (`b8e7e2c`). Nothing on the
+index build or search path changed; measured numbers stay as stamped.
