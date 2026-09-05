@@ -5747,7 +5747,7 @@ impl Searcher {
     let overlay_hits = vorpal_ann::exhaustive_semantic(
       embedder.dim(),
       &overlay.overlay_ids,
-      |i, row| embed_node_into(kg, embedder, overlay.overlay_ids[i], row, &embed_root),
+      |i, row| embed_node_into(kg, embedder, overlay.overlay_ids[i], row, embed_root),
       &query_vec,
       take,
     );
@@ -5792,7 +5792,7 @@ impl Searcher {
         SemanticCandidates::Exact(vorpal_ann::exhaustive_semantic(
           embedder.dim(),
           &ids,
-          |i, row| embed_node_into(kg, embedder, ids[i], row, &embed_root),
+          |i, row| embed_node_into(kg, embedder, ids[i], row, embed_root),
           &query_vec,
           take,
         ))
@@ -5820,7 +5820,7 @@ impl Searcher {
           .filter(|&id| filter.is_empty() || compiled_filter.admits(kg, id))
           .map(|id| {
             let mut row = vec![0.0f32; embedder.dim()];
-            embed_node_into(kg, embedder, id, &mut row, &embed_root);
+            embed_node_into(kg, embedder, id, &mut row, embed_root);
             // The ONE shared distance tree (vorpal_ann::l2_sq — lane-decomposed SIMD,
             // bit-deterministic): the exhaustive arm's rerank-skip is sound only
             // because scan and rerank distances agree bit-for-bit.

@@ -418,7 +418,7 @@ impl ScanWithConfig {
       combined.set_no_suppress_all_rule(&self.no_suppress_all_rule);
       let interactive = self.arg.output.needs_interactive();
       // exclude_fix rule because we already have diff inspection before
-      let scanned = combined.scan(&grep, /* separate_fix*/ interactive);
+      let scanned = combined.scan(grep, /* separate_fix*/ interactive);
       if interactive {
         // Graph predicates gate diffs too: an unproven site must not even be offered as an
         // interactive edit — it belongs on the audit list.

@@ -539,7 +539,7 @@ impl OutlineExtractor {
   /// produces products for.
   fn extracts(&self, lang: SgLang) -> bool {
     self.by_lang.get(lang).is_some()
-      || self.dynamic_specs.get(&lang).is_some()
+      || self.dynamic_specs.contains_key(&lang)
       || resolved_ref_spec(lang).is_some()
   }
 
