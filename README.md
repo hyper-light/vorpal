@@ -423,21 +423,17 @@ run each, 2026-09-05, v0.8.2.
 | | vorpal MCP tool | 3 | 52 K | $0.107 | 5.9 s |
 | | vorpal CLI via shell | 2 | 36 K | $0.031 | 6.6 s |
 
-Read it plainly. A model turn costs about 20 K tokens of context and a few seconds on
-Opus before any tool does anything, so an answer is priced by its turns. Two turns, one
-command and one reply, is the floor any tool can reach in an agent, and vorpal reaches it
-on every row through the shell: 36 K to 43 K tokens against grep's 59 K to 93 K, and
-less wall on three of four. The MCP tool path is one turn more, the schema load, then a
-single `graph` call on every row (`callees` replaced the old `reachable`-plus-`snippet`
-detour for "what does X call"), with fewer tokens and less wall than grep on every row.
-Every arm answered correctly; the graph answers cite call-site lines and edge grades,
-and on the kernel callees question grep's read also listed the inline helpers
-(`fsnotify_access`, `add_rchar`) the graph does not resolve as call edges. What this
-took: a 21-tool listing under 12 KB, one `graph` tool for eight relations, call sites on
-its rows, lean records by default, and instructions that say the answer is complete and
-carry the CLI command for the index. Earlier runs of this table, from the 27-tool
-surface at 8 turns and 161 K on the kernel callers question down to here, are in
-`docs/wip/BENCHMARKS.md`.
+Each turn on Opus carries about 20 K tokens of context and takes a few seconds before
+any tool runs, so the turn count decides most of the cost. Through the shell every
+question took two turns, the command and the reply: 36 K to 43 K tokens against grep's
+59 K to 93 K, and less wall time on three of the four. Through the MCP tools every
+question took three: the schema load, one `graph` call, and the reply. On the kernel
+callees question that is one turn fewer than the previous measurement, where the answer
+needed a `reachable` call and then a `snippet`. All twelve answers were correct. On the
+kernel callees question grep's read also listed two inline helpers, `fsnotify_access`
+and `add_rchar`, that the graph does not resolve as call edges. Earlier versions of this
+table, back to the 27-tool surface that took 8 turns and 161 K tokens on the kernel
+callers question, are in `docs/wip/BENCHMARKS.md`.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,
