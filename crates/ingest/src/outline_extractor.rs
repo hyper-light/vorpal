@@ -8,6 +8,10 @@ use rayon::prelude::*;
 use vorpal_core::Language;
 use vorpal_kg::KgWriter;
 use vorpal_lang_registry::SgLang;
+
+/// A parsed source root — ast-grep's document over the tree-sitter tree, exactly what the
+/// extractor's own parsers produce and what the scan's rule matcher holds for a visited file.
+pub type ParsedRoot = vorpal_core::Vorpal<vorpal_core::tree_sitter::StrDoc<SgLang>>;
 use vorpal_outline::DEFAULT_OUTLINE_RULES;
 use vorpal_outline::combined_extractor::CombinedExtractors;
 use vorpal_outline::extractor::{SerializableOutlineRule, parse_outline_rules};
@@ -516,10 +520,55 @@ impl OutlineExtractor {
     &self,
     path: &str,
     source: &str,
-    parse: fn(SgLang, &str, &str) -> vorpal_core::Vorpal<vorpal_core::tree_sitter::StrDoc<SgLang>>,
+    parse: fn(SgLang, &str, &str) -> ParsedRoot,
     finish: impl FnOnce(product::ExtractedParts<'_>) -> R,
   ) -> Option<R> {
     let lang = SgLang::from_path(path)?;
+    // The rules-or-spec gate runs BEFORE the parse is paid for (the body re-derives it).
+    if !self.extracts(lang) {
+      return None;
+    }
+    // The parse tree (`grep`) is owned locally; everything extracted is copied into the owned
+    // product before it drops. Reference extraction runs even without outline rules (the file
+    // node is the only definition span).
+    let grep = parse(lang, path, source);
+    self.extract_from_grep(lang, path, source, &grep, finish)
+  }
+
+  /// Whether `lang` has outline rules or a reference spec — the languages this extractor
+  /// produces products for.
+  fn extracts(&self, lang: SgLang) -> bool {
+    self.by_lang.get(lang).is_some()
+      || self.dynamic_specs.get(&lang).is_some()
+      || resolved_ref_spec(lang).is_some()
+  }
+
+  /// [`OutlineExtractor::extract_product`] over a parse the caller already holds. The scan's
+  /// rule matcher parses every file it visits with the very `grep` this extractor would run,
+  /// so banking the file's product from that tree costs no second read and no second parse
+  /// (an indexed kernel scan with an empty bank paid both: 2.72 s against 1.54 s once the
+  /// bank was warm). The root must be this extractor's own parse of `path`: its language is
+  /// checked — a mismatch answers `None` and the caller takes the parsing entry — and its
+  /// text is the extraction input, so the product describes exactly the bytes that were
+  /// parsed. The caller stamps the product with the stat those bytes came from.
+  pub fn extract_product_from_root(&self, path: &str, root: &ParsedRoot) -> Option<FileProduct> {
+    let lang = SgLang::from_path(path)?;
+    if *root.lang() != lang || !self.extracts(lang) {
+      return None;
+    }
+    self.extract_from_grep(lang, path, root.source(), root, product_from_parts)
+  }
+
+  /// The single extraction body over a parsed root — every product, owned or encoded, from
+  /// a fresh parse or a borrowed one, comes through here (see [`OutlineExtractor::extract_with`]).
+  fn extract_from_grep<R>(
+    &self,
+    lang: SgLang,
+    path: &str,
+    source: &str,
+    grep: &ParsedRoot,
+    finish: impl FnOnce(product::ExtractedParts<'_>) -> R,
+  ) -> Option<R> {
     let combined = self.by_lang.get(lang);
     // A data spec (dynamic language, or a user override) wins over the builtin const table.
     let spec = self.dynamic_specs.get(&lang).or_else(|| resolved_ref_spec(lang));
@@ -531,10 +580,6 @@ impl OutlineExtractor {
     // cannot stamp an identity for, whose products could never validate — not extractable.
     // Host identity folds injectable grammars (C3a) — the same value the replay gate computes.
     let grammar_generation = crate::grammar_generation_for(lang)?;
-    // The parse tree (`grep`) is owned locally; everything extracted is copied into the owned
-    // product before it drops. Reference extraction runs even without outline rules (the file
-    // node is the only definition span).
-    let grep = parse(lang, path, source);
     // Injections (C3a): embedded languages parse with tree-sitter included ranges, so every
     // span below is a host-file byte offset. Hosts without injections pay nothing (the
     // injectable set is a static `None` for almost every language).

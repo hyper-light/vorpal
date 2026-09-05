@@ -611,11 +611,19 @@ fn finish<'i>(
 
   // Resolve the reference's path text once per reference, not once per candidate.
   let from_path_text = interner.text_of(reference.from_path);
+  // Cross-file visibility of a NON-exported candidate exists only for `.rs` and `.java`
+  // referrers (`privately_visible` answers false for every other referring path, whatever
+  // the candidate). For those referrers every private candidate is masked without looking
+  // at its path — no interner round trip per candidate. Same admitted set, same order.
+  let private_possible = from_path_text.ends_with(".rs") || from_path_text.ends_with(".java");
   visible.clear();
   visible.extend(
     set
       .iter()
-      .filter(|s| s.exported || privately_visible(interner.text_of(s.path), from_path_text))
+      .filter(|s| {
+        s.exported
+          || (private_possible && privately_visible(interner.text_of(s.path), from_path_text))
+      })
       .copied(),
   );
   if visible.is_empty() {

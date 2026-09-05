@@ -13,6 +13,7 @@ use vorpal_language::SupportLang;
 
 use crate::config::{ProjectConfig, read_rule_file, with_rule_stats};
 use crate::lang::SgLang;
+use vorpal_core::Language as _;
 use crate::print::{
   CloudPrinter, ColoredPrinter, Diff, FileNamePrinter, InteractivePrinter, JSONPrinter, Platform,
   PrintProcessor, Printer, ReportStyle, SimpleFile,
@@ -374,10 +375,19 @@ impl crate::remote::CountedProduce for ScanWithConfig {
     // use path relative to project director
     let abs_path = path.canonicalize()?;
     let normalized_path = abs_path.strip_prefix(&self.proj_dir).unwrap_or(path);
-    let ret = self.render_items::<P>(path, normalized_path, items, processor)?;
+    let ret = self.render_items::<P>(path, normalized_path, &items, processor)?;
     if !ret.is_empty() {
-      // Scan feeds the index too (§3.4): rule matches bank the file's extraction product.
-      let _ = vorpal_index::warm_product_cache(path);
+      // Scan feeds the index too (§3.4): rule matches bank the file's extraction product —
+      // from the parse the matcher already holds for this path's language, so the bank
+      // costs no second read and no second parse (a fresh parse only when no held root
+      // is the extractor's own for the path).
+      let held = items
+        .iter()
+        .find(|grep| SgLang::from_path(path) == Some(*grep.lang()));
+      let _ = match held {
+        Some(grep) => vorpal_index::warm_product_cache_from_root(path, grep),
+        None => vorpal_index::warm_product_cache(path),
+      };
     }
     Ok(ret)
   }
@@ -393,7 +403,7 @@ impl ScanWithConfig {
     &self,
     path: &Path,
     normalized_path: &Path,
-    items: smallvec::SmallVec<[crate::utils::Vorpal; 1]>,
+    items: &[crate::utils::Vorpal],
     processor: &P::Processor,
   ) -> Result<Vec<(P::Processed, u32)>> {
     let mut error_count = 0usize;
@@ -471,7 +481,7 @@ impl ScanWithConfig {
     )?;
     Ok(
       self
-        .render_items::<P>(display_path, normalized_path, items, processor)?
+        .render_items::<P>(display_path, normalized_path, &items, processor)?
         .into_iter()
         .map(|(f, _)| f)
         .collect(),

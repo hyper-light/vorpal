@@ -4275,3 +4275,79 @@ in 3.36 ms warm (24,709 B structured) against `rg -n 'schedule_timeout_interrupt
 -t c` 930 ms / 164 lines / 13,489 B. `evals/mcp_percall.py` now labels non-`hits`
 outcomes instead of counting their records.
 
+
+## Profile findings: seven fixes, each with its oracle and its A/B (2026-09-05)
+
+Source: the other session's read-only diagnostic pass (`/private/tmp/vorpal-profile.whkiQX/
+REPORT.md`, built from `ea9765d`). Every finding was re-derived against the source before
+any change; every fix ships with a falsifiable oracle; every wall-clock claim below is an
+interleaved A/B of the shipped 0.8.2 release binary (A) against a release build of this
+branch (B), same machine, same page-cache state, stdin from /dev/null, `evals/
+ab_index_search.py` and `evals/scan_ab.sh`. Generation ids are compared on every cold
+build: A and B commit the SAME generation on the kernel and on LLVM, so the resolver and
+allocation changes provably alter no output byte.
+
+| # | finding | fix | oracle |
+|---|---|---|---|
+| 1 | respan compose reported `graph_reused` while rewriting node spans → a no-overlay daemon kept stale rows, `snippet` sliced the old span from the new file and called it verified | respan reports `false`; `IndexReport::graph_reused` documented as "node store AND edges byte-identical"; daemon reloads | `crates/mcp/tests/respan_live.rs` — fails on the old flag in 15 s ("span start 27, expected 71"), passes in 0.6 s |
+| 1b | (found while testing 1) the stat backstop was gated on the overlay FEATURE flag; `VORPAL_NO_LIVE_OVERLAY=1` daemons had no liveness backstop | gate is `env.is_default()` only | same test could not see the edit at all before this |
+| 2 | `embedding_root` walked all 8.9 M kernel nodes on every search | one `OnceLock<String>` per immutable `Searcher` | warm-tier search below; identical top results |
+| 3 | cached searcher opened the GENERATION dir, where `encoder.dir` never lives → root-local encoder selection ignored | cache keyed on (generation, resolved selection), opened through the ROOT | `lib.rs::cached_searcher_honours_the_roots_encoder_selection` (root `off` shadows any global; a root model dir is read and reported) |
+| 4 | cold seal compacted the CSC in edge-log order; incremental lanes and the slab loader were src-major → derived `graph.bin` differed (718 incoming rows on ast-grep) | one law: `KgWriter` always `compact_src_major`; the dead flag removed | `kg/tests/csc_order.rs`; differential oracle 3 (incremental vs scratch `graph.bin` bytes); the pass's own `compare_graph_cache.py` re-run: **exit 0, `all_graph_bytes_and_adjacency_equal`** (was exit 2) |
+| 5 | indexed scan re-read and re-parsed every matched file to bank its product | `extract_product_from_root` over the matcher's own parse; `warm_product_cache_from_root`; the CLI renders from borrowed roots | scan A/B below; diagnostics identical (6,819) and bank identical (3,365 products) |
+| 6 | resolver probed every non-exported candidate's path text even for referrers that admit no private candidate | `private_possible` gate (`.rs`/`.java` referrers only) before per-candidate `text_of` | LLVM/kernel generation ids identical A vs B; resolver suite green |
+| 7 | `finalize_references` grew its output vector row by row (~4 GB cumulative allocation on the kernel) | `out.reserve(pending.len())` — an exact upper bound | generation ids identical; peak RSS flat (below) |
+
+**Cold index, 3 interleaved reps each (wall s / max RSS GB):**
+
+| corpus | A (0.8.2) | B (fix) | generation |
+|---|---|---|---|
+| kernel (75,954 files, 8,891,771 nodes) | 10.37, 9.97, 9.68 → **9.97** / 5.43, 5.21, 5.33 | 9.62, 10.13, 9.61 → **9.62** / 5.36, 5.28, 5.19 | `855d30a6…` both arms |
+| LLVM (1,444,028 nodes) | 9.20, 8.32, 8.27 → **8.32** / 2.39 | 7.95, 7.85, 7.60 → **7.85** / 2.39 | `740c265d…` both arms |
+
+Kernel −3.5 % is within the run spread; LLVM −5.6 % is consistent across all three
+pairs (the resolver short-circuit is a C++ referrer's win). RSS unchanged either way.
+
+**Search, kernel, warm daemon over MCP stdio, median of 30 (k=10), three queries × 3 reps:**
+
+| tier | A (0.8.2) | B (fix) | top-3 |
+|---|---|---|---|
+| warm (ann + postings present; scratch copy warmed by A) | 68.5, 66.9, 63.3 / 69.8, 65.7, 60.0 / 61.9, 66.7, 64.7 ms | **0.75, 1.35, 1.18 / 0.73, 0.73, 0.76 / 0.77, 0.84, 0.81 ms** | identical on every pair |
+| exhaustive (today's rebuilt kernel index, no warm tier) | 991, 991, 1012 ms | 943, 952, 953 ms | identical |
+| first query (open + first search, warm tier) | 506–549 ms | 503–540 ms | — |
+
+The profile's stack samples said the prefix walk was nearly the whole warm search; the
+A/B says the same: ~65 ms → ~0.8 ms per query, the first query unchanged (the walk runs
+once per handle, lazily). Under the exhaustive tier the walk was one ~45 ms slice of a
+~1 s scan.
+
+**Kernel incremental `vorpal index` on the scratch copy (touch / end-of-file comment /
+restore), 3 reps:** A 0.61, 0.55, 0.59 / 0.63, 0.58, 0.60 / 0.55, 0.58, 0.61 s; B 0.54,
+0.57, 0.59 / 0.57, 0.61, 0.63 / 0.57, 0.61, 0.62 s — flat; the src-major seal costs nothing
+measurable on the cutoff and compose lanes.
+
+**Indexed scan (the pass's reconstructed `kmalloc` rule, `--json=stream --inspect
+summary`, 63,775 files scanned), two runs of 3 reps:**
+
+| inbox | A (0.8.2) | B (fix) |
+|---|---|---|
+| cold (bank emptied before each run; 3,365 products banked by both) | 3.45, 2.75, 2.80 / 2.76, 2.77, 2.81 → **2.78** | 2.07, 2.11, 2.08 / 2.03, 2.07, 2.09 → **2.08** |
+| warm (bank full; nothing to bank) | 1.57, 1.56, 1.60 / 1.54, 1.60, 1.63 → 1.585 | 1.61, 1.61, 1.63 / 1.58, 1.62, 1.62 → 1.615 |
+
+Cold-inbox −25 %: the second parse is gone (2.72 s in the pass's own matrix; the warm
+inbox was 1.54–1.58 s there). The warm-inbox sign (+0.03 s, 1.9 %) is consistent across
+the six pairs but inside each arm's spread; attributed separately below.
+
+**Daemon oracle on the fix build:** `live_differential` 10/10; `cargo test` green for
+vorpal, vorpal-ingest, vorpal-index, vorpal-mcp, vorpal-kg, vorpal-graph, vorpal-resolve
+(`pack_v2` now detects the respan lane by its carry note, not by the reuse flag).
+
+**Warm-inbox attribution.** A second release build of this branch with ONLY the scan change
+reverted (files: cli scan.rs, index lib.rs warm functions, ingest extractor + export) against
+the full fix, 4 interleaved reps: warm inbox 1.647, 1.581, 1.573, 1.691 → 1.614 (no scan
+change) vs 1.579, 1.592, 1.599, 1.670 → **1.596** (fix); cold inbox 4.72, 2.83, 2.87, 3.16 vs
+3.99, 2.01, 2.10, 2.18 (the first pair paid a cold page cache on both arms). The +1.9 % seen
+against the 0.8.2 binary is build-layout/run noise: with the scan change as the only
+variable the warm path is not slower (−1 %) and the cold path is ~0.75 s faster on every
+pair. Machine: load 2–4 during the timed lanes; the 20–30 load averages logged between lanes
+were the lagging average of this harness's own 18-thread index builds.

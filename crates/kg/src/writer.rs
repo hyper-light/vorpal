@@ -133,21 +133,11 @@ pub struct KgWriter {
   flags: Vec<u8>,
   span_start: Vec<u32>,
   span_end: Vec<u32>,
-  /// P4.3 CSC law: seal the in-coming CSC over the src-major enumeration (bucketed format)
-  /// instead of the raw interleaved log (flat format). Set by whoever knows the
-  /// generation's format BEFORE the first seal — the served graph must equal the loaded
-  /// one bit-for-bit, per-destination adjacency order included.
-  csc_src_major: bool,
 }
 
 impl KgWriter {
   pub fn new() -> Self {
     Self::default()
-  }
-
-  /// Adopt the bucketed format's CSC law (see the field docs). Idempotent; set at boot.
-  pub fn set_csc_src_major(&mut self, on: bool) {
-    self.csc_src_major = on;
   }
 
   /// Pre-size for a known apply: `nodes` definitions (all thirteen dense columns, so a
@@ -604,11 +594,17 @@ impl KgWriter {
 
     crate::phase_stamp("seal: compact");
     let edges = std::mem::take(&mut self.edges);
-    let graph = if self.csc_src_major {
-      Graph::compact_src_major(n, &edges)
-    } else {
-      Graph::compact(n, &edges)
-    };
+    // The one CSC law (P4.3): the in-coming CSC is scattered over the SRC-MAJOR enumeration,
+    // never the raw interleaved log. Every other producer of a graph — the bucketed edge
+    // slabs rebuilt on load (`edgestore::load_graph`), the compose lanes' `Graph::from_parts`
+    // over slab order, the retained seal below — enumerates src-major, so a sealed graph and
+    // any graph rebuilt from its slabs are bit-identical, per-destination adjacency order
+    // included. The writer once carried an opt-in flag for this that nothing set: cold
+    // builds sealed in log order while every incremental lane sealed src-major, and the
+    // derived `graph.bin` caches of a cold and an incremental generation for the same tree
+    // differed in 718 incoming rows (ast-grep, 2026-09-05) — same edges, different order,
+    // which bounded traversals and tie-breaks can observe.
+    let graph = Graph::compact_src_major(n, &edges);
     drop(edges);
     crate::phase_stamp("seal: kg assemble");
 
@@ -854,13 +850,8 @@ impl KgWriter {
           },
         )
       },
-      || {
-        if self.csc_src_major {
-          Graph::compact_src_major(n, &new_edges)
-        } else {
-          Graph::compact(n, &new_edges)
-        }
-      },
+      // The one CSC law — see `seal`.
+      || Graph::compact_src_major(n, &new_edges),
     );
     crate::phase_stamp("seal-canonical: assemble kg");
 

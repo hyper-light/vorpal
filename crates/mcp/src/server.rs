@@ -900,8 +900,10 @@ impl Server {
       // one atomic load + one clock read.
       // The sweep needs no overlay: without one it diffs against the COMMITTED
       // manifest (the boot window under load was exactly where a disarmed backstop
-      // let a silent watcher starve convergence).
-      let lane_ready = overlay_enabled() && self.env.is_default();
+      // let a silent watcher starve convergence). It was gated on the overlay FEATURE
+      // flag until 2026-09-05, which left a daemon running with the overlay switched off
+      // at the mercy of FSEvents' delivery delays — the sweep never depended on it.
+      let lane_ready = self.env.is_default();
       let due = match (self.last_sweep_at, self.last_sweep_cost) {
         (Some(at), Some(cost)) => at.elapsed() >= cost * BACKSTOP_OVERHEAD_INVERSE,
         // Never swept or never timed: the first eligible quiet query bootstraps the
@@ -958,7 +960,7 @@ impl Server {
     let change_set: Option<std::collections::HashSet<PathBuf>> = match &hints {
       Some(paths) => Some(paths.clone()),
       None => {
-        if overlay_enabled() && self.kg.is_some() && self.env.is_default() {
+        if self.kg.is_some() && self.env.is_default() {
           let sweep_started = std::time::Instant::now();
           let swept = match self.overlay.as_ref() {
             Some(overlay) => Some(overlay.stat_changes(&src)),

@@ -54,11 +54,14 @@ use vorpal_kg::NodeId;
 pub struct IndexReport {
   /// The tree was unchanged since the last index — reused without re-parsing (§3.4).
   pub reused: bool,
-  /// The committed generation's GRAPH artifacts are byte-identical carries of the prior
-  /// generation's (whole-tree reuse, and the stamp-only cutoff — which re-extracts changed
-  /// files but proves their extraction unchanged). A serving daemon may keep its loaded
-  /// graph, ANN tier, and overlay: they remain exact for the new generation. Distinct from
-  /// `reused`, which additionally claims no file was re-parsed at all.
+  /// The committed generation's GRAPH artifacts — the node store AND the edge families —
+  /// are byte-identical carries of the prior generation's (whole-tree reuse, and the
+  /// stamp-only cutoff — which re-extracts changed files but proves their extraction
+  /// unchanged). A serving daemon may then keep its loaded graph, ANN tier, and overlay:
+  /// every row it serves, spans included, is exact for the new generation. A lane that
+  /// moves any node column (the respan compose rewrites spans) must report `false`, or a
+  /// daemon keeps stale rows under a fresh artifact pin. Distinct from `reused`, which
+  /// additionally claims no file was re-parsed at all.
   pub graph_reused: bool,
   /// Files re-parsed this run (changed, new, or cache-missing).
   pub indexed: u64,
@@ -3627,6 +3630,24 @@ static WARM_ROOTS: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<WarmRoot>>>>> = On
 /// and returns whether a product was written. A fresh product for the file's current stat is
 /// left untouched, so repeated matches are near-free.
 pub fn warm_product_cache(file: &Path) -> io::Result<bool> {
+  warm_product_cache_with(file, None)
+}
+
+/// [`warm_product_cache`] from a parse the caller already holds — the scan's own rule-matcher
+/// parse of the file — so banking costs no second read and no second parse. The root's text
+/// must be the file's current content: its length is checked against the stat the product is
+/// stamped with, and a mismatch (the file moved under the scan) reads and parses afresh.
+pub fn warm_product_cache_from_root(
+  file: &Path,
+  root: &vorpal_ingest::ParsedRoot,
+) -> io::Result<bool> {
+  warm_product_cache_with(file, Some(root))
+}
+
+fn warm_product_cache_with(
+  file: &Path,
+  root: Option<&vorpal_ingest::ParsedRoot>,
+) -> io::Result<bool> {
   let Ok(canonical) = file.canonicalize() else {
     return Ok(false);
   };
@@ -3654,9 +3675,6 @@ pub fn warm_product_cache(file: &Path) -> io::Result<bool> {
     }
   }
 
-  let Ok(source) = fs::read_to_string(&canonical) else {
-    return Ok(false);
-  };
   let extractor = OutlineExtractor::new().map_err(io::Error::other)?;
   // Bank products written by a broken binary replay into healthy runs (same digests, same
   // source) — the self-check keeps a bad build from feeding the bank at all. Scoped to the
@@ -3668,8 +3686,23 @@ pub fn warm_product_cache(file: &Path) -> io::Result<bool> {
   }];
   vorpal_ingest::verify_extraction_for_manifest(&extractor, &stat_for_lang)
     .map_err(io::Error::other)?;
-  let Some(mut product) = extractor.extract_product(&keyed, &source) else {
-    return Ok(false);
+  // A held parse whose text is the file as stat'ed above extracts without another read or
+  // parse; anything else (no root, a different language for the path, a length that no
+  // longer matches the stat) takes the reading entry.
+  let held = root
+    .filter(|root| root.source().len() as u64 == meta.len())
+    .and_then(|root| extractor.extract_product_from_root(&keyed, root));
+  let mut product = match held {
+    Some(product) => product,
+    None => {
+      let Ok(source) = fs::read_to_string(&canonical) else {
+        return Ok(false);
+      };
+      let Some(product) = extractor.extract_product(&keyed, &source) else {
+        return Ok(false);
+      };
+      product
+    }
   };
   product.source_size = meta.len();
   product.source_mtime_ns = mtime_ns;
@@ -4583,6 +4616,11 @@ fn search_index_impl(
 pub struct Searcher {
   generation_dir: PathBuf,
   kg: Kg,
+  /// The canonical tree prefix every stored path shares (see [`embedding_root`]), derived
+  /// once per handle on first need. The handle pins one immutable generation, so the value
+  /// can never go stale; deriving it per query walked every node of the graph — on the
+  /// kernel's 8.9 M nodes that walk was nearly the whole cost of a warm search.
+  embed_root: std::sync::OnceLock<String>,
   /// The persisted ANN tier — present only when fresh for this generation (the common warm
   /// case). Absent → `run` takes the overlay/exhaustive tiers (cold, degraded, load per call).
   ann: Option<AnnIndex>,
@@ -4679,6 +4717,7 @@ impl Searcher {
     Ok(Searcher {
       generation_dir,
       kg,
+      embed_root: std::sync::OnceLock::new(),
       ann,
       postings,
       embedder,
@@ -4724,6 +4763,7 @@ impl Searcher {
     Ok(Searcher {
       generation_dir,
       kg,
+      embed_root: std::sync::OnceLock::new(),
       ann: None,
       postings: None,
       embedder,
@@ -5634,9 +5674,10 @@ impl Searcher {
     // so query vectors, overlay embeds, and the rerank always match the stored rows.
     let embedder = &self.embedder;
     let query_vec = embedder.embed(query);
-    // One root per query session: every node vector this search computes strips the same
-    // canonical tree prefix (see `embedding_root`).
-    let embed_root = embedding_root(kg);
+    // One root per HANDLE: every node vector this search computes strips the same canonical
+    // tree prefix (see `embedding_root`), derived on the first query and reused by every
+    // later one — the handle's generation is immutable, so the prefix is too.
+    let embed_root: &str = self.embed_root.get_or_init(|| embedding_root(kg));
 
   // Semantic candidate pool, by tier — a search NEVER waits on an ANN build:
   // 1. **Base-fresh**: the persisted tier matches this KG generation → beam search.
@@ -6051,32 +6092,58 @@ pub fn open_searcher(index_dir: &Path) -> Result<Arc<Searcher>, Box<dyn Error>> 
 /// re-`mmap`ing every tier per call. Safe by construction: generation dirs are
 /// content-addressed and immutable, so a cached entry is never stale — a rebuild resolves to a
 /// new dir and opens a fresh entry. Bounded, so retired generations' mappings are released.
-/// Newest-first LRU of open searchers, keyed by immutable generation dir.
-type SearcherCache = Mutex<Vec<(PathBuf, Arc<Searcher>)>>;
+/// Newest-first LRU of open searchers, keyed by (immutable generation dir, the root's
+/// resolved encoder selection): a generation is content-addressed and never changes, but
+/// the ROOT's `encoder.dir` can (`vorpal tune` writes `off`; `vorpal enable` turns a model
+/// on), and a handle opened under one selection must not answer queries made under another.
+type SearcherCache = Mutex<Vec<(PathBuf, String, Arc<Searcher>)>>;
+
+/// The root's effective encoder selection, spelled as the cache key: the per-index choice
+/// when the root carries one (`off`, or a model directory), else the global enable, else
+/// none. Resolved exactly as [`open_selected_encoder`] resolves it.
+fn encoder_selection_key(index_root: &Path) -> String {
+  match encoder_selection(index_root) {
+    Some(EncoderSelection::Off) => "off".to_string(),
+    Some(EncoderSelection::Model(dir)) => dir.to_string_lossy().into_owned(),
+    None => models::global_encoder_selection()
+      .map(|dir| dir.to_string_lossy().into_owned())
+      .unwrap_or_default(),
+  }
+}
 
 fn cached_searcher(index_dir: &Path) -> Result<Arc<Searcher>, Box<dyn Error>> {
   const CAP: usize = 8;
   static CACHE: OnceLock<SearcherCache> = OnceLock::new();
   let generation_dir = vorpal_kg::resolve_index_dir(index_dir);
+  let selection = encoder_selection_key(index_dir);
   let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
   {
     let mut guard = cache.lock().unwrap();
-    if let Some(pos) = guard.iter().position(|(dir, _)| *dir == generation_dir) {
+    if let Some(pos) = guard
+      .iter()
+      .position(|(dir, sel, _)| *dir == generation_dir && *sel == selection)
+    {
       let entry = guard.remove(pos);
-      let searcher = entry.1.clone();
+      let searcher = entry.2.clone();
       guard.push(entry); // most-recently-used to the back
       return Ok(searcher);
     }
   }
   // Open (mmap all tiers) outside the lock — a load must not serialize searches on other
-  // generations.
-  let searcher = Arc::new(Searcher::open(&generation_dir)?);
+  // generations. Opened through the ROOT, never the generation dir: the encoder selection
+  // and the dense sidecar's enablement are root artifacts (`encoder.dir`, `semantic.tier`),
+  // and an open keyed on the generation dir alone read neither — the root's own `encoder.dir`
+  // was ignored and only the global enable applied (probe-reproduced 2026-09-05).
+  let searcher = Arc::new(Searcher::open(index_dir)?);
   let mut guard = cache.lock().unwrap();
-  // A concurrent caller may have opened the same generation meanwhile; keep a single entry.
-  if let Some(pos) = guard.iter().position(|(dir, _)| *dir == generation_dir) {
-    return Ok(guard[pos].1.clone());
+  // A concurrent caller may have opened the same pair meanwhile; keep a single entry.
+  if let Some(pos) = guard
+    .iter()
+    .position(|(dir, sel, _)| *dir == generation_dir && *sel == selection)
+  {
+    return Ok(guard[pos].2.clone());
   }
-  guard.push((generation_dir, searcher.clone()));
+  guard.push((generation_dir, selection, searcher.clone()));
   if guard.len() > CAP {
     guard.remove(0);
   }
@@ -7073,6 +7140,38 @@ pub fn format_nodes(kg: &Kg, ids: &[NodeId]) -> String {
 #[cfg(test)]
 mod tests {
   use super::{DENSE_LIST, DenseFusion, RRF_K, admit_dense, rrf_fuse_explained, rrf_fuse_with};
+
+  /// The cached searcher is keyed on the ROOT's encoder selection and opened through the
+  /// root: a per-index `encoder.dir` is honoured whatever the global enable says (it once
+  /// was not — the cache opened the generation dir, where no `encoder.dir` ever lives).
+  #[test]
+  fn cached_searcher_honours_the_roots_encoder_selection() {
+    let base = std::env::temp_dir().join(format!("vorpal-searcher-sel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("repo");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+    let root = base.join("index");
+    super::build_index(&src, &root).expect("index");
+
+    // A root selection naming a directory that is not a model: the open fails and the
+    // handle SAYS so — proof the root's file was read, whatever the global state.
+    let missing = base.join("no-such-model");
+    super::write_encoder_selection(&root, &missing).unwrap();
+    let selected = super::cached_searcher(&root).expect("searcher");
+    assert!(
+      selected.encoder_status().is_some_and(|note| note.contains("encoder disabled")),
+      "root-local selection ignored: {:?}",
+      selected.encoder_status()
+    );
+    // The per-index opt-out shadows every global enable: no encoder, no note.
+    super::write_encoder_opt_out(&root).unwrap();
+    let off = super::cached_searcher(&root).expect("searcher");
+    assert!(off.encoder_status().is_none(), "{:?}", off.encoder_status());
+    // Two selections over one generation are two handles, not one stale one.
+    assert!(!std::sync::Arc::ptr_eq(&selected, &off));
+    let _ = std::fs::remove_dir_all(&base);
+  }
 
   fn rrf_fuse(lists: &[Vec<u64>], k: usize) -> Vec<(u64, f32)> {
     rrf_fuse_explained(lists, k)
