@@ -175,12 +175,15 @@ Every command with examples: **[docs/getting-started.md](docs/getting-started.md
 
 ## Performance
 
-Numbers below are release builds of **v0.7.1** on an Apple M5 Max (18 cores, 128 GB,
-macOS 26.4.1, rustc 1.98.0), measured 2026-09-03. Times are wall-clock for the whole CLI
-invocation including process start; cold times are the best of three runs on a quiet
-machine. Every dataset is pinned by commit. Indexing always builds the full graph
-(calls, imports, types, data flow, near-clone pairs, request-to-route links, co-change
-history), so each number covers the whole product, not a symbol table. Method and
+Numbers below are release builds of **v0.8.3** on an Apple M5 Max (18 cores, 128 GB,
+macOS 26.4.1, rustc 1.98.0), measured 2026-09-05. Times are wall-clock for the whole CLI
+invocation including process start; cold times are the best of three runs. Every run
+waited for a quiet machine first: two consecutive one-second `top` samples at least 88 %
+idle, with nothing above half a core except the two macOS daemons that never fully idle
+(`fseventsd`, `WindowServer`), whose load we recorded beside each result instead. Docker
+Desktop stayed open throughout. Every dataset is pinned by commit. Indexing always builds
+the full graph (calls, imports, types, data flow, near-clone pairs, request-to-route
+links, co-change history), so each number covers the whole product, not a symbol table. Method and
 history: `docs/wip/BENCHMARKS.md`.
 
 ### How long does indexing take?
@@ -191,38 +194,49 @@ vorpal index <source-tree> --out <index-dir>
 
 | Linux kernel @ `1590cf032971` (75,954 files parsed of 94,843 tracked, ~30 M LOC) | |
 |---|---|
-| Cold index → **8,891,771 nodes** | **8.2 s** |
-| Edit one file, re-index | **0.5 s** |
+| Cold index → **8,891,771 nodes** | **10.9 s** |
+| Edit a function body, re-index | **0.9 s** |
+| Edit a comment only | 0.6 s |
+| Add a function | 4.6 s |
 | `touch` one file (content unchanged) | 0.5 s |
-| Nothing changed | **0.13 s** |
+| Nothing changed | **0.15 s** |
+
+The edit rows are medians of five saves to `fs/read_write.c`. A body edit or a comment
+change replays only that file against the carried graph. Adding a definition changes the
+file's signature and import sets, so the incremental lanes decline and the build replays
+the whole reach graph; that is where the 4.6 s goes. The cold time is slower than the
+8.2 s we published for v0.7.1 on 2026-09-03. Measured again on 2026-09-05 under the same
+gate, within the same hour as these numbers, v0.7.1 builds this index in 10.7 s and
+v0.8.2 in 11.4 s, so the difference is the machine on the day, not the code.
 
 Fifteen other repositories, shallow-cloned at the pinned commit. "Files parsed" counts
 files a grammar handled, not everything tracked; the kernel row uses the same rule.
 
 | Repo | Language | Files parsed | Nodes | Cold | Unchanged |
 |---|---|---:|---:|---:|---:|
-| llvm/llvm-project `d37814473` | C++ | 86,124 | 1,444,028 | 8.4 s | 0.30 s |
-| ziglang/zig `738d2be9` | Zig | 17,025 | 1,085,567 | 6.3 s | 0.03 s |
-| JetBrains/kotlin `9f27f51dd` | Kotlin | 75,448 | 795,719 | 2.7 s | 0.40 s |
-| kubernetes/kubernetes `bce953e8` | Go | 26,641 | 692,828 | 2.1 s | 0.08 s |
-| dotnet/roslyn `4cac4334` | C# | 19,522 | 490,284 | 2.2 s | 0.07 s |
-| rust-lang/rust `5db7f4be8` | Rust | 41,607 | 464,064 | 2.7 s | 0.08 s |
-| WordPress/WordPress `c195362` | PHP | 4,195 | 286,824 | 1.9 s | 0.02 s |
-| apache/spark `06539777` | Scala | 11,512 | 253,753 | 1.6 s | 0.05 s |
+| llvm/llvm-project `d37814473` | C++ | 86,124 | 1,444,028 | 7.4 s | 0.22 s |
+| ziglang/zig `738d2be9` | Zig | 17,025 | 1,085,567 | 6.2 s | 0.04 s |
+| JetBrains/kotlin `9f27f51dd` | Kotlin | 75,448 | 795,719 | 2.4 s | 0.31 s |
+| kubernetes/kubernetes `bce953e8` | Go | 26,641 | 692,828 | 1.9 s | 0.10 s |
+| dotnet/roslyn `4cac4334` | C# | 19,522 | 490,284 | 2.0 s | 0.06 s |
+| rust-lang/rust `5db7f4be8` | Rust | 41,607 | 464,064 | 2.6 s | 0.09 s |
+| WordPress/WordPress `c195362` | PHP | 4,195 | 286,824 | 1.7 s | 0.02 s |
+| apache/spark `06539777` | Scala | 11,512 | 253,753 | 1.5 s | 0.06 s |
 | apache/kafka `6e4c555` | Java | 7,246 | 209,131 | 0.7 s | 0.03 s |
-| vercel/next.js `483f8420` | TS/JS | 27,216 | 204,754 | 1.0 s | 0.23 s |
-| ghc/ghc `44d7788f` | Haskell | 15,837 | 178,259 | 0.7 s | 0.04 s |
-| python/cpython `b86a41cbf63` | Python/C | 3,841 | 162,945 | 1.0 s | 0.01 s |
-| rails/rails `4130768` | Ruby | 3,952 | 49,635 | 0.4 s | 0.02 s |
-| neovim/neovim `d423675` | C/Lua | 1,476 | 40,507 | 0.3 s | 0.01 s |
+| vercel/next.js `483f8420` | TS/JS | 27,216 | 204,754 | 0.9 s | 0.22 s |
+| ghc/ghc `44d7788f` | Haskell | 15,837 | 178,259 | 0.6 s | 0.04 s |
+| python/cpython `b86a41cbf63` | Python/C | 3,841 | 162,945 | 0.9 s | 0.02 s |
+| rails/rails `4130768` | Ruby | 3,952 | 49,635 | 0.3 s | 0.03 s |
+| neovim/neovim `d423675` | C/Lua | 1,476 | 40,507 | 0.2 s | 0.02 s |
 | vuejs/core `d63616c` | Vue/TS | 626 | 11,191 | 0.1 s | 0.01 s |
 
-This repository: 1,884 files parsed of 2,868 tracked → 79,567 nodes, 7.8 s cold¹, 0.01 s
+This repository: 1,894 files parsed of 2,879 tracked → 79,817 nodes, 7.4 s cold¹, 0.02 s
 unchanged. The vendored tree-sitter runtime and 49 grammars are included in that count.
 
-Disk: the kernel index is a 7.6 GB generation, most of it a parsed-product cache that
-makes the sub-second edits above possible. The previous generation is kept until the next
-commit, then swept. Indexer peak RSS on the kernel: 5.6 GB.
+Disk: the kernel index is a 4.8 GB generation, most of it a parsed-product cache that
+makes the sub-second edits above possible; the search tiers a daemon warms on top of it
+bring the directory to 8.1 GB (table below). The previous generation is kept until the
+next commit, then swept. Indexer peak RSS on the kernel: 5.4 GB.
 
 ¹ One 33 MB generated `parser.c` sets the floor; everything else parses in parallel
 underneath it. To re-run a pinned row, fetch by the full SHA
@@ -231,17 +245,19 @@ underneath it. To re-run a pinned row, fetch by the full SHA
 ### Does it stay current while I edit?
 
 Yes. `vorpal mcp` watches the tree and re-indexes changed files as you save. Changes
-apply incrementally, including to the semantic-search tier, so a save never triggers a
-full rebuild. Round trips measured from the client side (medians of 30 calls, kernel
-index):
+apply incrementally, including to the semantic-search tier, so a save never re-parses the
+tree. Round trips measured from the client side (medians of 30 calls, kernel index); the
+save rows are medians of seven saves to `fs/read_write.c` on a scratch copy of the kernel,
+polled every 20 ms until the daemon's answer showed the edit (range 1.9–4.9 s; each save
+commits a new generation):
 
 | Operation | Time |
 |---|---|
-| Graph query (`graph`, `node`, …) | **< 1 ms** |
-| Hybrid search (default tier; per-tier table below) | **59 ms** |
+| Graph query (`graph`, `node`, …) | **0.13 ms** |
+| Hybrid search (default tier; per-tier table below) | **0.8 ms** |
 | Server start → answering queries on an existing index | immediate |
-| First search after start (ranking tier warm-up, once) | 3.6 s |
-| Save a file → index current again | ~0.5 s |
+| First search after start (ranking tier warm-up, once) | 0.19 s |
+| Save a file → answers include the change | **2.0 s** (a body edit) · 2.2 s (a new function) |
 
 Repositories with multi-megabyte source files get one more optimization in a long-lived
 process (the MCP daemon, a watch loop, an SDK server calling `indexBuild` per save):
@@ -253,8 +269,9 @@ re-extraction on every row below.
 |---|---:|---:|---:|
 | 54 MB generated C (`tree-sitter-julia` parser), edit between definitions | 4.2 s | 1.9 s | **0.7 s** |
 | 54 MB generated C, edit *inside* its single 43 MB parse-table definition | 4.2 s | 1.9 s | **1.7 s** |
-| 17 MB generated C (`tree-sitter-cpp` parser) | 1.33 s | **0.58 s** | — |
-| 1.4 MB hand-written C (CPython `Parser/parser.c`) | 104 ms | **34 ms** | — |
+| 17 MB generated C (`tree-sitter-cpp` parser), edit near the top | 1.35 s | 0.60 s | **0.21 s** |
+| 17 MB generated C, edit in the middle | 1.35 s | 0.60 s | **0.47 s** |
+| 1.4 MB hand-written C (CPython `Parser/parser.c`) | 107 ms | 37 ms | **17 ms** |
 
 The granularity is the enclosing definition: an edit inside one giant definition
 re-walks that definition. Walk splicing currently ships for C; if any splice check fails,
@@ -280,9 +297,11 @@ embeddings, and graph in-degree. Nothing to download. Two optional tiers sit on 
   it with `semanticTier: learned` in `vorpalconfig.yml` (or `vorpal-index index
   --semantic-tier learned`).
 - **Neural encoder.** CodeRankEmbed (MIT) reranks the top candidates at query time. The
-  f16 and f32 downloads rank identically (cosine 1.000000 after conversion) and differ
-  only in disk and memory. It also embeds referenced definitions in the background, which
-  lets it surface answers the name-based channels never find. That fill runs on the GPU
+  f16 and f32 downloads produce the same embeddings to within rounding (cosine 1.000000
+  after conversion); they rank the same on CPython and this repo and differ by 0.001
+  NDCG@10 on the kernel, and otherwise differ only in disk. It also embeds referenced
+  definitions in the background, which lets it surface answers the name-based channels
+  never find. That fill runs on the GPU
   when one is present (Metal, Vulkan, or DX12 through `wgpu`; Apple, NVIDIA, AMD, Intel),
   otherwise on the platform BLAS or portable CPU code. Results do not depend on which
   built the embeddings. `VORPAL_ENCODER_GPU=off` forces CPU.
@@ -291,16 +310,16 @@ Graded retrieval on three corpora with the bundled labelled query sets (`xtask/l
 54 / 54 / 55 queries across six classes from exact name to paraphrase; every grade cites a
 source line in the `.evidence.md` files; NDCG@10 / MRR / recall@5; `cargo xtask searcheval`):
 
-| Corpus (queries) | Default | + learned tier | + encoder (f16 = f32) |
+| Corpus (queries) | Default | + learned tier | + encoder (f32; f16 in a footnote) |
 |---|---:|---:|---:|
-| Linux kernel, 8.9 M defs (54) | 0.299 / 0.307 / 0.302 | **0.313 / 0.303 / 0.361** | 0.289 / 0.289 / 0.309 |
-| CPython, 163 K defs (54) | 0.307 / 0.292 / 0.333 | 0.340 / 0.320 / 0.389¹ | **0.350 / 0.330 / 0.426** |
-| This repo, 79 K defs (55) | 0.400 / 0.394 / 0.400 | 0.450 / 0.443 / 0.536 | **0.461 / 0.453 / 0.527** |
+| Linux kernel, 8.9 M defs (54) | 0.306 / 0.310 / 0.312 | **0.315 / 0.304 / 0.361** | 0.295 / 0.290 / 0.302² |
+| CPython, 163 K defs (54) | 0.306 / 0.291 / 0.333 | 0.341 / 0.322 / 0.389¹ | **0.351 / 0.331 / 0.426** |
+| This repo, 79 K defs (55) | 0.400 / 0.393 / 0.400 | 0.430 / 0.427 / 0.455 | **0.455 / 0.448 / 0.500** |
 
 Which tier to run is a per-repository decision. The encoder helps on CPython and this
-repo but lowers the kernel's short-keyword queries (0.276 → 0.216), because those answers
-live in subword identifiers that the encoder re-orders. `vorpal tune` runs this
-measurement on your own queries and enables a tier only when it strictly improves the
+repo but lowers the kernel's aggregate, mostly on the subset-of-a-name queries (0.540 →
+0.438), because those answers live in subword identifiers that the encoder re-orders.
+`vorpal tune` runs this measurement on your own queries and enables a tier only when it strictly improves the
 mean and wins at least as often as it loses.
 
 Two classes stay weak on every tier. Descriptive queries on the kernel score 0.07
@@ -311,43 +330,49 @@ reads doc comments. The tables above are measured before that fill, so they are 
 out.
 
 ¹ The learned tier also runs a per-corpus BM25 check and enables BM25 when paired probes
-show a clear win. It enabled itself on CPython, not on the kernel or this repo.
+show a clear win. It enabled itself on CPython (38 wins to 17 losses over 512
+paired probes) and on this repo (34 to 16), not on the kernel (17 to 10, under the gate's
+margin).
+
+² f16 on the kernel: 0.296 / 0.290 / 0.302.
 
 ### How fast are queries, and what do they cost in memory?
 
 One-shot CLI (`vorpal search`, process start plus index mmap, page cache warm): kernel
-**0.19–0.20 s**, CPython 0.01 s, this repo under 0.01 s. The daemon keeps the index warm.
+**0.20 s**, CPython 0.01 s, this repo under 0.01 s. The daemon keeps the index warm.
 Measured over 30 stdio round trips per tool from a client process, with the server's
 resident memory sampled after every call:
 
 | Index · tier | Search median | Search p95 | First search | Graph query | Peak RSS |
 |---|---:|---:|---:|---:|---:|
-| Kernel · default | 59 ms | 65 ms | 0.21 s | 0.11 ms | 2.1 GB |
-| Kernel · learned | 61 ms | 63 ms | 0.24 s | 0.12 ms | 2.6 GB |
-| Kernel · learned + f16 | 96 ms² | 485 ms | 0.69 s³ | 0.12 ms | 2.8 GB |
-| Kernel · learned + f32 | 94 ms² | 356 ms | 0.62 s³ | 0.11 ms | 2.7 GB |
-| CPython · default | 1.0 ms | 1.3 ms | 5 ms | 0.05 ms | 106 MB |
-| CPython · learned | 2.2 ms | 2.6 ms | 15 ms | 0.07 ms | 149 MB |
-| CPython · learned + f16 | 36 ms² | 263 ms | 0.38 s | 0.07 ms | 719 MB |
-| CPython · learned + f32 | 35 ms² | 245 ms | 0.40 s | 0.08 ms | 677 MB |
-| This repo · default | 0.7 ms | 0.8 ms | 3 ms | 0.05 ms | 63 MB |
-| This repo · learned + f16 | 35 ms² | 276 ms | 0.42 s | 0.07 ms | 623 MB |
-| This repo · learned + f32 | 34 ms² | 244 ms | 0.42 s | 0.07 ms | 603 MB |
+| Kernel · default | 0.8 ms | 2.1 ms | 0.19 s | 0.13 ms | 2.1 GB |
+| Kernel · learned | 2.1 ms | 2.7 ms | 0.22 s | 0.18 ms | 2.4 GB |
+| Kernel · learned + f16 | 36 ms³ | 319 ms | 0.69 s⁴ | 0.13 ms | 3.0 GB |
+| Kernel · learned + f32 | 36 ms³ | 324 ms | 0.59 s⁴ | 0.13 ms | 2.9 GB |
+| CPython · default | 0.3 ms | 0.7 ms | 5 ms | 0.13 ms | 110 MB |
+| CPython · learned | 1.4 ms | 1.7 ms | 11 ms | 0.14 ms | 154 MB |
+| CPython · learned + f16 | 36 ms³ | 253 ms | 0.37 s | 0.15 ms | 748 MB |
+| CPython · learned + f32 | 35 ms³ | 256 ms | 0.29 s | 0.15 ms | 658 MB |
+| This repo · default | 0.3 ms | 0.5 ms | 3 ms | 0.10 ms | 65 MB |
+| This repo · learned | 1.3 ms | 1.4 ms | 6 ms | 0.12 ms | 79 MB |
+| This repo · learned + f16 | 35 ms³ | 218 ms | 0.42 s | 0.13 ms | 652 MB |
+| This repo · learned + f32 | 35 ms³ | 226 ms | 0.33 s | 0.13 ms | 561 MB |
 
-² Encoder medians cycle through a small query set, so most calls hit the 4,096-entry
-embedding cache. The p95 and first-search columns show the uncached cost: 0.3–0.5 s per
+³ Encoder medians cycle through a small query set, so most calls hit the 4,096-entry
+embedding cache. The p95 and first-search columns show the uncached cost: 0.2–0.3 s per
 new query at k = 10. Graph queries never touch the encoder. f16 halves the download but
 decodes to f32 in memory, so it is not smaller at run time. Encoder rows include the
-background embedding fill as it ships by default: complete on CPython and this repo, at
-the 10-minute cap on the kernel (40,704 of 717,369 referenced definitions).
+background embedding fill as it ships by default: complete on CPython (35,364 referenced
+definitions) and this repo (11,869), at the 10-minute cap on the kernel (36,096 with f16,
+44,032 with f32).
 
-³ Weights and index already in the page cache. The first process after a reboot pays a
-one-time page-in, about 4.8 s on the kernel.
+⁴ Weights and index already in the page cache. The first process after a reboot pays a
+one-time page-in, about 4.8 s on the kernel (measured for v0.7.1).
 
-Index on disk (one committed generation, parsed-product cache included): kernel
-**7.6 GB** default / 8.3 GB with the learned model; CPython 200 / 267 MB; this repo
-836 / 867 MB. Encoder weights: 547 MB (f32) or 274 MB (f16), stored once under
-`~/.vorpal/models`.
+Index on disk (one committed generation with its parsed-product cache and the warmed
+search tiers): kernel **8.1 GB** default / 8.5 GB with the learned model; CPython
+210 / 280 MB; this repo 880 / 910 MB. Encoder weights: 547 MB (f32) or 274 MB (f16),
+stored once under `~/.vorpal/models`.
 
 ### How does it compare?
 
@@ -360,13 +385,17 @@ rg 'kmalloc\(' -t c ~/linux             # comparison
 
 | Tool | Time | What you get |
 |---|---|---|
-| `vorpal scan` | 4.8 s | 42.6k `call_expression` nodes that call `kmalloc` |
-| `ripgrep` | 1.0 s | text lines containing `kmalloc(` |
+| `vorpal scan` | 1.5 s (2.5 s the first time) | 6,819 `call_expression` nodes whose text matches `kmalloc` |
+| `ripgrep` | 0.8 s | 3,387 text lines containing `kmalloc(` |
 
-Parsing and AST-matching 63,775 files costs about 5× a text grep of the same tree.
+The rule matches any call expression containing the pattern, so it also returns
+`kmalloc_array(...)`, `devm_kmalloc(...)`, and every outer call that wraps one; an earlier
+version of this row reported 42.6k matches from a broader rule. AST-matching 63,775 files
+costs about twice a text grep once the parsed products are banked, three times on the
+first run, which parses everything.
 
 **Against an agent's built-in tools.** An agent already has grep and read, so we
-measured vorpal against them, on this repo and on the Linux kernel, with the v0.8.2
+measured vorpal against them, on this repo and on the Linux kernel, with the v0.8.3
 binary on 2026-09-05. Each row asks one question of a warm vorpal daemon (one MCP call,
 median of five after a first call) and of the ripgrep-plus-read pipeline behind Claude
 Code's Grep and Read tools. Wall time is the tool's own work. The last column is what
@@ -374,16 +403,16 @@ the model then has to read.
 
 | Question | vorpal | rg + read | Output the model reads |
 |---|---:|---:|---|
-| This repo: callers of `tool_result` | 0.09 ms | 14 ms | 2 records with call sites vs 3 text lines |
-| This repo: callees of `tool_result` | 0.16 ms | no equivalent | 7 records with call sites |
-| This repo: what `run_install` reaches | 0.04 ms, 1 call | 6 ms, `rg -A 75` | 4 records vs 76 lines (3 KB) |
-| This repo: source of `render_toml` | 0.04 ms | 39 ms, 2 commands | verified body vs 58 lines |
-| Kernel: callers of `schedule_timeout_interruptible` (page of 100) | 3.4 ms | 930 ms | 100 of 140 resolved records (25 KB) vs 164 lines (13 KB) |
-| Kernel: callers of `vfs_read` | 0.10 ms | 675 ms | 3 records with call sites vs 13 lines |
-| Kernel: callees of `vfs_read` | 0.07 ms | 685 ms, then the body | 4 records with call sites vs 41 lines |
-| Kernel: find `schedule_timeout` | 0.06 ms | 686 ms | 1 record vs 1 line |
-| Kernel: source of `vfs_read` | 0.05 ms | 688 ms, then a read | verified body vs 42 lines |
-| Kernel: what `vfs_read` reaches, depth 2 | 0.07 ms | no equivalent | 3 records |
+| This repo: callers of `tool_result` | 0.10 ms | 16 ms | 2 records with call sites vs 3 text lines |
+| This repo: callees of `tool_result` | 0.14 ms | no equivalent | 7 records with call sites |
+| This repo: what `run_install` reaches | 0.05 ms, 1 call | 6 ms, `rg -A 75` | 4 records vs 76 lines (3 KB) |
+| This repo: source of `render_toml` | 0.05 ms | 39 ms, 2 commands | verified body vs 58 lines |
+| Kernel: callers of `schedule_timeout_interruptible` (page of 100) | 2.7 ms | 748 ms | 100 of 140 resolved records (25 KB) vs 164 lines (13 KB) |
+| Kernel: callers of `vfs_read` | 0.10 ms | 692 ms | 3 records with call sites vs 13 lines |
+| Kernel: callees of `vfs_read` | 0.11 ms | 763 ms, then the body | 4 records with call sites vs 41 lines |
+| Kernel: find `schedule_timeout` | 0.05 ms | 677 ms | 1 record vs 1 line |
+| Kernel: source of `vfs_read` | 0.08 ms | 713 ms, then a read | verified body vs 42 lines |
+| Kernel: what `vfs_read` reaches, depth 2 | 0.06 ms | no equivalent | 3 records |
 
 On a small repo both are far under a model turn; the difference is round trips. On the
 kernel every grep rescans 75,954 files (0.7 to 0.9 s) while the graph answers in
@@ -393,8 +422,10 @@ grades. A name with several definitions comes back as the list of candidates rat
 than a merged answer: `kmalloc` has six in the kernel tree, and its macro form resolves
 no call edges at all, so an earlier version of this table that counted those six
 candidates as callers was wrong. The first call in a fresh daemon pays a cold open plus the
-tree revalidation sweep (114 ms on this repo, 278 ms on the kernel); a kernel tree that
-changed since its generation pays a rebuild on that first call instead (9.4 s measured).
+tree revalidation sweep (119 ms on this repo; 0.27 s on the kernel with the tree's
+metadata cached, 2.8 s once when it was not on the kernel); a
+kernel tree that changed since its generation pays a rebuild on that first call instead
+(9.4 s measured with v0.8.2).
 
 Claude Code feeds the model a tool's `structuredContent`, so `format` decides how much
 the model reads. For the three callers of `vfs_read`, the structured result is 817 B by
@@ -410,41 +441,50 @@ could also run the vorpal CLI from the shell; the server's instructions include 
 exact command for its index, and the shell tool is never deferred. For that run, allow
 the executable by the path the server prints, for example `Bash(/path/to/vorpal:*)`.
 Tokens count everything the model processed, cache reads included. Cost is what the API
-billed. One run per cell, measured 2026-09-05 with v0.8.2.
+billed. One run per cell, measured 2026-09-05 with v0.8.3.
 
 | Question | Tools | Turns | Tokens | Cost | Wall |
 |---|---|---:|---:|---:|---:|
-| This repo: who calls `tool_result` | grep + read | 4 | 71 K | $0.284 | 8.4 s |
-| | vorpal MCP tool | 3 | 62 K | $0.177 | 5.0 s |
-| | vorpal CLI via shell | 2 | 43 K | $0.031 | 4.7 s |
-| This repo: what `run_install` reaches | grep + read | 4 | 76 K | $0.214 | 12.0 s |
-| | vorpal MCP tool | 3 | 63 K | $0.158 | 7.1 s |
-| | vorpal CLI via shell | 2 | 43 K | $0.040 | 7.3 s |
-| Kernel: who calls `vfs_read` | grep + read | 6 | 93 K | $0.291 | 15.4 s |
-| | vorpal MCP tool | 3 | 51 K | $0.136 | 4.5 s |
-| | vorpal CLI via shell | 2 | 36 K | $0.030 | 7.2 s |
-| Kernel: what `vfs_read` calls | grep + read | 3 | 59 K | $0.106 | 6.7 s |
-| | vorpal MCP tool | 3 | 52 K | $0.107 | 5.9 s |
-| | vorpal CLI via shell | 2 | 36 K | $0.031 | 6.6 s |
+| This repo: who calls `tool_result` | grep + read | 8 | 154 K | $0.273 | 17.0 s |
+| | vorpal MCP tool | 3 | 64 K | $0.185 | 5.6 s |
+| | vorpal CLI via shell | 2 | 44 K | $0.240 | 5.0 s |
+| This repo: what `run_install` reaches | grep + read | 4 | 78 K | $0.225 | 11.7 s |
+| | vorpal MCP tool | 3 | 65 K | $0.163 | 7.8 s |
+| | vorpal CLI via shell | 2 | 44 K | $0.142 | 8.4 s |
+| Kernel: who calls `vfs_read` | grep + read | 8 | 85 K | $0.217 | 22.8 s |
+| | vorpal MCP tool | 3 | 51 K | $0.136 | 5.8 s |
+| | vorpal CLI via shell | 2 | 36 K | $0.123 | 6.5 s |
+| Kernel: what `vfs_read` calls | grep + read | 4 | 59 K | $0.116 | 10.3 s |
+| | vorpal MCP tool | 3 | 51 K | $0.105 | 5.6 s |
+| | vorpal CLI via shell | 2 | 36 K | $0.093 | 7.0 s |
 
 Each turn on Opus carries about 20 K tokens of context and takes a few seconds before
 any tool runs, so the turn count decides most of the cost. Through the shell every
-question took two turns, the command and the reply: 36 K to 43 K tokens against grep's
-59 K to 93 K, and less wall time on three of the four. Through the MCP tools every
-question took three: the schema load, one `graph` call, and the reply. On the kernel
-callees question that is one turn fewer than the previous measurement, where the answer
-needed a `reachable` call and then a `snippet`. All twelve answers were correct. On the
-kernel callees question grep's read also listed two inline helpers, `fsnotify_access`
-and `add_rchar`, that the graph does not resolve as call edges. Earlier versions of this
-table, back to the 27-tool surface that took 8 turns and 161 K tokens on the kernel
-callers question, are in `docs/wip/BENCHMARKS.md`.
+question took two turns, the command and the reply: 36 K to 44 K tokens against grep's
+59 K to 154 K, and less wall time on all four. Through the MCP tools every question took
+three: the schema load, one `graph` or `reachable` call, and the reply. Grep's turn
+count varies from run to run (4 to 8 here, 3 to 6 in the previous measurement) because
+the model decides how many searches to try. Cost follows the prompt cache as much as
+the tokens: a run whose prefix was already cached bills the cached tokens at a tenth of
+the input rate, which is why the first shell run cost more than the others at the same
+token count. All twelve answers named the right callers, callees, and reachable
+definitions. On the kernel callees question grep's read also listed two inline helpers,
+`fsnotify_access` and `add_rchar`, that the graph does not resolve as call edges. On the
+`run_install` question grep found one transitive call, `claude_desktop_config`, made
+inside a struct literal, that the graph does not record; the graph arms instead carried
+three depth-2 records the resolver grades `constrained`, names from vendored grammar
+JSON, which the model flagged as not real targets. Earlier versions of this table, back
+to the 27-tool surface that took 8 turns and 161 K tokens on the kernel callers question,
+are in `docs/wip/BENCHMARKS.md`.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,
 BM25, a Cypher subset, and an MCP server, so the same corpora, labelled queries, and
 metrics run against both. Both indexed the same checkouts on the same machine. cbm ran
 in its `full` mode (the only mode with semantic edges), timed through its scriptable
-`cli`; memory is peak RSS over the whole process tree.
+`cli`; memory is peak RSS over the whole process tree. This table is the v0.7.1
+comparison from 2026-09-03, on that day's label sets and machine; we did not re-run cbm
+for v0.8.3. The current vorpal numbers for the same rows are in the tables above.
 
 | | vorpal | codebase-memory-mcp |
 |---|---|---|

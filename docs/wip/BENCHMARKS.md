@@ -4351,3 +4351,314 @@ against the 0.8.2 binary is build-layout/run noise: with the scan change as the 
 variable the warm path is not slower (−1 %) and the cold path is ~0.75 s faster on every
 pair. Machine: load 2–4 during the timed lanes; the 20–30 load averages logged between lanes
 were the lagging average of this harness's own 18-thread index builds.
+
+## v0.8.3 — full README restamp on a quiet machine (2026-09-05)
+
+Owner directive: cut 0.8.3 with the README re-benchmarked for every table, and manage the
+benchmarks so they are accurate on a quiet machine, with Docker Desktop open (the
+cross-platform lanes need it). This record is the method, the readings, and every number
+behind the README's Performance section as restamped for v0.8.3.
+
+**Binary.** `target/release/vorpal` built from the 0.8.3 bump on top of `b2eece4`
+(`vorpal --version` asserted 0.8.3 before every lane); the same binary was installed to
+`~/.local/bin/vorpal` for the MCP lanes, which run through Claude Code's configured
+server path. Controls: the v0.8.2 binary that `~/.local/bin` held before the install, and
+the v0.7.1 GitHub release asset (`bench.noindex/ctl/vorpal-0.7.1`).
+
+**Harness.** `evals/readme_bench.py <bin> <out> [--phases index17,edit,tiers,giant,scan]
+[--append]`, driven from a Spotlight-excluded scratch directory (`bench.noindex`) with a
+private 1.7 GB copy of the kernel tree for every lane that writes. Each timed start waits
+for the machine to be quiet: two consecutive one-second `top` samples with CPU idle
+≥ 88 % and no process above 50 % of a core, ignoring the harness itself and two baseline
+daemons that never idle on this machine, `fseventsd` (pinned near a full core while
+Docker Desktop's file sharing is up) and `WindowServer`. The gate records the idle
+figure, the hottest process, and `fseventsd`'s load beside every row instead of waiting
+for them. A disk guard refuses tier builds under 15 GB free (the first attempt filled the
+volume mid-build; `target/debug/incremental`, 38 GB, was deleted). `searcheval` runs from
+a release build of `xtask` (the debug alias took 47 minutes on the encoder tier) with
+`VORPAL_DENSE_CHANNEL=off`, so the quality table is the pre-fill floor the README states.
+Encoder weights live at `~/.vorpal/models/coderankembed-{f16,f32}` (installed with
+`vorpal enable`, then disabled again so no global selection leaks into other lanes);
+tiers are selected per index with `semanticTier` / `encoderDir` in a config file.
+
+**Machine readings across the campaign.** 141 gated starts; CPU idle 88.1–97.9 % (median 90.4); `fseventsd` 0–160 % of a core (median 100); hottest other process 9 % median, 45 % max. Every lane ran with Docker Desktop
+open, as directed.
+
+### Cold kernel, three arms interleaved (2026-09-05, 3 reps each)
+
+| arm | cold reps (s) → best | max RSS GB | generation |
+|---|---|---:|---|
+| 0.8.3 (this build) | 11.93, 10.85, 11.10 → **10.85** | 5.36 | `855d30a6…` |
+| 0.8.2 | 11.64, 11.40, 11.39 → **11.39** | 5.39 | `855d30a6…` |
+| 0.7.1 | 10.70, 10.77, 11.57 → **10.70** | 5.37 | `855d30a6…` |
+
+All three arms commit the same generation. Today's v0.7.1 control is 2.5 s slower than
+the 8.2 s the README carried for it from 2026-09-03 (measured with the same asset), so
+the day, not the code, moved: `fseventsd` held a full core throughout today's lanes and
+did not on 2026-09-03. Against the same-day controls 0.8.3 is the fastest of the three
+by best-of-three and by median.
+
+### Seventeen corpora, 0.8.3 (cold best of 3, unchanged median of 3)
+
+| corpus | files parsed / tracked | nodes | cold reps (s) → best | unchanged reps (s) → median | disk GB | max RSS GB | generation |
+|---|---:|---:|---|---|---:|---:|---|
+| linux | 75,954 / 94,843 | 8,891,771 | 11.93, 10.85, 11.10 → **10.85** | 0.163, 0.150, 0.378 → 0.163 | 4.83 | 5.36 | `855d30a6` |
+| zig | 17,025 / 20,545 | 1,085,567 | 6.46, 6.21, 6.22 → **6.21** | 0.037, 0.039, 0.031 → 0.037 | 0.56 | 1.58 | `1fa94f52` |
+| kotlin | 75,448 / 110,106 | 795,719 | 3.23, 2.44, 2.46 → **2.44** | 0.362, 0.311, 0.310 → 0.311 | 0.68 | 1.30 | `24eb8848` |
+| kubernetes | 26,641 / 31,296 | 692,828 | 2.15, 1.94, 1.93 → **1.93** | 0.100, 0.101, 0.075 → 0.100 | 0.52 | 0.97 | `377392a6` |
+| roslyn | 19,522 / 35,125 | 490,284 | 2.16, 2.00, 1.97 → **1.97** | 0.089, 0.062, 0.063 → 0.063 | 0.35 | 0.81 | `d1c79b6b` |
+| rust | 41,607 / 62,568 | 464,064 | 2.82, 2.55, 2.62 → **2.55** | 0.089, 0.086, 0.090 → 0.089 | 0.35 | 1.42 | `c5aad546` |
+| WordPress | 4,195 / 5,010 | 286,824 | 1.77, 1.74, 1.77 → **1.74** | 0.020, 0.017, 0.019 → 0.019 | 0.15 | 1.36 | `b88e554e` |
+| spark | 11,512 / 27,322 | 253,753 | 1.66, 1.53, 1.54 → **1.53** | 0.061, 0.062, 0.045 → 0.061 | 0.27 | 0.64 | `8943369f` |
+| kafka | 7,246 / 7,537 | 209,131 | 0.75, 0.66, 0.67 → **0.66** | 0.038, 0.031, 0.031 → 0.031 | 0.24 | 0.53 | `23c77ed3` |
+| next.js | 27,216 / 31,852 | 204,754 | 1.11, 0.93, 0.94 → **0.93** | 0.224, 0.224, 0.183 → 0.224 | 0.13 | 0.45 | `3141c5ba` |
+| ghc | 15,837 / 26,918 | 178,259 | 0.76, 0.65, 0.63 → **0.63** | 0.042, 0.034, 0.035 → 0.035 | 0.11 | 0.55 | `d2294033` |
+| cpython | 3,841 / 5,948 | 162,945 | 0.97, 0.91, 0.90 → **0.90** | 0.018, 0.017, 0.017 → 0.017 | 0.16 | 0.62 | `da3e2692` |
+| rails | 3,952 / 4,996 | 49,635 | 0.37, 0.33, 0.34 → **0.33** | 0.027, 0.023, 0.027 → 0.027 | 0.06 | 0.37 | `a911a70a` |
+| neovim | 1,476 / 3,918 | 40,507 | 0.26, 0.23, 0.24 → **0.23** | 0.016, 0.017, 0.015 → 0.016 | 0.04 | 0.22 | `c430fb92` |
+| vue-core | 626 / 705 | 11,191 | 0.13, 0.13, 0.13 → **0.13** | 0.013, 0.013, 0.011 → 0.013 | 0.01 | 0.13 | `84c517ac` |
+| vorpal | 1,894 / 2,879 | 79,817 | 7.41, 7.60, 7.44 → **7.41** | 0.022, 0.019, 0.017 → 0.019 | 0.85 | 9.79 | `66734e2b` |
+| llvm-project | 86,124 / 183,249 | 1,444,028 | 8.23, 7.38, 7.42 → **7.38** | 0.272, 0.221, 0.223 → 0.223 | 1.39 | 2.41 | `740c265d` |
+
+Files parsed and node counts are identical to the 2026-09-03 rows for every pinned
+corpus; this repository grew from 1,884 → 1,894 parsed files and 79,567 → 79,817 nodes
+between the two dates.
+
+### Kernel edit lanes (scratch copy, `fs/read_write.c`)
+
+The README's former "edit one file" row appended a function. Three reps:
+
+| rep | add a function (s) | touch (s) | unchanged (s) | restore (s) |
+|---:|---:|---:|---:|---:|
+| 0 | 4.73 | 0.51 | 0.141 | 4.17 |
+| 1 | 4.07 | 0.52 | 0.14 | 4.09 |
+| 2 | 4.12 | 0.55 | 0.14 | 4.19 |
+
+That is a full replay, not the incremental lane, so the row was split by edit class
+(`evals/edit_classes.py`, 3 reps each, restore timed separately; the body edit appends a
+comment to a statement inside `kernel_read` in this run — the anchor's first match — and
+the committed script now targets the same statement inside `vfs_read`):
+
+| class | reps (s) → median | restore (s) | lane |
+|---|---|---|---|
+| body edit | 4.8, 0.8, 0.94 → **0.94** | 0.85, 0.8, 0.81 | compose |
+| comment only | 0.54, 0.59, 0.71 → **0.59** | 0.54, 0.68, 0.57 | compose |
+| add a function | 5.4, 4.62, 4.06 → **4.62** | 4.06, 4.11, 4.08 | full pipeline |
+
+Lane classification for the add-a-function class, from the build's trace stamps:
+
+```
+respan: ineligible (<scratch>/kernel-copy/fs/read_write.c): outline items
+defs-stable: ineligible (<scratch>/kernel-copy/fs/read_write.c): definition set
+defs-changed: 1 edited files, 1 affected names -> 0 dirty files
+defs-changed: scoped resolution declined: scoped: session imports diverge from the carried reach graph — declining to the full pipeline
+stream: start
+```
+
+Adding a definition changes the file's signature set and its import set; respan and
+defs-stable are ineligible by construction, and the defs-changed lane declines because the
+session's imports diverge from the carried reach graph, so the build replays the reach
+graph in full (4–5 s). A body edit and a comment-only edit compose in 0.5–0.9 s. The
+first body-edit rep (4.8 s) followed a consolidation and is the one outlier in nine
+incremental reps. The README table now shows the three classes separately.
+
+### Search tiers (12 rows; daemon over MCP stdio, 30 round trips per tool, `health` sampled for RSS)
+
+| corpus · tier | build s | warm s | search med / p95 / first ms | graph ms | peak RSS GB | disk GB | NDCG@10 / MRR / recall@5 (all) | one-shot search / callers s |
+|---|---:|---:|---|---:|---:|---:|---|---|
+| kernel · default | 10.96 | 120.8 | 0.78 / 2.14 / 187.9 | 0.125 | 2.096 | 8.11 | 0.306 / 0.31 / 0.312 | 0.200 / 0.061 |
+| kernel · learned | 9.55 | 190.3 | 2.12 / 2.69 / 219.3 | 0.18 | 2.365 | 8.5 | 0.315 / 0.304 / 0.361 | — / — |
+| kernel · learned-f16 | nan | nan | 35.98 / 319.0 / 686.9 | 0.127 | 2.963 | 8.59 | 0.296 / 0.29 / 0.302 | — / — |
+| kernel · learned-f32 | 8.15 | 773.5 | 36.05 / 323.48 / 587.0 | 0.129 | 2.88 | 8.61 | 0.295 / 0.29 / 0.302 | — / — |
+| cpython · default | 0.94 | 1.3 | 0.29 / 0.66 / 5.1 | 0.126 | 0.11 | 0.21 | 0.306 / 0.291 / 0.333 | 0.009 / 0.006 |
+| cpython · learned | 0.87 | 6.7 | 1.37 / 1.72 / 10.5 | 0.137 | 0.154 | 0.28 | 0.341 / 0.322 / 0.389 | — / — |
+| cpython · learned-f16 | 0.86 | 406.3 | 35.74 / 252.98 / 372.9 | 0.153 | 0.748 | 0.36 | 0.351 / 0.331 / 0.426 | — / — |
+| cpython · learned-f32 | 0.89 | 398.0 | 35.3 / 255.52 / 293.6 | 0.154 | 0.658 | 0.36 | 0.351 / 0.331 / 0.426 | — / — |
+| vorpal · default | 7.25 | 0.7 | 0.28 / 0.45 / 3.1 | 0.101 | 0.065 | 0.88 | 0.4 / 0.393 / 0.4 | 0.007 / 0.005 |
+| vorpal · learned | 7.08 | 3.7 | 1.33 / 1.41 / 6.2 | 0.119 | 0.079 | 0.91 | 0.43 / 0.427 / 0.455 | — / — |
+| vorpal · learned-f16 | 7.04 | 185.2 | 34.77 / 218.17 / 418.4 | 0.127 | 0.652 | 0.93 | 0.455 / 0.448 / 0.5 | — / — |
+| vorpal · learned-f32 | 7.31 | 180.4 | 34.59 / 225.87 / 331.1 | 0.133 | 0.561 | 0.93 | 0.455 / 0.448 / 0.5 | — / — |
+
+Quality is `cargo run --release -p xtask -- searcheval <idx> xtask/labels/<corpus>.json
+--root <tree>` with the dense channel off; per-class tables are in
+the campaign's `searcheval-*.txt` outputs (scratch) (kernel default: conjunctive 0.349, descriptive
+0.073, exact 0.891, paraphrase 0.000, short-keyword 0.250, subset 0.540; kernel + f16:
+0.395 / 0.073 / 0.908 / 0.000 / 0.241 / 0.438). The encoder's kernel loss is the subset
+class, not the short-keyword class the README used to name. Dense sidecars at measurement:
+kernel 36,096 rows (f16) and 44,032 (f32) at the 10-minute cap; CPython 35,364; this repo
+11,869 (both complete). f16 and f32 agree to the third decimal everywhere except kernel
+NDCG@10 (0.296 vs 0.295).
+
+BM25 self-probe verdicts (`ann.model.json` in the learned generation, rebuilt after the
+campaign to read them): CPython **enabled** (probes=512, wins 38 / losses 17, mean on
+0.4328 vs off 0.4276); this repo **enabled** (wins 34 / losses 16, 0.3874 vs 0.3839);
+kernel **not enabled** (wins 17 / losses 10, 0.1422 vs 0.1412, under the gate's margin). The README footnote used to say the check enabled BM25
+on CPython only; this repo now clears the gate too.
+
+### Giant files (`tree_cache_bench`, 8 rounds; even rounds edit near the top, odd rounds near the middle)
+
+| file | mode | rounds (ms cached vs fresh) |
+|---|---|---|
+| julia parser.c 54 MB | tree cache only | round 1: 4175 ms cached vs 4339 ms fresh; round 2: 1923 ms cached vs 4387 ms fresh; round 3: 1941 ms cached vs 4184 ms fresh; round 4: 1948 ms cached vs 4237 ms fresh; round 5: 2056 ms cached vs 4264 ms fresh; round 6: 1943 ms cached vs 4206 ms fresh; round 7: 1993 ms cached vs 4196 ms fresh; round 8: 1918 ms cached vs 4242 ms fresh |
+| cpp parser.c 17 MB | tree cache only | round 1: 1318 ms cached vs 1363 ms fresh; round 2: 604 ms cached vs 1366 ms fresh; round 3: 607 ms cached vs 1352 ms fresh; round 4: 599 ms cached vs 1349 ms fresh; round 5: 607 ms cached vs 1340 ms fresh; round 6: 601 ms cached vs 1345 ms fresh; round 7: 607 ms cached vs 1346 ms fresh; round 8: 600 ms cached vs 1347 ms fresh |
+| cpython Parser/parser.c 1.4 MB | tree cache only | round 1: 106 ms cached vs 112 ms fresh; round 2: 37 ms cached vs 111 ms fresh; round 3: 37 ms cached vs 108 ms fresh; round 4: 36 ms cached vs 107 ms fresh; round 5: 37 ms cached vs 107 ms fresh; round 6: 36 ms cached vs 107 ms fresh; round 7: 37 ms cached vs 107 ms fresh; round 8: 36 ms cached vs 107 ms fresh |
+| julia parser.c 54 MB | + walk splice | round 1: 4183 ms cached vs 4405 ms fresh; round 2: 675 ms cached vs 4432 ms fresh; round 3: 1735 ms cached vs 4226 ms fresh; round 4: 659 ms cached vs 4195 ms fresh; round 5: 1706 ms cached vs 4243 ms fresh; round 6: 693 ms cached vs 4297 ms fresh; round 7: 1741 ms cached vs 4182 ms fresh; round 8: 674 ms cached vs 4203 ms fresh |
+| cpp parser.c 17 MB | + walk splice | round 1: 1347 ms cached vs 1376 ms fresh; round 2: 213 ms cached vs 1364 ms fresh; round 3: 467 ms cached vs 1342 ms fresh; round 4: 210 ms cached vs 1355 ms fresh; round 5: 467 ms cached vs 1347 ms fresh; round 6: 217 ms cached vs 1356 ms fresh; round 7: 468 ms cached vs 1353 ms fresh; round 8: 216 ms cached vs 1363 ms fresh |
+| cpython Parser/parser.c 1.4 MB | + walk splice | round 1: 106 ms cached vs 112 ms fresh; round 2: 17 ms cached vs 117 ms fresh; round 3: 17 ms cached vs 109 ms fresh; round 4: 17 ms cached vs 110 ms fresh; round 5: 17 ms cached vs 107 ms fresh; round 6: 17 ms cached vs 108 ms fresh; round 7: 17 ms cached vs 107 ms fresh; round 8: 17 ms cached vs 107 ms fresh |
+
+### Indexed scan (kernel copy, rule `kind: call_expression` + `regex: kmalloc`, `--json=stream`)
+
+| rep | scan s | matches | rg s | rg lines |
+|---:|---:|---:|---:|---:|
+| 0 | 2.54 | 6819 | 0.84 | 3387 |
+| 1 | 1.5 | 6819 | 0.79 | 3387 |
+| 2 | 1.49 | 6819 | 0.8 | 3387 |
+
+The first rep pays the parsed-product bank (2.5 s); the bank is then warm (1.5 s). The
+rule matches 6,819 call expressions whose text contains `kmalloc`, which includes
+`kmalloc_array(...)`, `devm_kmalloc(...)` and every outer call wrapping one; the README's
+old 42.6k figure came from a broader rule and is replaced. `rg 'kmalloc\(' -t c` finds
+3,387 lines in 0.79–0.84 s.
+
+### MCP per call (warm daemon, median of 5 after a first call; `evals/mcp_percall.py`)
+
+| corpus | question | vorpal ms | vorpal bytes | records | rg + read ms | bytes | lines | command |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| repo | callers tool_result | 0.104 | 597 | 2 | 15.7 | 266 | 3 | `rg -n 'tool_result\(' crates` |
+| repo | callees tool_result | 0.138 | 1,857 | 7 | — | — | — | — |
+| repo | reachable run_install out | 0.051 | 1,019 | 4 | 6.2 | 3021 | 76 | `rg -n -A 75 'fn run_install' crates/cli/src/mcp_install.rs` |
+| repo | snippet render_toml | 0.050 | 2,140 | 1 | 38.6 | 1673 | 58 | `rg -n 'fn render_toml' crates && sed -n "$(rg -n 'fn render_toml' crates \| head -1 \| cut -d: -f2),+56p" "$(rg -l 'fn render_toml' crates \| head -1)"` |
+| repo | search 'stdio pump reader thread' | 3.795 | 1,425 | 5 | 15.0 | 244 | 2 | `rg -n -i 'stdio.*pump\|reader thread' crates` |
+| kernel | callers schedule_timeout_interruptible (limit 100) | 2.670 | 24,709 | 100 | 747.6 | 13490 | 164 | `rg -n 'schedule_timeout_interruptible\(' -t c` |
+| kernel | callers vfs_read | 0.101 | 817 | 3 | 692.4 | 1208 | 13 | `rg -n 'vfs_read\(' -t c` |
+| kernel | callees vfs_read | 0.108 | 1,041 | 4 | 763.4 | 1781 | 41 | `rg -n -A 40 '^ssize_t vfs_read\(' -t c` |
+| kernel | node schedule_timeout | 0.050 | 335 | 1 | 677.4 | 89 | 1 | `rg -n '^signed long __sched schedule_timeout\(' -t c` |
+| kernel | snippet vfs_read | 0.080 | 1,266 | 1 | 712.8 | 1062 | 42 | `rg -n '^ssize_t vfs_read\(' -t c && sed -n "$(rg -n '^ssize_t vfs_read\(' fs/read_write.c \| head -1 \| cut -d: -f1),+40p" fs/read_write.c` |
+| kernel | reachable vfs_read out depth 2 exact | 0.056 | 812 | 3 | — | — | — | — |
+
+First call of a fresh daemon (cold open + revalidation sweep): this repo 119 ms; kernel
+2,849 ms in the lane, which ran right after the campaign's 17-corpus build had pushed the
+kernel tree's metadata out of the cache. Four fresh kernel daemons started back to back
+afterwards: 265, 268, 272, 265 ms. Steady-state `node` on the kernel is 0.01 ms; the
+second call of a fresh daemon is 110–123 ms (something lazy still runs behind the first
+answer — unexamined, noted as a lead).
+
+### End to end, Claude Code 2.1.261, Opus, effort high (`evals/mcp_agent_e2e.py`, one run per cell)
+
+| corpus | question | arm | turns | ToolSearch | tokens | cost $ | wall s | calls |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| repo | callers_tool_result | grep | 8 | 0 | 154,160 | 0.273 | 17.0 | Grep; Grep; Read; Read; Grep; Bash(awk 'NR>=95 && NR<=175 && /fn /' /Users/adalundhe/Proje; Grep |
+| repo | callers_tool_result | mcp | 3 | 1 | 64,493 | 0.185 | 5.6 | ToolSearch(select:mcp__vorpal__graph,mcp__vorpal__node); graph(callers) |
+| repo | callers_tool_result | cli | 2 | 0 | 44,200 | 0.240 | 5.0 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers tool_r |
+| repo | reaches_run_install | grep | 4 | 0 | 78,241 | 0.225 | 11.7 | Grep; Grep; Read |
+| repo | reaches_run_install | mcp | 3 | 1 | 65,087 | 0.163 | 7.8 | ToolSearch(select:mcp__vorpal__reachable,mcp__vorpal__node); reachable |
+| repo | reaches_run_install | cli | 2 | 0 | 44,459 | 0.142 | 8.4 | Bash(/Users/adalundhe/.local/bin/vorpal graph reachable run_ |
+| kernel | callers_vfs_read | grep | 8 | 0 | 85,372 | 0.217 | 22.8 | Grep; Grep; Grep; Grep; Bash(rg -n --pcre2 '(?<![_a-zA-Z0-9])vfs_read(?![_a-zA-Z0-9]; Read; Read |
+| kernel | callers_vfs_read | mcp | 3 | 1 | 51,367 | 0.136 | 5.8 | ToolSearch(select:mcp__vorpal__graph); graph(callers) |
+| kernel | callers_vfs_read | cli | 2 | 0 | 35,890 | 0.123 | 6.5 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers vfs_re |
+| kernel | callees_vfs_read | grep | 4 | 0 | 59,136 | 0.116 | 10.3 | Grep; Grep; Read |
+| kernel | callees_vfs_read | mcp | 3 | 1 | 51,427 | 0.105 | 5.6 | ToolSearch(select:mcp__vorpal__graph); graph(callees) |
+| kernel | callees_vfs_read | cli | 2 | 0 | 35,938 | 0.093 | 7.0 | Bash(/Users/adalundhe/.local/bin/vorpal graph callees vfs_re |
+
+All twelve answers named the right definitions. Costs follow the prompt cache as much as
+the token count: the first CLI-arm run wrote 22 K tokens of cache (`cache_creation`) and
+billed $0.240 for 44 K tokens, the other CLI runs 10–11 K and $0.09–0.14; the previous
+day's CLI arm had billed $0.03–0.04 for the same token counts. Tokens and turns are the
+comparable columns.
+
+Two resolver findings from the transcripts, not fixed in this release:
+
+- `targets` in `crates/cli/src/mcp_install.rs` calls `claude_desktop_config(&home)` as a
+  struct-literal field value (line 82). The graph has no callers for
+  `claude_desktop_config`; grep's read found it. Calls in struct-literal field positions
+  are not recorded as call edges (Rust).
+- `targets` also calls a local closure `wanted` (lines 113/122). The graph resolved that
+  name to an unrelated `wanted` in `crates/wire/src/msg.rs` at grade `constrained`, and
+  `join`/`value` inside `server_entry` to entries in vendored grammar JSON. Closure-local
+  and generic names should not resolve across crates at any grade the tools show by
+  default.
+
+### Daemon: save a file → answers include it (kernel copy, watched daemon, `node` polled every 20 ms)
+
+Lane: `evals/daemon_save_latency.py <bin> <kernel-copy> <out> add|body`. A watched
+`vorpal mcp` daemon on the scratch kernel copy; each rep waits for the quiet gate, writes
+the file, and polls the daemon every 20 ms until its answer reflects the edit, then
+restores the file and polls until the answer reverts.
+
+**Class `add` (append a new function to `fs/read_write.c`; visible when `node` returns
+the new definition).** First run, 5 reps, `health` not sampled:
+
+| rep | save → visible s | restore → gone s | gate idle % | `fseventsd` % at gate |
+|---:|---:|---:|---:|---:|
+| 0 | 1.801 | 2.3 | 95.5 | 0.0 |
+| 1 | 1.243 | 1.766 | 95.1 | 2.2 |
+| 2 | 8.086 | 6.259 | 90.3 | 101.7 |
+| 3 | 8.415 | 3.552 | 89.8 | 100.5 |
+| 4 | 1.288 | 1.716 | 90.3 | 100.2 |
+
+Reps 2 and 3 coincided with `fseventsd` at a full core in the gate sample and took 8 s;
+not isolated. Second run, 7 reps, with the daemon's `health` record read before the save,
+after visibility, and after the restore, and a machine sample right after visibility:
+
+| rep | save → visible s | restore → gone s | generation before → after save → after restore | idle % / `fseventsd` % right after the save |
+|---:|---:|---:|---|---|
+| 0 | 2.185 | 1.813 | `7dccfc09` → `e2e4672d` → `d89863e9` | 90.39 / 98.5 |
+| 1 | 2.978 | 2.364 | `d89863e9` → `3fa86e4f` → `ae1b0aeb` | 85.81 / 99.8 |
+| 2 | 1.309 | 1.752 | `ae1b0aeb` → `dfd0b901` → `6b08af24` | 90.13 / 99.9 |
+| 3 | 4.934 | 1.311 | `6b08af24` → `9a8144b3` → `eb7f268e` | 95.6 / 1.5 |
+| 4 | 3.481 | 1.418 | `eb7f268e` → `8ad084f2` → `ff7268da` | 90.83 / 17.5 |
+| 5 | 1.353 | 3.001 | `ff7268da` → `481536f2` → `9ef7821e` | 88.94 / 104.5 |
+| 6 | 1.219 | 2.319 | `9ef7821e` → `c0962b7c` → `ec84ebd3` | 90.51 / 100.3 |
+
+Median save → visible **2.19 s** (range 1.219–4.934), restore → gone
+1.81 s. Every save and every restore committed a new generation: the daemon
+answers this class from a fresh generation each time, in a quarter to a half of the 4.6 s
+the CLI's full replay takes for the same edit, because the graph is already resident.
+The two slow reps (3 and 4) had no external load in either sample; the spread is the
+daemon's own background work between saves, which this lane does not observe.
+
+**Class `body` (change one statement inside `vfs_read`; visible when `snippet vfs_read`
+shows the new text).** 7 reps, the comment appended to the `rw_verify_area` statement inside `vfs_read`
+(line 565); a first attempt that edited the first match of that statement, in `kernel_read`,
+is described under the harness lessons:
+
+| rep | save → visible s | generation before → after save | idle % / `fseventsd` % right after the save |
+|---:|---:|---|---|
+| 0 | 2.318 | `5cd84175` → `e14eb129` | 94.28 / 1.8 |
+| 1 | 2.588 | `1a7dfba0` → `077d307f` | 95.46 / 1.4 |
+| 2 | 4.419 | `6274b1aa` → `df6ec4de` | 88.56 / 100.1 |
+| 3 | 1.929 | `93735545` → `e2b61690` | 88.71 / 101.3 |
+| 4 | 1.935 | `3ea6715c` → `bff9fcff` | 74.4 / 100.3 |
+| 5 | 2.003 | `9215e757` → `db009a67` | 88.9 / 99.0 |
+| 6 | 2.039 | `b75fc386` → `e09e9f47` | 90.3 / 100.3 |
+
+Median save → visible **2.04 s** (range 1.929–4.419). The restore
+direction is not measurable through `snippet`: as soon as the file reverts, the tool
+refuses with "changed since this generation indexed it" until the daemon commits again, so
+the marker is absent from the first poll (0.0 s on every rep) — a refusal, not a
+disappearance. Both classes commit a new generation per save. Through the daemon a body
+edit is current in ~2 s against the CLI's 0.9 s compose for the same edit; the difference
+is the watcher's settle time plus the reload, not the compose, and is a lead.
+
+README row: "Save a file → answers include the change: 2.0 s (a body edit) · 2.2 s (a new
+function)", medians of seven each.
+
+
+### Harness lessons recorded
+
+- `rg` with an inherited pipe on stdin and no path argument reads stdin forever; every
+  harness subprocess now gets `stdin=DEVNULL`.
+- `cargo xtask` is a debug alias; use the release build for anything that runs an encoder.
+- zsh aborts a whole `rm` when one glob has no match; the driver removes explicit paths.
+- Monitor pipelines through `cut` buffer and emit nothing; watch raw files.
+- Spotlight indexes scratch trees unless the directory is `*.noindex`; the first kernel
+  copy under a plain name cost `mds_stores` a core for an hour.
+- `fseventsd` at a full core is the cost of keeping Docker Desktop open on this machine;
+  it is recorded beside every row rather than gated on.
+- A visibility probe must edit the definition it polls. The first body-edit daemon lane
+  replaced the first match of `ret = rw_verify_area(READ, file, pos, count);`, which is in
+  `kernel_read`, then polled `snippet vfs_read` for the marker: every rep hit the 60 s
+  timeout and read as "the daemon serves a stale body after a body edit, verified against
+  the new pack". Falsified by `grep -n` of the marker (line 547, `kernel_read`), and by the
+  one-shot CLI refusing the stale span before re-index and showing the marker after. The
+  daemon was right; the probe was wrong. Anchor by the enclosing signature, not `replace(…, 1)`.
