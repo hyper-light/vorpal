@@ -68,7 +68,7 @@ migration, policy #1). The format is a property of a generation, never mixed wit
 | edge slabs (`edges/<k>.bin` + toc) | `VERSION` (crates/kg/src/edgestore.rs) | 1 | family treated as absent → scoped composes decline; next full build rewrites it |
 | usage postings (`usage/<k>.bin` + toc) | `VERSION` (crates/kg/src/usagestore.rs) | 1 | family treated as absent → scoped composes decline; next full build rewrites it |
 | sigs sketch ledger (`sigs/<k>.bin` + toc) | `VERSION` (crates/kg/src/sigstore.rs) | 2 | prior generation neither reused nor composed from → full pipeline rebuilds the family |
-| include-reach graph (`reach.bin`) | `REACH_GRAPH_VERSION` (crates/resolve/src/reach.rs) | 1 | scoped composes decline (reach oracle unreplayable) → full pipeline rebuilds it |
+| include-reach graph (`reach.bin`) | `REACH_GRAPH_VERSION` (crates/resolve/src/reach.rs) | 2 | scoped composes decline (reach oracle unreplayable) → full pipeline rebuilds it |
 | data-flow sidecar (`dataflow.bin`) | `VERSION` (crates/kg/src/dataflow.rs) | 1 | load fails loudly → rebuild (absent file ≠ mismatch: older generations answer no flows) |
 | lexical posting tier (`postings.bin`) | `VERSION` (crates/index/src/postings.rs) | 2 | scan fallback → warm rebuilds |
 | embedding semantics (`ann.model.json`) | `LEXICAL_EMBED_VERSION` (crates/ann/src/embed.rs) | 2 | ANN tier distrusted → exact fallback → warm rebuilds |
