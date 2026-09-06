@@ -5255,3 +5255,135 @@ add-a-function the fix's generation against a from-scratch build of the identica
 | #1 | `5ff81cd8c1d9…` | `5ff81cd8c1d9…` | True |
 | #2 | `6de755d6a122…` | `6de755d6a122…` | True |
 
+
+## The compose's 1.3 s, phase by phase — allocations, faults, contention (2026-09-06)
+
+Owner: "This is still much slower. Can we examine the allocs, reallocs, and page faults along
+the path? Any thread contention as well." Measured with the ledger-instrumented indexer
+(`vorpal-index --features alloc-ledger,vorpal-kg/alloc-stats`, the same `build_index`
+lanes as the CLI) on the kernel copy, `fseventsd` still pinned at a full core (see the
+regression record), so walls are inflated and the counters are the point.
+
+**Add a function (defs-changed compose), wall 1.39 s, rep 1 of 2:**
+
+| segment (ends at stamp) | s | allocs | reallocs | frees | MB | minor faults | sys ms | user ms | vol. sw | invol. sw |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| scan: manifest done | 0.106 | 535,059 | 261,581 | 458,674 | 184 | 2,645 | 1,149 | 196 | 0 | 2,345 |
+| kg load: nodes | 0.054 | 246,786 | 18,220 | 145,473 | 128 | 3,949 | 16 | 32 | 0 | 52 |
+| kg load: done | 0.041 | 16 | 4 | 15 | 5 | 33,785 | 11 | 29 | 0 | 65 |
+| respan: ineligible (/private/tmp/claude-501/-Users-a | 0.039 | 2,658 | 1,363 | 1,644 | 16 | 858 | 12 | 10 | 0 | 40 |
+| defs-stable: ineligible (/private/tmp/claude-501/-Us | 0.032 | 1,872 | 841 | 1,874 | 10 | 13 | 7 | 8 | 1 | 28 |
+| seal: scc | 0.033 | 2,946 | 955 | 2,624 | 11 | 16 | 7 | 9 | 0 | 41 |
+| scoped: table ready | 0.049 | 222,916 | 3,440 | 87,614 | 71 | 16,091 | 71 | 52 | 0 | 5,164 |
+| defs-changed: sigs family loaded+translated | 0.027 | 779 | 513 | 775 | 92 | 9,068 | 11 | 16 | 0 | 17 |
+| defs-changed: pairing repaired | 0.033 | 12 | 30 | 7 | 17 | 10,793 | 4 | 28 | 0 | 8 |
+| defs-changed surgery: identity ready | 0.313 | 6,213 | 4,892 | 6,457 | 55 | 8 | 306 | 5 | 0 | 98 |
+| defs-changed surgery: evidence done | 0.024 | 1,055 | 558 | 1,044 | 159 | 9,672 | 11 | 13 | 1 | 4 |
+| defs-changed surgery: graph cache done | 0.239 | 791 | 517 | 791 | 1,165 | 40,770 | 83 | 204 | 4 | 51 |
+| defs-changed surgery: names sorted | 0.153 | 4 | 0 | 3 | 136 | 7,868 | 5 | 144 | 0 | 488 |
+| commit: content-id hash start | 0.115 | 234,352 | 6,193 | 234,403 | 96 | 463 | 60 | 48 | 0 | 68 |
+
+Totals: 1,357,298 allocs, 302,013 reallocs, 1,039,573 frees, 2,426 MB
+allocated, 143,610 minor faults, user 0.84 s, sys 1.84 s,
+11 voluntary / 10,258 involuntary switches, intern reads contended
+0, budget parks 0, channel-full stalls 0. The body-edit compose in the
+same run: 0.78 s, 1.05 M allocs, 55 K faults, sys 1.73 s (its 0.40 s compose segment is
+0.35 s of system time — the same carry).
+
+**Reading it.** No contention anywhere. Two thirds of the CPU is system time, and it sits
+in three places: the manifest scan (94 K stats, 1.3 s of kernel CPU across the pool in
+0.1 s of wall), the carry (`carry_families`: 1,541 hard links of the unchanged bucket
+slabs into the staged generation, 0.29 s of system time on one thread — the "identity
+ready" segment), and the graph-cache rebuild (0.12 s sys + 0.23 s user, 1,164 MB
+allocated and 41 K faults, almost all of it `fs::read` of every node segment — 1.4 GB —
+to hash the cache stamp's node half). The names index is one 8.9 M-pair single-threaded
+sort (0.15 s). The surgery proper (identity, evidence, edges, sigs, usage, dataflow
+patches) is ~0.15 s in total.
+
+**The carry is the filesystem, and the shortcuts are measured-and-closed.** 1,541 `link()`
+calls at 0.19–0.30 ms each. `carry_families` carries the 2026-09-01 laws: thread fan-out
+is 1.8× slower (APFS serializes link creation above the directory), and whole-directory
+`clonefile` was built and rejected because clones are new vnodes, the page cache is
+vnode-keyed, and every chained compose re-faulted the prior's families cold (1.04–1.10 s →
+1.58–1.61 s at kernel scale). Two new measurements today, on this generation's 513-file
+`nodes/` family, three rounds each: sequential hard links 146 ms (285 µs/file);
+`clonefile` of the directory in one call 4.5 ms (9 µs/file, 32× faster on the call —
+but the law's page-cache penalty is downstream of the call and stands); per-file
+`clonefile` 39 ms; `linkat` with directory fds instead of absolute paths 304 vs 297 µs
+per link — no gain, path resolution is not the cost. What is left is the file count per
+generation (1,804 here: 257 buckets × 5 families + heaps), which the bucket-count sweep
+below measures.
+
+**Two fixes landed:**
+
+1. The graph-cache stamp's node half is the xxh3 fold of the per-bucket `vseg` digests the
+   nodes TOC already records (`kg::fold_vseg_digests` / `nodes_toc_stamp`), at every site
+   that stamps or validates `graph.bin` — the seal, the loader, respan, defs-stable,
+   defs-changed. `graph.stamp` gets its own `STAMP_VERSION` (2), so a version-1 stamp is
+   simply stale and the cache rebuilds lazily once. Per defs-changed compose: −1.4 GB of
+   reads, −1.16 GB allocated, −41 K faults; per load of any bucketed index: no more
+   re-hash of every mapped node segment.
+2. The successor names index sorts its 8.9 M unique `(hash, id)` pairs with
+   `par_sort_unstable` — byte-identical output, one thread's 0.15 s spread over the pool.
+
+Tests: kg (24), the index lane suites, `defs_changed_includes`, `pack_v2`, the differential
+oracle (graph.bin bytes), `incremental_replay`, `format_policy`, `respan_live`,
+`live_differential` — all green; clippy clean.
+
+### After the two fixes (same ledger binary rebuilt, same machine state)
+
+Add a function, wall 1.26 s: 1,356,064 allocs, 1,897 MB allocated (was 2,426),
+128,550 minor faults (was 143,610), user 0.98 s, sys 1.83 s; body edit
+0.70 s with 21 K faults (was 55 K: the loader no longer re-hashes the mapped segments).
+
+| segment (ends at stamp) | s | allocs | MB | minor faults | sys ms | user ms |
+|---|---:|---:|---:|---:|---:|---:|
+| scan: manifest done | 0.105 | 534,593 | 182 | 2,558 | 1,162 | 195 |
+| kg load: nodes | 0.046 | 246,786 | 128 | 3,935 | 15 | 31 |
+| respan: ineligible (/private/tmp/claude-501/-Users-a | 0.041 | 2,658 | 16 | 855 | 12 | 10 |
+| defs-stable: ineligible (/private/tmp/claude-501/-Us | 0.030 | 1,872 | 10 | 13 | 6 | 8 |
+| seal: scc | 0.030 | 2,946 | 11 | 15 | 6 | 8 |
+| scoped: table ready | 0.058 | 222,916 | 71 | 27,926 | 81 | 50 |
+| defs-changed: sigs family loaded+translated | 0.027 | 779 | 92 | 9,067 | 10 | 14 |
+| defs-changed: pairing repaired | 0.035 | 12 | 17 | 10,793 | 4 | 28 |
+| defs-changed surgery: identity ready | 0.315 | 6,213 | 55 | 7 | 293 | 5 |
+| defs-changed surgery: evidence done | 0.026 | 1,055 | 160 | 9,660 | 11 | 13 |
+| defs-changed surgery: graph cache done | 0.207 | 23 | 636 | 40,529 | 53 | 195 |
+| defs-changed surgery: names sorted | 0.102 | 4 | 135 | 7,883 | 32 | 328 |
+| commit: content-id hash start | 0.113 | 234,352 | 97 | 502 | 59 | 46 |
+
+The graph-cache segment dropped from 0.27 s / 1,164 MB to 0.21 s / 636 MB (what remains is
+the 16 M-edge translation into three columns plus the two CSR builds and the write); the
+names segment from 0.15 s to 0.10 s (the parallel sort is ~0.02 s; the 8.9 M-pair
+translation loop before it is the rest). The carry is unchanged at 0.30 s.
+
+A/B against the 0.8.4 release asset, three interleaved reps, ungated (`fseventsd` still at
+a full core): add a function [4.55, 4.52, 4.54] → [1.18, 1.21, 1.22] s; remove it
+[4.81, 4.67, 4.74] → [1.24, 2.39, 2.44] s (the two 2.4 s
+reps followed the base arm's 4.7 s full rebuild of the same tree state — the storage-stall
+mode, not the lane: the sweep below measured the same removal at 1.17–1.22 s); body edit
+[0.77, 0.8, 0.83] → [0.74, 0.74, 0.76]; comment [0.56, 0.59, 0.6] → [0.55, 0.59, 0.6].
+Every composed add-a-function generation equals its scratch build (3 of 3).
+
+### Bucket-count sweep (the carry's only lever), kernel copy, fixed build, ungated
+
+`VORPAL_BUCKET_TARGET_FILES` = 512 is the recorded law (`bucket_count_for`: 75,954 files →
+256 buckets); 1024 → 128 buckets; 2048 → 64. One cold build per target, then two reps of
+every edit lane on it. Seconds:
+
+| bucket target (files) | buckets | files per generation | cold | add a function | remove it | body edit | touch | unchanged | carry s | graph cache s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 256 | 1,804 | 8.54 | 1.17, 1.15 | 1.17, 1.22 | 0.7, 0.73 | 0.53, 0.57 | 0.13, 0.15 | 0.29–0.31 | 0.19–0.21 |
+| 1024 | 128 | 908 | 9.42 | 0.96, 0.98 | 0.97, 0.97 | 0.52, 0.51 | 0.38, 0.37 | 0.13, 0.13 | 0.15–0.17 | 0.19–0.19 |
+| 2048 | 64 | 460 | 9.33 | 0.85, 0.83 | 0.86, 0.9 | 0.4, 0.4 | 0.27, 0.27 | 0.13, 0.13 | 0.08–0.08 | 0.19–0.22 |
+
+Every incremental lane loses the carry's share as the file count halves: add a function
+1.16 → 0.97 → 0.84 s, body edit 0.71 → 0.52 → 0.40 s, touch (stamp cutoff) 0.55 → 0.38 →
+0.27 s. The cold build read 0.8–0.9 s slower at 128 and 64 buckets in this one-rep pass;
+interleaved cold reps at 256 vs 64 buckets follow below. The P4.1 sweep that set 512 files
+per bucket swept upward from 256 buckets (0.43 s cutoff at 256, 0.54 at 1024, 1.24 at 4096)
+and never below it; below it the per-bucket link cost dominates and fewer buckets win.
+Changing the target is a bucket-law change: every existing index re-buckets on its next
+full build (the generation id changes), which is the owner's call.
+
+Interleaved cold builds, three reps each, same machine state: 256 buckets (target 512): walls [8.33, 8.4, 8.81] best 8.33 median 8.4; 64 buckets (target 2048): walls [8.24, 9.95, 9.85] best 8.24 median 9.85. Best-of-three equal within 0.1 s; the one-rep 0.8 s gap above was run order, not the bucket count.
