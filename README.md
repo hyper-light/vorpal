@@ -435,8 +435,8 @@ through the structured half. For the three callers of `vfs_read` that is 753 B b
 rewrites the text half, which this client never shows.
 
 **What that costs end to end.** We tested Claude Code 2.1.261 with Opus 5 at high effort
-(pinned with `--effort high`) on the same four questions, three ways. The first run could only use Grep, Glob,
-and Read. The second could only use vorpal's MCP tools as Claude Code ships them, with
+(pinned with `--effort high`) on the same four questions, three ways. The first run could
+only use Grep, Glob, and Read. The second could only use vorpal's MCP tools as Claude Code ships them, with
 schemas deferred, so the first use of each tool costs a `ToolSearch` turn. The third
 could also run the vorpal CLI from the shell; the server's instructions include the
 exact command for its index, and the shell tool is never deferred. For that run, allow
