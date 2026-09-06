@@ -5386,4 +5386,4 @@ and never below it; below it the per-bucket link cost dominates and fewer bucket
 Changing the target is a bucket-law change: every existing index re-buckets on its next
 full build (the generation id changes), which is the owner's call.
 
-Interleaved cold builds, three reps each, same machine state: 256 buckets (target 512): walls [8.33, 8.4, 8.81] best 8.33 median 8.4; 64 buckets (target 2048): walls [8.24, 9.95, 9.85] best 8.24 median 9.85. Best-of-three equal within 0.1 s; the one-rep 0.8 s gap above was run order, not the bucket count.
+Interleaved cold builds, three reps each, same machine state: 256 buckets (target 512): walls [8.33, 8.4, 8.81] best 8.33 median 8.4; 64 buckets (target 2048): walls [8.24, 9.95, 9.85] best 8.24 median 9.85. Best-of-three equal within 0.1 s, but two of the three 64-bucket reps were 9.9 s against one slow 256-bucket rep, so the cold cost of fewer, larger slabs is UNCONFIRMED under this machine state (larger single writes may sit longer in the storage-stall mode) — to be re-measured on a quiet machine, three reps per target, before any bucket-law change.
