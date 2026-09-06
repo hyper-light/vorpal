@@ -197,11 +197,11 @@ vorpal index <source-tree> --out <index-dir>
 | Linux kernel @ `1590cf032971` (75,954 files parsed of 94,843 tracked, ~30 M LOC) | |
 |---|---|
 | Cold index → **8,891,771 nodes** | **8.1 s** |
-| Edit a function body, re-index | **0.8 s** |
-| Edit a comment only | 0.7 s |
-| Add a function | 4.7 s |
-| `touch` one file (content unchanged) | 0.6 s |
-| Nothing changed | **0.14 s** |
+| Edit a function body, re-index | **0.4 s** |
+| Edit a comment only | 0.2 s |
+| Add a function | 0.9 s |
+| `touch` one file (content unchanged) | 0.2 s |
+| Nothing changed | **0.13 s** |
 
 The edit rows are medians of three saves to `fs/read_write.c`. A body edit or a comment
 change replays only that file against the carried graph. Adding a definition takes the
@@ -236,11 +236,11 @@ files a grammar handled, not everything tracked; the kernel row uses the same ru
 This repository: 1,897 files parsed of 2,882 tracked → 79,901 nodes, 6.8 s cold¹, 0.02 s
 unchanged. The vendored tree-sitter runtime and 49 grammars are included in that count.
 
-Disk: the kernel index is a 4.8 GB generation, most of it a parsed-product cache that
-makes the sub-second edits above possible; the search tiers a daemon warms on top of it
-bring the directory to 8.1 GB (table below). The previous generation is kept until the
-next commit, then swept. Indexer peak RSS on the kernel: 5.8 GB; a batch build keeps
-freed pages until it exits, which costs about 0.3 GB of that and saves 1.7 M page faults.
+Disk: the kernel index is a 4.5 GB generation of 236 files, most of it a parsed-product
+cache that makes the sub-second edits above possible; the search tiers a daemon warms on
+top of it add about 3.3 GB (table below). The previous generation is kept until the next
+commit, then swept. Indexer peak RSS on the kernel: 6.1 GB; a batch build keeps freed
+pages until it exits, which costs about 0.3 GB of that and saves 1.7 M page faults.
 
 ¹ One 33 MB generated `parser.c` sets the floor; everything else parses in parallel
 underneath it. To re-run a pinned row, fetch by the full SHA

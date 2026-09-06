@@ -51,12 +51,19 @@ pub fn tree_relative<'a>(path: &'a str, canonical_root: &str) -> &'a str {
 // incremental build that grows past a threshold diverge byte-wise from a scratch build of
 // the same tree. ONE home for the law: the product pack and the node/heap slabs must
 // bucket identically or "one edit, one bucket" stops composing across artifacts.
-// Constants from the recorded two-scale sweep (docs/wip/SUBSECOND.md §P4.1 — linux kernel
-// 76 868 files and vorpal repo ~2k): kernel stamp-cutoff wall 0.43 s at B=256, 0.54 s at
-// B=1024, 1.24 s at B=4096 (past ~100 files/bucket the per-bucket link/mmap overhead
-// beats byte savings), so the target lands the kernel exactly on its measured optimum:
-// 76 868 / 512 → next_pow2(150) = 256.
-const BUCKET_TARGET_FILES: usize = 512;
+// Constants from two recorded sweeps. P4.1 (docs/wip/SUBSECOND.md, 2026-09-01) swept UP
+// from 256 buckets on the kernel: stamp-cutoff 0.43 s at B=256, 0.54 s at 1024, 1.24 s at
+// 4096 — past ~100 files/bucket the per-bucket link/mmap overhead beats byte savings. The
+// 2026-09-06 sweep (docs/wip/BENCHMARKS.md, "Bucket sweep, interleaved") swept DOWN, three
+// interleaved cold builds and two reps of every edit lane per point, and found the other
+// wall: every incremental lane carries the unchanged slabs by one hard link per file at
+// ~0.2–0.3 ms each, so fewer files per generation win until the per-bucket slab rewrite
+// starts to bite. Kernel (75 954 files), medians: add a function / body edit / touch /
+// cold-best — 256 buckets 1.45 / 0.88 / 0.61 / 8.87 s, 128: 0.97 / 0.51 / 0.38 / 8.75,
+// 64: 0.84 / 0.40 / 0.27 / 8.72, 32: 0.83 / 0.37 / 0.23 / 7.98, 16: 0.88 / 0.39 / 0.22 /
+// 8.14. The minimum is 32, so the target lands the kernel there: 75 954 / 4096 →
+// next_pow2(19) = 32. Corpora under 65 536 files sit on the 16-bucket floor either way.
+const BUCKET_TARGET_FILES: usize = 4096;
 const BUCKET_MIN: u32 = 16;
 /// Also the naming bound: `{:04}` bucket file names sort numerically only below 10 000.
 pub const BUCKET_MAX: u32 = 4096;
@@ -132,7 +139,7 @@ mod tests {
     assert_eq!(bucket_count_for(0), bucket_count_for(1), "clamped floor");
     let kernel_scale = 76_868usize;
     let b = bucket_count_for(kernel_scale);
-    assert_eq!(b, 256, "the kernel lands on its measured-optimum bucket count");
+    assert_eq!(b, 32, "the kernel lands on its measured-optimum bucket count (2026-09-06 sweep)");
     // Monotonic in file count, power-of-two, bounded.
     let mut prev = 0;
     for files in [0usize, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000] {

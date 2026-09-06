@@ -5387,3 +5387,63 @@ Changing the target is a bucket-law change: every existing index re-buckets on i
 full build (the generation id changes), which is the owner's call.
 
 Interleaved cold builds, three reps each, same machine state: 256 buckets (target 512): walls [8.33, 8.4, 8.81] best 8.33 median 8.4; 64 buckets (target 2048): walls [8.24, 9.95, 9.85] best 8.24 median 9.85. Best-of-three equal within 0.1 s, but two of the three 64-bucket reps were 9.9 s against one slow 256-bucket rep, so the cold cost of fewer, larger slabs is UNCONFIRMED under this machine state (larger single writes may sit longer in the storage-stall mode) — to be re-measured on a quiet machine, three reps per target, before any bucket-law change.
+
+### Bucket sweep, interleaved (rep-major across targets), three cold builds per target (2026-09-06, ungated, `fseventsd` still pinned)
+
+| bucket target | buckets | files per generation | cold ×3 | add a function | remove it | body edit | touch | unchanged | carry s |
+|---:|---:|---:|---|---|---|---|---|---|---|
+| 512 | 256 | 1,804 | 8.87, 8.95, 12.35 | 1.55, 1.34 | 1.82, 1.28 | 1.0, 0.76 | 0.61, 0.61 | 0.15, 0.14 | 0.34–0.41 |
+| 1024 | 128 | 908 | 10.06, 8.78, 8.75 | 0.97, 0.98 | 0.99, 1.02 | 0.52, 0.5 | 0.38, 0.37 | 0.13, 0.13 | 0.17–0.19 |
+| 2048 | 64 | 460 | 8.72, 8.94, 8.79 | 0.85, 0.83 | 0.85, 0.88 | 0.39, 0.41 | 0.27, 0.27 | 0.13, 0.13 | 0.08–0.08 |
+
+Cold best-of-three 8.87 / 8.75 / 8.72 s — equal within 0.15 s, so the one-rep 0.8 s gap in
+the first pass was run order. Every incremental lane is fastest at 64 buckets (carry
+0.40 → 0.08 s; add a function 1.45 → 0.84, body 0.88 → 0.40, touch 0.61 → 0.27 s medians).
+`bucket_count_for` clamps at 16 buckets, so corpora under ~32 K files bucket identically
+under a 2048-file target; LLVM (183 K files) would go 512 → 128 buckets.
+
+## Bucket law set by benchmark: 4096 files per bucket (2026-09-06)
+
+Owner: determine the optimal bucket size by benchmark. Five points on the kernel copy,
+rep-major and target-interleaved (every point sees the same machine drift), three cold
+builds and two reps of every edit lane per point, the fixed 0.8.5 build, `fseventsd`
+still pinned at a full core (ungated; the body-edit and comment rows at 256 buckets agree
+with the morning's gated values within 0.1 s). Objective: the sum of the three edit-lane
+medians (add a function + body edit + touch) with cold as the constraint.
+
+| bucket target | buckets | files per generation | cold ×3 (best) | add a function | remove it | body edit | touch | unchanged | carry s | edit sum |
+|---:|---:|---:|---|---|---|---|---|---|---|---:|
+| 512 | 256 | 1,804 | 8.87, 8.95, 12.35 (8.87) | 1.55, 1.34 | 1.82, 1.28 | 1.0, 0.76 | 0.61, 0.61 | 0.15, 0.14 | 0.34–0.41 | 2.94 |
+| 1024 | 128 | 908 | 10.06, 8.78, 8.75 (8.75) | 0.97, 0.98 | 0.99, 1.02 | 0.52, 0.5 | 0.38, 0.37 | 0.13, 0.13 | 0.17–0.19 | 1.86 |
+| 2048 | 64 | 460 | 8.72, 8.94, 8.79 (8.72) | 0.85, 0.83 | 0.85, 0.88 | 0.39, 0.41 | 0.27, 0.27 | 0.13, 0.13 | 0.08–0.08 | 1.51 |
+| 4096 | 32 | 236 | 7.98, 8.41, 9.82 (7.98) | 0.84, 0.82 | 0.85, 0.84 | 0.37, 0.37 | 0.23, 0.24 | 0.13, 0.13 | 0.04–0.04 | 1.44 |
+| 8192 | 16 | 124 | 8.14, 8.6, 8.54 (8.14) | 0.89, 0.87 | 0.89, 0.88 | 0.39, 0.39 | 0.22, 0.22 | 0.13, 0.12 | 0.02–0.03 | 1.49 |
+
+The minimum is 32 buckets (edit sum 1.44 s; 64: 1.51, 16: 1.49) and it also has the best
+cold. Below 32 the per-bucket slab rewrite starts to pay back what the carry saves (16
+buckets: nodes slab 88 MB per bucket). `BUCKET_TARGET_FILES` 512 → 4096
+(`crates/kg/src/identity.rs`, rationale updated with both sweeps; the law test pins the
+kernel on 32). Corpora under 65,536 files sit on the 16-bucket floor before and after;
+LLVM (183 K files) goes 512 → 64 buckets, Kotlin (110 K) 256 → 32. Existing indexes above
+the floor re-bucket on their next full build.
+
+### Final 0.8.5 binary at the new law, kernel copy
+
+Cold build (one rep, ungated, `/usr/bin/time -l`): 11.03 s real with `fseventsd` at a full
+core (the sweep's three cold builds at 32 buckets read 7.98 / 8.41 / 9.82 s), user 111.3 s,
+sys 7.2 s, max RSS 6.13 GB (5.8 GB at 256 buckets — larger per-bucket buffers); the
+generation is 236 files and 4.5 GB (1,804 files and 4.8 GB before). The README keeps the
+morning's gated 8.1 s cold row (the sweep shows cold unchanged within noise) and takes the
+edit rows from `evals/edit_classes.py` on this binary, three reps, every rep passing the
+quiet gate (idle 88.7–91.9 %, `fseventsd` excluded as before):
+
+| class | reps (s) → median | restore (s) | gate idle % |
+|---|---|---|---|
+| body edit | 0.37, 0.37, 0.38 → **0.37** | 0.38, 0.36, 0.37 | 91.9, 90.5, 91.9 |
+| comment only | 0.23, 0.23, 0.26 → **0.23** | 0.23, 0.23, 0.23 | 88.7, 89.5, 91.5 |
+| add a function | 0.86, 0.9, 0.9 → **0.90** | 0.86, 0.82, 0.83 | 90.8, 91.7, 91.4 |
+
+Touch and unchanged from the sweep's 32-bucket point: 0.23 / 0.24 and 0.13 / 0.13 s. README
+kernel rows now: cold 8.1 s, body edit 0.4 s, comment 0.2 s, add a function 0.9 s, touch
+0.2 s, unchanged 0.13 s, peak RSS 6.1 GB, generation 4.5 GB / 236 files.
+
