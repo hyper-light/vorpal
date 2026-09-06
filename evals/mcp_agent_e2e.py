@@ -2,17 +2,29 @@
 """End-to-end agent benchmark behind the README's "What that costs end to end" table.
 
 Four questions x three arms (grep/read only; vorpal MCP tools only; vorpal with the shell
-allowed) on Claude Code, `--model opus`, CLAUDE_EFFORT=high, one run each. Writes
-results.json plus one stream-json transcript per run into the output directory.
-Tokens = input + cache_read + cache_creation from the result event; cost as billed.
+allowed) on Claude Code, `--model opus --effort high`. Per cell, RUNS runs back to back
+(default 4). Cost on Opus is dominated by the prompt-cache WRITE of the prefix (system
+prompt, tool schemas, MCP instructions; 1-hour TTL at twice the input price), and that
+prefix is shared by every question of one arm+corpus group, so only the first run of a
+group in a fresh hour is cold; every later run is warm. The harness therefore orders runs
+by group, marks the first run of each group `cold_intent`, and records every run's usage
+classes (cache_creation / cache_read / input / output), billed cost, turns, wall, tool
+calls, and stream-json transcript. The README reports the cold run's cost and the medians
+of the warm runs. Effort is pinned with the --effort flag: CLAUDE_EFFORT is a variable
+Claude Code EXPORTS to hooks and Bash, not one it reads (2026-09-06 finding).
 
-    python3 evals/mcp_agent_e2e.py <out-dir> [grep,mcp,cli]
+    python3 evals/mcp_agent_e2e.py <out-dir> [grep,mcp,cli] [--runs N] [--not-before <unix epoch>]
 
-Needs ~/.local/bin/vorpal and indexes at <repo>/.vorpal/index and ~/Projects/linux/.vorpal/index.
-Recorded runs: docs/wip/BENCHMARKS.md (2026-09-05, v0.8.2)."""
-import json, os, subprocess, sys, time, pathlib
-S = pathlib.Path(sys.argv[1]); S.mkdir(parents=True, exist_ok=True)
-ARMS = sys.argv[2].split(",") if len(sys.argv) > 2 else ["grep", "mcp", "cli"]
+Results append to <out-dir>/results.json (one row per run). Needs ~/.local/bin/vorpal and
+indexes at <repo>/.vorpal/index and ~/Projects/linux/.vorpal/index.
+Recorded runs: docs/wip/BENCHMARKS.md."""
+import json, os, statistics, subprocess, sys, time, pathlib
+args = sys.argv[1:]
+RUNS = int(args[args.index("--runs") + 1]) if "--runs" in args else 4
+NOT_BEFORE = float(args[args.index("--not-before") + 1]) if "--not-before" in args else 0.0
+pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--runs", "--not-before"))]
+S = pathlib.Path(pos[0]); S.mkdir(parents=True, exist_ok=True)
+ARMS = pos[1].split(",") if len(pos) > 1 else ["grep", "mcp", "cli"]
 VORPAL = os.path.expanduser("~/.local/bin/vorpal")
 REPO = "/Users/adalundhe/Projects/vorpal"; KERNEL = "/Users/adalundhe/Projects/linux"
 CORPORA = {"repo": (REPO, f"{REPO}/.vorpal/index"), "kernel": (KERNEL, f"{KERNEL}/.vorpal/index")}
@@ -32,9 +44,12 @@ def mcp_config(index):
   p.write_text(json.dumps({"mcpServers": {"vorpal": {"command": VORPAL, "args": ["mcp", "--index", index]}}}))
   return str(p)
 EMPTY = S / "mcp-empty.json"; EMPTY.write_text(json.dumps({"mcpServers": {}}))
-def run(corpus, key, question, arm):
+RESULTS = S / "results.json"
+rows = json.loads(RESULTS.read_text()) if RESULTS.exists() else []
+
+def run(corpus, key, question, arm, run_idx, cold_intent):
   cwd, index = CORPORA[corpus]
-  cmd = ["claude", "-p", question + SUFFIX[arm], "--model", "opus", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"]
+  cmd = ["claude", "-p", question + SUFFIX[arm], "--model", "opus", "--effort", "high", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"]
   if arm == "grep":
     cmd += ["--mcp-config", str(EMPTY), "--allowedTools", "Grep,Glob,Read,Bash(rg:*),Bash(grep:*)", "--disallowedTools", "Edit,Write,Agent"]
   elif arm == "mcp":
@@ -44,39 +59,63 @@ def run(corpus, key, question, arm):
     # allowlist must match that spelling too — `Bash(vorpal:*)` alone denies the command.
     cmd += ["--mcp-config", mcp_config(index), "--allowedTools", f"mcp__vorpal,Bash(vorpal:*),Bash({VORPAL}:*)", "--disallowedTools", "Grep,Glob,Read,Edit,Write,Agent"]
   t0 = time.time()
-  proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL, env={**os.environ, 'CLAUDE_EFFORT': 'high'})
+  proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
   wall = time.time() - t0
-  calls, result, answer = [], None, ""
+  calls, result, answer, per_turn = [], None, "", []
   for line in proc.stdout.splitlines():
     try: ev = json.loads(line)
     except Exception: continue
     if ev.get("type") == "assistant":
       m = ev.get("message")
       if isinstance(m, dict):
+        u = m.get("usage") or {}
+        per_turn.append({k: u.get(k) for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")})
         for block in m.get("content", []) or []:
           if isinstance(block, dict) and block.get("type") == "tool_use":
-            name = block.get("name", "")
-            inp = block.get("input", {})
+            name = block.get("name", ""); inp = block.get("input", {})
             brief = name
             if name == "ToolSearch": brief = f"ToolSearch({inp.get('query','')})"
-            elif name.startswith("mcp__vorpal__"): brief = name.replace("mcp__vorpal__", "") + (f"({inp.get('relation')})" if inp.get("relation") else "")
-            elif name == "Bash": brief = "Bash(" + str(inp.get("command", ""))[:90] + ")"
+            elif name.startswith("mcp__vorpal__"): brief = name.replace("mcp__vorpal__", "") + (f"({inp.get('relation')})" if inp.get("relation") else "") + (f"[format={inp.get('format')}]" if inp.get("format") else "")
+            elif name == "Bash": brief = "Bash(" + str(inp.get("command", ""))[:160] + ")"
             calls.append(brief)
           elif isinstance(block, dict) and block.get("type") == "text":
             answer = block.get("text", "")
     elif ev.get("type") == "result":
       result = ev
   usage = (result or {}).get("usage", {}) or {}
-  tokens = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
-  row = {"corpus": corpus, "question": key, "arm": arm, "turns": (result or {}).get("num_turns"), "ts": sum(1 for c in calls if c.startswith("ToolSearch")),
-         "tokens": tokens, "cost": (result or {}).get("total_cost_usd"), "wall_s": round(((result or {}).get("duration_ms") or wall*1000)/1000, 1),
-         "calls": calls, "rc": proc.returncode, "answer": answer[:1500], "error": (result or {}).get("is_error")}
-  (S / f"{corpus}-{key}-{arm}.stream.jsonl").write_text(proc.stdout)
-  if proc.stderr: (S / f"{corpus}-{key}-{arm}.stderr").write_text(proc.stderr)
+  cc, cr, ci, co = (usage.get(k, 0) or 0 for k in ("cache_creation_input_tokens", "cache_read_input_tokens", "input_tokens", "output_tokens"))
+  row = {"corpus": corpus, "question": key, "arm": arm, "run": run_idx, "cold_intent": cold_intent,
+         "turns": (result or {}).get("num_turns"), "ts": sum(1 for c in calls if c.startswith("ToolSearch")),
+         "tokens": ci + cr + cc, "cache_create": cc, "cache_read": cr, "input": ci, "output": co,
+         "cost": (result or {}).get("total_cost_usd"), "wall_s": round(((result or {}).get("duration_ms") or wall * 1000) / 1000, 1),
+         "models": sorted(((result or {}).get("modelUsage") or {}).keys()), "calls": calls, "per_turn": per_turn,
+         "rc": proc.returncode, "answer": answer[:1500], "error": (result or {}).get("is_error"), "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0))}
+  (S / f"{corpus}-{key}-{arm}-run{run_idx}.stream.jsonl").write_text(proc.stdout)
+  if proc.stderr: (S / f"{corpus}-{key}-{arm}-run{run_idx}.stderr").write_text(proc.stderr)
   return row
-rows = []
-for corpus, key, q in QUESTIONS:
+
+if NOT_BEFORE:
+  while time.time() < NOT_BEFORE:
+    time.sleep(min(30, NOT_BEFORE - time.time()))
+for arm in ARMS:
+  for corpus in ("repo", "kernel"):
+    first_in_group = True
+    for c, key, q in QUESTIONS:
+      if c != corpus: continue
+      for r in range(1, RUNS + 1):
+        cold_intent = first_in_group and r == 1
+        row = run(corpus, key, q, arm, r, cold_intent); rows.append(row)
+        RESULTS.write_text(json.dumps(rows, indent=1))
+        print(f"{corpus:6} {key:20} {arm:4} run{r} {'COLD' if cold_intent else 'warm'} turns={row['turns']} ts={row['ts']} tokens={row['tokens']:,} create={row['cache_create']:,} read={row['cache_read']:,} cost={row['cost']} wall={row['wall_s']} models={row['models']} calls={' | '.join(row['calls'])}", flush=True)
+        first_in_group = False
+
+# summary: cold run cost per group's first cell; warm medians per cell
+print("\n== summary (this invocation's arms) ==")
+for c, key, q in QUESTIONS:
   for arm in ARMS:
-    row = run(corpus, key, q, arm); rows.append(row)
-    print(f"{corpus:6} {key:20} {arm:4} turns={row['turns']} ts={row['ts']} tokens={row['tokens']:,} cost={row['cost']} wall={row['wall_s']} calls={' '.join(row['calls'])}", flush=True)
-    (S / "results.json").write_text(json.dumps(rows, indent=1))
+    cell = [r for r in rows if r["corpus"] == c and r["question"] == key and r["arm"] == arm]
+    if not cell: continue
+    warm = [r for r in cell if not r["cold_intent"]]
+    cold = [r for r in cell if r["cold_intent"]]
+    med = lambda k, rs: statistics.median(r[k] for r in rs if r.get(k) is not None) if rs else None
+    print(f"{c:6} {key:20} {arm:4} cold={cold[0]['cost'] if cold else '-'} (create {cold[0]['cache_create'] if cold else '-'}) warm: n={len(warm)} turns={med('turns', warm)} tokens={med('tokens', warm)} cost={med('cost', warm)} wall={med('wall_s', warm)}")

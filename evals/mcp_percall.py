@@ -33,7 +33,9 @@ def med_call(d, tool, args, n=5):
   # An ambiguous selector returns candidate definitions, not relation hits — say so.
   if sc.get("outcome") not in (None, "hits"):
     n = f"{n} ({sc.get('outcome')})"
-  return statistics.median(dts), len(json.dumps(sc)), n, first_dt
+  compact = len(json.dumps(sc, separators=(",", ":")))
+  text = (r.get("content") or [{}])[0].get("text", "") if isinstance(r.get("content"), list) else ""
+  return statistics.median(dts), compact, n, first_dt, len(text.encode())
 def med_cmd(cmd, cwd, n=5):
   # stdin must be /dev/null: with an inherited pipe and no path argument, rg searches STDIN
   # and waits for EOF forever (the 21-minute hang of 2026-09-05).
@@ -62,13 +64,13 @@ for corpus, root in (("repo", REPO), ("kernel", KERNEL)):
               ("snippet vfs_read", "snippet", {"name":"vfs_read"}, "rg -n '^ssize_t vfs_read\\(' -t c && sed -n \"$(rg -n '^ssize_t vfs_read\\(' fs/read_write.c | head -1 | cut -d: -f1),+40p\" fs/read_write.c"),
               ("reachable vfs_read out depth 2 exact", "reachable", {"name":"vfs_read","direction":"out","max_depth":2,"min_grade":"exact"}, None)]
   for label, tool, args, cmd in probes:
-    dt, nbytes, nrec, first = med_call(d, tool, args)
+    dt, nbytes, nrec, first, tbytes = med_call(d, tool, args)
     if cmd:
       cdt, cbytes, clines = med_cmd(cmd, root)
       rows.append((corpus, label, dt, nbytes, nrec, cdt, cbytes, clines, cmd))
     else:
       rows.append((corpus, label, dt, nbytes, nrec, None, None, None, None))
-    print(f"{corpus:6} {label:36} vorpal {dt:7.2f} ms {nbytes:7,} B {nrec} rec | " + (f"cmd {cdt:7.1f} ms {cbytes:9,} B {clines} lines | {cmd}" if cmd else "no grep equivalent"), flush=True)
+    print(f"{corpus:6} {label:36} vorpal {dt:7.2f} ms {nbytes:7,} B structured (compact, what Claude Code feeds the model) / {tbytes:6,} B text, {nrec} rec | " + (f"cmd {cdt:7.1f} ms {cbytes:9,} B {clines} lines | {cmd}" if cmd else "no grep equivalent"), flush=True)
   print(f"{corpus:6} cold-open first call: {cold:.1f} ms")
   d.close()
 json.dump(rows, open(sys.argv[1], "w"), indent=1)

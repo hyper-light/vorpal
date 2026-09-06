@@ -4662,3 +4662,170 @@ function)", medians of seven each.
   the new pack". Falsified by `grep -n` of the marker (line 547, `kernel_read`), and by the
   one-shot CLI refusing the stale span before re-index and showing the marker after. The
   daemon was right; the probe was wrong. Anchor by the enclosing signature, not `replace(…, 1)`.
+
+## E2E table re-measured: cold and warm prompt cache, effort pinned (2026-09-06)
+
+The owner flagged the 0.8.3 end-to-end table ("wildly off"), the format question, the
+`structuredContent` paragraph, and asked whether the runs were Opus 5 at high effort. Four
+findings, then the re-measurement that replaces the table.
+
+**1. The Cost column was mostly the prompt-cache write.** Fitting the twelve 0.8.3 runs'
+billed cost to their usage classes gives cache writes at $10/M (Opus 5 input $5/M, the
+1-hour-TTL write at 2×), reads at $0.5/M, output at $25/M. 80–90 % of every cell was the
+write of the prefix (system prompt, tool schemas, MCP instructions, the first user message
+with its injected context), and whether a cell paid it depended on what earlier runs had
+left in the cache within the hour. Isolating experiment, same CLI cell back to back: cold
+$0.197 (turn-1 write 17,735 tokens) vs warm $0.030 (write 412), identical two turns, same
+command, same 447 B result. The 0.8.2 table's CLI cells ($0.03) had been warm; the 0.8.3
+campaign's were cold.
+
+**2. Lean was in use on both arms.** `protocol.rs::default_record_format` returns `lean`
+for node/graph/reachable/search/…; the default output is byte-identical to `format: lean`
+(text 448 B, structured 817 B pretty). The CLI arm's transcripts show the fast-path command
+with `--format lean` on every run; the MCP arm's calls carry `format=lean` on some runs and
+the default on the rest.
+
+**3. Claude Code 2.1.261 feeds the model the compact `structuredContent`, not the text.**
+Verified in the stream-json transcript: the `user` turn's tool_result content is
+`JSON.stringify(structuredContent)` — 753 B for the three callers of `vfs_read` — and the
+448 B lean text block is dropped. The README's 817 / 377 / 1,320 B were pretty-printed
+sizes; the model receives 753 / 355 / 1,235 B (lean / ids / toon). `toon` rewrites the
+text half only, so in this client it is the largest payload; the README no longer names
+it there. `evals/mcp_percall.py` now reports the compact size and the text size.
+
+**4. Opus 5, effort high — by default, not by the pin.** Every `assistant` message and the
+`system/init` event carry `claude-opus-5` (a 900-token `claude-haiku-4-5` side call per run
+is Claude Code's own; it is in the billed total). The harness had set `CLAUDE_EFFORT=high`
+in the environment; the binary's own strings say that variable is what Claude Code
+*exports* to hooks and Bash ("Also exposed to hook commands and Bash as the CLAUDE_EFFORT
+env var"), and the input controls are `--effort` and `CLAUDE_CODE_EFFORT_LEVEL`. A wrapper
+script run inside a plain `claude -p --model opus` printed `EFFORT=high`, so the runs were
+high because that is this install's default for Opus. The harness now passes
+`--effort high`. (A bare `echo $CLAUDE_EFFORT` is denied by the permission system as a
+`simple_expansion`; the wrapper script is the way to read it.)
+
+### Method
+
+`evals/mcp_agent_e2e.py <out> <arms> --runs 4 [--not-before <epoch>]`. Runs are ordered by
+arm+corpus group; each cell runs four times back to back: run 1 is the cold ask (its
+first-message block, and for the group's first cell also the system+tools block, are
+written to the cache), runs 2–4 are warm repeats. Cold/warm is decided from the recorded
+per-turn usage: a warm run's first turn writes nothing (< 1,500 tokens); a repeat whose
+first turn wrote a prefix is dropped, because the prefix changed under it. Every run keeps
+its stream-json transcript. The grep groups ran at 01:07Z (their prefixes were untouched
+that day); the MCP and CLI groups waited for `--not-before 01:55Z`, an hour after the last
+probe that had warmed them. Effort pinned with `--effort high`; model `opus` (= claude-opus-5).
+
+Prefix anatomy from the turn-1 writes: in the repo cwd the group's first cold run wrote
+12.8–13.6 K (mcp/grep) and 21.5 K (cli, whose system prompt carries the Bash allowlist and
+fast-path note), the next question's first ask 9.7–10.5 K (the first-message block:
+CLAUDE.md, memory, git status, the question); in the kernel cwd 9.1–9.9 K then 5.5–6.3 K.
+The repo's git status is part of that block: one warm repeat (repo callers grep, run 2)
+re-wrote 12,850 tokens because this session edited README.md between runs 1 and 2; it is
+dropped and the cell was topped up with two more repeats (runs 5–6) while the prefix was
+still cached. Nothing in the repo was touched during the rest of the campaign.
+
+### Table as published (medians of the first three valid warm runs; cold = run 1)
+
+| Question | Tools | Turns | Tokens | Cost cold | Cost warm | Wall |
+|---|---|---:|---:|---:|---:|---:|
+| This repo: who calls `tool_result` | grep + read | 5 | 73 K | $0.212 | $0.081 | 9.4 s |
+|  | vorpal MCP tool | 3 | 63 K | $0.178 | $0.054 | 5.9 s |
+|  | vorpal CLI via shell | 2 | 43 K | $0.236 | $0.028 | 5.3 s |
+| This repo: what `run_install` reaches | grep + read | 4 | 77 K | $0.224 | $0.136 | 11.8 s |
+|  | vorpal MCP tool | 3 | 64 K | $0.161 | $0.045 | 7.0 s |
+|  | vorpal CLI via shell | 2 | 44 K | $0.140 | $0.040 | 7.9 s |
+| Kernel: who calls `vfs_read` | grep + read | 5 | 104 K | $0.197 | $0.200 | 16.6 s |
+|  | vorpal MCP tool | 3 | 51 K | $0.138 | $0.042 | 6.9 s |
+|  | vorpal CLI via shell | 2 | 36 K | $0.124 | $0.029 | 6.1 s |
+| Kernel: what `vfs_read` calls | grep + read | 3 | 59 K | $0.116 | $0.053 | 8.2 s |
+|  | vorpal MCP tool | 3 | 51 K | $0.107 | $0.046 | 5.7 s |
+|  | vorpal CLI via shell | 2 | 36 K | $0.093 | $0.026 | 5.8 s |
+
+Warm, cost follows turns: grep $0.05–0.14, MCP $0.04–0.05, shell $0.03–0.04. Cold adds the
+prefix write, $0.09–0.21 depending on the arm and cwd; on the kernel callers grep cell the
+warm median ($0.200) equals the cold run because its repeats read more file content
+(their own tail writes: 3.6–13.1 K tokens per run) and took 4–6 turns.
+
+### Every run
+
+| corpus | question | arm | run | turns | tokens | turn-1 cache write | total cache write | cache read | output | billed $ | wall s | calls |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| repo | callers_tool_result | grep | 1 (cold) | 5 | 74,106 | 12,844 | 16,140 | 57,960 | 811 | 0.2117 | 10.7 | Grep; Grep; Read; Read |
+| repo | callers_tool_result | grep | 2 | 3 | 47,900 | 12,850 | 14,992 | 32,904 | 336 | 0.1758 | 4.9 | Grep; Grep |
+| repo | callers_tool_result | grep | 3 | 4 | 73,346 | 0 | 2,766 | 70,574 | 673 | 0.0808 | 9.0 | Grep; Read; Read |
+| repo | callers_tool_result | grep | 4 | 9 | 152,617 | 0 | 4,497 | 148,108 | 1,406 | 0.1552 | 18.3 | Grep; Grep; Grep; Grep; Read; Read; Bash(rg -n '  fn \|  pub fn \|  pub\(crate\) fn ' /Users/adalundhe/Proje; Grep |
+| repo | reaches_run_install | grep | 1 (cold) | 3 | 76,736 | 9,701 | 17,275 | 59,455 | 814 | 0.2239 | 11.3 | Grep; Read |
+| repo | reaches_run_install | grep | 2 | 4 | 77,166 | 0 | 7,789 | 69,371 | 908 | 0.1363 | 11.8 | Grep; Grep; Read |
+| repo | reaches_run_install | grep | 3 | 4 | 80,492 | 0 | 9,452 | 71,034 | 982 | 0.1556 | 12.8 | Grep; Grep; Read |
+| repo | reaches_run_install | grep | 4 | 3 | 76,740 | 0 | 7,576 | 69,158 | 878 | 0.1333 | 11.5 | Grep; Read |
+| kernel | callers_vfs_read | grep | 1 (cold) | 6 | 84,361 | 9,081 | 13,060 | 71,293 | 1,174 | 0.1967 | 19.4 | Grep; Grep; Bash(rg -n --no-heading '(^\|[^A-Za-z0-9_])vfs_read($\|[^A-Za-z0-9_])' -; Read; Read |
+| kernel | callers_vfs_read | grep | 2 | 4 | 100,963 | 0 | 13,128 | 87,827 | 941 | 0.1998 | 14.5 | Bash(grep -rn "vfs_read" --include=*.c --include=*.h --include=*.S . \|; Grep; Bash(grep -n "vfs_read" -B 25 /Users/adalundhe/Projects/linux/fs/read_ |
+| kernel | callers_vfs_read | grep | 3 | 6 | 104,121 | 0 | 3,564 | 100,547 | 992 | 0.1118 | 16.9 | Grep; Bash(grep -rn --include=*.c --include=*.h '\bvfs_read[[:space:]]*(' . ; Grep; Read; Read |
+| kernel | callers_vfs_read | grep | 4 | 5 | 132,160 | 0 | 12,735 | 119,415 | 1,011 | 0.2134 | 16.6 | Bash(grep -rn "vfs_read" --include=*.c --include=*.h --include=*.S . \|; Grep; Bash(sed -n '700,720p' /Users/adalundhe/Projects/linux/fs/nfs/localio.; Bash(sed -n '750,756p' /Users/adalundhe/Projects/linux/fs/read_write.c |
+| kernel | callees_vfs_read | grep | 1 (cold) | 4 | 59,136 | 5,547 | 6,830 | 52,300 | 821 | 0.1160 | 10.1 | Grep; Grep; Read |
+| kernel | callees_vfs_read | grep | 2 | 4 | 59,136 | 0 | 0 | 59,130 | 674 | 0.0475 | 8.2 | Grep; Grep; Read |
+| kernel | callees_vfs_read | grep | 3 | 3 | 58,665 | 0 | 1,103 | 57,556 | 712 | 0.0587 | 8.9 | Grep; Read |
+| kernel | callees_vfs_read | grep | 4 | 3 | 58,669 | 0 | 1,105 | 57,558 | 481 | 0.0529 | 6.9 | Grep; Read |
+| repo | callers_tool_result | mcp | 1 (cold) | 3 | 62,606 | 13,628 | 14,498 | 48,102 | 316 | 0.1780 | 5.1 | ToolSearch(select:mcp__vorpal__graph); graph(callers) |
+| repo | callers_tool_result | mcp | 2 | 3 | 62,606 | 0 | 0 | 62,600 | 316 | 0.0402 | 5.1 | ToolSearch(select:mcp__vorpal__graph); graph(callers) |
+| repo | callers_tool_result | mcp | 3 | 3 | 63,412 | 0 | 1,273 | 62,133 | 428 | 0.0555 | 6.7 | ToolSearch(select:mcp__vorpal__graph,mcp__vorpal__node); graph(callers) |
+| repo | callers_tool_result | mcp | 4 | 3 | 63,392 | 0 | 1,263 | 62,123 | 359 | 0.0537 | 5.9 | ToolSearch(select:mcp__vorpal__graph,mcp__vorpal__node); graph(callers) |
+| repo | reaches_run_install | mcp | 1 (cold) | 3 | 63,864 | 10,479 | 12,179 | 51,679 | 480 | 0.1607 | 6.7 | ToolSearch(select:mcp__vorpal__reachable,mcp__vorpal__graph); reachable |
+| repo | reaches_run_install | mcp | 2 | 3 | 63,177 | 0 | 1,367 | 61,804 | 523 | 0.0587 | 7.2 | ToolSearch(select:mcp__vorpal__reachable); reachable[format=lean] |
+| repo | reaches_run_install | mcp | 3 | 3 | 63,864 | 0 | 0 | 63,858 | 492 | 0.0453 | 6.9 | ToolSearch(select:mcp__vorpal__reachable,mcp__vorpal__graph); reachable |
+| repo | reaches_run_install | mcp | 4 | 3 | 63,864 | 0 | 0 | 63,858 | 481 | 0.0450 | 7.0 | ToolSearch(select:mcp__vorpal__reachable,mcp__vorpal__graph); reachable |
+| kernel | callers_vfs_read | mcp | 1 (cold) | 3 | 51,405 | 9,855 | 10,824 | 40,575 | 341 | 0.1381 | 5.9 | ToolSearch(select:mcp__vorpal__graph); graph(callers) |
+| kernel | callers_vfs_read | mcp | 2 | 3 | 51,405 | 0 | 0 | 51,399 | 405 | 0.0369 | 7.1 | ToolSearch(select:mcp__vorpal__graph); graph(callers) |
+| kernel | callers_vfs_read | mcp | 3 | 3 | 51,366 | 0 | 949 | 50,411 | 249 | 0.0419 | 4.6 | ToolSearch(select:mcp__vorpal__graph); graph(callers) |
+| kernel | callers_vfs_read | mcp | 4 | 3 | 51,399 | 0 | 966 | 50,427 | 426 | 0.0466 | 6.9 | ToolSearch(select:mcp__vorpal__graph); graph(callers) |
+| kernel | callees_vfs_read | mcp | 1 (cold) | 3 | 51,479 | 6,321 | 7,374 | 44,099 | 400 | 0.1068 | 5.6 | ToolSearch(select:mcp__vorpal__graph); graph(callees) |
+| kernel | callees_vfs_read | mcp | 2 | 3 | 51,499 | 0 | 1,063 | 50,430 | 328 | 0.0451 | 5.4 | ToolSearch(select:mcp__vorpal__graph); graph(callees)[format=lean] |
+| kernel | callees_vfs_read | mcp | 3 | 3 | 51,449 | 0 | 1,038 | 50,405 | 384 | 0.0462 | 5.7 | ToolSearch(select:mcp__vorpal__graph); graph(callees) |
+| kernel | callees_vfs_read | mcp | 4 | 3 | 51,479 | 0 | 1,053 | 50,420 | 399 | 0.0467 | 5.9 | ToolSearch(select:mcp__vorpal__graph); graph(callees)[format=lean] |
+| repo | callers_tool_result | cli | 1 (cold) | 2 | 43,363 | 21,508 | 21,851 | 21,508 | 215 | 0.2357 | 4.6 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers tool_result --in |
+| repo | callers_tool_result | cli | 2 | 2 | 43,363 | 0 | 0 | 43,359 | 215 | 0.0281 | 5.3 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers tool_result --in |
+| repo | callers_tool_result | cli | 3 | 2 | 43,363 | 0 | 0 | 43,359 | 215 | 0.0281 | 5.5 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers tool_result --in |
+| repo | callers_tool_result | cli | 4 | 2 | 43,363 | 0 | 0 | 43,359 | 215 | 0.0281 | 4.9 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers tool_result --in |
+| repo | reaches_run_install | cli | 1 (cold) | 2 | 43,596 | 10,502 | 11,062 | 32,530 | 466 | 0.1396 | 7.4 | Bash(/Users/adalundhe/.local/bin/vorpal graph reachable run_install -- |
+| repo | reaches_run_install | cli | 2 | 2 | 43,620 | 0 | 584 | 43,032 | 467 | 0.0401 | 12.9 | Bash(/Users/adalundhe/.local/bin/vorpal graph reachable run_install -- |
+| repo | reaches_run_install | cli | 3 | 2 | 43,616 | 0 | 580 | 43,032 | 549 | 0.0421 | 7.8 | Bash(/Users/adalundhe/.local/bin/vorpal graph reachable run_install -- |
+| repo | reaches_run_install | cli | 4 | 2 | 43,596 | 0 | 0 | 43,592 | 540 | 0.0363 | 7.9 | Bash(/Users/adalundhe/.local/bin/vorpal graph reachable run_install -- |
+| kernel | callers_vfs_read | cli | 1 (cold) | 2 | 35,890 | 9,878 | 10,294 | 25,592 | 278 | 0.1237 | 6.2 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers vfs_read --index |
+| kernel | callers_vfs_read | cli | 2 | 2 | 35,890 | 0 | 416 | 35,470 | 257 | 0.0294 | 6.1 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers vfs_read --index |
+| kernel | callers_vfs_read | cli | 3 | 2 | 35,884 | 0 | 410 | 35,470 | 257 | 0.0293 | 6.0 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers vfs_read --index |
+| kernel | callers_vfs_read | cli | 4 | 2 | 35,890 | 0 | 0 | 35,886 | 335 | 0.0274 | 6.9 | Bash(/Users/adalundhe/.local/bin/vorpal graph callers vfs_read --index |
+| kernel | callees_vfs_read | cli | 1 (cold) | 2 | 35,946 | 6,344 | 6,820 | 29,122 | 371 | 0.0931 | 6.9 | Bash(/Users/adalundhe/.local/bin/vorpal graph callees vfs_read --index |
+| kernel | callees_vfs_read | cli | 2 | 2 | 35,913 | 0 | 443 | 35,466 | 265 | 0.0298 | 5.5 | Bash(/Users/adalundhe/.local/bin/vorpal graph callees vfs_read --index |
+| kernel | callees_vfs_read | cli | 3 | 2 | 35,913 | 0 | 0 | 35,909 | 283 | 0.0261 | 5.8 | Bash(/Users/adalundhe/.local/bin/vorpal graph callees vfs_read --index |
+| kernel | callees_vfs_read | cli | 4 | 2 | 35,913 | 0 | 0 | 35,909 | 283 | 0.0261 | 6.1 | Bash(/Users/adalundhe/.local/bin/vorpal graph callees vfs_read --index |
+| repo | callers_tool_result | grep | 5 | 5 | 71,113 | 0 | 1,975 | 69,132 | 652 | 0.0717 | 9.4 | Grep; Grep; Grep; Read |
+| repo | callers_tool_result | grep | 6 | 7 | 96,740 | 0 | 2,937 | 93,795 | 942 | 0.1009 | 13.0 | Grep; Grep; Grep; Read; Read; Read |
+
+### Answers
+
+All 50 runs finished (rc 0, no API error). Every vorpal-arm run named the right callers,
+callees, and reachable definitions. Grep on the repo callers question gave the right file
+and line in all six runs but named the enclosing function of `router.rs:171` correctly
+(`tools_call_multi`, fn at line 105) in one run only — two runs called it
+`Router::call_tool`, two gave no name, one said "in MultiProjectServer's tool dispatch".
+The `claude_desktop_config` and `wanted`/`join`/`value` resolver findings from 2026-09-05
+stand.
+
+### Per call, re-read for sizes (`evals/mcp_percall.py`, warm daemon, median of 5)
+
+| corpus | question | vorpal ms | structured compact B (what the model reads) | text B | records |
+|---|---|---:|---:|---:|---:|
+| repo | callers tool_result | 0.09 | 551 | ? | 2 |
+| repo | callees tool_result | 0.19 | 1,721 | ? | 7 |
+| repo | reachable run_install out | 0.06 | 921 | ? | 4 |
+| repo | snippet render_toml | 0.05 | 2,103 | ? | 1 |
+| repo | search 'stdio pump reader thread' | 4.70 | 1,320 | ? | 5 |
+| kernel | callers schedule_timeout_interruptible (limit 100) | 2.83 | 22,897 | ? | 100 |
+| kernel | callers vfs_read | 0.09 | 753 | ? | 3 |
+| kernel | callees vfs_read | 0.08 | 959 | ? | 4 |
+| kernel | node schedule_timeout | 0.04 | 309 | ? | 1 |
+| kernel | snippet vfs_read | 0.06 | 1,229 | ? | 1 |
+| kernel | reachable vfs_read out depth 2 exact | 0.06 | 736 | ? | 3 |
+
+The README's `schedule_timeout_interruptible` row now says 23 KB (compact) instead of 25 KB.
