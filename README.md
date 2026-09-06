@@ -175,13 +175,15 @@ Every command with examples: **[docs/getting-started.md](docs/getting-started.md
 
 ## Performance
 
-Numbers below are release builds of **v0.8.3** on an Apple M5 Max (18 cores, 128 GB,
-macOS 26.4.1, rustc 1.98.0), measured 2026-09-05. Times are wall-clock for the whole CLI
-invocation including process start; cold times are the best of three runs. Every run
-waited for a quiet machine first: two consecutive one-second `top` samples at least 88 %
-idle, with nothing above half a core except the two macOS daemons that never fully idle
-(`fseventsd`, `WindowServer`), whose load we recorded beside each result instead. Docker
-Desktop stayed open throughout. Every dataset is pinned by commit. Indexing always builds
+Numbers below are release builds of **v0.8.4** on an Apple M5 Max (18 cores, 128 GB,
+macOS 26.4.1, rustc 1.98.0). The indexing tables were measured 2026-09-06 with Docker
+Desktop closed; the search, giant-file, scan, and agent tables on 2026-09-05 and 06 with
+it open. Times are wall-clock for the whole CLI invocation including process start; cold
+times are the best of three runs. Every run waited for a quiet machine first: two
+consecutive one-second `top` samples at least 88 % idle, with nothing above half a core
+except `WindowServer` and `fseventsd`, which runs at a full core while an index build
+streams file events, and whose load we recorded beside each result instead. Every dataset
+is pinned by commit. Indexing always builds
 the full graph (calls, imports, types, data flow, near-clone pairs, request-to-route
 links, co-change history), so each number covers the whole product, not a symbol table. Method and
 history: `docs/wip/BENCHMARKS.md`.
@@ -194,49 +196,50 @@ vorpal index <source-tree> --out <index-dir>
 
 | Linux kernel @ `1590cf032971` (75,954 files parsed of 94,843 tracked, ~30 M LOC) | |
 |---|---|
-| Cold index → **8,891,771 nodes** | **10.9 s** |
-| Edit a function body, re-index | **0.9 s** |
-| Edit a comment only | 0.6 s |
-| Add a function | 4.6 s |
-| `touch` one file (content unchanged) | 0.5 s |
-| Nothing changed | **0.15 s** |
+| Cold index → **8,891,771 nodes** | **8.1 s** |
+| Edit a function body, re-index | **0.8 s** |
+| Edit a comment only | 0.7 s |
+| Add a function | 4.7 s |
+| `touch` one file (content unchanged) | 0.6 s |
+| Nothing changed | **0.14 s** |
 
-The edit rows are medians of five saves to `fs/read_write.c`. A body edit or a comment
+The edit rows are medians of three saves to `fs/read_write.c`. A body edit or a comment
 change replays only that file against the carried graph. Adding a definition changes the
 file's signature and import sets, so the incremental lanes decline and the build replays
-the whole reach graph; that is where the 4.6 s goes. The cold time is slower than the
-8.2 s we published for v0.7.1 on 2026-09-03. Measured again on 2026-09-05 under the same
-gate, within the same hour as these numbers, v0.7.1 builds this index in 10.7 s and
-v0.8.2 in 11.4 s, so the difference is the machine on the day, not the code.
+the whole reach graph; that is where the time goes. Same-day controls on the cold row,
+interleaved under the same gate: v0.7.1 built from its tag 8.7 s, v0.8.3 8.5 s. The
+10.9 s an earlier version of this table carried was a slow day for every binary, not the
+code; the investigation is in `docs/wip/BENCHMARKS.md`.
 
 Fifteen other repositories, shallow-cloned at the pinned commit. "Files parsed" counts
 files a grammar handled, not everything tracked; the kernel row uses the same rule.
 
 | Repo | Language | Files parsed | Nodes | Cold | Unchanged |
 |---|---|---:|---:|---:|---:|
-| llvm/llvm-project `d37814473` | C++ | 86,124 | 1,444,028 | 7.4 s | 0.22 s |
-| ziglang/zig `738d2be9` | Zig | 17,025 | 1,085,567 | 6.2 s | 0.04 s |
-| JetBrains/kotlin `9f27f51dd` | Kotlin | 75,448 | 795,719 | 2.4 s | 0.31 s |
-| kubernetes/kubernetes `bce953e8` | Go | 26,641 | 692,828 | 1.9 s | 0.10 s |
-| dotnet/roslyn `4cac4334` | C# | 19,522 | 490,284 | 2.0 s | 0.06 s |
-| rust-lang/rust `5db7f4be8` | Rust | 41,607 | 464,064 | 2.6 s | 0.09 s |
+| llvm/llvm-project `d37814473` | C++ | 86,124 | 1,444,028 | 7.3 s | 0.34 s |
+| ziglang/zig `738d2be9` | Zig | 17,025 | 1,085,567 | 5.6 s | 0.04 s |
+| JetBrains/kotlin `9f27f51dd` | Kotlin | 75,448 | 795,719 | 2.5 s | 0.43 s |
+| kubernetes/kubernetes `bce953e8` | Go | 26,641 | 692,828 | 1.9 s | 0.09 s |
+| dotnet/roslyn `4cac4334` | C# | 19,522 | 490,284 | 1.9 s | 0.08 s |
+| rust-lang/rust `5db7f4be8` | Rust | 41,607 | 464,064 | 2.5 s | 0.09 s |
 | WordPress/WordPress `c195362` | PHP | 4,195 | 286,824 | 1.7 s | 0.02 s |
 | apache/spark `06539777` | Scala | 11,512 | 253,753 | 1.5 s | 0.06 s |
-| apache/kafka `6e4c555` | Java | 7,246 | 209,131 | 0.7 s | 0.03 s |
-| vercel/next.js `483f8420` | TS/JS | 27,216 | 204,754 | 0.9 s | 0.22 s |
-| ghc/ghc `44d7788f` | Haskell | 15,837 | 178,259 | 0.6 s | 0.04 s |
+| apache/kafka `6e4c555` | Java | 7,246 | 209,131 | 0.7 s | 0.04 s |
+| vercel/next.js `483f8420` | TS/JS | 27,216 | 204,754 | 0.9 s | 0.25 s |
+| ghc/ghc `44d7788f` | Haskell | 15,837 | 178,259 | 0.6 s | 0.05 s |
 | python/cpython `b86a41cbf63` | Python/C | 3,841 | 162,945 | 0.9 s | 0.02 s |
 | rails/rails `4130768` | Ruby | 3,952 | 49,635 | 0.3 s | 0.03 s |
-| neovim/neovim `d423675` | C/Lua | 1,476 | 40,507 | 0.2 s | 0.02 s |
+| neovim/neovim `d423675` | C/Lua | 1,476 | 40,507 | 0.2 s | 0.01 s |
 | vuejs/core `d63616c` | Vue/TS | 626 | 11,191 | 0.1 s | 0.01 s |
 
-This repository: 1,894 files parsed of 2,879 tracked → 79,817 nodes, 7.4 s cold¹, 0.02 s
+This repository: 1,897 files parsed of 2,882 tracked → 79,901 nodes, 6.8 s cold¹, 0.02 s
 unchanged. The vendored tree-sitter runtime and 49 grammars are included in that count.
 
 Disk: the kernel index is a 4.8 GB generation, most of it a parsed-product cache that
 makes the sub-second edits above possible; the search tiers a daemon warms on top of it
 bring the directory to 8.1 GB (table below). The previous generation is kept until the
-next commit, then swept. Indexer peak RSS on the kernel: 5.4 GB.
+next commit, then swept. Indexer peak RSS on the kernel: 5.8 GB; a batch build keeps
+freed pages until it exits, which costs about 0.3 GB of that and saves 1.7 M page faults.
 
 ¹ One 33 MB generated `parser.c` sets the floor; everything else parses in parallel
 underneath it. To re-run a pinned row, fetch by the full SHA
@@ -435,56 +438,59 @@ through the structured half. For the three callers of `vfs_read` that is 753 B b
 rewrites the text half, which this client never shows.
 
 **What that costs end to end.** We tested Claude Code 2.1.261 with Opus 5 at high effort
-(pinned with `--effort high`) on the same four questions, three ways. The first run could
-only use Grep, Glob, and Read. The second could only use vorpal's MCP tools as Claude Code ships them, with
-schemas deferred, so the first use of each tool costs a `ToolSearch` turn. The third
-could also run the vorpal CLI from the shell; the server's instructions include the
-exact command for its index, and the shell tool is never deferred. For that run, allow
-the executable by the path the server prints, for example `Bash(/path/to/vorpal:*)`.
+(pinned with `--effort high`) on the same four questions, three ways. The first run
+could only use Grep, Glob, and Read. The second could only use vorpal's MCP tools as
+Claude Code ships them, with schemas deferred, so the first use of each tool costs a
+`ToolSearch` turn. The third could also run the vorpal CLI from the shell; the server's
+instructions include the exact command for its index, and the shell tool is never
+deferred. For that run, allow the executable by the path the server prints, for example
+`Bash(/path/to/vorpal:*)`.
 Tokens count everything the model processed, cache reads included. Cost is what the API
-billed, shown twice: cold, the first run of that arm on that corpus in a fresh hour, which
-writes the prompt cache; and warm, the median of three runs straight after it, with the
-cache holding the prefix. Turns, tokens, and wall are medians of the three warm runs.
-Measured 2026-09-06 with v0.8.3.
+billed with the prompt cache warm: each cell ran four times back to back and the table
+shows medians of the last three, whose first turn read the whole prefix from the cache.
+The first ask of an hour also writes that prefix, at twice the input price; that
+surcharge is measured separately below. Measured 2026-09-06 with v0.8.3.
 
-| Question | Tools | Turns | Tokens | Cost cold | Cost warm | Wall |
-|---|---|---:|---:|---:|---:|---:|
-| This repo: who calls `tool_result` | grep + read | 5 | 73 K | $0.212 | $0.081 | 9.4 s |
-|  | vorpal MCP tool | 3 | 63 K | $0.178 | $0.054 | 5.9 s |
-|  | vorpal CLI via shell | 2 | 43 K | $0.236 | $0.028 | 5.3 s |
-| This repo: what `run_install` reaches | grep + read | 4 | 77 K | $0.224 | $0.136 | 11.8 s |
-|  | vorpal MCP tool | 3 | 64 K | $0.161 | $0.045 | 7.0 s |
-|  | vorpal CLI via shell | 2 | 44 K | $0.140 | $0.040 | 7.9 s |
-| Kernel: who calls `vfs_read` | grep + read | 5 | 104 K | $0.197 | $0.200 | 16.6 s |
-|  | vorpal MCP tool | 3 | 51 K | $0.138 | $0.042 | 6.9 s |
-|  | vorpal CLI via shell | 2 | 36 K | $0.124 | $0.029 | 6.1 s |
-| Kernel: what `vfs_read` calls | grep + read | 3 | 59 K | $0.116 | $0.053 | 8.2 s |
-|  | vorpal MCP tool | 3 | 51 K | $0.107 | $0.046 | 5.7 s |
-|  | vorpal CLI via shell | 2 | 36 K | $0.093 | $0.026 | 5.8 s |
+| Question | Tools | Turns | Tokens | Cost | Wall |
+|---|---|---:|---:|---:|---:|
+| This repo: who calls `tool_result` | grep + read | 5 | 73 K | $0.081 | 9.4 s |
+|  | vorpal MCP tool | 3 | 63 K | $0.054 | 5.9 s |
+|  | vorpal CLI via shell | 2 | 43 K | $0.028 | 5.3 s |
+| This repo: what `run_install` reaches | grep + read | 4 | 77 K | $0.136 | 11.8 s |
+|  | vorpal MCP tool | 3 | 64 K | $0.045 | 7.0 s |
+|  | vorpal CLI via shell | 2 | 44 K | $0.040 | 7.9 s |
+| Kernel: who calls `vfs_read` | grep + read | 5 | 104 K | $0.200 | 16.6 s |
+|  | vorpal MCP tool | 3 | 51 K | $0.042 | 6.9 s |
+|  | vorpal CLI via shell | 2 | 36 K | $0.029 | 6.1 s |
+| Kernel: what `vfs_read` calls | grep + read | 3 | 59 K | $0.053 | 8.2 s |
+|  | vorpal MCP tool | 3 | 51 K | $0.046 | 5.7 s |
+|  | vorpal CLI via shell | 2 | 36 K | $0.026 | 5.8 s |
 
 Each turn on Opus re-reads the whole context, about 17 K tokens here, so the turn count
 sets the token column: two turns through the shell (the command and the reply), three
-through the MCP tools (the schema load, one `graph` or `reachable` call, the reply), three
-to six for grep, which decides how many searches to run and varies from run to run. Warm,
-the bill follows the turns: grep $0.05 to $0.14 a question, the MCP tools $0.04 to $0.05,
-the shell $0.03 to $0.04. Cold, the first question of the hour writes the prompt cache at
-twice the input price, about 10 K to 21 K tokens depending on the arm, and that write is
-most of a two- or three-turn bill; it is why the shell arm, the cheapest warm, is the most
-expensive cold on the first repo question. Grep's warm runs still write their own tail,
-the file contents it read, so on the kernel callers question its warm cost matched its
-cold one. Wall time for a two-turn shell run is 5 to 8 s, of which vorpal's own work is
-under 0.3 s; the rest is the model. Every vorpal run named the right callers, callees,
-and reachable definitions. Grep gave the right file and line every time, but on the repo
-callers question it named the enclosing function correctly in one run of six:
-`tools_call_multi` came back as `Router::call_tool` or was left out. On the kernel
-callees question grep's read also listed two inline
-helpers, `fsnotify_access` and `add_rchar`, that the graph does not resolve as call edges.
-On the `run_install` question grep found one transitive call, `claude_desktop_config`,
-made inside a struct literal, that the graph does not record; the graph arms instead
-carried three depth-2 records the resolver grades `constrained`, names from vendored
-grammar JSON, which the model flagged as not real targets. Earlier versions of this
-table, back to the 27-tool surface that took 8 turns and 161 K tokens on the kernel
-callers question, are in `docs/wip/BENCHMARKS.md`.
+through the MCP tools (the schema load, one `graph` or `reachable` call, the reply),
+three to six for grep, which decides how many searches to run and varies from run to
+run. The bill follows the turns: grep $0.05 to $0.14 a question, the MCP tools $0.04 to
+$0.05, the shell $0.03 to $0.04. Grep's runs also write their own tail, the file
+contents they read, at the cache-write price, which is why its kernel callers question
+costs the most. The first ask of an hour writes the prefix, system prompt, tool schemas
+and instructions, at $10 per million tokens on Opus 5: measured once per arm after an
+hour with no run, it added $0.09 to $0.14 to a grep question, $0.10 to $0.13 to an MCP
+one, and $0.17 to $0.22 to a shell one. The shell arm's prefix is the largest, 18 K to
+22 K tokens, and none of it was cached by anything else; the grep and MCP arms found 7 K
+to 10 K of theirs still cached from other Claude Code sessions on the machine. Wall time
+for a two-turn shell run is 5 to 8 s, of which vorpal's own work is under 0.3 s; the
+rest is the model. Every vorpal run named the right callers, callees, and reachable
+definitions. Grep gave the right file and line every time, but on the repo callers
+question it named the enclosing function correctly in one run of six: `tools_call_multi`
+came back as `Router::call_tool` or was left out. On the kernel callees question grep's
+read also listed two inline helpers, `fsnotify_access` and `add_rchar`, that the graph
+does not resolve as call edges. On the `run_install` question grep found one transitive
+call, `claude_desktop_config`, made inside a struct literal, that the graph does not
+record; the graph arms instead carried three depth-2 records the resolver grades
+`constrained`, names from vendored grammar JSON, which the model flagged as not real
+targets. Earlier versions of this table, back to the 27-tool surface that took 8 turns
+and 161 K tokens on the kernel callers question, are in `docs/wip/BENCHMARKS.md`.
 
 **Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
 at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,

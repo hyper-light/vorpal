@@ -218,6 +218,14 @@ impl ParseHealthPolicy {
   }
 }
 
+/// Batch fault economics for a one-shot build: keep freed pages resident for the process
+/// lifetime instead of returning them to the kernel at once (see
+/// `vorpal_ingest::retain_dirty_pages_for_batch_run`). Batch commands — `vorpal index`,
+/// `vorpal-index index` — call this once at entry; daemons must not.
+pub fn retain_dirty_pages_for_batch_run() {
+  vorpal_ingest::retain_dirty_pages_for_batch_run();
+}
+
 /// Ingest `src`, resolve cross-file references, and persist the knowledge graph to `out`,
 /// with cache validity decided by [`CacheMode::from_env`] (fast-stat unless
 /// `VORPAL_VERIFY_CACHE=1`).

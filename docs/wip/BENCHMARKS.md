@@ -4829,3 +4829,350 @@ stand.
 | kernel | reachable vfs_read out depth 2 exact | 0.06 | 736 | ? | 3 |
 
 The README's `schedule_timeout_interruptible` row now says 23 KB (compact) instead of 25 KB.
+
+## Kernel cold "regression" 8.2 → 10.9 s: investigated, not the code (2026-09-06)
+
+Owner: "Our benchmarks have worsened by 2.7s+ since the v0.7.1 release. Re-bench, investigate
+why (including allocs, reallocs, pagefaults, thread contention, etc.)". Everything below is
+the Linux kernel checkout at `~/Projects/linux` (1590cf032971, 75,954 files parsed); every
+run committed generation `855d30a6…`, so every arm did the same work.
+
+### What was measured
+
+- **Same binaries, today vs the campaign day.** Cold kernel builds on 2026-09-05 (README
+  campaign, Docker Desktop open, `fseventsd` at a full core all day, disk 98 % full, heavy
+  concurrent file churn from the campaign itself): 0.8.3 local 10.85–11.93, 0.8.2 11.39–11.64,
+  v0.7.1 release asset 10.70–11.57. Today, quiet, Docker closed: 0.8.3 local 8.15–8.64,
+  0.8.3 asset 8.46–8.98, v0.7.1 asset 8.52–8.99, v0.7.1 built locally from the tag with the
+  same toolchain 8.52–9.03 — interleaved, phase-stamped, three or two reps each.
+- **Instruction and cycle counts.** `/usr/bin/time -l` on three back-to-back 0.8.3 builds at
+  05:23Z: 11.61, 11.27, 8.45 s wall with 1.7756 / 1.7710 / 1.7707 T instructions retired,
+  531 / 517 / 510 G cycles, user CPU 111.8 / 111.3 / 109.9 s, sys 12.8 / 11.1 / 11.0 s.
+  The slow runs execute the same instructions in the same CPU time; the extra wall is time
+  the threads spend off-core. The first slow run paged the tree in (14,212 major faults,
+  45,612 voluntary switches); the second had 24 major faults and 3,119 voluntary switches
+  against 1,058 in the fast run — a few thousand extra blocking waits, not a code path.
+- **Phase by phase (VORPAL_PHASE_TRACE stamps, timestamped on receipt).** The parse stream
+  is 6.1–6.8 s of every 8.2–9.0 s build on every binary. Between versions the only
+  consistent differences are `seal: compact` 0.17–0.20 s (0.8.3) vs 0.07–0.09 s (0.7.1) —
+  the one-CSC-law change (cold seal now compacts src-major; +0.10 s, every run, every build
+  flavor) — and `link: resolve` 0.29 s (0.8.3) vs 0.35–0.38 s (0.7.1), the resolver's
+  private-visibility gate (−0.07 s). Net ≈ +0.03 s; the walls are equal within their spread.
+- **Allocator faults.** The `vorpal` CLI links jemalloc with the compiled-in
+  `narenas:8,dirty_decay_ms:0,muzzy_decay_ms:0` and never switches decay off, so freed pages
+  go straight back to the kernel and get re-faulted: 2.31 M minor faults and 11.3–11.4 s of
+  system CPU per cold build. The standalone `vorpal-index` binary flips decay off at start
+  (`retain_dirty_pages_for_batch_run`) and pays 0.53 M. The same is true of v0.7.1 (its
+  `crates/cli/src/main.rs` carries the same string), so this is not the regression, but it
+  is real: with `_RJEM_MALLOC_CONF=narenas:8,dirty_decay_ms:-1,muzzy_decay_ms:-1` the same
+  0.8.3 binary does 0.53 M faults and 6.9–7.5 s sys (−4 s of kernel CPU), wall 8.07–8.30 vs
+  8.15–8.27 (no change on a quiet machine), max RSS +0.1–0.8 GB.
+- **Codegen.** Release assets (CI builds) are 0.3–0.4 s slower than local builds of the same
+  commit (0.8.3: 8.46 vs 8.15 best; 0.7.1: 8.52 asset vs 8.52 local — equal there). The
+  09-05 controls were assets; the README's 8.2 s of 09-03 was a local build. Small, noted.
+- **Disk.** 4.75 GB/s sequential write with fsync at 98 % full; zero local snapshots. Not it.
+- **Thermal / frequency.** Ruled out by the constant CPU time per instruction across fast
+  and slow runs.
+
+
+- **Allocations, reallocations, tree-sitter allocations, contention (ledger builds of both
+  versions, table below).** Per cold kernel build: 7.98 M allocs / 3.40 M reallocs /
+  51.0 GB allocated (0.7.1) vs 7.97 M / 3.13 M / 48.9 GB (0.8.3) — the reallocation drop is
+  the `finalize_references` reserve; tree-sitter 16.1 M allocs and 854 K reallocs in both;
+  minor faults 653 K vs 649 K (decay off in this binary); copy-on-write faults 125; page-ins
+  0; intern-table reads contended 1.9–2.0 K of 824 K writes; budget parks 0; channel-full
+  stalls 0; involuntary switches ~100 K, voluntary ~1 K. Nothing that separates the
+  versions, and no contention counter that could cost seconds. The parse stream alone is
+  6.5 M allocs, 2.6–2.9 M reallocs, 35–37 GB, 15.7 M tree-sitter allocs, ~140 K faults.
+- **Unrelated I/O before a build (page-cache eviction) — falsified.** Builds right after
+  writing and deleting 40 GB: 8.75 / 9.35 / 8.91 s vs 8.77 / 14.75 / 8.84 s right after a
+  warm build. The one slow build in the experiment (14.75 s) had a normal parse stream
+  (6.85 s) and 9,744 voluntary switches; the 40 GB write in the same minute took 42 s
+  against 3.9–6.3 s in the other pairs. That slow mode is the volume's write throughput
+  collapsing for a minute — the build's write phases (product pack, generation, commit)
+  stall while the parse does not.
+- **Five `vorpal mcp` daemons on this repo** (vorpal 0.8.0 from `/usr/local/bin`, one per
+  open Claude Code session, ~880 MB RSS each) re-index the repo whenever its tree changes.
+  They last committed generations at 02:33–02:35Z, after this session's harness edits, and
+  were idle during today's slow runs — not today's cause, but a standing source of 5 ×
+  (7 s of 18-thread CPU + 9.8 GB) bursts on every edit, and they run a stale binary.
+
+### Tables
+
+**Three back-to-back 0.8.3 builds at 05:23Z (`/usr/bin/time -l`):**
+
+| rep | wall s | user s | sys s | instructions | cycles | max RSS GB | major faults | minor faults | vol. switches | invol. switches | fseventsd mean % during |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 11.61 | 111.83 | 12.75 | 1.7756 T | 531 G | 5.01 | 14,212 | 2,299,777 | 45,612 | 364,840 | 62.1 |
+| 1 | 11.27 | 111.25 | 11.06 | 1.7710 T | 517 G | 4.91 | 24 | 2,322,664 | 3,119 | 194,897 | 15.8 |
+| 2 | 8.45 | 109.87 | 10.96 | 1.7707 T | 510 G | 4.91 | 24 | 2,320,130 | 1,058 | 216,677 | 18.4 |
+
+**Interleaved matrix, quiet machine, Docker closed (`VORPAL_PHASE_TRACE`):**
+
+| binary | rep | wall s | parse stream s | link resolve s | seal compact s | user s | sys s | minor faults | vol. sw | invol. sw | fseventsd % during |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.8.3-local | 0 | 8.15 | 6.107 | 0.28 | 0.17 | 107.95 | 10.87 | 2,313,709 | 264 | 132,644 | 49.3 |
+| 0.8.3-asset | 0 | 8.46 | 6.392 | 0.29 | 0.18 | 110.77 | 11.21 | 2,304,562 | 1,388 | 135,618 | 70.6 |
+| 0.7.1-asset | 0 | 8.52 | 6.469 | 0.35 | 0.08 | 111.84 | 11.58 | 2,357,086 | 1,349 | 159,389 | 79.2 |
+| 0.8.3-local | 1 | 8.54 | 6.467 | 0.28 | 0.17 | 111.14 | 11.21 | 2,315,362 | 375 | 128,615 | 100.3 |
+| 0.8.3-asset | 1 | 8.98 | 6.668 | 0.29 | 0.19 | 112.79 | 12.22 | 2,290,990 | 1,551 | 192,005 | 100.6 |
+| 0.7.1-asset | 1 | 8.99 | 6.757 | 0.36 | 0.08 | 114.56 | 12.18 | 2,346,037 | 1,119 | 181,723 | 100.7 |
+| 0.8.3-local | 2 | 8.64 | 6.533 | 0.28 | 0.17 | 111.18 | 11.55 | 2,307,607 | 1,275 | 146,908 | 99.5 |
+| 0.8.3-asset | 2 | 8.79 | 6.579 | 0.29 | 0.19 | 112.46 | 11.87 | 2,311,213 | 639 | 139,942 | 100.5 |
+| 0.7.1-asset | 2 | 8.93 | 6.73 | 0.35 | 0.08 | 114.36 | 12.05 | 2,358,493 | 1,817 | 165,571 | 100.3 |
+
+**jemalloc decay, same 0.8.3 binary (`_RJEM_MALLOC_CONF` overrides the compiled-in `dirty_decay_ms:0`):**
+
+| arm | rep | wall s | parse stream s | user s | sys s | max RSS GB | minor faults | vol. sw | invol. sw |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.8.3-decay0 | 0 | 8.15 | 6.09 | 108.61 | 11.29 | 4.92 | 2,310,843 | 295 | 189,237 |
+| 0.8.3-decayoff | 0 | 8.19 | 6.316 | 108.3 | 6.93 | 5.73 | 527,596 | 1,393 | 119,550 |
+| 0.8.3-decay0 | 1 | 8.27 | 6.11 | 110.05 | 11.34 | 5.73 | 2,305,720 | 651 | 137,818 |
+| 0.8.3-decayoff | 1 | 8.3 | 6.302 | 110.45 | 7.49 | 5.78 | 530,015 | 1,062 | 141,220 |
+| 0.8.3-decay0 | 2 | 8.24 | 6.149 | 110.08 | 11.4 | 5.78 | 2,320,376 | 1,114 | 149,208 |
+| 0.8.3-decayoff | 2 | 8.07 | 6.197 | 109.27 | 7.12 | 5.93 | 541,068 | 646 | 132,400 |
+
+**v0.7.1 built locally from the tag (same toolchain) vs 0.8.3, plus `alloc-stats` builds of both:**
+
+| arm | rep | wall s | parse stream s | include-reach s | link resolve s | seal compact s | seal start → evidence saved s | user s | sys s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.8.3-local | 0 | 8.56 | 6.15 | 0.25 | 0.29 | 0.17 | 1.01 | 108.98 | 11.09 |
+| 0.7.1-local | 0 | 8.52 | 6.431 | 0.27 | 0.36 | 0.08 | 0.65 | 111.92 | 11.46 |
+| 0.8.3-stats | 0 | 8.75 | 6.525 | 0.26 | 0.29 | 0.20 | 0.82 | 111.91 | 11.83 |
+| 0.7.1-stats | 0 | 9.03 | 6.753 | 0.29 | 0.38 | 0.09 | 0.72 | 114.14 | 12.3 |
+| 0.8.3-local | 1 | 9.02 | 6.767 | 0.29 | 0.31 | 0.20 | 0.82 | 113.86 | 12.15 |
+| 0.7.1-local | 1 | 9.03 | 6.897 | 0.27 | 0.36 | 0.08 | 0.66 | 116.05 | 12.14 |
+| 0.8.3-stats | 1 | 9.04 | 6.72 | 0.29 | 0.29 | 0.20 | 0.85 | 113.74 | 12.45 |
+| 0.7.1-stats | 1 | 9.06 | 6.686 | 0.30 | 0.36 | 0.09 | 0.81 | 114.01 | 13.18 |
+
+**Allocation ledger (`vorpal-index --features alloc-ledger`, counting global allocator + tree-sitter hooks; decay off in this binary), end-of-run totals per build:**
+
+| metric | 0.8.3-ledger rep 0 | 0.7.1-ledger rep 0 | 0.8.3-ledger rep 1 | 0.7.1-ledger rep 1 |
+|---|---:|---:|---:|---:|
+| wall s | 8.05 | 8.13 | 8.05 | 8.36 |
+| allocs | 7,971,062 | 7,980,921 | 7,970,187 | 7,983,360 |
+| reallocs | 3,121,385 | 3,395,537 | 3,138,567 | 3,394,812 |
+| frees | 6,971,453 | 6,981,491 | 6,970,566 | 6,983,600 |
+| allocated MB | 48,926 | 51,014 | 48,896 | 50,990 |
+| tree-sitter allocs | 16,180,890 | 16,101,831 | 16,076,228 | 16,102,877 |
+| tree-sitter reallocs | 854,070 | 854,066 | 854,186 | 854,038 |
+| tree-sitter MB | 2,322 | 2,315 | 2,314 | 2,316 |
+| minor faults | 652,058 | 655,035 | 645,344 | 650,184 |
+| cow faults | 124 | 125 | 125 | 125 |
+| page-ins | 0 | 0 | 0 | 0 |
+| user µs | 109,652,510 | 112,337,113 | 110,845,538 | 112,376,099 |
+| sys µs | 6,804,822 | 6,798,685 | 7,148,157 | 7,227,070 |
+| vol. switches | 285 | 1,000 | 1,501 | 1,280 |
+| invol. switches | 106,489 | 103,386 | 112,722 | 99,214 |
+| intern reads contended | 2,020 | 1,977 | 2,078 | 1,915 |
+| intern writes | 824,194 | 824,194 | 824,194 | 824,197 |
+| budget parks | 0 | 0 | 0 | 0 |
+| channel-full stalls | 0 | 0 | 0 | 0 |
+
+**Ledger, parse-stream phase only (`stream: start` → `admission done`), per build:**
+
+| build | stream s | allocs | reallocs | frees | MB | tree-sitter allocs | minor faults | sys ms | user ms | vol. sw | invol. sw | intern contended |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.8.3-ledger rep 0 | 5.93 | 6,486,636 | 2,603,717 | 5,495,537 | 34,888 | 15,747,312 | 147,487 | 3,504 | 96,717 | 66 | 69,597 | 1,996 |
+| 0.7.1-ledger rep 0 | 6.05 | 6,493,816 | 2,870,820 | 5,502,720 | 37,091 | 15,653,638 | 147,652 | 3,568 | 98,191 | 807 | 67,109 | 1,958 |
+| 0.8.3-ledger rep 1 | 5.86 | 6,481,344 | 2,608,548 | 5,490,810 | 34,837 | 15,631,694 | 138,672 | 3,563 | 97,842 | 1,293 | 73,126 | 2,066 |
+| 0.7.1-ledger rep 1 | 6.17 | 6,488,677 | 2,859,728 | 5,498,167 | 36,996 | 15,663,535 | 141,343 | 3,524 | 98,227 | 1,121 | 59,904 | 1,893 |
+
+**Does unrelated file I/O before a build reproduce the slow mode? (0.8.3 CLI, three pairs):**
+
+| build | wall s | parse stream s | user s | sys s | major faults | vol. sw | invol. sw |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| A: after a warm build | 8.77 | 6.533 | 110.4 | 11.45 | 24 | 1,392 | 152,253 |
+| B: after 40 GB of unrelated writes | 8.75 | 6.608 | 111.26 | 11.25 | 33 | 1,671 | 147,778 |
+| A: after a warm build | 14.75 | 6.847 | 110.99 | 11.87 | 24 | 9,744 | 218,651 |
+| B: after 40 GB of unrelated writes | 9.35 | 6.564 | 109.45 | 12.17 | 24 | 1,771 | 221,447 |
+| A: after a warm build | 8.84 | 6.499 | 111.18 | 11.98 | 24 | 1,000 | 118,478 |
+| B: after 40 GB of unrelated writes | 8.91 | 6.579 | 112.48 | 11.97 | 33 | 219 | 123,319 |
+
+### Conclusion
+
+No code regression between v0.7.1 and v0.8.3 on the kernel cold build: same generation,
+same instructions, same CPU time, equal walls when interleaved on the same machine state.
+The README's 10.9 s (and its same-day controls) measured a machine that was ~30 % slower
+for every binary that day; today the same binaries measure 8.2–9.0 s. I could not make the
+slow mode appear on demand: two of three back-to-back builds at 05:23Z were 11.3–11.6 s
+and the next nine were 8.2–9.0 s, with nothing in the sampled daemons (fseventsd, mds,
+Docker, WindowServer) separating them. What is known about the slow day: Docker Desktop
+open with `fseventsd` at 100 % throughout, the disk at 98 %, and the campaign's own
+multi-gigabyte file churn between builds. The cause of the off-core time is unproven;
+the one instance caught in the act was a storage stall (write throughput 10× down for a
+minute) with the parse phase unaffected; the candidates are ranked in the leads below.
+
+### Leads (measured, not fixed)
+
+1. CLI `index` runs jemalloc at decay 0: 2.3 M minor faults and ~4 s of avoidable kernel
+   CPU per kernel build. Fix = the `vorpal-index` runtime switch in the CLI's batch path.
+   Zero wall gain on a quiet machine; the candidate for the contended-machine mode is the
+   VM-map lock traffic those faults and `madvise` calls generate across 18 threads.
+2. `seal: compact` +0.10 s from the src-major CSC law; if it matters, sort the edge log
+   src-major while it is built instead of after.
+3. Release assets 0.3 s slower than local builds; check the CI toolchain and target flags.
+4. Storage stalls: sample the volume's throughput (`iostat -w 1`) beside every timed run so a
+   stalled build is labelled at measurement time instead of diagnosed afterwards.
+5. The five stale-binary daemons: replace `/usr/local/bin/vorpal` (owner's sudo) and let the
+   sessions restart their servers; a session's daemon should probably not rebuild a
+   9.8 GB-RSS index five times over for one edit.
+
+### Allocator tuning beyond decay: nothing (2026-09-06)
+
+Same 0.8.3 CLI binary, decay off in every arm, two interleaved cold kernel builds each:
+one arena per thread (`narenas:18`) instead of eight, 64 KB thread caches
+(`lg_tcache_max:16`), and both. Walls 8.02–8.55 s against the decay-off baseline's
+8.02–8.16; system CPU 7.0–7.3 s in every arm; faults 530–551 K in every arm; user CPU
+1–4 s higher with the larger caches. The allocator's arena locking is not a cost at 18
+threads (the ledger's contention counters had said the same); decay is the only allocator
+knob with a measured effect, and it moves kernel CPU, not wall, on a quiet machine.
+
+| arm (`_RJEM_MALLOC_CONF`) | rep | wall s | parse stream s | user s | sys s | max RSS GB | minor faults |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| decayoff | 0 | 8.02 | 6.162 | 108.05 | 7.0 | 5.89 | 540,747 |
+| decayoff-narenas18 | 0 | 8.02 | 6.157 | 108.13 | 7.03 | 6.02 | 546,322 |
+| decayoff-tcache64k | 0 | 8.11 | 6.177 | 108.92 | 7.06 | 6.02 | 534,974 |
+| decayoff-narenas18-tcache64k | 0 | 8.55 | 6.633 | 110.85 | 7.16 | 6.11 | 551,248 |
+| decayoff | 1 | 8.16 | 6.309 | 109.78 | 6.98 | 6.11 | 530,054 |
+| decayoff-narenas18 | 1 | 8.4 | 6.496 | 111.72 | 7.09 | 6.11 | 544,372 |
+| decayoff-tcache64k | 1 | 8.4 | 6.466 | 113.69 | 7.19 | 6.11 | 541,419 |
+| decayoff-narenas18-tcache64k | 1 | 8.27 | 6.316 | 111.22 | 7.31 | 6.11 | 544,598 |
+
+## v0.8.4 — the two fixes landed, with the gate that had silently disabled the first (2026-09-06)
+
+Owner: land both leads from the regression investigation. Both are in, and landing the
+first exposed a third defect.
+
+**1. `seal: compact` — the in-CSR is now the out-CSR's transpose.** `Graph::compact_src_major`
+used to re-linearize every edge into three fresh columns (src, dst, etype: ~160 MB on the
+kernel, plus their first-touch faults) and run a second counting sort over them so the
+in-CSR would list each destination's sources in ascending order — the CSC law that makes a
+graph rebuilt from the bucket slabs bit-identical to the sealed one. `DirectedCsr::transpose`
+produces the same bytes from the out-CSR directly: a degree histogram over its targets,
+then a scatter that walks rows in ascending source order, which fills every in-row in source
+order by construction. `crates/graph/src/csr.rs::transpose_matches_src_major_rebuild` pins
+it against the old construction on pseudo-random multigraphs with self-loops and parallel
+edges; `kg/tests/csc_order.rs` and the index differential oracle (graph.bin bytes) pass.
+Kernel seal compact 0.171–0.178 s → 0.128–0.136 s; the remaining gap to v0.7.1's 0.07–0.09 s
+(which built both CSRs in parallel from the raw log) is the price of the src-major law.
+
+**2. The CLI's `index` command switches jemalloc decay off for the run**, through
+`vorpal_ingest::retain_dirty_pages_for_batch_run` (raw `mallctl`: `arenas.*` for arenas
+created later, `arena.4096.*` = MALLCTL_ARENAS_ALL for the existing ones), forwarded by
+`vorpal_index::retain_dirty_pages_for_batch_run` and called at the top of `run_index`. The
+standalone `vorpal-index` binary now calls the same function instead of its private copy.
+Daemons keep the compiled-in `dirty_decay_ms:0` and their phase-seam purge.
+
+**3. The gate: the ingest crate's `jemalloc` feature was never on in the `vorpal` and
+`vorpal-mcp` binaries.** The first A/B of the fix build showed the same 2.30 M faults and
+11.6–11.8 s of system CPU as the base — the switch was compiled out. `vorpal-index` is a
+`default-features = false` workspace dependency, the CLI enables only `model-install`, and
+`vorpal-ingest` came in with its defaults, which do not include `jemalloc`. So in every
+`vorpal`/`vorpal-mcp` build to date, `release_freed_pages` — the phase-seam purge the
+daemon relies on to hand memory back — had been the macOS system-allocator fallback
+(`malloc_zone_pressure_relief`, which the jemalloc-global binary does not route through),
+i.e. a no-op. Both binaries now enable `vorpal-ingest/jemalloc` in the same platform-gated
+dependency table that links jemalloc (not on MSVC or musl-aarch64, where there is no
+jemalloc). `cargo tree -e features` on the CLI shows the feature; the CPython build's final
+stamp reads 152,646 minor faults with 0.8.3 and 83,692 with 0.8.4.
+
+### Kernel A/B, base 0.8.3 vs 0.8.4, three interleaved cold builds, quiet machine, Docker closed
+
+| arm | rep | wall s | parse stream s | seal compact s | seal start → evidence saved s | user s | sys s | max RSS GB | minor faults | vol. sw | invol. sw | generation |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| base-0.8.3 | 0 | 9.83 | 7.661 | 0.178 | 0.734 | 115.18 | 15.27 | 5.08 | 2,268,306 | 94,801 | 459,558 | `855d30a6` |
+| fix-0.8.4 | 0 | 8.5 | 6.614 | 0.128 | 0.638 | 113.94 | 7.19 | 5.23 | 650,706 | 959 | 137,053 | `855d30a6` |
+| base-0.8.3 | 1 | 8.59 | 6.472 | 0.175 | 0.739 | 109.71 | 11.2 | 5.23 | 2,309,035 | 320 | 130,863 | `855d30a6` |
+| fix-0.8.4 | 1 | 8.28 | 6.365 | 0.136 | 0.666 | 110.62 | 7.13 | 5.26 | 653,784 | 297 | 125,063 | `855d30a6` |
+| base-0.8.3 | 2 | 8.94 | 6.798 | 0.171 | 0.724 | 113.85 | 11.42 | 5.26 | 2,312,477 | 1,223 | 134,622 | `855d30a6` |
+| fix-0.8.4 | 2 | 9.07 | 6.659 | 0.136 | 0.962 | 110.92 | 7.8 | 5.52 | 662,388 | 11,379 | 169,277 | `855d30a6` |
+
+Minor faults −71 % (2.27–2.31 M → 651–662 K), system CPU −4 s (11.2–11.4 s → 7.1–7.8 s;
+the base's rep 0 paid 15.3 s and 94,801 blocking waits, the first cold read of the tree
+after the rebuild), seal compact −0.04 s, max RSS +0.03 to +0.26 GB (retained pages), user
+CPU flat. Walls: best-of-three 8.59 → 8.28 s; pairs 9.83→8.50, 8.59→8.28, 8.94→9.07 (the
+last is one fix run with an 11,379-wait stall in its write phases — the storage stall mode
+again, 0.96 s seal→evidence against 0.64–0.67). Same generation in all six.
+
+The first A/B (`ab_fix.json`) also produced a 0.13 s "build" — the harness's `rmtree` of the
+previous index had silently not completed and the run short-circuited as unchanged. The
+harness now asserts the directory is gone before timing and flags `unchanged` runs.
+
+### Cold first-ask surcharge, one run per arm and corpus, 65 minutes apart (2026-09-06)
+
+The per-row cold column of the morning's table was not uniformly cold (a static block of
+the prefix can be cached by any earlier run within the hour), so it was replaced by the
+warm cost per row plus one measured first-ask surcharge per arm: `--effort high`, the
+group's first question, each run at least 65 minutes after the previous one from this
+harness, transcripts kept.
+
+| arm | corpus | started (UTC) | turns | turn-1 cache write | turn-1 cache read | billed | warm median, same cell | first-ask surcharge |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| grep | repo | 03:25 | 7 | 13,028 | 10,027 | $0.224 | $0.081 | +$0.143 |
+| grep | kernel | 04:30 | 5 | 9,276 | 10,027 | $0.287 | $0.200 | +$0.087 |
+| mcp | repo | 05:35 | 3 | 13,806 | 6,790 | $0.179 | $0.054 | +$0.125 |
+| mcp | kernel | 06:40 | 3 | 10,050 | 6,790 | $0.138 | $0.042 | +$0.096 |
+| cli | repo | 07:45 | 2 | 22,299 | 0 | $0.243 | $0.028 | +$0.215 |
+| cli | kernel | 08:50 | 2 | 17,930 | 0 | $0.200 | $0.029 | +$0.171 |
+
+Only the shell arm's runs read nothing from the cache: its prefix (Bash allowlist plus
+the MCP instructions) is unique to it. The grep and MCP arms still read 6.8–10.0 K tokens
+on turn 1 after the hour — static blocks kept warm by the owner's other Claude Code
+sessions, which are alive on this machine (their five `vorpal mcp` daemons are the proof).
+A fully cold run therefore cannot be produced on demand here; the surcharge column is
+what a first ask cost with that residue in place, and the shell arm's is the fully-cold
+figure. README: "$0.09–0.14 grep, $0.10–0.13 MCP, $0.17–0.22 shell".
+
+### README indexing tables re-measured with the 0.8.4 binary (2026-09-06, Docker closed)
+
+`evals/readme_bench.py /abs/target/release/vorpal <out> --phases index17,edit --control
+0.7.1=<v0.7.1 built from its tag> --control 0.8.3=<0.8.3 base build>`, corpora re-cloned at
+their pins into scratch (`evals/clone_corpora.sh`; kafka and neovim needed full clones,
+their short ids are not resolvable through the commits API), then `evals/edit_classes.py`
+on a fresh kernel copy. 120 gated starts: idle 88.4–91.9 %
+(median 90.7); `fseventsd` median 100 % of a core — it
+runs at a full core during index writes with Docker closed too, so the README's earlier
+attribution of that load to Docker's file sharing was wrong and is corrected.
+
+| corpus | arm | files parsed / tracked | nodes | cold reps (s) → best | unchanged reps (s) → median | max RSS GB |
+|---|---|---:|---:|---|---|---:|
+| linux | 0.8.4 | 75,954 / 94,843 | 8,891,771 | 8.59, 8.39, 8.10 → **8.10** | 0.135, 0.136, 0.145 → 0.136 | 5.76 |
+| linux | 0.8.3 | 75,954 / 94,843 | 8,891,771 | 8.82, 8.48, 8.79 → **8.48** | — | 5.40 |
+| linux | 0.7.1 | 75,954 / 94,843 | 8,891,771 | 9.72, 8.95, 8.68 → **8.68** | — | 5.39 |
+| llvm-project | 0.8.4 | 86,124 / 183,249 | 1,444,028 | 8.13, 7.28, 10.72 → **7.28** | 0.359, 0.328, 0.343 → 0.343 | 2.69 |
+| zig | 0.8.4 | 17,025 / 20,545 | 1,085,567 | 5.74, 5.59, 5.64 → **5.59** | 0.044, 0.042, 0.040 → 0.042 | 2.51 |
+| kotlin | 0.8.4 | 75,448 / 110,106 | 795,719 | 3.31, 2.51, 2.51 → **2.51** | 0.435, 0.433, 0.425 → 0.433 | 1.44 |
+| kubernetes | 0.8.4 | 26,641 / 31,296 | 692,828 | 2.11, 1.89, 1.87 → **1.87** | 0.109, 0.091, 0.090 → 0.091 | 1.06 |
+| roslyn | 0.8.4 | 19,522 / 35,125 | 490,284 | 2.09, 1.93, 1.98 → **1.93** | 0.094, 0.079, 0.077 → 0.079 | 1.16 |
+| rust | 0.8.4 | 41,607 / 62,568 | 464,064 | 2.84, 2.46, 2.53 → **2.46** | 0.103, 0.089, 0.090 → 0.090 | 1.85 |
+| WordPress | 0.8.4 | 4,195 / 5,010 | 286,824 | 1.71, 1.66, 1.72 → **1.66** | 0.022, 0.022, 0.021 → 0.022 | 1.85 |
+| spark | 0.8.4 | 11,512 / 27,322 | 253,753 | 1.61, 1.54, 1.55 → **1.54** | 0.066, 0.058, 0.058 → 0.058 | 0.74 |
+| kafka | 0.8.4 | 7,246 / 7,537 | 209,131 | 0.77, 0.68, 0.70 → **0.68** | 0.043, 0.037, 0.042 → 0.042 | 0.62 |
+| next.js | 0.8.4 | 27,216 / 31,852 | 204,754 | 1.09, 0.97, 0.95 → **0.95** | 0.257, 0.243, 0.246 → 0.246 | 0.55 |
+| ghc | 0.8.4 | 15,837 / 26,918 | 178,259 | 0.77, 0.64, 0.64 → **0.64** | 0.047, 0.043, 0.048 → 0.047 | 0.63 |
+| cpython | 0.8.4 | 3,841 / 5,948 | 162,945 | 0.96, 0.91, 0.88 → **0.88** | 0.023, 0.020, 0.020 → 0.020 | 0.78 |
+| rails | 0.8.4 | 3,952 / 4,996 | 49,635 | 0.36, 0.32, 0.34 → **0.32** | 0.029, 0.029, 0.028 → 0.029 | 0.48 |
+| neovim | 0.8.4 | 1,476 / 3,918 | 40,507 | 0.28, 0.24, 0.24 → **0.24** | 0.016, 0.015, 0.015 → 0.015 | 0.26 |
+| vue-core | 0.8.4 | 626 / 705 | 11,191 | 0.13, 0.12, 0.12 → **0.12** | 0.013, 0.014, 0.017 → 0.014 | 0.15 |
+| vorpal | 0.8.4 | 1,897 / 2,882 | 79,901 | 6.79, 6.76, 6.76 → **6.76** | 0.019, 0.018, 0.019 → 0.019 | 11.82 |
+
+Kernel edit lane (add a function / touch / unchanged / restore):
+
+| rep | add a function (s) | touch (s) | unchanged (s) | restore (s) |
+|---:|---:|---:|---:|---:|
+| 0 | 9.26 | 0.7 | 0.159 | 4.55 |
+| 1 | 4.65 | 0.56 | 0.148 | 4.51 |
+| 2 | 4.52 | 0.6 | 0.161 | 4.54 |
+
+Kernel edit classes (`evals/edit_classes.py`, the body edit inside `vfs_read`):
+
+| class | reps (s) → median | restore (s) | lane |
+|---|---|---|---|
+| body edit | 0.85, 1.22, 0.78 → **0.85** | 0.82, 0.87, 0.82 | compose |
+| comment only | 0.62, 0.74, 0.65 → **0.65** | 0.59, 0.6, 0.69 | compose |
+| add a function | 4.49, 4.69, 4.66 → **4.66** | 4.57, 4.63, 4.59 | full pipeline |
+
+README now: kernel cold **8.1 s** (same-day controls v0.7.1 8.7 s, 0.8.3 8.5 s), body edit
+0.8 s, comment 0.7 s, add a function 4.7 s, touch 0.6 s, unchanged 0.14 s, peak RSS 5.8 GB
+(+0.3 GB retained pages); fifteen-repo rows and the self row from the same run.

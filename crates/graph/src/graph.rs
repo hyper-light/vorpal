@@ -37,18 +37,11 @@ impl Graph {
   /// IS the log's restriction either way).
   pub fn compact_src_major(node_count: u32, log: &EdgeLog) -> Self {
     let out = DirectedCsr::build(node_count, log.srcs(), log.dsts(), log.etypes());
-    let total = out.total_edges();
-    let mut srcs = Vec::with_capacity(total);
-    let mut dsts = Vec::with_capacity(total);
-    let mut etypes = Vec::with_capacity(total);
-    for u in 0..node_count {
-      for (&dst, &et) in out.targets(u).iter().zip(out.edge_types(u)) {
-        srcs.push(u);
-        dsts.push(dst);
-        etypes.push(et);
-      }
-    }
-    let inc = DirectedCsr::build(node_count, &dsts, &srcs, &etypes);
+    // The in-CSR is the out-CSR's transpose taken in ascending source order: the same bytes
+    // as rebuilding it from the src-major edge list, without allocating that list (three
+    // columns of every edge — ~160 MB and their first-touch faults on the kernel) and
+    // without the extra pass. Measured at 0.17–0.20 s per kernel seal before this.
+    let inc = out.transpose(node_count);
     Self {
       node_count,
       out,

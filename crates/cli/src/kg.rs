@@ -565,6 +565,10 @@ fn extraction_env_from_project(
 }
 
 pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCode> {
+  // Fault economics for the one-shot build: keep freed pages resident until exit (the
+  // standalone indexer has always done this; the CLI's `index` never did — 2.31 M minor
+  // faults and ~4 s of avoidable system CPU per kernel build, BENCHMARKS.md 2026-09-06).
+  vorpal_index::retain_dirty_pages_for_batch_run();
   let out = arg.out.unwrap_or_else(|| arg.src.join(DEFAULT_INDEX_DIR));
   let mode = if arg.verify {
     vorpal_index::CacheMode::Verified

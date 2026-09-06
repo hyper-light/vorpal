@@ -9,11 +9,12 @@ prefix is shared by every question of one arm+corpus group, so only the first ru
 group in a fresh hour is cold; every later run is warm. The harness therefore orders runs
 by group, marks the first run of each group `cold_intent`, and records every run's usage
 classes (cache_creation / cache_read / input / output), billed cost, turns, wall, tool
-calls, and stream-json transcript. The README reports the cold run's cost and the medians
-of the warm runs. Effort is pinned with the --effort flag: CLAUDE_EFFORT is a variable
+calls, and stream-json transcript. A run is FULLY cold only when its first turn's cache_read is 0, which needs no Claude Code run on the
+machine for the previous hour (static prefix blocks are shared across arms); the README reports
+the warm medians per cell and the fully-cold first-ask surcharge per arm. Effort is pinned with the --effort flag: CLAUDE_EFFORT is a variable
 Claude Code EXPORTS to hooks and Bash, not one it reads (2026-09-06 finding).
 
-    python3 evals/mcp_agent_e2e.py <out-dir> [grep,mcp,cli] [--runs N] [--not-before <unix epoch>]
+    python3 evals/mcp_agent_e2e.py <out-dir> [grep,mcp,cli] [--runs N] [--not-before <unix epoch>] [--only <corpus>:<question-key>]
 
 Results append to <out-dir>/results.json (one row per run). Needs ~/.local/bin/vorpal and
 indexes at <repo>/.vorpal/index and ~/Projects/linux/.vorpal/index.
@@ -22,7 +23,8 @@ import json, os, statistics, subprocess, sys, time, pathlib
 args = sys.argv[1:]
 RUNS = int(args[args.index("--runs") + 1]) if "--runs" in args else 4
 NOT_BEFORE = float(args[args.index("--not-before") + 1]) if "--not-before" in args else 0.0
-pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--runs", "--not-before"))]
+ONLY = args[args.index("--only") + 1] if "--only" in args else None  # "<corpus>:<question-key>"
+pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--runs", "--not-before", "--only"))]
 S = pathlib.Path(pos[0]); S.mkdir(parents=True, exist_ok=True)
 ARMS = pos[1].split(",") if len(pos) > 1 else ["grep", "mcp", "cli"]
 VORPAL = os.path.expanduser("~/.local/bin/vorpal")
@@ -102,7 +104,10 @@ for arm in ARMS:
     first_in_group = True
     for c, key, q in QUESTIONS:
       if c != corpus: continue
-      for r in range(1, RUNS + 1):
+      if ONLY and f"{c}:{key}" != ONLY: continue
+      done = [x["run"] for x in rows if x["corpus"] == c and x["question"] == key and x["arm"] == arm]
+      start = (max(done) + 1) if done else 1  # appending to an existing results.json continues the numbering
+      for r in range(start, start + RUNS):
         cold_intent = first_in_group and r == 1
         row = run(corpus, key, q, arm, r, cold_intent); rows.append(row)
         RESULTS.write_text(json.dumps(rows, indent=1))

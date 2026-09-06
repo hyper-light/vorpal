@@ -19,11 +19,12 @@ Recorded runs: docs/wip/BENCHMARKS.md.
 """
 import json, os, re, shutil, statistics, subprocess, sys, time, pathlib
 
-BIN = sys.argv[1]; OUT = pathlib.Path(sys.argv[2]); OUT.mkdir(parents=True, exist_ok=True)
+BIN = os.path.abspath(sys.argv[1]); OUT = pathlib.Path(sys.argv[2]); OUT.mkdir(parents=True, exist_ok=True)  # absolute: some lanes chdir
+ONLY = {c for c in os.environ.get("VORPAL_BENCH_ONLY", "").split(",") if c}  # index17 corpus filter (labels), e.g. vorpal,vue-core
 PHASES = sys.argv[sys.argv.index("--phases") + 1].split(",") if "--phases" in sys.argv else ["index17", "edit", "tiers", "giant", "scan"]
 CONTROLS = [a.split("=", 1) for i, a in enumerate(sys.argv) if i > 0 and sys.argv[i - 1] == "--control"]
 REPO = "/Users/adalundhe/Projects/vorpal"
-PROFILE = "/private/tmp/vorpal-profile.whkiQX"
+PROFILE = os.environ.get("VORPAL_BENCH_PROFILE", "/private/tmp/vorpal-profile.whkiQX")  # <PROFILE>/corpora/<repo> = the 15 pinned clones (evals/clone_corpora.sh)
 CORPORA = [  # (readme label, path, tracked-count path)
   ("linux", "/Users/adalundhe/Projects/linux"),
   ("llvm-project", f"{PROFILE}/corpora/llvm-project"), ("zig", f"{PROFILE}/corpora/zig"),

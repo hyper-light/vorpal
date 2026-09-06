@@ -808,6 +808,46 @@ pub fn phase_trace(label: &str) {
   vorpal_kg::phase_stamp(label);
 }
 
+/// Keep freed pages resident for the rest of a batch run (jemalloc decay off). The binaries
+/// compile in `dirty_decay_ms:0,muzzy_decay_ms:0`, which returns every freed run to the
+/// kernel at once — right for a daemon's idle memory, wrong for a build that cycles tens of
+/// gigabytes through a few-gigabyte live set: on the kernel a cold `vorpal index` paid
+/// 2.31 M minor faults and ~11 s of system CPU re-touching pages jemalloc had just handed
+/// back, against 0.53 M and ~7 s with decay off (2026-09-06, BENCHMARKS.md). `arenas.*`
+/// sets the default for arenas created later; `arena.4096.*` is MALLCTL_ARENAS_ALL, every
+/// arena that already exists (the vendored jemalloc fixes upstream's out-of-bounds walk
+/// for that sentinel). A refused knob leaves default decay in place — this is a
+/// performance hint, never a correctness input — so results are deliberately discarded.
+/// Batch COMMANDS call this once at entry; long-lived processes (the MCP daemon) keep the
+/// compiled-in decay and rely on [`release_freed_pages`] at phase seams.
+pub fn retain_dirty_pages_for_batch_run() {
+  #[cfg(all(
+    feature = "jemalloc",
+    not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+  ))]
+  {
+    for name in [
+      b"arenas.dirty_decay_ms\0".as_slice(),
+      b"arenas.muzzy_decay_ms\0".as_slice(),
+      b"arena.4096.dirty_decay_ms\0".as_slice(),
+      b"arena.4096.muzzy_decay_ms\0".as_slice(),
+    ] {
+      let mut forever: isize = -1;
+      // SAFETY: `name` is a NUL-terminated mallctl key; the value is a live `isize`, which
+      // is the type jemalloc documents for the decay_ms knobs (ssize_t).
+      unsafe {
+        let _ = tikv_jemalloc_sys::mallctl(
+          name.as_ptr() as *const std::ffi::c_char,
+          std::ptr::null_mut(),
+          std::ptr::null_mut(),
+          (&mut forever as *mut isize).cast::<std::ffi::c_void>(),
+          std::mem::size_of::<isize>(),
+        );
+      }
+    }
+  }
+}
+
 /// Hand freed-but-retained allocator pages back to the OS at a phase boundary. On macOS the
 /// default malloc keeps freed pages dirty in per-thread magazines, so a build's peak
 /// footprint reads as (largest phase) + (every earlier phase's retained garbage) even when
