@@ -14,6 +14,7 @@
 //! TOCs. Any surprise is an error: the caller falls back to the full pipeline, never
 //! commits a guess.
 
+use rayon::slice::ParallelSliceMut;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -802,12 +803,11 @@ pub fn compose_defs_changed(
       }
     }
     let graph = vorpal_graph::Graph::from_parts(node_count as u32, &srcs, &dsts, &etypes);
-    // The node fold over the staged vsegs, in bucket order — the stamp's node half.
-    let mut fold = xxhash_rust::xxh3::Xxh3::new();
-    for bucket in 0..buckets {
-      fold.update(&fs::read(nodes_dir.join(format!("{bucket:04}.vseg")))?);
-    }
-    if let Some(stamp) = crate::edgestore::expected_stamp(staging, fold.digest()) {
+    // The stamp's node half: the TOC-digest fold of the staged node TOC (written above) —
+    // not a re-hash of every staged vseg (1.4 GB read + 1.16 GB allocated per compose).
+    let node_fold = crate::kg::nodes_toc_stamp(&node_toc)
+      .ok_or_else(|| io::Error::other("defs-changed: staged node TOC unreadable"))?;
+    if let Some(stamp) = crate::edgestore::expected_stamp(staging, node_fold) {
       let _ = crate::edgestore::write_cache(staging, &graph, stamp);
     }
   }
@@ -893,7 +893,9 @@ pub fn compose_defs_changed(
         }
       }
     }
-    pairs.sort_unstable();
+    // Unique (hash, id) pairs: an unstable parallel sort is byte-identical to the serial
+    // one (8.9 M pairs on the kernel: 0.15 s on one thread).
+    pairs.par_sort_unstable();
     crate::phase_stamp("defs-changed surgery: names sorted");
     crate::kg::write_names_index_pairs(staging, &pairs)?;
   }

@@ -31,6 +31,10 @@ const SLAB_MAGIC: &[u8; 4] = b"VEDG";
 const TOC_MAGIC: &[u8; 4] = b"VEDT";
 const STAMP_MAGIC: &[u8; 4] = b"VGST";
 const VERSION: u32 = 1;
+/// `graph.stamp`'s own version: 2 since the node half became the TOC-digest fold
+/// (`kg::fold_vseg_digests`); a version-1 stamp is simply stale, and the cache rebuilds
+/// lazily once.
+const STAMP_VERSION: u32 = 2;
 /// Slab header: magic + version + bucket u32 + edge count u64.
 const SLAB_HEADER: usize = 20;
 /// One row: src_local u32 + dst_key u64 + dst_ordinal u32 + etype u16.
@@ -297,7 +301,7 @@ pub(crate) fn cache_stamp_of(dir: &Path) -> Option<(u64, u64)> {
   if bytes.len() != 24 || &bytes[0..4] != STAMP_MAGIC {
     return None;
   }
-  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != VERSION {
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != STAMP_VERSION {
     return None;
   }
   Some((
@@ -329,7 +333,7 @@ pub(crate) fn write_stamp(dir: &Path, stamp: (u64, u64)) -> io::Result<()> {
   let stamp_tmp = dir.join("graph.stamp.tmp");
   let mut out = fs::File::create(&stamp_tmp)?;
   out.write_all(STAMP_MAGIC)?;
-  out.write_all(&VERSION.to_le_bytes())?;
+  out.write_all(&STAMP_VERSION.to_le_bytes())?;
   out.write_all(&stamp.0.to_le_bytes())?;
   out.write_all(&stamp.1.to_le_bytes())?;
   drop(out);

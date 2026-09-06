@@ -244,7 +244,6 @@ pub(crate) fn rebuild_node_buckets(
   let prior_toc_bytes = fs::read(prior.join(NODES_TOC))
     .map_err(|_| io::Error::other("respan: prior node TOC unreadable"))?;
   let mut new_vseg_meta: Vec<Option<(u64, u64)>> = vec![None; buckets]; // (len, digest)
-  let mut vseg_fold = xxhash_rust::xxh3::Xxh3::new();
   for bucket in 0..buckets {
     let vseg_name = format!("{bucket:04}.vseg");
     let heap_name = format!("{bucket:04}.heap");
@@ -266,7 +265,6 @@ pub(crate) fn rebuild_node_buckets(
     // scc-ripple lane: compare, fold-after-link, rebuild).
     let prior_bytes = fs::read(prior.join(NODES_DIR).join(&vseg_name))?;
     if planned_in_bucket[bucket].is_empty() && scc_new.is_none() {
-      vseg_fold.update(&prior_bytes);
       link_pair(&nodes_dir)?;
       continue;
     }
@@ -285,7 +283,6 @@ pub(crate) fn rebuild_node_buckets(
       }
     };
     if planned_in_bucket[bucket].is_empty() && !scc_bucket_differs {
-      vseg_fold.update(segment.bytes());
       link_pair(&nodes_dir)?;
       continue;
     }
@@ -366,7 +363,6 @@ pub(crate) fn rebuild_node_buckets(
     builder.add_u32("scc_size", &scc_size).map_err(build_err)?;
     let bytes = builder.build().map_err(build_err)?;
     let digest = xxhash_rust::xxh3::xxh3_64(&bytes);
-    vseg_fold.update(&bytes);
     let tmp = nodes_dir.join(format!("{vseg_name}.tmp"));
     fs::write(&tmp, &bytes)?;
     fs::rename(&tmp, nodes_dir.join(&vseg_name))?;
@@ -398,6 +394,8 @@ pub(crate) fn rebuild_node_buckets(
   let toc_tmp = nodes_dir.join("toc.bin.tmp");
   fs::write(&toc_tmp, &toc)?;
   fs::rename(&toc_tmp, staging.join(NODES_TOC))?;
-  let node_fold = vseg_fold.digest();
+  // The stamp's node half is the TOC-digest fold of the TOC just written.
+  let node_fold = crate::kg::nodes_toc_stamp(&toc)
+    .ok_or_else(|| io::Error::other("respan: staged node TOC unreadable"))?;
   Ok(node_fold)
 }

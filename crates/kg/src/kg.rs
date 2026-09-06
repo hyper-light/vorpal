@@ -120,6 +120,37 @@ struct BuiltBucket {
   heap_digest: u64,
 }
 
+/// The node half of the graph-cache stamp: an xxh3 fold of the per-bucket `vseg` digests
+/// in bucket order — the digests the TOC already records when each slab is written. Every
+/// site that stamps or validates `graph.bin` derives it from here (the seal, the loader,
+/// the respan / defs-stable / defs-changed composes), so it costs O(buckets) instead of
+/// re-hashing every node segment: on the kernel that re-hash was 1.4 GB per compose and
+/// per load (BENCHMARKS.md 2026-09-06). Old stamps (raw-byte folds) are retired by
+/// `edgestore::STAMP_VERSION`, not by colliding with these values.
+pub(crate) fn fold_vseg_digests(digests: impl IntoIterator<Item = u64>) -> u64 {
+  let mut fold = xxhash_rust::xxh3::Xxh3::new();
+  for digest in digests {
+    fold.update(&digest.to_le_bytes());
+  }
+  fold.digest()
+}
+
+/// [`fold_vseg_digests`] over a nodes TOC's bytes (`nodes/toc.bin`); `None` when the
+/// bytes are not a nodes TOC.
+pub(crate) fn nodes_toc_stamp(toc: &[u8]) -> Option<u64> {
+  if toc.len() < NODES_TOC_HEADER || &toc[0..4] != NODES_TOC_MAGIC {
+    return None;
+  }
+  let buckets = u32::from_le_bytes(toc[8..12].try_into().ok()?) as usize;
+  if toc.len() < NODES_TOC_HEADER + buckets * NODES_TOC_ROW {
+    return None;
+  }
+  Some(fold_vseg_digests((0..buckets).map(|k| {
+    let at = NODES_TOC_HEADER + k * NODES_TOC_ROW + 12;
+    u64::from_le_bytes(toc[at..at + 8].try_into().expect("8 bytes in range"))
+  })))
+}
+
 struct NodesTocRow {
   rows: u32,
   vseg_len: u64,
@@ -1509,11 +1540,7 @@ impl Kg {
         }
       }
     }
-    let mut fold = xxhash_rust::xxh3::Xxh3::new();
-    for bucket in &built {
-      fold.update(&bucket.vseg);
-    }
-    Ok(fold.digest())
+    Ok(fold_vseg_digests(built.iter().map(|bucket| bucket.vseg_digest)))
   }
 
   /// The dense-id ⇄ `(file_key, ordinal)` map this graph persists under `layout` — what
@@ -1902,11 +1929,12 @@ impl Kg {
       // cache. Serve the cache only when its stamp matches BOTH the loaded node slabs and
       // the edge TOC; otherwise rebuild from the slabs and re-cache best-effort (the lazy
       // sidecar posture ANN established for committed generations).
-      let mut fold = xxhash_rust::xxh3::Xxh3::new();
-      for segment in &segments {
-        fold.update(segment.bytes());
-      }
-      let node_fold = fold.digest();
+      // The node half of the stamp comes from the TOC's per-bucket digests (O(buckets)),
+      // never from re-hashing the mapped segments (1.4 GB on the kernel, every load).
+      let node_fold = fs::read(dir.join(NODES_TOC))
+        .ok()
+        .and_then(|toc| nodes_toc_stamp(&toc))
+        .unwrap_or(0);
       let id_map = NodeIdMap::from_dir(dir).ok_or(SegmentError::Corrupt(
         "bucketed node store: unreadable TOC for the id map",
       ))?;

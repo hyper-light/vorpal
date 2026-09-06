@@ -63,7 +63,15 @@ pub const BUCKET_MAX: u32 = 4096;
 
 /// The bucket count for a corpus of `files` live files. Pure, monotonic, power-of-two.
 pub fn bucket_count_for(files: usize) -> u32 {
-  let want = files.div_ceil(BUCKET_TARGET_FILES).max(1) as u64;
+  // `VORPAL_BUCKET_TARGET_FILES` is a MEASUREMENT knob for re-running the sweep that set
+  // `BUCKET_TARGET_FILES` (BENCHMARKS.md 2026-09-06: the carry's per-file hard-link cost
+  // scales with the bucket count); it is read once and never a production setting.
+  let target = std::env::var("VORPAL_BUCKET_TARGET_FILES")
+    .ok()
+    .and_then(|v| v.parse::<usize>().ok())
+    .filter(|&t| t > 0)
+    .unwrap_or(BUCKET_TARGET_FILES);
+  let want = files.div_ceil(target).max(1) as u64;
   let pow2 = want.next_power_of_two().min(u64::from(BUCKET_MAX)) as u32;
   pow2.clamp(BUCKET_MIN, BUCKET_MAX)
 }
