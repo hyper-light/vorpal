@@ -5176,3 +5176,82 @@ Kernel edit classes (`evals/edit_classes.py`, the body edit inside `vfs_read`):
 README now: kernel cold **8.1 s** (same-day controls v0.7.1 8.7 s, 0.8.3 8.5 s), body edit
 0.8 s, comment 0.7 s, add a function 4.7 s, touch 0.6 s, unchanged 0.14 s, peak RSS 5.8 GB
 (+0.3 GB retained pages); fifteen-repo rows and the self row from the same run.
+
+## "Add a function 4.7 s": the defs-changed lane never fired on C — fixed in 0.8.5 (2026-09-06)
+
+Owner: "add a function 4.7 s — this one's a bit slow compared to the others! Can we
+investigate why?" (body edit 0.8 s, comment 0.7 s on the same file).
+
+**Where the time went.** Traced on the kernel copy with `VORPAL_PHASE_TRACE`: respan
+ineligible (outline items changed), defs-stable ineligible (definition set changed),
+defs-changed started (`1 edited files, 1 affected names -> 0 dirty files`) and then
+`scoped resolution declined: session imports diverge from the carried reach graph`, so the
+build fell through to the full pipeline: 2.1 s replaying all 75,954 products through the
+stream, 0.2 s absorb, 0.2 s include-reach, 0.3 s resolve, ~1.2 s seal + evidence + save —
+4.4 s. The same edit shape on a Rust file of this repo took the defs-changed lane end to
+end in 0.29 s.
+
+**Why it declined.** The decline message was made to say what diverged
+(`reach_rows_divergence`): for `fs/read_write.c` the session resolved 10 first-hop
+includes where the carried graph holds 19; the nine missing were
+`arch/x86/include/asm/unistd.h`, `include/linux/export.h`, `include/linux/fcntl.h`,
+`include/linux/fs.h` and five more — every root-relative include. Those resolve through
+`SymbolTable::file_by_suffix`'s second rung, include-root support, which the full build
+learns from the whole corpus's import stream (`learn_include_roots`, called only in
+`pipeline.rs` and `retained.rs`): `include/` out-supports `tools/include/` by orders of
+magnitude, so `<linux/fs.h>` binds the main tree. The scoped compose built its table
+from the universe's file entries and never learned support, so those suffix matches tied
+and resolved to nothing; the row check then refused the lane — correctly, since
+proceeding would have dropped nine include edges from the session's reach.
+
+**Fix.** `reach.bin` version 2 appends the learned support (root → count, roots sorted;
+roots are the path up to the suffix without a trailing slash, absolute like the graph's
+paths). The full pipeline and the daemon's maintained link both persist it; a version 1
+graph still decodes and reports no support, and the compose declines on it naming the
+reason. The scoped compose installs the stored map on its table
+(`SymbolTable::set_include_root_support`) before the import-binding seed, exactly where
+the full build learns it. Exactness: with the session's imports unchanged, a full build
+over the same tree learns the identical map (only session files changed and their
+contributions are identical), and a session whose imports changed fails the row check
+regardless — so no delta bookkeeping is needed. Tests: `resolve/tests/include_root_support.rs`
+(installed support decides the tie the same way learned support does, and export round-trips),
+`resolve::reach::format_tests` (v2 round trip, v1 decode without support, truncation),
+`index/tests/defs_changed_includes.rs` (a C fixture with `include/linux/{thing,other}.h`
+and a `tools/include/linux/thing.h` shadow, support 7 vs 4: a definition-adding edit takes
+the compose and converges byte for byte with a scratch build, add and remove). The existing
+lane, differential and pack suites pass unchanged.
+
+### Kernel A/B, 0.8.4 release asset vs the fix, three interleaved reps per edit class
+
+Each arm keeps its own index directory on the shared kernel copy; both indexes see every
+state transition. Cold builds first (base 9.7 s, fix 9.53 s), then per rep:
+add a function → both arms build → restore → both arms build, then body edit and comment
+the same way. Machine state: `fseventsd` pegged at a full core with 22.7 GB resident
+(see the regression record), so the quiet gate could not pass and these runs are ungated;
+the body-edit and comment rows in the same run (0.78–0.91 s and 0.56–0.60 s on both arms)
+match their gated values from the morning, which is the control that the daemon's state
+did not distort the lane comparison. The README row is restamped from a gated run once
+`fseventsd` is restarted.
+
+| arm | edit | walls (s), 3 reps | median | lane |
+|---|---|---|---:|---|
+| 0.8.4 asset | add a function | 4.74, 4.55, 4.48 | **4.55** | full pipeline |
+| 0.8.4 asset | remove it again | 4.51, 4.54, 4.51 | **4.51** | full pipeline |
+| 0.8.4 asset | body edit | 0.78, 0.86, 0.8 | **0.80** | compose |
+| 0.8.4 asset | comment only | 0.57, 0.58, 0.6 | **0.58** | compose |
+| 0.8.5 fix | add a function | 1.39, 1.32, 1.34 | **1.34** | defs-changed compose |
+| 0.8.5 fix | remove it again | 1.29, 1.33, 1.35 | **1.33** | defs-changed compose |
+| 0.8.5 fix | body edit | 0.86, 0.91, 0.8 | **0.86** | compose |
+| 0.8.5 fix | comment only | 0.56, 0.58, 0.59 | **0.58** | compose |
+
+The 0.8.4 arm declines every add and remove (`session imports diverge from the carried
+reach graph`) and replays the full pipeline; the fix takes the defs-changed compose both
+ways. Convergence, the incremental = scratch law at kernel scale — after each composed
+add-a-function the fix's generation against a from-scratch build of the identical tree:
+
+| rep | composed generation | scratch build of the same tree | equal |
+|---:|---|---|---|
+| #0 | `771275d9e069…` | `771275d9e069…` | True |
+| #1 | `5ff81cd8c1d9…` | `5ff81cd8c1d9…` | True |
+| #2 | `6de755d6a122…` | `6de755d6a122…` | True |
+

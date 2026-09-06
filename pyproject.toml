@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "vorpal-cli"
-version = "0.8.4"
+version = "0.8.5"
 description = "Structural Search and Rewrite code at large scale using precise AST pattern."
 authors = [{ name = "Ada Lundhe", email = "adalundhe@lundhe.audio" }]
 maintainers = [{ name = "Ada Lundhe", email = "adalundhe@lundhe.audio" }]

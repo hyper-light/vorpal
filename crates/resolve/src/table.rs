@@ -190,6 +190,31 @@ impl<'i> SymbolTable<'i> {
     }
   }
 
+  /// The learned include-root support, sorted by root: what [`Self::learn_include_roots`]
+  /// derived from this link's import stream. Persisted beside the reach graph so a scoped
+  /// compose can break suffix ties exactly as the full build did.
+  pub fn include_root_support(&self) -> Vec<(&'i str, u32)> {
+    let mut out: Vec<(&'i str, u32)> = self.root_support.iter().map(|(&r, &n)| (r, n)).collect();
+    out.sort_unstable();
+    out
+  }
+
+  /// Install a persisted include-root support map in place of learning one — the scoped
+  /// compose's path. A session sees only its own files' imports, which can never reproduce
+  /// corpus-wide support; the prior generation's map is exactly what a full build over the
+  /// same tree learns while the session's imports are unchanged, and a session whose imports
+  /// changed fails the reach-row check regardless.
+  pub fn set_include_root_support<'a>(
+    &mut self,
+    interner: &'i Interner,
+    entries: impl IntoIterator<Item = (&'a str, u32)>,
+  ) {
+    self.root_support.clear();
+    for (root, count) in entries {
+      self.root_support.insert(interner.text_of(interner.intern(root)), count);
+    }
+  }
+
   /// Resolve a root-relative import (`linux/export.h`-shaped: at least one directory
   /// component) to the indexed file it names, by path suffix. Disambiguation is an
   /// evidence hierarchy, every rung corpus-derived:

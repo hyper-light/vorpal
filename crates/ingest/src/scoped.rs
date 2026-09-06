@@ -706,6 +706,29 @@ fn resolve_session(
   }
   table.finalize();
 
+  // --- include-root support, installed rather than learned: the full build derives it
+  // from the whole corpus's import stream, which decides every suffix tie (`<linux/fs.h>`
+  // binds `include/`, not `tools/include/`). A session sees only its own files' imports
+  // and cannot reproduce that, which is why definition-adding edits on C used to decline
+  // here. The prior generation's map is exactly what a full build over the same tree
+  // learns while the session's imports are unchanged; a session whose imports changed
+  // fails the reach-row check below regardless. ---
+  let Some(reach_graph) = reach_graph else {
+    return Err(io::Error::other(
+      "scoped: prior generation lacks reach.bin — declining to the full pipeline",
+    ));
+  };
+  let Some(root_support) = reach_graph.include_root_support() else {
+    return Err(io::Error::other(
+      "scoped: prior generation's reach graph carries no include-root support (written \
+       before 0.8.5) — declining to the full pipeline",
+    ));
+  };
+  table.set_include_root_support(
+    interner,
+    root_support.iter().map(|(root, count)| (root.as_str(), *count)),
+  );
+
   // --- import-binding pre-pass over EVERY session file (bindings key on from_path,
   // exactly the bulk's one-table shape) ---
   // EXACTLY the full pipeline's seed input (spill.imports() retains every
@@ -726,11 +749,6 @@ fn resolve_session(
   // hop; the session files' own hops derive FRESH from this session's imports. A
   // prior without the graph, or a session whose imports no longer match the carried
   // graph (which composes hard-link), declines to the full pipeline. ---
-  let Some(reach_graph) = reach_graph else {
-    return Err(io::Error::other(
-      "scoped: prior generation lacks reach.bin — declining to the full pipeline",
-    ));
-  };
   let session_imports: Vec<Reference<'_>> = collected
     .iter()
     .flat_map(|c| c.references.iter())
@@ -740,10 +758,13 @@ fn resolve_session(
   let fresh_edges = vorpal_resolve::include_edges(interner, &table, &session_imports);
   let roots: Vec<vorpal_resolve::NameId<'_>> =
     files.iter().map(|f| interner.intern(&f.path)).collect();
-  if !vorpal_resolve::reach_rows_match(interner, reach_graph, &roots, &fresh_edges) {
-    return Err(io::Error::other(
-      "scoped: session imports diverge from the carried reach graph — declining to the full pipeline",
-    ));
+  if let Some(why) =
+    vorpal_resolve::reach_rows_divergence(interner, reach_graph, &roots, &fresh_edges)
+  {
+    return Err(io::Error::other(format!(
+      "scoped: session imports diverge from the carried reach graph — declining to the full \
+       pipeline ({why})"
+    )));
   }
   let reach = vorpal_resolve::IncludeReach::for_roots(interner, reach_graph, &fresh_edges, &roots);
 

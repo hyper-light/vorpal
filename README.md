@@ -204,9 +204,10 @@ vorpal index <source-tree> --out <index-dir>
 | Nothing changed | **0.14 s** |
 
 The edit rows are medians of three saves to `fs/read_write.c`. A body edit or a comment
-change replays only that file against the carried graph. Adding a definition changes the
-file's signature and import sets, so the incremental lanes decline and the build replays
-the whole reach graph; that is where the time goes. Same-day controls on the cold row,
+change replays only that file against the carried graph. Adding a definition takes the
+defs-changed compose: the changed file is re-resolved against the carried include graph
+and the definitions it affects are patched in place, and the result is checked to equal a
+from-scratch build of the same tree. Same-day controls on the cold row,
 interleaved under the same gate: v0.7.1 built from its tag 8.7 s, v0.8.3 8.5 s. The
 10.9 s an earlier version of this table carried was a slow day for every binary, not the
 code; the investigation is in `docs/wip/BENCHMARKS.md`.

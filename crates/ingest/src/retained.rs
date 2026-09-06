@@ -1027,11 +1027,12 @@ impl RetainedIndex {
         },
       )?
     };
+    let root_support = table.include_root_support();
     let edge_strs: Vec<(&str, &str)> = include_edges
       .iter()
       .map(|&(from, to)| (interner.text_of(from), interner.text_of(to)))
       .collect();
-    let reach_graph = vorpal_resolve::encode_reach_graph(&edge_strs);
+    let reach_graph = vorpal_resolve::encode_reach_graph(&edge_strs, &root_support);
     drop(edge_strs);
     self.assemble(&blocks, &order, want_evidence, pre_edges, pre_lut, inverse, pairing, reach_graph)
   }

@@ -1384,6 +1384,9 @@ fn link_resolve<'i>(
       },
     )?
   };
+  // The learned include-root support rides with the reach graph (v2): a scoped compose
+  // installs it instead of learning from its own handful of imports.
+  let root_support = table.include_root_support();
   drop(table);
   drop(arg_join);
   drop(param_table);
@@ -1395,7 +1398,7 @@ fn link_resolve<'i>(
     .iter()
     .map(|&(from, to)| (interner.text_of(from), interner.text_of(to)))
     .collect();
-  let reach_graph = vorpal_resolve::encode_reach_graph(&edge_strs);
+  let reach_graph = vorpal_resolve::encode_reach_graph(&edge_strs, &root_support);
   drop(edge_strs);
   drop(include_edges);
   Ok((stats, evidence, flows, reach_graph))

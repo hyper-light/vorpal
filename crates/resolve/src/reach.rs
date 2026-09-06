@@ -311,11 +311,13 @@ mod tests {
 pub const REACH_GRAPH_FILE: &str = "reach.bin";
 const REACH_MAGIC: &[u8; 4] = b"VRCH";
 /// Bumped when the layout or the edge-derivation semantics change.
-pub const REACH_GRAPH_VERSION: u32 = 1;
+pub const REACH_GRAPH_VERSION: u32 = 2;
 
-/// Encode `(includer, included)` path edges canonically. Determinism: the
-/// path table is the sorted, deduped path set; rows sort by (from, to) index.
-pub fn encode_reach_graph(edges: &[(&str, &str)]) -> Vec<u8> {
+/// Encode `(includer, included)` path edges canonically, followed (version 2) by the
+/// include-root support the link learned (`SymbolTable::include_root_support`).
+/// Determinism: the path table is the sorted, deduped path set; rows sort by (from, to)
+/// index; support rows sort by root.
+pub fn encode_reach_graph(edges: &[(&str, &str)], support: &[(&str, u32)]) -> Vec<u8> {
   let mut paths: Vec<&str> = edges.iter().flat_map(|&(a, b)| [a, b]).collect();
   paths.sort_unstable();
   paths.dedup();
@@ -356,6 +358,15 @@ pub fn encode_reach_graph(edges: &[(&str, &str)]) -> Vec<u8> {
   for &(_, to) in &pairs {
     out.extend_from_slice(&to.to_le_bytes());
   }
+  let mut support: Vec<(&str, u32)> = support.to_vec();
+  support.sort_unstable();
+  support.dedup();
+  out.extend_from_slice(&(support.len() as u32).to_le_bytes());
+  for (root, count) in support {
+    out.extend_from_slice(&(root.len() as u32).to_le_bytes());
+    out.extend_from_slice(root.as_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+  }
   out
 }
 
@@ -365,6 +376,9 @@ pub struct ReachGraph {
   paths: Vec<String>,
   row_starts: Vec<u32>,
   targets: Vec<u32>,
+  /// Version 2 generations carry the link's learned include-root support; a version 1
+  /// graph decodes with `None`, and composes that need it decline.
+  support: Option<Vec<(String, u32)>>,
 }
 
 impl ReachGraph {
@@ -374,7 +388,7 @@ impl ReachGraph {
       return None;
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    if version != REACH_GRAPH_VERSION {
+    if version != 1 && version != REACH_GRAPH_VERSION {
       return None;
     }
     let path_count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
@@ -398,11 +412,34 @@ impl ReachGraph {
       targets.push(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
       at += 4;
     }
+    let support = if version >= 2 {
+      let count = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+      at += 4;
+      let mut support = Vec::with_capacity(count);
+      for _ in 0..count {
+        let len = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+        at += 4;
+        let root = std::str::from_utf8(bytes.get(at..at + len)?).ok()?;
+        at += len;
+        let n = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        support.push((root.to_string(), n));
+      }
+      Some(support)
+    } else {
+      None
+    };
     (at == bytes.len()).then_some(Self {
       paths,
       row_starts,
       targets,
+      support,
     })
+  }
+
+  /// The include-root support persisted with this graph (`None` for a version 1 graph).
+  pub fn include_root_support(&self) -> Option<&[(String, u32)]> {
+    self.support.as_deref()
   }
 
   fn row_of(&self, path: &str) -> Option<usize> {
@@ -477,6 +514,20 @@ pub fn reach_rows_match<'i>(
   roots: &[NameId<'i>],
   fresh: &[(NameId<'i>, NameId<'i>)],
 ) -> bool {
+  reach_rows_divergence(interner, graph, roots, fresh).is_none()
+}
+
+/// Why [`reach_rows_match`] would say no: the first root whose fresh first-hop targets
+/// differ from the persisted row, with what the session resolved that the graph lacks and
+/// what the graph holds that the session did not resolve. `None` when every row matches.
+/// The decline message carries this so a compose that falls back to the full pipeline says
+/// which include moved — or, when nothing moved in the source, which side failed to resolve.
+pub fn reach_rows_divergence<'i>(
+  interner: &'i crate::Interner,
+  graph: &ReachGraph,
+  roots: &[NameId<'i>],
+  fresh: &[(NameId<'i>, NameId<'i>)],
+) -> Option<String> {
   for &root in roots {
     let mut fresh_targets: Vec<&str> = fresh
       .iter()
@@ -494,10 +545,27 @@ pub fn reach_rows_match<'i>(
       None => Vec::new(),
     };
     if fresh_targets != stored {
-      return false;
+      let missing: Vec<&str> =
+        stored.iter().copied().filter(|t| fresh_targets.binary_search(t).is_err()).collect();
+      let extra: Vec<&str> =
+        fresh_targets.iter().copied().filter(|t| stored.binary_search(t).is_err()).collect();
+      let show = |v: &[&str]| -> String {
+        let head: Vec<&str> = v.iter().copied().take(4).collect();
+        let more = v.len().saturating_sub(4);
+        if more > 0 { format!("{} (+{more} more)", head.join(", ")) } else { head.join(", ") }
+      };
+      return Some(format!(
+        "{}: session resolved {} first-hop include(s), the carried graph holds {}; \
+         in the graph but not resolved now: [{}]; resolved now but not in the graph: [{}]",
+        interner.text_of(root),
+        fresh_targets.len(),
+        stored.len(),
+        show(&missing),
+        show(&extra)
+      ));
     }
   }
-  true
+  None
 }
 
 #[cfg(test)]
@@ -525,7 +593,7 @@ mod graph_tests {
     let edges: Vec<(NameId, NameId)> =
       edge_strs.iter().map(|&(x, y)| (id(x), id(y))).collect();
     let full = IncludeReach::from_edges(&edges);
-    let encoded = encode_reach_graph(&edge_strs);
+    let encoded = encode_reach_graph(&edge_strs, &[]);
     let graph = ReachGraph::decode(&encoded).expect("round-trips");
     for root_name in &names {
       let root = id(root_name);
@@ -542,5 +610,37 @@ mod graph_tests {
         );
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod format_tests {
+  use super::*;
+
+  #[test]
+  fn support_round_trips_and_version_one_decodes_without_it() {
+    let edges = [("a.c", "include/x.h"), ("b.c", "include/x.h"), ("b.c", "tools/include/x.h")];
+    let support = [("tools/include/", 3u32), ("include/", 9u32)];
+    let bytes = encode_reach_graph(&edges, &support);
+    let graph = ReachGraph::decode(&bytes).expect("v2 decodes");
+    assert_eq!(
+      graph.include_root_support(),
+      Some(&[("include/".to_string(), 9u32), ("tools/include/".to_string(), 3u32)][..]),
+      "support rows come back sorted by root"
+    );
+    let row = graph.row_of("b.c").expect("b.c has a row");
+    let targets: Vec<&str> = graph.out_of(row).iter().map(|&t| graph.paths[t as usize].as_str()).collect();
+    assert_eq!(targets, ["include/x.h", "tools/include/x.h"]);
+    // A version 1 graph is the same bytes without the support section and with the old
+    // version stamp: it still decodes, and reports no support.
+    let support_len = 4 + support.iter().map(|(r, _)| 4 + r.len() + 4).sum::<usize>();
+    let mut v1 = bytes[..bytes.len() - support_len].to_vec();
+    v1[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let old = ReachGraph::decode(&v1).expect("v1 decodes");
+    assert!(old.include_root_support().is_none());
+    assert_eq!(old.paths, graph.paths);
+    // Truncated or foreign bytes decode to nothing.
+    assert!(ReachGraph::decode(&bytes[..bytes.len() - 1]).is_none());
+    assert!(ReachGraph::decode(b"VRCHxxxx").is_none());
   }
 }

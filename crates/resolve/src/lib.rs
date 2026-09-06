@@ -24,7 +24,10 @@ mod store;
 mod table;
 
 pub use intern::{Interner, NameId};
-pub use reach::{IncludeReach, REACH_GRAPH_FILE, ReachGraph, encode_reach_graph, reach_rows_match};
+pub use reach::{
+  IncludeReach, REACH_GRAPH_FILE, ReachGraph, encode_reach_graph, reach_rows_divergence,
+  reach_rows_match,
+};
 pub use reference::{RefForm, RefKind, Reference};
 pub use resolver::{
   ChainReturns, Confidence, MAX_RETAINED_ALTERNATIVES, Resolution, ResolutionGrade, ResolveReason, ResolveStats,
