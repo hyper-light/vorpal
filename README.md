@@ -1,3 +1,13 @@
+<p align="center">
+  <a href="docs/assets/brand/vorpal-blade-transparent.png">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/vorpal-blade-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/vorpal-blade-light.svg">
+      <img src="docs/assets/brand/vorpal-blade-light.svg" alt="Vorpal blade logo" width="108" height="180">
+    </picture>
+  </a>
+</p>
+
 <h1 align="center">vorpal</h1>
 <p align="center"><em>Code analysis and search, swift and sharp.</em></p>
 
