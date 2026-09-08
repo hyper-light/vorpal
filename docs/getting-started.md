@@ -22,7 +22,6 @@ Each tagged release attaches **one binary per platform** to the
 | Linux ARM64 (static/musl) | `vorpal-linux-arm64-musl` |
 | Windows x64 | `vorpal-windows-x64.exe` |
 | Windows ARM64 | `vorpal-windows-arm64.exe` |
-| Windows x86 (32-bit) | `vorpal-windows-x86.exe` |
 
 ```sh
 # macOS Apple Silicon example

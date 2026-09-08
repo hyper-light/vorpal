@@ -138,22 +138,6 @@ function requireNative() {
         loadErrors.push(e)
       }
       }
-    } else if (process.arch === 'ia32') {
-      try {
-        return require('./vorpal-napi.win32-ia32-msvc.node')
-      } catch (e) {
-        loadErrors.push(e)
-      }
-      try {
-        const binding = require('@hyper-light/vorpal-node-win32-ia32-msvc')
-        const bindingPackageVersion = require('@hyper-light/vorpal-node-win32-ia32-msvc/package.json').version
-        if (bindingPackageVersion !== '0.4.1' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.4.1 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
-        return binding
-      } catch (e) {
-        loadErrors.push(e)
-      }
     } else if (process.arch === 'arm64') {
       try {
         return require('./vorpal-napi.win32-arm64-msvc.node')

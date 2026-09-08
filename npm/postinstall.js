@@ -19,7 +19,6 @@ function detectPackageName() {
     }
     case "win32":
       if (arch === "arm64") return "@hyper-light/vorpal-cli-win32-arm64-msvc";
-      if (arch === "ia32") return "@hyper-light/vorpal-cli-win32-ia32-msvc";
       if (arch === "x64") return "@hyper-light/vorpal-cli-win32-x64-msvc";
       break;
   }

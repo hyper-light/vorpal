@@ -71,7 +71,6 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true, asset: vorpal-linux-arm64-musl }
           - { target: x86_64-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-x64.exe }
           - { target: aarch64-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-arm64.exe }
-          - { target: i686-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-x86.exe }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -263,8 +262,7 @@ jobs:
             vorpal-linux-x64-musl=linux-x64-musl \
             vorpal-linux-arm64-musl=linux-arm64-musl \
             vorpal-windows-x64.exe=win32-x64-msvc \
-            vorpal-windows-arm64.exe=win32-arm64-msvc \
-            vorpal-windows-x86.exe=win32-ia32-msvc; do
+            vorpal-windows-arm64.exe=win32-arm64-msvc; do
             asset="${pair%%=*}"
             platform="${pair##*=}"
             binary="artifacts/${asset}/${asset}"
