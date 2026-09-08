@@ -365,9 +365,14 @@ source line in the `.evidence.md` files; NDCG@10 / MRR / recall@5; `cargo xtask 
 
 | Corpus (queries) | Default | + learned tier | + encoder (f32; f16 in a footnote) |
 |---|---:|---:|---:|
-| Linux kernel, 8.9 M defs (54) | 0.306 / 0.310 / 0.312 | **0.315 / 0.304 / 0.361** | 0.295 / 0.290 / 0.302² |
+| Linux kernel, 8.9 M defs (54) | **0.329 / 0.327 / 0.358** | 0.315 / 0.304 / 0.361 | 0.295 / 0.290 / 0.302² |
 | CPython, 163 K defs (54) | 0.306 / 0.291 / 0.333 | 0.341 / 0.322 / 0.389¹ | **0.351 / 0.331 / 0.426** |
-| This repo, 79 K defs (55) | 0.400 / 0.393 / 0.400 | 0.430 / 0.427 / 0.455 | **0.455 / 0.448 / 0.500** |
+| This repo, 79 K defs (55) | 0.402 / 0.395 / 0.445 | 0.430 / 0.427 / 0.455 | **0.455 / 0.448 / 0.500** |
+
+The default column was re-measured 2026-09-07: it now includes the body list, which
+nominates definitions whose source holds every query word when no definition name does.
+That moved the kernel and this-repo rows; CPython did not change. The learned and encoder
+columns are from 2026-09-06.
 
 Which tier to run is a per-repository decision. The encoder helps on CPython and this
 repo but lowers the kernel's aggregate, mostly on the subset-of-a-name queries (0.540 →
