@@ -276,7 +276,16 @@ jobs:
         run: |
           set -euo pipefail
           for dir in npm/platforms/*/; do
-            (cd "$dir" && npm publish --access public)
+            (cd "$dir" \
+              && name=$(node -p "require('./package.json').name") && ver=$(node -p "require('./package.json').version") \
+              && if npm view "$name@$ver" version >/dev/null 2>&1; then echo "$name@$ver already live; skipping"; else npm publish --access public; fi)
           done
-      - name: Publish @hyper-light/vorpal-cli wrapper
-        run: cd npm && npm publish --access public
+      - name: Publish @hyper-light/vorpal-cli wrapper (skip a version that is already live)
+        working-directory: npm
+        run: |
+          name=$(node -p "require('./package.json').name"); ver=$(node -p "require('./package.json').version")
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "$name@$ver is already on the registry; skipping (a re-run after a moved tag)"
+          else
+            npm publish --access public
+          fi

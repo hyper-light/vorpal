@@ -154,5 +154,12 @@ jobs:
         run: |
           cd crates/wasm/pkg
           node -e "const f='package.json',p=require('./'+f);p.name='@hyper-light/vorpal-wasm';require('fs').writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
-      - name: Publish
-        run: cd crates/wasm/pkg && npm publish --access public
+      - name: Publish (skip a version that is already live)
+        working-directory: crates/wasm/pkg
+        run: |
+          name=$(node -p "require('./package.json').name"); ver=$(node -p "require('./package.json').version")
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "$name@$ver is already on the registry; skipping (a re-run after a moved tag)"
+          else
+            npm publish --access public
+          fi
