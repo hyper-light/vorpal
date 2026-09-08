@@ -25,6 +25,7 @@ pub mod carry_libc {
   pub use libc::{RUSAGE_SELF, getrusage, rusage};
 }
 pub mod csr;
+pub mod peak;
 pub mod pod;
 pub mod policy;
 pub mod prefetch;
@@ -33,6 +34,7 @@ pub mod store;
 
 pub use arena::BatchArena;
 pub use csr::Csr;
+pub use peak::{PeakMemory, describe as describe_peak_memory, peak_memory, sample_private};
 pub use pod::PodColumn;
 pub use policy::{AccessPattern, Hotness, PagePolicy, ResourcePolicy, StorePolicy};
 pub use prefetch::{prefetch_read, prefetch_read_nta, prefetch_slice_ahead};

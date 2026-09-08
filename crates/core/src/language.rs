@@ -41,6 +41,16 @@ pub trait Language: Clone + 'static {
     None
   }
 
+  /// A second parse to try when `src` did not build the pattern a user meant: return a
+  /// `(context, selector)` pair for [`crate::Pattern::contextual`], or `None` to keep the first
+  /// result. `root_kind` is the kind the single-node parse rooted at (`None` when the source
+  /// did not parse as one node). C-family grammars use this for call-shaped sources —
+  /// tree-sitter C reads `f($A)` as a `macro_type_specifier`, never a call — by re-parsing
+  /// inside a function body and selecting the `call_expression`.
+  fn contextual_fallback(&self, _src: &str, _root_kind: Option<u16>) -> Option<(String, &'static str)> {
+    None
+  }
+
   fn kind_to_id(&self, kind: &str) -> u16;
   fn field_to_id(&self, field: &str) -> Option<u16>;
   fn build_pattern(&self, builder: &PatternBuilder) -> Result<Pattern, PatternError>;

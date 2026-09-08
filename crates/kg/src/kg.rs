@@ -866,6 +866,22 @@ impl Kg {
     ))
   }
 
+  /// Just the node's definition span — two u32 column reads, no heap strings. `(0, 0)` on
+  /// segments built before spans. Attribution loops (which definition holds this byte?)
+  /// walk a file's run with this instead of decoding every node view.
+  pub fn node_span(&self, id: NodeId) -> Option<(u32, u32)> {
+    let (seg, row) = self.directory.locate(id)?;
+    let seg = seg as usize;
+    let (segment, cols) = (&self.segments[seg], &self.cols[seg]);
+    Some(match (cols.span_start, cols.span_end) {
+      (Some(start_col), Some(end_col)) => (
+        segment.column_at(start_col)?.get_u32(row)?,
+        segment.column_at(end_col)?.get_u32(row)?,
+      ),
+      _ => (0, 0),
+    })
+  }
+
   /// The raw kind-tag column as contiguous per-slab stripes `(dense id base, tags)`, in
   /// id order — the whole-graph scan fast path: no per-row directory lookup inside a
   /// stripe. One stripe for flat/sealed graphs, one per bucket for bucketed generations.

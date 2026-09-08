@@ -36,6 +36,10 @@ const MAX_CAPTURED_CHANGES: usize = 4096;
 pub(crate) struct SourceWatch {
   src: PathBuf,
   dirty: Arc<AtomicBool>,
+  /// Every event the watcher ever saw, counted (errors and overflows included) — a level
+  /// that only rises, so a consumer can key a cache on it and miss no event: the dirty
+  /// flag is consumed by the tick and cannot tell two events in one window apart.
+  events: Arc<std::sync::atomic::AtomicU64>,
   /// `Some(set)` = every relevant change since the last take is in the set (a complete
   /// capture, safe to hint the manifest with). `None` = certainty was lost (startup gap,
   /// watcher error, overflow, a directory-level event, or set-size cap) and the next
@@ -63,7 +67,9 @@ impl SourceWatch {
     let dirty = Arc::new(AtomicBool::new(true));
     // Startup gap: changes before the daemon existed produced no events → unknown.
     let changed: Arc<Mutex<Option<HashSet<PathBuf>>>> = Arc::new(Mutex::new(None));
+    let events = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let flag = Arc::clone(&dirty);
+    let events_flag = Arc::clone(&events);
     let capture = Arc::clone(&changed);
     let root = src.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
@@ -91,6 +97,7 @@ impl SourceWatch {
               }
             }
             flag.store(true, Ordering::Release);
+            events_flag.fetch_add(1, Ordering::AcqRel);
           }
         }
         // A watcher error means events may have been lost: assume the worst.
@@ -99,6 +106,7 @@ impl SourceWatch {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
           flag.store(true, Ordering::Release);
+          events_flag.fetch_add(1, Ordering::AcqRel);
         }
       }
     })
@@ -112,6 +120,7 @@ impl SourceWatch {
       src,
       dirty,
       changed,
+      events,
       _watcher: watcher,
     })
   }
@@ -140,12 +149,23 @@ impl SourceWatch {
   /// Re-arm the flag — used when a revalidation attempt failed, so the next query retries
   /// instead of serving the pre-failure graph as if it were fresh. Capture certainty is
   /// poisoned too: the failed attempt consumed the set.
+  /// Whether dirt is pending, without consuming it.
+  pub(crate) fn peek_dirty(&self) -> bool {
+    self.dirty.load(std::sync::atomic::Ordering::SeqCst)
+  }
+
   pub(crate) fn mark_dirty(&self) {
     *self
       .changed
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     self.dirty.store(true, Ordering::Release);
+    self.events.fetch_add(1, Ordering::AcqRel);
+  }
+
+  /// The number of events seen so far (see `events`).
+  pub(crate) fn event_count(&self) -> u64 {
+    self.events.load(Ordering::Acquire)
   }
 }
 

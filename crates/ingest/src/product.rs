@@ -47,7 +47,22 @@ use vorpal_resolve::{RefForm, RefKind};
 // coverage signal beside the byte ratio. The decoders reject trailing bytes, so no
 // compatible extension existed; the bump costs nothing extra because the C rule edit
 // that arms recovery re-keys every product through the rules digest anyway.
-pub const PRODUCT_FORMAT_VERSION: u32 = 20;
+// 21 (never shipped; its layout moved three times under one number — a bench index written
+// by one intermediate binary was misread by the next, so the number moved on):
+// 22: top-level cuts (`cuts`, right after the parse-health header) — the byte offset of
+// every direct child of the parse root, delta-LEB128 with the child's `has_error` flag in
+// the low bit. A pattern match is one node, so it lies inside exactly one top-level child;
+// the structural searches parse only the children that hold the pattern's literal (each
+// alone, as a tree-sitter included range) and stay exact for error-free children — a child
+// tree-sitter recovered is parsed with its file, because recovery is context-dependent.
+// Header-relative so `peek_product_cuts` never decodes items or refs; a `refs_off` u32
+// before the cuts (offset 52) lets `peek_product_refs` read the reference rows without the
+// outline; every call reference carries its call shape (`arity << 2 | opaque << 1 | plain`).
+pub const PRODUCT_FORMAT_VERSION: u32 = 22;
+
+/// Cap on recorded top-level cuts per file: a file with more direct root children than this
+/// records none (chunk-scoped parsing degrades to the whole-file parse, never to a wrong one).
+pub const MAX_PRODUCT_CUTS: usize = 65_535;
 
 /// `(local entity index, [(param name, type text?)])` — see `FileProduct::entity_params`.
 pub type EntityParams = Vec<(u32, Vec<(String, Option<String>)>)>;
@@ -93,6 +108,10 @@ pub struct FileProduct {
   /// out (see [`vorpal_outline::model::SwallowRecovery`]). Empty for every file where the
   /// diagnosis did not fire — the structural coverage signal the byte ratio cannot see.
   pub swallows: Vec<SwallowRecovery>,
+  /// Top-level cuts (v22): `(start byte, has_error)` of every direct child of the parse root
+  /// (comments excluded), ascending. Empty when the file has no children or more than
+  /// [`MAX_PRODUCT_CUTS`].
+  pub cuts: Vec<(u32, bool)>,
   pub items: Vec<OutlineItem<'static>>,
   pub refs: Vec<ProductRef>,
   /// Per-entity parameter lists (G-M1): `(local entity index, [(name, type_text?)])`, sorted
@@ -138,6 +157,13 @@ pub struct ProductRef {
   pub receiver_type: Option<String>,
   /// [`crate::typefacts::BindOrigin`] tag for `receiver_type`; `0xFF` when absent.
   pub receiver_type_origin: u8,
+  /// Call shape (v22): `named argument count << 2 | has_error << 1 | plain callee`, where
+  /// "plain callee" means the callee node is a bare identifier spelled exactly `name` and
+  /// `has_error` says tree-sitter recovered somewhere inside the call. Arguments are the
+  /// named, non-comment children of the call's argument list — what an ast-grep `$A` per
+  /// argument counts under Smart strictness. `0` for every non-call reference. Lets a call
+  /// pattern (`f($A, $B)`, `f($$$)`) be answered from the product without a parse.
+  pub call_shape: u32,
   /// Call-site arguments (G-M1 capture; consumed by data-flow in G-M3).
   pub args: Vec<ProductArg>,
 }
@@ -189,7 +215,12 @@ pub struct ProductArg {
   pub expr: Option<String>,
 }
 
-pub(crate) fn refkind_tag(kind: RefKind) -> u8 {
+/// The tag [`refkind_tag`] gives `RefKind::Call` and [`refform_tag`] gives `RefForm::Bare` —
+/// what a call-shape filter compares against without importing the resolve types.
+pub const CALL_REF_TAG: u8 = 0;
+pub const BARE_FORM_TAG: u8 = 0;
+
+pub fn refkind_tag(kind: RefKind) -> u8 {
   match kind {
     RefKind::Call => 0,
     RefKind::Type => 1,
@@ -209,7 +240,7 @@ pub(crate) fn tag_refkind(tag: u8) -> RefKind {
   }
 }
 
-pub(crate) fn refform_tag(form: RefForm) -> u8 {
+pub fn refform_tag(form: RefForm) -> u8 {
   match form {
     RefForm::Bare => 0,
     RefForm::Static => 1,
@@ -299,6 +330,7 @@ pub(crate) struct RefParts<'a> {
   pub(crate) receiver: Option<Cow<'a, str>>,
   pub(crate) receiver_type: Option<&'a str>,
   pub(crate) receiver_type_origin: u8,
+  pub(crate) call_shape: u32,
   pub(crate) args: Vec<crate::references::RawArg<'a>>,
 }
 
@@ -315,6 +347,7 @@ pub(crate) struct ExtractedParts<'a> {
   pub(crate) error_bytes: u64,
   pub(crate) error_spans: Vec<(u32, u32)>,
   pub(crate) swallows: Vec<SwallowRecovery>,
+  pub(crate) cuts: Vec<(u32, bool)>,
   pub(crate) items: Vec<OutlineItem<'a>>,
   pub(crate) refs: Vec<RefParts<'a>>,
   pub(crate) entity_params: EntityParamsView<'a>,
@@ -343,6 +376,11 @@ pub(crate) fn encode_parts_into(
   buf.extend_from_slice(&parts.grammar_digest.to_le_bytes());
   push_u32(buf, parts.error_nodes);
   buf.extend_from_slice(&parts.error_bytes.to_le_bytes());
+  // v22: the byte offset of the reference section, patched once the items are encoded, so
+  // a reader that wants only references (`peek_product_refs`) never walks the outline.
+  let refs_off_at = buf.len();
+  push_u32(buf, 0);
+  push_cuts(buf, &parts.cuts);
   push_u32(buf, parts.error_spans.len() as u32);
   for &(start, end) in &parts.error_spans {
     push_u32(buf, start);
@@ -368,6 +406,10 @@ pub(crate) fn encode_parts_into(
       }
       buf.push(u8::from(member.is_public));
     }
+  }
+  {
+    let off = (buf.len() - rollback) as u32;
+    buf[refs_off_at..refs_off_at + 4].copy_from_slice(&off.to_le_bytes());
   }
   push_u32(buf, parts.refs.len() as u32);
   for r in &parts.refs {
@@ -395,6 +437,7 @@ pub(crate) fn encode_parts_into(
       | (u8::from(r.receiver_type.is_some()) << 1)
       | (u8::from(!r.args.is_empty()) << 2);
     buf.push(flags);
+    push_leb(buf, r.call_shape);
     if let Some(v) = &r.receiver {
       push_str(buf, v);
     }
@@ -636,6 +679,9 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
   buf.extend_from_slice(&product.grammar_digest.to_le_bytes());
   push_u32(buf, product.error_nodes);
   buf.extend_from_slice(&product.error_bytes.to_le_bytes());
+  let refs_off_at = buf.len();
+  push_u32(buf, 0);
+  push_cuts(buf, &product.cuts);
   push_u32(buf, product.error_spans.len() as u32);
   for &(start, end) in &product.error_spans {
     push_u32(buf, start);
@@ -661,6 +707,10 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
       }
       buf.push(u8::from(member.is_public));
     }
+  }
+  {
+    let off = (buf.len() - rollback) as u32;
+    buf[refs_off_at..refs_off_at + 4].copy_from_slice(&off.to_le_bytes());
   }
   push_u32(buf, product.refs.len() as u32);
   for r in &product.refs {
@@ -690,6 +740,7 @@ pub fn encode_product_into(product: &FileProduct, buf: &mut Vec<u8>) {
       | (u8::from(r.receiver_type.is_some()) << 1)
       | (u8::from(!r.args.is_empty()) << 2);
     buf.push(flags);
+    push_leb(buf, r.call_shape);
     if let Some(v) = &r.receiver {
       push_str(buf, v);
     }
@@ -761,6 +812,22 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+  fn leb(&mut self) -> io::Result<u32> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+    loop {
+      let byte = *self.bytes.get(self.off).ok_or_else(|| corrupt("truncated product"))?;
+      self.off += 1;
+      value |= u32::from(byte & 0x7f) << shift;
+      if byte & 0x80 == 0 {
+        return Ok(value);
+      }
+      shift += 7;
+      if shift > 28 {
+        return Err(corrupt("oversized varint"));
+      }
+    }
+  }
   fn take(&mut self, len: usize) -> io::Result<&'a [u8]> {
     let end = self
       .off
@@ -874,6 +941,8 @@ pub struct ProductView<'a> {
   pub error_spans: Vec<(u32, u32)>,
   /// Parser-swallow recoveries (v20) — see `FileProduct::swallows`.
   pub swallows: Vec<SwallowRecovery>,
+  /// Top-level cuts (v22), raw LEB128 deltas — decode with [`Cuts::new`].
+  pub cuts: &'a [u8],
   pub items: Vec<OutlineItem<'a>>,
   pub refs: Vec<RefView<'a>>,
   /// Per-entity parameter lists, borrowed (see `FileProduct::entity_params`).
@@ -903,6 +972,8 @@ pub struct RefView<'a> {
   pub receiver: Option<&'a str>,
   pub receiver_type: Option<&'a str>,
   pub receiver_type_origin: u8,
+  /// See `ProductRef::call_shape`.
+  pub call_shape: u32,
   /// Argument records: encoded bytes (the replay path, decoded lazily) or a borrow of the
   /// owned records (the just-parsed bridge) — one accessor serves both.
   args: ArgsSrc<'a>,
@@ -938,6 +1009,7 @@ impl<'a> RefView<'a> {
     receiver: Option<&'a str>,
     receiver_type: Option<&'a str>,
     receiver_type_origin: u8,
+    call_shape: u32,
     args: &'a [ProductArg],
   ) -> Self {
     Self {
@@ -951,6 +1023,7 @@ impl<'a> RefView<'a> {
       alias,
       receiver,
       receiver_type,
+      call_shape,
       receiver_type_origin,
       args: ArgsSrc::Owned(args),
     }
@@ -1015,6 +1088,206 @@ pub fn peek_product_stamps(bytes: &[u8]) -> Option<(u64, u64)> {
     u64::from_le_bytes(bytes[16..24].try_into().ok()?),
   ))
 }
+/// Unsigned LEB128.
+fn push_leb(buf: &mut Vec<u8>, mut value: u32) {
+  loop {
+    let byte = (value & 0x7f) as u8;
+    value >>= 7;
+    if value == 0 {
+      buf.push(byte);
+      return;
+    }
+    buf.push(byte | 0x80);
+  }
+}
+
+/// The v22 cuts section: count, then per child LEB128 of `delta << 1 | has_error`, deltas
+/// between ascending start offsets.
+fn push_cuts(buf: &mut Vec<u8>, cuts: &[(u32, bool)]) {
+  push_u32(buf, cuts.len() as u32);
+  let mut prev = 0u32;
+  for &(cut, has_error) in cuts {
+    let mut delta = (cut.wrapping_sub(prev) << 1) | u32::from(has_error);
+    prev = cut;
+    loop {
+      let byte = (delta & 0x7f) as u8;
+      delta >>= 7;
+      if delta == 0 {
+        buf.push(byte);
+        break;
+      }
+      buf.push(byte | 0x80);
+    }
+  }
+}
+
+/// Decode a cuts section starting at `off`; returns the raw section bytes (past the count)
+/// and the offset after it. Bounds-checked: a truncated delta is a corrupt product.
+fn cuts_section(bytes: &[u8], off: usize) -> io::Result<(&[u8], usize)> {
+  let count = bytes
+    .get(off..off + 4)
+    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    .ok_or_else(|| corrupt("truncated product"))?;
+  let start = off + 4;
+  let mut at = start;
+  for _ in 0..count {
+    loop {
+      let byte = *bytes.get(at).ok_or_else(|| corrupt("truncated cuts"))?;
+      at += 1;
+      if byte & 0x80 == 0 {
+        break;
+      }
+    }
+  }
+  Ok((&bytes[start..at], at))
+}
+
+/// Iterate a cuts section as `(absolute start offset, has_error)`, ascending.
+#[derive(Clone, Copy)]
+pub struct Cuts<'a> {
+  raw: &'a [u8],
+  at: usize,
+  prev: u32,
+}
+
+impl Iterator for Cuts<'_> {
+  type Item = (u32, bool);
+  fn next(&mut self) -> Option<(u32, bool)> {
+    if self.at >= self.raw.len() {
+      return None;
+    }
+    let mut packed = 0u32;
+    let mut shift = 0u32;
+    loop {
+      let byte = *self.raw.get(self.at)?;
+      self.at += 1;
+      packed |= u32::from(byte & 0x7f) << shift;
+      if byte & 0x80 == 0 {
+        break;
+      }
+      shift += 7;
+      if shift > 28 {
+        return None;
+      }
+    }
+    self.prev = self.prev.wrapping_add(packed >> 1);
+    Some((self.prev, packed & 1 == 1))
+  }
+}
+
+impl<'a> Cuts<'a> {
+  pub fn new(raw: &'a [u8]) -> Self {
+    Cuts { raw, at: 0, prev: 0 }
+  }
+  pub fn is_empty(&self) -> bool {
+    self.raw.is_empty()
+  }
+}
+
+/// The top-level cuts of a v22 product, straight from the header — no item or reference
+/// decoding. `None` for any other format generation or a truncated product.
+pub fn peek_product_cuts(bytes: &[u8]) -> Option<Cuts<'_>> {
+  if bytes.len() < 52 || &bytes[0..4] != PRODUCT_MAGIC {
+    return None;
+  }
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
+    return None;
+  }
+  let (raw, _) = cuts_section(bytes, 56).ok()?;
+  Some(Cuts::new(raw))
+}
+
+/// One reference row read straight from the product's reference section — the fields a
+/// call-shape filter and a symbol-attribution need, borrowed, no outline decoded and no
+/// vector built. Argument records are skipped, not decoded.
+#[derive(Clone, Copy, Debug)]
+pub struct RefRow<'a> {
+  pub from_entity_index: u32,
+  pub name: &'a str,
+  pub kind: u8,
+  pub form: u8,
+  pub has_qualifier: bool,
+  pub start: u32,
+  pub end: u32,
+  pub call_shape: u32,
+}
+
+/// Lazy iterator over a product's reference rows ([`peek_product_refs`]).
+pub struct RefRows<'a> {
+  r: Reader<'a>,
+  remaining: usize,
+}
+
+impl<'a> Iterator for RefRows<'a> {
+  type Item = RefRow<'a>;
+  fn next(&mut self) -> Option<RefRow<'a>> {
+    if self.remaining == 0 {
+      return None;
+    }
+    self.remaining -= 1;
+    let r = &mut self.r;
+    let from_entity_index = r.u32().ok()?;
+    let name = r.str_borrowed().ok()?;
+    let kind = r.u8().ok()?;
+    let start = r.u32().ok()?;
+    let end = r.u32().ok()?;
+    let form = r.u8().ok()?;
+    let has_qualifier = r.u8().ok()? != 0;
+    if has_qualifier {
+      r.str_borrowed().ok()?;
+    }
+    if r.u8().ok()? != 0 {
+      r.str_borrowed().ok()?; // alias
+    }
+    let flags = r.u8().ok()?;
+    let call_shape = r.leb().ok()?;
+    if flags & 1 != 0 {
+      r.str_borrowed().ok()?; // receiver
+    }
+    if flags & 2 != 0 {
+      r.str_borrowed().ok()?; // receiver type
+      r.u8().ok()?; // origin
+    }
+    let args = if flags & 4 != 0 { r.u16().ok()? } else { 0 };
+    for _ in 0..args {
+      r.u16().ok()?;
+      r.u8().ok()?;
+      if r.u8().ok()? != 0 {
+        r.str_borrowed().ok()?;
+      }
+      if r.u8().ok()? != 0 {
+        r.str_borrowed().ok()?;
+      }
+    }
+    Some(RefRow {
+      from_entity_index,
+      name,
+      kind,
+      form,
+      has_qualifier,
+      start,
+      end,
+      call_shape,
+    })
+  }
+}
+
+/// The reference rows of a v22 product, straight from the header's section offset — no
+/// outline decoded, no allocation. `None` for any other format generation or a truncated
+/// product.
+pub fn peek_product_refs(bytes: &[u8]) -> Option<RefRows<'_>> {
+  if bytes.len() < 56 || &bytes[0..4] != PRODUCT_MAGIC {
+    return None;
+  }
+  if u32::from_le_bytes(bytes[4..8].try_into().ok()?) != PRODUCT_FORMAT_VERSION {
+    return None;
+  }
+  let refs_off = u32::from_le_bytes(bytes[52..56].try_into().ok()?) as usize;
+  let mut r = Reader { bytes, off: refs_off };
+  let remaining = r.count().ok()?;
+  Some(RefRows { r, remaining })
+}
+
 
 /// The content digest (`xxh3` of the source bytes) from the product header — the identity
 /// staged validation compares when stat alone cannot be trusted.
@@ -1127,6 +1400,9 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
   let grammar_digest = r.u64()?;
   let error_nodes = r.u32()?;
   let error_bytes = r.u64()?;
+  let refs_off = r.u32()? as usize;
+  let (cuts_raw, after_cuts) = cuts_section(bytes, r.off)?;
+  r.off = after_cuts;
   let span_count = r.count()?;
   let mut error_spans = Vec::with_capacity(span_count.min(16));
   for _ in 0..span_count {
@@ -1152,6 +1428,9 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       members,
     });
   }
+  if r.off != refs_off {
+    return Err(corrupt("reference section offset disagrees with the layout"));
+  }
   let ref_count = r.count()?;
   let mut refs = Vec::with_capacity(ref_count);
   for _ in 0..ref_count {
@@ -1172,6 +1451,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       None
     };
     let flags = r.u8()?;
+    let call_shape = r.leb()?;
     let receiver = if flags & 1 != 0 {
       Some(r.str_borrowed()?)
     } else {
@@ -1208,6 +1488,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
       receiver,
       receiver_type,
       receiver_type_origin,
+      call_shape,
       args: ArgsSrc::Encoded {
         bytes: args_bytes,
         count: args_count,
@@ -1278,6 +1559,7 @@ pub fn decode_product_view(bytes: &[u8]) -> io::Result<ProductView<'_>> {
     error_bytes,
     error_spans,
     swallows,
+    cuts: cuts_raw,
     items,
     refs,
     entity_params,
@@ -1302,6 +1584,9 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
   let grammar_digest = r.u64()?;
   let error_nodes = r.u32()?;
   let error_bytes = r.u64()?;
+  let refs_off = r.u32()? as usize;
+  let (cuts_raw, after_cuts) = cuts_section(bytes, r.off)?;
+  r.off = after_cuts;
   let span_count = r.count()?;
   let mut error_spans = Vec::with_capacity(span_count.min(16));
   for _ in 0..span_count {
@@ -1327,6 +1612,9 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
       members,
     });
   }
+  if r.off != refs_off {
+    return Err(corrupt("reference section offset disagrees with the layout"));
+  }
   let ref_count = r.count()?;
   let mut refs = Vec::with_capacity(ref_count);
   for _ in 0..ref_count {
@@ -1339,6 +1627,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     let qualifier = if r.u8()? != 0 { Some(r.str()?) } else { None };
     let alias = if r.u8()? != 0 { Some(r.str()?) } else { None };
     let flags = r.u8()?;
+    let call_shape = r.leb()?;
     let receiver = if flags & 1 != 0 { Some(r.str()?) } else { None };
     let (receiver_type, receiver_type_origin) = if flags & 2 != 0 {
       (Some(r.str()?), r.u8()?)
@@ -1371,6 +1660,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
       receiver,
       receiver_type,
       receiver_type_origin,
+      call_shape,
       args,
     });
   }
@@ -1438,6 +1728,7 @@ pub fn decode_product(bytes: &[u8]) -> io::Result<FileProduct> {
     error_bytes,
     error_spans,
     swallows,
+    cuts: Cuts::new(cuts_raw).collect(),
     items,
     refs,
     entity_params,
@@ -1602,5 +1893,11 @@ mod tests {
       checked += 1;
     }
     assert!(checked >= 6, "battery shrank to {checked} — extraction broke?");
+  }
+
+  #[test]
+  fn call_and_bare_tags_match_the_encoders() {
+    assert_eq!(refkind_tag(RefKind::Call), CALL_REF_TAG);
+    assert_eq!(refform_tag(RefForm::Bare), BARE_FORM_TAG);
   }
 }

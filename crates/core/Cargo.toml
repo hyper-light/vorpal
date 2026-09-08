@@ -15,6 +15,7 @@ version.workspace = true
 
 [dependencies]
 bit-set.workspace = true
+memchr = "2"
 regex.workspace = true
 regex-syntax = "0.8"
 thiserror.workspace = true

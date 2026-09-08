@@ -19,6 +19,7 @@
 //! ```
 
 mod bash;
+mod c;
 mod cpp;
 mod csharp;
 mod css;
@@ -554,6 +555,74 @@ impl Language for SupportLang {
   fn from_path<P: AsRef<Path>>(path: P) -> Option<Self> {
     from_extension(path.as_ref())
   }
+  fn contextual_fallback(&self, src: &str, root_kind: Option<u16>) -> Option<(String, &'static str)> {
+    c_family_call_fallback(*self, src, root_kind)
+  }
+}
+
+/// tree-sitter C (and C++, which inherits the rule) parses a lone `name(arg)` — and therefore
+/// `f($A)` and `f($$$)` — as a `macro_type_specifier`, a type, never a call. A search for a
+/// one-argument call then matches nothing, silently. When the source is call-shaped and the
+/// single-node parse rooted at that kind (or at an error, or did not parse as one node), the
+/// same text re-parses inside a function body, where it can only be an expression statement,
+/// and the pattern is rooted at its `call_expression`. Sources that are not call-shaped (an
+/// assignment, a declaration, a bare identifier) keep their first parse.
+fn c_family_call_fallback(
+  lang: SupportLang,
+  src: &str,
+  root_kind: Option<u16>,
+) -> Option<(String, &'static str)> {
+  if !matches!(lang, SupportLang::C | SupportLang::Cpp) {
+    return None;
+  }
+  let body = src.trim().trim_end_matches(';').trim_end();
+  if !looks_call_shaped(body) {
+    return None;
+  }
+  // Any root other than a call is the wrong reading of a call-shaped source: C gives a
+  // `macro_type_specifier`, C++ a `declaration` (`ns::g($A)` as a function declarator), or the
+  // parse splits into several nodes. Sources that already rooted at a call keep it.
+  let retry = match root_kind {
+    None => true,
+    Some(kind) => kind != lang.kind_to_id("call_expression"),
+  };
+  retry.then(|| (format!("void __vorpal_ctx(void) {{ {body}; }}"), "call_expression"))
+}
+
+/// `callee(...)`: a non-empty callee of identifier / member / scope characters (metavariable
+/// sigils included), then one balanced parenthesized argument list closing the source.
+fn looks_call_shaped(body: &str) -> bool {
+  let Some(open) = body.find('(') else {
+    return false;
+  };
+  let callee = body[..open].trim_end();
+  if callee.is_empty()
+    || !callee.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.' | ':' | '-' | '>') || c as u32 >= 0x1_0000)
+    || !callee.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$' || c as u32 >= 0x1_0000)
+  {
+    return false;
+  }
+  if !body.ends_with(')') {
+    return false;
+  }
+  let mut depth = 0i32;
+  for (i, ch) in body.char_indices() {
+    match ch {
+      '(' => depth += 1,
+      ')' => {
+        depth -= 1;
+        if depth < 0 {
+          return false;
+        }
+        if depth == 0 && i + 1 != body.len() {
+          // the list closed before the end: `f(a) + g(b)` is not one call
+          return false;
+        }
+      }
+      _ => {}
+    }
+  }
+  depth == 0
 }
 
 impl LanguageExt for SupportLang {

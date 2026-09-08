@@ -19,6 +19,7 @@ pub mod defs_changed;
 pub mod defs_stable;
 pub mod respan;
 mod sigstore;
+pub mod trigramstore;
 mod usagestore;
 mod model;
 mod writer;
@@ -32,6 +33,7 @@ pub use edgestore::{EDGES_DIR, EDGES_TOC, is_edges_member};
 pub use sigstore::{
   SIG_SKETCH_LEN, SIGS_DIR, SIGS_TOC, SigFamilyRow, SigStore, is_sigs_member, save_sigs,
 };
+pub use trigramstore::{TRIGRAMS_DIR, TRIGRAMS_TOC, TrigramStore, is_trigrams_member};
 pub use usagestore::{USAGE_DIR, USAGE_TOC, UsageStore, is_usage_member};
 pub use evidence::{
   AltSet, EVIDENCE_DIR, EVIDENCE_TOC, EvidenceLayout, EvidenceOutcome, EvidenceRow,

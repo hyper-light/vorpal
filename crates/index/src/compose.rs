@@ -254,6 +254,20 @@ pub(crate) fn try_respan_compose(
   ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
+  // The text tier's delta runs beside the lane (its own directory, its own thread) and is
+  // joined before the manifest lands — off the lane's critical path.
+  let text_delta = crate::trigrams::spawn_compose_delta(
+    prior,
+    &staging,
+    tree_root,
+    changed
+      .iter()
+      .map(|e| crate::trigrams::ChangedFile {
+        path: e.path.clone(),
+        size: e.size,
+      })
+      .collect(),
+  );
   if let Err(err) = vorpal_kg::respan::respan_generation(&staging, prior, &plans) {
     vorpal_kg::phase_stamp(&format!("respan: fell back to the full pipeline: {err}"));
     let _ = fs::remove_dir_all(&staging);
@@ -276,6 +290,7 @@ pub(crate) fn try_respan_compose(
   }
   drop(sink);
   writer.finish(manifest.entries().iter().map(|entry| entry.path.clone()))?;
+  crate::trigrams::finish_compose_delta(text_delta, &staging);
   manifest.save(&staging.join("manifest.bin"))?;
   commit_generation(out, prior, staging)?;
   let nodes = vorpal_kg::Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
@@ -775,6 +790,20 @@ pub(crate) fn try_defs_stable_compose(
   ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
+  // The text tier's delta runs beside the lane (its own directory, its own thread) and is
+  // joined before the manifest lands — off the lane's critical path.
+  let text_delta = crate::trigrams::spawn_compose_delta(
+    prior,
+    &staging,
+    tree_root,
+    changed
+      .iter()
+      .map(|e| crate::trigrams::ChangedFile {
+        path: e.path.clone(),
+        size: e.size,
+      })
+      .collect(),
+  );
   if let Err(err) =
     vorpal_kg::defs_stable::compose_defs_stable(&staging, prior, prior_kg, &plan)
   {
@@ -800,6 +829,7 @@ pub(crate) fn try_defs_stable_compose(
   }
   drop(sink);
   writer.finish(manifest.entries().iter().map(|e| e.path.clone()))?;
+  crate::trigrams::finish_compose_delta(text_delta, &staging);
   manifest.save(&staging.join("manifest.bin"))?;
   commit_generation(out, prior, staging)?;
   let nodes = vorpal_kg::Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);
@@ -1360,6 +1390,20 @@ pub(crate) fn try_defs_changed_compose(
   ));
   let _ = fs::remove_dir_all(&staging);
   fs::create_dir_all(&staging)?;
+  // The text tier's delta runs beside the lane (its own directory, its own thread) and is
+  // joined before the manifest lands — off the lane's critical path.
+  let text_delta = crate::trigrams::spawn_compose_delta(
+    prior,
+    &staging,
+    tree_root,
+    changed
+      .iter()
+      .map(|e| crate::trigrams::ChangedFile {
+        path: e.path.clone(),
+        size: e.size,
+      })
+      .collect(),
+  );
   let fresh_seals: Vec<(u64, &vorpal_kg::Kg)> =
     sealed.iter().map(|s| (s.file_key, &s.fresh_kg)).collect();
   if let Err(err) = vorpal_kg::defs_changed::compose_defs_changed(
@@ -1392,6 +1436,7 @@ pub(crate) fn try_defs_changed_compose(
   }
   drop(sink);
   writer.finish(manifest.entries().iter().map(|e| e.path.clone()))?;
+  crate::trigrams::finish_compose_delta(text_delta, &staging);
   manifest.save(&staging.join("manifest.bin"))?;
   commit_generation(out, prior, staging)?;
   let nodes = vorpal_kg::Kg::peek_node_count(&vorpal_kg::resolve_index_dir(out)).unwrap_or(0);

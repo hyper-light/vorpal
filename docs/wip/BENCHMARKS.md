@@ -5447,3 +5447,469 @@ Touch and unchanged from the sweep's 32-bucket point: 0.23 / 0.24 and 0.13 / 0.1
 kernel rows now: cold 8.1 s, body edit 0.4 s, comment 0.2 s, add a function 0.9 s, touch
 0.2 s, unchanged 0.13 s, peak RSS 6.1 GB, generation 4.5 GB / 236 files.
 
+
+## vorpal versus microsoft/tgrep on the README corpora (2026-09-07)
+
+tgrep 1.0.4 (`e2007b5`, release build from `../tgrep`) is a trigram-indexed grep with a
+TCP server: `tgrep index .`, `tgrep serve .`, then every `tgrep <pattern> .` is a fresh
+client that connects to the server. Its equivalent here is `vorpal index .`, one
+`vorpal mcp` daemon on the tree, and each query as a `search` call to that daemon. Driver:
+`evals/tgrep_bench.py` (results in its `tgrep_bench.json`), vorpal 0.8.5 release asset,
+ripgrep 15.2.0. `fseventsd` sat at 0–15 % of a core through the builds and the query suite
+and at a full core through every save row; idle and `fseventsd` are recorded per row.
+
+### Cold index, three reps each, interleaved tgrep / vorpal, `/usr/bin/time -l`
+
+| corpus | tool | files | wall (median of 3) | max RSS | peak footprint | on disk |
+|---|---|---:|---:|---:|---:|---:|
+| Linux kernel | tgrep | 94,719 | **7.7 s** (7.61 / 7.71 / 8.30) | 0.32 GB | 0.24 GB | 1,018 MB |
+| Linux kernel | vorpal | 75,954 parsed | **8.1 s** (7.90 / 8.10 / 9.30) | 5.76 GB | 4.82 GB | 4,601 MB |
+| CPython | tgrep | 5,721 | 0.54 s | 0.14 GB | 0.13 GB | 74 MB |
+| CPython | vorpal | 3,841 parsed | 0.94 s | 0.72 GB | 0.69 GB | 149 MB |
+| this repo | tgrep | 2,769 | 0.60 s | 0.25 GB | 0.09 GB | 28 MB |
+| this repo | vorpal | 1,902 parsed | 7.11 s | 11.24 GB | 11.22 GB | 813 MB |
+
+Same wall on the kernel; 18× the memory and 4.5× the disk, because vorpal's generation
+carries the parsed-product cache that makes its edit lanes sub-second, and tgrep writes
+6 bytes per (trigram, file) posting through a 64 MiB external-sort arena. The repo row is
+the vendored 49-grammar parser floor (one 33 MB generated `parser.c`), not a scaling law.
+
+### tgrep's kernel query suite: 102 regexes from its `scripts/benchmark-queries.json`
+
+Fresh `tgrep` client per query against `tgrep serve --no-watch`; `rg -n` for the baseline;
+the same 102 strings as `search` (k=10, lean) on a warm `vorpal mcp` daemon (first search
+215 ms, once); the 82 identifier-shaped ones also as `graph references`.
+
+| | total | median | p95 | what comes back |
+|---|---:|---:|---:|---|
+| tgrep (client → serve) | **2.6 s** | 20.9 ms | 53.5 ms | 184,789 matching lines over the suite |
+| ripgrep | 104.8 s | 1,024 ms | 1,080 ms | the same lines (101 of 102 queries byte-equal; tgrep drops `scripts/Makefile.lib` — `.lib` is on its binary-extension list) |
+| vorpal `search` (daemon) | **79.5 ms** | 0.65 ms | 1.32 ms | 10 ranked definitions; the top hit is the queried name on 69 of 82 identifiers, a near-variant on the other 13 (`netdev_err` → `netdev_err_once`) |
+| vorpal `graph references` (daemon) | 0.23 s | 1.62 ms | — | resolved reference records: 45 hits, 34 ambiguous, 3 no-match |
+
+Different answers to the same string: tgrep returns every line; vorpal returns the
+definitions and the graph edges. RSS after the suite: `tgrep serve` 1.42 GB (its 50 K-entry
+content cache filled by the suite's candidate files; 388 MB after the five-call table
+below), `vorpal mcp` 5.4 GB.
+
+### Same job, both tools: every call of a function in the kernel's C files
+
+tgrep and rg run `name\(` with `-t c`, fresh process each (3 reps, median). The daemon rows
+are `code_search` with the call spelled at its arity (`kmalloc($A, $B)`,
+`vfs_read($A, $B, $C, $D)`, `$R = schedule_timeout($A)`, …), `structural_search` with the
+same pattern, and `search <name>`. 3 reps each.
+
+| function | tgrep | rg | vorpal `code_search` | vorpal `structural_search` | vorpal `search` |
+|---|---:|---:|---:|---:|---:|
+| `kmalloc` | 18 ms · 3,387 lines | 713 ms | **4.3 s** · 2,715 matches | 4.1 s (stopped at limit 100) | <1 ms · 10 defs |
+| `vfs_read` | 7.7 ms · 13 | 715 ms | 4.6 s · 3 | 57.3 s | <1 ms |
+| `schedule_timeout` | 11 ms · 315 | 685 ms | 4.4 s · 71 | 57.7 s | <1 ms |
+| `devm_platform_ioremap_resource` | 16 ms · 1,755 | 688 ms | 5.1 s · 100+ | 6.0 s (limit) | <1 ms |
+| `netif_napi_add` | 8.3 ms · 205 | 657 ms | 5.3 s · 100+ | 29.5 s | <1 ms |
+
+`code_search` reads and tree-sitter-parses all 63,775 C files on every call (parallel,
+`par_chunks(256)`, no literal prefilter — `crates/index/src/records.rs:1377`);
+`structural_search` walks the tree single-threaded and stops at its limit, so its time is
+how far into the tree the hundredth match sits. Two more findings on the way:
+tree-sitter C parses `name($A)` and `name($$$)` as a `macro_type_specifier`, so a
+pattern-only search for a one-argument call finds nothing unless spelled in assignment
+or statement form; and `structural_search` puts its matches in the text block only
+(`structuredContent` carries just the generation).
+
+### Save → visible, scratch clone of the kernel, `fs/read_write.c`, append a function, 7 reps
+
+tgrep serve with its watcher, polled by a fresh client every 20 ms; vorpal mcp polled with
+`node`. `fseventsd` at 99–103 % of a core on every rep.
+
+| daemon | reps (s) | median | RSS |
+|---|---|---:|---:|
+| tgrep serve | 0.23, 3.52, 5.03, 4.40, 4.12, 4.67, 4.82 | **4.4 s** | 172 MB |
+| vorpal mcp, saves 4 s apart | 10.7, 19.7, 6.5, 4.6, 6.4, 20.9, 2.7 | 6.5 s | 12.4 GB |
+| vorpal mcp, each save after the daemon idles | 2.59, 4.25, 1.89, 8.98, 8.74, 4.27, 2.30 | **4.3 s** | 9.9 GB |
+
+tgrep's own work per save is milliseconds (one file's trigrams into the overlay); its 3.5–5 s
+rows are FSEvents delivery under a pinned `fseventsd`, and vorpal's gated rows land on the
+same floor (README: 2.2 s with `fseventsd` quiet). The ungated rows show something vorpal
+owns: every committed generation re-warms the search tiers in-process (595 % CPU, 0 % idle
+on the 10–21 s reps; the boot warm on the fresh clone index took 107 s to settle), and a
+save that arrives during the re-warm waits behind it. The gated run's waits were 1.1–3.2 s
+per rep once the boot warm was done.
+
+### Artifacts
+Clone, both tgrep indexes and the clone's `.vorpal` (25 GB after 21 saves) deleted after
+recording; `tgrep_bench.json` kept in the session scratch.
+
+## The text tier, and parsing only the statements that can match (2026-09-07)
+
+Follow-up to the tgrep comparison above. Everything here is in the working tree, uncommitted.
+Same machine, same corpora, release builds; `fseventsd` state recorded per table (it sat at
+100 % of a core through the chunk runs, as it did through the save rows above).
+
+### What landed
+
+- **Text tier**: `trigrams/<k>.tri` + `trigrams/toc.bin`, one slab per file bucket (the
+  bucket law's 4096 files), postings `trigram → (file ordinal delta, next-byte Bloom mask)`.
+  Validity is per bucket, a fold of `(file key, source xxh3)` pairs, so it never enters the
+  Merkle identity; a scratch `vorpal index` never writes it, the daemon's warm heals it last,
+  the compose lanes and the served persist delta it, `commit_generation` hard-links it forward.
+  `VORPAL_NO_TEXT_INDEX=1` is the parity veto.
+- **Candidate path** shared by `code_search`, `structural_search`, `rule_search`, and the new
+  `text_search`: required literals → trigram candidates → `memchr` prefilter → matcher.
+  An alternation plans one AND-walk per branch and unions them (`regex_literal_branches`,
+  cap 16), so `TODO|FIXME` prunes; before this it fell to a full scan because the branches'
+  required literals intersect to nothing (tgrep's planner had this, ours did not).
+- **Product v21 `cuts`**: the start byte of every direct child of the parse root (comments
+  excluded), with tree-sitter's `has_error` flag per child. `extraction_identity` now folds
+  `PRODUCT_FORMAT_VERSION`, because the whole-tree fast path compared only the grammar stamp
+  and a format bump on an unchanged tree never rebuilt (found when the first parity run
+  reported `chunked 0` everywhere on a 2.8 s "rebuild").
+- **Chunk-scoped parse** (`crates/index/src/chunks.rs`): the prefilter's anchor literal gives
+  offsets, the cut table names the top-level statement holding each, and tree-sitter parses
+  those statements **one at a time** as single included ranges. A match is one node and lies
+  inside exactly one top-level statement, so the match set equals the whole-file parse's.
+- **Chunk memo**: verified match starts keyed by (pattern, xxh3 of the chunk bytes), 64 shards,
+  `VORPAL_CHUNK_MEMO_BYTES` (default 64 MiB), oldest half of a shard dropped when full.
+  `code_search` only; a repeat re-parses just the chunks whose bytes changed.
+- Bookkeeping: `Kg::node_span` (span-only attribution, no heap strings per node),
+  `RunIndex::count_where` (the pruned-count population without a 76k-run walk per query).
+
+### Three rules the kernel-scale parity run forced, in the order they were learned
+
+`evals/tgrep_bench.py --phases chunk_parity`: 15 patterns × `code_search` + `structural_search`,
+one daemon per arm (`VORPAL_NO_CHUNK_PARSE=1` for the whole-file arm), 3 reps, totals and the
+sha256 of the returned page compared.
+
+1. **Merged ranges → 4 mismatches.** The first build handed every anchor chunk of a file to
+   one parse as several included ranges. `container_of($A, $B, $C)` found 19,778 against 19,777
+   and `if ($C) return $X;` 381,815 against 381,811. The extra `container_of` was
+   `tools/testing/selftests/bpf/progs/refcounted_kptr.c:760`, a call inside a function
+   preceded by `SEC("?tc")` / `__failure __msg(...)` lines: the whole-file parse recovered
+   from those and lost the call, the chunk parse did not. Error recovery is
+   context-dependent; the chunk parse was *more* right, and still not the reference.
+2. **"Zero ERROR nodes in the file" → 0 mismatches, and the win gone.** Only ~16 % of kernel C
+   files parse with no ERROR node (`kmalloc`: 569 of 3,572 files chunked; 0.70 s against
+   0.78 s whole).
+3. **Per-child `has_error` flag, one range per parse → 0 mismatches, win kept.** A chunk whose
+   child tree-sitter recovered parses with its file; every other anchor chunk parses alone.
+   One range per parse is not an optimization: tree-sitter reads several included ranges as
+   one contiguous text, and a JavaScript `let x = foo` (no semicolon) followed by a skipped
+   statement and then `(function(){…})()` reads as `foo(function…)()`. The fixture oracle
+   (`crates/index/tests/chunks.rs`) carries that shape; merged ranges would count 9
+   `fetchJson($A)` calls where the file has 8.
+
+### Kernel, both tools, chunked against whole-file, 3 reps, median (run 3, `fseventsd` 102 %)
+
+| pattern | matches | files scanned | chunked files | `code_search` chunked | whole | `structural_search` chunked | whole |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `kmalloc($A, $B)` | 2,715 | 3,572 | 1,946 | **0.46 s** | 0.74 s | **0.53 s** | 0.85 s |
+| `vfs_read($A, $B, $C, $D)` | 3 | 18 | 8 | 21 ms | 24 ms | 122 ms | 124 ms |
+| `$R = schedule_timeout($A)` | 72 | 408 | 290 | **47 ms** | 114 ms | 155 ms | 217 ms |
+| `devm_platform_ioremap_resource($A, $B)` | 1,744 | 1,763 | 1,169 | **0.10 s** | 0.21 s | 0.21 s | 0.34 s |
+| `netif_napi_add($A, $B, $C)` | 198 | 255 | 191 | **43 ms** | 130 ms | 162 ms | 316 ms |
+| `kfree($A)` | 40,499 | 10,742 | 5,168 | **1.17 s** | 1.99 s | 1.32 s | 2.03 s |
+| `mutex_lock($A)` | 22,705 | 5,576 | 3,030 | **0.66 s** | 1.12 s | 0.78 s | 1.25 s |
+| `spin_lock_irqsave($A, $B)` | 14,094 | 3,394 | 1,795 | **0.45 s** | 0.73 s | 0.55 s | 0.81 s |
+| `list_for_each_entry($A, $B, $C)` | 9,782 | 4,184 | 13 | 1.09 s | 0.98 s | 1.11 s | 1.22 s |
+| `container_of($A, $B, $C)` | 19,777 | 8,934 | 1,248 | 1.52 s | 1.65 s | 1.54 s | 1.73 s |
+| `WARN_ON($A)` | 13,734 | 6,469 | 3,711 | **0.68 s** | 1.35 s | 0.80 s | 1.42 s |
+| `if ($C) return $X;` | 381,811 | 43,129 | 14,618 | 3.50 s | 4.16 s | 3.80 s | 4.12 s |
+| `os.path.join($A, $B)` (python) | 257 | 111 | 111 | **2 ms** | 32 ms | 90 ms | 94 ms |
+| `def $F(self, $$$): $$$` (python) | 1,819 | 205 | 204 | **6 ms** | 33 ms | 82 ms | 95 ms |
+
+0 mismatches over 30 rows. "chunked files" counts files where every anchor chunk was
+error-free; the rest parse whole by rule. `list_for_each_entry` is the rule's cost made
+visible: it is a for-loop macro, tree-sitter flags the function using it, so 13 of 4,184
+files chunk and the row is a wash. The Python rows are the memo: reps 2 and 3 answer every
+chunk from it (`chunkMemoHits` 266 and 869), the first rep is the parse (21 ms / 19 ms). On
+the C rows the memo answers 2,849 (`kmalloc`) to 105,349 (`if_return`) chunks per repeat and
+the parse of the non-chunkable files sets the floor. The structural rows carry the walk of
+the tree (`files_of`, ~100 ms on the kernel) that `code_search` does not.
+
+Against the record above, same job, same daemon protocol: `code_search kmalloc` 4.3 s → 0.46 s,
+`structural_search` 4.1 s (at limit 100) → 0.53 s (all 2,715). tgrep answers `kmalloc\(` in
+18 ms, as a line list; these rows answer with the call's arity matched and each match
+attributed to its definition.
+
+### `text_search`, the 102-query kernel suite (recorded before the chunk work, same tier)
+
+| | tgrep (fresh client) | ripgrep | vorpal `text_search` (daemon) |
+|---|---:|---:|---:|
+| total | 2.6 s | 105.4 s | **2.63 s** |
+| median | 21 ms | — | **12.8 ms** |
+| p95 | — | — | 116 ms |
+| lines equal to rg | — | — | 20 of 102 (rg counts every line; we return one record per matching line inside indexed files, with the enclosing symbol) |
+
+Parity: every query against `VORPAL_NO_TEXT_INDEX=1` (exhaustive scan, 684 ms median,
+70.6 s total): 0 mismatches. Heal on the kernel: 75,954 files, 130,394,026 postings, 440 MB
+at B=256 (the bucket law gives 32 buckets on this tree; 1.5–1.7 s release), in the daemon's
+warm after the ANN tier.
+
+### Profiling rounds (ledger build, `VORPAL_PHASE_TRACE=1`, kernel)
+
+`cargo build --release -p vorpal-index --features alloc-ledger --target-dir target/ledger`.
+Round 1 → 4 on the heal: allocations 380 k → 746, reallocations 77 k → 676, churn 6.3 GB →
+2.2 GB, minor faults 318 k → 92 k (the 92 k are first-touch of the 16 pooled scratches).
+`text_search` faults per 2,112-file call 6.5 k → 1.7 k (pooled read buffers). Two rayon
+findings behind those numbers: `fold`/`map_init` create state per split, not per thread, so
+per-thread scratch must be an explicit pool; `with_min_len` cuts work-stealing churn.
+Owner's veto recorded: the daemon's jemalloc decay stays at 0 (a decay change measured
+slower on wall clock and was reverted).
+
+### Open, measured, not done
+
+- `structural_search` and `rule_search` re-run the whole search for every page (381,811
+  hits = 382 pages × ~4 s). A cursor over a retained result would make paging free.
+- The memo is `code_search` only; `structural_search` needs the match node for its text,
+  so it would have to memoize `(start, end, kind)` instead of starts.
+- Steps 3 and 4 of the plan (a call-site table so call patterns never parse; absence proofs,
+  symbol-scoped text search, a body channel for `search`) are not started.
+
+### Artifacts
+Kernel `.vorpal` rebuilt from scratch for run 3 (the v21 cuts encoding changed between run 1
+and run 3 without a bump, so run 1's products were unreadable by run 3's binary); the kernel
+clone and both tgrep indexes deleted; `tgrep_bench.json` (all three `chunk_parity` rows) kept
+in the session scratch.
+
+## Steps 3 and 4 of the graph-and-trigram stack, and the allocation pass (2026-09-07, later)
+
+Uncommitted, on top of the section above. Same kernel index protocol (`evals/tgrep_bench.py
+--phases chunk_parity,search`, one daemon per arm, `fseventsd` at ~100 % throughout).
+
+### Step 3: call patterns answered from the product's call references, no parse
+
+The extractor already records every call as a reference with the call node's span. Product
+v21 adds a **call shape** per reference: `named non-comment argument count << 2 | opaque << 1 |
+plain callee`. A pattern whose arguments are all single metavariables (`f($A, $B)`, `f()`) or
+one `$$$` is answered by filtering the file's reference rows — read in place through a
+section offset in the product header, no outline decoded. Everything else (`$R = f($A)`,
+`f($A, 0)`, `f($A, $A)`, `f($A, $$$)`, qualified callees, selector/context patterns) keeps
+the parse path.
+
+Three rules, each earned by a kernel-scale mismatch:
+
+1. **Arguments count what ast-grep counts.** Empirically (`vorpal run`), Smart strictness
+   skips comments and ERROR children and counts MISSING ones: `f(a, /* c */ b)` matches
+   `f($A, $B)`, `container_of(l, struct node_data, l)` (an ERROR child wrapping `struct`)
+   matches `container_of($A, $B, $C)`, `f(a, )` matches nothing. The first build counted
+   ERROR children and found 884 `container_of` sites against 19,777.
+2. **A call tree-sitter recovered inside is opaque**: its file takes the parse path for that
+   callee. Restored `container_of` to 19,777 on the next run.
+3. **A drilled call chain is opaque.** `list_for_each_entry(tp_mod, &list, list)` followed by
+   `(void) nb->notifier_call(...)` on the next line parses as a call whose callee is a call;
+   the walk records ONE reference at the outer node with the outer's arguments, ast-grep
+   matches the inner call. Three kernel sites (`kernel/tracepoint.c:562,586`,
+   `sound/soc/soc-dapm.c:1454`) until the flag; 0 mismatches after.
+
+### Step 4: what the graph and the tier can only do together
+
+- `graph … mentions: true` (inbound relations): every whole-word textual mention of the name
+  in files the graph's answer does not cover, with `complete: true` when nothing was stale
+  or truncated. Empty and complete means no file outside the answer spells the name.
+- `text_search … symbol: NAME`: the graph names the definition's file and byte span; only
+  those bytes are read.
+- `search` gains a `body` list, only when the name and BM25 lists are both empty: definitions
+  whose source holds every query word, via the tier, at most `pool` files read, files above
+  the tier's 16 MiB cap skipped (this repo's vendored 54 MB grammar parsers made every phrase
+  query read them: 36 ms mean against 0.6 ms until the skip).
+
+### Kernel run 7 (final binary, cold rebuild 9.3 s), 0 mismatches over 30 rows
+
+| pattern | matches | files scanned | from references | chunk-parsed | `code_search` | whole-file | `structural_search` | whole-file |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `kmalloc($A, $B)` | 2,715 | 3,572 | 3,571 | 0 | **35 ms** | 719 ms | 135 ms | 867 ms |
+| `vfs_read($A, $B, $C, $D)` | 3 | 18 | 17 | 0 | **6 ms** | 21 ms | 107 ms | 126 ms |
+| `$R = schedule_timeout($A)` | 72 | 408 | — | 290 | 45 ms | 119 ms | 148 ms | 222 ms |
+| `devm_platform_ioremap_resource($A, $B)` | 1,744 | 1,763 | 1,763 | 0 | **17 ms** | 211 ms | 119 ms | 303 ms |
+| `netif_napi_add($A, $B, $C)` | 198 | 255 | 255 | 0 | **5 ms** | 124 ms | 106 ms | 278 ms |
+| `kfree($A)` | 40,499 | 10,742 | 10,738 | 0 | **90 ms** | 2,132 ms | 194 ms | 2,244 ms |
+| `mutex_lock($A)` | 22,705 | 5,576 | 5,576 | 0 | **49 ms** | 1,218 ms | 151 ms | 1,407 ms |
+| `spin_lock_irqsave($A, $B)` | 14,094 | 3,394 | 3,394 | 0 | **32 ms** | 797 ms | 137 ms | 900 ms |
+| `list_for_each_entry($A, $B, $C)` | 9,782 | 4,184 | 4,181 | 0 | **42 ms** | 1,066 ms | 141 ms | 1,243 ms |
+| `container_of($A, $B, $C)` | 19,777 | 8,934 | 2,009 | 0 | 1,184 ms | 1,833 ms | 1,379 ms | 1,811 ms |
+| `WARN_ON($A)` | 13,734 | 6,469 | 6,467 | 0 | **64 ms** | 1,343 ms | 159 ms | 1,448 ms |
+| `if ($C) return $X;` | 381,811 | 43,129 | — | 14,618 | 3.5 s | 4.3 s | 4.0 s | 4.5 s |
+| `os.path.join($A, $B)` (python) | 257 | 111 | — | 111 | **2 ms** | 43 ms | 80 ms | 113 ms |
+| `def $F(self, $$$): $$$` (python) | 1,819 | 205 | — | 204 | **4 ms** | 38 ms | 83 ms | 123 ms |
+
+`container_of` is rule 2's cost made visible: 6,925 of its 8,934 files hold a recovered
+call (a type as an argument), so they parse. The `structural_search` rows sit on a ~100 ms
+floor that is the tree walk itself (see the allocation pass). Against the first tgrep record:
+`code_search kmalloc` 4.3 s → 0.46 s (chunk parse) → **35 ms**; tgrep answers `kmalloc\(`
+in 18 ms as a line list.
+
+### `search`, the 102-query suite, body list on / off, back to back on one index
+
+| arm | median | total | identifiers top-hit exact |
+|---|---:|---:|---:|
+| body off | 0.68 ms | 83.9 ms | 65 / 82 |
+| body on | 0.80 ms | 122.8 ms | 65 / 82 |
+
+Identical rankings (the earlier 69/82 was a retrained learned tier on a new generation, not
+the body list); the +39 ms total is the ~20 non-identifier queries that fire the body list at
+~2 ms each. A first run right after the rebuild read 1.9–3.5 ms median — the tier warming,
+reproduced by the off arm's 3.49 → 0.68 ms on the same daemon order.
+
+### Recall gate (searcheval, k=25), body list on / off
+
+| corpus | class | NDCG@10 on / off | MRR on / off | recall@5 on / off | latency mean on / off |
+|---|---|---:|---:|---:|---:|
+| CPython (54) | all | 0.306 / 0.306 | 0.291 / 0.291 | 0.333 / 0.333 | 586 µs / 467 µs |
+| this repo (55) | all | 0.409 / 0.389 | 0.398 / 0.385 | 0.464 / 0.400 | 36 ms / 0.57 ms (before the oversized-file skip; after: see below) |
+
+| Linux kernel (54) | all | 0.329 / 0.302 | 0.327 / 0.293 | 0.358 / 0.340 | 7.5 ms / 2.3 ms (max 127 / 52 ms) |
+
+CPython: byte-identical metrics. This repo: recall@5 up 0.400 → 0.464 on the short-keyword
+class (queries whose words name no definition), paraphrase unchanged at 0. Kernel: every
+class at or above the off arm (exact and subset identical, paraphrase 0.011 NDCG from 0,
+short-keyword MRR 0.224 from 0.218). Latency on the kernel is the body list's own work,
+traced per stage: 12 ms mean on the 70 of 108 searches that fire it (candidates 1.5 ms,
+files read and attributed 9.9 ms), 0 elsewhere. A first kernel gate read 98 ms mean on the
+on arm — a torn postings tier from a daemon killed mid-warm between the arms (the name
+channel fell back to its exhaustive scan at ~210 ms a query, on both arms once traced), not
+the body list; the tier was rebuilt to completion and both arms rerun back to back.
+
+After the oversized-file skip, this repo again (same index): body on 0.402 / 0.395 / 0.445,
+off 0.389 / 0.385 / 0.400; latency mean 4.8 ms on (max 79 ms) against 0.50 ms off — the
+remaining cost is the pool of files a phrase query reads, paid only by queries whose words
+name no definition.
+
+### The allocation, page-fault, and contention pass
+
+Ledger daemon (`cargo build --release -p vorpal --features alloc-ledger --target-dir
+target/ledger`, the CLI binary's jemalloc wrapped in the vorpal-kg event counters, a new
+feature), `VORPAL_PHASE_TRACE=1`, kernel index, per call = deltas between the call's first
+and last phase stamps, rep 3 of 3 (`scratchpad/prof/run5.py`).
+
+Before → after, per call:
+
+| call | allocations | reallocations | allocated | minor faults | involuntary switches | wall |
+|---|---:|---:|---:|---:|---:|---:|
+| `code_search kmalloc($A, $B)` (references) | 41,769 → **13,447** | 8,143 → **1,205** | 433 MB → **28 MB** | 21,803 → **1,885** | 1,005 → 702 | 48 → 31 ms |
+| `code_search WARN_ON($A)` (references) | 75,646 → **22,077** | 21,311 → **1,240** | 749 MB → **82 MB** | 35,576 → **3,888** | 1,642 → 771 | 74 → 56 ms |
+| `code_search if ($C) return $X;` (chunks, memo) | 2.27 M → 1.46 M | 816,340 → **1,392** | 1.97 GB → 0.95 GB | 71,215 → 42,319 | 47,778 → 27,259 | 3.54 → 3.12 s |
+| `structural_search kmalloc($A, $B)` | 501,061 → 478,714 | 337,465 → 337,472 | 533 MB → 134 MB | 22,847 → 2,857 | 5,186 → 4,046 | 186 → 140 ms |
+| `text_search FIXME` | 24,035 → 24,043 | 18,085 → 18,082 | 41 MB → 39 MB | 1,767 → 1,644 | 2,507 → 414 | 32 → 20 ms |
+| `search`, name evidence | 1,187 → 1,187 | 213 → 213 | — | 16 → 16 | 0 → 0 | 1.2 → 0.6 ms |
+
+Voluntary context switches were 0–3 on every row before and after: **no lock contention
+anywhere in these paths** (the involuntary ones are CPU preemption across 18 workers).
+What moved the numbers:
+
+- **Reference rows read in place.** The reference path decoded the whole product view per
+  file (items, members, refs, params: ~12 allocations and 6 faults a file). A `refs_off`
+  u32 in the v21 header (offset 52, patched after the outline is encoded) and
+  `peek_product_refs` iterate the rows with no allocation.
+- **Per-thread read buffer and scan scratch.** `code_search` and the MCP scanner read every
+  file into a fresh `Vec` (`fs::read`); now a thread-local buffer (rayon's workers persist)
+  and a thread-local `ChunkScratch` (cuts, anchors, chunks, memo keys, starts, spans) — no
+  allocation per file after the first, and the earlier process-wide buffer pool's two mutex
+  operations per file are gone. That is the 8,143 → 1,205 and 816,340 → 1,392
+  reallocation columns.
+- What is left: on the reference path ~3.8 allocations per matched file are the output
+  (a `BTreeMap` of definitions and the record vector); on the chunk path ~34 per file are
+  ast-grep's per-candidate metavariable environments inside `find_all` (381,811 matches) —
+  the matcher's own cost, not the scan's; `text_search` is output-bound (one `String` per
+  matching line, four allocations a record); `structural_search` is the tree walk: 63k
+  `PathBuf`s and a sort every call, 478k allocations of its 479k.
+- **Walk cache** (after this profile): the structural tools remember the walk per
+  `(root, language, suffix)` under an epoch the daemon bumps on every watcher event (and
+  before every call if the watcher holds an unseen event); no watcher, no cache.
+  Traced on the kernel index (`VORPAL_PHASE_TRACE=1`, stamps around the walk):
+  `structural_search netif_napi_add($A, $B, $C)` 187 ms on the first call (the walk is
+  104 ms of it) then **10–16 ms**; `structural_search kmalloc($A, $B)` **51–54 ms** for all
+  2,715 matches (135 ms before the cache); `rule_search` on the same pattern ~410 ms — the
+  rule path has no reference shortcut and no memo, it parses its 3,572 candidate files
+  chunk-scoped every call. The first version keyed the cache on a per-call check of the
+  watcher's dirty flag and never hit: the flag is a level the tick consumes, so back-to-back
+  calls inside one dirty window re-walked every time, and two events in one window would
+  have left a stale list. The cache now keys on the watcher's event count (a level that only
+  rises), so any event after a walk misses.
+
+### Format bump, and the whole-file memo
+
+The product format moved to **22**: v21's layout changed three times under one number
+(cuts, the call shape, `refs_off`), and a bench index written by one intermediate binary
+was misread by the next — the number now names one layout. Files the exactness rules send
+to the whole-file parse (an anchor chunk tree-sitter recovered in, or no cut table) are now
+memoized as one chunk keyed by the file's bytes, in `code_search` and in the structural
+tools' span-only paths, so a repeat of the pattern re-parses only files whose bytes moved.
+
+Kernel, `if ($C) return $X;` (381,811 matches; 28,511 of 43,129 candidate files parse
+whole under the error rule), one daemon, first call then two repeats:
+
+| tool | first call | repeat |
+|---|---:|---:|
+| `code_search` | 3.65 s | **0.38–0.48 s** (133,860 memo replays) |
+| `structural_search` | 3.22 s | **0.43 s** |
+| `rule_search`, bare pattern | 3.20 s | **0.44–0.46 s** |
+
+The repeat is what remains after no parse at all: reading and digest-verifying 43k files,
+the anchor scan, and building 381k records. An edit re-parses exactly the files (or chunks)
+whose bytes moved.
+
+### Artifacts
+Kernel `.vorpal` rebuilt cold three more times under v21 before the bump; gate indexes for
+CPython and this repo under the session scratch, deleted after recording; `tgrep_bench.json`
+holds run 7 and the search A/B.
+
+### `rule_search` shortcuts and paging that replays (2026-09-07, last)
+
+- A rule that is exactly `rule: {pattern: P}` — no `fix`, `constraints`, `utils`,
+  `transform`, `rewriters` — has span-only records, so it takes the same two parse-free
+  answers as `structural_search`: the reference rows for a call shape, and a chunk memo of
+  `(start, end, kind)` triples per verified chunk (a second memo, salted apart from
+  `code_search`'s starts). A rule with a `fix` needs the match environment and keeps the
+  parse path.
+- The structural tools remember their result set for paging, keyed on the tool, every
+  argument except `cursor`/`limit`/`format`, the served generation, and the watcher's event
+  count; a cursor call replays the set, a first call always recomputes. Eight sets kept.
+
+Kernel index, one daemon, 3 reps:
+
+| call | before | now |
+|---|---:|---:|
+| `rule_search` bare `kmalloc($A, $B)` | 410–540 ms | **30–34 ms** (3,571 files from references) |
+| `rule_search` with `fix:` on the same pattern | 460–520 ms | 460–495 ms (parse path by design) |
+| `rule_search` bare `if ($C) return $X;` (381,811 hits) | 4.0–4.3 s | 3.0–3.6 s (chunk memo on repeats; 28k of 43k files parse whole by the error rule) |
+| `structural_search WARN_ON($A)` | 159 ms | **59–83 ms** (cached walk + references) |
+| any second page of the above | a full re-run (382 pages × 4 s for 381k hits) | **0.3–2.3 ms** |
+
+A first page after a multi-second search occasionally absorbs a daemon tick (130–140 ms
+seen once each on two runs); later pages sit at the replay floor.
+
+## The README refresh for 0.9.0: one index number, tgrep and cbm re-run (2026-09-07, last)
+
+- **Canonical index rows** (`evals/readme_bench.py --phases index17`, quiet gate): kernel
+  cold 10.66 / 10.62 / 11.0 s with a git process at 38–42 % of a core during every rep,
+  RSS 5.9–6.1 GB, 4.84 GB on disk, unchanged 0.11 s best; CPython 0.86 s best, 0.73 GB,
+  0.16 GB, unchanged 0.02 s; this repo 6.93 s best, 11.6–12.2 GB, 0.86 GB, unchanged
+  0.02 s. Because 10.6 s is 2.5 s over the v0.8.4 row, an interleaved A/B against the
+  installed 0.8.0 binary followed under the same gate (`--control old=/usr/local/bin/vorpal`):
+  new 9.01 / 8.09 / 8.29 s, old 8.67 / 8.57 / 9.08 s, `fseventsd` at 100–116 % of a core
+  on every rep, nothing else hot. No regression; **8.1 s** (best of 3) is the number in
+  every README table. New RSS 5.9–6.1 GB against old 5.3 GB: the v22 products carry cuts
+  and call shapes, +0.3 GB on disk (4.5 → 4.8 GB).
+- **tgrep** (`--phases build`, interleaved, 3 reps, `fseventsd` ~100 %): kernel 8.63 / 8.17 /
+  7.76 s, 0.31 GB, 1.0 GB; CPython 0.61 / 0.53 / 0.54 s, 0.14 GB, 74 MB; this repo
+  0.77 / 0.63 / 0.69 s, 0.26 GB, 28 MB. vorpal in the same interleave: kernel 13.15
+  (under a test suite I then killed) / 9.32 / 8.79 s; the README uses the canonical row.
+- **cbm** (`evals/cbm_bench.py`, `mode: full`, process-tree RSS at 50 ms):
+  kernel 295.6 s, 30.8 GB, 8,529,631 nodes / 15,982,096 edges, 15.8 GB, re-index 14.2 s;
+  CPython 38.5 s, 6.5 GB, 136,118 / 867,558, 632 MB, 5.2 s; this repo 43.1 s, 31.8 GB,
+  67,797 / 215,090, 297 MB, 5.4 s. `search_graph` (BM25, limit 25) graded with the
+  searcheval math on today's label files — kernel 0.218 / 0.188 / 0.293 (exact class
+  0.674 / 0.562 / 1.000, paraphrase 0), CPython 0.200 / 0.205 / 0.222, this repo
+  0.462 / 0.466 / 0.473 (exact 0.979 / 1.000 / 1.000, short-keyword 0.795 / 0.845 / 0.750).
+  One-shot latency: search 5.9 s kernel, 3.5 s the others; `trace_path` callers of
+  `vfs_read` 3.8–4.1 s. The first grading pass read 0.000 everywhere: cbm answers as a
+  text table inside `content[0].text`, not a JSON list; the parser was fixed and the
+  three corpora regraded. The 2026-09-03 record's cbm peak of 70.3 GB on the kernel was
+  30.8 GB today under the same sampler shape.
+- **vorpal one-shots** (kernel index, no daemon): `search vfs_read` 2.70 s on the first
+  touch then 0.15 / 0.14 s; `graph callers vfs_read` 0.01 s ×3.
+- **Kernel edit lanes** on the final binary (`readme_bench.py --phases edit` and
+  `edit_classes.py`, kernel copy, quiet gate, `fseventsd` ~100 %): add a function 0.87 /
+  0.96 / 0.87 s and 0.80 / 0.80 / 0.91 s, body edit 0.36 / 0.36 / 0.36 s, comment only
+  0.23 / 0.23 / 0.23 s, touch 0.23 s, unchanged 0.13 s — every README edit row holds under
+  the v22 products.
+- **Final suites** (core, kg, ingest, index, mcp, mem): no failing result line.

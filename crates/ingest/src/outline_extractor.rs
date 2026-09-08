@@ -165,6 +165,7 @@ fn product_from_parts(parts: product::ExtractedParts<'_>) -> FileProduct {
       error_bytes: parts.error_bytes,
       error_spans: parts.error_spans,
       swallows: parts.swallows,
+      cuts: parts.cuts,
       items: parts.items.into_iter().map(product::own_item).collect(),
       // The batch-path ownership point: names/qualifiers rode through extraction as borrows
       // of `source`; they are copied exactly once, here, into the detachable product.
@@ -182,6 +183,7 @@ fn product_from_parts(parts: product::ExtractedParts<'_>) -> FileProduct {
           alias: r.alias.map(Cow::into_owned),
           receiver_type: r.receiver_type.map(str::to_string),
           receiver_type_origin: r.receiver_type_origin,
+          call_shape: r.call_shape,
           receiver: r.receiver.map(Cow::into_owned),
           args: r
             .args
@@ -1179,6 +1181,7 @@ impl OutlineExtractor {
           receiver_type: receiver_typing.map(|(ty, _)| ty),
           receiver_type_origin: receiver_typing.map(|(_, o)| o.tag()).unwrap_or(0xFF),
           receiver: r.receiver,
+          call_shape: r.call_shape,
           args: r.args,
         }
       })
@@ -1193,6 +1196,7 @@ impl OutlineExtractor {
       error_bytes,
       error_spans,
       swallows,
+      cuts: top_level_cuts(&root),
       items,
       refs,
       entity_params,
@@ -1201,6 +1205,33 @@ impl OutlineExtractor {
       requests: raw_requests,
     }))
   }
+}
+
+/// `(start byte, has_error)` of every direct child of the parse root, ascending (product v21
+/// `cuts`). Every named and anonymous child counts except comments — each is a complete node, so a
+/// parse of the text from one cut to the next reproduces that child exactly; a comment
+/// rides in the gap after the preceding child (the consumer's chunk carries its trailing
+/// gap), so a trailing comment leaves the table unchanged and the stamp-only cutoff lane
+/// still recognizes that edit as extraction-identical. Empty past
+/// [`product::MAX_PRODUCT_CUTS`] children (the consumer then parses the whole file).
+fn top_level_cuts(root: &vorpal_core::Node<'_, vorpal_core::tree_sitter::StrDoc<SgLang>>) -> Vec<(u32, bool)> {
+  let mut cuts: Vec<(u32, bool)> = Vec::with_capacity(root.children().count().min(product::MAX_PRODUCT_CUTS));
+  for child in root.children() {
+    if child.kind().contains("comment") {
+      continue;
+    }
+    if cuts.len() >= product::MAX_PRODUCT_CUTS {
+      return Vec::new();
+    }
+    let start = child.range().start as u32;
+    if cuts.last().is_some_and(|&(last, _)| start < last) {
+      // Children are in document order; a regression would make the section unusable.
+      return Vec::new();
+    }
+    // `has_error` is tree-sitter's O(1) subtree flag: an ERROR or MISSING anywhere below.
+    cuts.push((start, child.has_error()));
+  }
+  cuts
 }
 
 /// [`local_layout`]'s product: borrowed entity identities plus `(byte range, id)` spans, both

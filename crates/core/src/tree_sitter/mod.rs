@@ -36,6 +36,10 @@ std::thread_local! {
   /// Injection parsing (which sets included ranges) deliberately does NOT use this slot:
   /// it builds fresh parsers, so the shared one never carries range state between files.
   static REUSED_PARSER: std::cell::RefCell<Option<Parser>> = const { std::cell::RefCell::new(None) };
+  /// The parser for range-scoped parses ([`StrDoc::try_new_ranged`]): every use sets its own
+  /// included ranges and clears them after, so it can be reused without leaking range state
+  /// into a whole-file parse.
+  static RANGED_PARSER: std::cell::RefCell<Option<Parser>> = const { std::cell::RefCell::new(None) };
 }
 
 #[inline]
@@ -102,6 +106,50 @@ impl<L: LanguageExt> StrDoc<L> {
   pub fn new(src: &str, lang: L) -> Self {
     Self::try_new(src, lang).expect("Parser tree error")
   }
+
+  /// Parse only `ranges` of `src` (tree-sitter included ranges): the tree covers those byte
+  /// ranges and nothing else, with every node positioned at its absolute offset in `src`.
+  /// The ranges must be ascending and non-overlapping. Uses its own per-thread parser so the
+  /// whole-file slot never carries range state.
+  pub fn try_new_ranged(src: &str, lang: L, ranges: &[tree_sitter::Range]) -> Result<Self, String> {
+    if ranges.is_empty() {
+      return Self::try_new(src, lang);
+    }
+    let tree = parse_ranges(src, &lang, ranges)?;
+    Ok(Self {
+      src: src.to_string(),
+      lang,
+      tree,
+    })
+  }
+
+  /// A document from parts already in hand — the source string and a tree parsed over it
+  /// ([`parse_ranges`]) — so a caller parsing one file chunk by chunk moves one `String`
+  /// through each document instead of copying the file per chunk (see [`Root::into_doc`]).
+  pub fn from_parts(src: String, lang: L, tree: Tree) -> Self {
+    Self { src, lang, tree }
+  }
+}
+
+/// The tree of `ranges` of `src` alone (tree-sitter included ranges), nodes at their
+/// absolute offsets. A dedicated per-thread parser: every call sets its own ranges and
+/// clears them after, so the whole-file slot never carries range state.
+pub fn parse_ranges<L: LanguageExt>(src: &str, lang: &L, ranges: &[tree_sitter::Range]) -> Result<Tree, String> {
+  let ts_lang = lang.get_ts_language();
+  RANGED_PARSER.with(|slot| -> Result<Tree, String> {
+    let mut slot = slot.borrow_mut();
+    let parser = slot.get_or_insert_with(Parser::new);
+    parser.set_included_ranges(ranges).map_err(|e| format!("{e:?}"))?;
+    parser.set_language(&ts_lang).map_err(|e| e.to_string())?;
+    let parsed = parser.parse(src.as_bytes(), None);
+    // Leave no range state behind for the next caller (every use sets its own, but a
+    // failed set above would otherwise inherit these).
+    let _ = parser.set_included_ranges(&[]);
+    parsed.ok_or_else(|| TSParseError::TreeUnavailable.to_string())
+  })
+}
+
+impl<L: LanguageExt> StrDoc<L> {
 
   /// Incremental construction from a previous parse of the SAME file: `history` is the
   /// old source and its tree. The old tree is cloned (a refcount bump), edited with the
@@ -522,6 +570,11 @@ impl<L: LanguageExt> Root<StrDoc<L>> {
   }
   pub fn try_new(src: &str, lang: L) -> Result<Self, String> {
     let doc = StrDoc::try_new(src, lang)?;
+    Ok(Self { doc })
+  }
+  /// [`StrDoc::try_new_ranged`], wrapped as a root.
+  pub fn try_new_ranged(src: &str, lang: L, ranges: &[tree_sitter::Range]) -> Result<Self, String> {
+    let doc = StrDoc::try_new_ranged(src, lang, ranges)?;
     Ok(Self { doc })
   }
   pub fn get_text(&self) -> &str {

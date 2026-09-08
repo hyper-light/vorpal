@@ -266,41 +266,11 @@ pub fn filter_source_rule(
   Ok(ret)
 }
 
-/// Cap on prebuilt finders per matcher: the longest (most selective) literals win the slots.
-const MAX_PREFILTER_LITERALS: usize = 8;
+pub use vorpal_core::matcher::Prefilter;
 
-/// Pre-parse literal filter (§12): SIMD substring finders (memchr/memmem) over a matcher's
-/// required literals, checked against the raw bytes with per-token AND semantics. A file
-/// missing any required literal cannot match, so it is skipped before tree-sitter ever runs.
-/// Purely a necessary condition — matching semantics are unchanged.
-pub struct Prefilter {
-  finders: Vec<memchr::memmem::Finder<'static>>,
-}
-
-impl Prefilter {
-  pub fn for_rule(rule: &Rule) -> Self {
-    Self::from_literals(rule.required_literals())
-  }
-
-  fn from_literals(mut literals: Vec<&str>) -> Self {
-    literals.sort_unstable();
-    literals.dedup();
-    literals.sort_by_key(|l| std::cmp::Reverse(l.len()));
-    let finders = literals
-      .into_iter()
-      .take(MAX_PREFILTER_LITERALS)
-      .map(|l| memchr::memmem::Finder::new(l.as_bytes()).into_owned())
-      .collect();
-    Self { finders }
-  }
-
-  /// True when every required literal occurs in `content` (vacuously true with no literals).
-  pub fn may_match(&self, content: &str) -> bool {
-    self
-      .finders
-      .iter()
-      .all(|finder| finder.find(content.as_bytes()).is_some())
-  }
+/// The pre-parse literal filter of a rule (§12): [`Prefilter`] over its required literals.
+pub fn prefilter_for_rule(rule: &Rule) -> Prefilter {
+  Prefilter::from_literals(rule.required_literals())
 }
 
 // sub_matchers are the injected languages
@@ -328,10 +298,10 @@ pub fn filter_source_pattern<'a>(
   // §12 fast path: consult required literals BEFORE parsing. Injected-language matchers are
   // checked against the whole file (injected regions are substrings of it — sound). A file no
   // candidate matcher can match never reaches tree-sitter.
-  let root_filter = root_matcher.map(Prefilter::for_rule);
+  let root_filter = root_matcher.map(prefilter_for_rule);
   let sub_filters: Vec<Prefilter> = sub_matchers
     .iter()
-    .map(|(_, matcher)| Prefilter::for_rule(matcher))
+    .map(|(_, matcher)| prefilter_for_rule(matcher))
     .collect();
   let root_viable = root_filter
     .as_ref()
@@ -430,13 +400,13 @@ mod test {
   fn test_prefilter_gates_on_required_literals() {
     use vorpal_core::Pattern;
     let lang = SgLang::Builtin(SupportLang::Rust);
-    let filter = Prefilter::for_rule(&Rule::Pattern(Pattern::new("special_sentinel($A)", lang)));
+    let filter = prefilter_for_rule(&Rule::Pattern(Pattern::new("special_sentinel($A)", lang)));
     assert!(filter.may_match("fn x() { special_sentinel(1); }"));
     // Per-token AND is formatting-insensitive.
     assert!(filter.may_match("special_sentinel ( 1 )"));
     assert!(!filter.may_match("fn x() { other(1); }"));
     // A metavariable-only pattern requires nothing and gates nothing.
-    let all_pass = Prefilter::for_rule(&Rule::Pattern(Pattern::new("$A", lang)));
+    let all_pass = prefilter_for_rule(&Rule::Pattern(Pattern::new("$A", lang)));
     assert!(all_pass.may_match("anything at all"));
   }
 

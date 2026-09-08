@@ -62,8 +62,11 @@ pub fn run_if_sentinel() {
         }
         None => None,
       };
+      let text_index = rest.iter().any(|arg| arg == "--text-index")
+        || std::env::var("VORPAL_TEXT_INDEX").is_ok_and(|v| v == "1");
       let options = crate::WarmOptions {
         dense_budget_secs: cap,
+        text_index,
       };
       match crate::warm_ann_with(Path::new(&dir), options) {
         Ok(()) => 0,

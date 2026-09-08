@@ -50,7 +50,12 @@ migration, policy #1). The format is a property of a generation, never mixed wit
    "unavailable" (or fall back to exact-but-slower paths) while queries stay correct.
 4. **Additive sidecars are the only writes an existing generation admits**, and each must be
    self-validating: the ANN tier and posting tier are stamped with the node-segment hash
-   (plus model provenance for ANN); `names.idx` is backfilled once and validated on read.
+   (plus model provenance for ANN); `names.idx` is backfilled once and validated on read;
+   the text tier (`trigrams/<k>.tri`) validates **per bucket** against a fold of that
+   bucket's per-file source digests, so a bucket whose files changed reads as uncovered
+   (its files scan exhaustively) until the daemon's next warm rebuilds it — a from-scratch
+   build never writes it, the compose lanes delta it, and `commit_generation` hard-links
+   it forward like the ANN tier. None of these sidecars enters generation identity.
 5. **The durable identities are external ids (`eid:<32 hex>`) and the source tree**, not the
    on-disk format. Pre-1.0, the index format is explicitly not a cross-version interchange
    format; nothing needs migrating because nothing is lost by rebuilding.
@@ -60,7 +65,7 @@ migration, policy #1). The format is a property of a generation, never mixed wit
 <!-- BEGIN GENERATED VERSION TABLE -->
 | Artifact | Constant | Value | On mismatch |
 |---|---|---|---|
-| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 20 | cache miss → re-parse |
+| extraction products (`products/*.vpb`, pack bodies) | `PRODUCT_FORMAT_VERSION` (crates/ingest/src/product.rs) | 22 | cache miss → re-parse |
 | product pack, bucketed layout (`products/<k>.pack` + `products/toc.bin`) — the default | `BUCKET_VERSION` (crates/ingest/src/pack.rs) | 1 | pack ignored → rebuilt by next build |
 | product pack, legacy flat layout (`products.pack`/`products.idx`) — deprecated, written only under `VORPAL_FORMAT=flat`; reads retained | `PACK_VERSION` (crates/ingest/src/pack.rs) | 2 | pack ignored → rebuilt by next build |
 | graph segments (`*.vseg`, `strings.heap`, `graph.bin`) | `FORMAT_VERSION` (crates/segment/src/format.rs) | 1 | `Kg::load` fails loudly → rebuild |
@@ -75,6 +80,7 @@ migration, policy #1). The format is a property of a generation, never mixed wit
 | calls-graph communities (`communities.bin`) | `VERSION` (crates/kg/src/communities.rs) | 1 | sidecar treated as absent → `community` answers `null`, `architecture` says not built → warm rebuilds |
 | semantic engine calibration (`ann.calib`) | `ANN_CALIB_VERSION` (crates/index/src/lib.rs) | 1 | calibration treated as absent → structural routing floor (full-population fetches scan; the beam keeps everything below) → next warm re-measures |
 | learned embedding model (`ann.model.bin`) | `LEARNED_MODEL_VERSION` (crates/ann/src/learned/persist.rs) | 3 | model unreadable/stale → lexical fallback stated in provenance → warm retrains |
+| text tier — trigram postings per file bucket (`trigrams/<k>.tri` + `trigrams/toc.bin`), a sidecar outside generation identity | `VERSION` (crates/kg/src/trigramstore.rs) | 1 | bucket treated as absent → its files scan exhaustively → the daemon's next warm heals it from source |
 <!-- END GENERATED VERSION TABLE -->
 
 The ANN tier itself (`ann.bin` + `ann.files` + `ann.stamp`) is freshness-gated by the

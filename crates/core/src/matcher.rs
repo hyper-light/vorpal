@@ -8,6 +8,7 @@
 mod kind;
 mod node_match;
 mod pattern;
+mod prefilter;
 mod text;
 
 use crate::Doc;
@@ -18,8 +19,9 @@ use std::borrow::Cow;
 
 pub use kind::{KindMatcher, KindMatcherError, kind_utils};
 pub use node_match::NodeMatch;
-pub use pattern::{DumpPattern, Pattern, PatternBuilder, PatternError, PatternNode};
-pub use text::{RegexMatcher, RegexMatcherError};
+pub use pattern::{DumpPattern, Pattern, PatternBuilder, PatternError, PatternNode, PatternSpec};
+pub use prefilter::{MAX_PREFILTER_LITERALS, Prefilter};
+pub use text::{MAX_LITERAL_BRANCHES, RegexMatcher, RegexMatcherError, regex_literal_branches, regex_required_literals};
 
 /// `Matcher` defines whether a tree-sitter node matches certain pattern,
 /// and update the matched meta-variable values in `MetaVarEnv`.

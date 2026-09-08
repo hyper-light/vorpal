@@ -731,8 +731,22 @@ impl ServedPersist {
       .map_err(|err| format!("served persist: evidence bases: {err}"))?;
     // Three independent artifact groups write concurrently; the manifest stays last (the
     // commit point), exactly like the pipeline's tail.
-    let (pack_result, evidence_result, dataflow_result, sigs_result, kg_result) =
+    // The text tier's delta: exactly the edited files' buckets rebuilt from disk, every other
+    // slab hard-linked (absent when the prior carries no family — the warm heals a first one).
+    let text_changed: Vec<crate::trigrams::ChangedFile> = new_products
+      .iter()
+      .filter_map(|(path, _)| {
+        let entries = manifest.entries();
+        let at = entries.binary_search_by(|e| e.path.as_str().cmp(path.as_str())).ok()?;
+        Some(crate::trigrams::ChangedFile {
+          path: path.clone(),
+          size: entries[at].size,
+        })
+      })
+      .collect();
+    let (pack_result, evidence_result, dataflow_result, sigs_result, kg_result, text_result) =
       std::thread::scope(|scope| {
+        let text_task = scope.spawn(|| crate::trigrams::compose_delta(&prior, &staging, &tree_root, &text_changed));
         let pack_task = scope.spawn(|| -> std::io::Result<()> {
           let reader = PackReader::open_rooted(&prior, Some(&tree_root)).map(Arc::new);
           let writer = PackWriter::new(
@@ -770,8 +784,14 @@ impl ServedPersist {
           dataflow_task.join().expect("dataflow saver panicked"),
           sigs_task.join().expect("sigs saver panicked"),
           kg_result,
+          text_task.join().unwrap_or_else(|_| Err(std::io::Error::other("text tier delta panicked"))),
         )
       });
+    if let Err(err) = text_result {
+      // Never fails a persist: the generation commits without the family (absent, not wrong).
+      vorpal_kg::phase_stamp(&format!("served persist: text tier delta dropped the family: {err}"));
+      let _ = fs::remove_dir_all(staging.join(vorpal_kg::TRIGRAMS_DIR));
+    }
     pack_result.map_err(|err| format!("served persist: pack: {err}"))?;
     evidence_result.map_err(|err| format!("served persist: evidence: {err}"))?;
     dataflow_result.map_err(|err| format!("served persist: dataflow: {err}"))?;

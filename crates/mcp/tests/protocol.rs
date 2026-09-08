@@ -98,6 +98,7 @@ fn initialize_handshake_and_tool_listing() {
       "schema",
       "coverage",
       "code_search",
+      "text_search",
       "architecture",
       "compare_generations",
       "impact",
@@ -226,6 +227,20 @@ fn modern_era_is_served_statelessly() {
   assert!(!is_err);
   assert!(text.contains("caller"));
 
+  // `mentions: true` adds the absence proof: b.rs defines target and a.rs calls it, so no
+  // file outside the graph's answer spells the name — empty and complete.
+  let response = request(
+    &mut server,
+    111,
+    "tools/call",
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target", "mentions": true}}),
+  );
+  let mentions = &response["result"]["structuredContent"]["mentions"];
+  assert_eq!(mentions["unattributedFiles"], 0, "{mentions}");
+  assert_eq!(mentions["complete"], true, "{mentions}");
+  assert_eq!(mentions["attributedFiles"], 2, "{mentions}");
+  assert_eq!(mentions["records"].as_array().map(Vec::len), Some(0));
+
   let _ = fs::remove_dir_all(src.parent().unwrap());
 }
 
@@ -246,7 +261,7 @@ fn profiles_gate_both_the_listing_and_the_calls() {
     .iter()
     .map(|t| t["name"].as_str().unwrap())
     .collect();
-  assert_eq!(names, ["schema", "node", "fetch_span", "snippet", "search"]);
+  assert_eq!(names, ["schema", "text_search", "node", "fetch_span", "snippet", "search"]);
 
   // Advertised tools answer; unlisted tools are unknown to this daemon — a protocol error,
   // exactly as for a name that exists nowhere — so the listing and the gate never drift.
@@ -456,6 +471,115 @@ fn rule_search_and_ast_dump_serve_the_full_rule_model() {
   // Dry run means dry: the file still holds the original call.
   let a_rs = fs::read_to_string(src.join("a.rs")).unwrap();
   assert!(a_rs.contains("target()") && !a_rs.contains("replaced"), "{a_rs}");
+
+  // The same hits ride structuredContent as records (paged like every record tool).
+  let response = request(
+    &mut server,
+    12,
+    "tools/call",
+    json!({"name": "rule_search", "arguments": {"rule": rule}}),
+  );
+  let records = response["result"]["structuredContent"]["records"].as_array().expect("rule records");
+  assert_eq!(records.len(), 1, "{records:?}");
+  assert_eq!(records[0]["rule"], "retarget");
+  assert!(records[0]["path"].as_str().unwrap().ends_with("a.rs"));
+  assert_eq!(records[0]["line"], 4);
+  assert_eq!(records[0]["fixes"][0], "replaced()");
+  assert_eq!(response["result"]["structuredContent"]["outcome"], "hits");
+
+  // A bare-pattern rule (no fix/constraints) has span-only records: it is answered through
+  // the reference shortcut or the chunk memo like `structural_search`, same record shape.
+  let response = request(
+    &mut server,
+    121,
+    "tools/call",
+    json!({"name": "rule_search", "arguments": {"rule": "id: bare\nlanguage: rust\nrule:\n  pattern: target()\n"}}),
+  );
+  let sc = &response["result"]["structuredContent"];
+  let bare = sc["records"].as_array().expect("bare rule records");
+  assert_eq!(bare.len(), 1, "{sc}");
+  assert_eq!(bare[0]["rule"], "bare");
+  assert_eq!(bare[0]["line"], 4);
+  assert_eq!(bare[0]["column"], 5);
+  assert_eq!(bare[0]["text"], "target()");
+  assert!(sc["callSiteFiles"].as_u64().is_some(), "{sc}");
+
+  // Paging replays the remembered set: two definitions, one per page, a cursor between.
+  let first = request(
+    &mut server,
+    122,
+    "tools/call",
+    json!({"name": "structural_search", "arguments": {"pattern": "pub fn $F() -> i32 { $$$ }", "lang": "rust", "limit": 1}}),
+  );
+  let sc1 = &first["result"]["structuredContent"];
+  assert_eq!(sc1["total"], 2, "{sc1}");
+  assert_eq!(sc1["records"].as_array().unwrap().len(), 1);
+  let cursor = sc1["nextCursor"].as_str().expect("a second page").to_string();
+  let second = request(
+    &mut server,
+    123,
+    "tools/call",
+    json!({"name": "structural_search", "arguments": {"pattern": "pub fn $F() -> i32 { $$$ }", "lang": "rust", "limit": 1, "cursor": cursor}}),
+  );
+  let sc2 = &second["result"]["structuredContent"];
+  assert_eq!(sc2["total"], 2, "{sc2}");
+  let (p1, p2) = (sc1["records"][0]["path"].as_str().unwrap(), sc2["records"][0]["path"].as_str().unwrap());
+  assert_ne!(p1, p2, "each page holds a different definition: {sc1} {sc2}");
+  assert!(sc2["nextCursor"].is_null(), "{sc2}");
+
+  // structural_search: records with path/line/column/kind/text, and the honesty margins.
+  let response = request(
+    &mut server,
+    13,
+    "tools/call",
+    json!({"name": "structural_search", "arguments": {"pattern": "target()", "lang": "rust"}}),
+  );
+  let sc = &response["result"]["structuredContent"];
+  let records = sc["records"].as_array().expect("structural records");
+  assert_eq!(records.len(), 1, "{sc}");
+  assert!(records[0]["path"].as_str().unwrap().ends_with("a.rs"));
+  assert_eq!(records[0]["line"], 4);
+  assert_eq!(records[0]["kind"], "call_expression");
+  assert_eq!(records[0]["text"], "target()");
+  assert_eq!(sc["candidateFiles"], 2);
+  assert_eq!(sc["scannedFiles"].as_u64().unwrap() + sc["prefilteredFiles"].as_u64().unwrap() + sc["prunedFiles"].as_u64().unwrap(), 2);
+  assert!(sc["chunkParsedFiles"].as_u64().is_some(), "{sc}");
+  let text = response["result"]["content"][0]["text"].as_str().unwrap();
+  assert!(text.contains("a.rs:4:5  target()"), "{text}");
+
+  // text_search: grep-shaped records over the indexed files, with the enclosing symbol.
+  let response = request(
+    &mut server,
+    14,
+    "tools/call",
+    json!({"name": "text_search", "arguments": {"pattern": r"target\(\)"}}),
+  );
+  let sc = &response["result"]["structuredContent"];
+  let records = sc["records"].as_array().expect("text records");
+  // a.rs:4 (the call) and b.rs:1 (the definition `pub fn target() -> i32`), path order.
+  assert_eq!(records.len(), 2, "{sc}");
+  assert!(records[0]["path"].as_str().unwrap().ends_with("a.rs"));
+  assert_eq!(records[0]["line"], 4);
+  assert_eq!(records[0]["column"], 5);
+  assert_eq!(records[0]["text"], "    target()");
+  assert_eq!(records[0]["symbol"], "caller");
+  assert!(records[1]["path"].as_str().unwrap().ends_with("b.rs"));
+  assert_eq!(records[1]["symbol"], "target");
+  assert_eq!(sc["totalMatches"], 2);
+  assert_eq!(sc["matchedFiles"], 2);
+  assert!(sc["index"] == "trigram" || sc["index"] == "full-scan", "{sc}");
+  // No three-byte literal: an honest full scan, same answer.
+  let response = request(
+    &mut server,
+    15,
+    "tools/call",
+    json!({"name": "text_search", "arguments": {"pattern": "t.rg.t"}}),
+  );
+  let sc = &response["result"]["structuredContent"];
+  assert_eq!(sc["index"], "full-scan", "{sc}");
+  assert!(sc["indexReason"].as_str().is_some());
+  // `use b::target;`, the call, and the definition — one record per line.
+  assert_eq!(sc["totalMatches"], 3, "{sc}");
 
   // A malformed rule is a tool error, not a crash.
   let (text, is_err) = call_tool(&mut server, 3, "rule_search", json!({"rule": "rule: [nonsense"}));

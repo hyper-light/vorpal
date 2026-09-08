@@ -112,6 +112,7 @@ pub(crate) struct SnapRef {
   alias: Option<Snip>,
   receiver: Option<Snip>,
   args: Vec<SnapArg>,
+  call_shape: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,7 @@ impl SnapPending {
             expr: capture_opt(&a.expr, src),
           })
           .collect(),
+        call_shape: r.call_shape,
       }),
       Pending::TypeUse { from, name, start, end } => SnapPending::TypeUse {
         from: from.raw() as u32,
@@ -208,6 +210,7 @@ impl SnapPending {
             })
           })
           .collect::<Option<Vec<_>>>()?,
+        call_shape: r.call_shape,
       }),
       SnapPending::TypeUse { from, name, start, end } => Pending::TypeUse {
         from: vorpal_kg::NodeId::new(u64::from(remap(*from)?)),

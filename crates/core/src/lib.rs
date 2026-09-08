@@ -12,6 +12,7 @@ pub mod meta_var;
 pub mod ops;
 pub mod replacer;
 pub mod source;
+pub mod trigram;
 #[cfg(feature = "tree-sitter")]
 pub mod tree_sitter;
 

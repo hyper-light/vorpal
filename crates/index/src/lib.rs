@@ -24,6 +24,10 @@ pub mod autowarm;
 pub mod graph_predicates;
 pub mod postings;
 pub mod records;
+pub mod textsearch;
+pub mod chunks;
+pub mod callsite;
+pub mod trigrams;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -1770,6 +1774,11 @@ fn try_stamp_only_cutoff(
   if bucketed {
     carry_list.push((vorpal_ingest::PACK_DIR, vorpal_ingest::is_pack_member));
   }
+  // The text tier carries verbatim on a stamp-only cutoff: no file's bytes changed, so every
+  // bucket's content fold still holds.
+  if nodes_bucketed && prior.join(vorpal_kg::TRIGRAMS_TOC).is_file() {
+    carry_list.push((vorpal_kg::TRIGRAMS_DIR, vorpal_kg::is_trigrams_member));
+  }
   if !carry_list.is_empty() {
     vorpal_kg::carry_families(prior, &staging, &carry_list)?;
   }
@@ -1899,6 +1908,7 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       || name.as_os_str() == vorpal_kg::EDGES_DIR
       || name.as_os_str() == vorpal_kg::USAGE_DIR
       || name.as_os_str() == vorpal_kg::SIGS_DIR
+      || name.as_os_str() == vorpal_kg::TRIGRAMS_DIR
       || name.as_os_str() == "graph.stamp"
       || GENERATION_ARTIFACTS
         .iter()
@@ -1929,6 +1939,18 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
         if !member.as_deref().is_ok_and(is_generation_artifact_name) {
           let _ = fs::remove_file(entry.path());
         }
+      }
+    }
+  }
+  // The text tier is a sidecar family: swept by its own predicate, never folded into identity.
+  if let Ok(dirents) = fs::read_dir(staging.join(vorpal_kg::TRIGRAMS_DIR)) {
+    for entry in dirents.flatten() {
+      let member = entry
+        .file_name()
+        .into_string()
+        .map(|file| format!("{}/{file}", vorpal_kg::TRIGRAMS_DIR));
+      if !member.as_deref().is_ok_and(vorpal_kg::is_trigrams_member) {
+        let _ = fs::remove_file(entry.path());
       }
     }
   }
@@ -1985,6 +2007,18 @@ pub(crate) fn commit_generation(root: &Path, prior: &Path, staging: PathBuf) -> 
       if from.exists() && !to.exists() && fs::hard_link(&from, &to).is_err() {
         let _ = fs::copy(&from, &to);
       }
+    }
+    // The text tier rides the same way: every prior slab hard-links forward, and the
+    // reader validates each bucket against the new generation's content folds — a bucket
+    // whose files changed reads as uncovered until the next heal, never as wrong. A
+    // staging that already carries the family (a compose lane's delta) keeps its own.
+    if prior.join(vorpal_kg::TRIGRAMS_TOC).is_file() && !final_dir.join(vorpal_kg::TRIGRAMS_TOC).is_file() {
+      let _ = vorpal_kg::carry_family_dir(
+        prior,
+        &final_dir,
+        vorpal_kg::TRIGRAMS_DIR,
+        vorpal_kg::is_trigrams_member,
+      );
     }
   }
 
@@ -2640,6 +2674,10 @@ pub fn write_dense_channel_override(index_root: &Path, enabled: bool) -> io::Res
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WarmOptions {
   pub dense_budget_secs: Option<f64>,
+  /// Also heal the text tier (`trigrams/`) after the search tiers — the daemon's warm always
+  /// does; the bench-facing `__warm-ann` child only with `--text-index`, so the recorded warm
+  /// rows measure what they always measured.
+  pub text_index: bool,
 }
 
 /// The root's persisted dense cap (`<root>/dense.budget`, a human duration such
@@ -2753,6 +2791,44 @@ pub fn warm_ann(index_dir: &Path) -> Result<(), Box<dyn Error>> {
   warm_ann_with(index_dir, WarmOptions::default())
 }
 
+/// How a warm ended: the tier is current, or a caller asked it to stop at a phase boundary
+/// (nothing half-written — every artifact commits by tmp+rename with the stamp last).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarmOutcome {
+  Completed,
+  Cancelled,
+}
+
+/// A cooperative stop signal for [`warm_ann_cancellable`]: checked between the warm's phases
+/// (and before the vector build), never mid-write.
+pub type WarmCancel = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// [`warm_ann_with`] that stops at the next phase boundary once `cancel` is set — the daemon
+/// preempts a re-warm when a save arrives, so the save never queues behind it.
+pub fn warm_ann_with_cancel(
+  index_dir: &Path,
+  options: WarmOptions,
+  cancel: Option<&WarmCancel>,
+) -> Result<WarmOutcome, Box<dyn Error>> {
+  let selection = tier_selection(index_dir)?;
+  let dense_budget = options
+    .dense_budget_secs
+    .or_else(|| dense_budget_selection(index_dir));
+  let dense_encoder = open_selected_encoder(index_dir).0;
+  let index_dir = &vorpal_kg::resolve_index_dir(index_dir);
+  let lock_path = index_dir.join("ann.build.lock");
+  let lock_file = fs::OpenOptions::new()
+    .create(true)
+    .truncate(false)
+    .write(true)
+    .open(&lock_path)?;
+  let mut lock = fd_lock::RwLock::new(lock_file);
+  let Ok(_guard) = lock.try_write() else {
+    return Ok(WarmOutcome::Completed);
+  };
+  ensure_ann(index_dir, selection, dense_encoder, dense_budget, options.text_index, cancel)
+}
+
 /// [`warm_ann`] with explicit [`WarmOptions`] (the CLI's `--dense-budget-secs`).
 pub fn warm_ann_with(index_dir: &Path, options: WarmOptions) -> Result<(), Box<dyn Error>> {
   // The tier selection lives at the ROOT (it survives generations); read it before
@@ -2786,7 +2862,7 @@ pub fn warm_ann_with(index_dir: &Path, options: WarmOptions) -> Result<(), Box<d
   let Ok(_guard) = lock.try_write() else {
     return Ok(());
   };
-  ensure_ann(index_dir, selection, dense_encoder, dense_budget)
+  ensure_ann(index_dir, selection, dense_encoder, dense_budget, options.text_index, None).map(|_| ())
 }
 
 /// Run the warm-time per-corpus BM25 gate iff the committed record carries no
@@ -2853,7 +2929,10 @@ fn ensure_ann(
   selection: SemanticTier,
   dense_encoder: Option<Box<vorpal_ann::encoder::CodeEncoder>>,
   dense_budget: Option<f64>,
-) -> Result<(), Box<dyn Error>> {
+  text_index: bool,
+  cancel: Option<&WarmCancel>,
+) -> Result<WarmOutcome, Box<dyn Error>> {
+  let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
   // One build at a time **per index directory**: an eager background warm and a foreground
   // search on the same index must not both build (duplicate work, racing writes), but a
   // host serving several indexes warms them concurrently — the old process-wide mutex
@@ -2875,11 +2954,17 @@ fn ensure_ann(
   // actually embedded, even if `nodes.vseg` is replaced underneath us mid-decision.
   let kg = Kg::load(index_dir)?;
   let current = stamp_of(&kg);
+  if cancelled() {
+    return Ok(WarmOutcome::Cancelled);
+  }
   if ann_is_fresh(index_dir, current, selection) {
     // The vector tier is current, but the lexical tier heals independently (it can be
     // missing on indexes warmed by older builds, or after a partial cleanup).
     if !postings::postings_are_fresh(index_dir, current) {
       postings::build_postings(&kg, index_dir, current)?;
+    }
+    if cancelled() {
+      return Ok(WarmOutcome::Cancelled);
     }
     ensure_communities(&kg, index_dir, current)?;
     // The engine calibration heals independently too (older warms never measured one)
@@ -2894,10 +2979,23 @@ fn ensure_ann(
     // The per-corpus BM25 gate heals independently too (pre-gate records carry no
     // verdict) — deterministic from content, so healing converges in one pass.
     ensure_bm25_gate(index_dir, current)?;
+    if cancelled() {
+      return Ok(WarmOutcome::Cancelled);
+    }
     // The dense sidecar heals independently (stamp-gated; budget- and
     // encoder-conditional — see `dense.rs`).
     ensure_dense(index_dir, &kg, current, dense_encoder, dense_budget);
-    return Ok(());
+    if cancelled() {
+      return Ok(WarmOutcome::Cancelled);
+    }
+    // Last, and only when asked: the text tier's uncovered buckets, from source.
+    if text_index {
+      let _ = trigrams::heal(index_dir);
+    }
+    return Ok(WarmOutcome::Completed);
+  }
+  if cancelled() {
+    return Ok(WarmOutcome::Cancelled);
   }
   // Build under the SELECTED tier. A learned selection whose corpus is below the
   // learned tier's floor falls back to lexical with the reason STATED in the persisted
@@ -2931,6 +3029,10 @@ fn ensure_ann(
   } else {
     "none".to_string()
   };
+  if cancelled() {
+    // Before the vector build: the retrofit scratch is swept at the next retrofit entry.
+    return Ok(WarmOutcome::Cancelled);
+  }
   build_ann(&kg, index_dir, current, &embedder, retrofitted.as_ref())
     .map_err(|err| err as Box<dyn Error>)?;
   if let Some(rows) = retrofitted {
@@ -2985,6 +3087,9 @@ fn ensure_ann(
   if !postings::postings_are_fresh(index_dir, current) {
     postings::build_postings(&kg, index_dir, current)?;
   }
+  if cancelled() {
+    return Ok(WarmOutcome::Cancelled);
+  }
   ensure_communities(&kg, index_dir, current)?;
   // Calibrate the semantic-engine crossover on the just-built tier — measured on this
   // machine over this index's rows, through the tier's own embedder.
@@ -2996,7 +3101,14 @@ fn ensure_ann(
   ensure_bm25_gate(index_dir, current)?;
   // Last: the dense sidecar + its gate, over the committed tier (`dense.rs`).
   ensure_dense(index_dir, &kg, current, dense_encoder, dense_budget);
-  Ok(())
+  if cancelled() {
+    return Ok(WarmOutcome::Cancelled);
+  }
+  // And after every search tier, when asked: the text tier's uncovered buckets.
+  if text_index {
+    let _ = trigrams::heal(index_dir);
+  }
+  Ok(WarmOutcome::Completed)
 }
 
 /// Seed of the learned training run — an IDENTIFIER of the deterministic protocol
@@ -3788,7 +3900,12 @@ fn build_warm_root(index_root: &Path) -> io::Result<Option<WarmRoot>> {
 /// fresh sidecar exists and its per-corpus gate enabled it; when it fuses
 /// without BM25, an EMPTY fourth list holds BM25's position (an empty list adds
 /// no RRF mass), so ranks stay positional against this table.
-const SEARCH_CHANNELS: [&str; 5] = ["name", "vector", "graph", "bm25", "dense"];
+const SEARCH_CHANNELS: [&str; 6] = ["name", "vector", "graph", "bm25", "dense", "body"];
+/// The body list's position in [`SEARCH_CHANNELS`]: definitions whose bodies hold every
+/// query word, from the text tier — present only when no definition NAME carried a word
+/// (the name and BM25 lists both came back empty), so every query with name evidence fuses
+/// exactly as before, byte for byte.
+const BODY_LIST: usize = 5;
 
 /// One fused-ranking row: `(node id, RRF score, per-channel 0-based ranks)` — the shape
 /// [`Searcher::run`] returns.
@@ -3811,6 +3928,8 @@ struct Channels {
   /// The doc-side dense channel (`dense.rs`): encoder cosine over the sidecar's
   /// covered definitions — empty when no query embedding was supplied.
   dense: Vec<u64>,
+  /// The body channel (see [`BODY_LIST`]): empty unless the name and BM25 lists are.
+  body: Vec<u64>,
 }
 
 /// The orthogonality boundary of the semantic space: embeddings are L2-normalized, so
@@ -4792,8 +4911,9 @@ impl Searcher {
   /// query embedding produced a dense list, that list — behind an EMPTY BM25
   /// placeholder if BM25 is off (an empty list adds no RRF mass).
   fn fused_lists(&self, channels: Channels, dense_on: bool, k: usize) -> Vec<Vec<u64>> {
+    let body = channels.body;
     let mut lists = vec![channels.named, channels.semantic, channels.by_degree];
-    if self.bm25_enabled || dense_on {
+    if self.bm25_enabled || dense_on || !body.is_empty() {
       lists.push(channels.bm25);
     }
     if dense_on {
@@ -4837,6 +4957,13 @@ impl Searcher {
         }
       }
       lists.push(dense);
+    }
+    if !body.is_empty() {
+      // Positional: an empty dense placeholder keeps the body list at `BODY_LIST`.
+      while lists.len() < BODY_LIST {
+        lists.push(Vec::new());
+      }
+      lists.push(body);
     }
     lists
   }
@@ -5333,7 +5460,12 @@ impl Searcher {
       dense_query.as_deref(),
     )?;
     let lists = self.fused_lists(channels, dense_query.is_some(), k);
-    Ok(self.rerank_with_encoder(query, self.fuse(&lists, k), dense_query))
+    vorpal_kg::phase_stamp("search: lists ready");
+    let fused = self.fuse(&lists, k);
+    vorpal_kg::phase_stamp("search: fused");
+    let out = self.rerank_with_encoder(query, fused, dense_query);
+    vorpal_kg::phase_stamp("search: reranked");
+    Ok(out)
   }
 
   /// The stated reason a configured encoder is NOT active (`None` = active, or no
@@ -5843,6 +5975,7 @@ impl Searcher {
     scored.into_iter().map(|(dist, id)| (id, dist)).unzip()
   };
 
+  vorpal_kg::phase_stamp("search: semantic ready");
   let query_tokens = tokenize(query);
   // Classify one candidate into the name channel's tiers (exact string, token-equal,
   // token-subset) — shared verbatim by the posting-index path and the exhaustive scan, so
@@ -5901,6 +6034,7 @@ impl Searcher {
   named.sort_by_key(|&(id, key)| (key, id));
   named.truncate(pool);
   let named: Vec<u64> = named.into_iter().map(|(id, _)| id).collect();
+  vorpal_kg::phase_stamp("search: named ready");
 
   // In-degree is a *disambiguator among name-matched candidates* (three `seal` methods → the
   // most-called one first), never a global popularity prior — a union with the semantic pool
@@ -5935,6 +6069,7 @@ impl Searcher {
     Vec::new()
   };
 
+  vorpal_kg::phase_stamp("search: bm25 ready");
   // The dense channel (`dense.rs`): int8 scan + f16 rescore over the sidecar's
   // covered definitions, filtered BEFORE ranking (exact, no overfetch slack).
   // The list's LENGTH is the sidecar's derived depth (`DenseSidecar::depth`, the
@@ -5960,6 +6095,16 @@ impl Searcher {
     by_degree.sort_by_key(|&id| (std::cmp::Reverse(kg.in_degree_referential(NodeId::new(id))), id));
   }
 
+    // The body channel: only when no definition name carries a query word — a phrase
+    // from a comment, a string, a macro body. Definitions whose bodies hold every word,
+    // through the text tier (candidates → read → memmem → enclosing definition).
+    let body = if named.is_empty() && bm25.is_empty() && !query_tokens.is_empty() && !Self::body_channel_disabled() {
+      self.body_channel(&query_tokens, pool, |id| filter.is_empty() || compiled_filter.admits(kg, id))
+    } else {
+      Vec::new()
+    };
+
+  vorpal_kg::phase_stamp("search: channels ready");
     Ok(Channels {
       named,
       semantic,
@@ -5967,7 +6112,103 @@ impl Searcher {
       by_degree,
       bm25,
       dense,
+      body,
     })
+  }
+
+  /// `VORPAL_NO_BODY_CHANNEL=1`: the A/B veto for the body list.
+  fn body_channel_disabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("VORPAL_NO_BODY_CHANNEL").is_some_and(|v| v == "1"))
+  }
+
+  /// Definitions whose source holds every query token of three bytes or more, ascending
+  /// by id, at most `pool`: the text tier names the files (a complete candidate set is
+  /// required — an uncovered bucket means no list, never a partial one), each admitted file
+  /// is read once (verified against the pack), every token's occurrences are attributed to
+  /// the innermost definition span, and a definition counts when it holds all tokens.
+  /// At most `pool` files are read, ascending by file key, so the cost is bounded by the
+  /// fusion pool the caller already sized.
+  fn body_channel(&self, query_tokens: &[String], pool: usize, admit: impl Fn(u64) -> bool) -> Vec<u64> {
+    let literals: Vec<&str> = query_tokens.iter().map(String::as_str).filter(|t| t.len() >= 3).collect();
+    if literals.is_empty() {
+      return Vec::new();
+    }
+    let dir = self.generation_dir.as_path();
+    let Some(pack) = cached_pack(dir) else {
+      return Vec::new();
+    };
+    let Some(tier) = trigrams::cached(dir, &pack) else {
+      return Vec::new();
+    };
+    vorpal_kg::phase_stamp("body: planning");
+    let Some(set) = tier.candidates_for_literals(&literals) else {
+      return Vec::new();
+    };
+    if !set.is_complete() {
+      return Vec::new();
+    }
+    vorpal_kg::phase_stamp("body: candidates ready");
+    let runs = cached_runs(&self.kg, Some(dir));
+    let index = trigrams::cached_run_index(dir, &runs, &pack);
+    vorpal_kg::phase_stamp("body: runs ready");
+    let finders: Vec<memchr::memmem::Finder<'_>> = literals.iter().map(|l| memchr::memmem::Finder::new(l.as_bytes())).collect();
+    let mut buf = trigrams::take_read_buffer();
+    let mut hits: Vec<(u64, usize)> = Vec::new(); // (id, occurrences)
+    let mut spans: Vec<(u32, u32, u64)> = Vec::new();
+    let mut per_def: std::collections::HashMap<u64, (u64, usize)> = std::collections::HashMap::new(); // id → (token mask, occurrences)
+    for &key in set.admitted().iter().take(pool) {
+      let Some(run_i) = index.run_of(key) else { continue };
+      let run = &runs[run_i as usize];
+      // Files the tier does not index (above `MAX_INDEXED_FILE_BYTES`) are candidates by
+      // absence of evidence, not presence: this repo's vendored 54 MB grammar parsers made
+      // every phrase query read them (36 ms mean against 0.6 ms). Skip them here.
+      if pack
+        .get(&run.path)
+        .and_then(vorpal_ingest::peek_product_stamps)
+        .is_some_and(|(size, _)| size > trigrams::MAX_INDEXED_FILE_BYTES)
+      {
+        continue;
+      }
+      if !matches!(
+        read_indexed_source_into(Some(&pack), &run.path, &mut buf),
+        Ok(IndexedReadVerdict::Verified) | Ok(IndexedReadVerdict::Unverified)
+      ) {
+        continue;
+      }
+      spans.clear();
+      spans.extend((run.start..run.start + run.len as u64).filter_map(|id| {
+        let node = NodeId::new(id);
+        if self.kg.node_kind(node)? == vorpal_kg::SymbolKind::File {
+          return None;
+        }
+        let (start, end) = self.kg.node_span(node)?;
+        (end > start).then_some((start, end, id))
+      }));
+      per_def.clear();
+      for (t, finder) in finders.iter().enumerate() {
+        for at in finder.find_iter(&buf) {
+          let owner = spans
+            .iter()
+            .filter(|&&(s, e, _)| (s as usize) <= at && at < e as usize)
+            .min_by_key(|&&(s, e, _)| e - s)
+            .map(|&(.., id)| id);
+          if let Some(id) = owner {
+            let entry = per_def.entry(id).or_insert((0, 0));
+            entry.0 |= 1u64 << t;
+            entry.1 += 1;
+          }
+        }
+      }
+      let all = (1u64 << finders.len()) - 1;
+      hits.extend(per_def.iter().filter(|(_, (mask, _))| *mask == all).map(|(&id, &(_, n))| (id, n)));
+    }
+    trigrams::give_read_buffer(buf);
+    vorpal_kg::phase_stamp("body: files scanned");
+    hits.retain(|&(id, _)| admit(id));
+    hits.sort_unstable_by_key(|&(id, n)| (std::cmp::Reverse(n), id));
+    hits.truncate(pool);
+    hits.into_iter().map(|(id, _)| id).collect()
   }
 
   /// Run a search and render it to the CLI's exact text format — shared by `search_index`
@@ -6566,6 +6807,38 @@ pub fn read_indexed_source(
 
 /// [`read_indexed_source`] against an already-open pack: bulk callers (multi-node snippet
 /// selections) open the pack once instead of re-mapping it per file.
+/// [`read_indexed_source_with`] into a caller-owned buffer (cleared first): the verdict
+/// without the allocation. `Changed` and errors leave the buffer's contents unspecified.
+pub fn read_indexed_source_into(
+  pack: Option<&PackReader>,
+  path: &str,
+  buf: &mut Vec<u8>,
+) -> Result<IndexedReadVerdict, String> {
+  use std::io::Read;
+  buf.clear();
+  let mut file = fs::File::open(path).map_err(|err| format!("read {path}: {err}"))?;
+  if let Ok(meta) = file.metadata() {
+    buf.reserve(meta.len() as usize);
+  }
+  file
+    .read_to_end(buf)
+    .map_err(|err| format!("read {path}: {err}"))?;
+  let indexed_digest = pack.and_then(|pack| pack.get(path).and_then(vorpal_ingest::peek_product_digest));
+  Ok(match indexed_digest {
+    Some(digest) if xxhash_rust::xxh3::xxh3_64(buf) == digest => IndexedReadVerdict::Verified,
+    Some(_) => IndexedReadVerdict::Changed,
+    None => IndexedReadVerdict::Unverified,
+  })
+}
+
+/// The verdict half of [`IndexedRead`], for buffer-reusing readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexedReadVerdict {
+  Verified,
+  Unverified,
+  Changed,
+}
+
 pub fn read_indexed_source_with(
   pack: Option<&PackReader>,
   path: &str,

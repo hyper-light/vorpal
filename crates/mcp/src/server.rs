@@ -66,7 +66,7 @@ impl Profile {
   /// The single authority on membership: tools_list filters by it and run_tool gates on it,
   /// so the advertised surface and the callable surface can never drift apart.
   fn allows(self, tool: &str) -> bool {
-    const SCOUT: &[&str] = &["node", "search", "snippet", "schema", "fetch_span"];
+    const SCOUT: &[&str] = &["node", "search", "text_search", "snippet", "schema", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
       "graph", "reachable", "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
@@ -99,6 +99,9 @@ pub struct Server {
   /// an answer from the pinned graph that produced its ids.
   kg_dir: Option<PathBuf>,
   watch: Option<SourceWatch>,
+  /// Result sets of the structural tools, kept for paging (see `page_key`).
+  structural_pages: PageCache<crate::tools::StructuralHit>,
+  rule_pages: PageCache<crate::tools::RuleHit>,
   /// Hinted-rebuild counter — every 64th watched revalidation full-scans as reconciliation
   /// insurance, even when capture certainty held.
   hinted_rebuilds: u64,
@@ -125,6 +128,24 @@ pub struct Server {
   /// generation always ends up warm.
   warm: Option<std::thread::JoinHandle<()>>,
   warm_pending: bool,
+  /// When the pending warm was first asked for, and the running warm with its stop signal.
+  /// A re-warm spawns only once the tree has been quiet since the last commit (see
+  /// `warm_quiet`) or after `warm_deadline`, and a save that lands mid-warm preempts it at the
+  /// next phase boundary — so a save never queues behind a 60 s tier rebuild. Boot and a
+  /// never-warmed index spawn at once (the first search must stay fast).
+  warm_requested_at: Option<std::time::Instant>,
+  warm_run: Option<WarmRun>,
+  /// The last commit-shaped event (every `request_warm` call is one).
+  last_commit_at: Option<std::time::Instant>,
+  /// Hourly full reconcile (content-authoritative rebuild of the whole tree): when it last
+  /// ran, since when it has been due, and when the last tool call arrived — it waits for
+  /// `RECONCILE_QUIET` without queries and gives up waiting after `RECONCILE_DEADLINE`.
+  last_full_reconcile_at: std::time::Instant,
+  reconcile_due_since: Option<std::time::Instant>,
+  last_query_at: Option<std::time::Instant>,
+  /// Whether the in-flight `rebuilding` is a reconcile (an unchanged generation then keeps
+  /// the overlay and the live tier, and requests no warm).
+  rebuilding_is_reconcile: bool,
   /// The in-flight deferred persistence of a live-adopted build (SUBSECOND.md live rebuild
   /// v1): the daemon is already serving the sealed graph; this handle is writing its
   /// generation. `kg_dir` stays `None` until it lands — generation-bound tools drain it
@@ -213,6 +234,105 @@ struct LiveAnnLatch {
   /// A warm landed since the last attempt — the one signal that may justify a retry
   /// (the warm rewrote the artifacts the last judgment saw). Consumed by the retry.
   rearmed: bool,
+}
+
+/// The running warm thread and its stop signal; `preemptible` is false for a warm the
+/// deadline forced, so a save burst cannot starve the tier forever.
+struct WarmRun {
+  handle: std::thread::JoinHandle<vorpal_index::WarmOutcome>,
+  cancel: vorpal_index::WarmCancel,
+  preemptible: bool,
+}
+
+/// Quiet the tree must have been (since the last commit-shaped event) before a re-warm
+/// spawns. `VORPAL_WARM_QUIET_SECS` overrides; the default sits above the measured
+/// save-to-visible tail (2–4 s) so a save burst settles before the tier rebuilds.
+fn warm_quiet() -> std::time::Duration {
+  std::time::Duration::from_secs_f64(
+    std::env::var("VORPAL_WARM_QUIET_SECS")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(5.0),
+  )
+}
+
+/// How long a pending warm may be deferred before it spawns regardless of quiet
+/// (`VORPAL_WARM_DEADLINE_SECS`, default 120).
+fn warm_deadline() -> std::time::Duration {
+  std::time::Duration::from_secs_f64(
+    std::env::var("VORPAL_WARM_DEADLINE_SECS")
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(120.0),
+  )
+}
+
+/// `VORPAL_NO_WARM_DEFER=1` restores the immediate re-warm.
+fn warm_defer_disabled() -> bool {
+  std::env::var("VORPAL_NO_WARM_DEFER").is_ok_and(|v| v == "1" || v == "true" || v == "yes")
+}
+
+/// Whether a pending warm may spawn now. Pure, so the policy is unit-testable: immediate when
+/// the index has no tier yet (nothing to preempt, and the first search wants one) or when
+/// deferral is off; otherwise only with no dirt pending, no committer in flight, and the tree
+/// quiet for `quiet` since the last commit — or once `deadline` has passed since the request.
+/// Returns `(spawn, preemptible)`.
+#[allow(clippy::too_many_arguments)]
+fn warm_spawn_due(
+  tier_exists: bool,
+  defer_disabled: bool,
+  dirty: bool,
+  committer_busy: bool,
+  since_commit: Option<std::time::Duration>,
+  since_request: std::time::Duration,
+  quiet: std::time::Duration,
+  deadline: std::time::Duration,
+) -> (bool, bool) {
+  if !tier_exists || defer_disabled {
+    return (true, true);
+  }
+  if committer_busy {
+    return (false, true);
+  }
+  if since_request >= deadline {
+    return (true, false);
+  }
+  if dirty {
+    return (false, true);
+  }
+  (since_commit.is_none_or(|d| d >= quiet), true)
+}
+
+/// Hourly full reconcile: interval (`VORPAL_RECONCILE_SECS`, `0` disables), the query-quiet
+/// it waits for, and the deadline after which it runs regardless of queries.
+fn reconcile_interval() -> Option<std::time::Duration> {
+  let secs: f64 = std::env::var("VORPAL_RECONCILE_SECS")
+    .ok()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(3600.0);
+  (secs > 0.0).then(|| std::time::Duration::from_secs_f64(secs))
+}
+const RECONCILE_QUIET: std::time::Duration = std::time::Duration::from_secs(120);
+const RECONCILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+/// Whether the hourly reconcile should fire now. Pure: due once `since_last >= interval`;
+/// runs when the daemon has seen no tool call for `RECONCILE_QUIET` and no dirt is pending,
+/// or once it has been due for `RECONCILE_DEADLINE`; never while a committer or warm is busy.
+fn reconcile_due(
+  since_last: std::time::Duration,
+  interval: std::time::Duration,
+  since_query: Option<std::time::Duration>,
+  dirty: bool,
+  busy: bool,
+  due_for: Option<std::time::Duration>,
+) -> bool {
+  if busy || since_last < interval {
+    return false;
+  }
+  if due_for.is_some_and(|d| d >= RECONCILE_DEADLINE) {
+    return true;
+  }
+  !dirty && since_query.is_none_or(|q| q >= RECONCILE_QUIET)
 }
 
 /// Wall-time share the liveness-backstop sweep may consume on the quiet query path
@@ -333,7 +453,7 @@ impl Server {
     if autowarm_enabled() && generation.join("nodes.vseg").exists() && !tier_reconcilable {
       let warm_dir = index_dir.clone();
       warm = Some(std::thread::spawn(move || {
-        let _ = vorpal_index::warm_ann(&warm_dir);
+        let _ = vorpal_index::warm_ann_with(&warm_dir, vorpal_index::WarmOptions { text_index: true, ..Default::default() });
       }));
     }
     let supervisor = Supervisor::discover();
@@ -359,6 +479,13 @@ impl Server {
       proactive,
       warm,
       warm_pending: false,
+      warm_requested_at: None,
+      warm_run: None,
+      last_commit_at: None,
+      last_full_reconcile_at: std::time::Instant::now(),
+      reconcile_due_since: None,
+      last_query_at: None,
+      rebuilding_is_reconcile: false,
       persisting: None,
       overlay: None,
       overlay_building: None,
@@ -370,6 +497,8 @@ impl Server {
       last_sweep_cost: None,
       live_ann_discard_task: false,
       watch,
+      structural_pages: PageCache::default(),
+      rule_pages: PageCache::default(),
     };
     // The overlay is the serving architecture, not an optimization to warm lazily: start
     // building it the moment the daemon exists (its own gates decline when there is no
@@ -614,6 +743,30 @@ impl Server {
   /// success the committed generation becomes the artifact pin and the ANN warm fires; on
   /// failure the watch re-arms so the next query rebuilds — the served graph stays correct
   /// (it reflects the source tree), only durability lagged.
+  /// The key a structural result set is remembered under for paging: the tool, every
+  /// argument except the page's own (`cursor`, `limit`, `format`), the served generation,
+  /// and the watcher's event count — so a later page replays the same set, and any tree
+  /// change or generation change between pages recomputes it.
+  fn page_key(&self, tool: &str, args: &Value, walk_epoch: Option<u64>) -> String {
+    let mut query = args.clone();
+    if let Some(map) = query.as_object_mut() {
+      map.remove("cursor");
+      map.remove("limit");
+      map.remove("format");
+    }
+    format!(
+      "{tool}|{}|{}|{query}",
+      self.kg_dir.as_deref().map(|d| d.display().to_string()).unwrap_or_default(),
+      walk_epoch.map_or(-1i128, i128::from)
+    )
+  }
+
+  /// The walk-cache epoch for the structural tools: the watcher's event count, so any
+  /// event after a cached walk misses the cache; `None` without a watcher (never cached).
+  fn walk_epoch(&self) -> Option<u64> {
+    self.watch.as_ref().map(|w| w.event_count())
+  }
+
   fn reap_persist(&mut self, block: bool) {
     if !block && !self.persisting.as_ref().is_some_and(|h| h.is_finished()) {
       return;
@@ -646,12 +799,38 @@ impl Server {
   /// warm → retry forever was exactly the loop that buried this daemon's watcher in its
   /// own artifact churn on every sub-floor corpus).
   fn reap_warm(&mut self) {
+    if self.warm_run.as_ref().is_some_and(|r| r.handle.is_finished())
+      && let Some(run) = self.warm_run.take()
+    {
+      match run.handle.join() {
+        Ok(vorpal_index::WarmOutcome::Completed) => {
+          if let Some(latch) = &mut self.live_ann_latch {
+            latch.rearmed = true;
+          }
+        }
+        // A preempted warm re-armed `warm_pending` when it was cancelled; nothing else.
+        Ok(vorpal_index::WarmOutcome::Cancelled) | Err(_) => {}
+      }
+    }
     if self.warm.as_ref().is_some_and(|h| h.is_finished()) {
       let _ = self.warm.take().map(std::thread::JoinHandle::join);
       if let Some(latch) = &mut self.live_ann_latch {
         latch.rearmed = true;
       }
     }
+  }
+
+  /// The committed generation's text tier, when `root` is the tree that generation indexed
+  /// (a tool walking a different tree must not prune by another tree's postings).
+  fn text_tier_for(&self, root: &Path) -> Option<crate::tools::TextTier> {
+    let dir = self.kg_dir.as_deref()?;
+    let (pack, index) = vorpal_index::trigrams::for_generation(dir)?;
+    let pack_root = pack.root()?;
+    let canonical = root.canonicalize().ok()?;
+    if canonical.to_string_lossy() != pack_root {
+      return None;
+    }
+    Some(crate::tools::TextTier { pack, index })
   }
 
   /// Request an eager background ANN warm of the current generation. Single-flight: while a
@@ -674,16 +853,79 @@ impl Server {
       return;
     }
     self.reap_warm();
-    if self.warm.is_some() {
-      self.warm_pending = true;
+    let now = std::time::Instant::now();
+    self.last_commit_at = Some(now);
+    self.warm_pending = true;
+    self.warm_requested_at.get_or_insert(now);
+    self.maybe_spawn_warm();
+  }
+
+  /// Spawn the pending warm if the policy says now (see `warm_spawn_due`).
+  fn maybe_spawn_warm(&mut self) {
+    if !self.warm_pending {
+      return;
+    }
+    self.reap_warm();
+    if self.warm.is_some() || self.warm_run.is_some() {
+      return;
+    }
+    let now = std::time::Instant::now();
+    let generation = vorpal_kg::resolve_index_dir(&self.index_dir);
+    let tier_exists = generation.join("ann.stamp").exists();
+    let dirty = self.dirty_since.is_some() || self.watch.as_ref().is_some_and(|w| w.peek_dirty());
+    let committer_busy =
+      self.rebuilding.is_some() || self.canonicalizing.is_some() || self.persisting.is_some();
+    let (spawn, preemptible) = warm_spawn_due(
+      tier_exists,
+      warm_defer_disabled(),
+      dirty,
+      committer_busy,
+      self.last_commit_at.map(|t| now.duration_since(t)),
+      self
+        .warm_requested_at
+        .map_or(std::time::Duration::ZERO, |t| now.duration_since(t)),
+      warm_quiet(),
+      warm_deadline(),
+    );
+    if !spawn {
       return;
     }
     self.warm_pending = false;
+    self.warm_requested_at = None;
+    let cancel: vorpal_index::WarmCancel =
+      std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_cancel = cancel.clone();
     let index_dir = self.index_dir.clone();
-    self.warm = Some(std::thread::spawn(move || {
-      let _ = vorpal_index::warm_ann(&index_dir);
-    }));
+    let handle = std::thread::spawn(move || {
+      vorpal_index::warm_ann_with_cancel(
+        &index_dir,
+        vorpal_index::WarmOptions {
+          text_index: true,
+          ..Default::default()
+        },
+        Some(&thread_cancel),
+      )
+      .unwrap_or(vorpal_index::WarmOutcome::Completed)
+    });
+    self.warm_run = Some(WarmRun {
+      handle,
+      cancel,
+      preemptible,
+    });
   }
+
+  /// A save arrived: stop a preemptible warm at its next phase boundary and re-arm it.
+  fn preempt_warm(&mut self) {
+    if let Some(run) = &self.warm_run
+      && run.preemptible
+      && !run.handle.is_finished()
+    {
+      run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+      self.warm_pending = true;
+      self.warm_requested_at.get_or_insert(std::time::Instant::now());
+    }
+  }
+
 
   /// Bring the in-memory graph up to date with the watched source tree. A dirty watch runs
   /// the incremental build and **adopts the sealed in-memory graph the build hands back**
@@ -728,13 +970,26 @@ impl Server {
     let Some(handle) = self.rebuilding.take() else {
       return;
     };
+    let was_reconcile = std::mem::take(&mut self.rebuilding_is_reconcile);
     let ok = handle.join().unwrap_or(false);
     if !ok {
+      if was_reconcile {
+        // A failed reconcile is not evidence of dirt; the next hour retries.
+        return;
+      }
       if let Some(watch) = &self.watch {
         watch.mark_dirty();
       }
       self.dirty_since =
         Some(std::time::Instant::now() + std::time::Duration::from_millis(4500));
+      return;
+    }
+    if was_reconcile
+      && self.kg_dir.as_deref() == Some(vorpal_kg::resolve_index_dir(&self.index_dir).as_path())
+    {
+      // Nothing drifted: the content-addressed commit landed on the served generation.
+      // Keep the overlay and the live tier; request no warm.
+      vorpal_kg::phase_stamp("reconcile: tree agrees with the served generation");
       return;
     }
     if let Err(err) = self.adopt_committed_generation() {
@@ -749,10 +1004,10 @@ impl Server {
   fn advance_background(&mut self) {
     // Trailing coalesced warm: if a warm finished while a newer request was pending, spawn
     // the follow-up now (it warms whatever CURRENT is today).
-    if self.warm_pending && self.warm.as_ref().is_none_or(|h| h.is_finished()) {
-      self.request_warm();
-    }
     self.reap_warm();
+    if self.warm_pending {
+      self.maybe_spawn_warm();
+    }
     // Reap a finished background persist (non-blocking) so `kg_dir` pins the committed
     // generation as soon as it exists.
     self.reap_persist(false);
@@ -828,20 +1083,31 @@ impl Server {
   /// needs the full pipeline builds through [`Self::refresh`]'s background tier as the
   /// single in-flight committer, and the daemon keeps serving the current graph meanwhile.
   pub fn tick(&mut self) {
+    vorpal_kg::phase_stamp("tick: enter");
+    self.tick_inner();
+    vorpal_kg::phase_stamp("tick: exit");
+  }
+
+  fn tick_inner(&mut self) {
     self.advance_background();
     if !self.proactive {
       return;
     }
-    let Some(watch) = &self.watch else {
-      return;
+    let took_dirty = match &self.watch {
+      Some(watch) => watch.take_dirty(),
+      None => return,
     };
-    if watch.take_dirty() {
+    if took_dirty {
       self.dirty_since = Some(std::time::Instant::now());
+      self.preempt_warm();
     } else if self.kg.is_none() && self.dirty_since.is_none() && self.rebuilding.is_none() {
       // Boot on a possibly-stale tree: changes since the last index produced no watch
       // events, so treat startup itself as dirt — the first pass brings the index current
       // before the first query needs it (the worker's old "starts dirty" behavior).
       self.dirty_since = Some(std::time::Instant::now());
+    }
+    if self.dirty_since.is_none() {
+      self.maybe_reconcile();
     }
     let Some(since) = self.dirty_since else {
       return;
@@ -859,12 +1125,83 @@ impl Server {
     self.dirty_since = None;
     // Hand the consumed dirt back to the shared flag — `refresh` keys off it, and a fresh
     // edit landing meanwhile simply re-arms the debounce on the next tick.
-    watch.mark_dirty();
+    if let Some(watch) = &self.watch {
+      watch.mark_dirty();
+    }
     if let Err(err) = self.refresh(true) {
       // stderr is free under stdio MCP (the protocol owns stdout). The failure path
       // re-armed the dirty flag, so queries retry and surface the error themselves.
       eprintln!("vorpal-mcp: proactive refresh failed: {err}");
     }
+  }
+
+  /// The hourly full reconcile (tgrep's rule: an OS notification can go missing, and nothing
+  /// else revisits a file the daemon believes it knows): once an hour, after two minutes
+  /// without a tool call and with no dirt pending — or four hours after it fell due — rebuild
+  /// the whole tree content-authoritatively (`VORPAL_VERIFY_CACHE=1`) through the same
+  /// background committer a proactive rebuild uses. An unchanged tree commits the same
+  /// generation and adopts nothing; drift is adopted like any proactive commit.
+  fn maybe_reconcile(&mut self) {
+    let Some(interval) = reconcile_interval() else {
+      return;
+    };
+    if self.kg.is_none() {
+      return;
+    }
+    let now = std::time::Instant::now();
+    let since_last = now.duration_since(self.last_full_reconcile_at);
+    if since_last >= interval {
+      self.reconcile_due_since.get_or_insert(now);
+    }
+    let busy = self.rebuilding.is_some()
+      || self.canonicalizing.is_some()
+      || self.persisting.is_some()
+      || self.warm_run.as_ref().is_some_and(|r| !r.handle.is_finished());
+    let dirty = self.dirty_since.is_some() || self.watch.as_ref().is_some_and(|w| w.peek_dirty());
+    let due = reconcile_due(
+      since_last,
+      interval,
+      self.last_query_at.map(|t| now.duration_since(t)),
+      dirty,
+      busy,
+      self.reconcile_due_since.map(|t| now.duration_since(t)),
+    );
+    if !due {
+      return;
+    }
+    let Some(src) = self.watch.as_ref().map(|w| w.src().to_path_buf()) else {
+      return;
+    };
+    vorpal_kg::phase_stamp("reconcile: hourly content-authoritative rebuild starting");
+    self.last_full_reconcile_at = now;
+    self.reconcile_due_since = None;
+    // This rebuild subsumes the `%64` full-sweep insurance and the liveness backstop.
+    self.hinted_rebuilds = 0;
+    self.last_sweep_at = Some(now);
+    self.rebuilding_is_reconcile = true;
+    let supervisor = self.supervisor.clone();
+    let index_dir = self.index_dir.clone();
+    let env = self.env.clone();
+    self.rebuilding = Some(std::thread::spawn(move || {
+      match supervisor.build_with_env(&src, &index_dir, &[("VORPAL_VERIFY_CACHE", "1")]) {
+        Ok(BuildOutcome::Supervised(_)) => true,
+        Ok(BuildOutcome::Unavailable) => {
+          let _guard = in_process_build_guard();
+          build_index_env(
+            &src,
+            &index_dir,
+            CacheMode::Verified,
+            ParseHealthPolicy::default(),
+            &env,
+          )
+          .is_ok()
+        }
+        Err(err) => {
+          eprintln!("vorpal-mcp: reconcile rebuild failed: {err}");
+          false
+        }
+      }
+    }));
   }
 
   fn ensure_fresh(&mut self) -> Result<(), String> {
@@ -882,7 +1219,10 @@ impl Server {
     // clean-fast-path below must not serve pre-edit state, so drain and adopt FIRST (a
     // no-op when nothing is in flight). Draining costs at most what building here
     // ourselves would have — the child is building the very freshness a query wants.
-    self.reap_rebuilding(true);
+    // A reconcile child is different: the tree is believed current, so a clean-flag query
+    // serves on and only a dirty one waits for it.
+    let dirty_now = self.watch.as_ref().is_some_and(|w| w.peek_dirty());
+    self.reap_rebuilding(!self.rebuilding_is_reconcile || dirty_now);
     let Some(watch) = &self.watch else {
       return Ok(());
     };
@@ -1377,6 +1717,7 @@ impl Server {
       .get("arguments")
       .cloned()
       .unwrap_or_else(|| json!({}));
+    vorpal_kg::phase_stamp(&format!("tool_result: {tool} enter"));
     match self.run_tool(tool, &args) {
       Ok((text, mut data)) => {
         let format = args
@@ -1402,6 +1743,7 @@ impl Server {
         // Typed tools return their records/pagination here; text-only tools return `{}`.
         // Generation identity rides every success either way.
         data["generation"] = self.generation_id();
+        vorpal_kg::phase_stamp(&format!("tool_result: {tool} shaped"));
         json!({
           "content": [{"type": "text", "text": text}],
           "structuredContent": data,
@@ -1438,6 +1780,7 @@ impl Server {
   /// Run one tool: rendered text for humans plus, for the typed tools, a structured object
   /// (records + pagination) that `tools_call` merges into `structuredContent`.
   fn run_tool(&mut self, tool: &str, args: &Value) -> Result<(String, Value), ToolError> {
+    self.last_query_at = Some(std::time::Instant::now());
     let str_arg = |key: &str| {
       args
         .get(key)
@@ -1643,6 +1986,45 @@ impl Server {
         }
         Ok((text, json!({})))
       }
+      "text_search" => {
+        let pattern = str_arg("pattern")?;
+        let case_insensitive = args.get("case_insensitive").and_then(Value::as_bool).unwrap_or(false);
+        let lang = args.get("lang").and_then(Value::as_str).map(str::to_string);
+        let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
+        let max_results = args.get("max_results").and_then(Value::as_u64).unwrap_or(1000) as usize;
+        self.kg()?;
+        let dir = self.kg_dir.clone();
+        let Some(kg) = self.kg.as_deref() else {
+          return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
+        };
+        let symbol = args.get("symbol").and_then(Value::as_str).map(str::to_string);
+        let query = vorpal_index::textsearch::TextQuery {
+          pattern: &pattern,
+          case_insensitive,
+          lang: lang.as_deref(),
+          prefix: prefix.as_deref(),
+          max_results,
+          symbol: symbol.as_deref(),
+        };
+        let report = vorpal_index::textsearch::text_search(kg, dir.as_deref(), &query).map_err(ToolError::from)?;
+        let text = vorpal_index::textsearch::render_text_search(&report);
+        let mut data = paged(report.records, args, "hits")?;
+        data["totalMatches"] = report.total_matches.into();
+        data["matchedFiles"] = report.matched_files.into();
+        data["candidateFiles"] = report.candidate_files.into();
+        data["prunedFiles"] = report.pruned_files.into();
+        data["prefilteredFiles"] = report.prefiltered_files.into();
+        data["scannedFiles"] = report.scanned_files.into();
+        data["staleFiles"] = report.stale_files.into();
+        data["unreadableFiles"] = report.unreadable_files.into();
+        data["index"] = report.index.clone().into();
+        if let Some(reason) = &report.index_reason {
+          data["indexReason"] = reason.clone().into();
+        }
+        data["textIndex"] = report.text_index.clone().into();
+        data["capped"] = report.truncated.into();
+        Ok((text, data))
+      }
       "code_search" => {
         let pattern = str_arg("pattern")?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(20) as usize;
@@ -1653,10 +2035,15 @@ impl Server {
         let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
+        let spec = vorpal_core::matcher::PatternSpec {
+          pattern: &pattern,
+          selector: args.get("selector").and_then(Value::as_str),
+          context: args.get("context").and_then(Value::as_str),
+        };
         let report = vorpal_index::records::code_search(
           kg,
           dir.as_deref(),
-          &pattern,
+          &spec,
           lang.as_deref(),
           prefix.as_deref(),
           k,
@@ -1664,9 +2051,16 @@ impl Server {
         .map_err(ToolError::from)?;
         let text = vorpal_index::records::render_code_search(&report);
         let mut data = paged(report.records, args, "hits")?;
+        vorpal_kg::phase_stamp("code_search arm: paged");
         data["staleFiles"] = report.stale_files.into();
         data["unreadableFiles"] = report.unreadable_files.into();
         data["scannedFiles"] = report.scanned_files.into();
+        data["prunedFiles"] = report.pruned_files.into();
+        data["prefilteredFiles"] = report.prefiltered_files.into();
+        data["chunkParsedFiles"] = report.chunk_parsed_files.into();
+        data["chunkMemoHits"] = report.chunk_memo_hits.into();
+        data["callSiteFiles"] = report.callsite_files.into();
+        data["textIndex"] = report.text_index.clone().into();
         data["totalMatches"] = report.total_matches.into();
         Ok((text, data))
       }
@@ -1851,11 +2245,51 @@ impl Server {
             Some(&verify),
           )
           .map_err(ToolError::from)?;
-          selected_data(selected, args)?
+          // `mentions: true` on an inbound verb adds the absence proof: whole-word textual
+          // mentions of the name in files the graph's answer does not cover (text tier).
+          let mentions = if args.get("mentions").and_then(Value::as_bool).unwrap_or(false)
+            && !matches!(verb, "callees" | "similar")
+            && let vorpal_index::records::Selected::Hits(hits) = &selected
+          {
+            let mut attributed: std::collections::HashSet<&str> = hits.iter().map(|h| h.node.path.as_str()).collect();
+            let own: Vec<String> = vorpal_index::resolve_target(kg, &target)
+              .ok()
+              .into_iter()
+              .flatten()
+              .filter_map(|id| kg.node(id).map(|v| v.path.to_string()))
+              .collect();
+            attributed.extend(own.iter().map(String::as_str));
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+            Some(vorpal_index::textsearch::unattributed_mentions(kg, dir.as_deref(), &target.name, &attributed, limit).map_err(ToolError::from)?)
+          } else {
+            None
+          };
+          let mut data = selected_data(selected, args)?;
+          if let Some(mentions) = mentions {
+            data["mentions"] = serde_json::to_value(&mentions).unwrap_or(Value::Null);
+          }
+          data
         };
-        let text = vorpal_index::graph_query_on(kg, verb, &target)
+        let mut text = vorpal_index::graph_query_on(kg, verb, &target)
           .map_err(|err| err.to_string())
           .map_err(ToolError::from)?;
+        if let Some(m) = data.get("mentions") {
+          let files = m.get("unattributedFiles").and_then(Value::as_u64).unwrap_or(0);
+          let complete = m.get("complete").and_then(Value::as_bool).unwrap_or(false);
+          text.push_str(&format!(
+            "\nmentions outside the graph's answer: {} lines in {files} files ({})\n",
+            m.get("records").and_then(Value::as_array).map_or(0, Vec::len),
+            if complete { "complete" } else { "incomplete: stale or truncated" }
+          ));
+          for rec in m.get("records").and_then(Value::as_array).into_iter().flatten().take(50) {
+            text.push_str(&format!(
+              "  {}:{}: {}\n",
+              rec.get("path").and_then(Value::as_str).unwrap_or(""),
+              rec.get("line").and_then(Value::as_u64).unwrap_or(0),
+              rec.get("text").and_then(Value::as_str).unwrap_or("").trim()
+            ));
+          }
+        }
         Ok((text, data))
       }
       "search" => {
@@ -1933,7 +2367,8 @@ impl Server {
         let pattern = str_arg("pattern")?;
         let lang = str_arg("lang")?;
         let path = args.get("path").and_then(Value::as_str);
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+        let selector = args.get("selector").and_then(Value::as_str);
+        let context = args.get("context").and_then(Value::as_str);
         let root = self
           .watch
           .as_ref()
@@ -1945,16 +2380,48 @@ impl Server {
                <src>/.vorpal/index location)",
             )
           })?;
-        crate::tools::structural_search(&root, &pattern, &lang, path, limit.clamp(1, 1000))
-          .map_err(ToolError::from)
-          .map(|text| (text, json!({})))
+        let tier = self.text_tier_for(&root);
+        let walk_epoch = self.walk_epoch();
+        let page_key = self.page_key("structural_search", args, walk_epoch);
+        let (hits, stats) = match self.structural_pages.take_if_key(&page_key, args) {
+          Some(cached) => cached,
+          None => crate::tools::structural_search(
+            &root,
+            &vorpal_core::matcher::PatternSpec { pattern: &pattern, selector, context },
+            &lang,
+            path,
+            tier.as_ref(),
+            walk_epoch,
+          )
+          .map_err(ToolError::from)?,
+        };
+        let total = hits.len();
+        let mut data = paged_slice(&hits, args, "hits")?;
+        self.structural_pages.put(page_key, hits, stats);
+        let page: Vec<crate::tools::StructuralHit> = data["records"]
+          .as_array()
+          .map(|rows| rows.iter().filter_map(|r| serde_json::from_value(r.clone()).ok()).collect())
+          .unwrap_or_default();
+        data["candidateFiles"] = stats.candidate_files.into();
+        data["prunedFiles"] = stats.pruned_files.into();
+        data["prefilteredFiles"] = stats.prefiltered_files.into();
+        data["chunkParsedFiles"] = stats.chunk_parsed_files.into();
+        data["callSiteFiles"] = stats.callsite_files.into();
+        data["scannedFiles"] = stats.scanned_files.into();
+        Ok((crate::tools::render_structural(&page, &stats, total), data))
       }
       "health" => {
         // Serve from the pinned generation so spans/entities match the ids other tools hand out.
         self.kg()?;
         let dir = self.kg_dir.clone().unwrap_or_else(|| self.index_dir.clone());
+        let peak = vorpal_mem::peak_memory();
         vorpal_index::parse_health_report(&dir)
-          .map(|text| (text, json!({})))
+          .map(|text| {
+            (
+              text,
+              json!({"daemonMemory": {"peakPrivateBytes": peak.private_peak, "peakRssBytes": peak.rss_peak, "method": peak.method}}),
+            )
+          })
           .map_err(|err| ToolError::from(err.to_string()))
       }
       "schema" => {
@@ -1973,7 +2440,6 @@ impl Server {
       "rule_search" => {
         let rule = str_arg("rule")?;
         let path = args.get("path").and_then(Value::as_str);
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
         let root = self
           .watch
           .as_ref()
@@ -1985,9 +2451,27 @@ impl Server {
                <src>/.vorpal/index location)",
             )
           })?;
-        crate::tools::rule_search(&root, &rule, path, limit.clamp(1, 1000))
-          .map_err(ToolError::from)
-          .map(|text| (text, json!({})))
+        let tier = self.text_tier_for(&root);
+        let walk_epoch = self.walk_epoch();
+        let page_key = self.page_key("rule_search", args, walk_epoch);
+        let (hits, stats) = match self.rule_pages.take_if_key(&page_key, args) {
+          Some(cached) => cached,
+          None => crate::tools::rule_search(&root, &rule, path, tier.as_ref(), walk_epoch).map_err(ToolError::from)?,
+        };
+        let total = hits.len();
+        let mut data = paged_slice(&hits, args, "hits")?;
+        self.rule_pages.put(page_key, hits, stats);
+        let page: Vec<crate::tools::RuleHit> = data["records"]
+          .as_array()
+          .map(|rows| rows.iter().filter_map(|r| serde_json::from_value(r.clone()).ok()).collect())
+          .unwrap_or_default();
+        data["candidateFiles"] = stats.candidate_files.into();
+        data["prunedFiles"] = stats.pruned_files.into();
+        data["prefilteredFiles"] = stats.prefiltered_files.into();
+        data["chunkParsedFiles"] = stats.chunk_parsed_files.into();
+        data["callSiteFiles"] = stats.callsite_files.into();
+        data["scannedFiles"] = stats.scanned_files.into();
+        Ok((crate::tools::render_rules(&page, &stats, total), data))
       }
       "ast_dump" => {
         let (source, lang) = match (args.get("source").and_then(Value::as_str), args.get("path").and_then(Value::as_str)) {
@@ -2408,7 +2892,7 @@ impl Server {
 const ALL_TOOL_NAMES: &[&str] = &[
   "index", "health", "schema", "coverage", "code_search", "architecture", "compare_generations",
   "impact", "dead_code", "node", "graph", "reachable", "structural_search", "rule_search",
-  "ast_dump", "fetch_span", "data_flow", "query", "snippet", "why", "search",
+  "ast_dump", "fetch_span", "data_flow", "query", "snippet", "why", "search", "text_search",
 ];
 
 /// The relations `graph` serves — each but `callees` was a tool of its own before
@@ -2434,6 +2918,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     "id": {"type": "integer"},
     "eid": {"type": "string"},
     "all": {"type": "boolean", "description": "merge same-named"},
+    "mentions": {"type": "boolean"},
     "cursor": {"type": "string"},
     "limit": {"type": "integer", "description": "max 1000"}
   });
@@ -2473,17 +2958,32 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
         "pattern": {"type": "string", "description": "ast-grep pattern"},
         "lang": {"type": "string"},
         "prefix": {"type": "string"},
-        "k": {"type": "integer", "description": "top-k"}
+        "k": {"type": "integer", "description": "top-k"},
+        "selector": {"type": "string", "description": "root kind"},
+        "context": {"type": "string", "description": "context source"}
       })),
       &["pattern"],
     ),
-    tool("architecture", "Orientation summary: module mass, hubs by in-degree, entry-point candidates.", json!({"top": {"type": "integer", "description": "rows per section"}}), &[]),
+    tool(
+      "text_search",
+      "Regex over indexed files: path:line:col, line, symbol.",
+      with(&page, json!({
+        "pattern": {"type": "string"},
+        "case_insensitive": {"type": "boolean"},
+        "lang": {"type": "string"},
+        "prefix": {"type": "string"},
+        "symbol": {"type": "string"},
+        "max_results": {"type": "integer"}
+      })),
+      &["pattern"],
+    ),
+    tool("architecture", "Orientation summary: module mass, hubs by in-degree, entry-point candidates.", json!({"top": {"type": "integer", "description": "rows"}}), &[]),
     tool(
       "compare_generations",
-      "What changed between two index generations: files, nodes by durable eid, edge counts.",
+      "Diff two generations: files, nodes by eid, edge counts.",
       with(&page, json!({
-        "from": {"type": "string", "description": "generation id"},
-        "to": {"type": "string", "description": "generation id"}
+        "from": {"type": "string", "description": "gen id"},
+        "to": {"type": "string", "description": "gen id"}
       })),
       &[],
     ),
@@ -2535,23 +3035,23 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "structural_search",
-      "ast-grep pattern over the watched source tree: path:line + matched text.",
-      json!({
+      "ast-grep pattern over the watched tree: path:line:column + matched text.",
+      with(&page, json!({
         "pattern": {"type": "string", "description": "ast-grep pattern"},
         "lang": {"type": "string"},
         "path": {"type": "string", "description": "suffix"},
-        "limit": {"type": "integer", "description": "max 1000"}
-      }),
+        "selector": {"type": "string", "description": "root kind"},
+        "context": {"type": "string", "description": "context source"}
+      })),
       &["pattern", "lang"],
     ),
     tool(
       "rule_search",
       "Run YAML rule(s), constraints and fix dry-run included, over the watched tree.",
-      json!({
+      with(&page, json!({
         "rule": {"type": "string", "description": "YAML"},
-        "path": {"type": "string", "description": "suffix"},
-        "limit": {"type": "integer", "description": "max 1000"}
-      }),
+        "path": {"type": "string", "description": "suffix"}
+      })),
       &["rule"],
     ),
     tool(
@@ -2644,6 +3144,22 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
 /// `limit` caps the page (default 100, max 1000), and the returned object always **declares**
 /// truncation — `total`, `truncated`, and `nextCursor` when more remain. Recomputing the
 /// vector per page keeps the server stateless; determinism makes the pages coherent.
+/// [`paged`] over a borrowed set — the structural tools keep their result set for later
+/// pages, so the page is sliced without moving or cloning the set.
+fn paged_slice<T: serde::Serialize>(
+  records: &[T],
+  args: &Value,
+  outcome: &str,
+) -> Result<Value, ToolError> {
+  vorpal_index::records::paged_value(
+    records,
+    args.get("cursor").and_then(Value::as_str),
+    args.get("limit").and_then(Value::as_u64),
+    outcome,
+  )
+  .map_err(ToolError::from)
+}
+
 fn paged<T: serde::Serialize>(
   records: Vec<T>,
   args: &Value,
@@ -2755,3 +3271,72 @@ fn watch_root(index_dir: &Path) -> Option<PathBuf> {
   src.is_dir().then(|| src.to_path_buf())
 }
 
+
+#[cfg(test)]
+mod warm_and_reconcile_policy_tests {
+  use super::*;
+  use std::time::Duration;
+
+  #[test]
+  fn warm_spawns_at_once_without_a_tier_or_with_deferral_off() {
+    assert_eq!(warm_spawn_due(false, false, true, true, None, Duration::ZERO, Duration::from_secs(5), Duration::from_secs(120)), (true, true));
+    assert_eq!(warm_spawn_due(true, true, true, false, None, Duration::ZERO, Duration::from_secs(5), Duration::from_secs(120)), (true, true));
+  }
+
+  #[test]
+  fn warm_waits_for_quiet_and_never_behind_a_committer() {
+    let (q, d) = (Duration::from_secs(5), Duration::from_secs(120));
+    assert_eq!(warm_spawn_due(true, false, true, false, Some(Duration::from_secs(9)), Duration::from_secs(9), q, d), (false, true));
+    assert_eq!(warm_spawn_due(true, false, false, false, Some(Duration::from_secs(2)), Duration::from_secs(2), q, d), (false, true));
+    assert_eq!(warm_spawn_due(true, false, false, false, Some(Duration::from_secs(6)), Duration::from_secs(6), q, d), (true, true));
+    assert_eq!(warm_spawn_due(true, false, false, true, Some(Duration::from_secs(60)), Duration::from_secs(60), q, d), (false, true));
+    // the deadline forces a non-preemptible warm even under dirt
+    assert_eq!(warm_spawn_due(true, false, true, false, Some(Duration::from_secs(1)), Duration::from_secs(121), q, d), (true, false));
+  }
+
+  #[test]
+  fn reconcile_waits_for_query_quiet_then_gives_up_waiting() {
+    let hour = Duration::from_secs(3600);
+    assert!(!reconcile_due(Duration::from_secs(100), hour, None, false, false, None));
+    assert!(!reconcile_due(hour, hour, None, false, true, None));
+    assert!(!reconcile_due(hour, hour, Some(Duration::from_secs(30)), false, false, Some(Duration::from_secs(10))));
+    assert!(!reconcile_due(hour, hour, Some(Duration::from_secs(300)), true, false, Some(Duration::from_secs(10))));
+    assert!(reconcile_due(hour, hour, Some(Duration::from_secs(300)), false, false, Some(Duration::from_secs(10))));
+    assert!(reconcile_due(hour, hour, None, false, false, None));
+    assert!(reconcile_due(hour, hour, Some(Duration::from_secs(1)), true, false, Some(RECONCILE_DEADLINE)));
+  }
+}
+
+/// A few structural result sets remembered for paging: a cursor call with the same key
+/// replays the set instead of re-running the search (382 pages × 4 s for 381k hits before).
+/// Bounded; the oldest entry is dropped. A first call (no cursor) always recomputes, so a
+/// repeated query sees the current tree.
+struct PageCache<T> {
+  entries: Vec<(String, Vec<T>, crate::tools::WalkStats)>,
+}
+
+impl<T> Default for PageCache<T> {
+  fn default() -> Self {
+    PageCache { entries: Vec::new() }
+  }
+}
+
+const PAGE_CACHE_CAP: usize = 8;
+
+impl<T> PageCache<T> {
+  fn take_if_key(&mut self, key: &str, args: &Value) -> Option<(Vec<T>, crate::tools::WalkStats)> {
+    if args.get("cursor").and_then(Value::as_str).is_none() {
+      return None;
+    }
+    let pos = self.entries.iter().position(|(k, _, _)| k == key)?;
+    let (_, hits, stats) = self.entries.remove(pos);
+    Some((hits, stats))
+  }
+  fn put(&mut self, key: String, hits: Vec<T>, stats: crate::tools::WalkStats) {
+    self.entries.retain(|(k, _, _)| k != &key);
+    self.entries.push((key, hits, stats));
+    if self.entries.len() > PAGE_CACHE_CAP {
+      self.entries.remove(0);
+    }
+  }
+}

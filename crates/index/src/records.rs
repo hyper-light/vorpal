@@ -1327,8 +1327,21 @@ pub struct CodeSearchReport {
   pub stale_files: u64,
   /// Files that vanished since indexing or are not valid UTF-8 (skipped, and said so).
   pub unreadable_files: u64,
-  /// Files scanned (post lang/prefix filters).
+  /// Files read and parsed (post lang/prefix filters and the two literal gates below).
   pub scanned_files: u64,
+  /// Files the text tier proved cannot hold every required literal — never read.
+  pub pruned_files: u64,
+  /// Files read but proved matchless by the literal prefilter — never parsed.
+  pub prefiltered_files: u64,
+  /// Files parsed chunk-scoped: only the top-level statements holding the anchor literal
+  /// (see `crate::chunks`).
+  pub chunk_parsed_files: u64,
+  /// Chunks answered from the memo of previously verified chunks (no parse).
+  pub chunk_memo_hits: u64,
+  /// Files answered from the product's call references — a call pattern, no parse at all.
+  pub callsite_files: u64,
+  /// `fresh`, `partial(live/total)` or `absent`: how much of the corpus the text tier covered.
+  pub text_index: String,
   pub total_matches: u64,
 }
 
@@ -1341,19 +1354,95 @@ pub struct CodeSearchReport {
 pub fn code_search(
   kg: &Kg,
   artifacts_dir: Option<&std::path::Path>,
-  pattern: &str,
+  spec: &vorpal_core::matcher::PatternSpec<'_>,
   lang_filter: Option<&str>,
   path_prefix: Option<&str>,
   k: usize,
 ) -> Result<CodeSearchReport, String> {
   use rayon::prelude::*;
+  use vorpal_core::matcher::Prefilter;
   use vorpal_ingest::SgLang;
+  use vorpal_kg::identity::FileKey;
+  use vorpal_kg::trigramstore::{CandidateSet, Verdict};
   use vorpal_language::{Language, LanguageExt};
 
+  vorpal_kg::phase_stamp("code_search: enter");
   let runs = crate::cached_runs(kg, artifacts_dir);
   let pack = artifacts_dir.and_then(crate::cached_pack);
   // Copyable borrow for the per-chunk closures.
   let pack_ref = pack.as_deref();
+  // The text tier: which files can hold every literal the pattern requires. Absent or
+  // partial, the uncovered files simply scan — and a background heal fills the gap.
+  let text = match (artifacts_dir, pack_ref) {
+    (Some(dir), Some(pack)) => crate::trigrams::cached(dir, pack),
+    _ => None,
+  };
+  vorpal_kg::phase_stamp("code_search: runs + pack + text index in hand");
+  let text_status = text.as_ref().map_or_else(|| "absent".to_string(), |t| t.status());
+  if let Some(dir) = artifacts_dir
+    && text.as_ref().is_none_or(|t| !t.is_fresh())
+  {
+    crate::trigrams::request_heal(dir);
+  }
+  let lang_ok = |lang: SgLang| -> bool {
+    lang_filter.is_none_or(|filter| format!("{lang:?}").eq_ignore_ascii_case(filter) || lang.to_string() == filter)
+  };
+  // One compile per language present (the smart constructor re-parses C-family call shapes
+  // in statement context), one literal prefilter, one candidate set — hoisted out of the
+  // parallel loop so nothing is recompiled per chunk.
+  struct Compiled {
+    lang: SgLang,
+    matcher: vorpal_core::matcher::Pattern,
+    prefilter: Prefilter,
+    candidates: Option<CandidateSet>,
+    /// The pattern half of the chunk-memo key.
+    pattern_key: u64,
+    /// Set when the pattern is a call shape the product's references answer without a parse.
+    call_shape: Option<crate::callsite::CallShape>,
+  }
+  // Languages present and the file-key → run map, once per generation.
+  let run_index = match (artifacts_dir, pack_ref) {
+    (Some(dir), Some(pack)) => Some(crate::trigrams::cached_run_index(dir, &runs, pack)),
+    _ => None,
+  };
+  let langs: Vec<SgLang> = match &run_index {
+    Some(index) => index.langs().iter().copied().filter(|l| lang_ok(*l)).collect(),
+    None => {
+      let mut langs: Vec<SgLang> = Vec::new();
+      for run in runs.iter() {
+        if let Some(lang) = SgLang::from_path(&run.path)
+          && lang_ok(lang)
+          && !langs.contains(&lang)
+        {
+          langs.push(lang);
+        }
+      }
+      langs
+    }
+  };
+  vorpal_kg::phase_stamp("code_search: languages listed");
+  let compiled: Vec<Compiled> = langs
+    .into_iter()
+    .filter_map(|lang| {
+      let matcher = match spec.selector {
+        Some(selector) => vorpal_core::matcher::Pattern::contextual(spec.context.unwrap_or(spec.pattern), selector, lang),
+        None => vorpal_core::matcher::Pattern::try_new_smart(spec.pattern, lang),
+      }
+      .ok()?;
+      let prefilter = Prefilter::for_pattern(&matcher);
+      let candidates = text
+        .as_ref()
+        .and_then(|t| t.candidates_for_literals(&matcher.required_literals()));
+      Some(Compiled {
+        lang,
+        matcher,
+        prefilter,
+        candidates,
+        pattern_key: crate::chunks::pattern_key(&lang.to_string(), spec.pattern, spec.selector, spec.context),
+        call_shape: crate::callsite::shape_of(spec, lang),
+      })
+    })
+    .collect();
   let semantic = {
     let mut mask = [false; 256];
     for edge in [
@@ -1370,73 +1459,221 @@ pub fn code_search(
   };
 
   enum FileOutcome {
-    /// Read + parsed + matched (defs may be empty — matchless is still scanned).
-    Scanned(Vec<(u64, u32, u32)>),
+    /// Read + parsed + matched (defs may be empty — matchless is still scanned); the flags
+    /// say the parse was chunk-scoped / the product's call references answered it (no
+    /// parse), the count how many chunks the memo answered.
+    Scanned(Vec<(u64, u32, u32)>, bool, bool, u32),
     /// Current bytes no longer match the generation — never half-trusted.
     Stale,
     /// Vanished since indexing, or not valid UTF-8 — excluded, and SAID so.
     Unreadable,
+    /// The text tier proved a required literal absent — never read.
+    Pruned,
+    /// Read, but the literal prefilter proved it matchless — never parsed.
+    Prefiltered,
   }
 
-  // Pattern compilation is ~a parse of the pattern itself: per-chunk, per-language reuse
-  // keeps it to a few hundred compiles across a monorepo instead of one per file (the
-  // difference between 69 s and parse-bound wall time on the kernel's 63K C files).
-  let per_file: Vec<Option<FileOutcome>> = runs
-    .par_chunks(256)
-    .flat_map_iter(|chunk| {
-      let mut compiled: Vec<(SgLang, vorpal_core::matcher::Pattern)> = Vec::new();
-      chunk.iter().map(move |run| {
+  vorpal_kg::phase_stamp("code_search: candidates ready");
+  let compiled = &compiled;
+  let text_ref = text.as_deref();
+  // When every language's candidate set is complete (no uncovered bucket), the files to
+  // scan are exactly the admitted keys — iterate those, not every run. The pruned count is
+  // then the complement within the filtered population.
+  let admitted_runs: Option<Vec<u32>> = match &run_index {
+    Some(index) if !compiled.is_empty() && compiled.iter().all(|c| c.candidates.as_ref().is_some_and(|s| s.is_complete())) => {
+      let mut idx: Vec<u32> = compiled
+        .iter()
+        .flat_map(|c| c.candidates.as_ref().into_iter().flat_map(|s| s.admitted().iter().copied()))
+        .filter_map(|key| index.run_of(key))
+        .collect();
+      idx.sort_unstable();
+      idx.dedup();
+      Some(idx)
+    }
+    _ => None,
+  };
+  let scan_run = |run: &crate::annfiles::FileRun, check_verdict: bool| -> Option<FileOutcome> {
       let lang = SgLang::from_path(&run.path)?;
-      if let Some(filter) = lang_filter {
-        if !format!("{lang:?}").eq_ignore_ascii_case(filter) && lang.to_string() != filter {
-          return None;
-        }
+      if !lang_ok(lang) {
+        return None;
       }
       if let Some(prefix) = path_prefix {
         if !run.path.starts_with(prefix) {
           return None;
         }
       }
-      let matcher = match compiled.iter().position(|(l, _)| *l == lang) {
-        Some(at) => &compiled[at].1,
-        None => {
-          let pattern = vorpal_core::matcher::Pattern::try_new(pattern, lang).ok()?;
-          compiled.push((lang, pattern));
-          &compiled[compiled.len() - 1].1
+      let entry = compiled.iter().find(|c| c.lang == lang)?;
+      let matcher = &entry.matcher;
+      if check_verdict
+        && let (Some(set), Some(text), Some(pack)) = (&entry.candidates, text_ref, pack_ref)
+      {
+        let key = FileKey::of(pack.stored_key(&run.path)).0;
+        if text.verdict(set, key) == Verdict::Pruned {
+          return Some(FileOutcome::Pruned);
+        }
+      }
+      // The read buffer and the scan scratch are this thread's, reused across files and
+      // queries: no allocation per candidate file past the first.
+      let mut buf = crate::trigrams::take_read_buffer();
+      let verified = match crate::read_indexed_source_into(pack_ref, &run.path, &mut buf) {
+        Ok(crate::IndexedReadVerdict::Verified) => true,
+        Ok(crate::IndexedReadVerdict::Unverified) => false,
+        Ok(crate::IndexedReadVerdict::Changed) => {
+          crate::trigrams::give_read_buffer(buf);
+          return Some(FileOutcome::Stale);
+        }
+        Err(_) => {
+          crate::trigrams::give_read_buffer(buf);
+          return Some(FileOutcome::Unreadable);
         }
       };
-      let bytes = match crate::read_indexed_source_with(pack_ref, &run.path) {
-        Ok(crate::IndexedRead::Verified(bytes)) => bytes,
-        Ok(crate::IndexedRead::Unverified(bytes)) => bytes,
-        Ok(crate::IndexedRead::Changed) => return Some(FileOutcome::Stale),
-        Err(_) => return Some(FileOutcome::Unreadable),
-      };
-      let Ok(source) = String::from_utf8(bytes) else {
+      if !entry.prefilter.may_match_bytes(&buf) {
+        crate::trigrams::give_read_buffer(buf);
+        return Some(FileOutcome::Prefiltered);
+      }
+      let mut scratch = crate::chunks::take_scratch();
+      let mut chunked = false;
+      let mut memo_hits = 0u32;
+      let mut callsite = false;
+      let product = pack_ref.and_then(|pack| pack.get(&run.path));
+      // A call shape reads its matches off the product's reference rows — the same
+      // whole-file parse the reference arm runs, precomputed; rows are read in place, no
+      // outline decoded. Verified bytes only. One opaque call of the callee (recovery
+      // inside it, or a drilled call chain) sends the file to the parse path instead.
+      if verified
+        && let Some(shape) = &entry.call_shape
+        && let Some(rows) = product.and_then(vorpal_ingest::peek_product_refs)
+      {
+        let mut opaque = false;
+        for row in rows {
+          if row.kind != vorpal_ingest::CALL_REF_TAG || row.name != shape.callee {
+            continue;
+          }
+          if crate::callsite::shape_has_error(row.call_shape) {
+            opaque = true;
+            break;
+          }
+          if row.form == vorpal_ingest::BARE_FORM_TAG && !row.has_qualifier && shape.admits(row.call_shape) {
+            scratch.starts.push(row.start);
+          }
+        }
+        if opaque {
+          scratch.starts.clear();
+        } else {
+          callsite = true;
+        }
+      }
+      // Chunks holding the anchor literal (verified bytes only — the cuts describe the
+      // indexed bytes); each is answered from the memo when its bytes were verified
+      // before, and only the rest are parsed, one included range each.
+      if !callsite
+        && verified
+        && let Some(cuts) = product.and_then(vorpal_ingest::peek_product_cuts)
+      {
+        entry.prefilter.anchor_positions(&buf, &mut scratch.positions);
+        if crate::chunks::chunks_with_anchors(&buf, cuts, &mut scratch) {
+          chunked = true;
+          let crate::chunks::ChunkScratch {
+            chunks,
+            rel,
+            starts,
+            to_parse,
+            chunk_keys,
+            ..
+          } = &mut *scratch;
+          for &(start, end) in chunks.iter() {
+            let key = crate::chunks::chunk_key(&buf[start..end]);
+            rel.clear();
+            if crate::chunks::memo_get(entry.pattern_key, key, rel) {
+              memo_hits += 1;
+              starts.extend(rel.iter().map(|r| r + start as u32));
+            } else {
+              to_parse.push((start, end));
+              chunk_keys.push(key);
+            }
+          }
+        }
+      }
+      let Ok(mut source) = String::from_utf8(buf) else {
+        crate::chunks::give_scratch(scratch);
         return Some(FileOutcome::Unreadable);
       };
-      let grep = lang.grep(&source);
-      let mut match_starts: Vec<u32> = grep
-        .root()
-        .find_all(matcher)
-        .map(|hit| hit.range().start as u32)
-        .collect();
-      if match_starts.is_empty() {
-        // Scanned, clean, matchless — counted as scanned (silence must be attributable).
-        return Some(FileOutcome::Scanned(Vec::new()));
-      }
-      match_starts.sort_unstable();
-      // Attribute to the innermost containing definition span within this file's run.
-      let spans: Vec<(u32, u32, u64)> = (run.start..run.start + run.len as u64)
-        .filter_map(|id| {
-          let view = kg.node(NodeId::new(id))?;
-          if view.kind == vorpal_kg::SymbolKind::File || view.span.1 <= view.span.0 {
-            return None;
+      if callsite {
+        // answered above
+      } else if !chunked {
+        // The whole-file parse (no cut table, or an anchor chunk tree-sitter recovered in) is
+        // memoized as one chunk keyed by the whole file's bytes — a repeat of the pattern on
+        // an unchanged file replays it; an edit anywhere in the file re-parses it once.
+        let file_key = verified.then(|| crate::chunks::chunk_key(source.as_bytes()));
+        let mut replayed = false;
+        if let Some(key) = file_key {
+          scratch.rel.clear();
+          if crate::chunks::memo_get(entry.pattern_key, key, &mut scratch.rel) {
+            memo_hits += 1;
+            replayed = true;
+            let rel = &scratch.rel;
+            scratch.starts.extend(rel.iter().copied());
           }
-          Some((view.span.0, view.span.1, id))
-        })
-        .collect();
+        }
+        if !replayed {
+          let grep = lang.grep(&source);
+          scratch.starts.extend(grep.root().find_all(matcher).map(|hit| hit.range().start as u32));
+          if let Some(key) = file_key {
+            crate::chunks::memo_put(entry.pattern_key, key, &scratch.starts);
+          }
+        }
+      } else if !scratch.to_parse.is_empty() {
+        // One parse per chunk (never several ranges in one parse — see `chunks`); the
+        // source String moves through each document and comes back, no copy per chunk.
+        // Every parsed chunk's verified set is recorded, empty sets too: absence is an answer.
+        let mut points = crate::chunks::PointCursor::default();
+        for i in 0..scratch.to_parse.len() {
+          let (start, end) = scratch.to_parse[i];
+          let key = scratch.chunk_keys[i];
+          let range = points.range(source.as_bytes(), start, end);
+          let Ok(tree) = vorpal_core::tree_sitter::parse_ranges(&source, &lang, &[range]) else {
+            // The parser declined: this file parses whole, its chunks stay unmemoized.
+            scratch.starts.clear();
+            let grep = lang.grep(&source);
+            scratch.starts.extend(grep.root().find_all(matcher).map(|hit| hit.range().start as u32));
+            break;
+          };
+          let root = vorpal_core::Vorpal::doc(vorpal_core::tree_sitter::StrDoc::from_parts(source, lang, tree));
+          scratch.rel.clear();
+          scratch.rel.extend(
+            root
+              .root()
+              .find_all(matcher)
+              .map(|hit| hit.range().start)
+              .filter(|&m| start <= m && m < end)
+              .map(|m| (m - start) as u32),
+          );
+          source = root.into_doc().src;
+          crate::chunks::memo_put(entry.pattern_key, key, &scratch.rel);
+          let rel = &scratch.rel;
+          scratch.starts.extend(rel.iter().map(|r| r + start as u32));
+        }
+      }
+      if scratch.starts.is_empty() {
+        // Scanned, clean, matchless — counted as scanned (silence must be attributable).
+        crate::trigrams::give_read_buffer(source.into_bytes());
+        crate::chunks::give_scratch(scratch);
+        return Some(FileOutcome::Scanned(Vec::new(), chunked, callsite, memo_hits));
+      }
+      scratch.starts.sort_unstable();
+      // Attribute to the innermost containing definition span within this file's run.
+      let spans = &mut scratch.spans;
+      spans.clear();
+      spans.extend((run.start..run.start + run.len as u64).filter_map(|id| {
+        let node = NodeId::new(id);
+        if kg.node_kind(node)? == vorpal_kg::SymbolKind::File {
+          return None;
+        }
+        let (start, end) = kg.node_span(node)?;
+        (end > start).then_some((start, end, id))
+      }));
       let mut defs: std::collections::BTreeMap<u64, (u32, u32)> = std::collections::BTreeMap::new();
-      for &start in &match_starts {
+      for &start in &scratch.starts {
         let owner = spans
           .iter()
           .filter(|&&(s, e, _)| s <= start && start < e)
@@ -1447,34 +1684,64 @@ pub fn code_search(
         entry.0 += 1;
         entry.1 = entry.1.min(start);
       }
-      Some(FileOutcome::Scanned(
-        defs
-          .into_iter()
-          .map(|(id, (count, first))| {
-            let line = source.as_bytes()[..first as usize]
-              .iter()
-              .filter(|&&b| b == b'\n')
-              .count() as u32
-              + 1;
-            (id, count, line)
-          })
-          .collect(),
-      ))
-      })
-    })
-    .collect();
+      let bytes = source.as_bytes();
+      let out: Vec<(u64, u32, u32)> = defs
+        .into_iter()
+        .map(|(id, (count, first))| {
+          let line = memchr::memchr_iter(b'\n', &bytes[..first as usize]).count() as u32 + 1;
+          (id, count, line)
+        })
+        .collect();
+      crate::trigrams::give_read_buffer(source.into_bytes());
+      crate::chunks::give_scratch(scratch);
+      Some(FileOutcome::Scanned(out, chunked, callsite, memo_hits))
+  };
+  let (per_file, population): (Vec<Option<FileOutcome>>, u64) = match &admitted_runs {
+    Some(idx) => {
+      // The filtered population size, for the pruned count (files in scope minus admitted):
+      // per-language totals from the run index when there is no prefix, a walk otherwise.
+      let population = match (&run_index, path_prefix) {
+        (Some(index), None) => index.count_where(|lang| lang.is_some_and(|l| lang_ok(l))),
+        _ => runs
+          .iter()
+          .filter(|run| SgLang::from_path(&run.path).is_some_and(|l| lang_ok(l)) && path_prefix.is_none_or(|p| run.path.starts_with(p)))
+          .count() as u64,
+      };
+      (idx.par_iter().map(|&i| scan_run(&runs[i as usize], false)).collect(), population)
+    }
+    None => (
+      runs
+        .par_chunks(256)
+        .flat_map_iter(|chunk| chunk.iter().map(|run| scan_run(run, true)))
+        .collect(),
+      0,
+    ),
+  };
 
+  vorpal_kg::phase_stamp("code_search: scan done");
   let mut stale_files = 0u64;
   let mut unreadable_files = 0u64;
   let mut scanned_files = 0u64;
+  let mut pruned_files = 0u64;
+  let mut prefiltered_files = 0u64;
+  let mut chunk_parsed_files = 0u64;
+  let mut chunk_memo_hits = 0u64;
+  let mut callsite_files = 0u64;
   let mut total_matches = 0u64;
   let mut hits: Vec<(u64, u32, u32)> = Vec::new();
+  let mut seen_files = 0u64;
   for file in per_file.into_iter().flatten() {
+    seen_files += 1;
     match file {
       FileOutcome::Stale => stale_files += 1,
       FileOutcome::Unreadable => unreadable_files += 1,
-      FileOutcome::Scanned(defs) => {
+      FileOutcome::Pruned => pruned_files += 1,
+      FileOutcome::Prefiltered => prefiltered_files += 1,
+      FileOutcome::Scanned(defs, chunked, callsite, memo) => {
         scanned_files += 1;
+        chunk_parsed_files += u64::from(chunked);
+        callsite_files += u64::from(callsite);
+        chunk_memo_hits += u64::from(memo);
         for (id, count, first) in defs {
           total_matches += u64::from(count);
           hits.push((id, count, first));
@@ -1483,6 +1750,10 @@ pub fn code_search(
     }
   }
 
+  if admitted_runs.is_some() {
+    // Candidate-driven scan: everything in the population we never visited was pruned.
+    pruned_files = population.saturating_sub(seen_files);
+  }
   // Rank: semantic in-degree desc, then match count desc, then id — computed only for
   // definitions that actually matched.
   let mut ranked: Vec<(u64, u32, u32, u64)> = hits
@@ -1503,6 +1774,7 @@ pub fn code_search(
       .then_with(|| a.0.cmp(&b.0))
   });
   ranked.truncate(k.clamp(1, 1000));
+  vorpal_kg::phase_stamp("code_search: ranked");
 
   let records = ranked
     .into_iter()
@@ -1515,11 +1787,18 @@ pub fn code_search(
       })
     })
     .collect();
+  vorpal_kg::phase_stamp("code_search: report built");
   Ok(CodeSearchReport {
     records,
     stale_files,
     unreadable_files,
     scanned_files,
+    pruned_files,
+    prefiltered_files,
+    chunk_parsed_files,
+    chunk_memo_hits,
+    callsite_files,
+    text_index: text_status,
     total_matches,
   })
 }
@@ -1530,8 +1809,14 @@ pub fn render_code_search(report: &CodeSearchReport) -> String {
   let mut out = String::new();
   let _ = writeln!(
     out,
-    "{} matches across {} scanned files ({} stale, {} unreadable — skipped, not guessed); top definitions by in-degree:",
-    report.total_matches, report.scanned_files, report.stale_files, report.unreadable_files
+    "{} matches across {} scanned files ({} pruned by the text index [{}], {} prefiltered by literals, {} stale, {} unreadable — skipped, not guessed); top definitions by in-degree:",
+    report.total_matches,
+    report.scanned_files,
+    report.pruned_files,
+    report.text_index,
+    report.prefiltered_files,
+    report.stale_files,
+    report.unreadable_files
   );
   for record in &report.records {
     let _ = writeln!(

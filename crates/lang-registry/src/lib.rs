@@ -223,6 +223,12 @@ impl Language for SgLang {
     }
   }
 
+  fn contextual_fallback(&self, src: &str, root_kind: Option<u16>) -> Option<(String, &'static str)> {
+    match self {
+      Builtin(b) => b.contextual_fallback(src, root_kind),
+      Custom(c) => c.contextual_fallback(src, root_kind),
+    }
+  }
   fn kind_to_id(&self, kind: &str) -> u16 {
     match self {
       Builtin(b) => b.kind_to_id(kind),

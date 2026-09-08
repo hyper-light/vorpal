@@ -582,7 +582,7 @@ impl PackReader {
   /// The stored-key spelling of a caller's path: bucketed packs store tree-relative
   /// spellings, so an absolute path is stripped against the reader's root — the single
   /// conversion point on the read side.
-  fn stored_key<'a>(&self, path: &'a str) -> &'a str {
+  pub fn stored_key<'a>(&self, path: &'a str) -> &'a str {
     match (&self.root, self.relative_keys) {
       (Some(root), true) => tree_relative(path, root),
       _ => path,
@@ -658,6 +658,30 @@ impl PackReader {
   /// Per-bucket TOC rows, when this pack was loaded through a consistent TOC.
   pub fn bucket_meta(&self) -> Option<&[BucketMeta]> {
     self.meta.as_deref()
+  }
+
+  /// The canonical tree root this reader strips absolute paths against, if it has one.
+  pub fn root(&self) -> Option<&str> {
+    self.root.as_deref()
+  }
+
+  /// One bucket's live `(stored path, product bytes)` pairs, path-sorted — the text tier
+  /// builds a bucket's postings from exactly this set (bucketed layout; the flat layout
+  /// has one bucket, 0).
+  pub fn bucket_entries(&self, bucket: u32) -> Vec<(&str, &[u8])> {
+    let Ok(bucket) = u16::try_from(bucket) else {
+      return Vec::new();
+    };
+    self
+      .bucket_slots(bucket)
+      .into_iter()
+      .filter_map(|(path, off, len)| {
+        let body = self
+          .bucket_bytes(bucket)
+          .get(off as usize..(off + len as u64) as usize)?;
+        Some((path, body))
+      })
+      .collect()
   }
 
   /// Every packed `(stored path, product bytes)` pair, in unspecified order — whole-bank

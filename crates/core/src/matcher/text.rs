@@ -44,7 +44,7 @@ impl RegexMatcher {
 /// require their body's literals, and everything uncertain (classes, lookarounds, `min = 0`,
 /// non-UTF-8 fragments) requires nothing. Case-insensitive parts compile to classes in the
 /// HIR, so they naturally contribute nothing rather than a wrong-case literal.
-fn regex_required_literals(pattern: &str) -> Vec<String> {
+pub fn regex_required_literals(pattern: &str) -> Vec<String> {
   use regex_syntax::hir::{Hir, HirKind};
   fn walk(hir: &Hir, out: &mut Vec<String>) {
     match hir.kind() {
@@ -90,6 +90,87 @@ fn regex_required_literals(pattern: &str) -> Vec<String> {
   out.dedup();
   out
 }
+
+/// The literal branches of a regex, as a disjunction of conjunctions: a match satisfies at
+/// least one branch, and every literal of that branch occurs inside it. `TODO|FIXME` yields
+/// `[[TODO], [FIXME]]`; `foo(bar|baz)` yields `[[foo, bar], [foo, baz]]`; a pattern with no
+/// alternation yields one branch equal to [`regex_required_literals`]. Bounded at
+/// [`MAX_LITERAL_BRANCHES`] branches — past that the alternation collapses to the literals
+/// common to its branches (still sound, less selective). The candidate path unions the
+/// per-branch candidate sets, so an alternation prunes instead of scanning everything.
+pub fn regex_literal_branches(pattern: &str) -> Vec<Vec<String>> {
+  use regex_syntax::hir::{Hir, HirKind};
+  fn dnf(hir: &Hir) -> Vec<Vec<String>> {
+    match hir.kind() {
+      HirKind::Literal(literal) => match std::str::from_utf8(&literal.0) {
+        Ok(text) if !text.is_empty() => vec![vec![text.to_string()]],
+        _ => vec![Vec::new()],
+      },
+      HirKind::Concat(parts) => {
+        let mut acc: Vec<Vec<String>> = vec![Vec::new()];
+        for part in parts {
+          let branches = dnf(part);
+          if acc.len() * branches.len() > MAX_LITERAL_BRANCHES {
+            // Too many combinations: keep what every branch of `part` requires.
+            let common = common_literals(&branches);
+            for a in acc.iter_mut() {
+              a.extend(common.iter().cloned());
+            }
+            continue;
+          }
+          let mut next = Vec::with_capacity(acc.len() * branches.len());
+          for a in &acc {
+            for b in &branches {
+              let mut merged = a.clone();
+              merged.extend(b.iter().cloned());
+              next.push(merged);
+            }
+          }
+          acc = next;
+        }
+        acc
+      }
+      HirKind::Capture(capture) => dnf(&capture.sub),
+      HirKind::Repetition(repetition) if repetition.min >= 1 => dnf(&repetition.sub),
+      HirKind::Alternation(branches) => {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for branch in branches {
+          out.extend(dnf(branch));
+        }
+        if out.len() > MAX_LITERAL_BRANCHES {
+          return vec![common_literals(&out)];
+        }
+        out
+      }
+      _ => vec![Vec::new()],
+    }
+  }
+  fn common_literals(branches: &[Vec<String>]) -> Vec<String> {
+    let mut iter = branches.iter();
+    let Some(first) = iter.next() else {
+      return Vec::new();
+    };
+    let mut common: Vec<String> = first.clone();
+    for branch in iter {
+      common.retain(|l| branch.contains(l));
+    }
+    common
+  }
+  let Ok(hir) = regex_syntax::Parser::new().parse(pattern) else {
+    return vec![Vec::new()];
+  };
+  let mut branches = dnf(&hir);
+  for branch in branches.iter_mut() {
+    branch.sort_unstable();
+    branch.dedup();
+  }
+  branches.sort();
+  branches.dedup();
+  branches
+}
+
+/// Cap on literal branches a regex plan expands to (each branch costs one candidate walk).
+pub const MAX_LITERAL_BRANCHES: usize = 16;
 
 impl Matcher for RegexMatcher {
   fn match_node_with_env<'tree, D: Doc>(
@@ -143,5 +224,21 @@ mod required_literal_tests {
     assert_eq!(matcher.required_literals(), ["_SUSPEND".to_string()]);
     let free = RegexMatcher::try_new("[a-z]+").expect("valid regex");
     assert!(free.required_literals().is_empty());
+  }
+
+  #[test]
+  fn literal_branches_distribute_alternations() {
+    assert_eq!(regex_literal_branches("TODO|FIXME"), vec![vec!["FIXME".to_string()], vec!["TODO".to_string()]]);
+    assert_eq!(
+      regex_literal_branches("foo(bar|baz)"),
+      vec![vec!["bar".to_string(), "foo".to_string()], vec!["baz".to_string(), "foo".to_string()]]
+    );
+    assert_eq!(regex_literal_branches("hello"), vec![vec!["hello".to_string()]]);
+    assert_eq!(regex_literal_branches("[a-z]+"), vec![Vec::<String>::new()]);
+    // a branch with no literal keeps the union honest: it requires nothing
+    assert_eq!(regex_literal_branches("abc|[0-9]+"), vec![Vec::<String>::new(), vec!["abc".to_string()]]);
+    // past the cap the alternation collapses to its common literals (here: none)
+    let wide = (0..20).map(|i| format!("lit{i}")).collect::<Vec<_>>().join("|");
+    assert_eq!(regex_literal_branches(&wide), vec![Vec::<String>::new()]);
   }
 }

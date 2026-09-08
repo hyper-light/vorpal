@@ -676,6 +676,7 @@ pub fn run_index(arg: IndexArg, project: Result<ProjectConfig>) -> Result<ExitCo
   if report.cache_mode != "fast-stat" {
     println!("cache mode: {}", report.cache_mode);
   }
+  println!("{}", vorpal_mem::describe_peak_memory(&vorpal_mem::peak_memory()));
   println!("index: {}", out.display());
   Ok(ExitCode::SUCCESS)
 }
@@ -1190,7 +1191,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     let report = vorpal_index::records::code_search(
       &kg,
       Some(&gen_dir),
-      &arg.query,
+      &vorpal_core::matcher::PatternSpec::plain(&arg.query),
       arg.lang.as_deref(),
       arg.prefix.as_deref(),
       arg.k.max(1),

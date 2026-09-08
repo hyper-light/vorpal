@@ -21,6 +21,7 @@ mod pack;
 mod pipeline;
 mod product;
 mod references;
+pub use references::{call_callee_field, call_kinds, is_leaf_kind};
 mod retained;
 mod selfcheck;
 pub mod requests;
@@ -125,6 +126,7 @@ pub use pipeline::{
   stream_apply, stream_apply_with_fresh, stream_apply_spilled,
 };
 pub use product::{
+  BARE_FORM_TAG, CALL_REF_TAG, Cuts, MAX_PRODUCT_CUTS, RefRow, RefRows, peek_product_cuts, peek_product_refs, refform_tag, refkind_tag,
   FileProduct, ProductRef, ProductRequest, ProductSignature, ProductStats, ProductView, RefView,
   RequestView, SignatureView, cache_file_name, decode_product,
   decode_product_view, encode_product_into, load_product, peek_product_digest,
@@ -218,14 +220,18 @@ pub fn extraction_identity_for_path(path: &str, rules_digest: u64) -> Option<u64
 /// Combine a grammar digest and a rules digest into one product-identity digest (order-fixed
 /// xxh3, so it never accidentally cancels the way a XOR could).
 pub fn extraction_identity(grammar_digest: u64, rules_digest: u64) -> u64 {
-  // Four identity inputs: the grammar generation, the rules digest, the typefacts table
-  // version, and the signature scheme version — editing capture semantics re-keys products
-  // with no format bump.
-  let mut buf = [0u8; 28];
+  // Five identity inputs: the grammar generation, the rules digest, the typefacts table
+  // version, the signature scheme version — editing capture semantics re-keys products
+  // with no format bump — and the product format version itself, so a format bump on an
+  // UNCHANGED tree still moves the manifest's stamp: the whole-tree fast path declines and
+  // the tree rebuilds once (rebuild is the migration). Before this fold a bump that only
+  // added a section (v21 cuts) left unchanged trees serving the old shape indefinitely.
+  let mut buf = [0u8; 32];
   buf[..8].copy_from_slice(&grammar_digest.to_le_bytes());
   buf[8..16].copy_from_slice(&rules_digest.to_le_bytes());
   buf[16..24].copy_from_slice(&typefacts::TYPEFACTS_VERSION.to_le_bytes());
-  buf[24..].copy_from_slice(&signature::SIGNATURE_VERSION.to_le_bytes());
+  buf[24..28].copy_from_slice(&signature::SIGNATURE_VERSION.to_le_bytes()[..4]);
+  buf[28..].copy_from_slice(&product::PRODUCT_FORMAT_VERSION.to_le_bytes());
   xxhash_rust::xxh3::xxh3_64(&buf)
 }
 

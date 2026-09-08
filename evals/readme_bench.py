@@ -131,6 +131,8 @@ def rss_gb_from_time_l(stderr):
 # ---------------- index17 ----------------
 def phase_index17():
     for label, src in CORPORA:
+        if ONLY and label not in ONLY:
+            continue
         arms = [("new", BIN)] + ([(l, b) for l, b in CONTROLS] if label == "linux" else [])
         out = OUT / f"idx17-{label}"
         tracked = subprocess.run(["git", "-C", src, "ls-files"], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.count("\n")
@@ -216,8 +218,13 @@ def phase_tiers():
     (cfgs / "learned.yml").write_text("semanticTier: learned\n")
     for k, m in MODELS.items(): (cfgs / f"learned-{k}.yml").write_text(f"semanticTier: learned\nencoderDir: {m}\n")
     done = {(r["corpus"], r["tier"]) for r in R["rows"] if r.get("phase") == "tiers" and "search_median_ms" in r}
+    tiers_wanted = [t for t in os.environ.get("VORPAL_BENCH_TIERS", "default,learned,learned-f16,learned-f32").split(",") if t]
     for corpus, src in TIER_CORPORA.items():
+        if ONLY and corpus not in ONLY:
+            continue
         for tier in ("default", "learned", "learned-f16", "learned-f32"):
+            if tier not in tiers_wanted:
+                continue
             if (corpus, tier) in done:
                 log("tiers: keeping the completed row for", corpus, tier); continue
             index = OUT / f"tier-{corpus}-{tier}"

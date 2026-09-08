@@ -61,6 +61,17 @@ impl Supervisor {
   /// must NOT retry in-process (a crashing input would then take the daemon down, which is
   /// exactly what supervision exists to prevent).
   pub(crate) fn build(&self, src: &Path, out: &Path) -> Result<BuildOutcome, String> {
+    self.build_with_env(src, out, &[])
+  }
+
+  /// [`Self::build`] with extra environment for the child — the hourly reconcile asks for
+  /// `VORPAL_VERIFY_CACHE=1` (content-authoritative replay) this way.
+  pub(crate) fn build_with_env(
+    &self,
+    src: &Path,
+    out: &Path,
+    env: &[(&str, &str)],
+  ) -> Result<BuildOutcome, String> {
     let Some((program, flavor)) = &self.candidate else {
       return Ok(BuildOutcome::Unavailable);
     };
@@ -78,6 +89,9 @@ impl Supervisor {
       IndexerFlavor::VorpalIndex => {
         cmd.arg("index").arg(&src_abs).arg(&out_abs);
       }
+    }
+    for (key, value) in env {
+      cmd.env(key, value);
     }
     cmd
       .current_dir(&src_abs)

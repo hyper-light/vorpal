@@ -1526,6 +1526,7 @@ pub(crate) fn apply_product_with_args<'i>(
         r.receiver.as_deref(),
         r.receiver_type.as_deref(),
         r.receiver_type_origin,
+        r.call_shape,
         &r.args,
       )
     }),

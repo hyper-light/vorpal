@@ -314,6 +314,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(note) = &report.request_note {
           println!("requests: {note}");
         }
+        println!("{}", vorpal_mem::describe_peak_memory(&vorpal_mem::peak_memory()));
         if report.excluded_files > 0 {
           println!(
             "note: {} unhealthy files excluded from the graph (parse-health policy)",

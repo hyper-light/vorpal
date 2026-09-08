@@ -408,6 +408,7 @@ fn title_of(name: &str) -> String {
     "graph" => "Graph neighbours",
     "reachable" => "Reachability",
     "structural_search" => "Structural search",
+    "text_search" => "Text search",
     "rule_search" => "Rule search",
     "ast_dump" => "AST dump",
     "fetch_span" => "Fetch source span",

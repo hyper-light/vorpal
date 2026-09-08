@@ -143,7 +143,7 @@ it from `.cursor/mcp.json`).
 Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
 `compare_generations`, `impact`, `dead_code`, `node`, `graph` (callers, callees, references,
 importers, implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
-`rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`. The whole listing is
+`rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`, `text_search`. The whole listing is
 under 12 KB on the wire (11.7 KB; a test gates it), because a client either loads each schema
 in a model turn or carries the listing in every turn's input; the server's instructions
 also carry the CLI one-liner for its index, so a client with a shell can answer a single
@@ -185,18 +185,22 @@ Every command with examples: **[docs/getting-started.md](docs/getting-started.md
 
 ## Performance
 
-Numbers below are release builds of **v0.8.4** on an Apple M5 Max (18 cores, 128 GB,
-macOS 26.4.1, rustc 1.98.0). The indexing tables were measured 2026-09-06 with Docker
-Desktop closed; the search, giant-file, scan, and agent tables on 2026-09-05 and 06 with
-it open. Times are wall-clock for the whole CLI invocation including process start; cold
-times are the best of three runs. Every run waited for a quiet machine first: two
-consecutive one-second `top` samples at least 88 % idle, with nothing above half a core
-except `WindowServer` and `fseventsd`, which runs at a full core while an index build
-streams file events, and whose load we recorded beside each result instead. Every dataset
-is pinned by commit. Indexing always builds
-the full graph (calls, imports, types, data flow, near-clone pairs, request-to-route
-links, co-change history), so each number covers the whole product, not a symbol table. Method and
-history: `docs/wip/BENCHMARKS.md`.
+Numbers below are release builds of **v0.9.0** on an Apple M5 Max (18 cores, 128 GB,
+macOS 26.4.1, rustc 1.98.0). The kernel, CPython, and this-repo index rows, the structural
+search table, and both tool comparisons were measured 2026-09-07; the other fifteen index
+rows and the tier and agent tables on 2026-09-05 and 06 with v0.8.4. Every dataset is
+pinned by commit. One cold-index number per corpus appears throughout: the one in the
+indexing table.
+
+Times are wall-clock for the whole CLI invocation, process start included. Cold times are
+the best of three runs. Every run waited for a quiet machine: two consecutive one-second
+`top` samples at least 88 % idle, with nothing above half a core except `WindowServer`
+and `fseventsd`. `fseventsd` runs at a full core while an index build streams file
+events, so its load is recorded beside each result.
+
+Indexing always builds the full graph: calls, imports, types, data flow, near-clone
+pairs, request-to-route links, co-change history. Each number covers the whole product,
+not a symbol table. Method and history: `docs/wip/BENCHMARKS.md`.
 
 ### How long does indexing take?
 
@@ -217,10 +221,10 @@ The edit rows are medians of three saves to `fs/read_write.c`. A body edit or a 
 change replays only that file against the carried graph. Adding a definition takes the
 defs-changed compose: the changed file is re-resolved against the carried include graph
 and the definitions it affects are patched in place, and the result is checked to equal a
-from-scratch build of the same tree. Same-day controls on the cold row,
-interleaved under the same gate: v0.7.1 built from its tag 8.7 s, v0.8.3 8.5 s. The
-10.9 s an earlier version of this table carried was a slow day for every binary, not the
-code; the investigation is in `docs/wip/BENCHMARKS.md`.
+from-scratch build of the same tree. Same-day control on the cold row, interleaved
+under the same gate: the installed 0.8.0 binary 8.6 s. A run earlier the same day read
+10.6 s for both while a git process held 40 % of a core; the slow day is the machine, not
+the code, and both runs are in `docs/wip/BENCHMARKS.md`.
 
 Fifteen other repositories, shallow-cloned at the pinned commit. "Files parsed" counts
 files a grammar handled, not everything tracked; the kernel row uses the same rule.
@@ -243,10 +247,10 @@ files a grammar handled, not everything tracked; the kernel row uses the same ru
 | neovim/neovim `d423675` | C/Lua | 1,476 | 40,507 | 0.2 s | 0.01 s |
 | vuejs/core `d63616c` | Vue/TS | 626 | 11,191 | 0.1 s | 0.01 s |
 
-This repository: 1,897 files parsed of 2,882 tracked → 79,901 nodes, 6.8 s cold¹, 0.02 s
+This repository: 1,917 files parsed of 2,889 tracked → 80,611 nodes, 6.9 s cold¹, 0.02 s
 unchanged. The vendored tree-sitter runtime and 49 grammars are included in that count.
 
-Disk: the kernel index is a 4.5 GB generation of 236 files, most of it a parsed-product
+Disk: the kernel index is a 4.8 GB generation of 236 files, most of it a parsed-product
 cache that makes the sub-second edits above possible; the search tiers a daemon warms on
 top of it add about 3.3 GB (table below). The previous generation is kept until the next
 commit, then swept. Indexer peak RSS on the kernel: 6.1 GB; a batch build keeps freed
@@ -293,6 +297,41 @@ the file falls back to a full walk. One-shot CLI builds are unaffected because n
 is retained unless a file is parsed again. `VORPAL_TREE_CACHE=0` disables retention,
 `VORPAL_WALK_REUSE=0` disables only the splice; `_MIN` and `_BUDGET` set the 1 MiB floor
 and the 256 MiB budget.
+
+### How fast is structural search?
+
+`code_search` and `structural_search` run an ast-grep pattern over the indexed tree. The
+daemon keeps a trigram index of the source, so a pattern only visits files that contain
+its literals. Inside a file it parses only the top-level statements that contain the
+literal; the index records where each statement starts. A statement tree-sitter had to
+recover from is parsed with its whole file, so the result is the same as parsing every
+file whole. A test compares the two on fixtures, and every kernel row below was checked
+the same way. `text_search` is grep over the same index; each line comes back with the
+symbol it sits in.
+
+Linux kernel, one daemon, median of 3 calls:
+
+| Query | Before the text index | Now |
+|---|---:|---:|
+| `code_search kmalloc($A, $B)`: 2,715 calls, each with its function | 4.3 s | **35 ms** |
+| `code_search kfree($A)`: 40,499 calls | — | **90 ms** |
+| `structural_search kmalloc($A, $B)` | 4.1 s, stopped at 100 | **51 ms**, all 2,715 |
+| `code_search $R = schedule_timeout($A)` | 4.4 s | **45 ms** |
+| `code_search os.path.join($A, $B)` in Python, second call | — | **2 ms** |
+| `code_search if ($C) return $X;`: 381,811 matches, first call then a repeat | — | 3.7 s, then **0.4 s** |
+| `text_search`, tgrep's 102-query suite, per query | — | **12.8 ms** (tgrep 21 ms, ripgrep about 1 s) |
+
+Call patterns whose arguments are all metavariables, such as `f($A, $B)`, `f()`, or
+`f($$$)`, need no parse at all. The index records every call with its argument count, so
+the answer comes from the graph's own call references. Calls that tree-sitter had to
+recover inside still go through the parser. A pattern run twice replays the unchanged
+parts from a memo, so after an edit only the changed files are parsed again. The full
+tables and the rules behind them are in `docs/wip/BENCHMARKS.md`.
+
+The graph and the text index also answer two questions neither can alone. `graph` with
+`mentions: true` lists every place a name appears in text outside the files the graph
+already answered with, so an empty list before a rename means nothing was missed.
+`text_search` with `symbol` searches one definition's source and nothing else.
 
 ### Is search any good?
 
@@ -429,17 +468,18 @@ the model then has to read.
 | Kernel: what `vfs_read` reaches, depth 2 | 0.06 ms | no equivalent | 3 records |
 
 On a small repo both are far under a model turn; the difference is round trips. On the
-kernel every grep rescans 75,954 files (0.7 to 0.9 s) while the graph answers in
-microseconds to milliseconds, and grep's lines include definitions, comments, and
-macros the model must sift, where the graph returns resolved call edges with their
-grades. A name with several definitions comes back as the list of candidates rather
-than a merged answer: `kmalloc` has six in the kernel tree, and its macro form resolves
-no call edges at all, so an earlier version of this table that counted those six
-candidates as callers was wrong. The first call in a fresh daemon pays a cold open plus the
-tree revalidation sweep (119 ms on this repo; 0.27 s on the kernel with the tree's
-metadata cached, 2.8 s once when it was not on the kernel); a
-kernel tree that changed since its generation pays a rebuild on that first call instead
-(9.4 s measured with v0.8.2).
+kernel, every grep rescans 75,954 files (0.7 to 0.9 s) while the graph answers in
+microseconds to milliseconds. Grep's lines also include definitions, comments, and macros
+the model has to sift; the graph returns resolved call edges with their grades.
+
+A name with several definitions comes back as a list of candidates, not a merged answer.
+`kmalloc` has six in the kernel tree, and its macro form resolves no call edges at all,
+so an earlier version of this table that counted those six as callers was wrong.
+
+The first call in a fresh daemon pays a cold open plus the tree revalidation sweep:
+119 ms on this repo, 0.27 s on the kernel with the tree's metadata cached, 2.8 s once
+when it was not. A kernel tree that changed since its generation pays a rebuild on that
+first call instead (9.4 s measured with v0.8.2).
 
 Claude Code hands the model a tool's `structuredContent` as compact JSON and drops the
 text block (checked in the 2.1.261 transcripts), so `format` shapes what the model reads
@@ -448,19 +488,20 @@ through the structured half. For the three callers of `vfs_read` that is 753 B b
 `format: ids`; each page puts its common directory in one `base` field. `toon` only
 rewrites the text half, which this client never shows.
 
-**What that costs end to end.** We tested Claude Code 2.1.261 with Opus 5 at high effort
-(pinned with `--effort high`) on the same four questions, three ways. The first run
-could only use Grep, Glob, and Read. The second could only use vorpal's MCP tools as
-Claude Code ships them, with schemas deferred, so the first use of each tool costs a
-`ToolSearch` turn. The third could also run the vorpal CLI from the shell; the server's
-instructions include the exact command for its index, and the shell tool is never
-deferred. For that run, allow the executable by the path the server prints, for example
-`Bash(/path/to/vorpal:*)`.
+**What that costs end to end.** We asked Claude Code 2.1.261 (Opus 5, `--effort high`)
+the same four questions three ways:
+
+- grep only: the model could use Grep, Glob, and Read.
+- vorpal MCP tools, as Claude Code ships them. Schemas are deferred, so the first use of
+  each tool costs a `ToolSearch` turn.
+- vorpal CLI from the shell. The server's instructions carry the exact command for its
+  index, and the shell tool is never deferred. For this arm, allow the executable by the
+  path the server prints, for example `Bash(/path/to/vorpal:*)`.
+
 Tokens count everything the model processed, cache reads included. Cost is what the API
-billed with the prompt cache warm: each cell ran four times back to back and the table
-shows medians of the last three, whose first turn read the whole prefix from the cache.
-The first ask of an hour also writes that prefix, at twice the input price; that
-surcharge is measured separately below. Measured 2026-09-06 with v0.8.3.
+billed with the prompt cache warm: each cell ran four times back to back, and the table
+shows medians of the last three. The first-ask surcharge is measured separately below.
+Measured 2026-09-06 with v0.8.3.
 
 | Question | Tools | Turns | Tokens | Cost | Wall |
 |---|---|---:|---:|---:|---:|
@@ -478,60 +519,98 @@ surcharge is measured separately below. Measured 2026-09-06 with v0.8.3.
 |  | vorpal CLI via shell | 2 | 36 K | $0.026 | 5.8 s |
 
 Each turn on Opus re-reads the whole context, about 17 K tokens here, so the turn count
-sets the token column: two turns through the shell (the command and the reply), three
-through the MCP tools (the schema load, one `graph` or `reachable` call, the reply),
-three to six for grep, which decides how many searches to run and varies from run to
-run. The bill follows the turns: grep $0.05 to $0.14 a question, the MCP tools $0.04 to
-$0.05, the shell $0.03 to $0.04. Grep's runs also write their own tail, the file
-contents they read, at the cache-write price, which is why its kernel callers question
-costs the most. The first ask of an hour writes the prefix, system prompt, tool schemas
-and instructions, at $10 per million tokens on Opus 5: measured once per arm after an
-hour with no run, it added $0.09 to $0.14 to a grep question, $0.10 to $0.13 to an MCP
-one, and $0.17 to $0.22 to a shell one. The shell arm's prefix is the largest, 18 K to
-22 K tokens, and none of it was cached by anything else; the grep and MCP arms found 7 K
-to 10 K of theirs still cached from other Claude Code sessions on the machine. Wall time
-for a two-turn shell run is 5 to 8 s, of which vorpal's own work is under 0.3 s; the
-rest is the model. Every vorpal run named the right callers, callees, and reachable
-definitions. Grep gave the right file and line every time, but on the repo callers
-question it named the enclosing function correctly in one run of six: `tools_call_multi`
-came back as `Router::call_tool` or was left out. On the kernel callees question grep's
-read also listed two inline helpers, `fsnotify_access` and `add_rchar`, that the graph
-does not resolve as call edges. On the `run_install` question grep found one transitive
-call, `claude_desktop_config`, made inside a struct literal, that the graph does not
-record; the graph arms instead carried three depth-2 records the resolver grades
-`constrained`, names from vendored grammar JSON, which the model flagged as not real
-targets. Earlier versions of this table, back to the 27-tool surface that took 8 turns
-and 161 K tokens on the kernel callers question, are in `docs/wip/BENCHMARKS.md`.
+sets the token column. The shell takes two turns (the command and the reply), the MCP
+tools three (the schema load, one `graph` or `reachable` call, the reply), and grep three
+to six, depending on how many searches the model decides to run.
 
-**Against the nearest tool.** [codebase-memory-mcp] (cbm, v0.10.8-dev built from source
-at `997d087`) is also a single local binary with tree-sitter parsing, a typed code graph,
-BM25, a Cypher subset, and an MCP server, so the same corpora, labelled queries, and
-metrics run against both. Both indexed the same checkouts on the same machine. cbm ran
-in its `full` mode (the only mode with semantic edges), timed through its scriptable
-`cli`; memory is peak RSS over the whole process tree. This table is the v0.7.1
-comparison from 2026-09-03, on that day's label sets and machine; we did not re-run cbm
-for v0.8.3. The current vorpal numbers for the same rows are in the tables above.
+The bill follows the turns:
+
+- grep: $0.05 to $0.14 a question. Its runs also write the file contents they read at the
+  cache-write price, which is why the kernel callers question costs the most.
+- MCP tools: $0.04 to $0.05.
+- shell: $0.03 to $0.04.
+
+The first ask of an hour also writes the prefix (system prompt, tool schemas,
+instructions) at $10 per million tokens on Opus 5. Measured once per arm after an idle
+hour, that added $0.09 to $0.14 to a grep question, $0.10 to $0.13 to an MCP one, and
+$0.17 to $0.22 to a shell one. The shell arm's prefix is the largest, 18 K to 22 K tokens,
+and none of it was already cached; the grep and MCP arms found 7 K to 10 K of theirs
+cached by other Claude Code sessions on the machine.
+
+A two-turn shell run takes 5 to 8 s of wall time. vorpal's own work is under 0.3 s of
+that; the rest is the model.
+
+On correctness:
+
+- Every vorpal run named the right callers, callees, and reachable definitions.
+- Grep found the right file and line every time. On the repo callers question it named
+  the enclosing function correctly in one run of six: `tools_call_multi` came back as
+  `Router::call_tool` or was left out.
+- On the kernel callees question, grep's read also listed two inline helpers,
+  `fsnotify_access` and `add_rchar`, that the graph does not resolve as call edges.
+- On the `run_install` question, grep found one transitive call made inside a struct
+  literal, `claude_desktop_config`, that the graph does not record. The graph arms instead
+  carried three depth-2 records the resolver grades `constrained`, names from vendored
+  grammar JSON, which the model flagged as not real targets.
+
+Earlier versions of this table, back to the 27-tool surface that took 8 turns and 161 K
+tokens on the kernel callers question, are in `docs/wip/BENCHMARKS.md`.
+
+**Against tgrep.** [tgrep] (1.0.4) is a trigram-indexed grep with a server. You run
+`tgrep index .`, then `tgrep serve .`, and each `tgrep <pattern> .` connects to the
+server. The vorpal equivalent is `vorpal index .`, one `vorpal mcp` daemon, and one call
+per question. Both tools were built from source and run on the same checkouts on
+2026-09-07. tgrep's index rows are medians of three builds timed with `/usr/bin/time -l`;
+vorpal's are the indexing table's. The driver is `evals/tgrep_bench.py`.
+
+| | tgrep | vorpal |
+|---|---|---|
+| **Linux kernel**, cold index | 8.2 s, 0.31 GB RSS, 1.0 GB on disk, 94,719 files | 8.1 s, 6.1 GB RSS, 4.8 GB on disk, 75,954 files parsed into 8.9 M nodes |
+| **CPython**, cold index | 0.54 s, 0.14 GB, 74 MB | 0.9 s, 0.7 GB, 160 MB |
+| **This repo**, cold index (49 vendored grammars) | 0.69 s, 0.26 GB, 28 MB | 6.9 s, 11.6 GB, 860 MB |
+| tgrep's 102-query kernel suite, median per query | 21 ms, text lines | `text_search` **12.8 ms**, lines with their symbol; `search` **0.65 ms**, ranked definitions |
+| Every call of `kmalloc` in the kernel | 18 ms, 3,387 lines matching `kmalloc\(` | `code_search kmalloc($A, $B)` **35 ms**, 2,715 two-argument calls with their functions |
+| Callers of `vfs_read` | 7.7 ms, 13 lines | `graph callers` 0.10 ms, 3 call edges with their sites |
+| Save a file, then ask again (kernel clone) | 4.4 s | 4.3 s; 2.0 to 2.2 s when `fseventsd` is quiet |
+
+tgrep indexes bytes, so it builds faster, uses far less memory, and takes any regex. A
+grep question over the kernel costs about 20 ms with either tool. vorpal's answers carry
+more: a call matched with its argument count and the function it sits in, a caller as a
+resolved edge, a definition ranked among definitions. `text_search` returns the same
+lines an exhaustive scan would; this was checked on every query in the suite.
+
+[tgrep]: https://github.com/microsoft/tgrep
+
+**Against the nearest tool.** [codebase-memory-mcp] (cbm) is also a single local binary
+with tree-sitter parsing, a typed code graph, BM25, a Cypher subset, and an MCP server, so
+the same corpora, labelled queries, and metrics run against both. This table was measured
+2026-09-07 with cbm `997d087` built from source, on the same checkouts and machine. cbm
+ran in its `full` mode, the only mode with semantic edges, through its scriptable `cli`;
+its memory is peak RSS over the whole process tree, sampled every 50 ms. Search rows use
+the same label files and the same NDCG@10 / MRR / recall@5 math; cbm's `search_graph` in
+BM25 mode, vorpal's default tier.
 
 | | vorpal | codebase-memory-mcp |
 |---|---|---|
-| **Linux kernel** cold index (75,954 files) | **8.2 s** · 8.89 M nodes · peak RSS 5.6 GB · 7.6 GB on disk | 265 s · 8.53 M nodes / 16.0 M edges · peak RSS **70.3 GB** · 15.9 GB SQLite |
-| Kernel, nothing changed | **0.12 s** | 12.5 s |
-| **CPython** cold index (3,841 files) | **1.0 s** · 162,945 nodes · 0.8 GB RSS · 200 MB | 36.2 s · 136,118 nodes · 6.6 GB RSS · 663 MB |
-| **This repo** cold index (49 vendored grammar giants) | **7.4 s** · 78,894 nodes · 12.2 GB RSS · 836 MB | 44.8 s · 66,141 nodes · 32.3 GB RSS · 291 MB |
-| Search, kernel labels (NDCG@10 / MRR / recall@5) | **0.299 / 0.375 / 0.229** (default tier) | 0.116 / 0.104 / 0.167 (BM25) |
-| Search, CPython labels | 0.137 / 0.208 / 0.250 default · **0.410 / 0.556 / 0.500** learned + encoder | 0.274 / 0.246 / 0.167 (BM25) |
-| Search, this repo's labels | 0.571 / 0.560 / 0.550 default · **0.648 / 0.625 / 0.750** with the encoder | 0.479 / 0.500 / 0.450 (BM25) |
-| cbm `semantic_query` (keyword-vector mode), all three corpora | — | 0.000 on every class |
-| One search, one-shot CLI (kernel) | **0.2 s** (daemon: 59 ms) | 3.3–5.5 s |
-| Callers of a symbol, one-shot CLI (kernel) | **0.06 s** (daemon: 0.1 ms) | 3.3–4.4 s |
-| Ranking tiers | default · learned (trained per corpus) · neural encoder rerank (f16/f32), per-index `tune` | BM25 · regex · static per-token vectors |
+| **Linux kernel** cold index (75,954 files) | **8.1 s**, 8.89 M nodes, 6.1 GB peak RSS, 4.8 GB on disk | 296 s, 8.53 M nodes / 16.0 M edges, 30.8 GB peak RSS, 15.8 GB SQLite |
+| Kernel, nothing changed | **0.13 s** | 14.2 s |
+| **CPython** cold index (3,841 files) | **0.9 s**, 162,945 nodes, 0.7 GB, 160 MB | 38.5 s, 136,118 nodes, 6.5 GB, 632 MB |
+| CPython, nothing changed | 0.02 s | 5.2 s |
+| **This repo** cold index (49 vendored grammars) | **6.9 s**, 80,611 nodes, 11.6 GB, 860 MB | 43.1 s, 67,797 nodes, 31.8 GB, 297 MB |
+| This repo, nothing changed | 0.02 s | 5.4 s |
+| Search, kernel labels (NDCG@10 / MRR / recall@5) | **0.329 / 0.327 / 0.358** | 0.218 / 0.188 / 0.293 |
+| Search, CPython labels | **0.306 / 0.291 / 0.333** | 0.200 / 0.205 / 0.222 |
+| Search, this repo's labels | 0.402 / 0.395 / 0.445 | **0.462 / 0.466 / 0.473** |
+| One search, one-shot CLI (kernel) | **0.15 s** (daemon: 0.7 ms) | 5.6 s |
+| Callers of a symbol, one-shot CLI (kernel) | **0.01 s** (daemon: 0.1 ms) | 3.6 to 4.1 s |
+| Ranking tiers | default, learned (trained per corpus), neural encoder rerank (f16/f32), per-index `tune` | BM25, regex, static per-token vectors |
 | Languages | 49 grammars | 162 grammars |
 | Determinism | byte-identical generations, incremental = scratch (release-gated) | not claimed |
 
-cbm ships 162 grammars to vorpal's 49, and its BM25 ranking beats vorpal's default tier
-on CPython's descriptive queries. With the learned tier or encoder enabled, vorpal ranks
-higher on all three corpora. cbm's `semantic_query` did not return a relevant definition
-for any labelled query. cbm's memory use reflects its RAM-first indexing design.
+cbm ships 162 grammars to vorpal's 49, and its BM25 ranks this repo's labels higher than
+vorpal's default tier; vorpal's learned and encoder tiers score 0.455 / 0.448 / 0.500 on
+that set (table above). On the kernel and CPython labels vorpal's default tier ranks
+higher. cbm's memory use reflects its RAM-first indexing design.
 
 [codebase-memory-mcp]: https://github.com/DeusData/codebase-memory-mcp
 

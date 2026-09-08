@@ -52,6 +52,9 @@ pub(crate) struct RawRef<'t> {
   pub(crate) receiver: Option<Cow<'t, str>>,
   /// Per-argument records at the call site (G-M1, consumed by data-flow in G-M3).
   pub(crate) args: Vec<RawArg<'t>>,
+  /// `named argument count << 1 | plain callee` for calls (see `ProductRef::call_shape`), 0
+  /// for everything else.
+  pub(crate) call_shape: u32,
 }
 
 /// One call-site argument: position, traceability class, keyword name (Python), and — for
@@ -92,8 +95,41 @@ impl<'t> RawRef<'t> {
       qualifier: None,
       form: RefForm::Bare,
       alias: None,
+      call_shape: 0,
     }
   }
+}
+
+/// The call shape a call pattern is answered from: the named, non-comment children of the
+/// argument list (what an ast-grep `$A` per argument counts under Smart strictness, which
+/// skips comments) shifted left two; bit 1 ("opaque") set when tree-sitter recovered inside
+/// the call (an ERROR or MISSING node anywhere below it — ast-grep skips ERROR children and
+/// counts MISSING ones) or the callee is itself a call, so the call is only ever answered by
+/// a parse; bit 0 set when the callee
+/// node is a bare identifier-class leaf spelled exactly `name` — `(f)(x)`, `f<T>(x)`,
+/// `a.f(x)` are not.
+fn call_shape(call: &SgNode<'_>, callee: &SgNode<'_>, name: &str, chained: bool) -> u32 {
+  let container = call.field("arguments").or_else(|| {
+    call.children().find(|c| {
+      matches!(
+        c.kind().as_ref(),
+        "arguments" | "argument_list" | "call_suffix"
+      )
+    })
+  });
+  let arity = container.map_or(0, |c| {
+    c.children()
+      .filter(|n| n.is_named() && !n.kind().contains("comment"))
+      .count()
+  });
+  let callee_kind = callee.kind();
+  let plain = LEAF_KINDS.contains(&callee_kind.as_ref()) && callee.text().as_ref() == name;
+  // Opaque: tree-sitter recovered inside the call, or the walk drilled a call chain
+  // (`f(a)(b)` — a macro invocation followed by a parenthesized statement reads this way in
+  // C): the one reference stands at the OUTER node with the outer's arguments, while
+  // ast-grep matches the INNER call, so the file must parse for this name.
+  let opaque = call.has_error() || chained;
+  ((arity.min(u32::MAX as usize >> 2) as u32) << 2) | (u32::from(opaque) << 1) | u32::from(plain)
 }
 
 /// How to locate the referenced sub-node inside a matched call/import node.
@@ -1630,6 +1666,28 @@ pub(crate) fn resolved_ref_spec(lang: SgLang) -> Option<&'static ResolvedRefSpec
 
 /// Reference-extraction spec for a language. Pure-structural languages (CSS, HTML, JSON,
 /// Markdown, YAML) have no call/import semantics and return `None`.
+/// The node kinds `lang`'s reference spec treats as calls (empty when the language has no
+/// spec) — the kinds whose references carry a call shape.
+pub fn call_kinds(lang: SgLang) -> Vec<&'static str> {
+  ref_spec(lang).map_or_else(Vec::new, |spec| spec.calls.iter().map(|c| c.kind).collect())
+}
+
+/// The single `(call node kind, callee field)` pair of `lang`'s reference spec, when the
+/// language has exactly one call kind and names its callee by a field — the languages whose
+/// call references a call pattern can be answered from (C, C++, Rust, Python, Go, …).
+pub fn call_callee_field(lang: SgLang) -> Option<(&'static str, &'static str)> {
+  let spec = ref_spec(lang)?;
+  match spec.calls {
+    [CallSpec { kind, callee: Sel::Field(field), .. }] => Some((kind, field)),
+    _ => None,
+  }
+}
+
+/// Whether `kind` is an identifier-class leaf (the callee spellings a call shape calls plain).
+pub fn is_leaf_kind(kind: &str) -> bool {
+  LEAF_KINDS.contains(&kind)
+}
+
 pub(crate) fn ref_spec(lang: SgLang) -> Option<&'static RefSpec> {
   use SupportLang as L;
   // Dynamic languages gain serialized specs in F-M4; until then they are structural-only.
@@ -1942,6 +2000,7 @@ pub(crate) fn walk_reference_tree<'t>(
           };
           // Drill through same-family call chains (Haskell curried `apply`, `f()()`), so one
           // chain yields one reference, attributed at the outermost node.
+          let mut chained = false;
           while let Some(inner) = spec
             .calls
             .iter()
@@ -1949,6 +2008,7 @@ pub(crate) fn walk_reference_tree<'t>(
             .and_then(|c| select(&callee, &c.callee))
           {
             callee = inner;
+            chained = true;
           }
           let Some(name) = callee_name(&callee) else {
             break 'dispatch;
@@ -1996,6 +2056,7 @@ pub(crate) fn walk_reference_tree<'t>(
                 } else {
                   (None, Vec::new())
                 };
+                let call_shape = call_shape(&node, &callee, name.as_ref(), chained);
                 pending.push(Pending::Ready(RawRef {
                   from,
                   name,
@@ -2007,6 +2068,7 @@ pub(crate) fn walk_reference_tree<'t>(
                   alias: None,
                   receiver,
                   args,
+                  call_shape,
                 }));
               }
             }
@@ -2743,6 +2805,7 @@ fn emit_imports<'t>(
         alias: import_alias(&target),
         receiver: None,
         args: Vec::new(),
+        call_shape: 0,
       }));
     }
   }
@@ -3314,6 +3377,7 @@ mod tests {
                 receiver: None,
                 args: Vec::new(),
                 alias: import_alias(&target),
+                call_shape: 0,
               });
             }
           }
@@ -3425,6 +3489,7 @@ mod tests {
       let Some(mut callee) = select(&node, &cspec.callee) else {
         continue;
       };
+      let mut chained = false;
       while let Some(inner) = spec
         .calls
         .iter()
@@ -3432,6 +3497,7 @@ mod tests {
         .and_then(|c| select(&callee, &c.callee))
       {
         callee = inner;
+        chained = true;
       }
       let Some(name) = callee_name(&callee) else {
         continue;
@@ -3473,6 +3539,7 @@ mod tests {
             // The twin mirrors the fused walk's no-typefacts configuration (the only one the
             // differential harness runs): extras are gated off there, so they are here.
             // Extras semantics have their own pinning suite (typefacts_capture.rs).
+            let call_shape = call_shape(&node, &callee, name.as_ref(), chained);
             out.push(RawRef {
               from,
               name,
@@ -3484,6 +3551,7 @@ mod tests {
               alias: None,
               receiver: None,
               args: Vec::new(),
+              call_shape,
             });
           }
         }

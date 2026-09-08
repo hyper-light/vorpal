@@ -56,6 +56,11 @@ impl<D: Doc> Root<D> {
     Self { doc }
   }
 
+  /// Take the document back out (its source, for the next chunk's parse).
+  pub fn into_doc(self) -> D {
+    self.doc
+  }
+
   pub fn lang(&self) -> &D::Lang {
     self.doc.get_lang()
   }

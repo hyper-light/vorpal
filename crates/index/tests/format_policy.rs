@@ -149,6 +149,13 @@ fn generated_table() -> String {
       version_of("crates/ann/src/learned/persist.rs", "LEARNED_MODEL_VERSION"),
       "model unreadable/stale → lexical fallback stated in provenance → warm retrains",
     ),
+    (
+      "text tier — trigram postings per file bucket (`trigrams/<k>.tri` + `trigrams/toc.bin`), a sidecar outside generation identity",
+      "VERSION",
+      "crates/kg/src/trigramstore.rs",
+      version_of("crates/kg/src/trigramstore.rs", "VERSION"),
+      "bucket treated as absent → its files scan exhaustively → the daemon's next warm heals it from source",
+    ),
   ];
 
   let mut table = String::from("| Artifact | Constant | Value | On mismatch |\n|---|---|---|---|\n");

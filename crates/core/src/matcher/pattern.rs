@@ -18,6 +18,26 @@ pub struct Pattern {
   pub strictness: MatchStrictness,
 }
 
+/// How a search tool was asked for a pattern: the source, and optionally an explicit
+/// `selector` (the AST kind to root at inside `context`, which defaults to the pattern itself)
+/// — the manual form of what [`Pattern::try_new_smart`] does for C-family call shapes.
+#[derive(Debug, Clone, Copy)]
+pub struct PatternSpec<'a> {
+  pub pattern: &'a str,
+  pub selector: Option<&'a str>,
+  pub context: Option<&'a str>,
+}
+
+impl<'a> PatternSpec<'a> {
+  pub fn plain(pattern: &'a str) -> Self {
+    Self {
+      pattern,
+      selector: None,
+      context: None,
+    }
+  }
+}
+
 pub struct PatternBuilder<'a> {
   selector: Option<&'a str>,
   src: Cow<'a, str>,
@@ -390,6 +410,36 @@ impl Pattern {
 
   pub fn new<L: Language>(src: &str, lang: L) -> Self {
     Self::try_new(src, lang).unwrap()
+  }
+
+  /// [`Self::try_new`], then the language's [`Language::contextual_fallback`] when the first
+  /// parse rooted somewhere the language knows is wrong for this source shape (or did not
+  /// parse as one node). The fallback result replaces the first only when it builds; every
+  /// other outcome is exactly `try_new`'s. Used by the search tools, not by `vorpal run`,
+  /// whose `--selector` is the explicit form of the same thing.
+  pub fn try_new_smart<L: Language>(src: &str, lang: L) -> Result<Self, PatternError> {
+    let first = Self::try_new(src, lang.clone());
+    let root_kind = match &first {
+      Ok(pattern) => pattern.root_kind_id(),
+      Err(PatternError::MultipleNode(_)) => None,
+      Err(_) => return first,
+    };
+    let Some((context, selector)) = lang.contextual_fallback(src, root_kind) else {
+      return first;
+    };
+    match Self::contextual(&context, selector, lang) {
+      Ok(pattern) => Ok(pattern),
+      Err(_) => first,
+    }
+  }
+
+  /// The node kind this pattern is rooted at: the pinned selector kind for a contextual
+  /// pattern, else the kind of its root node (`None` for a bare metavariable).
+  pub fn root_kind_id(&self) -> Option<u16> {
+    self.root_kind.or(match &self.node {
+      PatternNode::Terminal { kind_id, .. } | PatternNode::Internal { kind_id, .. } => Some(*kind_id),
+      PatternNode::MetaVar { .. } => None,
+    })
   }
 
   pub fn with_strictness(mut self, strictness: MatchStrictness) -> Self {

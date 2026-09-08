@@ -7,9 +7,48 @@ use vorpal::execute_main;
 /// page return — a bulk index/scan's peak footprint tracks its live set instead of stacking
 /// each phase's retained garbage (2.05 GB → 1.13 GB at kernel scale), and the thread-local
 /// caches are faster under the pipeline's multithreaded churn.
-#[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
+#[cfg(all(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))), not(feature = "alloc-ledger")))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Ledger builds (feature `alloc-ledger`, profiling only): the same jemalloc wrapped in
+/// the vorpal-kg event counters the phase stamps print — the daemon's per-call
+/// allocation/reallocation counts come from here (see `crates/index/src/main.rs`).
+#[cfg(all(
+  feature = "alloc-ledger",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+struct LedgerAlloc;
+
+#[cfg(all(
+  feature = "alloc-ledger",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+unsafe impl std::alloc::GlobalAlloc for LedgerAlloc {
+  unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+    vorpal_kg::ledger::note_alloc(layout.size());
+    unsafe { std::alloc::GlobalAlloc::alloc(&tikv_jemallocator::Jemalloc, layout) }
+  }
+  unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+    vorpal_kg::ledger::note_alloc(layout.size());
+    unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&tikv_jemallocator::Jemalloc, layout) }
+  }
+  unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+    vorpal_kg::ledger::note_dealloc(layout.size());
+    unsafe { std::alloc::GlobalAlloc::dealloc(&tikv_jemallocator::Jemalloc, ptr, layout) }
+  }
+  unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+    vorpal_kg::ledger::note_realloc(new_size);
+    unsafe { std::alloc::GlobalAlloc::realloc(&tikv_jemallocator::Jemalloc, ptr, layout, new_size) }
+  }
+}
+
+#[cfg(all(
+  feature = "alloc-ledger",
+  not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64")))
+))]
+#[global_allocator]
+static ALLOC: LedgerAlloc = LedgerAlloc;
 
 #[cfg(not(any(target_env = "msvc", all(target_env = "musl", target_arch = "aarch64"))))]
 mod jemalloc_conf {
