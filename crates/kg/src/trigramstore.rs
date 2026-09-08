@@ -16,10 +16,14 @@
 //! + unindexed `unindexed × ordinal u32` (files the builder could not read as indexed — always candidates)
 //! + key table `trigrams × {key u32, pool_off u32, count u32}` (ascending key)
 //! + pool: per key `count × {ordinal delta LEB128, next_mask u8}`.
-//! TOC (`trigrams/toc.bin`): `[VTRT][version][buckets u32][total postings u64]` +
-//! per slab `{files u32, pad u32, len u64, digest u64, content_fold u64}`.
+//!
+//! TOC (`trigrams/toc.bin`): `[VTRT][version][buckets u32][total postings u64]` followed by
+//! one row per slab: `{files u32, pad u32, len u64, digest u64, content_fold u64}`.
 
 use std::fs;
+
+/// One healed slab: `(bucket, files, len, digest, content_fold)`.
+type HealedSlab = (u32, u32, u64, u64, u64);
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -215,7 +219,7 @@ pub fn encode_packed_into(
   content_fold: u64,
   file_keys: &[u64],
   unindexed_ordinals: &[u32],
-  flat: &mut Vec<u64>,
+  flat: &mut [u64],
   out: &mut Vec<u8>,
 ) -> u64 {
   debug_assert!(file_keys.windows(2).all(|w| w[0] < w[1]));
@@ -575,7 +579,7 @@ pub fn heal_write_slab(
   fold: u64,
   file_keys: &[u64],
   unindexed: &[u32],
-  flat: &mut Vec<u64>,
+  flat: &mut [u64],
   out: &mut Vec<u8>,
 ) -> io::Result<HealRow> {
   let family_dir = dir.join(TRIGRAMS_DIR);
@@ -674,9 +678,9 @@ pub fn heal_buckets_packed(
     .and_then(|b| b.get(12..20).map(|s| u64::from_le_bytes(s.try_into().unwrap())))
     .unwrap_or(0);
   let prior = TrigramStore::open_unchecked(dir);
-  let written: io::Result<Vec<(u32, u32, u64, u64, u64)>> = rebuilt
+  let written: io::Result<Vec<HealedSlab>> = rebuilt
     .into_par_iter()
-    .map_init(Vec::<u8>::new, |out, mut build| -> io::Result<(u32, u32, u64, u64, u64)> {
+    .map_init(Vec::<u8>::new, |out, mut build| -> io::Result<HealedSlab> {
       let bucket = build.bucket;
       let postings = encode_packed_into(bucket, folds[bucket as usize], &build.file_keys, &build.unindexed, &mut build.flat, out);
       let digest = xxhash_rust::xxh3::xxh3_64(out);

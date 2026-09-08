@@ -1701,10 +1701,10 @@ pub fn code_search(
       // The filtered population size, for the pruned count (files in scope minus admitted):
       // per-language totals from the run index when there is no prefix, a walk otherwise.
       let population = match (&run_index, path_prefix) {
-        (Some(index), None) => index.count_where(|lang| lang.is_some_and(|l| lang_ok(l))),
+        (Some(index), None) => index.count_where(|lang| lang.is_some_and(&lang_ok)),
         _ => runs
           .iter()
-          .filter(|run| SgLang::from_path(&run.path).is_some_and(|l| lang_ok(l)) && path_prefix.is_none_or(|p| run.path.starts_with(p)))
+          .filter(|run| SgLang::from_path(&run.path).is_some_and(&lang_ok) && path_prefix.is_none_or(|p| run.path.starts_with(p)))
           .count() as u64,
       };
       (idx.par_iter().map(|&i| scan_run(&runs[i as usize], false)).collect(), population)

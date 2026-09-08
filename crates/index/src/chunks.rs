@@ -151,20 +151,11 @@ pub fn chunks_with_anchors(bytes: &[u8], cuts: Cuts<'_>, scratch: &mut ChunkScra
 /// The single included range for one chunk, with exact points (tree-sitter positions every
 /// node from them). `row`/`line_start`/`cursor` carry the newline count forward across
 /// ascending chunks so each file is scanned for newlines once.
+#[derive(Default)]
 pub struct PointCursor {
   row: usize,
   line_start: usize,
   cursor: usize,
-}
-
-impl Default for PointCursor {
-  fn default() -> Self {
-    PointCursor {
-      row: 0,
-      line_start: 0,
-      cursor: 0,
-    }
-  }
 }
 
 impl PointCursor {
@@ -208,8 +199,11 @@ impl PointCursor {
 
 const MEMO_SHARDS: usize = 64;
 
+/// A memo entry: the last-use tick and the verified match starts.
+type MemoEntry = (u64, Box<[u32]>);
+
 struct MemoShard {
-  map: std::collections::HashMap<(u64, u64), (u64, Box<[u32]>)>,
+  map: std::collections::HashMap<(u64, u64), MemoEntry>,
   bytes: usize,
   tick: u64,
 }
@@ -346,8 +340,10 @@ mod tests {
     // three top-level statements at 0, 10, 20 (each "fn x() {}\n" is 10 bytes)
     let src = b"fn a() {}\nfn b() {}\nfn c() {}\n";
     let raw = cuts_of(&[0, 10, 20]);
-    let mut scratch = ChunkScratch::default();
-    scratch.positions = vec![23]; // inside chunk 2
+    let mut scratch = ChunkScratch {
+      positions: vec![23], // inside chunk 2
+      ..Default::default()
+    };
     assert!(chunks_with_anchors(src, Cuts::new(&raw), &mut scratch));
     assert_eq!(scratch.chunks, vec![(20, 30)]);
     // one chunk per anchor chunk, deduplicated, ascending

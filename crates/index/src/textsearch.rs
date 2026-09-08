@@ -183,7 +183,7 @@ pub fn text_search(
       let mut line_start: usize = 0;
       let mut cursor: usize = 0;
       let mut last_line_reported: Option<usize> = None;
-      for found in regex.find_iter(&bytes) {
+      for found in regex.find_iter(bytes) {
         let start = found.start();
         // advance the line counter to `start`
         while cursor < start {

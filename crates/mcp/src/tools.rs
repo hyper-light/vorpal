@@ -156,6 +156,7 @@ pub struct SpanShortcut<'a, T> {
   pub memo_key: Option<u64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_files<M, T, F>(
   files: &[PathBuf],
   lang: SgLang,
@@ -447,15 +448,15 @@ pub fn rule_search(
       let m = v.as_mapping()?;
       let key = |k: &str| serde_yaml::Value::String(k.to_string());
       for forbidden in ["fix", "constraints", "utils", "transform", "rewriters"] {
-        if m.contains_key(&key(forbidden)) {
+        if m.contains_key(key(forbidden)) {
           return None;
         }
       }
-      let rule = m.get(&key("rule"))?.as_mapping()?;
+      let rule = m.get(key("rule"))?.as_mapping()?;
       if rule.len() != 1 {
         return None;
       }
-      rule.get(&key("pattern"))?.as_str().map(str::to_string)
+      rule.get(key("pattern"))?.as_str().map(str::to_string)
     })
     .collect();
   let mut all: Vec<RuleHit> = Vec::new();

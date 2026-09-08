@@ -3272,6 +3272,38 @@ fn watch_root(index_dir: &Path) -> Option<PathBuf> {
 }
 
 
+/// A few structural result sets remembered for paging: a cursor call with the same key
+/// replays the set instead of re-running the search (382 pages × 4 s for 381k hits before).
+/// Bounded; the oldest entry is dropped. A first call (no cursor) always recomputes, so a
+/// repeated query sees the current tree.
+struct PageCache<T> {
+  entries: Vec<(String, Vec<T>, crate::tools::WalkStats)>,
+}
+
+impl<T> Default for PageCache<T> {
+  fn default() -> Self {
+    PageCache { entries: Vec::new() }
+  }
+}
+
+const PAGE_CACHE_CAP: usize = 8;
+
+impl<T> PageCache<T> {
+  fn take_if_key(&mut self, key: &str, args: &Value) -> Option<(Vec<T>, crate::tools::WalkStats)> {
+    args.get("cursor").and_then(Value::as_str)?;
+    let pos = self.entries.iter().position(|(k, _, _)| k == key)?;
+    let (_, hits, stats) = self.entries.remove(pos);
+    Some((hits, stats))
+  }
+  fn put(&mut self, key: String, hits: Vec<T>, stats: crate::tools::WalkStats) {
+    self.entries.retain(|(k, _, _)| k != &key);
+    self.entries.push((key, hits, stats));
+    if self.entries.len() > PAGE_CACHE_CAP {
+      self.entries.remove(0);
+    }
+  }
+}
+
 #[cfg(test)]
 mod warm_and_reconcile_policy_tests {
   use super::*;
@@ -3304,39 +3336,5 @@ mod warm_and_reconcile_policy_tests {
     assert!(reconcile_due(hour, hour, Some(Duration::from_secs(300)), false, false, Some(Duration::from_secs(10))));
     assert!(reconcile_due(hour, hour, None, false, false, None));
     assert!(reconcile_due(hour, hour, Some(Duration::from_secs(1)), true, false, Some(RECONCILE_DEADLINE)));
-  }
-}
-
-/// A few structural result sets remembered for paging: a cursor call with the same key
-/// replays the set instead of re-running the search (382 pages × 4 s for 381k hits before).
-/// Bounded; the oldest entry is dropped. A first call (no cursor) always recomputes, so a
-/// repeated query sees the current tree.
-struct PageCache<T> {
-  entries: Vec<(String, Vec<T>, crate::tools::WalkStats)>,
-}
-
-impl<T> Default for PageCache<T> {
-  fn default() -> Self {
-    PageCache { entries: Vec::new() }
-  }
-}
-
-const PAGE_CACHE_CAP: usize = 8;
-
-impl<T> PageCache<T> {
-  fn take_if_key(&mut self, key: &str, args: &Value) -> Option<(Vec<T>, crate::tools::WalkStats)> {
-    if args.get("cursor").and_then(Value::as_str).is_none() {
-      return None;
-    }
-    let pos = self.entries.iter().position(|(k, _, _)| k == key)?;
-    let (_, hits, stats) = self.entries.remove(pos);
-    Some((hits, stats))
-  }
-  fn put(&mut self, key: String, hits: Vec<T>, stats: crate::tools::WalkStats) {
-    self.entries.retain(|(k, _, _)| k != &key);
-    self.entries.push((key, hits, stats));
-    if self.entries.len() > PAGE_CACHE_CAP {
-      self.entries.remove(0);
-    }
   }
 }
