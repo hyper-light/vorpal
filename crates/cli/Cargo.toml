@@ -80,8 +80,8 @@ assert_cmd = "2.0.14"
 predicates = "3.1.0"
 tempfile = "3.10.1"
 # In-process SSH server for the remote-stream / SSH differential tests (a hermetic "VM").
-russh = { version = "0.54", default-features = false, features = ["ring", "flate2"] }
-rand_core = { version = "0.6.4", features = ["getrandom", "std"] }
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2"] }
+rand = "0.10"
 tokio = { version = "1.37", features = ["full"] }
 
 # Support cargo bininstall, https://github.com/hyper-light/vorpal/issues/1742

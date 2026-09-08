@@ -19,13 +19,13 @@ tokio = { version = "1.37", features = ["rt", "rt-multi-thread", "io-util", "io-
 async-trait = "0.1"
 thiserror = { workspace = true }
 tracing = "0.1"
-russh = { version = "0.54", optional = true, default-features = false, features = ["ring", "flate2"] }
+russh = { version = "0.63", optional = true, default-features = false, features = ["ring", "flate2"] }
 
 [dev-dependencies]
 tokio = { version = "1.37", features = ["full"] }
 tempfile = "3.10"
-russh = { version = "0.54", default-features = false, features = ["ring", "flate2"] }
-rand_core = { version = "0.6.4", features = ["getrandom", "std"] }
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2"] }
+rand = "0.10"
 
 [lints]
 workspace = true

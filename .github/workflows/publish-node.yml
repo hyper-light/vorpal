@@ -35,7 +35,7 @@ jobs:
           - { target: aarch64-pc-windows-msvc, os: windows-latest }
           - { target: i686-pc-windows-msvc, os: windows-latest }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
@@ -43,7 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: napi-${{ matrix.target }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install napi CLI
@@ -51,7 +51,7 @@ jobs:
       - name: Build
         working-directory: crates/napi
         run: napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.target }}
           path: crates/napi/vorpal-napi.*.node
@@ -74,7 +74,7 @@ jobs:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build .node in node:24-alpine (native musl)
         run: |
           docker run --rm -v "$PWD:/w" -w /w \
@@ -91,7 +91,7 @@ jobs:
               cd crates/napi
               napi build --no-const-enum --dts ignore.d.ts --platform --release --target ${{ matrix.target }}
             '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.target }}
           path: crates/napi/vorpal-napi.*.node
@@ -106,8 +106,8 @@ jobs:
       id-token: write   # OIDC: npm trusted publishing — no token, no 2FA
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
@@ -115,7 +115,7 @@ jobs:
         run: npm install -g npm@latest
       - name: Install napi CLI
         run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: crates/napi/artifacts
       - name: Move artifacts into platform packages
@@ -133,7 +133,7 @@ jobs:
       id-token: write   # OIDC: npm trusted publishing — no token, no 2FA
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
@@ -141,7 +141,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use russh::keys::PublicKeyOrCertificate;
 use russh::client::{self, Handle};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey, load_secret_key};
 use russh::{ChannelMsg, Disconnect};
@@ -60,13 +61,18 @@ struct ClientHandler {
 impl client::Handler for ClientHandler {
   type Error = russh::Error;
 
-  async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
+  async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
     match &self.verifier {
       HostKeyVerifier::AcceptAny => {
         tracing::warn!("accepting UNVERIFIED ssh host key (TOFU) — pin the key to harden");
         Ok(true)
       }
-      HostKeyVerifier::Pinned(keys) => Ok(keys.iter().any(|k| k == key)),
+      // A pinned key matches a bare host key, or a host certificate whose key it is: the
+      // pin names the key, not the certificate around it.
+      HostKeyVerifier::Pinned(keys) => Ok(match key {
+        PublicKeyOrCertificate::PublicKey { key, .. } => keys.iter().any(|k| k == key),
+        PublicKeyOrCertificate::Certificate(cert) => keys.iter().any(|k| k.key_data() == cert.public_key()),
+      }),
     }
   }
 }

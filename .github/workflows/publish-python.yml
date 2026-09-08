@@ -34,7 +34,7 @@ jobs:
           - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
           - { name: windows-x64, os: windows-latest, target: x64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -44,7 +44,7 @@ jobs:
           target: ${{ matrix.target || '' }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist -m crates/pyo3/Cargo.toml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.name }}
           path: dist
@@ -54,13 +54,13 @@ jobs:
     name: sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
           command: sdist
           args: --out dist -m crates/pyo3/Cargo.toml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-sdist
           path: dist
@@ -72,7 +72,7 @@ jobs:
     needs: [wheels, sdist]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

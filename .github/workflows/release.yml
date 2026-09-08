@@ -36,7 +36,7 @@ jobs:
     name: Version guard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag must match the workspace version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -48,7 +48,7 @@ jobs:
     name: Test gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
@@ -73,7 +73,7 @@ jobs:
           - { target: aarch64-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-arm64.exe }
           - { target: i686-pc-windows-msvc, os: windows-latest, asset: vorpal-windows-x86.exe }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
@@ -119,7 +119,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Copy-Item "target/${{ matrix.target }}/release/vorpal.exe" "${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
@@ -143,7 +143,7 @@ jobs:
     env:
       SIGNING_KEY: ${{ secrets.VORPAL_AGENT_SIGNING_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0  # keep in sync with rust-toolchain.toml
@@ -201,7 +201,7 @@ jobs:
               "${{ matrix.target }}" "$hash" > "agent-${{ matrix.target }}.json"
           fi
           cp "target/${{ matrix.target }}/release/vorpal-loader" "vorpal-loader-${{ matrix.target }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-bundle-${{ matrix.target }}
           path: |
@@ -218,7 +218,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - uses: softprops/action-gh-release@v2
@@ -243,14 +243,14 @@ jobs:
       id-token: write   # OIDC: npm trusted publishing — no token, no 2FA
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
       - name: Ensure npm supports trusted publishing (>= 11.5.1)
         run: npm install -g npm@latest
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Place binaries into platform packages

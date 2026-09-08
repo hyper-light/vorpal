@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{self, Auth, Msg, Server as _, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
@@ -48,9 +48,11 @@ impl server::Handler for TestHandler {
   async fn channel_open_session(
     &mut self,
     _channel: Channel<Msg>,
+    reply: server::ChannelOpenHandle,
     _session: &mut Session,
-  ) -> Result<bool, Self::Error> {
-    Ok(true)
+  ) -> Result<(), Self::Error> {
+    reply.accept().await;
+    Ok(())
   }
 
   async fn exec_request(
@@ -79,7 +81,7 @@ impl server::Handler for TestHandler {
         match stdout.read(&mut buf).await {
           Ok(0) | Err(_) => break,
           Ok(n) => {
-            if handle.data(channel, CryptoVec::from(&buf[..n])).await.is_err() {
+            if handle.data(channel, buf[..n].to_vec()).await.is_err() {
               break;
             }
           }
@@ -119,7 +121,7 @@ impl server::Handler for TestHandler {
 
 /// Start the in-process server on a random localhost port; returns (addr, host public key).
 async fn start_server() -> (std::net::SocketAddr, russh::keys::PublicKey) {
-  let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).unwrap();
+  let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
   let pubkey = key.public_key().clone();
   let config = Arc::new(server::Config {
     keys: vec![key],
@@ -187,7 +189,7 @@ async fn ssh_push_file_and_nonzero_exit() {
 async fn ssh_rejects_unpinned_host_key() {
   let (addr, _pubkey) = start_server().await;
   // Pin a DIFFERENT key than the server's → host-key check must reject the connection.
-  let other = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).unwrap();
+  let other = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
   let cfg = SshConfig {
     host: addr.ip().to_string(),
     port: addr.port(),

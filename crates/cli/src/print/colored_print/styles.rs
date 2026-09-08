@@ -3,6 +3,7 @@ use super::{ColorChoice, DiffStyles};
 use ansi_term::{Color, Style};
 use anyhow::Result;
 
+#[cfg(not(target_os = "windows"))]
 use std::borrow::Cow;
 use std::env;
 use std::io::Write;
