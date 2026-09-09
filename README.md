@@ -1,9 +1,9 @@
 <p align="center">
-  <a href="docs/assets/brand/vorpal-blade-transparent.png">
+  <a href="docs/assets/brand/vorpal-blade-preview.png">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/vorpal-blade-dark.svg">
       <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/vorpal-blade-light.svg">
-      <img src="docs/assets/brand/vorpal-blade-light.svg" alt="Vorpal blade logo" width="54" height="90">
+      <img src="docs/assets/brand/vorpal-blade-light.svg" alt="Vorpal logo: the original blade and rounded hilt with floral engraving" width="54" height="90">
     </picture>
   </a>
 </p>
