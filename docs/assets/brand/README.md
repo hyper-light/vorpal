@@ -45,3 +45,8 @@ The unmodified original PNG is retained at
 
 The previous theme SVGs embedded that PNG and recolored its alpha channel with
 a filter. The new SVGs express the same design as native contours.
+
+## Treatment examples
+
+[Two surface-treatment previews](vorpal-examples.md) retain the original blade,
+hilt, flowers, and flourishes. They are separate from the current README artwork.
