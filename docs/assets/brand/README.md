@@ -1,31 +1,34 @@
 # Vorpal blade
 
-Converted to native SVG on 2026-09-09 from the original artwork at `9dd873d`.
-The blade silhouette, rounded hilt, flowers, stems, and curling flourishes are
-preserved. This is a contour conversion of that artwork, with the same
-proportions and orientation.
+The polished bevel treatment was selected on 2026-09-10 and is used by the
+README. It preserves the original blade silhouette, rounded hilt, flowers,
+stems, and curling flourishes. A narrow internal bevel adds depth along the
+cutting edge, while the hilt keeps its solid treatment.
 
 ## Files and construction
 
-- `vorpal-blade.svg` is the editable monochrome vector master.
-- `vorpal-blade-light.svg` and `vorpal-blade-dark.svg` use identical contours in
-  `#1f2328` and `#f0f6fc`. The README displays these vectors directly.
+- `vorpal-blade.svg` is the editable vector master in the light-theme colors.
+- `vorpal-blade-light.svg` and `vorpal-blade-dark.svg` use identical contours.
+  Their body colors are `#1f2328` and `#f0f6fc`; their bevel colors are `#8e9399`
+  and `#7c8794`. The README displays these vectors directly.
 - `vorpal-blade-transparent.png` is a 648 × 1080 export of the vector master.
 - `vorpal-blade-preview.png` shows both themes enlarged and at the existing
   54 × 90 README size, with the heading and tagline beneath the blade.
-- `vorpal-blade-comparison.png` places the original raster rendering beside the
-  vector conversion, in both themes and at both sizes. It was visually checked
-  on 2026-09-09, including the hilt and every floral opening.
+- `vorpal-blade-comparison.png` records the original raster-to-vector conversion
+  checked on 2026-09-09, before the bevel was applied.
 
-The trace follows the original PNG's alpha boundary at 127.5 out of 255. All
-five closed contours are retained. Contour simplification uses a 0.4-source-pixel
-tolerance, about 0.03 pixels at README size. The path contains 496 vertices;
-the even-odd fill rule preserves the transparent floral openings and the gap
-between blade and hilt.
+The original artwork was converted to vectors on 2026-09-09. Its trace follows
+the original PNG's alpha boundary at 127.5 out of 255. All five closed contours
+are retained. Contour simplification uses a 0.4-source-pixel tolerance, about
+0.03 pixels at README size. The base artwork contains 496 vertices; the
+even-odd fill rule preserves the transparent floral openings and the gap
+between blade and hilt. The bevel is clipped to that same artwork, so its
+flowers and flourishes remain open.
 
 The original `293 36 712 1187` viewBox and the README's 54 × 90 dimensions are
-unchanged. The vector artwork uses solid theme ink with transparent cutouts.
-There are no embedded bitmaps, filters, fonts, scripts, or external resources.
+unchanged. There are no embedded bitmaps, filters, fonts, scripts, or external
+resources. On 2026-09-10, both theme SVGs rendered identically to the selected
+example at 54 × 90 with `rsvg-convert`; the README preview was visually checked.
 
 Reproduce the transparent export from the repository root with:
 
@@ -42,11 +45,10 @@ blade opens the preview; all paths are relative to the repository.
 
 The unmodified original PNG is retained at
 `9dd873d:docs/assets/brand/vorpal-blade-transparent.png` in git history.
-
 The previous theme SVGs embedded that PNG and recolored its alpha channel with
-a filter. The new SVGs express the same design as native contours.
+a filter. The current SVGs express the same design as native contours.
 
 ## Treatment examples
 
-[Two surface-treatment previews](vorpal-examples.md) retain the original blade,
-hilt, flowers, and flourishes. They are separate from the current README artwork.
+[The two treatment examples](vorpal-examples.md) record the options considered.
+A, the polished bevel, is now used by the README. B remains an unused preview.

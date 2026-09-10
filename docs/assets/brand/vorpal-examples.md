@@ -2,8 +2,9 @@
 
 Prepared 2026-09-09. These are two surface treatments of the existing vector
 artwork. Both reuse its exact blade and hilt contours, flowers, stems, and
-flourishes. Both keep the 54 × 90 dimensions and original viewBox. The examples
-have not been applied to the main logo or root README.
+flourishes. Both keep the 54 × 90 dimensions and original viewBox. A, the polished
+bevel, was selected on 2026-09-10 and is now used by the main logo and README.
+B remains an unused preview.
 
 ## A — Polished bevel
 
