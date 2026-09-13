@@ -209,19 +209,41 @@ agent tends to treat it as a work list and wander off from the question it was a
 things keep the answer inside the user's area without hiding anything.
 
 **Scope.** `graph`, `reachable`, `impact`, `search`, `text_search`, and `code_search` take
-`within`: one path prefix or a list of them (`"fs"`, `["drivers/net", "include/linux"]`,
-`"mm/slab.c"`). Entries are relative to the source root or absolute, and matching is by
-whole path segment, so `fs` never admits `fsnotify/`. Rows whose file lies outside the scope
-are dropped from the page and counted in `outsideScope`; the answer echoes the scope it
-used. The traversal itself is not changed: a caller two hops away through an out-of-scope
-file is still found, with its `via`. `search`, `text_search`, and `code_search` apply the
-scope before ranking, so `k` results means `k` results inside it.
+a `scope` object, or the `within` shorthand for its most common field:
 
-`scope` sets a session default: `scope {within: ["fs"]}` and every later call without its
-own `within` answers inside `fs`, stamped `scope.source: "session"`. `within: []` on a call
-is the unscoped view for that call; `scope {clear: true}` removes the default; `scope {}`
-shows it. A relative entry with no source root (a custom `--index` location) is an error
-that names the entry, never a silent empty answer.
+| field | meaning |
+|---|---|
+| `within` | path prefixes to stay inside: `"fs"`, `["drivers/net", "include/linux"]`, a file `"mm/slab.c"`, or an anchor-relative entry `"@file"`, `"@dir"`, `"@package"` (the file, directory, or nearest package manifest of the symbol the call is about; on `search`, `text_search`, and `code_search`, of the most recent symbol a graph, reachable, or snippet call was about; a session scope with these binds per call) |
+| `except` | path prefixes to leave out, even inside `within` |
+| `classes` | path classes admitted: `source`, `test`, `vendored`, `generated` (empty = all) |
+| `kind`, `lang`, `exported` | symbol kind, language, visibility of the row |
+| `changed_since` | a git ref, or `"worktree"`: only files changed since it (resolved once, when the scope is set) |
+
+Entries are relative to the source root or absolute, and matching is by whole path
+segment, so `fs` never admits `fsnotify/`. An entry that names nothing, an unknown class
+or kind, or an unknown scope field is an error that names it, never a silent empty answer.
+Rows outside the scope are dropped from the page and counted in `outsideScope`; the
+answer echoes the scope it used. The traversal itself is not changed: a caller two hops
+away through an out-of-scope file is still found, with its `via`.
+
+`search`, `text_search`, and `code_search` apply the scope before ranking, so `k` results
+means `k` results inside it, and they generate their candidates inside it too: a path
+scope becomes a handful of dense-id ranges (files are path-sorted within each bucket), the
+semantic channel scans exactly those rows' codes when that is cheaper than a beam wide
+enough to reach them (measured on the running machine, not assumed), and the body channel
+reads only files inside the scope. A scoped search is therefore complete where the old
+prefix facet was often starved, and its cost follows the scope's size, not the
+repository's. `@package` walks up from the symbol's directory to the nearest Cargo.toml,
+package.json, go.mod, pyproject.toml, setup.py, pom.xml, build.gradle, CMakeLists.txt,
+Kbuild, or Makefile.
+
+`scope` sets a session default with the same fields: `scope {within: ["fs"], classes:
+["source"]}` and every later call without a scope of its own answers inside it, stamped
+`scope.source: "session"`. Its answer reports the resolved prefixes, any entries still
+waiting for a symbol, and the population the scope covers (rows, ranges, files). `within:
+[]` or `scope: {}` on a call is the unscoped view for that call; `scope {clear: true}`
+removes the default; `scope {}` shows it. On the CLI, `vorpal graph` and `vorpal search`
+take `--within`, `--except`, and `--no-tests`.
 
 **Rings.** `reachable` and `impact` return one hop by default (`maxDepth: 1`, the direct
 neighbours) and state what the next ring would add as `frontier`. `max_depth: 2` widens by
@@ -239,7 +261,7 @@ since, so drift is visible while it happens. Both the text and `structuredConten
 
 | Tool | What it does |
 |---|---|
-| `scope` | Set (`within`), show (no arguments), or clear (`clear: true`) the session's default scope. Returns the entries as given and the absolute prefixes they resolved to. |
+| `scope` | Set (any scope field), show (no arguments), or clear (`clear: true`) the session's default scope. Returns the entries as given, the absolute prefixes they resolved to, deferred `@…` entries, and the population covered. |
 
 ## One daemon, many projects
 

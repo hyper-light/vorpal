@@ -1386,7 +1386,10 @@ pub fn scope_steps(
   let before = steps.len();
   let kept: Vec<vorpal_kg::ReachStep> = steps
     .into_iter()
-    .filter(|s| kg.node(NodeId::new(s.node as u64)).is_some_and(|v| scope.admits(v.path)))
+    .filter(|s| {
+      kg.node(NodeId::new(s.node as u64))
+        .is_some_and(|v| scope.admits_node(v.path, v.kind, v.exported))
+    })
     .collect();
   let outside = before - kept.len();
   (kept, outside)
@@ -1427,6 +1430,15 @@ pub fn reach_page_from_steps(
     start,
     end,
   })
+}
+
+/// Whether `scope` admits a typed row: its path facets plus kind and visibility. A kind
+/// the record spells in a form the parser does not know is not held against the row.
+pub fn scope_admits_record(scope: &crate::PathScope, node: &NodeRecord) -> bool {
+  match vorpal_kg::SymbolKind::parse(&node.kind) {
+    Some(kind) => scope.admits_node(&node.path, kind, node.exported),
+    None => scope.admits(&node.path),
+  }
 }
 
 /// Order a symbol's neighbours nearest-first by path: the anchor's own file, then its

@@ -228,6 +228,13 @@ pub struct GraphArg {
   /// Merge results across ALL same-named definitions (the pre-selector behavior).
   #[clap(long)]
   all: bool,
+  /// Keep only rows under this path (relative to the source root; repeatable; `@file`,
+  /// `@dir`, `@package` bind to the symbol asked about). The rest is counted, not listed.
+  #[clap(long, value_name = "PREFIX")]
+  within: Vec<String>,
+  /// Drop rows under this path (repeatable).
+  #[clap(long, value_name = "PREFIX")]
+  except: Vec<String>,
   /// (reachable) Traversal direction: `in` = everything reaching the symbol (transitive
   /// callers), `out` = everything it reaches, `both` = the undirected closure (hops may
   /// alternate orientation). Default `in`.
@@ -327,6 +334,12 @@ pub struct SearchArg {
   /// Filter: exclude test-classified paths (tests/, __tests__/, *_test.*, test_*.py, …).
   #[clap(long)]
   no_tests: bool,
+  /// Search inside this path only (relative to the source root; repeatable).
+  #[clap(long, value_name = "PREFIX")]
+  within: Vec<String>,
+  /// Leave this path out (repeatable).
+  #[clap(long, value_name = "PREFIX")]
+  except: Vec<String>,
   /// Show the base fused ordering and the encoder-reranked ordering side by side —
   /// ONE search, two views (requires the advanced embedder: `vorpal enable` or
   /// `encoderDir`). Text output only.
@@ -1111,8 +1124,9 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     return Ok(ExitCode::SUCCESS);
   }
 
+  let scope_flags = !arg.within.is_empty() || !arg.except.is_empty() || arg.no_tests;
   let output = match (arg.format, &traversal) {
-    (OutputFormat::Text, Some((direction, relations, max_depth, min_confidence))) => {
+    (OutputFormat::Text, Some((direction, relations, max_depth, min_confidence))) if !scope_flags => {
       let kg = vorpal_index::Kg::load(&dir)
         .map_err(|err| anyhow::anyhow!(err.to_string()))
         .with_context(|| missing_index_hint(&dir))?;
@@ -1120,13 +1134,20 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
       vorpal_index::reachable_query_on(&kg, Some(&gen_dir), &target, *direction, relations, *max_depth, *min_confidence)
         .map_err(boxed)?
     }
-    (OutputFormat::Text, None) => vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
+    (OutputFormat::Text, None) if !scope_flags => vorpal_index::graph_query_selected(&dir, arg.verb.as_str(), &target)
       .map_err(boxed)
       .with_context(|| missing_index_hint(&dir))?,
     (machine, _) => {
       let kg = vorpal_index::Kg::load(&dir)
         .map_err(|err| anyhow::anyhow!(err.to_string()))
         .with_context(|| missing_index_hint(&dir))?;
+      // The scope binds `@…` entries to the symbol asked about; with scope flags the text
+      // format renders the scoped records (lean), since the prose renderers are unscoped.
+      let anchor = vorpal_index::resolve_target(&kg, &target)
+        .ok()
+        .and_then(|ids| ids.first().copied())
+        .and_then(|id| kg.node(id).map(|view| view.path.to_string()));
+      let scope = cli_scope(&dir, &arg.within, &arg.except, arg.no_tests, anchor.as_deref())?;
       let cursor = arg.page.cursor.as_deref();
       let value = match (&traversal, arg.verb) {
         (Some((direction, relations, max_depth, min_confidence)), _) => {
@@ -1173,11 +1194,94 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         )
         .map_err(anyhow::Error::msg)?,
       };
-      emit_machine(machine, &value)?
+      let value = match &scope {
+        Some(scope) => scope_records_value(value, scope),
+        None => value,
+      };
+      if matches!(machine, OutputFormat::Text) {
+        let rows = value.get("records").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        let mut text = vorpal_index::records::lean_from_values(&rows);
+        if let Some(outside) = value.get("outsideScope").and_then(serde_json::Value::as_u64).filter(|&n| n > 0) {
+          text.push_str(&format!("outside scope: {outside} rows not listed\n"));
+        }
+        text
+      } else {
+        emit_machine(machine, &value)?
+      }
     }
   };
   print!("{output}");
   Ok(ExitCode::SUCCESS)
+}
+
+/// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`).
+fn source_root_of(index_dir: &Path) -> Option<PathBuf> {
+  let vorpal = index_dir.parent()?;
+  if index_dir.file_name()? != "index" || vorpal.file_name()? != ".vorpal" {
+    return None;
+  }
+  std::fs::canonicalize(vorpal.parent()?).ok()
+}
+
+/// The scope the CLI flags state, resolved as the MCP surface resolves its `scope`:
+/// relative entries against the source root, `@…` entries against `anchor`.
+fn cli_scope(
+  index_dir: &Path,
+  within: &[String],
+  except: &[String],
+  no_tests: bool,
+  anchor: Option<&str>,
+) -> Result<Option<vorpal_index::PathScope>> {
+  if within.is_empty() && except.is_empty() && !no_tests {
+    return Ok(None);
+  }
+  let spec = vorpal_index::ScopeSpec {
+    within: within.to_vec(),
+    except: except.to_vec(),
+    classes: if no_tests {
+      vec!["source".to_string(), "vendored".to_string(), "generated".to_string()]
+    } else {
+      Vec::new()
+    },
+    ..Default::default()
+  };
+  let scope = vorpal_index::PathScope::from_spec(&spec, source_root_of(index_dir).as_deref(), anchor)
+    .map_err(anyhow::Error::msg)?;
+  if !scope.deferred().is_empty() {
+    anyhow::bail!(
+      "scope entries {} bind to a symbol: give the graph verb a name",
+      scope.deferred().join(", ")
+    );
+  }
+  Ok(Some(scope))
+}
+
+/// Apply a CLI scope to a graph answer's records page: drop the rows outside it, count
+/// them as `outsideScope`, and stamp the scope — the same envelope the MCP tools return.
+fn scope_records_value(mut value: serde_json::Value, scope: &vorpal_index::PathScope) -> serde_json::Value {
+  let Some(rows) = value.get_mut("records").and_then(serde_json::Value::as_array_mut) else {
+    return value;
+  };
+  let before = rows.len();
+  rows.retain(|row| {
+    let Some(path) = row.get("path").and_then(serde_json::Value::as_str) else {
+      return true;
+    };
+    let kind = row
+      .get("kind")
+      .and_then(serde_json::Value::as_str)
+      .and_then(vorpal_kg::SymbolKind::parse);
+    let exported = row.get("exported").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    match kind {
+      Some(kind) => scope.admits_node(path, kind, exported),
+      None => scope.admits(path),
+    }
+  });
+  let kept = rows.len();
+  value["total"] = serde_json::json!(kept);
+  value["outsideScope"] = serde_json::json!(before - kept);
+  value["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+  value
 }
 
 pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
@@ -1218,6 +1322,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     }
     return Ok(ExitCode::SUCCESS);
   }
+  let within = cli_scope(&dir, &arg.within, &arg.except, false, None)?;
   let filter = vorpal_index::SearchFilter {
     path_prefix: arg.prefix,
     path_suffix: arg.path,
@@ -1225,7 +1330,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     lang: arg.lang,
     exported_only: arg.exported,
     exclude_tests: arg.no_tests,
-    within: None,
+    within,
   };
   if arg.ranked {
     if !matches!(arg.format, OutputFormat::Text) {

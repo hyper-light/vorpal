@@ -29,7 +29,7 @@ pub mod chunks;
 pub mod callsite;
 pub mod trigrams;
 pub mod scope;
-pub use scope::PathScope;
+pub use scope::{PathScope, ScopeSpec};
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -4455,6 +4455,19 @@ impl SearchFilter {
       && !self.exclude_tests
       && self.within.as_ref().is_none_or(PathScope::is_empty)
   }
+
+  /// Facets other than the path scope: the ones the semantic tier cannot pre-filter and
+  /// must overfetch for. A path scope alone needs no overfetch — its candidates are
+  /// generated inside the scope's id ranges.
+  pub fn has_facets_beyond_within(&self) -> bool {
+    self.path_prefix.is_some()
+      || self.path_suffix.is_some()
+      || self.kind.is_some()
+      || self.lang.is_some()
+      || self.exported_only
+      || self.exclude_tests
+      || self.within.as_ref().is_some_and(PathScope::has_facets_beyond_prefixes)
+  }
 }
 
 /// Conservative cross-language path classification. A **filter** facet, never a ranking
@@ -4578,7 +4591,7 @@ impl<'f> CompiledSearchFilter<'f> {
       }
     }
     if let Some(scope) = self.within {
-      if !scope.admits(view.path) {
+      if !scope.admits_node(view.path, view.kind, view.exported) {
         return false;
       }
     }
@@ -4628,10 +4641,7 @@ pub fn search_records_filtered_live(
   tier: &live_ann::LiveAnnTier,
 ) -> Result<Vec<records::SearchHitRecord>, Box<dyn Error>> {
   let searcher = cached_searcher(index_dir)?;
-  let pool = (k * 4).max(50);
-  let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
-  let query_vec = active_embedder().embed(query);
-  let semantic_pool = tier.search_ids(&query_vec, take);
+  let semantic_pool = searcher.live_semantic_pool(tier, query, k, filter);
   let ranked = searcher.run_with_semantic_pool(query, k, filter, semantic_pool)?;
   Ok(hit_records(&searcher.kg, ranked))
 }
@@ -4675,6 +4685,11 @@ pub fn search_records_filtered(
 /// The typed search answer with conjunction provenance: `hits` plus `multi_phrase` when
 /// the query used the `"…" AND "…"` syntax. [`search_records_filtered`] is its
 /// `hits`-only shim.
+/// How much of the index at `index_dir` a scope covers: `(rows, ranges, files)`.
+pub fn scope_population(index_dir: &Path, scope: &PathScope) -> Result<(u64, usize, usize), Box<dyn Error>> {
+  Ok(cached_searcher(index_dir)?.scope_population(scope))
+}
+
 pub fn search_report_filtered(
   index_dir: &Path,
   query: &str,
@@ -4695,10 +4710,7 @@ pub fn search_report_filtered_live(
   tier: &live_ann::LiveAnnTier,
 ) -> Result<records::SearchReport, Box<dyn Error>> {
   let searcher = cached_searcher(index_dir)?;
-  let pool = (k * 4).max(50);
-  let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
-  let query_vec = searcher.embedder.embed(query);
-  let semantic_pool = tier.search_ids(&query_vec, take);
+  let semantic_pool = searcher.live_semantic_pool(tier, query, k, filter);
   searcher.report_live(query, k, filter, semantic_pool)
 }
 
@@ -4754,9 +4766,231 @@ fn search_index_impl(
 /// Reusing the mappings removes the per-query mmap/munmap storm that serialized concurrent
 /// searches on the kernel address-space lock (~10× system-time blow-up at 32 concurrent
 /// queries before this).
+/// Runtime samples behind the scoped semantic regime: what one code-scan row costs and
+/// what one unit of beam width costs, on THIS machine over THIS tier. Seeded by a probe
+/// scan on the first scoped query and refreshed by every scoped scan or beam that runs,
+/// so the choice between "scan the scope exactly" and "beam with selectivity-derived
+/// overfetch" is made from measured costs, never from frozen numbers. Medians over a
+/// bounded window, the same rule `calibrate_semantic_cutover` applies to its probes.
+#[derive(Default)]
+struct ScanStats {
+  scan_ns_per_row: Vec<f64>,
+  beam_ns_per_width: Vec<f64>,
+}
+
+/// Samples kept per statistic: three probes × three repeats, as the cutover calibration.
+const SCAN_STAT_SAMPLES: usize = 9;
+/// Rows the seeding probe scan covers — a measurement sample large enough to amortize the
+/// parallel scan's start-up and read steady-state throughput (32 K rows ≈ 8 MB of codes).
+const SCAN_PROBE_ROWS: u64 = 32_768;
+
+impl ScanStats {
+  fn push(samples: &mut Vec<f64>, value: f64) {
+    if samples.len() == SCAN_STAT_SAMPLES {
+      samples.remove(0);
+    }
+    samples.push(value);
+  }
+  fn median(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+      return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted.get(sorted.len() / 2).copied()
+  }
+  fn note_scan(&mut self, rows: u64, elapsed: std::time::Duration) {
+    if rows > 0 {
+      Self::push(&mut self.scan_ns_per_row, elapsed.as_nanos() as f64 / rows as f64);
+    }
+  }
+  fn note_beam(&mut self, width: usize, elapsed: std::time::Duration) {
+    if width > 0 {
+      Self::push(&mut self.beam_ns_per_width, elapsed.as_nanos() as f64 / width as f64);
+    }
+  }
+}
+
+/// How the semantic channel answers inside a scope of `rows` rows out of `n`.
+enum ScopedRegime {
+  /// Exact code-space scan over the scope's id ranges.
+  Scan,
+  /// The graph beam, asked for enough rows that `take` of them are expected in scope.
+  Beam { take: usize },
+}
+
+impl Searcher {
+  fn file_table(&self) -> &scope::FileTable {
+    self.file_table.get_or_init(|| scope::FileTable::build(&self.kg))
+  }
+
+  /// The dense-id ranges `scope` covers in this generation.
+  pub fn scope_ranges(&self, scope: &PathScope) -> scope::ScopeRanges {
+    self.file_table().ranges_for(scope)
+  }
+
+  /// How much of this generation a scope covers: `(rows, ranges, files)`.
+  pub fn scope_population(&self, scope: &PathScope) -> (u64, usize, usize) {
+    let ranges = self.scope_ranges(scope);
+    (ranges.rows(), ranges.ranges().len(), self.file_table().file_count())
+  }
+
+  fn stats(&self) -> std::sync::MutexGuard<'_, ScanStats> {
+    self.scan_stats.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
+
+  /// Pick the regime from measured costs. A missing scan sample is seeded by `probe` (a
+  /// scan over the first [`SCAN_PROBE_ROWS`] ids); a missing beam sample means "beam and
+  /// measure it".
+  fn scoped_regime(
+    &self,
+    rows: u64,
+    n: usize,
+    take: usize,
+    probe: impl FnOnce(&scope::ScopeRanges),
+  ) -> ScopedRegime {
+    if self.stats().scan_ns_per_row.is_empty() && n > 0 {
+      let covered = (n as u64).min(SCAN_PROBE_ROWS);
+      let probe_ranges = scope::ScopeRanges::single(0..covered);
+      let started = std::time::Instant::now();
+      probe(&probe_ranges);
+      self.stats().note_scan(covered, started.elapsed());
+    }
+    // Overfetch from selectivity: E[in-scope rows in a pool of `take_eff`] = take.
+    let overfetch = (n as u64).div_ceil(rows.max(1)) as usize;
+    let take_eff = take.saturating_mul(overfetch).clamp(take, n.max(take));
+    let stats = self.stats();
+    match (ScanStats::median(&stats.scan_ns_per_row), ScanStats::median(&stats.beam_ns_per_width)) {
+      (Some(scan_ns), Some(beam_ns)) => {
+        let scan_cost = rows as f64 * scan_ns;
+        let beam_cost = vorpal_ann::beam_width(take_eff, n) as f64 * beam_ns;
+        if scan_cost <= beam_cost {
+          ScopedRegime::Scan
+        } else {
+          ScopedRegime::Beam { take: take_eff }
+        }
+      }
+      (Some(_), None) => ScopedRegime::Beam { take: take_eff },
+      (None, _) => ScopedRegime::Scan,
+    }
+  }
+
+  /// The scoped semantic pool from the persisted tier: exact scan or measured beam, with
+  /// the scan as the fallback when the beam starves the scope.
+  fn scoped_pool_persisted(
+    &self,
+    ann: &AnnIndex,
+    query_vec: &[f32],
+    take: usize,
+    ranges: &scope::ScopeRanges,
+  ) -> Vec<u64> {
+    let n = ann.len();
+    let scan = |ranges: &scope::ScopeRanges, take: usize| -> Vec<u64> {
+      let started = std::time::Instant::now();
+      let out: Vec<u64> = ann
+        .scan_codes_ranges(query_vec, take, ranges.ranges())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+      self.stats().note_scan(ranges.rows(), started.elapsed());
+      out
+    };
+    match self.scoped_regime(ranges.rows(), n, take, |probe| {
+      std::hint::black_box(ann.scan_codes_ranges(query_vec, 1, probe.ranges()));
+    }) {
+      ScopedRegime::Scan => {
+        vorpal_kg::phase_stamp(&format!("search: scoped scan {} rows in {} ranges", ranges.rows(), ranges.ranges().len()));
+        scan(ranges, take)
+      }
+      ScopedRegime::Beam { take: take_eff } => {
+        vorpal_kg::phase_stamp(&format!("search: scoped beam take {take_eff} over {} rows of {n}", ranges.rows()));
+        let started = std::time::Instant::now();
+        let pool: Vec<u64> = ann.search(query_vec, take_eff).into_iter().map(|(id, _)| id).collect();
+        self.stats().note_beam(vorpal_ann::beam_width(take_eff, n), started.elapsed());
+        let admitted = pool.iter().filter(|&&id| ranges.contains(id)).count();
+        if admitted < take.min(ranges.rows() as usize) {
+          vorpal_kg::phase_stamp("search: scoped beam starved — exact scan");
+          scan(ranges, take)
+        } else {
+          pool
+        }
+      }
+    }
+  }
+
+  /// The scoped semantic pool from the daemon's live tier (see `scoped_pool_persisted`).
+  pub fn scoped_pool_live(
+    &self,
+    tier: &live_ann::LiveAnnTier,
+    query_vec: &[f32],
+    take: usize,
+    ranges: &scope::ScopeRanges,
+  ) -> Vec<u64> {
+    let n = tier.rows();
+    let scan = |ranges: &scope::ScopeRanges, take: usize| -> Vec<u64> {
+      let started = std::time::Instant::now();
+      let out = tier.scan_scoped(query_vec, take, ranges);
+      self.stats().note_scan(ranges.rows(), started.elapsed());
+      out
+    };
+    match self.scoped_regime(ranges.rows(), n, take, |probe| {
+      std::hint::black_box(tier.scan_scoped(query_vec, 1, probe));
+    }) {
+      ScopedRegime::Scan => {
+        vorpal_kg::phase_stamp(&format!("search: scoped scan {} rows in {} ranges", ranges.rows(), ranges.ranges().len()));
+        scan(ranges, take)
+      }
+      ScopedRegime::Beam { take: take_eff } => {
+        vorpal_kg::phase_stamp(&format!("search: scoped beam take {take_eff} over {} rows of {n}", ranges.rows()));
+        let started = std::time::Instant::now();
+        let pool = tier.search_ids(query_vec, take_eff);
+        self.stats().note_beam(take_eff, started.elapsed());
+        let admitted = pool.iter().filter(|&&id| ranges.contains(id)).count();
+        if admitted < take.min(ranges.rows() as usize) {
+          vorpal_kg::phase_stamp("search: scoped beam starved — exact scan");
+          scan(ranges, take)
+        } else {
+          pool
+        }
+      }
+    }
+  }
+
+  /// The semantic pool a live-tier query hands to `report_live`: inside the scope's id
+  /// ranges when a path scope is set (no ×4 overfetch for the scope itself), the tier's
+  /// beam otherwise. Facets the tier cannot pre-filter keep their overfetch.
+  pub fn live_semantic_pool(
+    &self,
+    tier: &live_ann::LiveAnnTier,
+    query: &str,
+    k: usize,
+    filter: &SearchFilter,
+  ) -> Vec<u64> {
+    let pool = (k * 4).max(50);
+    let take = pool * 2 * if filter.has_facets_beyond_within() { 4 } else { 1 };
+    let query_vec = self.embedder.embed(query);
+    let ranges = filter
+      .within
+      .as_ref()
+      .filter(|scope| !scope.is_empty())
+      .map(|scope| self.scope_ranges(scope));
+    match ranges {
+      Some(ranges) if ranges.is_empty() => Vec::new(),
+      Some(ranges) => self.scoped_pool_live(tier, &query_vec, take, &ranges),
+      None => tier.search_ids(&query_vec, take),
+    }
+  }
+}
+
 pub struct Searcher {
   generation_dir: PathBuf,
   kg: Kg,
+  /// This generation's file table (paths in dense order with bucket boundaries) — what a
+  /// path scope resolves to id ranges through. Built on the first scoped query.
+  file_table: std::sync::OnceLock<scope::FileTable>,
+  /// Measured scan and beam costs behind the scoped semantic regime (see [`ScanStats`]).
+  scan_stats: Mutex<ScanStats>,
   /// The canonical tree prefix every stored path shares (see [`embedding_root`]), derived
   /// once per handle on first need. The handle pins one immutable generation, so the value
   /// can never go stale; deriving it per query walked every node of the graph — on the
@@ -4859,6 +5093,8 @@ impl Searcher {
       generation_dir,
       kg,
       embed_root: std::sync::OnceLock::new(),
+      file_table: std::sync::OnceLock::new(),
+      scan_stats: Mutex::new(ScanStats::default()),
       ann,
       postings,
       embedder,
@@ -4905,6 +5141,8 @@ impl Searcher {
       generation_dir,
       kg,
       embed_root: std::sync::OnceLock::new(),
+      file_table: std::sync::OnceLock::new(),
+      scan_stats: Mutex::new(ScanStats::default()),
       ann: None,
       postings: None,
       embedder,
@@ -5845,7 +6083,27 @@ impl Searcher {
   // Filters shrink the pool AFTER the approximate tiers (the ANN cannot pre-filter), so a
   // filtered query overfetches to keep its post-filter pool honest; the exhaustive fallback
   // filters BEFORE scoring and needs no slack.
-  let take = pool * 2 * if filter.is_empty() { 1 } else { 4 };
+  // A path scope generates its candidates inside its own id ranges (below), so only the
+  // facets the tiers cannot pre-filter keep the ×4 overfetch.
+  let scoped: Option<(&PathScope, scope::ScopeRanges)> = filter
+    .within
+    .as_ref()
+    .filter(|scope| !scope.is_empty())
+    .map(|scope| (scope, self.scope_ranges(scope)));
+  // Exact scoping needs a quantized tier with ascending ids (every persisted Vamana tier);
+  // a flat tier keeps the overfetch-and-filter path, which is exact there anyway.
+  let scoped_exact = scoped.as_ref().is_some_and(|(_, ranges)| !ranges.is_empty())
+    && self
+      .ann
+      .as_ref()
+      .is_some_and(|ann| ann.has_quantized_graph() && ann.ids_ascending());
+  let take = pool
+    * 2
+    * if filter.has_facets_beyond_within() || (scoped.is_some() && !scoped_exact) {
+      4
+    } else {
+      1
+    };
   // Route between the two semantic engines by THIS index's warm-time calibration
   // (`ann.calib`: the crossover measured on the running machine over the ingested rows —
   // see `calibrate_semantic_cutover`). Without a calibration, the floor is the proven
@@ -5872,6 +6130,17 @@ impl Searcher {
     // The daemon's live tier already picked the pool; the exact rerank below
     // orders it — identical downstream to any approximate tier.
     SemanticCandidates::Approx(supplied)
+  } else if let Some((_, ranges)) = scoped.as_ref()
+    && ranges.is_empty()
+  {
+    // The scope covers no rows: nothing to rank, nothing to fetch.
+    SemanticCandidates::Approx(Vec::new())
+  } else if !take_exhaustive
+    && scoped_exact
+    && let Some((_, ranges)) = scoped.as_ref()
+    && let Some(ann) = &self.ann
+  {
+    SemanticCandidates::Approx(self.scoped_pool_persisted(ann, &query_vec, take, ranges))
   } else if !take_exhaustive && let Some(ann) = &self.ann {
     SemanticCandidates::Approx(
       ann
@@ -6113,7 +6382,12 @@ impl Searcher {
     // from a comment, a string, a macro body. Definitions whose bodies hold every word,
     // through the text tier (candidates → read → memmem → enclosing definition).
     let body = if named.is_empty() && bm25.is_empty() && !query_tokens.is_empty() && !Self::body_channel_disabled() {
-      self.body_channel(&query_tokens, pool, |id| filter.is_empty() || compiled_filter.admits(kg, id))
+      self.body_channel(
+        &query_tokens,
+        pool,
+        |id| filter.is_empty() || compiled_filter.admits(kg, id),
+        scoped.as_ref().map(|(scope, _)| *scope),
+      )
     } else {
       Vec::new()
     };
@@ -6143,7 +6417,13 @@ impl Searcher {
   /// the innermost definition span, and a definition counts when it holds all tokens.
   /// At most `pool` files are read, ascending by file key, so the cost is bounded by the
   /// fusion pool the caller already sized.
-  fn body_channel(&self, query_tokens: &[String], pool: usize, admit: impl Fn(u64) -> bool) -> Vec<u64> {
+  fn body_channel(
+    &self,
+    query_tokens: &[String],
+    pool: usize,
+    admit: impl Fn(u64) -> bool,
+    within: Option<&PathScope>,
+  ) -> Vec<u64> {
     let literals: Vec<&str> = query_tokens.iter().map(String::as_str).filter(|t| t.len() >= 3).collect();
     if literals.is_empty() {
       return Vec::new();
@@ -6171,9 +6451,19 @@ impl Searcher {
     let mut hits: Vec<(u64, usize)> = Vec::new(); // (id, occurrences)
     let mut spans: Vec<(u32, u32, u64)> = Vec::new();
     let mut per_def: std::collections::HashMap<u64, (u64, usize)> = std::collections::HashMap::new(); // id → (token mask, occurrences)
-    for &key in set.admitted().iter().take(pool) {
+    // The scope narrows the candidate FILES before the pool is counted, so a scoped query
+    // reads files inside its scope only — never the repository-wide candidates.
+    let mut considered = 0usize;
+    for &key in set.admitted().iter() {
+      if considered >= pool {
+        break;
+      }
       let Some(run_i) = index.run_of(key) else { continue };
       let run = &runs[run_i as usize];
+      if within.is_some_and(|scope| !scope.admits(&run.path)) {
+        continue;
+      }
+      considered += 1;
       // Files the tier does not index (above `MAX_INDEXED_FILE_BYTES`) are candidates by
       // absence of evidence, not presence: this repo's vendored 54 MB grammar parsers made
       // every phrase query read them (36 ms mean against 0.6 ms). Skip them here.

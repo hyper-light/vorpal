@@ -205,6 +205,9 @@ pub struct Server {
 #[derive(Default)]
 struct Radius {
   anchor: Option<String>,
+  /// The defining file of the most recent symbol asked about — what `@file` / `@dir` /
+  /// `@package` bind to on tools that have no symbol of their own (search).
+  anchor_path: Option<String>,
   files: std::collections::HashSet<String>,
   dirs: std::collections::HashSet<String>,
 }
@@ -2028,7 +2031,7 @@ impl Server {
         let lang = args.get("lang").and_then(Value::as_str).map(str::to_string);
         let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
         let max_results = args.get("max_results").and_then(Value::as_u64).unwrap_or(1000) as usize;
-        let scoped = self.scope_for_call(args)?;
+        let scoped = self.scope_for_call(args, self.radius.anchor_path.as_deref())?;
         self.kg()?;
         let dir = self.kg_dir.clone();
         let Some(kg) = self.kg.as_deref() else {
@@ -2069,7 +2072,7 @@ impl Server {
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(20) as usize;
         let lang = args.get("lang").and_then(Value::as_str).map(str::to_string);
         let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
-        let scoped = self.scope_for_call(args)?;
+        let scoped = self.scope_for_call(args, self.radius.anchor_path.as_deref())?;
         self.kg()?;
         let dir = self.kg_dir.clone();
         let Some(kg) = self.kg.as_deref() else {
@@ -2193,7 +2196,7 @@ impl Server {
         .map_err(|err| err.to_string())?;
         let changed = vorpal_index::impact::changed_paths(&root, since.as_deref())
           .map_err(ToolError::from)?;
-        let scoped = self.scope_for_call(args)?;
+        let scoped = self.scope_for_call(args, None)?;
         self.kg()?;
         let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
@@ -2326,25 +2329,33 @@ impl Server {
           // The caller's scope is a view over the rows (counted, never traversed around),
           // and the rows come nearest file first so a page truncated by `limit` drops the
           // far edge of the answer. `similar` keeps its similarity order.
-          let scoped = self.scope_for_call(args)?;
+          let anchor = vorpal_index::resolve_target(kg, &target)
+            .ok()
+            .and_then(|ids| ids.first().copied())
+            .and_then(|id| kg.node(id).map(|view| view.path.to_string()));
+          if anchor.is_some() {
+            self.radius.anchor_path = anchor.clone();
+          }
+          let scoped = self.scope_for_call(args, anchor.as_deref())?;
           let mut outside = None;
           let selected = match selected {
             vorpal_index::records::Selected::Hits(hits) => {
               let mut hits = match &scoped {
                 Some((scope, _)) => {
-                  let (kept, excluded) = scope.split(hits, |hit| hit.node.path.as_str());
-                  outside = Some(excluded);
+                  let before = hits.len();
+                  let kept: Vec<_> = hits
+                    .into_iter()
+                    .filter(|hit| vorpal_index::records::scope_admits_record(scope, &hit.node))
+                    .collect();
+                  outside = Some(before - kept.len());
                   kept
                 }
                 None => hits,
               };
               if verb != "similar"
-                && let Some(anchor) = vorpal_index::resolve_target(kg, &target)
-                  .ok()
-                  .and_then(|ids| ids.first().copied())
-                  .and_then(|id| kg.node(id).map(|view| view.path.to_string()))
+                && let Some(anchor) = anchor.as_deref()
               {
-                vorpal_index::records::order_by_proximity(&mut hits, &anchor);
+                vorpal_index::records::order_by_proximity(&mut hits, anchor);
               }
               vorpal_index::records::attach_call_sites(kg, dir.as_deref(), verb, &target, &mut hits, Some(&verify))
                 .map_err(ToolError::from)?;
@@ -2384,7 +2395,7 @@ impl Server {
       "search" => {
         let query = str_arg("query")?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let scoped = self.scope_for_call(args)?;
+        let scoped = self.scope_for_call(args, self.radius.anchor_path.as_deref())?;
         // Structured pre-ranking filters (IMPROVEMENTS #9): k results means k MATCHING
         // results — filters apply to every channel before fusion, never as a post-cut.
         let filter = vorpal_index::SearchFilter {
@@ -2862,30 +2873,44 @@ impl Server {
         Ok((text, data))
       }
       "scope" => {
-        // The session's default radius. `within` sets it (an empty list clears it),
-        // `clear` clears it, neither shows it. Entries resolve against the source root
-        // now, so a typo is an error here rather than a silent empty answer later.
+        // The session's default radius: the `scope` object fields (or the `within`
+        // shorthand) set it, `clear` clears it, neither shows it. Entries resolve against
+        // the source root now, so a typo is an error here rather than a silent empty
+        // answer later; `@file`/`@dir`/`@package` stay deferred until a symbol binds them.
         if args.get("clear").and_then(Value::as_bool).unwrap_or(false) {
           self.scope = None;
-        } else if let Some(value) = args.get("within") {
-          let scope = self.resolve_scope(value)?;
+        } else if let Some(spec) = Self::scope_spec(args)? {
+          let scope = self.resolve_spec(&spec, None)?;
           self.scope = (!scope.is_empty()).then_some(scope);
         }
         let root = self.source_root().map(|root| root.to_string_lossy().into_owned());
         Ok(match &self.scope {
-          Some(scope) => (
-            format!(
-              "scope: {} (resolved: {})\n",
-              scope.within.join(", "),
-              scope.prefixes().join(", ")
-            ),
-            json!({
-              "outcome": "scoped",
-              "scope": {"within": scope.within, "source": "session"},
-              "prefixes": scope.prefixes(),
-              "root": root,
-            }),
-          ),
+          Some(scope) => {
+            let mut echo = serde_json::to_value(scope).unwrap_or_else(|_| json!({}));
+            echo["source"] = json!("session");
+            let deferred = scope.deferred();
+            (
+              format!(
+                "scope: {}{}\n",
+                echo,
+                if deferred.is_empty() { String::new() } else { format!(" (binds per symbol: {})", deferred.join(", ")) }
+              ),
+              json!({
+                "outcome": "scoped",
+                "scope": echo,
+                "prefixes": scope.prefixes(),
+                "excludes": scope.excludes(),
+                "deferred": deferred,
+                "root": root,
+                // A scope still waiting for a symbol has no population yet.
+                "population": deferred.is_empty().then(|| {
+                  vorpal_index::scope_population(&self.index_dir, scope)
+                    .ok()
+                    .map(|(rows, ranges, files)| json!({"rows": rows, "ranges": ranges, "files": files}))
+                }).flatten(),
+              }),
+            )
+          }
           None => (
             "scope: none — every answer is repository-wide\n".to_string(),
             json!({"outcome": "unscoped", "root": root}),
@@ -2940,7 +2965,6 @@ impl Server {
           args.get("min_grade").and_then(Value::as_str),
         )
         .map_err(|err| err.to_string())?;
-        let scoped = self.scope_for_call(args)?;
         self.kg()?;
         // Freshness first: kg() pins the generation and its dir together, so the sidecar
         // read can never come from a different generation than the ids it annotates.
@@ -2951,6 +2975,14 @@ impl Server {
             "no graph is loaded — run the 'index' tool first",
           ));
         };
+        let anchor = vorpal_index::resolve_target(kg, &target)
+          .ok()
+          .and_then(|ids| ids.first().copied())
+          .and_then(|id| kg.node(id).map(|view| view.path.to_string()));
+        if anchor.is_some() {
+          self.radius.anchor_path = anchor.clone();
+        }
+        let scoped = self.scope_for_call(args, anchor.as_deref())?;
         // Page-materialized: the BFS runs whole (that IS the deterministic vector), but
         // record construction is paid per page — an undirected kernel walk reaches 200K+
         // nodes and building all their records to serve one page dominated this tool.
@@ -3025,35 +3057,112 @@ impl Server {
     Some(std::fs::canonicalize(&root).unwrap_or(root))
   }
 
-  /// Resolve a `within` argument — one string or an array of strings — into a scope.
-  fn resolve_scope(&self, value: &Value) -> Result<vorpal_index::PathScope, ToolError> {
-    const SHAPE: &str = "within must be a string or an array of strings";
-    let entries: Vec<String> = match value {
-      Value::String(one) => vec![one.clone()],
-      Value::Array(items) => items
-        .iter()
-        .map(|item| item.as_str().map(str::to_string).ok_or_else(|| ToolError::coded("bad-argument", SHAPE)))
-        .collect::<Result<_, _>>()?,
-      Value::Null => Vec::new(),
-      _ => return Err(ToolError::coded("bad-argument", SHAPE)),
-    };
-    vorpal_index::PathScope::resolve(&entries, self.source_root().as_deref())
+  /// Parse the scope a call states: the `scope` object (`within`, `except`, `classes`,
+  /// `kind`, `lang`, `exported`, `changed_since`) plus the top-level `within` shorthand.
+  /// Unknown fields are errors — a typo must not become a silently unscoped answer.
+  fn scope_spec(args: &Value) -> Result<Option<vorpal_index::ScopeSpec>, ToolError> {
+    const SHAPE: &str = "must be a string or an array of strings";
+    fn strings(value: &Value, field: &str) -> Result<Vec<String>, ToolError> {
+      match value {
+        Value::String(one) => Ok(vec![one.clone()]),
+        Value::Array(items) => items
+          .iter()
+          .map(|item| {
+            item
+              .as_str()
+              .map(str::to_string)
+              .ok_or_else(|| ToolError::coded("bad-argument", format!("scope.{field} {SHAPE}")))
+          })
+          .collect(),
+        Value::Null => Ok(Vec::new()),
+        _ => Err(ToolError::coded("bad-argument", format!("scope.{field} {SHAPE}"))),
+      }
+    }
+    let object = args.get("scope");
+    let shorthand = args.get("within");
+    if object.is_none() && shorthand.is_none() {
+      return Ok(None);
+    }
+    let mut spec = vorpal_index::ScopeSpec::default();
+    if let Some(value) = shorthand {
+      spec.within = strings(value, "within")?;
+    }
+    if let Some(object) = object {
+      let Some(map) = object.as_object() else {
+        return Err(ToolError::coded("bad-argument", "scope must be an object"));
+      };
+      for (key, value) in map {
+        match key.as_str() {
+          "within" => spec.within.extend(strings(value, "within")?),
+          "except" => spec.except = strings(value, "except")?,
+          "classes" => spec.classes = strings(value, "classes")?,
+          "kind" => spec.kind = value.as_str().map(str::to_string),
+          "lang" => spec.lang = value.as_str().map(str::to_string),
+          "exported" => spec.exported = value.as_bool(),
+          "changed_since" | "changedSince" => spec.changed_since = value.as_str().map(str::to_string),
+          other => {
+            return Err(ToolError::coded(
+              "bad-argument",
+              format!(
+                "unknown scope field '{other}' (within, except, classes, kind, lang, exported, changed_since)"
+              ),
+            ));
+          }
+        }
+      }
+    }
+    Ok(Some(spec))
+  }
+
+  /// Resolve a spec against the source root, binding `@file`/`@dir`/`@package` to
+  /// `anchor` (a symbol's defining file) when one is known.
+  fn resolve_spec(
+    &self,
+    spec: &vorpal_index::ScopeSpec,
+    anchor: Option<&str>,
+  ) -> Result<vorpal_index::PathScope, ToolError> {
+    vorpal_index::PathScope::from_spec(spec, self.source_root().as_deref(), anchor)
       .map_err(|message| ToolError::coded("bad-argument", message))
   }
 
-  /// The scope in force for one call, with where it came from: the call's own `within`
-  /// (an empty list means unscoped, explicitly), else the session default. `None` = none.
+  /// The scope in force for one call, with where it came from: the call's own scope (an
+  /// empty one means unscoped, explicitly), else the session default bound to this call's
+  /// anchor. A scope whose `@…` entries have nothing to bind to is an error, never a
+  /// silently unscoped answer.
   fn scope_for_call(
     &self,
     args: &Value,
+    anchor: Option<&str>,
   ) -> Result<Option<(vorpal_index::PathScope, &'static str)>, ToolError> {
-    match args.get("within") {
-      Some(value) => {
-        let scope = self.resolve_scope(value)?;
-        Ok((!scope.is_empty()).then_some((scope, "call")))
+    let (scope, source) = match Self::scope_spec(args)? {
+      Some(spec) => {
+        if spec.is_empty() {
+          return Ok(None);
+        }
+        (self.resolve_spec(&spec, anchor)?, "call")
       }
-      None => Ok(self.scope.clone().filter(|scope| !scope.is_empty()).map(|scope| (scope, "session"))),
+      None => match (&self.scope, anchor) {
+        (Some(scope), Some(anchor)) => (
+          scope
+            .bind(self.source_root().as_deref(), anchor)
+            .map_err(|message| ToolError::coded("bad-argument", message))?,
+          "session",
+        ),
+        (Some(scope), None) => (scope.clone(), "session"),
+        (None, _) => return Ok(None),
+      },
+    };
+    if !scope.deferred().is_empty() {
+      return Err(ToolError::coded(
+        "bad-argument",
+        format!(
+          "scope entries {} bind to a symbol: use them on graph, reachable, or snippet first, \
+           or after one of those has set this session's anchor",
+          scope.deferred().join(", ")
+        ),
+      ));
     }
+    Ok((!scope.is_empty()).then_some((scope, source)))
   }
 
   /// Fold one answer into the session's drift telemetry and stamp it as `radius`: the
@@ -3141,7 +3250,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     "kind": {"type": "string"},
     "id": {"type": "integer"},
     "eid": {"type": "string"},
-    "all": {"type": "boolean", "description": "merge same-named"},
+    "all": {"type": "boolean"},
     "cursor": {"type": "string"},
     "limit": {"type": "integer"}
   });
@@ -3149,7 +3258,10 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     "cursor": {"type": "string"},
     "limit": {"type": "integer"}
   });
-  let within = json!({"within": {"type": "array", "items": {"type": "string"}}});
+  let within = json!({
+    "within": {"type": "array", "items": {"type": "string"}},
+    "scope": {"type": "object"}
+  });
   let with = |base: &Value, extra: Value| -> Value {
     let mut props = base.clone();
     if let (Some(p), Some(e)) = (props.as_object_mut(), extra.as_object()) {
@@ -3176,8 +3288,17 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     tool("schema", "Kinds, relations, grades, and tier state in this index, with counts.", json!({}), &[]),
     tool(
       "scope",
-      "Set (`within`: path prefixes), show, or clear the session's default scope; scoped tools answer inside it and count the rest.",
-      with(&within, json!({"clear": {"type": "boolean"}})),
+      "Set, show, or clear the session's default scope (within/except paths incl. @file/@dir/@package, classes, kind, lang, exported, changed_since).",
+      json!({
+        "within": {"type": "array", "items": {"type": "string"}},
+        "except": {"type": "array", "items": {"type": "string"}},
+        "classes": {"type": "array", "items": {"type": "string"}},
+        "kind": {"type": "string"},
+        "lang": {"type": "string"},
+        "exported": {"type": "boolean"},
+        "changed_since": {"type": "string"},
+        "clear": {"type": "boolean"}
+      }),
       &[],
     ),
     tool("coverage", "Per-file parse coverage (error bytes and ratio), worst first.", page.clone(), &[]),
@@ -3189,8 +3310,8 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
         "lang": {"type": "string"},
         "prefix": {"type": "string"},
         "k": {"type": "integer"},
-        "selector": {"type": "string", "description": "root kind"},
-        "context": {"type": "string", "description": "context source"}
+        "selector": {"type": "string"},
+        "context": {"type": "string"}
       })),
       &["pattern"],
     ),
@@ -3212,8 +3333,8 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
       "compare_generations",
       "Diff two generations: files, nodes by eid, edge counts.",
       with(&page, json!({
-        "from": {"type": "string", "description": "gen id"},
-        "to": {"type": "string", "description": "gen id"}
+        "from": {"type": "string"},
+        "to": {"type": "string"}
       })),
       &[],
     ),
@@ -3270,8 +3391,8 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
         "pattern": {"type": "string", "description": "ast-grep pattern"},
         "lang": {"type": "string"},
         "path": {"type": "string", "description": "suffix"},
-        "selector": {"type": "string", "description": "root kind"},
-        "context": {"type": "string", "description": "context source"}
+        "selector": {"type": "string"},
+        "context": {"type": "string"}
       })),
       &["pattern", "lang"],
     ),
@@ -3279,7 +3400,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
       "rule_search",
       "Run YAML rule(s), constraints and fix dry-run included, over the watched tree.",
       with(&page, json!({
-        "rule": {"type": "string", "description": "YAML"},
+        "rule": {"type": "string"},
         "path": {"type": "string", "description": "suffix"}
       })),
       &["rule"],
@@ -3348,7 +3469,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
       "search",
       "Hybrid search over definitions: name match + embedding similarity.",
       with(&with(&page, within), json!({
-        "query": {"type": "string", "description": "text, or phrase AND phrase"},
+        "query": {"type": "string"},
         "k": {"type": "integer"},
         "kind": {"type": "string"},
         "lang": {"type": "string"},
@@ -3425,7 +3546,9 @@ fn stamp_scope(
   outside: Option<usize>,
 ) {
   if let Some((scope, source)) = scoped {
-    data["scope"] = json!({"within": scope.within, "source": source});
+    let mut echo = serde_json::to_value(scope).unwrap_or_else(|_| json!({}));
+    echo["source"] = json!(source);
+    data["scope"] = echo;
     if let Some(outside) = outside {
       data["outsideScope"] = json!(outside);
     }

@@ -154,12 +154,17 @@ tool set for read-only agents. Full descriptions and the wire contract:
 **[docs/mcp.md](docs/mcp.md)**.
 
 Answers stay inside the area you are working in. `graph`, `reachable`, `impact`, `search`,
-`text_search`, and `code_search` take `within` (a path prefix or a list), and `scope` sets
-it once for the session. Rows outside it are counted in `outsideScope`, not listed, so a
-complete answer stays complete as a number. `reachable` and `impact` return one ring by
-default and report the next ring's size as `frontier`; `max_depth: 0` walks everything.
-`graph` rows come nearest file first, and every answer carries a `radius` field showing
-how many files and directories the session has touched since its first question.
+`text_search`, and `code_search` take a `scope`: paths to stay inside (`within`, including
+`@file`, `@dir`, and `@package` relative to the symbol asked about), paths to leave out
+(`except`), path classes such as `source` only, a kind or language, or files changed since
+a git ref. `within` alone is the shorthand, and `scope` sets a default for the session.
+Rows outside it are counted in `outsideScope`, not listed, so a complete answer stays
+complete as a number. Search generates its candidates inside the scope rather than
+overfetching and filtering, so a scoped search is complete and costs what the scope
+covers. `reachable` and `impact` return one ring by default and report the next ring's
+size as `frontier`; `max_depth: 0` walks everything. `graph` rows come nearest file first,
+and every answer carries a `radius` field showing how many files and directories the
+session has touched since its first question.
 
 ## Language packages
 

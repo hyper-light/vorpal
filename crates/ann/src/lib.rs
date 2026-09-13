@@ -30,7 +30,7 @@ mod scan;
 mod vamana;
 
 pub use embed::{Embedder, LEXICAL_EMBED_VERSION, LexicalEmbedder, ModelProvenance, tokenize};
-pub use index::{AnnConfig, AnnIndex};
+pub use index::{AnnConfig, AnnIndex, beam_width};
 pub use overlay::AnnOverlay;
 pub use quant::SignQuantizer;
 pub use scan::exhaustive_semantic;

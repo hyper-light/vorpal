@@ -145,6 +145,8 @@ pub struct AnnIndex {
   /// `(chosen l_build rung, measured pool recall)`. In-memory provenance only — the
   /// persisted form lives in `ann.model.json`; loaded indexes report `None`.
   calibration: Option<(u32, f32)>,
+  /// Lazily verified: `ids` ascend (see [`AnnIndex::ids_ascending`]).
+  ids_sorted: std::sync::OnceLock<bool>,
 }
 
 /// The Vamana graph's storage form. Both expose identical rows via [`Adjacency`].
@@ -184,6 +186,12 @@ impl AnnGraphStore {
 /// Beam-width multiplier over the requested pool, read once. `VORPAL_ANN_BEAM` overrides
 /// the default of 2 for tuning; the exact rerank re-scores the returned pool, so this trades
 /// only approximate-pool breadth, never final precision.
+/// The beam width the Vamana search uses for `k` results over `n` rows — exposed so a
+/// caller can predict a beam's cost from measured per-width samples.
+pub fn beam_width(k: usize, n: usize) -> usize {
+  (k * ann_beam_mult()).clamp(64, n.max(1))
+}
+
 fn ann_beam_mult() -> usize {
   use std::sync::OnceLock;
   static M: OnceLock<usize> = OnceLock::new();
@@ -273,6 +281,7 @@ impl AnnIndex {
       },
       medoid: 0,
       calibration: None,
+      ids_sorted: std::sync::OnceLock::new(),
     }
   }
 
@@ -383,6 +392,7 @@ impl AnnIndex {
       },
       medoid: vamana.medoid,
       calibration,
+      ids_sorted: std::sync::OnceLock::new(),
     }
   }
 
@@ -486,6 +496,91 @@ impl AnnIndex {
   /// `(l_build rung, measured pool recall at the default search contract)`.
   pub fn calibration(&self) -> Option<(u32, f32)> {
     self.calibration
+  }
+
+  /// Whether `ids` ascend — the precondition for addressing rows by dense-id range. The
+  /// warm builds rows in node-id order, so this holds for every persisted tier; it is
+  /// checked once (O(n)) rather than assumed, and a tier that fails it simply never takes
+  /// the range path.
+  pub fn ids_ascending(&self) -> bool {
+    *self.ids_sorted.get_or_init(|| self.ids.windows(2).all(|w| w[0] < w[1]))
+  }
+
+  /// [`AnnIndex::scan_codes`] over the rows whose ids fall in `ranges` (sorted, disjoint
+  /// dense-id ranges): exact in code space over exactly that population, at a cost
+  /// proportional to the rows covered — the scoped counterpart of the beam. `None` when
+  /// the tier has no codes or its ids are not ascending.
+  pub fn scan_codes_ranges(
+    &self,
+    query: &[f32],
+    take: usize,
+    ranges: &[std::ops::Range<u64>],
+  ) -> Option<Vec<(u64, f32)>> {
+    use crate::scan::HeapEntry;
+    use rayon::prelude::*;
+    let quant = self.quant.as_ref()?;
+    if !self.ids_ascending() {
+      return None;
+    }
+    let n = self.len();
+    if n == 0 || take == 0 || ranges.is_empty() {
+      return Some(Vec::new());
+    }
+    let mut q = query.to_vec();
+    q.resize(self.dim, 0.0);
+    normalize(&mut q);
+    let quantized = quant.quantize_query(&q);
+    // Dense-id ranges → internal row ranges, by binary search on the ascending ids.
+    let rows: Vec<std::ops::Range<u32>> = ranges
+      .iter()
+      .map(|r| {
+        let lo = self.ids.partition_point(|&id| id < r.start) as u32;
+        let hi = self.ids.partition_point(|&id| id < r.end) as u32;
+        lo..hi
+      })
+      .filter(|r| r.end > r.start)
+      .collect();
+    let evict_push = |heap: &mut std::collections::BinaryHeap<HeapEntry>, entry: HeapEntry| {
+      if heap.len() == take {
+        if let Some(worst) = heap.peek()
+          && entry.cmp(worst) != std::cmp::Ordering::Less
+        {
+          return;
+        }
+        heap.pop();
+      }
+      heap.push(entry);
+    };
+    // Four rows per step through the batched kernel; a short tail goes one by one.
+    let top = rows
+      .par_iter()
+      .flat_map(|r| (r.start..r.end).into_par_iter().step_by(4).map(move |i| (i, r.end)))
+      .fold(std::collections::BinaryHeap::new, |mut heap, (i, end)| {
+        if i + 4 <= end {
+          let group = [i, i + 1, i + 2, i + 3];
+          let dists = quant.dist_to_query_x4(group, &quantized);
+          for k in 0..4 {
+            evict_push(&mut heap, HeapEntry(dists[k], self.ids[group[k] as usize]));
+          }
+        } else {
+          for j in i..end {
+            evict_push(&mut heap, HeapEntry(quant.dist_to_query(j, &quantized), self.ids[j as usize]));
+          }
+        }
+        heap
+      })
+      .reduce(std::collections::BinaryHeap::new, |mut a, mut b| {
+        if b.len() > a.len() {
+          std::mem::swap(&mut a, &mut b);
+        }
+        for entry in b {
+          evict_push(&mut a, entry);
+        }
+        a
+      });
+    let mut merged: Vec<(f32, u64)> = top.into_iter().map(|HeapEntry(d, id)| (d, id)).collect();
+    merged.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    Some(merged.into_iter().map(|(dist, id)| (id, dist)).collect())
   }
 
   /// Top-`k` nearest rows as `(stable id, squared L2 distance)`, closest first. Every tier ends
@@ -746,6 +841,7 @@ impl AnnIndex {
       return Ok(AnnIndex {
         base_stamp,
         calibration: None,
+        ids_sorted: std::sync::OnceLock::new(),
         dim,
         vectors: Vec::new(),
         ids,
@@ -772,6 +868,7 @@ impl AnnIndex {
     Ok(AnnIndex {
       base_stamp,
       calibration: None,
+      ids_sorted: std::sync::OnceLock::new(),
       dim,
       vectors,
       ids,
@@ -786,5 +883,49 @@ impl AnnIndex {
       },
       medoid,
     })
+  }
+}
+
+#[cfg(test)]
+mod range_scan_tests {
+  use super::*;
+
+  fn vector_for(id: u64, dim: usize) -> Vec<f32> {
+    let mut state = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5A5A_A5A5;
+    let mut v: Vec<f32> = (0..dim)
+      .map(|_| {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) as f64 / u64::MAX as f64) as f32 - 0.5
+      })
+      .collect();
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    for x in &mut v {
+      *x /= norm.max(1e-9);
+    }
+    v
+  }
+
+  #[test]
+  fn scan_codes_ranges_is_the_code_space_top_k_over_exactly_the_ranges() {
+    let dim = 32;
+    // Ascending ids with gaps, as dense node ids with Import rows skipped.
+    let rows: Vec<(u64, Vec<f32>)> = (0..2000u64).map(|i| (i * 3 + 7, vector_for(i, dim))).collect();
+    let index = AnnIndex::build(dim, rows, Some(AnnConfig::Vamana));
+    assert!(index.has_quantized_graph() && index.ids_ascending());
+    let query = vector_for(99_991, dim);
+    let ranges = [100u64..400, 2000..2600];
+    let got = index.scan_codes_ranges(&query, 10, &ranges).expect("quantized tier");
+    // Oracle: the same code-space distance the scan uses, over every id the ranges cover.
+    let admit = |id: u64| ranges.iter().any(|r| r.contains(&id));
+    let mut oracle = index.scan_codes(&query, 10, admit).expect("quantized tier");
+    oracle.truncate(10);
+    assert_eq!(got, oracle);
+    assert!(got.iter().all(|(id, _)| admit(*id)), "{got:?}");
+    assert_eq!(index.scan_codes_ranges(&query, 10, &[]).unwrap(), Vec::new());
+    let beyond = 100_000..200_000;
+    assert_eq!(index.scan_codes_ranges(&query, 10, std::slice::from_ref(&beyond)).unwrap(), Vec::new());
   }
 }

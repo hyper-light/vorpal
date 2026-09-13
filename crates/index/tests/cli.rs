@@ -1904,3 +1904,49 @@ fn generation_diff_classifies_files_and_aligns_nodes_by_eid() {
 
   let _ = fs::remove_dir_all(&base);
 }
+
+/// `within` (candidates generated inside the scope's id ranges) must rank exactly as the
+/// old prefix facet (overfetch, then filter) — the two paths share every channel and the
+/// scope only changes where candidates come from.
+#[test]
+fn scoped_search_ranks_exactly_like_the_prefix_facet() {
+  unsafe { std::env::set_var("VORPAL_NO_AUTOWARM", "1") };
+  let base = std::env::temp_dir().join(format!("vorpal-scoped-{}", std::process::id()));
+  let src = base.join("src");
+  let out = base.join("index");
+  let _ = fs::remove_dir_all(&base);
+  for dir in ["core", "core/inner", "util", "utility"] {
+    fs::create_dir_all(src.join(dir)).unwrap();
+  }
+  for (i, dir) in ["core", "core/inner", "util", "utility"].iter().enumerate() {
+    let body: String = (0..12)
+      .map(|j| format!("pub fn widget_{i}_{j}() -> u32 {{ {j} }}\nfn shared_widget_{i}_{j}() -> u32 {{ {i} }}\n"))
+      .collect();
+    fs::write(src.join(dir).join("m.rs"), body).unwrap();
+  }
+  vorpal_index::build_index(&src, &out).unwrap();
+  let root = src.canonicalize().unwrap();
+  let names = |filter: &vorpal_index::SearchFilter| -> Vec<(String, String)> {
+    vorpal_index::search_records_filtered(&out, "shared widget", 8, filter)
+      .unwrap()
+      .into_iter()
+      .map(|hit| (hit.node.name, hit.node.path))
+      .collect()
+  };
+  for entry in ["core", "util", "core/inner"] {
+    let scope = vorpal_index::PathScope::resolve(&[entry.to_string()], Some(&root)).unwrap();
+    let scoped = names(&vorpal_index::SearchFilter {
+      within: Some(scope),
+      ..Default::default()
+    });
+    let prefixed = names(&vorpal_index::SearchFilter {
+      path_prefix: Some(format!("{}/", root.join(entry).display())),
+      ..Default::default()
+    });
+    assert_eq!(scoped, prefixed, "within {entry}");
+    assert!(!scoped.is_empty(), "within {entry}");
+    let under = format!("{}/", root.join(entry).display());
+    assert!(scoped.iter().all(|(_, p)| p.starts_with(&under)), "{scoped:?}");
+  }
+  let _ = fs::remove_dir_all(&base);
+}

@@ -106,7 +106,8 @@ impl AnnOverlay {
   }
 
   #[inline]
-  fn total_rows(&self) -> usize {
+  /// Base rows plus appended rows (dead ones included) — the merged row space.
+  pub fn total_rows(&self) -> usize {
     self.base_n + self.new_ids.len()
   }
 
@@ -142,6 +143,115 @@ impl AnnOverlay {
   }
 
   #[inline]
+  /// Rows `[0, base_len)` are the adopted base tier; rows above it were appended.
+  pub fn base_len(&self) -> usize {
+    self.base_n
+  }
+
+  /// The stable id of a merged row (a base row's caller-supplied id, or an appended row's).
+  pub fn stable_id_of(&self, row: u32) -> u64 {
+    self.id_of(row)
+  }
+
+  /// Exact code-space top-`take` over the live rows `admit` accepts — the scoped
+  /// counterpart of [`AnnOverlay::search_pool`]: cost proportional to the rows scanned,
+  /// no beam, no overfetch. Rows are the merged row space (base then appended); the
+  /// caller's `admit` typically tests a per-row id column against its scope. Dead rows
+  /// are never scanned. Deterministic: `(distance, row)` total order.
+  pub fn scan_filtered(
+    &self,
+    query: &[f32],
+    take: usize,
+    admit: impl Fn(u32) -> bool + Sync,
+  ) -> Vec<(u32, f32)> {
+    let all = 0..self.total_rows() as u32;
+    self.scan_filtered_in(query, take, std::slice::from_ref(&all), admit)
+  }
+
+  /// [`AnnOverlay::scan_filtered`] over the merged rows in `row_ranges` only — the caller
+  /// has already located where its scope's rows sit, so the scan costs those rows, not
+  /// the tier.
+  pub fn scan_filtered_in(
+    &self,
+    query: &[f32],
+    take: usize,
+    row_ranges: &[std::ops::Range<u32>],
+    admit: impl Fn(u32) -> bool + Sync,
+  ) -> Vec<(u32, f32)> {
+    use crate::scan::HeapEntry;
+    use rayon::prelude::*;
+    let total = self.total_rows() as u32;
+    let rows: Vec<std::ops::Range<u32>> = row_ranges
+      .iter()
+      .map(|r| r.start.min(total)..r.end.min(total))
+      .filter(|r| r.end > r.start)
+      .collect();
+    if rows.is_empty() || take == 0 {
+      return Vec::new();
+    }
+    let dim = self.base.dim;
+    let mut codes = vec![0i8; self.padded];
+    let (q_scale, q_snorm) = quantize_row(&query[..dim.min(query.len())], &mut codes[..dim]);
+    let evict_push = |heap: &mut std::collections::BinaryHeap<HeapEntry>, entry: HeapEntry| {
+      if heap.len() == take {
+        if let Some(worst) = heap.peek()
+          && entry.cmp(worst) != std::cmp::Ordering::Less
+        {
+          return;
+        }
+        heap.pop();
+      }
+      heap.push(entry);
+    };
+    // Base rows go four per step through the batched kernel (a step with a dead or
+    // refused row, or any appended row, goes one by one — same arithmetic per row).
+    let base_n = self.base_n as u32;
+    let quant = self.base.quant.as_ref();
+    let quantized = quant.map(|q| q.quantize_query(&{
+      let mut f = vec![0.0f32; dim];
+      f[..dim.min(query.len())].copy_from_slice(&query[..dim.min(query.len())]);
+      f
+    }));
+    let top = rows
+      .par_iter()
+      .flat_map(|r| (r.start..r.end).into_par_iter().step_by(4).map(move |i| (i, r.end)))
+      .fold(std::collections::BinaryHeap::new, |mut heap, (i, end)| {
+        let whole = i + 4 <= end && i + 4 <= base_n;
+        if whole
+          && let (Some(quant), Some(quantized)) = (quant, quantized.as_ref())
+          && (i..i + 4).all(|row| !self.dead[row as usize] && admit(row))
+        {
+          let group = [i, i + 1, i + 2, i + 3];
+          let dists = quant.dist_to_query_x4(group, quantized);
+          for k in 0..4 {
+            evict_push(&mut heap, HeapEntry(dists[k], u64::from(group[k])));
+          }
+        } else {
+          for row in i..(i + 4).min(end) {
+            if !self.dead[row as usize] && admit(row) {
+              evict_push(
+                &mut heap,
+                HeapEntry(self.dist_to_query(row, &codes, q_scale, q_snorm), u64::from(row)),
+              );
+            }
+          }
+        }
+        heap
+      })
+      .reduce(std::collections::BinaryHeap::new, |mut a, mut b| {
+        if b.len() > a.len() {
+          std::mem::swap(&mut a, &mut b);
+        }
+        for entry in b {
+          evict_push(&mut a, entry);
+        }
+        a
+      });
+    let mut merged: Vec<(f32, u64)> = top.into_iter().map(|HeapEntry(d, row)| (d, row)).collect();
+    merged.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    merged.into_iter().map(|(dist, row)| (row as u32, dist)).collect()
+  }
+
   fn id_of(&self, row: u32) -> u64 {
     if (row as usize) < self.base_n {
       self.base_ids[row as usize]
@@ -475,6 +585,41 @@ mod tests {
       .collect();
     scored.sort_by(|a, b| a.partial_cmp(b).unwrap());
     scored.into_iter().take(k).map(|(_, id)| id).collect()
+  }
+
+  #[test]
+  fn scan_filtered_is_exact_over_admitted_live_rows_across_edits() {
+    let dim = 32;
+    let rows: Vec<(u64, Vec<f32>)> = (0..1500u64).map(|i| (i, vector_for(i, dim))).collect();
+    let base = AnnIndex::build(dim, rows.clone(), Some(AnnConfig::Vamana));
+    let mut overlay = AnnOverlay::adopt(base).expect("vamana tier");
+    // Edits: tombstone a slice and append fresh rows; the merged row space is base then new.
+    for id in 300..340u64 {
+      overlay.delete(id);
+    }
+    let appended: Vec<(u64, Vec<f32>)> = (5000..5040u64).map(|i| (i, vector_for(i, dim))).collect();
+    for (id, v) in &appended {
+      overlay.insert(*id, v);
+    }
+    let query = vector_for(77_777, dim);
+    // Admit even stable ids only (a stand-in for "inside the scope's id ranges").
+    let admit_row = |row: u32| overlay.stable_id_of(row) % 2 == 0;
+    let got: Vec<u64> = overlay
+      .scan_filtered(&query, 12, admit_row)
+      .into_iter()
+      .map(|(row, _)| overlay.stable_id_of(row))
+      .collect();
+    // Oracle: code-space distance over every live, admitted row.
+    let mut codes = vec![0i8; overlay.padded];
+    let (scale, snorm) = quantize_row(&query, &mut codes[..dim]);
+    let mut oracle: Vec<(f32, u64)> = (0..overlay.total_rows() as u32)
+      .filter(|&row| !overlay.dead[row as usize] && admit_row(row))
+      .map(|row| (overlay.dist_to_query(row, &codes, scale, snorm), overlay.stable_id_of(row)))
+      .collect();
+    oracle.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let oracle: Vec<u64> = oracle.into_iter().take(12).map(|(_, id)| id).collect();
+    assert_eq!(got, oracle);
+    assert!(got.iter().all(|id| id % 2 == 0 && !(300..340).contains(id)), "{got:?}");
   }
 
   fn pool_recall(overlay: &AnnOverlay, live: &[(u64, Vec<f32>)], probes: &[Vec<f32>]) -> f64 {

@@ -1228,3 +1228,121 @@ fn scope_refuses_relative_entries_without_a_source_root_and_local_profile_drops_
   assert!(!names.contains(&"reachable") && !names.contains(&"impact"), "{names:?}");
   let _ = fs::remove_dir_all(src.parent().unwrap());
 }
+
+/// The object form of a scope: exclusions, path classes, kind, anchor-relative entries,
+/// deferred session binding, and files changed since a git ref.
+#[test]
+fn scope_object_facets_anchors_and_changed_files() {
+  let (src, idx) = scoped_tree("facets");
+  fs::create_dir_all(src.join("tests")).unwrap();
+  fs::write(
+    src.join("tests").join("t.rs"),
+    "use b::target;\n\npub fn test_caller() -> i32 {\n    target()\n}\n",
+  )
+  .unwrap();
+  fs::write(src.join("sub").join("Cargo.toml"), "[package]\nname = \"sub\"\nversion = \"0.0.0\"\n").unwrap();
+  let git = |args: &[&str]| {
+    let out = std::process::Command::new("git")
+      .arg("-C")
+      .arg(&src)
+      .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+      .args(args)
+      .output()
+      .expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+  };
+  git(&["init", "-q"]);
+  git(&["add", "-A"]);
+  git(&["commit", "-q", "-m", "init"]);
+
+  let mut server = Server::new(idx.clone());
+  let (text, is_err) = call_tool(&mut server, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err, "{text}");
+  let callers = |server: &mut Server, id: u64, name: &str, scope: Value| {
+    structured(server, id, "graph", json!({"relation": "callers", "name": name, "scope": scope}))
+  };
+
+  let all = callers(&mut server, 2, "target", json!({}));
+  assert_eq!(all["total"], 3, "{all}");
+
+  let except = callers(&mut server, 3, "target", json!({"except": ["sub"]}));
+  assert_eq!(except["total"], 2, "{except}");
+  assert_eq!(except["outsideScope"], 1, "{except}");
+  assert_eq!(except["scope"]["except"], json!(["sub"]), "{except}");
+  assert!(except["scope"].get("within").is_some_and(|w| w.as_array().is_some_and(Vec::is_empty)), "{except}");
+
+  let source_only = callers(&mut server, 4, "target", json!({"classes": ["source"]}));
+  assert_eq!(source_only["total"], 2, "{source_only}");
+  assert_eq!(source_only["outsideScope"], 1, "{source_only}");
+  for row in 0..2 {
+    assert!(!abs_path(&source_only, row).contains("/tests/"), "{source_only}");
+  }
+
+  let functions = callers(&mut server, 5, "target", json!({"kind": "Function"}));
+  assert_eq!(functions["total"], 3, "{functions}");
+  let structs = callers(&mut server, 6, "target", json!({"kind": "Struct"}));
+  assert_eq!(structs["total"], 0, "{structs}");
+  assert_eq!(structs["outsideScope"], 3, "{structs}");
+
+  // Anchor-relative: `@dir` is the symbol's own directory, `@package` its nearest manifest.
+  let at_dir = callers(&mut server, 7, "target", json!({"within": ["@dir"]}));
+  assert_eq!(at_dir["total"], 3, "{at_dir}");
+  assert_eq!(at_dir["scope"]["within"], json!(["@dir"]), "{at_dir}");
+  let sub_dir = callers(&mut server, 8, "caller2", json!({"within": ["@dir"]}));
+  assert_eq!(sub_dir["total"], 1, "{sub_dir}");
+  assert!(abs_path(&sub_dir, 0).ends_with("/sub/c.rs"), "{sub_dir}");
+  let package = callers(&mut server, 9, "caller2", json!({"within": ["@package"]}));
+  assert_eq!(package["total"], 1, "{package}");
+  let response = request(
+    &mut server,
+    10,
+    "tools/call",
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target", "within": ["@package"]}}),
+  );
+  assert_eq!(response["result"]["isError"], true, "{response}");
+  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("no package manifest above"));
+
+  // Unknown scope fields are errors, never a silently unscoped answer.
+  let response = request(
+    &mut server,
+    11,
+    "tools/call",
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target", "scope": {"withn": ["sub"]}}}),
+  );
+  assert_eq!(response["result"]["isError"], true, "{response}");
+  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("unknown scope field 'withn'"));
+
+  // Changed files: modify one caller's file, then scope to the worktree's changes.
+  fs::write(
+    src.join("sub").join("c.rs"),
+    "use b::target;\n\npub fn caller2() -> i32 {\n    target()\n}\n\npub fn outer() -> i32 {\n    caller2()\n}\n// touched\n",
+  )
+  .unwrap();
+  let changed = callers(&mut server, 12, "target", json!({"changed_since": "worktree"}));
+  assert_eq!(changed["total"], 1, "{changed}");
+  assert_eq!(changed["outsideScope"], 2, "{changed}");
+  assert_eq!(changed["scope"]["changedFiles"], 1, "{changed}");
+  assert!(abs_path(&changed, 0).ends_with("/sub/c.rs"), "{changed}");
+  let since_head = callers(&mut server, 13, "target", json!({"changed_since": "HEAD"}));
+  assert_eq!(since_head["total"], 1, "{since_head}");
+
+  // A session scope with a deferred `@dir` binds per symbol: a search before any symbol
+  // anchor exists is refused; after a graph call it answers inside that symbol's dir.
+  let mut fresh = Server::new(idx);
+  let set = structured(&mut fresh, 14, "scope", json!({"within": ["@dir"], "classes": ["source"]}));
+  assert_eq!(set["outcome"], "scoped", "{set}");
+  assert_eq!(set["deferred"], json!(["@dir"]), "{set}");
+  let response = request(&mut fresh, 15, "tools/call", json!({"name": "search", "arguments": {"query": "caller", "k": 5}}));
+  assert_eq!(response["result"]["isError"], true, "{response}");
+  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("bind to a symbol"));
+  let bound = structured(&mut fresh, 16, "graph", json!({"relation": "callers", "name": "caller2"}));
+  assert_eq!(bound["total"], 1, "{bound}");
+  assert_eq!(bound["scope"]["source"], "session", "{bound}");
+  let hits = structured(&mut fresh, 17, "search", json!({"query": "caller", "k": 5}));
+  assert!(hits["total"].as_u64().unwrap() >= 1, "{hits}");
+  for row in 0..hits["records"].as_array().unwrap().len() {
+    assert!(abs_path(&hits, row).contains("/sub/"), "{hits}");
+  }
+  assert_eq!(hits["scope"]["within"], json!(["@dir"]), "{hits}");
+  let _ = fs::remove_dir_all(src.parent().unwrap());
+}

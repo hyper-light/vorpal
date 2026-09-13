@@ -268,6 +268,28 @@ impl QuantMatrix {
   }
 
   /// Squared L2 between dequantized row `i` and a quantized query.
+  /// Four [`QuantMatrix::dist_to_query`] evaluations batched through the 4-row dot kernel,
+  /// so the rows' memory stalls overlap — the scan's inner loop. Per-row arithmetic is
+  /// identical to the single form.
+  #[inline]
+  pub fn dist_to_query_x4(&self, rows: [u32; 4], query: &QuantQuery) -> [f32; 4] {
+    let dots = dot_i8_x4(
+      [
+        self.row_codes(rows[0]),
+        self.row_codes(rows[1]),
+        self.row_codes(rows[2]),
+        self.row_codes(rows[3]),
+      ],
+      &query.codes,
+    );
+    let mut out = [0.0f32; 4];
+    for k in 0..4 {
+      let i = rows[k] as usize;
+      out[k] = self.snorm[i] + query.snorm - 2.0 * self.scales[i] * query.scale * dots[k] as f32;
+    }
+    out
+  }
+
   #[inline]
   pub fn dist_to_query(&self, i: u32, query: &QuantQuery) -> f32 {
     let dot = dot_i8(self.row_codes(i), &query.codes);
