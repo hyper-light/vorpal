@@ -96,6 +96,7 @@ fn initialize_handshake_and_tool_listing() {
       "index",
       "health",
       "schema",
+      "scope",
       "coverage",
       "code_search",
       "text_search",
@@ -261,7 +262,7 @@ fn profiles_gate_both_the_listing_and_the_calls() {
     .iter()
     .map(|t| t["name"].as_str().unwrap())
     .collect();
-  assert_eq!(names, ["schema", "text_search", "node", "fetch_span", "snippet", "search"]);
+  assert_eq!(names, ["schema", "scope", "text_search", "node", "fetch_span", "snippet", "search"]);
 
   // Advertised tools answer; unlisted tools are unknown to this daemon — a protocol error,
   // exactly as for a name that exists nowhere — so the listing and the gate never drift.
@@ -1008,4 +1009,222 @@ fn query_tool_answers_text_and_ir_and_refuses_typed() {
     json!({"text": "MATCH (f)-[:calls*1..99]->(g) RETURN f.name"}),
   );
   assert!(is_err && text.contains("ceiling"), "{text}");
+}
+
+/// A default-layout tree (`<src>/.vorpal/index`, so relative scope entries resolve against
+/// the source root) with callers in two directories and a two-hop chain:
+/// `outer → caller2 → target`, `caller → target`.
+fn scoped_tree(tag: &str) -> (PathBuf, PathBuf) {
+  let base = std::env::temp_dir().join(format!("vorpal-mcp-{tag}-{}", std::process::id()));
+  let src = base.join("src");
+  let idx = src.join(".vorpal").join("index");
+  let _ = fs::remove_dir_all(&base);
+  fs::create_dir_all(src.join("sub")).unwrap();
+  fs::write(src.join("b.rs"), "pub fn target() -> i32 {\n    0\n}\n").unwrap();
+  fs::write(
+    src.join("a.rs"),
+    "use b::target;\n\npub fn caller() -> i32 {\n    target()\n}\n",
+  )
+  .unwrap();
+  fs::write(
+    src.join("sub").join("c.rs"),
+    "use b::target;\n\npub fn caller2() -> i32 {\n    target()\n}\n\npub fn outer() -> i32 {\n    caller2()\n}\n",
+  )
+  .unwrap();
+  (src, idx)
+}
+
+/// A record's absolute path on the wire: `base` (the page's common directory) + `path`.
+fn abs_path(data: &Value, row: usize) -> String {
+  format!(
+    "{}{}",
+    data["base"].as_str().unwrap_or(""),
+    data["records"][row]["path"].as_str().unwrap_or("")
+  )
+}
+
+fn structured(server: &mut Server, id: u64, tool: &str, args: Value) -> Value {
+  let response = request(server, id, "tools/call", json!({"name": tool, "arguments": args}));
+  let result = &response["result"];
+  assert_eq!(result["isError"], false, "{}", result["content"][0]["text"]);
+  result["structuredContent"].clone()
+}
+
+#[test]
+fn scope_bounds_answers_and_counts_the_rest() {
+  let (src, idx) = scoped_tree("scope");
+  let mut server = Server::new(idx);
+  let (text, is_err) = call_tool(&mut server, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err, "{text}");
+
+  // Unscoped: both callers, nearest file first (a.rs shares target's directory).
+  let all = structured(&mut server, 2, "graph", json!({"relation": "callers", "name": "target"}));
+  assert_eq!(all["total"], 2, "{all}");
+  assert!(abs_path(&all, 0).ends_with("/a.rs"), "{all}");
+  assert!(abs_path(&all, 1).ends_with("/sub/c.rs"), "{all}");
+  assert!(all.get("scope").is_none() && all.get("outsideScope").is_none(), "{all}");
+  assert_eq!(all["radius"]["anchor"], "target", "{all}");
+  assert_eq!(all["radius"]["files"], 2, "{all}");
+  assert_eq!(all["radius"]["dirs"], 2, "{all}");
+
+  // A relative `within` resolves against the source root; the rest is counted, not listed,
+  // and the count plus the rows equals the unscoped answer.
+  let sub = structured(
+    &mut server,
+    3,
+    "graph",
+    json!({"relation": "callers", "name": "target", "within": ["sub"]}),
+  );
+  assert_eq!(sub["total"], 1, "{sub}");
+  assert_eq!(sub["outsideScope"], 1, "{sub}");
+  assert!(abs_path(&sub, 0).ends_with("/sub/c.rs"), "{sub}");
+  assert_eq!(sub["scope"], json!({"within": ["sub"], "source": "call"}), "{sub}");
+  let response = request(
+    &mut server,
+    4,
+    "tools/call",
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target", "within": ["sub"]}}),
+  );
+  let text = response["result"]["content"][0]["text"].as_str().unwrap();
+  assert!(text.contains("outside scope: 1 rows not listed (within: sub)"), "{text}");
+
+  // An entry that names nothing is an error, never a silent empty answer; a single
+  // string works like a list; matching is segment-exact (`su` exists here as a directory
+  // and is not a prefix of `sub/`).
+  let response = request(
+    &mut server,
+    5,
+    "tools/call",
+    json!({"name": "graph", "arguments": {"relation": "callers", "name": "target", "within": "nope"}}),
+  );
+  assert_eq!(response["result"]["isError"], true, "{response}");
+  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("names nothing under"));
+  fs::create_dir_all(src.join("su")).unwrap();
+  let none = structured(
+    &mut server,
+    5,
+    "graph",
+    json!({"relation": "callers", "name": "target", "within": "su"}),
+  );
+  assert_eq!(none["total"], 0, "{none}");
+  assert_eq!(none["outsideScope"], 2, "{none}");
+
+  // Session scope: set once, applied to every scoped call that passes no `within`; an
+  // explicit empty list is the unscoped view; `clear` removes it.
+  let set = structured(&mut server, 6, "scope", json!({"within": ["sub/"]}));
+  assert_eq!(set["outcome"], "scoped", "{set}");
+  let session = structured(&mut server, 7, "graph", json!({"relation": "callers", "name": "target"}));
+  assert_eq!(session["total"], 1, "{session}");
+  assert_eq!(session["scope"]["source"], "session", "{session}");
+  assert_eq!(session["outsideScope"], 1, "{session}");
+  let explicit = structured(
+    &mut server,
+    8,
+    "graph",
+    json!({"relation": "callers", "name": "target", "within": []}),
+  );
+  assert_eq!(explicit["total"], 2, "{explicit}");
+  assert!(explicit.get("scope").is_none(), "{explicit}");
+  let hits = structured(&mut server, 9, "search", json!({"query": "caller", "k": 5}));
+  assert!(hits["total"].as_u64().unwrap() >= 1, "{hits}");
+  for row in 0..hits["records"].as_array().unwrap().len() {
+    assert!(abs_path(&hits, row).contains("/sub/"), "search honours the session scope: {hits}");
+  }
+  assert_eq!(hits["scope"]["source"], "session", "{hits}");
+  let cleared = structured(&mut server, 10, "scope", json!({"clear": true}));
+  assert_eq!(cleared["outcome"], "unscoped", "{cleared}");
+  let again = structured(&mut server, 11, "graph", json!({"relation": "callers", "name": "target"}));
+  assert_eq!(again["total"], 2, "{again}");
+
+  // Rings: one hop by default with the next ring counted; 0 walks the whole closure; the
+  // scope is a view over the rows, so the two-hop node is still reached through sub/.
+  let ring = structured(&mut server, 12, "reachable", json!({"name": "target", "direction": "in"}));
+  assert_eq!(ring["total"], 2, "{ring}");
+  assert_eq!(ring["frontier"], 1, "{ring}");
+  assert_eq!(ring["maxDepth"], 1, "{ring}");
+  assert!(ring["records"].as_array().unwrap().iter().all(|r| r["depth"] == 1), "{ring}");
+  let response = request(
+    &mut server,
+    13,
+    "tools/call",
+    json!({"name": "reachable", "arguments": {"name": "target", "direction": "in"}}),
+  );
+  let text = response["result"]["content"][0]["text"].as_str().unwrap();
+  assert!(text.contains("frontier: 1 more at depth 2"), "{text}");
+  let whole = structured(
+    &mut server,
+    14,
+    "reachable",
+    json!({"name": "target", "direction": "in", "max_depth": 0}),
+  );
+  assert_eq!(whole["total"], 3, "{whole}");
+  assert_eq!(whole["frontier"], 0, "{whole}");
+  assert_eq!(whole["maxDepth"], 0, "{whole}");
+  let scoped_ring = structured(
+    &mut server,
+    15,
+    "reachable",
+    json!({"name": "target", "direction": "in", "within": ["sub"]}),
+  );
+  assert_eq!(scoped_ring["total"], 1, "{scoped_ring}");
+  assert_eq!(scoped_ring["outsideScope"], 1, "{scoped_ring}");
+  assert_eq!(scoped_ring["frontier"], 1, "{scoped_ring}");
+
+  // text_search and code_search take the same scope.
+  let lines = structured(
+    &mut server,
+    16,
+    "text_search",
+    json!({"pattern": "target\\(\\)", "within": ["sub"]}),
+  );
+  assert_eq!(lines["total"], 1, "{lines}");
+  assert!(abs_path(&lines, 0).ends_with("/sub/c.rs"), "{lines}");
+  let code = structured(
+    &mut server,
+    17,
+    "code_search",
+    json!({"pattern": "target()", "lang": "rust", "within": ["sub"]}),
+  );
+  assert_eq!(code["total"], 1, "{code}");
+  assert!(abs_path(&code, 0).ends_with("/sub/c.rs"), "{code}");
+
+  let _ = fs::remove_dir_all(src.parent().unwrap());
+}
+
+#[test]
+fn scope_refuses_relative_entries_without_a_source_root_and_local_profile_drops_closures() {
+  use vorpal_mcp::Profile;
+  let (src, idx) = temp_tree("scope-root");
+  let mut server = Server::new(idx.clone());
+  let (text, is_err) = call_tool(&mut server, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err, "{text}");
+  // A custom index location has no source root: a relative entry is an error naming it,
+  // never a silent empty answer; an absolute entry works.
+  let response = request(
+    &mut server,
+    2,
+    "tools/call",
+    json!({"name": "scope", "arguments": {"within": ["src"]}}),
+  );
+  assert_eq!(response["result"]["isError"], true, "{response}");
+  assert_eq!(response["result"]["structuredContent"]["code"], "bad-argument");
+  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("no source root"));
+  let abs = structured(&mut server, 3, "scope", json!({"within": [src.to_str().unwrap()]}));
+  assert_eq!(abs["outcome"], "scoped", "{abs}");
+  let callers = structured(&mut server, 4, "graph", json!({"relation": "callers", "name": "target"}));
+  assert_eq!(callers["total"], 1, "{callers}");
+  assert_eq!(callers["outsideScope"], 0, "{callers}");
+
+  let local = Server::with_profile(idx, Profile::Local);
+  let mut local = local;
+  let response = request(&mut local, 5, "tools/list", Value::Null);
+  let names: Vec<&str> = response["result"]["tools"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|t| t["name"].as_str().unwrap())
+    .collect();
+  assert!(names.contains(&"graph") && names.contains(&"structural_search") && names.contains(&"scope"), "{names:?}");
+  assert!(!names.contains(&"reachable") && !names.contains(&"impact"), "{names:?}");
+  let _ = fs::remove_dir_all(src.parent().unwrap());
 }

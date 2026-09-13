@@ -348,7 +348,7 @@ pub struct McpArg {
   #[clap(long)]
   index: Option<PathBuf>,
   /// Tool profile: `scout` (read-only navigation), `analysis` (+ traversal/evidence/health),
-  /// `full` (everything).
+  /// `local` (everything but `reachable`/`impact`), `full` (everything).
   #[clap(long, default_value = "full")]
   profile: String,
   /// Disable the proactive background rebuild (D1): the index then refreshes lazily on the
@@ -1194,6 +1194,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
       &vorpal_core::matcher::PatternSpec::plain(&arg.query),
       arg.lang.as_deref(),
       arg.prefix.as_deref(),
+      None,
       arg.k.max(1),
     )
     .map_err(anyhow::Error::msg)?;
@@ -1224,6 +1225,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     lang: arg.lang,
     exported_only: arg.exported,
     exclude_tests: arg.no_tests,
+    within: None,
   };
   if arg.ranked {
     if !matches!(arg.format, OutputFormat::Text) {

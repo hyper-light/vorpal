@@ -506,6 +506,7 @@ pub(crate) fn search_core(generation_dir: &std::path::Path, query: String, k: Op
       lang: options.lang,
       exported_only: options.exported.unwrap_or(false),
       exclude_tests: options.exclude_tests.unwrap_or(false),
+      within: None,
     };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.

@@ -77,7 +77,7 @@ fn chunk_scoped_code_search_equals_the_whole_file_parse() {
   let mut moved: Vec<String> = Vec::new();
   for &(pattern, lang, expected) in cases {
     let spec = PatternSpec::plain(pattern);
-    let with = code_search(&kg, Some(&generation), &spec, Some(lang), None, 100).unwrap();
+    let with = code_search(&kg, Some(&generation), &spec, Some(lang), None, None, 100).unwrap();
     // The veto is read once per process through a OnceLock, so the exhaustive arm runs in a
     // child process below; here we only compare against it.
     chunked_total += with.chunk_parsed_files;
@@ -86,7 +86,7 @@ fn chunk_scoped_code_search_equals_the_whole_file_parse() {
       assert_eq!(with.chunk_parsed_files, 0, "{pattern}: a call shape never parses");
     }
     // A repeat answers every chunk from the memo and must be identical.
-    let again = code_search(&kg, Some(&generation), &spec, Some(lang), None, 100).unwrap();
+    let again = code_search(&kg, Some(&generation), &spec, Some(lang), None, None, 100).unwrap();
     assert_eq!(rows(&again), rows(&with), "{pattern}: memo replay diverged");
     assert_eq!(again.total_matches, with.total_matches);
     if with.chunk_parsed_files > 0 && with.callsite_files == 0 {
@@ -159,7 +159,7 @@ fn child_exhaustive() {
   let pattern = std::env::var("VORPAL_CHUNKS_PATTERN").unwrap();
   let lang = std::env::var("VORPAL_CHUNKS_LANG").unwrap();
   let kg = vorpal_kg::Kg::load(&generation).unwrap();
-  let report = code_search(&kg, Some(&generation), &PatternSpec::plain(&pattern), Some(&lang), None, 100).unwrap();
+  let report = code_search(&kg, Some(&generation), &PatternSpec::plain(&pattern), Some(&lang), None, None, 100).unwrap();
   assert_eq!(report.chunk_parsed_files, 0, "the veto must hold in the child");
   assert_eq!(report.callsite_files, 0, "the call-site veto must hold in the child");
   println!("TOTAL\t{}", report.total_matches);

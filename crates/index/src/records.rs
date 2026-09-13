@@ -1088,15 +1088,29 @@ pub fn related_records_with_sites(
   verified_source: Option<VerifiedSource<'_>>,
 ) -> Result<Selected<RelatedRecord>, String> {
   let mut selected = related_records(kg, verb, target)?;
-  let Selected::Hits(hits) = &mut selected else {
-    return Ok(selected);
-  };
+  if let Selected::Hits(hits) = &mut selected {
+    attach_call_sites(kg, artifacts_dir, verb, target, hits, verified_source)?;
+  }
+  Ok(selected)
+}
+
+/// The site half of [`related_records_with_sites`], over rows a caller has already
+/// selected: one file read per distinct caller file, so a surface that drops rows first
+/// (a scope) pays for the rows it keeps, not for the whole answer.
+pub fn attach_call_sites(
+  kg: &Kg,
+  artifacts_dir: Option<&std::path::Path>,
+  verb: &str,
+  target: &GraphTarget,
+  hits: &mut [RelatedRecord],
+  verified_source: Option<VerifiedSource<'_>>,
+) -> Result<(), String> {
   if hits.is_empty() {
-    return Ok(selected);
+    return Ok(());
   }
   let (edge, outgoing) = verb_edge(verb)?;
   if edge.base() == vorpal_kg::EdgeType::SIMILAR_TO {
-    return Ok(selected);
+    return Ok(());
   }
   let targets: Vec<u64> = resolve_target(kg, target)
     .map_err(|err| err.to_string())?
@@ -1193,7 +1207,7 @@ pub fn related_records_with_sites(
     hit.site_line = Some(bytes[..line_start].iter().filter(|&&b| b == b'\n').count() as u32 + 1);
     hit.site = Some(text);
   }
-  Ok(selected)
+  Ok(())
 }
 
 /// One page of a selector-driven query whose full record set would be expensive to
@@ -1306,6 +1320,128 @@ pub fn reach_records_page(
   })
 }
 
+/// The BFS steps behind a `reachable` answer, before any page is materialized — the
+/// selector outcome of [`reach_records_page`] with the traversal exposed, so a surface can
+/// bound it to a ring, count the ring beyond, and apply a [`crate::PathScope`] before paging.
+#[derive(Debug)]
+pub enum SelectedSteps {
+  NoMatch,
+  Ambiguous(Vec<NodeRecord>),
+  Steps(Vec<vorpal_kg::ReachStep>),
+}
+
+/// Resolve `target` and run the relation-restricted BFS (see [`reach_records_page`] for the
+/// ambiguity contract).
+pub fn reach_steps(
+  kg: &Kg,
+  target: &GraphTarget,
+  dir: vorpal_kg::Direction,
+  relations: &[vorpal_kg::EdgeType],
+  max_depth: Option<u32>,
+  min_confidence: u8,
+) -> Result<SelectedSteps, String> {
+  let matches = resolve_target(kg, target).map_err(|err| err.to_string())?;
+  if matches.is_empty() {
+    return Ok(SelectedSteps::NoMatch);
+  }
+  if matches.len() > 1 && !target.merge_all {
+    return Ok(SelectedSteps::Ambiguous(
+      matches.iter().filter_map(|&id| node_record(kg, id)).collect(),
+    ));
+  }
+  let mut steps = Vec::new();
+  for &seed in &matches {
+    steps.extend(kg.reachable_via_paths(seed, dir, relations, max_depth, min_confidence));
+  }
+  Ok(SelectedSteps::Steps(steps))
+}
+
+/// Keep the steps within `bound` hops and count the ring just beyond it (`bound + 1`): a
+/// traversal run one ring deeper than the answer, so the answer can state how much a wider
+/// radius would add without materializing it. `None` bound = unbounded: everything is
+/// kept and the frontier is 0.
+pub fn ring_split(
+  steps: Vec<vorpal_kg::ReachStep>,
+  bound: Option<u32>,
+) -> (Vec<vorpal_kg::ReachStep>, usize) {
+  let Some(bound) = bound else {
+    return (steps, 0);
+  };
+  let before = steps.len();
+  let kept: Vec<vorpal_kg::ReachStep> = steps.into_iter().filter(|s| s.depth <= bound).collect();
+  let frontier = before - kept.len();
+  (kept, frontier)
+}
+
+/// Drop the steps whose node lies outside `scope`, counting them. The traversal itself is
+/// untouched: an in-scope node reached through an out-of-scope one keeps its `via`.
+pub fn scope_steps(
+  kg: &Kg,
+  steps: Vec<vorpal_kg::ReachStep>,
+  scope: &crate::PathScope,
+) -> (Vec<vorpal_kg::ReachStep>, usize) {
+  if scope.is_empty() {
+    return (steps, 0);
+  }
+  let before = steps.len();
+  let kept: Vec<vorpal_kg::ReachStep> = steps
+    .into_iter()
+    .filter(|s| kg.node(NodeId::new(s.node as u64)).is_some_and(|v| scope.admits(v.path)))
+    .collect();
+  let outside = before - kept.len();
+  (kept, outside)
+}
+
+/// One page of [`ReachRecord`]s over pre-computed steps (see [`reach_records_page`]).
+pub fn reach_page_from_steps(
+  kg: &Kg,
+  flows_dir: Option<&std::path::Path>,
+  relations: &[vorpal_kg::EdgeType],
+  steps: &[vorpal_kg::ReachStep],
+  page: PageRequest<'_>,
+) -> Result<SelectedPage<ReachRecord>, String> {
+  let flow_store = crate::flow_store_for(flows_dir, relations);
+  let PageBounds { start, end, total } = page_bounds(steps.len(), page.cursor, page.limit)?;
+  let records = steps[start..end]
+    .iter()
+    .filter_map(|step| {
+      Some(ReachRecord {
+        node: node_record(kg, NodeId::new(step.node as u64))?,
+        depth: step.depth,
+        via: step.via.0 as u64,
+        relation: step.via.1.name().to_string(),
+        grade: crate::confidence_label(step.via.1.confidence()).to_string(),
+        edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        flow_exprs: crate::flow_exprs_for_hop(
+          flow_store.as_ref(),
+          step.via.0,
+          step.node,
+          step.inbound,
+        ),
+      })
+    })
+    .collect();
+  Ok(SelectedPage::Page {
+    records,
+    total,
+    start,
+    end,
+  })
+}
+
+/// Order a symbol's neighbours nearest-first by path: the anchor's own file, then its
+/// directory, then the longest shared ancestor directory; ties keep the graph's id order.
+/// A page truncated by `limit` then drops the far edge of the answer, not a random slice.
+pub fn order_by_proximity(hits: &mut [RelatedRecord], anchor_path: &str) {
+  let anchor_dir = anchor_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+  hits.sort_by_cached_key(|hit| {
+    (
+      hit.node.path != anchor_path,
+      usize::MAX - crate::scope::shared_dir_segments(&hit.node.path, anchor_dir),
+    )
+  });
+}
+
 /// One graph-ranked structural-search hit: the enclosing definition of ≥1 pattern match,
 /// with its match count and semantic in-degree (the ranking signal — heavily-used code
 /// outranks dead-weight lookalikes, the same prior hybrid search uses).
@@ -1357,6 +1493,7 @@ pub fn code_search(
   spec: &vorpal_core::matcher::PatternSpec<'_>,
   lang_filter: Option<&str>,
   path_prefix: Option<&str>,
+  within: Option<&crate::PathScope>,
   k: usize,
 ) -> Result<CodeSearchReport, String> {
   use rayon::prelude::*;
@@ -1499,6 +1636,11 @@ pub fn code_search(
       }
       if let Some(prefix) = path_prefix {
         if !run.path.starts_with(prefix) {
+          return None;
+        }
+      }
+      if let Some(scope) = within {
+        if !scope.admits(&run.path) {
           return None;
         }
       }
@@ -1700,11 +1842,16 @@ pub fn code_search(
     Some(idx) => {
       // The filtered population size, for the pruned count (files in scope minus admitted):
       // per-language totals from the run index when there is no prefix, a walk otherwise.
-      let population = match (&run_index, path_prefix) {
-        (Some(index), None) => index.count_where(|lang| lang.is_some_and(&lang_ok)),
+      let unscoped = within.is_none_or(crate::PathScope::is_empty);
+      let population = match (&run_index, path_prefix, unscoped) {
+        (Some(index), None, true) => index.count_where(|lang| lang.is_some_and(&lang_ok)),
         _ => runs
           .iter()
-          .filter(|run| SgLang::from_path(&run.path).is_some_and(&lang_ok) && path_prefix.is_none_or(|p| run.path.starts_with(p)))
+          .filter(|run| {
+            SgLang::from_path(&run.path).is_some_and(&lang_ok)
+              && path_prefix.is_none_or(|p| run.path.starts_with(p))
+              && within.is_none_or(|scope| scope.admits(&run.path))
+          })
           .count() as u64,
       };
       (idx.par_iter().map(|&i| scan_run(&runs[i as usize], false)).collect(), population)
@@ -2558,6 +2705,10 @@ pub struct ImpactPage {
   pub missing_files: usize,
   /// BFS seeds (changed File nodes + their definitions).
   pub seeds: usize,
+  /// Nodes the ring beyond `max_depth` would add (0 when unbounded).
+  pub frontier: usize,
+  /// Impacted nodes outside the caller's scope, counted rather than listed.
+  pub outside_scope: usize,
 }
 
 /// The impact closure for pre-resolved seeds, page-materialized like every whole-graph
@@ -2603,6 +2754,62 @@ pub fn impact_page(
     changed_files: counts.0,
     missing_files: counts.1,
     seeds: seeds.len(),
+    frontier: 0,
+    outside_scope: 0,
+  })
+}
+
+/// The impact BFS alone (see [`impact_page`]): min-hop steps from the whole seed set.
+pub fn impact_steps(
+  kg: &Kg,
+  seeds: &[NodeId],
+  relations: &[vorpal_kg::EdgeType],
+  max_depth: Option<u32>,
+  min_confidence: u8,
+) -> Vec<vorpal_kg::ReachStep> {
+  kg.reachable_via_paths_multi(
+    seeds,
+    vorpal_kg::Direction::In,
+    relations,
+    max_depth,
+    min_confidence,
+  )
+}
+
+/// [`impact_page`] over pre-computed (ring-bounded, scoped) steps.
+pub fn impact_page_from_steps(
+  kg: &Kg,
+  steps: &[vorpal_kg::ReachStep],
+  counts: (usize, usize, usize),
+  frontier: usize,
+  outside_scope: usize,
+  page: PageRequest<'_>,
+) -> Result<ImpactPage, String> {
+  let PageBounds { start, end, total } = page_bounds(steps.len(), page.cursor, page.limit)?;
+  let records = steps[start..end]
+    .iter()
+    .filter_map(|step| {
+      Some(ReachRecord {
+        node: node_record(kg, NodeId::new(step.node as u64))?,
+        depth: step.depth,
+        via: step.via.0 as u64,
+        relation: step.via.1.name().to_string(),
+        grade: crate::confidence_label(step.via.1.confidence()).to_string(),
+        edge_direction: if step.inbound { "in" } else { "out" }.to_string(),
+        flow_exprs: Vec::new(),
+      })
+    })
+    .collect();
+  Ok(ImpactPage {
+    records,
+    total,
+    start,
+    end,
+    changed_files: counts.0,
+    missing_files: counts.1,
+    seeds: counts.2,
+    frontier,
+    outside_scope,
   })
 }
 

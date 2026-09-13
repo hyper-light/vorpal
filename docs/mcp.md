@@ -140,7 +140,7 @@ both a text rendering in `content` and `structuredContent`:
   semantic edit's sites wait for the served graph to absorb it).
 - Tool descriptions on the wire are deliberately terse: a client either loads a schema in
   a model turn or carries the whole listing in every turn, so the listing is kept under
-  10 KB (a test enforces it). The prose is here.
+  12 KB (a test enforces it). The prose is here.
 - `format: "lean" | "toon" | "ids"` shapes both the text and `structuredContent`,
   because clients such as Claude Code hand the model the structured half. `lean` keeps
   identity and ranking columns (`name`, `kind`, `path`, `id`, `grade`, …) and drops
@@ -193,13 +193,53 @@ offers:
 
 | profile | tools |
 |---|---|
-| `scout` | `node`, `search`, `text_search`, `snippet`, `schema`, `fetch_span` — read-only navigation |
+| `scout` | `node`, `search`, `text_search`, `snippet`, `schema`, `scope`, `fetch_span` — read-only navigation |
 | `analysis` | scout + `graph`, `reachable`, `why`, `health`, `dead_code`, `coverage`, `impact`, `compare_generations`, `architecture`, `code_search`, `data_flow`, `observed`, `query` |
+| `local` | everything except `reachable` and `impact` — for agents that should answer relationships one ring at a time |
 | `full` (default) | everything: analysis + `index`, `structural_search`, `rule_search`, `ast_dump` |
 
 ```json
 { "mcpServers": { "vorpal": { "command": "vorpal", "args": ["mcp", "--profile", "analysis"] } } }
 ```
+
+## Scope, rings, and radius
+
+The graph answers with complete sets. Handed a complete list of a symbol's importers, an
+agent tends to treat it as a work list and wander off from the question it was asked. Three
+things keep the answer inside the user's area without hiding anything.
+
+**Scope.** `graph`, `reachable`, `impact`, `search`, `text_search`, and `code_search` take
+`within`: one path prefix or a list of them (`"fs"`, `["drivers/net", "include/linux"]`,
+`"mm/slab.c"`). Entries are relative to the source root or absolute, and matching is by
+whole path segment, so `fs` never admits `fsnotify/`. Rows whose file lies outside the scope
+are dropped from the page and counted in `outsideScope`; the answer echoes the scope it
+used. The traversal itself is not changed: a caller two hops away through an out-of-scope
+file is still found, with its `via`. `search`, `text_search`, and `code_search` apply the
+scope before ranking, so `k` results means `k` results inside it.
+
+`scope` sets a session default: `scope {within: ["fs"]}` and every later call without its
+own `within` answers inside `fs`, stamped `scope.source: "session"`. `within: []` on a call
+is the unscoped view for that call; `scope {clear: true}` removes the default; `scope {}`
+shows it. A relative entry with no source root (a custom `--index` location) is an error
+that names the entry, never a silent empty answer.
+
+**Rings.** `reachable` and `impact` return one hop by default (`maxDepth: 1`, the direct
+neighbours) and state what the next ring would add as `frontier`. `max_depth: 2` widens by
+one ring, `max_depth: 0` walks the whole closure. Under a scope, `frontier` counts the next
+ring before the scope is applied. The BFS runs one ring deeper than the answer, which is
+still far less work than the unbounded closure that used to be the default.
+
+**Order and radius.** `graph` rows come nearest file first: the symbol's own file, then its
+directory, then the longest shared ancestor directory, ties in graph order (`similar` keeps
+its similarity order). A page truncated by `limit` therefore drops the far edge of the
+answer. Every record-bearing answer also carries `radius`: the first symbol or query the
+session asked about, and how many files and top-level directories its answers have named
+since, so drift is visible while it happens. Both the text and `structuredContent` carry
+`outsideScope` and `frontier`.
+
+| Tool | What it does |
+|---|---|
+| `scope` | Set (`within`), show (no arguments), or clear (`clear: true`) the session's default scope. Returns the entries as given and the absolute prefixes they resolved to. |
 
 ## One daemon, many projects
 
@@ -234,7 +274,7 @@ allow-list (`VORPAL_PROJECTS_FILE` overrides its path).
 | Tool | What it does |
 |---|---|
 | `architecture` | Orientation summary: module mass, hubs by in-degree, entry-point candidates. |
-| `impact` | Blast radius of changed files: git-diff-seeded transitive inbound closure (`since` a ref, or uncommitted changes). |
+| `impact` | Blast radius of changed files: git-diff-seeded inbound closure (`since` a ref, or uncommitted changes), one ring by default with `frontier` for the next; `max_depth: 0` for the whole closure; `within` scopes the rows. |
 | `dead_code` | Definitions with no semantic in-edges anywhere (suppression-honest dead-code leads; `prefix`/`exported`/`exclude_tests` refinements). |
 | `compare_generations` | What changed between two index generations: files, nodes by durable eid, edge counts. |
 
@@ -258,15 +298,15 @@ allow-list (`VORPAL_PROJECTS_FILE` overrides its path).
 | Tool | What it does |
 |---|---|
 | `node` | Nodes matching an exact symbol name. |
-| `graph` | The direct neighbours of a symbol over one `relation`: `callers` (incoming `calls`, each row with the call-site line in the caller), `callees` (outgoing `calls` — what the symbol calls — each row with the call-site line inside the symbol's own body), `references`, `importers` (files importing it), `implementors` (types implementing/extending a trait, interface, or base type), `type_users` (definitions using a type in fields, params, returns, or annotations), `similar` (near-clones from extraction-time MinHash sketches, ≥ 0.7 estimated Jaccard, confidence = similarity × 100, 8 partners kept per definition, nothing under 32 tokens signed), `observed` (runtime-observed calls from traces ingested with `vorpal-index ingest-traces <index> <folded-stacks>`, each row flagged with whether the static graph has the edge; a rebuild invalidates the sidecar until traces are re-ingested). The result is the complete set of resolved edges at the stated grade and needs no confirmation by search. `mentions: true` on an inbound relation adds every whole-word mention of the name in files the answer does not already cover, found through the text index. `complete` is true when nothing was stale or truncated; an empty, complete list means no other file mentions the name. |
-| `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. Restrict edge types with `relations` (default `["calls"]`; add `"data_flows"` to follow argument flow, `"changes_with"` for git co-change, `"similar_to"` for near-clones). |
+| `graph` | The direct neighbours of a symbol over one `relation`: `callers` (incoming `calls`, each row with the call-site line in the caller), `callees` (outgoing `calls` — what the symbol calls — each row with the call-site line inside the symbol's own body), `references`, `importers` (files importing it), `implementors` (types implementing/extending a trait, interface, or base type), `type_users` (definitions using a type in fields, params, returns, or annotations), `similar` (near-clones from extraction-time MinHash sketches, ≥ 0.7 estimated Jaccard, confidence = similarity × 100, 8 partners kept per definition, nothing under 32 tokens signed), `observed` (runtime-observed calls from traces ingested with `vorpal-index ingest-traces <index> <folded-stacks>`, each row flagged with whether the static graph has the edge; a rebuild invalidates the sidecar until traces are re-ingested). The result is the complete set of resolved edges at the stated grade and needs no confirmation by search; rows come nearest file first, and `within` (a path prefix or list) keeps the page inside the caller's area with the rest counted in `outsideScope`. `mentions: true` on an inbound relation adds every whole-word mention of the name in files the answer does not already cover, found through the text index. `complete` is true when nothing was stale or truncated; an empty, complete list means no other file mentions the name. |
+| `reachable` | Transitive traversal from a symbol — `direction: "in"` (everything reaching it) or `"out"` (everything it reaches), with the path back to the seed. One ring by default (`max_depth` 1) with `frontier` = what the next ring adds; `max_depth: 0` walks the whole closure. Restrict edge types with `relations` (default `["calls"]`; add `"data_flows"` to follow argument flow, `"changes_with"` for git co-change, `"similar_to"` for near-clones); `within` scopes the rows. |
 | `data_flow` | Where a symbol's arguments flow: per-argument rows (`arg#i` → callee `param#j`, with the argument expression when traceable) joined from the `dataflow.bin` sidecar. Captured for Rust/Python/TypeScript/TSX call sites; older generations without the sidecar answer empty. |
 | `query` | Cypher-shaped read-only queries (openCypher read subset): `MATCH (f:Function)-[:calls]->(g) WITH g, count(*) AS n WHERE n >= 20 AND NOT EXISTS { (g)-[:calls]->() } RETURN g.name, n ORDER BY n DESC LIMIT 20`. Linear patterns up to 8 segments with var-length paths and grade floors; `WHERE` trees with `=~`, `IN`, `IS NULL`, `n:Label`, `EXISTS {…}`; `WITH`/`UNWIND` stages; `RETURN [DISTINCT]` of expressions — properties, arithmetic, string/list functions, `CASE`, `count/sum/avg/min/max/collect` with implicit grouping; `ORDER BY`/`SKIP`/`LIMIT`; `UNION [ALL]`. Runs under explicit work ceilings (16KiB text, depth 10, 5M edge visits, 100k rows) and refuses by naming the ceiling instead of truncating. Not supported, by name: `OPTIONAL MATCH`, a second `MATCH`, `XOR`, map literals, path/relationship variables. |
 
 **Search**
 | Tool | What it does |
 |---|---|
-| `search` | Hybrid search over definitions — exact/token name match + lexical-embedding similarity + graph in-degree, fused into a top-k ranking. When no definition name contains a query word, a `body` channel adds the definitions whose source contains every word, found through the text index. Queries that match a name are ranked exactly as before. |
+| `search` | Hybrid search over definitions — exact/token name match + lexical-embedding similarity, fused into a top-k ranking (`within` narrows the candidates before ranking). When no definition name contains a query word, a `body` channel adds the definitions whose source contains every word, found through the text index. Queries that match a name are ranked exactly as before. |
 | `text_search` | Regex over the indexed files, grep-shaped: one record per matching line with `path`, `line`, `column`, the line's `text`, and the enclosing `symbol`/`kind`. Candidates come from the trigram text index (every file that can hold the regex's literals; an alternation such as `TODO|FIXME` is planned per branch), then a substring check, then the regex; the report says how many files were pruned, prefiltered, and scanned, and names `index: "full-scan"` with a reason when the regex carries no three-byte literal or is case-insensitive. `max_results` caps lines (default 1000, max 10000). `symbol` limits the search to that definition's source. |
 | `structural_search` | ast-grep-style structural pattern search with metavariables (`$X`, `$$$ARGS`), matched on the AST over the watched tree — records with `path`, `line`, `column`, `kind`, `text`, paged like every record tool. When the watched tree is the indexed one, candidates come from the text index and only the top-level statements that contain the pattern's literal are parsed; `chunkParsedFiles` counts the files handled that way. A call pattern whose arguments are all metavariables (`f($A, $B)`, `f()`, `f($$$)`) is answered from the index's call references without a parse; `callSiteFiles` counts those. `code_search` works the same way. `selector`/`context` root the pattern at an AST kind inside a surrounding source; C-family call shapes (`f($A)`) are re-parsed in statement context automatically. |
 | `rule_search` | Run full YAML rule(s) (composite/relational rules, constraints, `fix` dry-runs) over the watched tree — records with `rule`, `path`, `line`, `column`, `text`, `fixes`, paged. A rule that is only `rule: {pattern: P}`, with no fix, constraints, utils, transform, or rewriters, is answered the same way as `structural_search`. A rule with a `fix` is parsed. Later pages of either tool are served from the first call's result, so a cursor never re-runs the search; the result is dropped when the tree or the index changes. |

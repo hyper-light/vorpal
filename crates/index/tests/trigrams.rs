@@ -112,16 +112,16 @@ fn text_tier_heals_prunes_and_stays_exact() {
 
   // 3. code_search with the tier prunes and agrees with the exhaustive scan.
   let kg = vorpal_kg::Kg::load(&generation).unwrap();
-  let with = code_search(&kg, Some(&generation), &vorpal_core::matcher::PatternSpec::plain("helper_3($A)"), Some("rust"), None, 50).unwrap();
+  let with = code_search(&kg, Some(&generation), &vorpal_core::matcher::PatternSpec::plain("helper_3($A)"), Some("rust"), None, None, 50).unwrap();
   assert_eq!(with.text_index, "fresh");
   assert!(with.pruned_files > 0, "the tier must prune files lacking `helper_3`");
   assert!(with.total_matches >= 1);
-  let plain = without_tier(|| code_search(&kg, Some(&generation), &vorpal_core::matcher::PatternSpec::plain("helper_3($A)"), Some("rust"), None, 50).unwrap());
+  let plain = without_tier(|| code_search(&kg, Some(&generation), &vorpal_core::matcher::PatternSpec::plain("helper_3($A)"), Some("rust"), None, None, 50).unwrap());
   assert_eq!(plain.pruned_files, 0);
   assert_eq!(matched(&with), matched(&plain));
   assert_eq!(with.total_matches, plain.total_matches);
   // A pattern with no three-byte literal prunes nothing and stays exact.
-  let bare = code_search(&kg, Some(&generation), &vorpal_core::matcher::PatternSpec::plain("$A"), Some("rust"), None, 5).unwrap();
+  let bare = code_search(&kg, Some(&generation), &vorpal_core::matcher::PatternSpec::plain("$A"), Some("rust"), None, None, 5).unwrap();
   assert_eq!(bare.pruned_files, 0);
   let heal_again = heal(&generation).unwrap().unwrap();
   assert_eq!(heal_again.rebuilt_buckets, 0, "a fresh family heals nothing");
@@ -134,6 +134,7 @@ fn text_tier_heals_prunes_and_stays_exact() {
     prefix: None,
     max_results: 100,
     symbol: None,
+    within: None,
   };
   let with_alt = vorpal_index::textsearch::text_search(&kg, Some(&generation), &alt).unwrap();
   assert_eq!(with_alt.index, "trigram", "{:?}", with_alt.index_reason);
@@ -158,6 +159,7 @@ fn text_tier_heals_prunes_and_stays_exact() {
       prefix: None,
       max_results: 100,
       symbol: Some("entry_3"),
+      within: None,
     },
   )
   .unwrap();
@@ -201,15 +203,15 @@ fn text_tier_heals_prunes_and_stays_exact() {
   let (live_buckets, total) = index2.coverage();
   assert!(live_buckets + 1 >= total, "at most the edited file's bucket may be uncovered: {}", index2.status());
   let kg2 = vorpal_kg::Kg::load(&generation2).unwrap();
-  let with2 = code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("zephyr_probe()"), Some("rust"), None, 50).unwrap();
-  let plain2 = without_tier(|| code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("zephyr_probe()"), Some("rust"), None, 50).unwrap());
+  let with2 = code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("zephyr_probe()"), Some("rust"), None, None, 50).unwrap();
+  let plain2 = without_tier(|| code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("zephyr_probe()"), Some("rust"), None, None, 50).unwrap());
   assert_eq!(matched(&with2), matched(&plain2));
   assert_eq!(with2.total_matches, plain2.total_matches);
   heal(&generation2).unwrap().unwrap();
   let index2 = open_index(&generation2, &src).unwrap();
   assert!(index2.is_fresh(), "{}", index2.status());
-  let with3 = code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("helper_5($A)"), Some("rust"), None, 50).unwrap();
-  let plain3 = without_tier(|| code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("helper_5($A)"), Some("rust"), None, 50).unwrap());
+  let with3 = code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("helper_5($A)"), Some("rust"), None, None, 50).unwrap();
+  let plain3 = without_tier(|| code_search(&kg2, Some(&generation2), &vorpal_core::matcher::PatternSpec::plain("helper_5($A)"), Some("rust"), None, None, 50).unwrap());
   assert_eq!(matched(&with3), matched(&plain3));
   assert!(with3.pruned_files > 0);
 

@@ -43,6 +43,9 @@ pub enum Profile {
   Analysis,
   /// Read-only navigation only: find, search, read.
   Scout,
+  /// Everything but the transitive tools (`reachable`, `impact`): for agents that should
+  /// stay near the question and answer relationships one ring at a time.
+  Local,
 }
 
 impl Profile {
@@ -51,6 +54,7 @@ impl Profile {
       "full" => Some(Profile::Full),
       "analysis" => Some(Profile::Analysis),
       "scout" => Some(Profile::Scout),
+      "local" => Some(Profile::Local),
       _ => None,
     }
   }
@@ -60,13 +64,14 @@ impl Profile {
       Profile::Full => "full",
       Profile::Analysis => "analysis",
       Profile::Scout => "scout",
+      Profile::Local => "local",
     }
   }
 
   /// The single authority on membership: tools_list filters by it and run_tool gates on it,
   /// so the advertised surface and the callable surface can never drift apart.
   fn allows(self, tool: &str) -> bool {
-    const SCOUT: &[&str] = &["node", "search", "text_search", "snippet", "schema", "fetch_span"];
+    const SCOUT: &[&str] = &["node", "search", "text_search", "snippet", "schema", "scope", "fetch_span"];
     const ANALYSIS_EXTRA: &[&str] = &[
       "graph", "reachable", "why",
       "health", "dead_code", "coverage", "impact", "compare_generations", "architecture",
@@ -76,6 +81,7 @@ impl Profile {
       Profile::Full => true,
       Profile::Analysis => SCOUT.contains(&tool) || ANALYSIS_EXTRA.contains(&tool),
       Profile::Scout => SCOUT.contains(&tool),
+      Profile::Local => !matches!(tool, "reachable" | "impact"),
     }
   }
 }
@@ -185,7 +191,27 @@ pub struct Server {
   /// Set when the served graph advances past an in-flight live-ANN task: the reap
   /// drops that task's result instead of installing a tier keyed to a retired graph.
   live_ann_discard_task: bool,
+  /// The session's default `within` (the `scope` tool): applied to every scoped tool call
+  /// that passes no `within` of its own, and stamped on the answer as `scope.source =
+  /// "session"`. A view over answers, never over traversal (see `vorpal_index::PathScope`).
+  scope: Option<vorpal_index::PathScope>,
+  /// Drift telemetry: the first symbol or query this session asked about, and every file
+  /// and top-level directory its answers have named since — reported as `radius` on every
+  /// record-bearing answer so expansion is visible while it happens.
+  radius: Radius,
 }
+
+/// How far a session has wandered from its first question (see `Server::radius`).
+#[derive(Default)]
+struct Radius {
+  anchor: Option<String>,
+  files: std::collections::HashSet<String>,
+  dirs: std::collections::HashSet<String>,
+}
+
+/// The default traversal bound: one ring — the direct neighbours — so a closure answers the
+/// question asked and states (as `frontier`) what the next ring would add.
+const RING_DEPTH: u32 = 1;
 
 /// The live overlay is on by default; `VORPAL_NO_LIVE_OVERLAY=1` (or `true`/`yes`) keeps the
 /// daemon on the replay pipeline for every semantic edit — the escape hatch while the
@@ -388,8 +414,8 @@ impl Server {
        the shell without a schema load. Exact commands: `{bin} graph callers <name> --index \
        {index} --format lean` (other verbs in that position: callees, refs, importers, \
        implementors, typeusers, similar, node, snippet); transitive closure: `{bin} graph \
-       reachable <name> --direction out --index {index} --format lean` (--direction in for \
-       what reaches it; --depth N to bound it). Always the `graph` word, always --index. \
+       reachable <name> --direction out --depth 1 --index {index} --format lean` (--direction in \
+       for what reaches it; raise --depth only when the question needs the next ring). Always the `graph` word, always --index. \
        Prefer it for a single lookup; use the MCP tools for several calls."
     )
   }
@@ -402,6 +428,10 @@ observed), `reachable`, `snippet`, or `why` DIRECTLY with the exact symbol name;
 or `search` only when the name is unknown or ambiguous. Every graph, reachable, and why \
 result is the complete resolved set at the grade each row states — never confirm it with \
 search, code_search, or grep; callers and callees rows already carry the call-site line. \
+A relationship row is context for the question asked, not a new task: importers and callers \
+are consumers of a symbol, not defects. Stay inside the user's area: pass `within` (path \
+prefixes) or set it once with `scope`; read `outsideScope` and `frontier` instead of \
+widening, and raise `max_depth` only when the question needs the next ring. \
 Navigation lists default to lean. If your client defers these tools, load all \
 you will need in ONE ToolSearch call. Results page with cursor/limit and name the index \
 generation they were read from.";
@@ -499,6 +529,8 @@ impl Server {
       watch,
       structural_pages: PageCache::default(),
       rule_pages: PageCache::default(),
+      scope: None,
+      radius: Radius::default(),
     };
     // The overlay is the serving architecture, not an optimization to warm lazily: start
     // building it the moment the daemon exists (its own gates decline when there is no
@@ -1736,6 +1768,10 @@ impl Server {
           (Some("ids"), Some(rows)) => vorpal_index::records::ids_from_values(rows),
           _ => text,
         };
+        // What the answer left out rides the text too (a client may show the model only
+        // the text), then the drift telemetry — both before paths are relativized.
+        let text = with_scope_footer(text, &data);
+        self.note_radius(tool, &args, &mut data);
         // The structured half follows the same format: `base` + relative paths on every
         // page, fat columns dropped under `lean`, identity only under `ids` — because the
         // client may feed the model structuredContent rather than the text.
@@ -1818,7 +1854,7 @@ impl Server {
     };
     // Query tools serve from a graph the watch keeps fresh; the explicit `index` tool builds
     // from its own `src` argument and needs no pre-validation.
-    if tool != "index" {
+    if !matches!(tool, "index" | "scope") {
       self
         .ensure_fresh()
         .map_err(|message| ToolError::coded("index-unavailable", message))?;
@@ -1992,6 +2028,7 @@ impl Server {
         let lang = args.get("lang").and_then(Value::as_str).map(str::to_string);
         let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
         let max_results = args.get("max_results").and_then(Value::as_u64).unwrap_or(1000) as usize;
+        let scoped = self.scope_for_call(args)?;
         self.kg()?;
         let dir = self.kg_dir.clone();
         let Some(kg) = self.kg.as_deref() else {
@@ -2005,10 +2042,12 @@ impl Server {
           prefix: prefix.as_deref(),
           max_results,
           symbol: symbol.as_deref(),
+          within: scoped.as_ref().map(|(scope, _)| scope),
         };
         let report = vorpal_index::textsearch::text_search(kg, dir.as_deref(), &query).map_err(ToolError::from)?;
         let text = vorpal_index::textsearch::render_text_search(&report);
         let mut data = paged(report.records, args, "hits")?;
+        stamp_scope(&mut data, scoped.as_ref(), None);
         data["totalMatches"] = report.total_matches.into();
         data["matchedFiles"] = report.matched_files.into();
         data["candidateFiles"] = report.candidate_files.into();
@@ -2030,6 +2069,7 @@ impl Server {
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(20) as usize;
         let lang = args.get("lang").and_then(Value::as_str).map(str::to_string);
         let prefix = args.get("prefix").and_then(Value::as_str).map(str::to_string);
+        let scoped = self.scope_for_call(args)?;
         self.kg()?;
         let dir = self.kg_dir.clone();
         let Some(kg) = self.kg.as_deref() else {
@@ -2046,11 +2086,13 @@ impl Server {
           &spec,
           lang.as_deref(),
           prefix.as_deref(),
+          scoped.as_ref().map(|(scope, _)| scope),
           k,
         )
         .map_err(ToolError::from)?;
         let text = vorpal_index::records::render_code_search(&report);
         let mut data = paged(report.records, args, "hits")?;
+        stamp_scope(&mut data, scoped.as_ref(), None);
         vorpal_kg::phase_stamp("code_search arm: paged");
         data["staleFiles"] = report.stale_files.into();
         data["unreadableFiles"] = report.unreadable_files.into();
@@ -2138,8 +2180,11 @@ impl Server {
           }
           None => vec![vorpal_kg::EdgeType::CALLS],
         };
-        let max_depth = match args.get("max_depth").and_then(Value::as_u64) {
-          Some(0) | None => None,
+        // One ring by default; `max_depth: 0` is the whole closure. The BFS runs one ring
+        // deeper than the answer so `frontier` states what widening would add.
+        let bound = match args.get("max_depth").and_then(Value::as_u64) {
+          None => Some(RING_DEPTH),
+          Some(0) => None,
           Some(d) => Some(d as u32),
         };
         let min_confidence = vorpal_index::min_confidence_for_grade(
@@ -2148,18 +2193,33 @@ impl Server {
         .map_err(|err| err.to_string())?;
         let changed = vorpal_index::impact::changed_paths(&root, since.as_deref())
           .map_err(ToolError::from)?;
+        let scoped = self.scope_for_call(args)?;
         self.kg()?;
         let Some(kg) = self.kg.as_deref() else {
           return Err(ToolError::coded("index-unavailable", "no graph is loaded — run the 'index' tool first"));
         };
         let (seeds, missing) = vorpal_index::impact::seeds_for_paths(kg, &root, &changed);
-        let report = vorpal_index::records::impact_page(
+        let steps = vorpal_index::records::impact_steps(
           kg,
           &seeds,
           &relations,
-          max_depth,
+          bound.map(|d| d + 1),
           min_confidence,
-          (changed.len(), missing),
+        );
+        let (steps, frontier) = vorpal_index::records::ring_split(steps, bound);
+        let (steps, outside) = match &scoped {
+          Some((scope, _)) => {
+            let (kept, outside) = vorpal_index::records::scope_steps(kg, steps, scope);
+            (kept, Some(outside))
+          }
+          None => (steps, None),
+        };
+        let report = vorpal_index::records::impact_page_from_steps(
+          kg,
+          &steps,
+          (changed.len(), missing, seeds.len()),
+          frontier,
+          outside.unwrap_or(0),
           vorpal_index::records::PageRequest {
             cursor: args.get("cursor").and_then(Value::as_str),
             limit: args.get("limit").and_then(Value::as_u64),
@@ -2175,10 +2235,13 @@ impl Server {
           "changedFiles": report.changed_files,
           "missingFiles": report.missing_files,
           "seeds": report.seeds,
+          "maxDepth": bound.unwrap_or(0),
+          "frontier": frontier,
         });
         if report.end < report.total {
           data["nextCursor"] = json!(format!("o:{}", report.end));
         }
+        stamp_scope(&mut data, scoped.as_ref(), outside);
         Ok((text, data))
       }
       "coverage" => {
@@ -2237,14 +2300,10 @@ impl Server {
           // verified against the served extraction (overlay) before its line is sliced.
           let overlay = self.overlay.as_ref();
           let verify = move |path: &str| overlay.and_then(|overlay| overlay.verified_source(path));
-          let selected = vorpal_index::records::related_records_with_sites(
-            kg,
-            dir.as_deref(),
-            verb,
-            &target,
-            Some(&verify),
-          )
-          .map_err(ToolError::from)?;
+          // Rows first, sites last: the scope drops rows before their call-site lines are
+          // read, so a scoped answer costs the files it keeps, never the whole answer.
+          let selected = vorpal_index::records::related_records(kg, verb, &target)
+            .map_err(ToolError::from)?;
           // `mentions: true` on an inbound verb adds the absence proof: whole-word textual
           // mentions of the name in files the graph's answer does not cover (text tier).
           let mentions = if args.get("mentions").and_then(Value::as_bool).unwrap_or(false)
@@ -2264,7 +2323,37 @@ impl Server {
           } else {
             None
           };
+          // The caller's scope is a view over the rows (counted, never traversed around),
+          // and the rows come nearest file first so a page truncated by `limit` drops the
+          // far edge of the answer. `similar` keeps its similarity order.
+          let scoped = self.scope_for_call(args)?;
+          let mut outside = None;
+          let selected = match selected {
+            vorpal_index::records::Selected::Hits(hits) => {
+              let mut hits = match &scoped {
+                Some((scope, _)) => {
+                  let (kept, excluded) = scope.split(hits, |hit| hit.node.path.as_str());
+                  outside = Some(excluded);
+                  kept
+                }
+                None => hits,
+              };
+              if verb != "similar"
+                && let Some(anchor) = vorpal_index::resolve_target(kg, &target)
+                  .ok()
+                  .and_then(|ids| ids.first().copied())
+                  .and_then(|id| kg.node(id).map(|view| view.path.to_string()))
+              {
+                vorpal_index::records::order_by_proximity(&mut hits, &anchor);
+              }
+              vorpal_index::records::attach_call_sites(kg, dir.as_deref(), verb, &target, &mut hits, Some(&verify))
+                .map_err(ToolError::from)?;
+              vorpal_index::records::Selected::Hits(hits)
+            }
+            other => other,
+          };
           let mut data = selected_data(selected, args)?;
+          stamp_scope(&mut data, scoped.as_ref(), outside);
           if let Some(mentions) = mentions {
             data["mentions"] = serde_json::to_value(&mentions).unwrap_or(Value::Null);
           }
@@ -2295,6 +2384,7 @@ impl Server {
       "search" => {
         let query = str_arg("query")?;
         let k = args.get("k").and_then(Value::as_u64).unwrap_or(10) as usize;
+        let scoped = self.scope_for_call(args)?;
         // Structured pre-ranking filters (IMPROVEMENTS #9): k results means k MATCHING
         // results — filters apply to every channel before fusion, never as a post-cut.
         let filter = vorpal_index::SearchFilter {
@@ -2304,6 +2394,7 @@ impl Server {
           lang: args.get("lang").and_then(Value::as_str).map(str::to_string),
           exported_only: args.get("exported").and_then(Value::as_bool).unwrap_or(false),
           exclude_tests: args.get("exclude_tests").and_then(Value::as_bool).unwrap_or(false),
+          within: scoped.as_ref().map(|(scope, _)| scope.clone()),
         };
         // One ranking serves both surfaces: records for machines, and the explained text
         // rendered from the same records (byte-compatible with `search_index_explained`) —
@@ -2358,6 +2449,7 @@ impl Server {
           };
         }
         let mut data = paged(hits, args, "hits")?;
+        stamp_scope(&mut data, scoped.as_ref(), None);
         if let Some(mp) = &multi_phrase {
           data["multiPhrase"] = serde_json::to_value(mp).map_err(|err| err.to_string())?;
         }
@@ -2769,6 +2861,37 @@ impl Server {
         let data = paged(records, args, "hits")?;
         Ok((text, data))
       }
+      "scope" => {
+        // The session's default radius. `within` sets it (an empty list clears it),
+        // `clear` clears it, neither shows it. Entries resolve against the source root
+        // now, so a typo is an error here rather than a silent empty answer later.
+        if args.get("clear").and_then(Value::as_bool).unwrap_or(false) {
+          self.scope = None;
+        } else if let Some(value) = args.get("within") {
+          let scope = self.resolve_scope(value)?;
+          self.scope = (!scope.is_empty()).then_some(scope);
+        }
+        let root = self.source_root().map(|root| root.to_string_lossy().into_owned());
+        Ok(match &self.scope {
+          Some(scope) => (
+            format!(
+              "scope: {} (resolved: {})\n",
+              scope.within.join(", "),
+              scope.prefixes().join(", ")
+            ),
+            json!({
+              "outcome": "scoped",
+              "scope": {"within": scope.within, "source": "session"},
+              "prefixes": scope.prefixes(),
+              "root": root,
+            }),
+          ),
+          None => (
+            "scope: none — every answer is repository-wide\n".to_string(),
+            json!({"outcome": "unscoped", "root": root}),
+          ),
+        })
+      }
       "reachable" => {
         let name = str_arg("name")?;
         let direction = str_arg("direction")?;
@@ -2806,14 +2929,18 @@ impl Server {
           Some(_) => return Err(ToolError::coded("bad-argument", "relations must be an array of relation names")),
           None => vec![vorpal_kg::EdgeType::CALLS],
         };
-        let max_depth = match args.get("max_depth").and_then(Value::as_u64) {
-          Some(0) | None => None,
+        // One ring by default; `max_depth: 0` is the whole closure. The BFS runs one ring
+        // deeper than the answer so `frontier` states what widening would add.
+        let bound = match args.get("max_depth").and_then(Value::as_u64) {
+          None => Some(RING_DEPTH),
+          Some(0) => None,
           Some(d) => Some(d as u32),
         };
         let min_confidence = vorpal_index::min_confidence_for_grade(
           args.get("min_grade").and_then(Value::as_str),
         )
         .map_err(|err| err.to_string())?;
+        let scoped = self.scope_for_call(args)?;
         self.kg()?;
         // Freshness first: kg() pins the generation and its dir together, so the sidecar
         // read can never come from a different generation than the ids it annotates.
@@ -2827,28 +2954,48 @@ impl Server {
         // Page-materialized: the BFS runs whole (that IS the deterministic vector), but
         // record construction is paid per page — an undirected kernel walk reaches 200K+
         // nodes and building all their records to serve one page dominated this tool.
-        let selected = vorpal_index::records::reach_records_page(
+        let page = vorpal_index::records::PageRequest {
+          cursor: args.get("cursor").and_then(Value::as_str),
+          limit: args.get("limit").and_then(Value::as_u64),
+        };
+        let mut frontier = 0usize;
+        let mut outside = None;
+        let selected = match vorpal_index::records::reach_steps(
           kg,
-          flows_dir.as_deref(),
           &target,
           dir,
           &relations,
-          max_depth,
+          bound.map(|d| d + 1),
           min_confidence,
-          vorpal_index::records::PageRequest {
-            cursor: args.get("cursor").and_then(Value::as_str),
-            limit: args.get("limit").and_then(Value::as_u64),
-          },
         )
-        .map_err(ToolError::from)?;
-        let data = vorpal_index::records::selected_page_value(
-          selected,
-          args.get("cursor").and_then(Value::as_str),
-          args.get("limit").and_then(Value::as_u64),
-        )
-        .map_err(|message| ToolError::coded("bad-argument", message))?;
+        .map_err(ToolError::from)?
+        {
+          vorpal_index::records::SelectedSteps::NoMatch => vorpal_index::records::SelectedPage::NoMatch,
+          vorpal_index::records::SelectedSteps::Ambiguous(candidates) => {
+            vorpal_index::records::SelectedPage::Ambiguous(candidates)
+          }
+          vorpal_index::records::SelectedSteps::Steps(steps) => {
+            let (steps, beyond) = vorpal_index::records::ring_split(steps, bound);
+            frontier = beyond;
+            let steps = match &scoped {
+              Some((scope, _)) => {
+                let (kept, excluded) = vorpal_index::records::scope_steps(kg, steps, scope);
+                outside = Some(excluded);
+                kept
+              }
+              None => steps,
+            };
+            vorpal_index::records::reach_page_from_steps(kg, flows_dir.as_deref(), &relations, &steps, page)
+              .map_err(ToolError::from)?
+          }
+        };
+        let mut data = vorpal_index::records::selected_page_value(selected, page.cursor, page.limit)
+          .map_err(|message| ToolError::coded("bad-argument", message))?;
+        data["maxDepth"] = json!(bound.unwrap_or(0));
+        data["frontier"] = json!(frontier);
+        stamp_scope(&mut data, scoped.as_ref(), outside);
         // Text stays human-shaped but capped: a full undirected closure renders tens of MB.
-        let text = vorpal_index::reachable_query_on(kg, flows_dir.as_deref(), &target, dir, &relations, max_depth, min_confidence)
+        let text = vorpal_index::reachable_query_on(kg, flows_dir.as_deref(), &target, dir, &relations, bound, min_confidence)
           .map_err(|err| err.to_string())
           .map_err(ToolError::from)?;
         const TEXT_CAP: usize = 200;
@@ -2865,6 +3012,83 @@ impl Server {
       // declarations and this match — report it as such rather than as the caller's fault.
       other => Err(ToolError::coded("internal", format!("tool '{other}' is declared but has no implementation"))),
     }
+  }
+
+  /// The source root scope entries resolve against: the watched tree, else the root a
+  /// default-layout index dir implies — canonical, as node paths are.
+  fn source_root(&self) -> Option<PathBuf> {
+    let root = self
+      .watch
+      .as_ref()
+      .map(|watch| watch.src().to_path_buf())
+      .or_else(|| watch_root(&self.index_dir))?;
+    Some(std::fs::canonicalize(&root).unwrap_or(root))
+  }
+
+  /// Resolve a `within` argument — one string or an array of strings — into a scope.
+  fn resolve_scope(&self, value: &Value) -> Result<vorpal_index::PathScope, ToolError> {
+    const SHAPE: &str = "within must be a string or an array of strings";
+    let entries: Vec<String> = match value {
+      Value::String(one) => vec![one.clone()],
+      Value::Array(items) => items
+        .iter()
+        .map(|item| item.as_str().map(str::to_string).ok_or_else(|| ToolError::coded("bad-argument", SHAPE)))
+        .collect::<Result<_, _>>()?,
+      Value::Null => Vec::new(),
+      _ => return Err(ToolError::coded("bad-argument", SHAPE)),
+    };
+    vorpal_index::PathScope::resolve(&entries, self.source_root().as_deref())
+      .map_err(|message| ToolError::coded("bad-argument", message))
+  }
+
+  /// The scope in force for one call, with where it came from: the call's own `within`
+  /// (an empty list means unscoped, explicitly), else the session default. `None` = none.
+  fn scope_for_call(
+    &self,
+    args: &Value,
+  ) -> Result<Option<(vorpal_index::PathScope, &'static str)>, ToolError> {
+    match args.get("within") {
+      Some(value) => {
+        let scope = self.resolve_scope(value)?;
+        Ok((!scope.is_empty()).then_some((scope, "call")))
+      }
+      None => Ok(self.scope.clone().filter(|scope| !scope.is_empty()).map(|scope| (scope, "session"))),
+    }
+  }
+
+  /// Fold one answer into the session's drift telemetry and stamp it as `radius`: the
+  /// first symbol or query asked about, the files answers have named, and the top-level
+  /// directories (relative to the source root) those files span.
+  fn note_radius(&mut self, tool: &str, args: &Value, data: &mut Value) {
+    let Some(rows) = data.get("records").and_then(Value::as_array) else {
+      return;
+    };
+    if self.radius.anchor.is_none()
+      && matches!(tool, "graph" | "node" | "reachable" | "snippet" | "search" | "why" | "data_flow")
+    {
+      self.radius.anchor = args
+        .get("name")
+        .or_else(|| args.get("query"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    }
+    let root = self.source_root().map(|root| root.to_string_lossy().into_owned());
+    for path in rows.iter().filter_map(|row| row.get("path").and_then(Value::as_str)) {
+      if self.radius.files.contains(path) {
+        continue;
+      }
+      let dir = match root.as_deref().and_then(|root| path.strip_prefix(root)).and_then(|rel| rel.strip_prefix('/')) {
+        Some(rel) => rel.split_once('/').map_or(".", |(first, _)| first).to_string(),
+        None => path.rsplit_once('/').map_or("", |(dir, _)| dir).to_string(),
+      };
+      self.radius.dirs.insert(dir);
+      self.radius.files.insert(path.to_string());
+    }
+    data["radius"] = json!({
+      "files": self.radius.files.len(),
+      "dirs": self.radius.dirs.len(),
+      "anchor": self.radius.anchor,
+    });
   }
 
   /// The warm graph: lazily cold-open the persisted index on first query, then reuse.
@@ -2890,7 +3114,7 @@ impl Server {
 /// Every tool name this server can ever serve (the full profile), in listing order — the
 /// membership authority behind [`Server::serves`].
 const ALL_TOOL_NAMES: &[&str] = &[
-  "index", "health", "schema", "coverage", "code_search", "architecture", "compare_generations",
+  "index", "health", "schema", "scope", "coverage", "code_search", "architecture", "compare_generations",
   "impact", "dead_code", "node", "graph", "reachable", "structural_search", "rule_search",
   "ast_dump", "fetch_span", "data_flow", "query", "snippet", "why", "search", "text_search",
 ];
@@ -2918,14 +3142,14 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     "id": {"type": "integer"},
     "eid": {"type": "string"},
     "all": {"type": "boolean", "description": "merge same-named"},
-    "mentions": {"type": "boolean"},
     "cursor": {"type": "string"},
-    "limit": {"type": "integer", "description": "max 1000"}
+    "limit": {"type": "integer"}
   });
   let page = json!({
     "cursor": {"type": "string"},
-    "limit": {"type": "integer", "description": "max 1000"}
+    "limit": {"type": "integer"}
   });
+  let within = json!({"within": {"type": "array", "items": {"type": "string"}}});
   let with = |base: &Value, extra: Value| -> Value {
     let mut props = base.clone();
     if let (Some(p), Some(e)) = (props.as_object_mut(), extra.as_object()) {
@@ -2938,27 +3162,33 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
   let tools: Vec<Value> = vec![
     tool(
       "index",
-      "Build or refresh the index from a source directory; near-instant when unchanged.",
+      "Build or refresh the index from a source directory.",
       json!({
         "src": {"type": "string"},
         "verify": {"type": "boolean", "description": "by content"},
         "parse_health": {"type": "string", "enum": ["warn", "exclude", "fail"]},
-        "max_error_ratio": {"type": "number", "description": "error-byte ratio"},
+        "max_error_ratio": {"type": "number"},
         "semantic_tier": {"type": "string", "enum": ["lexical", "learned"]}
       }),
       &["src"],
     ),
     tool("health", "Per-file parse damage: ERROR nodes, affected bytes, definitions in damaged regions.", json!({}), &[]),
     tool("schema", "Kinds, relations, grades, and tier state in this index, with counts.", json!({}), &[]),
+    tool(
+      "scope",
+      "Set (`within`: path prefixes), show, or clear the session's default scope; scoped tools answer inside it and count the rest.",
+      with(&within, json!({"clear": {"type": "boolean"}})),
+      &[],
+    ),
     tool("coverage", "Per-file parse coverage (error bytes and ratio), worst first.", page.clone(), &[]),
     tool(
       "code_search",
       "ast-grep pattern search ranked by graph importance.",
-      with(&page, json!({
+      with(&with(&page, within.clone()), json!({
         "pattern": {"type": "string", "description": "ast-grep pattern"},
         "lang": {"type": "string"},
         "prefix": {"type": "string"},
-        "k": {"type": "integer", "description": "top-k"},
+        "k": {"type": "integer"},
         "selector": {"type": "string", "description": "root kind"},
         "context": {"type": "string", "description": "context source"}
       })),
@@ -2967,7 +3197,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     tool(
       "text_search",
       "Regex over indexed files: path:line:col, line, symbol.",
-      with(&page, json!({
+      with(&with(&page, within.clone()), json!({
         "pattern": {"type": "string"},
         "case_insensitive": {"type": "boolean"},
         "lang": {"type": "string"},
@@ -2977,7 +3207,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
       })),
       &["pattern"],
     ),
-    tool("architecture", "Orientation summary: module mass, hubs by in-degree, entry-point candidates.", json!({"top": {"type": "integer", "description": "rows"}}), &[]),
+    tool("architecture", "Orientation summary: module mass, hubs by in-degree, entry-point candidates.", json!({"top": {"type": "integer"}}), &[]),
     tool(
       "compare_generations",
       "Diff two generations: files, nodes by eid, edge counts.",
@@ -2989,18 +3219,18 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "impact",
-      "Blast radius of changed files: git-diff-seeded transitive inbound closure.",
-      with(&page, json!({
+      "Blast radius of changed files: git-diff-seeded inbound closure, one ring by default; `frontier` counts the next.",
+      with(&with(&page, within.clone()), json!({
         "since": {"type": "string", "description": "git ref"},
         "relations": {"type": "array", "items": {"type": "string"}},
-        "max_depth": {"type": "integer", "description": "0 = unbounded"},
+        "max_depth": {"type": "integer", "description": "1 ring; 0 = all"},
         "min_grade": {"type": "string"}
       })),
       &[],
     ),
     tool(
       "dead_code",
-      "Definitions with no semantic in-edges anywhere (suppression-honest dead-code leads).",
+      "Definitions with no semantic in-edges anywhere.",
       with(&page, json!({
         "prefix": {"type": "string"},
         "path": {"type": "string", "description": "suffix"},
@@ -3012,23 +3242,23 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "node",
-      "Definitions by exact name or regex `pattern`. Only needed when a name is unknown or ambiguous; graph/reachable/snippet take names directly.",
+      "Definitions by exact name or regex `pattern`; only when a name is unknown or ambiguous.",
       with(&sel, json!({"pattern": {"type": "string", "description": "ast-grep pattern"}})),
       &[],
     ),
     tool(
       "graph",
-      "Direct neighbours of a symbol over one relation: the COMPLETE resolved set at the stated grade, no confirmation needed. callers/callees/references rows carry the call-site line.",
-      with(&sel, json!({"relation": {"type": "string", "enum": GRAPH_RELATIONS}})),
+      "Direct neighbours over one relation, nearest file first: the COMPLETE resolved set at the stated grade; rows outside `within` are counted, not listed. callers/callees rows carry the call-site line.",
+      with(&with(&sel, within.clone()), json!({"relation": {"type": "string", "enum": GRAPH_RELATIONS}, "mentions": {"type": "boolean"}})),
       &["relation", "name"],
     ),
     tool(
       "reachable",
-      "Transitive closure from a symbol over `relations` (default calls), each row with its path to the seed. Complete; no confirmation needed.",
-      with(&sel, json!({
+      "Closure over `relations` (default calls): one ring by default, `frontier` counts the next, max_depth 0 walks it all. Complete.",
+      with(&with(&sel, within.clone()), json!({
         "direction": {"type": "string", "enum": ["in", "out", "both"]},
         "relations": {"type": "array", "items": {"type": "string"}},
-        "max_depth": {"type": "integer", "description": "0 = unbounded"},
+        "max_depth": {"type": "integer", "description": "1 ring; 0 = all"},
         "min_grade": {"type": "string", "enum": ["exact", "constrained", "heuristic"]}
       })),
       &["name", "direction"],
@@ -3088,7 +3318,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "query",
-      "Read-only Cypher-shaped graph query: MATCH (a:Kind {name: \"x\"})-[:calls*1..3]->(b) WHERE … WITH/UNWIND … RETURN [DISTINCT] properties or count/sum/avg/min/max/collect ORDER BY/SKIP/LIMIT, UNION. Refuses unsupported clauses and work ceilings by name.",
+      "Read-only Cypher-shaped graph query: MATCH … WHERE … WITH/UNWIND … RETURN [DISTINCT] … ORDER BY/SKIP/LIMIT, UNION; refuses unsupported clauses and work ceilings by name.",
       json!({
         "text": {"type": "string"},
         "ir": {"type": "object", "description": "typed IR"}
@@ -3106,7 +3336,7 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "why",
-      "Evidence for the edge from_id→to_id, or with `name` why no edge to that name exists: type, grade, reason, candidates, span.",
+      "Evidence for the edge from_id→to_id (or, with `name`, why none exists): type, grade, reason, candidates, span.",
       with(&page, json!({
         "from_id": {"type": "integer"},
         "to_id": {"type": "integer"},
@@ -3116,10 +3346,10 @@ pub(crate) fn tool_declarations(profile: Profile) -> Vec<Value> {
     ),
     tool(
       "search",
-      "Hybrid search over definitions: name match + embedding similarity + graph in-degree.",
-      with(&page, json!({
+      "Hybrid search over definitions: name match + embedding similarity.",
+      with(&with(&page, within), json!({
         "query": {"type": "string", "description": "text, or phrase AND phrase"},
-        "k": {"type": "integer", "description": "top-k"},
+        "k": {"type": "integer"},
         "kind": {"type": "string"},
         "lang": {"type": "string"},
         "path": {"type": "string", "description": "suffix"},
@@ -3186,6 +3416,50 @@ fn selected_data<T: serde::Serialize>(
     args.get("limit").and_then(Value::as_u64),
   )
   .map_err(|message| ToolError::coded("bad-argument", message))
+}
+
+/// Stamp the scope a scoped answer was computed under, and how many rows it left out.
+fn stamp_scope(
+  data: &mut Value,
+  scoped: Option<&(vorpal_index::PathScope, &'static str)>,
+  outside: Option<usize>,
+) {
+  if let Some((scope, source)) = scoped {
+    data["scope"] = json!({"within": scope.within, "source": source});
+    if let Some(outside) = outside {
+      data["outsideScope"] = json!(outside);
+    }
+  }
+}
+
+/// Append what a scoped or ring-bounded answer left out to its text: the rows outside the
+/// scope and the size of the next ring — so a client that shows the model only the text
+/// still sees the counts the structured half carries.
+fn with_scope_footer(mut text: String, data: &Value) -> String {
+  let outside = data.get("outsideScope").and_then(Value::as_u64).unwrap_or(0);
+  if outside > 0 {
+    let within: Vec<&str> = data
+      .pointer("/scope/within")
+      .and_then(Value::as_array)
+      .map(|items| items.iter().filter_map(Value::as_str).collect())
+      .unwrap_or_default();
+    if !text.ends_with('\n') {
+      text.push('\n');
+    }
+    text.push_str(&format!("outside scope: {outside} rows not listed (within: {})\n", within.join(", ")));
+  }
+  let frontier = data.get("frontier").and_then(Value::as_u64).unwrap_or(0);
+  if frontier > 0 {
+    let depth = data.get("maxDepth").and_then(Value::as_u64).unwrap_or(0);
+    if !text.ends_with('\n') {
+      text.push('\n');
+    }
+    text.push_str(&format!(
+      "frontier: {frontier} more at depth {} — raise max_depth, or 0 for the whole closure\n",
+      depth + 1
+    ));
+  }
+  text
 }
 
 /// A tool failure with a stable machine-readable code (IMPROVEMENTS #7). Codes are part of

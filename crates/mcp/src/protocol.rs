@@ -398,6 +398,7 @@ fn title_of(name: &str) -> String {
     "index" => "Build or refresh the index",
     "health" => "Parse health",
     "schema" => "Index schema",
+    "scope" => "Session scope",
     "coverage" => "Parse coverage",
     "code_search" => "Pattern search, ranked",
     "architecture" => "Architecture summary",

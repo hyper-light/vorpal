@@ -23,6 +23,9 @@ pub struct TextQuery<'a> {
   /// Scope the scan to one symbol's definition span(s): every definition of that name (the
   /// graph's spans), read from their files, nothing else. No candidates, no walk.
   pub symbol: Option<&'a str>,
+  /// The caller's working radius (see [`crate::PathScope`]): files outside it are never
+  /// scanned, in either mode.
+  pub within: Option<&'a crate::PathScope>,
 }
 
 /// One matching line.
@@ -157,6 +160,11 @@ pub fn text_search(
       }
       if let Some(prefix) = q.prefix
         && !run.path.starts_with(prefix)
+      {
+        return None;
+      }
+      if let Some(scope) = q.within
+        && !scope.admits(&run.path)
       {
         return None;
       }
@@ -357,6 +365,9 @@ fn symbol_scoped(
     if view.kind == vorpal_kg::SymbolKind::File || view.span.1 <= view.span.0 {
       continue;
     }
+    if q.within.is_some_and(|scope| !scope.admits(view.path)) {
+      continue;
+    }
     if let Some(lang) = q.lang
       && !vorpal_ingest::SgLang::from_path(view.path).is_some_and(|l| format!("{l:?}").eq_ignore_ascii_case(lang) || l.to_string() == lang)
     {
@@ -488,6 +499,7 @@ pub fn unattributed_mentions(
     prefix: None,
     max_results: MAX_RESULTS_CAP,
     symbol: None,
+    within: None,
   };
   let report = text_search(kg, artifacts_dir, &q)?;
   let mut records: Vec<TextMatchRecord> = report

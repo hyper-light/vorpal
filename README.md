@@ -139,19 +139,27 @@ it from `.cursor/mcp.json`).
 > Claude Code loads each MCP tool's schema in a turn of its own the first time a tool is
 > used; the trade-offs of keeping them resident are in [docs/mcp.md](docs/mcp.md).
 
-Tools exposed: `index`, `health`, `schema`, `coverage`, `code_search`, `architecture`,
+Tools exposed: `index`, `health`, `schema`, `scope`, `coverage`, `code_search`, `architecture`,
 `compare_generations`, `impact`, `dead_code`, `node`, `graph` (callers, callees, references,
 importers, implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
 `rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`, `text_search`. The whole listing is
-under 12 KB on the wire (11.7 KB; a test gates it), because a client either loads each schema
+under 12 KB on the wire (a test gates it), because a client either loads each schema
 in a model turn or carries the listing in every turn's input; the server's instructions
 also carry the CLI one-liner for its index, so a client with a shell can answer a single
 lookup in two turns with no schema load at all. Tools that return records
 page with cursors and accept `format: "lean" | "toon" | "ids"`; `graph` callers and callees
 rows carry the call-site line so "who calls X" and "what does X call" are one call each.
-`--profile scout|analysis|full` limits the
+`--profile scout|local|analysis|full` limits the
 tool set for read-only agents. Full descriptions and the wire contract:
 **[docs/mcp.md](docs/mcp.md)**.
+
+Answers stay inside the area you are working in. `graph`, `reachable`, `impact`, `search`,
+`text_search`, and `code_search` take `within` (a path prefix or a list), and `scope` sets
+it once for the session. Rows outside it are counted in `outsideScope`, not listed, so a
+complete answer stays complete as a number. `reachable` and `impact` return one ring by
+default and report the next ring's size as `frontier`; `max_depth: 0` walks everything.
+`graph` rows come nearest file first, and every answer carries a `radius` field showing
+how many files and directories the session has touched since its first question.
 
 ## Language packages
 

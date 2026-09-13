@@ -28,6 +28,8 @@ pub mod textsearch;
 pub mod chunks;
 pub mod callsite;
 pub mod trigrams;
+pub mod scope;
+pub use scope::PathScope;
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -4437,6 +4439,10 @@ pub struct SearchFilter {
   /// Exclude test-classified paths (`path_class` == Test): tests reference everything, so
   /// production-signal queries filter them out rather than demote them.
   pub exclude_tests: bool,
+  /// The caller's working radius (see [`PathScope`]): definitions outside it are not
+  /// candidates. Applied before ranking like every other facet, so `k` hits means `k`
+  /// hits inside the scope.
+  pub within: Option<PathScope>,
 }
 
 impl SearchFilter {
@@ -4447,6 +4453,7 @@ impl SearchFilter {
       && self.lang.is_none()
       && !self.exported_only
       && !self.exclude_tests
+      && self.within.as_ref().is_none_or(PathScope::is_empty)
   }
 }
 
@@ -4513,6 +4520,7 @@ struct CompiledSearchFilter<'f> {
   lang: Option<String>,
   exported_only: bool,
   exclude_tests: bool,
+  within: Option<&'f PathScope>,
 }
 
 impl<'f> CompiledSearchFilter<'f> {
@@ -4556,6 +4564,7 @@ impl<'f> CompiledSearchFilter<'f> {
       lang,
       exported_only: filter.exported_only,
       exclude_tests: filter.exclude_tests,
+      within: filter.within.as_ref().filter(|scope| !scope.is_empty()),
     })
   }
 
@@ -4565,6 +4574,11 @@ impl<'f> CompiledSearchFilter<'f> {
     };
     if let Some(prefix) = &self.path_prefix {
       if !view.path.starts_with(prefix.as_ref()) {
+        return false;
+      }
+    }
+    if let Some(scope) = self.within {
+      if !scope.admits(view.path) {
         return false;
       }
     }

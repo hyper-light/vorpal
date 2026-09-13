@@ -527,6 +527,7 @@ impl Index {
     lang: Option<String>,
     exported: bool,
     exclude_tests: bool,
+    within: None,
   ) -> PyResult<Py<PyAny>> {
     let generation_dir = self.generation_dir.clone();
     crate::async_bridge::dispatch(py, move || {
