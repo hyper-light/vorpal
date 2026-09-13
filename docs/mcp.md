@@ -237,6 +237,12 @@ repository's. `@package` walks up from the symbol's directory to the nearest Car
 package.json, go.mod, pyproject.toml, setup.py, pom.xml, build.gradle, CMakeLists.txt,
 Kbuild, or Makefile.
 
+A client that declares the `roots` capability (Claude Code, IDE clients) is asked for its
+workspace roots after `initialize` and whenever it announces they changed. Roots strictly
+inside the indexed tree become the session's default scope (`scope.source: "roots"`); a
+root at or above the tree means no scope. A scope set with the `scope` tool is never
+replaced by roots.
+
 `scope` sets a session default with the same fields: `scope {within: ["fs"], classes:
 ["source"]}` and every later call without a scope of its own answers inside it, stamped
 `scope.source: "session"`. Its answer reports the resolved prefixes, any entries still

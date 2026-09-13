@@ -148,6 +148,12 @@ impl AnnOverlay {
     self.base_n
   }
 
+  /// The adopted tier's own id per base row (its generation's dense ids, ascending when
+  /// the tier was built in id order) — distinct from the stable ids the overlay keys by.
+  pub fn base_ids(&self) -> &[u64] {
+    &self.base.ids
+  }
+
   /// The stable id of a merged row (a base row's caller-supplied id, or an appended row's).
   pub fn stable_id_of(&self, row: u32) -> u64 {
     self.id_of(row)
@@ -212,28 +218,36 @@ impl AnnOverlay {
       f[..dim.min(query.len())].copy_from_slice(&query[..dim.min(query.len())]);
       f
     }));
+    let chunk = crate::index::scan_chunk_rows();
     let top = rows
       .par_iter()
-      .flat_map(|r| (r.start..r.end).into_par_iter().step_by(4).map(move |i| (i, r.end)))
-      .fold(std::collections::BinaryHeap::new, |mut heap, (i, end)| {
-        let whole = i + 4 <= end && i + 4 <= base_n;
-        if whole
-          && let (Some(quant), Some(quantized)) = (quant, quantized.as_ref())
-          && (i..i + 4).all(|row| !self.dead[row as usize] && admit(row))
-        {
-          let group = [i, i + 1, i + 2, i + 3];
-          let dists = quant.dist_to_query_x4(group, quantized);
-          for k in 0..4 {
-            evict_push(&mut heap, HeapEntry(dists[k], u64::from(group[k])));
-          }
-        } else {
-          for row in i..(i + 4).min(end) {
-            if !self.dead[row as usize] && admit(row) {
-              evict_push(
-                &mut heap,
-                HeapEntry(self.dist_to_query(row, &codes, q_scale, q_snorm), u64::from(row)),
-              );
+      .flat_map(|r| (r.start..r.end).into_par_iter().step_by(chunk as usize).map(move |i| (i, r.end)))
+      .fold(std::collections::BinaryHeap::new, |mut heap, (start, end)| {
+        let end = end.min(start.saturating_add(chunk));
+        let mut i = start;
+        while i < end {
+          let whole = i + 4 <= end && i + 4 <= base_n;
+          if whole
+            && let (Some(quant), Some(quantized)) = (quant, quantized.as_ref())
+            && (i..i + 4).all(|row| !self.dead[row as usize] && admit(row))
+          {
+            let group = [i, i + 1, i + 2, i + 3];
+            let dists = quant.dist_to_query_x4(group, quantized);
+            for k in 0..4 {
+              evict_push(&mut heap, HeapEntry(dists[k], u64::from(group[k])));
             }
+            i += 4;
+          } else {
+            let stop = (i + 4).min(end);
+            for row in i..stop {
+              if !self.dead[row as usize] && admit(row) {
+                evict_push(
+                  &mut heap,
+                  HeapEntry(self.dist_to_query(row, &codes, q_scale, q_snorm), u64::from(row)),
+                );
+              }
+            }
+            i = stop;
           }
         }
         heap

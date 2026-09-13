@@ -1346,3 +1346,70 @@ fn scope_object_facets_anchors_and_changed_files() {
   assert_eq!(hits["scope"]["within"], json!(["@dir"]), "{hits}");
   let _ = fs::remove_dir_all(src.parent().unwrap());
 }
+
+/// A roots-capable client's workspace roots become the session's default scope when they
+/// lie strictly inside the indexed tree; a root at the tree means no scope; a scope a
+/// person sets wins over roots.
+#[test]
+fn client_roots_become_the_default_scope() {
+  let (src, idx) = scoped_tree("roots");
+  let mut server = Server::new(idx.clone());
+  let (text, is_err) = call_tool(&mut server, 1, "index", json!({"src": src.to_str().unwrap()}));
+  assert!(!is_err, "{text}");
+
+  // initialize with the roots capability, then the initialized notification: the server
+  // answers the notification with its own roots/list request.
+  let response = request(
+    &mut server,
+    2,
+    "initialize",
+    json!({"protocolVersion": "2025-06-18", "capabilities": {"roots": {"listChanged": true}}, "clientInfo": {"name": "t"}}),
+  );
+  assert_eq!(response["jsonrpc"], "2.0");
+  let line = server
+    .handle_line(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string())
+    .expect("a roots/list request goes out");
+  let req: Value = serde_json::from_str(&line).unwrap();
+  assert_eq!(req["method"], "roots/list", "{req}");
+  let req_id = req["id"].clone();
+
+  // The client's answer: one root, the `sub` directory inside the tree.
+  let sub_uri = format!("file://{}", src.join("sub").display());
+  let none = server.handle_line(
+    &json!({"jsonrpc": "2.0", "id": req_id, "result": {"roots": [{"uri": sub_uri, "name": "sub"}]}}).to_string(),
+  );
+  assert!(none.is_none(), "a response is never answered");
+  let callers = structured(&mut server, 3, "graph", json!({"relation": "callers", "name": "target"}));
+  assert_eq!(callers["total"], 1, "{callers}");
+  assert_eq!(callers["outsideScope"], 1, "{callers}");
+  assert_eq!(callers["scope"]["source"], "roots", "{callers}");
+  assert_eq!(callers["scope"]["within"], json!(["sub"]), "{callers}");
+
+  // A root at the tree itself: the whole tree is in play, the roots scope is dropped.
+  let line = server
+    .handle_line(&json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}).to_string())
+    .expect("re-asks for roots");
+  let req: Value = serde_json::from_str(&line).unwrap();
+  let root_uri = format!("file://{}", src.display());
+  server.handle_line(
+    &json!({"jsonrpc": "2.0", "id": req["id"], "result": {"roots": [{"uri": root_uri}]}}).to_string(),
+  );
+  let all = structured(&mut server, 4, "graph", json!({"relation": "callers", "name": "target"}));
+  assert_eq!(all["total"], 2, "{all}");
+  assert!(all.get("scope").is_none(), "{all}");
+
+  // A person's scope wins: set one, then roots change again — the person's scope stays.
+  let set = structured(&mut server, 5, "scope", json!({"within": ["sub"]}));
+  assert_eq!(set["scope"]["source"], "session", "{set}");
+  let line = server
+    .handle_line(&json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}).to_string())
+    .expect("re-asks for roots");
+  let req: Value = serde_json::from_str(&line).unwrap();
+  server.handle_line(
+    &json!({"jsonrpc": "2.0", "id": req["id"], "result": {"roots": [{"uri": format!("file://{}", src.display())}]}}).to_string(),
+  );
+  let still = structured(&mut server, 6, "graph", json!({"relation": "callers", "name": "target"}));
+  assert_eq!(still["scope"]["source"], "session", "{still}");
+  assert_eq!(still["total"], 1, "{still}");
+  let _ = fs::remove_dir_all(src.parent().unwrap());
+}

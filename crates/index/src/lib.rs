@@ -4690,6 +4690,12 @@ pub fn scope_population(index_dir: &Path, scope: &PathScope) -> Result<(u64, usi
   Ok(cached_searcher(index_dir)?.scope_population(scope))
 }
 
+/// Open the generation's searcher and build its scope file table now, so the first scoped
+/// query (or the first query at all) after a commit pays neither. Returns the file count.
+pub fn prewarm_scope_table(index_dir: &Path) -> Result<usize, Box<dyn Error>> {
+  Ok(cached_searcher(index_dir)?.file_table().file_count())
+}
+
 pub fn search_report_filtered(
   index_dir: &Path,
   query: &str,
@@ -4826,7 +4832,7 @@ impl Searcher {
 
   /// The dense-id ranges `scope` covers in this generation.
   pub fn scope_ranges(&self, scope: &PathScope) -> scope::ScopeRanges {
-    self.file_table().ranges_for(scope)
+    self.file_table().ranges_in(&self.kg, scope)
   }
 
   /// How much of this generation a scope covers: `(rows, ranges, files)`.
@@ -4859,6 +4865,12 @@ impl Searcher {
     // Overfetch from selectivity: E[in-scope rows in a pool of `take_eff`] = take.
     let overfetch = (n as u64).div_ceil(rows.max(1)) as usize;
     let take_eff = take.saturating_mul(overfetch).clamp(take, n.max(take));
+    // A scope covering at least half the tier overfetches at most 2×: that beam sits
+    // inside the unscoped latency envelope by construction, while scanning more than
+    // half the tier never does — no sample needed for this case.
+    if overfetch <= 2 {
+      return ScopedRegime::Beam { take: take_eff };
+    }
     let stats = self.stats();
     match (ScanStats::median(&stats.scan_ns_per_row), ScanStats::median(&stats.beam_ns_per_width)) {
       (Some(scan_ns), Some(beam_ns)) => {
@@ -4978,7 +4990,13 @@ impl Searcher {
     match ranges {
       Some(ranges) if ranges.is_empty() => Vec::new(),
       Some(ranges) => self.scoped_pool_live(tier, &query_vec, take, &ranges),
-      None => tier.search_ids(&query_vec, take),
+      None => {
+        // An unscoped beam is a free beam-cost sample for the scoped regime.
+        let started = std::time::Instant::now();
+        let pool = tier.search_ids(&query_vec, take);
+        self.stats().note_beam(take, started.elapsed());
+        pool
+      }
     }
   }
 }
@@ -6142,13 +6160,11 @@ impl Searcher {
   {
     SemanticCandidates::Approx(self.scoped_pool_persisted(ann, &query_vec, take, ranges))
   } else if !take_exhaustive && let Some(ann) = &self.ann {
-    SemanticCandidates::Approx(
-      ann
-        .search(&query_vec, take)
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect(),
-    )
+    // An unscoped beam is a free beam-cost sample for the scoped regime.
+    let started = std::time::Instant::now();
+    let pool: Vec<u64> = ann.search(&query_vec, take).into_iter().map(|(id, _)| id).collect();
+    self.stats().note_beam(vorpal_ann::beam_width(take, ann.len()), started.elapsed());
+    SemanticCandidates::Approx(pool)
   } else if let Some(overlay) = (!take_exhaustive
     && !self.exact_only
     // Provenance gap fix (the mixing hazard found in planning): a carried-forward

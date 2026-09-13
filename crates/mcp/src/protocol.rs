@@ -100,6 +100,18 @@ pub trait Handler {
   fn instructions(&self) -> Option<String> {
     None
   }
+  /// The client's `initialize` / `server/discover` params (capabilities, clientInfo), seen
+  /// before the response goes out.
+  fn client_initialized(&mut self, _params: &Value) {}
+  /// A request this server wants to send to the client right after it sent `notification`
+  /// (`notifications/initialized`, `notifications/roots/list_changed`, …), as a complete
+  /// JSON-RPC message, or `None`. The wire allows a server→client request wherever a
+  /// response could go.
+  fn request_after(&mut self, _notification: &str) -> Option<Value> {
+    None
+  }
+  /// The client's answer to a request this server sent (see `request_after`).
+  fn on_response(&mut self, _id: &Value, _result: Option<&Value>, _error: Option<&Value>) {}
 }
 
 /// Handle one line for `handler`. `None` means "say nothing" (a notification, or a blank
@@ -124,11 +136,21 @@ pub fn handle_line(handler: &mut impl Handler, line: &str) -> Option<String> {
   };
   let method = obj.get("method").and_then(Value::as_str);
   let params = obj.get("params").cloned().unwrap_or(Value::Null);
+  // A message with a result or error and no method is the client answering a request
+  // this server sent (roots/list): route it to the handler, never answer it.
+  if method.is_none() && (obj.contains_key("result") || obj.contains_key("error")) {
+    if let Some(id) = obj.get("id") {
+      handler.on_response(id, obj.get("result"), obj.get("error"));
+    }
+    return None;
+  }
   let id = match obj.get("id") {
-    // No id: a notification. Never answered, whatever it says.
+    // No id: a notification. Never answered — but it may be the moment to ask the client
+    // something (its roots), which goes out in the answer's place.
     None => {
-      handle_notification(method.unwrap_or(""), &params);
-      return None;
+      let method = method.unwrap_or("");
+      handle_notification(method, &params);
+      return handler.request_after(method).map(|request| request.to_string());
     }
     Some(id) if id.is_string() || id.is_i64() || id.is_u64() => id.clone(),
     Some(_) => {
@@ -144,6 +166,9 @@ pub fn handle_line(handler: &mut impl Handler, line: &str) -> Option<String> {
       RpcError::new(INVALID_REQUEST, "request has no method"),
     ));
   };
+  if matches!(method, "initialize" | "server/discover") {
+    handler.client_initialized(&params);
+  }
   let outcome = dispatch(handler, method, &params);
   Some(match outcome {
     Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),

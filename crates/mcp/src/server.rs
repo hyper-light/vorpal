@@ -195,6 +195,12 @@ pub struct Server {
   /// that passes no `within` of its own, and stamped on the answer as `scope.source =
   /// "session"`. A view over answers, never over traversal (see `vorpal_index::PathScope`).
   scope: Option<vorpal_index::PathScope>,
+  /// Where the session scope came from: `"session"` (the `scope` tool) or `"roots"` (the
+  /// client's workspace roots). A `scope` call replaces a roots-derived default; a roots
+  /// change never replaces a scope a person set.
+  scope_source: &'static str,
+  /// The client declared the `roots` capability at initialize.
+  client_roots: bool,
   /// Drift telemetry: the first symbol or query this session asked about, and every file
   /// and top-level directory its answers have named since — reported as `radius` on every
   /// record-bearing answer so expansion is visible while it happens.
@@ -396,6 +402,83 @@ impl Handler for Server {
   fn instructions(&self) -> Option<String> {
     Some(format!("{INSTRUCTIONS} {}", self.fast_path_note()))
   }
+
+  fn client_initialized(&mut self, params: &Value) {
+    self.client_roots = params.pointer("/capabilities/roots").is_some();
+  }
+
+  /// Ask a roots-capable client for its workspace roots once it is initialized and
+  /// whenever it says they changed: a root strictly inside the indexed tree becomes the
+  /// session's default scope (see `on_response`).
+  fn request_after(&mut self, notification: &str) -> Option<Value> {
+    let wanted = matches!(notification, "notifications/initialized" | "notifications/roots/list_changed");
+    (wanted && self.client_roots)
+      .then(|| json!({"jsonrpc": "2.0", "id": ROOTS_REQUEST_ID, "method": "roots/list"}))
+  }
+
+  fn on_response(&mut self, id: &Value, result: Option<&Value>, _error: Option<&Value>) {
+    if id.as_str() != Some(ROOTS_REQUEST_ID) {
+      return;
+    }
+    let roots: Vec<PathBuf> = result
+      .and_then(|r| r.get("roots"))
+      .and_then(Value::as_array)
+      .map(|items| {
+        items
+          .iter()
+          .filter_map(|root| root.get("uri").and_then(Value::as_str))
+          .filter_map(|uri| uri.strip_prefix("file://").map(PathBuf::from))
+          .collect()
+      })
+      .unwrap_or_default();
+    self.adopt_roots(&roots);
+  }
+}
+
+/// The id of the one request this server sends its client.
+const ROOTS_REQUEST_ID: &str = "vorpal:roots";
+
+impl Server {
+  /// Turn the client's workspace roots into the session's default scope: roots strictly
+  /// inside the indexed tree scope answers to them; a root at or above the tree means no
+  /// scope. A scope a person set with the `scope` tool is never replaced.
+  fn adopt_roots(&mut self, roots: &[PathBuf]) {
+    if self.scope.is_some() && self.scope_source != "roots" {
+      return;
+    }
+    let Some(source_root) = self.source_root() else {
+      return;
+    };
+    let root_str = source_root.to_string_lossy().into_owned();
+    let mut inside: Vec<String> = Vec::new();
+    for root in roots {
+      let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+      let spelled = root.to_string_lossy();
+      if spelled.as_ref() == root_str || root_str.starts_with(&format!("{spelled}/")) {
+        // A root at or above the tree: the whole tree is in play.
+        inside.clear();
+        break;
+      }
+      if let Some(rel) = spelled.strip_prefix(&format!("{root_str}/")) {
+        inside.push(rel.to_string());
+      }
+    }
+    if inside.is_empty() {
+      if self.scope_source == "roots" {
+        self.scope = None;
+      }
+      return;
+    }
+    let spec = vorpal_index::ScopeSpec {
+      within: inside,
+      ..Default::default()
+    };
+    if let Ok(scope) = vorpal_index::PathScope::from_spec(&spec, Some(&source_root), None) {
+      vorpal_kg::phase_stamp(&format!("scope: from client roots {:?}", scope.within));
+      self.scope = Some(scope);
+      self.scope_source = "roots";
+    }
+  }
 }
 
 impl Server {
@@ -533,12 +616,23 @@ impl Server {
       structural_pages: PageCache::default(),
       rule_pages: PageCache::default(),
       scope: None,
+      scope_source: "session",
+      client_roots: false,
       radius: Radius::default(),
     };
     // The overlay is the serving architecture, not an optimization to warm lazily: start
     // building it the moment the daemon exists (its own gates decline when there is no
     // generation yet, a committer is mid-write, or the environment is custom).
     server.spawn_overlay_build();
+    // A daemon booting on an existing generation warms its scope file table (and
+    // searcher) now, so a `scope` call or scoped query before any generation-bound tool
+    // pays nothing either.
+    if generation.join("nodes.vseg").exists() {
+      let index_dir = server.index_dir.clone();
+      std::thread::spawn(move || {
+        let _ = vorpal_index::prewarm_scope_table(&index_dir);
+      });
+    }
     server
   }
 
@@ -1080,6 +1174,12 @@ impl Server {
       kg.attach_evidence(&dir);
     }
     self.kg_dir = Some(dir);
+    // The generation's scope file table (and searcher) warm in the background, so the
+    // first scoped query after a commit pays neither.
+    let index_dir = self.index_dir.clone();
+    std::thread::spawn(move || {
+      let _ = vorpal_index::prewarm_scope_table(&index_dir);
+    });
   }
 
   /// Act on a finished canonicalization (see [`CanonicalizeOutcome`]) — shared by the
@@ -2879,15 +2979,17 @@ impl Server {
         // answer later; `@file`/`@dir`/`@package` stay deferred until a symbol binds them.
         if args.get("clear").and_then(Value::as_bool).unwrap_or(false) {
           self.scope = None;
+          self.scope_source = "session";
         } else if let Some(spec) = Self::scope_spec(args)? {
           let scope = self.resolve_spec(&spec, None)?;
           self.scope = (!scope.is_empty()).then_some(scope);
+          self.scope_source = "session";
         }
         let root = self.source_root().map(|root| root.to_string_lossy().into_owned());
         Ok(match &self.scope {
           Some(scope) => {
             let mut echo = serde_json::to_value(scope).unwrap_or_else(|_| json!({}));
-            echo["source"] = json!("session");
+            echo["source"] = json!(self.scope_source);
             let deferred = scope.deferred();
             (
               format!(
@@ -3146,9 +3248,9 @@ impl Server {
           scope
             .bind(self.source_root().as_deref(), anchor)
             .map_err(|message| ToolError::coded("bad-argument", message))?,
-          "session",
+          self.scope_source,
         ),
-        (Some(scope), None) => (scope.clone(), "session"),
+        (Some(scope), None) => (scope.clone(), self.scope_source),
         (None, _) => return Ok(None),
       },
     };

@@ -186,6 +186,25 @@ impl AnnGraphStore {
 /// Beam-width multiplier over the requested pool, read once. `VORPAL_ANN_BEAM` overrides
 /// the default of 2 for tuning; the exact rerank re-scores the returned pool, so this trades
 /// only approximate-pool breadth, never final precision.
+/// Rows one parallel scan task covers. The per-task cost (a heap, a rayon job) amortizes
+/// over the rows; the working set (chunk × 256 B of codes) should stay in L2 so the
+/// four-row kernel streams from cache. Set from the sweep recorded in
+/// docs/wip/BENCHMARKS.md ("scan chunk sweep"); `VORPAL_SCAN_CHUNK` is the measurement
+/// knob for re-running it, never a production setting.
+pub const SCAN_CHUNK_ROWS: u32 = 2048;
+
+pub(crate) fn scan_chunk_rows() -> u32 {
+  use std::sync::OnceLock;
+  static CHUNK: OnceLock<u32> = OnceLock::new();
+  *CHUNK.get_or_init(|| {
+    std::env::var("VORPAL_SCAN_CHUNK")
+      .ok()
+      .and_then(|v| v.parse::<u32>().ok())
+      .filter(|&c| c >= 4)
+      .unwrap_or(SCAN_CHUNK_ROWS)
+  })
+}
+
 /// The beam width the Vamana search uses for `k` results over `n` rows — exposed so a
 /// caller can predict a beam's cost from measured per-width samples.
 pub fn beam_width(k: usize, n: usize) -> usize {
@@ -551,21 +570,25 @@ impl AnnIndex {
       }
       heap.push(entry);
     };
-    // Four rows per step through the batched kernel; a short tail goes one by one.
+    // One parallel task per chunk; inside a task the rows go four at a time through the
+    // batched kernel, a short tail one by one.
+    let chunk = scan_chunk_rows();
     let top = rows
       .par_iter()
-      .flat_map(|r| (r.start..r.end).into_par_iter().step_by(4).map(move |i| (i, r.end)))
-      .fold(std::collections::BinaryHeap::new, |mut heap, (i, end)| {
-        if i + 4 <= end {
+      .flat_map(|r| (r.start..r.end).into_par_iter().step_by(chunk as usize).map(move |i| (i, r.end)))
+      .fold(std::collections::BinaryHeap::new, |mut heap, (start, end)| {
+        let end = end.min(start.saturating_add(chunk));
+        let mut i = start;
+        while i + 4 <= end {
           let group = [i, i + 1, i + 2, i + 3];
           let dists = quant.dist_to_query_x4(group, &quantized);
           for k in 0..4 {
             evict_push(&mut heap, HeapEntry(dists[k], self.ids[group[k] as usize]));
           }
-        } else {
-          for j in i..end {
-            evict_push(&mut heap, HeapEntry(quant.dist_to_query(j, &quantized), self.ids[j as usize]));
-          }
+          i += 4;
+        }
+        for j in i..end {
+          evict_push(&mut heap, HeapEntry(quant.dist_to_query(j, &quantized), self.ids[j as usize]));
         }
         heap
       })

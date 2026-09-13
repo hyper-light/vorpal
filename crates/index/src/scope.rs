@@ -442,15 +442,15 @@ impl ScopeRanges {
   }
 }
 
-/// One generation's file table: each file's path and dense-id block, plus a path-sorted
-/// permutation for prefix lookups. Built once per generation and cached by the searcher;
-/// a scope resolves to ranges with one binary search per entry and one push per file it
-/// covers. Nothing here assumes the dense layout is path-sorted: when it is (the pack's
-/// canonical order within a bucket), adjacent files merge into a few runs; when it is
-/// not, the ranges are simply more numerous and still exact.
+/// One generation's file table: each file's dense-id block, in a path-sorted order —
+/// without holding a single path. Paths live in the graph's own columns; the table keeps
+/// two `u64` and one `u32` per file and reads a path through the caller's `path_of`
+/// closure only while merging and while binary-searching a prefix (a few dozen reads per
+/// scope). Built once per generation by merging the per-bucket runs, which the pack
+/// already keeps path-sorted; a run that turns out unsorted is sorted on its own first,
+/// so the order is exact whatever the layout.
 #[derive(Debug)]
 pub struct FileTable {
-  paths: Vec<String>,
   starts: Vec<u64>,
   ends: Vec<u64>,
   /// File indices sorted by path.
@@ -460,9 +460,9 @@ pub struct FileTable {
 impl FileTable {
   pub fn build(kg: &Kg) -> Self {
     let file_tag = vorpal_kg::SymbolKind::File.tag();
-    let mut paths = Vec::new();
     let mut starts = Vec::new();
     let mut ends = Vec::new();
+    let mut runs: Vec<Range<usize>> = Vec::new();
     // File rows open blocks: the block of file `i` runs to the next file row, or to the
     // stripe's end (one stripe per bucket, one for a flat graph).
     let stripes: Vec<(Vec<u64>, u64)> = match kg.kind_tag_stripes() {
@@ -487,53 +487,80 @@ impl FileTable {
       }
     };
     for (rows, stripe_end) in stripes {
+      let run_start = starts.len();
       for (i, &row) in rows.iter().enumerate() {
-        let path = kg
-          .node(NodeId::new(row))
-          .map(|view| view.path.to_string())
-          .unwrap_or_default();
-        paths.push(path);
         starts.push(row);
         ends.push(rows.get(i + 1).copied().unwrap_or(stripe_end));
       }
+      if starts.len() > run_start {
+        runs.push(run_start..starts.len());
+      }
     }
-    Self::from_parts(paths, starts, ends)
+    let path_of = |file: u32| kg.node(NodeId::new(starts[file as usize])).map_or("", |view| view.path);
+    Self::from_runs(starts.clone(), ends, runs, path_of)
   }
 
-  fn from_parts(paths: Vec<String>, starts: Vec<u64>, ends: Vec<u64>) -> Self {
-    let mut order: Vec<u32> = (0..paths.len() as u32).collect();
-    order.sort_by(|&a, &b| paths[a as usize].cmp(&paths[b as usize]));
-    Self {
-      paths,
-      starts,
-      ends,
-      order,
+  /// Assemble the table from dense-id blocks grouped in runs that are each expected to be
+  /// path-sorted (verified; an unsorted run is sorted first), merged into one order.
+  fn from_runs<'p>(
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    runs: Vec<Range<usize>>,
+    path_of: impl Fn(u32) -> &'p str,
+  ) -> Self {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut sorted_runs: Vec<Vec<u32>> = runs
+      .into_iter()
+      .map(|run| {
+        let mut files: Vec<u32> = (run.start as u32..run.end as u32).collect();
+        if !files.windows(2).all(|w| path_of(w[0]) <= path_of(w[1])) {
+          files.sort_by(|&a, &b| path_of(a).cmp(path_of(b)));
+        }
+        files
+      })
+      .collect();
+    let mut order = Vec::with_capacity(starts.len());
+    // k-way merge: heap of (path, run index, position in run).
+    let mut heap: BinaryHeap<Reverse<(&'p str, usize, usize)>> = BinaryHeap::new();
+    for (r, files) in sorted_runs.iter().enumerate() {
+      if let Some(&first) = files.first() {
+        heap.push(Reverse((path_of(first), r, 0)));
+      }
     }
+    while let Some(Reverse((_, r, pos))) = heap.pop() {
+      let files = &sorted_runs[r];
+      order.push(files[pos]);
+      if let Some(&next) = files.get(pos + 1) {
+        heap.push(Reverse((path_of(next), r, pos + 1)));
+      }
+    }
+    sorted_runs.clear();
+    Self { starts, ends, order }
   }
 
   /// A table from explicit rows — tests only (a real table comes from [`FileTable::build`]).
   #[cfg(test)]
   fn from_rows(rows: &[(&str, u64, u64)]) -> Self {
-    Self::from_parts(
-      rows.iter().map(|(p, _, _)| (*p).to_string()).collect(),
-      rows.iter().map(|(_, s, _)| *s).collect(),
-      rows.iter().map(|(_, _, e)| *e).collect(),
-    )
+    let starts: Vec<u64> = rows.iter().map(|(_, s, _)| *s).collect();
+    let ends: Vec<u64> = rows.iter().map(|(_, _, e)| *e).collect();
+    let whole = 0..rows.len();
+    Self::from_runs(starts, ends, vec![whole], |f| rows[f as usize].0)
   }
 
   pub fn file_count(&self) -> usize {
-    self.paths.len()
+    self.starts.len()
   }
 
   /// The dense-id blocks of the files under one absolute prefix (segment-exact: the entry
   /// itself when it is a file, and everything below `prefix/`).
-  fn runs_under(&self, prefix: &str, out: &mut Vec<Range<u64>>) {
+  fn runs_under<'p>(&self, path_of: &impl Fn(u32) -> &'p str, prefix: &str, out: &mut Vec<Range<u64>>) {
     let below = format!("{prefix}/");
     let past = format!("{prefix}0");
-    let exact_lo = self.order.partition_point(|&f| self.paths[f as usize].as_str() < prefix);
-    let exact_hi = self.order.partition_point(|&f| self.paths[f as usize].as_str() <= prefix);
-    let lo = self.order.partition_point(|&f| self.paths[f as usize].as_str() < below.as_str());
-    let hi = self.order.partition_point(|&f| self.paths[f as usize].as_str() < past.as_str());
+    let exact_lo = self.order.partition_point(|&f| path_of(f) < prefix);
+    let exact_hi = self.order.partition_point(|&f| path_of(f) <= prefix);
+    let lo = self.order.partition_point(|&f| path_of(f) < below.as_str());
+    let hi = self.order.partition_point(|&f| path_of(f) < past.as_str());
     for i in (exact_lo..exact_hi).chain(lo..hi) {
       let file = self.order[i] as usize;
       out.push(self.starts[file]..self.ends[file]);
@@ -541,16 +568,17 @@ impl FileTable {
   }
 
   /// The ranges `scope` covers: the union of its include prefixes minus its excludes.
-  pub fn ranges_for(&self, scope: &PathScope) -> ScopeRanges {
+  /// `path_of` reads a file's path (by table index) from the graph.
+  pub fn ranges_for<'p>(&self, path_of: impl Fn(u32) -> &'p str, scope: &PathScope) -> ScopeRanges {
     let mut include = Vec::new();
     if scope.prefixes().is_empty() {
       // Excludes only: everything, minus them.
-      for file in 0..self.paths.len() {
+      for file in 0..self.starts.len() {
         include.push(self.starts[file]..self.ends[file]);
       }
     } else {
       for prefix in scope.prefixes() {
-        self.runs_under(prefix, &mut include);
+        self.runs_under(&path_of, prefix, &mut include);
       }
     }
     let included = ScopeRanges::from_ranges(include);
@@ -559,7 +587,7 @@ impl FileTable {
     }
     let mut exclude = Vec::new();
     for prefix in scope.excludes() {
-      self.runs_under(prefix, &mut exclude);
+      self.runs_under(&path_of, prefix, &mut exclude);
     }
     let excluded = ScopeRanges::from_ranges(exclude);
     let mut out = Vec::new();
@@ -582,6 +610,12 @@ impl FileTable {
       }
     }
     ScopeRanges::from_ranges(out)
+  }
+
+  /// [`FileTable::ranges_for`] reading paths from `kg` (the table's own generation).
+  pub fn ranges_in(&self, kg: &Kg, scope: &PathScope) -> ScopeRanges {
+    let starts = &self.starts;
+    self.ranges_for(|f| kg.node(NodeId::new(starts[f as usize])).map_or("", |view| view.path), scope)
   }
 }
 
@@ -734,7 +768,7 @@ mod tests {
   fn file_table_maps_a_scope_to_per_bucket_runs_minus_excludes() {
     // Two buckets, path-sorted within each; ids contiguous per file, file node first.
     // Two path-sorted buckets back to back — and the table must not care either way.
-    let table = FileTable::from_rows(&[
+    let rows = [
       ("/r/fs/a.c", 0, 10),
       ("/r/fs/ext4/b.c", 10, 25),
       ("/r/fsnotify/m.c", 25, 30),
@@ -742,26 +776,30 @@ mod tests {
       ("/r/fs/c.c", 50, 60),
       ("/r/fs/ext4/d.c", 60, 70),
       ("/r/mm/slab.h", 70, 80),
-    ]);
-    let ranges = table.ranges_for(&synthetic(&["fs"], &[]));
+    ];
+    let table = FileTable::from_rows(&rows);
+    let path_of = |f: u32| rows[f as usize].0;
+    let ranges = table.ranges_for(path_of, &synthetic(&["fs"], &[]));
     assert_eq!(ranges.ranges(), &[0..25, 50..70], "{ranges:?}");
     assert_eq!(ranges.rows(), 45);
-    let ranges = table.ranges_for(&synthetic(&["fs"], &["fs/ext4"]));
+    let ranges = table.ranges_for(path_of, &synthetic(&["fs"], &["fs/ext4"]));
     assert_eq!(ranges.ranges(), &[0..10, 50..60], "{ranges:?}");
     let slab = 30..50;
-    assert_eq!(table.ranges_for(&synthetic(&["mm/slab.c"], &[])).ranges(), std::slice::from_ref(&slab));
-    assert!(table.ranges_for(&synthetic(&["zz"], &[])).is_empty());
-    assert_eq!(table.ranges_for(&synthetic(&["fs", "mm"], &[])).rows(), 75);
+    assert_eq!(table.ranges_for(path_of, &synthetic(&["mm/slab.c"], &[])).ranges(), std::slice::from_ref(&slab));
+    assert!(table.ranges_for(path_of, &synthetic(&["zz"], &[])).is_empty());
+    assert_eq!(table.ranges_for(path_of, &synthetic(&["fs", "mm"], &[])).rows(), 75);
     // Excludes only: everything but.
-    assert_eq!(table.ranges_for(&synthetic(&[], &["mm"])).ranges(), &[0..30, 50..70]);
+    assert_eq!(table.ranges_for(path_of, &synthetic(&[], &["mm"])).ranges(), &[0..30, 50..70]);
     // An unsorted layout yields more, still exact, runs.
-    let shuffled = FileTable::from_rows(&[
+    let shuffled_rows = [
       ("/r/mm/slab.c", 0, 5),
       ("/r/fs/a.c", 5, 9),
       ("/r/x/y.c", 9, 12),
       ("/r/fs/b.c", 12, 20),
-    ]);
-    assert_eq!(shuffled.ranges_for(&synthetic(&["fs"], &[])).ranges(), &[5..9, 12..20]);
+    ];
+    let shuffled = FileTable::from_rows(&shuffled_rows);
+    let shuffled_path = |f: u32| shuffled_rows[f as usize].0;
+    assert_eq!(shuffled.ranges_for(shuffled_path, &synthetic(&["fs"], &[])).ranges(), &[5..9, 12..20]);
   }
 
   #[test]

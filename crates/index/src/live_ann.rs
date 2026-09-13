@@ -38,17 +38,72 @@ const PROBE_CHURN_DENOMINATOR: usize = 100;
 /// Recall at or below `baseline − PROBE_DEGRADATION` retires the tier to the compactor.
 const PROBE_DEGRADATION: f64 = 0.01;
 
+/// A run of base rows `[base_lo, base_hi)` (base-generation ids, gaps allowed) whose
+/// current ids are `base_id + shift`, with `shift = cur_lo - base_lo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IdRun {
+  base_lo: u64,
+  base_hi: u64,
+  cur_lo: u64,
+}
+
+impl IdRun {
+  fn shift(&self) -> i128 {
+    i128::from(self.cur_lo) - i128::from(self.base_lo)
+  }
+  fn cur_hi(&self) -> u64 {
+    self.cur_lo + (self.base_hi - self.base_lo)
+  }
+}
+
+/// Fold `(base id, current id or dead)` pairs in base-row order into runs.
+fn build_runs(pairs: impl Iterator<Item = (u64, Option<u64>)>) -> Vec<IdRun> {
+  let mut runs: Vec<IdRun> = Vec::new();
+  let mut open: Option<IdRun> = None;
+  for (base, cur) in pairs {
+    match (cur, open.as_mut()) {
+      (Some(cur), Some(run)) if i128::from(cur) - i128::from(base) == run.shift() && base >= run.base_hi => {
+        run.base_hi = base + 1;
+      }
+      (Some(cur), _) => {
+        if let Some(run) = open.take() {
+          runs.push(run);
+        }
+        open = Some(IdRun {
+          base_lo: base,
+          base_hi: base + 1,
+          cur_lo: cur,
+        });
+      }
+      (None, _) => {
+        if let Some(run) = open.take() {
+          runs.push(run);
+        }
+      }
+    }
+  }
+  if let Some(run) = open {
+    runs.push(run);
+  }
+  runs
+}
+
+fn runs_by_cur(runs: &[IdRun]) -> Vec<u32> {
+  let mut order: Vec<u32> = (0..runs.len() as u32).collect();
+  order.sort_by_key(|&i| runs[i as usize].cur_lo);
+  order
+}
+
 pub struct LiveAnnTier {
   overlay: AnnOverlay,
-  /// Current dense id per merged overlay row (`u64::MAX` for a dead or unmapped row) —
-  /// the column a scoped scan tests against its id ranges, so admission is one array
-  /// read per row instead of a hash lookup. Filled at adoption from the remap the
-  /// adoption already computes, extended on insert, rebuilt whenever ids are refreshed.
-  row_dense: Vec<u64>,
-  /// Whether `row_dense` over the base rows is non-decreasing (the adopted layout keeps
-  /// file order, so it is unless ids were refreshed out of order) — the precondition for
-  /// locating a dense-id range by binary search instead of a full pass.
-  base_dense_sorted: bool,
+  /// How the base tier's own ids map to the served generation's ids: runs of base rows
+  /// whose current id is the base id plus a constant. The remap is per file block and
+  /// keeps order, so an unchanged tree is one run and every edited file starts a new one
+  /// — a few dozen entries where a per-row column would be 8 bytes × every row. Rebuilt
+  /// from the stable ids whenever ids are refreshed.
+  runs: Vec<IdRun>,
+  /// `runs` indices ordered by current id (runs cover disjoint current ranges).
+  runs_by_cur: Vec<u32>,
   /// eid_lo → node id in the generation `refresh_ids` last saw — the pool translation.
   eid_to_id: HashMap<u64, u64>,
   /// First probe of this adopted tier — the self-anchored recall reference (same probe
@@ -136,7 +191,10 @@ impl LiveAnnTier {
       return Err(AdoptDecline { curable: false });
     }
     let mut eids = Vec::with_capacity(ann.len());
-    let mut row_dense = Vec::with_capacity(ann.len());
+    let mut runs = build_runs((0..ann.len()).map(|row| {
+      let old_id = ann.row_id(row);
+      (old_id, view.remap(old_id))
+    }));
     let mut dead_sentinels: Vec<u64> = Vec::new();
     for row in 0..ann.len() {
       let old_id = ann.row_id(row);
@@ -144,11 +202,8 @@ impl LiveAnnTier {
       match new_id.and_then(|new_id| eid_lo_of(kg, new_id)) {
         Some(eid) => {
           eids.push(eid);
-          row_dense.push(new_id.unwrap_or(u64::MAX));
         }
         None => {
-          // Dead rows keep their old id so the column stays monotone; `dead[]` skips them.
-          row_dense.push(old_id);
           // Dead base row (changed/deleted file, or a pre-eid node): key it with a unique
           // sentinel and tombstone it right after adoption — it keeps routing, never
           // returns. Sentinels descend from u64::MAX, far outside blake3-derived eids.
@@ -164,11 +219,12 @@ impl LiveAnnTier {
       vorpal_kg::phase_stamp("live-ann: adopt declined (overlay refused the base tier)");
       return Err(AdoptDecline { curable: true });
     };
-    let base_dense_sorted = row_dense.windows(2).all(|w| w[0] <= w[1]);
+    runs.shrink_to_fit();
+    let by_cur = runs_by_cur(&runs);
     let mut tier = Self {
       overlay,
-      row_dense,
-      base_dense_sorted,
+      runs,
+      runs_by_cur: by_cur,
       eid_to_id: HashMap::new(),
       baseline_recall: None,
       probe_rows: Vec::new(),
@@ -187,7 +243,6 @@ impl LiveAnnTier {
       let Some(eid) = eid_lo_of(kg, id) else { continue };
       embed_node_into(kg, &embedder, id, &mut row_buf, &embed_root);
       tier.overlay.insert(eid, &row_buf);
-      tier.row_dense.push(id);
     }
     vorpal_kg::phase_stamp(&format!(
       "live-ann: adopted {} live rows ({} base rows tombstoned, {} inserted)",
@@ -208,64 +263,76 @@ impl LiveAnnTier {
       }
     }
     self.eid_to_id = map;
-    // Ids may have moved: re-derive the dense column from the stable ids.
-    let total = self.overlay.total_rows();
-    let mut row_dense = Vec::with_capacity(total);
-    for row in 0..total as u32 {
-      row_dense.push(
-        self
-          .eid_to_id
-          .get(&self.overlay.stable_id_of(row))
-          .copied()
-          .unwrap_or(u64::MAX),
-      );
-    }
-    let base = self.overlay.base_len();
-    self.base_dense_sorted = row_dense[..base.min(row_dense.len())]
-      .windows(2)
-      .all(|w| w[0] <= w[1]);
-    self.row_dense = row_dense;
+    // Ids may have moved: re-derive the runs from the stable ids.
+    let base = self.overlay.base_len() as u32;
+    let base_ids = self.overlay.base_ids();
+    let map = &self.eid_to_id;
+    let overlay = &self.overlay;
+    let runs = build_runs((0..base).map(|row| {
+      (base_ids[row as usize], map.get(&overlay.stable_id_of(row)).copied())
+    }));
+    self.runs_by_cur = runs_by_cur(&runs);
+    self.runs = runs;
+  }
+
+  /// The current id of a base row, by its run (`None` for a dead or unmapped row).
+  fn current_id_of_base(&self, base_id: u64) -> Option<u64> {
+    let at = self.runs.partition_point(|run| run.base_lo <= base_id);
+    let run = self.runs.get(at.checked_sub(1)?)?;
+    (base_id < run.base_hi).then(|| (i128::from(base_id) + run.shift()) as u64)
   }
 
   /// Exact code-space top-`take` inside `ranges` (current dense ids), nearest first —
   /// the scoped counterpart of [`LiveAnnTier::search_ids`]: no beam, no overfetch, cost
   /// proportional to the rows the scope covers.
   pub fn scan_scoped(&self, query_vec: &[f32], take: usize, ranges: &crate::scope::ScopeRanges) -> Vec<u64> {
-    let dense = &self.row_dense;
-    let base = self.overlay.base_len().min(dense.len());
+    let base = self.overlay.base_len() as u32;
     let total = self.overlay.total_rows() as u32;
-    // Where the scope's rows sit: binary search on the monotone base column, one row
-    // range per dense range, plus every appended row (few; they carry arbitrary ids).
-    let mut row_ranges: Vec<std::ops::Range<u32>> = if self.base_dense_sorted {
-      ranges
-        .ranges()
-        .iter()
-        .map(|r| {
-          let lo = dense[..base].partition_point(|&id| id < r.start) as u32;
-          let hi = dense[..base].partition_point(|&id| id < r.end) as u32;
-          lo..hi
-        })
-        .collect()
-    } else {
-      let whole_base = 0..base as u32;
-      vec![whole_base]
-    };
-    row_ranges.push(base as u32..total);
-    // Base rows located by binary search are inside the ranges by construction; only
-    // appended rows (and every row when the column is unsorted) need the membership test.
-    let sorted = self.base_dense_sorted;
-    self
-      .overlay
-      .scan_filtered_in(query_vec, take, &row_ranges, |row| {
-        if sorted && (row as usize) < base {
-          return true;
+    let base_ids = self.overlay.base_ids();
+    // Where the scope's rows sit: each current-id range meets a few runs; each meeting
+    // is a base-id range, located on the ascending base ids by binary search. Appended
+    // rows (few, arbitrary ids) are scanned with a membership test.
+    let mut row_ranges: Vec<std::ops::Range<u32>> = Vec::new();
+    for r in ranges.ranges() {
+      let first = self
+        .runs_by_cur
+        .partition_point(|&i| self.runs[i as usize].cur_hi() <= r.start);
+      for &i in &self.runs_by_cur[first..] {
+        let run = &self.runs[i as usize];
+        if run.cur_lo >= r.end {
+          break;
         }
-        dense
-          .get(row as usize)
-          .is_some_and(|&id| id != u64::MAX && ranges.contains(id))
+        let lo = r.start.max(run.cur_lo);
+        let hi = r.end.min(run.cur_hi());
+        if lo >= hi {
+          continue;
+        }
+        let base_lo = (i128::from(lo) - run.shift()) as u64;
+        let base_hi = (i128::from(hi) - run.shift()) as u64;
+        let row_lo = base_ids.partition_point(|&id| id < base_lo) as u32;
+        let row_hi = base_ids.partition_point(|&id| id < base_hi) as u32;
+        if row_hi > row_lo {
+          row_ranges.push(row_lo..row_hi);
+        }
+      }
+    }
+    row_ranges.push(base..total);
+    let map = &self.eid_to_id;
+    let overlay = &self.overlay;
+    let current_of = |row: u32| -> Option<u64> {
+      if row < base {
+        self.current_id_of_base(base_ids[row as usize])
+      } else {
+        map.get(&overlay.stable_id_of(row)).copied()
+      }
+    };
+    overlay
+      .scan_filtered_in(query_vec, take, &row_ranges, |row| {
+        // Base rows located above are inside the ranges by construction.
+        row < base || current_of(row).is_some_and(|id| ranges.contains(id))
       })
       .into_iter()
-      .filter_map(|(row, _)| dense.get(row as usize).copied().filter(|&id| id != u64::MAX))
+      .filter_map(|(row, _)| current_of(row))
       .collect()
   }
 
@@ -293,7 +360,6 @@ impl LiveAnnTier {
       };
       embed_node_into(kg, &embedder, id, &mut row, &embed_root);
       self.overlay.insert(eid, &row);
-      self.row_dense.push(id);
     }
     self.rows_since_probe += removed_eids.len() + added_eids.len();
   }

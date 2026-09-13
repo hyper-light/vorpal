@@ -5913,3 +5913,36 @@ seen once each on two runs); later pages sit at the replay floor.
   0.23 / 0.23 / 0.23 s, touch 0.23 s, unchanged 0.13 s — every README edit row holds under
   the v22 products.
 - **Final suites** (core, kg, ingest, index, mcp, mem): no failing result line.
+
+
+## Scoped search: candidates inside the scope, and the scan chunk sweep (2026-09-13)
+
+A path scope resolves to dense-id ranges (files are path-sorted within each bucket:
+`fs`+`mm` on the kernel is 128,070 rows in 64 ranges). The semantic channel scans exactly
+those rows' i8 codes (4-row SDOT kernel, one parallel task per chunk of rows) or beams with
+selectivity-derived overfetch, whichever the runtime samples price lower; a scope covering
+at least half the tier always beams. Kernel (`../linux`, 75,954 files, live tier), one
+daemon per setting, `vfs_read` name query, k=5, min of 20 (the machine was shared):
+
+| `VORPAL_SCAN_CHUNK` | unscoped | within fs+mm (128,070 rows, scan) | within drivers (7,124,022 rows) | within fs/ext4 (3,926 rows) |
+|---|---:|---:|---:|---:|
+| 256 | 0.47 ms | 1.11 ms | 9.45 ms (scanned) | 1.48 ms |
+| 1024 | 0.44 ms | 0.98 ms | 2.09 ms (beam ×2) | 1.40 ms |
+| 2048 | 0.47 ms | 0.93 ms | 2.59 ms (beam ×2) | 1.39 ms |
+| 8192 | 0.47 ms | 1.08 ms | 2.22 ms (beam ×2) | 1.43 ms |
+| 32768 | 0.46 ms | 0.88 ms | 3.79 ms (beam ×2) | 1.31 ms |
+
+The chunk size is not the lever (all within the noise of a shared machine); 2048 stays.
+The scan of 128,070 rows costs ≈0.45 ms (≈3.5 ns/row, parallel), against 4 ms in the first
+implementation that walked every row of the tier and 30 ns/row before the batched kernel.
+The `drivers` row is why a half-or-more scope now always beams: the first daemon had only a
+scan sample and priced the scan under the beam. `fs/ext4` pays the body-channel fallback
+(the name channel finds nothing in scope, so the mentions in ext4's files are read: ~1 ms),
+which is the answer, not overhead. Daemon RSS 5.7–6.0 GB across the five runs (the tier
+and graph mmaps; the per-row dense-id column the first implementation kept, 8 B × 8.5 M
+rows ≈ 68 MB, is gone — the live tier keeps a few id runs instead).
+
+Parity against the old prefix facet (beam ×4, then filter), 4 queries × 3 scopes, k=8: the
+old path returned 0–2 hits on 7 of 12 pairs where the scope holds 8; where both return 8
+the sets and order agree except one pair at 6/8 overlap where the old pool was partially
+starved. The scoped path is the complete one.

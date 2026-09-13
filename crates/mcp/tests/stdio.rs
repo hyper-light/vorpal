@@ -60,6 +60,11 @@ fn binary_serves_mcp_over_stdio() {
   assert_eq!(response["result"]["serverInfo"]["name"], "vorpal-mcp");
 
   send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+  // The client declared `roots`, so the server asks for them right after `initialized`
+  // (a server→client request on the wire); answer with the tree root — no scope.
+  let ask = recv();
+  assert_eq!(ask["method"], "roots/list", "{ask}");
+  send(json!({"jsonrpc": "2.0", "id": ask["id"], "result": {"roots": [{"uri": format!("file://{}", src.display())}]}}));
 
   send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
               "params": {"name": "index", "arguments": {"src": src.to_string_lossy()}}}));

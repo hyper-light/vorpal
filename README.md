@@ -157,7 +157,8 @@ Answers stay inside the area you are working in. `graph`, `reachable`, `impact`,
 `text_search`, and `code_search` take a `scope`: paths to stay inside (`within`, including
 `@file`, `@dir`, and `@package` relative to the symbol asked about), paths to leave out
 (`except`), path classes such as `source` only, a kind or language, or files changed since
-a git ref. `within` alone is the shorthand, and `scope` sets a default for the session.
+a git ref. `within` alone is the shorthand, `scope` sets a default for the session, and a client
+that shares its workspace roots gets them as the default when they sit inside the tree.
 Rows outside it are counted in `outsideScope`, not listed, so a complete answer stays
 complete as a number. Search generates its candidates inside the scope rather than
 overfetching and filtering, so a scoped search is complete and costs what the scope
