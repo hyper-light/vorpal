@@ -1328,6 +1328,10 @@ fn scope_object_facets_anchors_and_changed_files() {
 
   // A session scope with a deferred `@dir` binds per symbol: a search before any symbol
   // anchor exists is refused; after a graph call it answers inside that symbol's dir.
+  // One daemon per index: the first server's background persist and canonicalization of
+  // the edited tree must land before a second server boots on it (dropping joins them),
+  // or the newcomer's first query can adopt a generation mid-commit.
+  drop(server);
   let mut fresh = Server::new(idx);
   let set = structured(&mut fresh, 14, "scope", json!({"within": ["@dir"], "classes": ["source"]}));
   assert_eq!(set["outcome"], "scoped", "{set}");
