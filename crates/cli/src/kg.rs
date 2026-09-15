@@ -1179,24 +1179,52 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         )
         .map_err(anyhow::Error::msg)?,
         // Rows carry the call site, exactly as the MCP `graph` tool's do — the shell fast
-        // path answers "who calls X" / "what does X call" in one command.
-        (None, verb) => vorpal_index::records::selected_value(
-          vorpal_index::records::related_records_with_sites(
-            &kg,
-            Some(vorpal_index::resolve_index_dir(&dir)).as_deref(),
-            verb.as_str(),
-            &target,
-            None,
-          )
-          .map_err(anyhow::Error::msg)?,
-          cursor,
-          arg.page.limit,
-        )
-        .map_err(anyhow::Error::msg)?,
+        // path answers "who calls X" / "what does X call" in one command. The scope is
+        // applied to the whole answer before paging and before the call sites are read,
+        // as the daemon applies it: a page of `limit` holds `limit` rows inside the scope,
+        // and the rows come nearest the symbol's file first.
+        (None, verb) => {
+          let gen_dir = vorpal_index::resolve_index_dir(&dir);
+          let selected =
+            vorpal_index::records::related_records(&kg, verb.as_str(), &target).map_err(anyhow::Error::msg)?;
+          let mut outside = None;
+          let selected = match selected {
+            vorpal_index::records::Selected::Hits(hits) => {
+              let mut hits = match &scope {
+                Some(scope) => {
+                  let before = hits.len();
+                  let kept: Vec<_> = hits
+                    .into_iter()
+                    .filter(|hit| vorpal_index::records::scope_admits_record(scope, &hit.node))
+                    .collect();
+                  outside = Some(before - kept.len());
+                  kept
+                }
+                None => hits,
+              };
+              if let Some(anchor) = anchor.as_deref() {
+                vorpal_index::records::order_by_proximity(&mut hits, anchor);
+              }
+              vorpal_index::records::attach_call_sites(&kg, Some(gen_dir.as_path()), verb.as_str(), &target, &mut hits, None)
+                .map_err(anyhow::Error::msg)?;
+              vorpal_index::records::Selected::Hits(hits)
+            }
+            other => other,
+          };
+          let mut value = vorpal_index::records::selected_value(selected, cursor, arg.page.limit)
+            .map_err(anyhow::Error::msg)?;
+          if let (Some(scope), Some(outside)) = (&scope, outside) {
+            value["outsideScope"] = serde_json::json!(outside);
+            value["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+          }
+          value
+        }
       };
-      let value = match &scope {
-        Some(scope) => scope_records_value(value, scope),
-        None => value,
+      // The traversal and listing arms page inside the index crate; their scope is a view
+      // over the page they return.
+      let value = match (&scope, value.get("outsideScope").is_some()) {
+        (Some(scope), false) => scope_records_value(value, scope),
+        _ => value,
       };
       if matches!(machine, OutputFormat::Text) {
         let rows = value.get("records").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
@@ -1215,12 +1243,16 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
 }
 
 /// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`).
+/// The default index path is the bare relative `.vorpal/index`, whose grandparent is the
+/// empty path: that is the current directory, as the daemon reads it.
 fn source_root_of(index_dir: &Path) -> Option<PathBuf> {
   let vorpal = index_dir.parent()?;
   if index_dir.file_name()? != "index" || vorpal.file_name()? != ".vorpal" {
     return None;
   }
-  std::fs::canonicalize(vorpal.parent()?).ok()
+  let src = vorpal.parent()?;
+  let src = if src.as_os_str().is_empty() { Path::new(".") } else { src };
+  std::fs::canonicalize(src).ok()
 }
 
 /// The scope the CLI flags state, resolved as the MCP surface resolves its `scope`:

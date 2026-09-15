@@ -42,6 +42,22 @@ fn graph_and_search_honour_scope_flags() {
   assert_eq!(value["scope"]["within"], serde_json::json!(["sub"]), "{value}");
   assert!(value["records"][0]["path"].as_str().unwrap().ends_with("sub/c.rs"), "{value}");
 
+  // The scope applies before paging: a page of one holds one row INSIDE the scope, not the
+  // first row of the unscoped answer with the scope dropping it afterwards.
+  let out = Command::new(cargo_bin!())
+    .args(["graph", "callers", "target", "--index", index, "--within", "sub", "--limit", "1", "--format", "json"])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+  let value: serde_json::Value = serde_json::from_slice(&out).expect("json envelope");
+  assert_eq!(value["total"], 1, "{value}");
+  assert_eq!(value["outsideScope"], 1, "{value}");
+  assert_eq!(value["records"].as_array().unwrap().len(), 1, "{value}");
+  assert!(value["records"][0]["path"].as_str().unwrap().ends_with("sub/c.rs"), "{value}");
+  assert!(value["records"][0].get("site_line").is_some(), "call sites are attached: {value}");
+
   let out = Command::new(cargo_bin!())
     .args(["graph", "callers", "target", "--index", index, "--except", "sub", "--format", "json"])
     .assert()
@@ -81,5 +97,42 @@ fn graph_and_search_honour_scope_flags() {
   let rows = value["records"].as_array().expect("records");
   assert!(!rows.is_empty(), "{value}");
   assert!(rows.iter().all(|r| r["path"].as_str().unwrap().contains("/sub/")), "{value}");
+  let _ = fs::remove_dir_all(src.parent().unwrap());
+}
+
+/// From the project root with no `--index`, the default `.vorpal/index` still names a
+/// source root, so a relative scope entry resolves (the README's quickstart shape).
+#[test]
+fn relative_scope_resolves_against_the_default_index_path() {
+  let src = tree("default-index");
+  Command::new(cargo_bin!())
+    .args(["index", src.to_str().unwrap()])
+    .assert()
+    .success();
+  let out = Command::new(cargo_bin!())
+    .current_dir(&src)
+    .args(["graph", "callers", "target", "--within", "sub", "--format", "json"])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+  let value: serde_json::Value = serde_json::from_slice(&out).expect("json envelope");
+  assert_eq!(value["total"], 1, "{value}");
+  assert_eq!(value["outsideScope"], 1, "{value}");
+  let out = Command::new(cargo_bin!())
+    .current_dir(&src)
+    .args(["search", "caller", "-k", "5", "--within", "sub", "--format", "json"])
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+  let value: serde_json::Value = serde_json::from_slice(&out).expect("json envelope");
+  let records = value["records"].as_array().expect("records");
+  assert!(!records.is_empty(), "{value}");
+  for record in records {
+    assert!(record["path"].as_str().unwrap().ends_with("sub/c.rs"), "{value}");
+  }
   let _ = fs::remove_dir_all(src.parent().unwrap());
 }

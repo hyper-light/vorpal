@@ -6106,3 +6106,38 @@ CPython `Parser/parser.c` 1.4 MB: fresh 111–118 ms; cache only 41–42 ms; spl
 the bench indexes and every driver's JSON (`readme-bench/`, `tgrep-bench/`, `pass1/`);
 removed after this record, per the hygiene rule. The per-row `quiet` samples live in those
 JSONs and are summarised above.
+
+
+## 0.10.1: three scope bugs found while writing the README's examples (2026-09-15)
+
+Writing the "Ask inside one part of the tree" section against the shipped 0.10.0 binary,
+on the kernel index in its default layout, hit three things in a row:
+
+- **`vorpal graph callers kmalloc --within fs/ext4` from the tree's root: "scope entry
+  'fs/ext4' is relative and this index has no source root".** The CLI's default index
+  path is the bare relative `.vorpal/index`; its grandparent is the empty path, and
+  `canonicalize("")` fails. The daemon's `watch_root` already treated the empty parent as
+  the current directory; the CLI now does too. Test:
+  `relative_scope_resolves_against_the_default_index_path` (crates/cli/tests/graph_scope.rs).
+- **A one-shot `vorpal search … --within fs/ext4` on the kernel ran for minutes at one
+  core** (killed after 3 min; `/usr/bin/time` RSS 3.3 GB). `VORPAL_PHASE_TRACE` stamped
+  `search: scoped beam take 216100 over 3926 rows of 8482685`: the scoped regime chooser
+  had a scan sample (seeded by its probe) and no beam sample, and that arm returned the
+  beam at `take × overfetch` unmeasured — width 216,100 on the persisted Vamana graph. A
+  fresh daemon whose first query is scoped (client roots as the session default) took
+  the same arm. Now the beam cost is seeded like the scan cost, with a bounded probe: one
+  beam at the plain unscoped width `take`, the same beam an unscoped search runs; no beam
+  is chosen without a price, and the arm without a price scans. After: the same one-shot
+  0.27 s wall (index open, file table, scan, body channel), 0.24 s unscoped. Test:
+  `scoped_regime_prices_the_beam_before_choosing_it` (crates/index/src/lib.rs).
+- **The CLI applied the scope to the page, not the answer.** `vorpal graph callers kmalloc
+  --all --within fs/ext4` printed `records[0]` and "outside scope: 100 rows not listed"
+  in 1.98 s: it took the first page of 100 unscoped rows, read their 100 call sites, then
+  dropped every one of them. The daemon scopes the whole row set first, orders it nearest
+  file first, reads the sites of the rows it keeps, then pages. The CLI's `graph` arm now
+  does the same, so a page of `limit` holds `limit` rows inside the scope and costs the
+  files it keeps. Test: the `--limit 1` case in `graph_and_search_honour_scope_flags`.
+- The text footer named an empty `within:` for a `changed_since` or `kind` scope; it now
+  names whichever facets the scope has (`changed since HEAD~3`, `kind Function`, …).
+
+The README examples in that section are the outputs of the fixed binary.

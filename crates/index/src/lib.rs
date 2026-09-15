@@ -4857,6 +4857,7 @@ impl ScanStats {
 }
 
 /// How the semantic channel answers inside a scope of `rows` rows out of `n`.
+#[derive(Debug)]
 enum ScopedRegime {
   /// Exact code-space scan over the scope's id ranges.
   Scan,
@@ -4885,14 +4886,20 @@ impl Searcher {
   }
 
   /// Pick the regime from measured costs. A missing scan sample is seeded by `probe` (a
-  /// scan over the first [`SCAN_PROBE_ROWS`] ids); a missing beam sample means "beam and
-  /// measure it".
+  /// scan over the first [`SCAN_PROBE_ROWS`] ids); a missing beam sample by `beam_probe`,
+  /// a beam at the plain unscoped width `take` — the same beam an unscoped search runs,
+  /// so it costs what an unscoped search costs. Both samples must exist before a beam is
+  /// chosen: the first scoped query of a process (a one-shot, or a daemon whose client
+  /// roots scope every query) once went to a beam of `take × overfetch` unmeasured, and
+  /// on the kernel that was a beam of 216,100 over 3,926 rows — minutes, where the scan
+  /// takes a millisecond.
   fn scoped_regime(
     &self,
     rows: u64,
     n: usize,
     take: usize,
     probe: impl FnOnce(&scope::ScopeRanges),
+    beam_probe: impl FnOnce(usize),
   ) -> ScopedRegime {
     if self.stats().scan_ns_per_row.is_empty() && n > 0 {
       let covered = (n as u64).min(SCAN_PROBE_ROWS);
@@ -4900,6 +4907,11 @@ impl Searcher {
       let started = std::time::Instant::now();
       probe(&probe_ranges);
       self.stats().note_scan(covered, started.elapsed());
+    }
+    if self.stats().beam_ns_per_width.is_empty() && n > 0 {
+      let started = std::time::Instant::now();
+      beam_probe(take);
+      self.stats().note_beam(vorpal_ann::beam_width(take, n), started.elapsed());
     }
     // Overfetch from selectivity: E[in-scope rows in a pool of `take_eff`] = take.
     let overfetch = (n as u64).div_ceil(rows.max(1)) as usize;
@@ -4921,8 +4933,8 @@ impl Searcher {
           ScopedRegime::Beam { take: take_eff }
         }
       }
-      (Some(_), None) => ScopedRegime::Beam { take: take_eff },
-      (None, _) => ScopedRegime::Scan,
+      // Unreachable once both probes ran (n > 0); the exact scan is the bounded choice.
+      (Some(_), None) | (None, _) => ScopedRegime::Scan,
     }
   }
 
@@ -4947,9 +4959,17 @@ impl Searcher {
       self.stats().note_scan(ranges.rows(), started.elapsed());
       out
     };
-    match self.scoped_regime(ranges.rows(), n, take, |probe| {
-      std::hint::black_box(ann.scan_codes_ranges(query_vec, 1, probe.ranges()));
-    }) {
+    match self.scoped_regime(
+      ranges.rows(),
+      n,
+      take,
+      |probe| {
+        std::hint::black_box(ann.scan_codes_ranges(query_vec, 1, probe.ranges()));
+      },
+      |width| {
+        std::hint::black_box(ann.search(query_vec, width));
+      },
+    ) {
       ScopedRegime::Scan => {
         vorpal_kg::phase_stamp(&format!("search: scoped scan {} rows in {} ranges", ranges.rows(), ranges.ranges().len()));
         scan(ranges, take)
@@ -4985,9 +5005,17 @@ impl Searcher {
       self.stats().note_scan(ranges.rows(), started.elapsed());
       out
     };
-    match self.scoped_regime(ranges.rows(), n, take, |probe| {
-      std::hint::black_box(tier.scan_scoped(query_vec, 1, probe));
-    }) {
+    match self.scoped_regime(
+      ranges.rows(),
+      n,
+      take,
+      |probe| {
+        std::hint::black_box(tier.scan_scoped(query_vec, 1, probe));
+      },
+      |width| {
+        std::hint::black_box(tier.search_ids(query_vec, width));
+      },
+    ) {
       ScopedRegime::Scan => {
         vorpal_kg::phase_stamp(&format!("search: scoped scan {} rows in {} ranges", ranges.rows(), ranges.ranges().len()));
         scan(ranges, take)
@@ -7817,6 +7845,53 @@ mod tests {
     assert!(off.encoder_status().is_none(), "{:?}", off.encoder_status());
     // Two selections over one generation are two handles, not one stale one.
     assert!(!std::sync::Arc::ptr_eq(&selected, &off));
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  /// The scoped regime never commits to a beam it has not priced: the first scoped query
+  /// of a process seeds BOTH cost samples with bounded probes (a scan over the first
+  /// probe rows, a beam at the plain unscoped width), and a narrow scope then takes the
+  /// scan. Before this, a process with a scan sample and no beam sample beamed at
+  /// `take × overfetch` unmeasured — 216,100 wide over 3,926 kernel rows.
+  #[test]
+  fn scoped_regime_prices_the_beam_before_choosing_it() {
+    let base = std::env::temp_dir().join(format!("vorpal-scoped-regime-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("repo");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.py"), "def alpha():\n    return 1\n").unwrap();
+    let root = base.join("index");
+    super::build_index(&src, &root).expect("index");
+    let searcher = super::cached_searcher(&root).expect("searcher");
+    let n = 8_482_685usize;
+    let take = 100usize;
+    let beam_widths = std::cell::RefCell::new(Vec::new());
+    let scans = std::cell::RefCell::new(0usize);
+    // A 3,926-row scope: 2,161× overfetch, the kernel `fs/ext4` shape.
+    let regime = searcher.scoped_regime(
+      3_926,
+      n,
+      take,
+      |ranges| {
+        assert_eq!(ranges.rows(), super::SCAN_PROBE_ROWS.min(n as u64));
+        *scans.borrow_mut() += 1;
+      },
+      |width| beam_widths.borrow_mut().push(width),
+    );
+    assert_eq!(*scans.borrow(), 1, "the scan sample is seeded once");
+    assert_eq!(*beam_widths.borrow(), vec![take], "the beam sample is seeded at the unscoped width");
+    {
+      let stats = searcher.stats();
+      assert_eq!(stats.scan_ns_per_row.len(), 1);
+      assert_eq!(stats.beam_ns_per_width.len(), 1);
+    }
+    // Both probes cost about nothing here, so the prices are equal-ish and the scan of
+    // 3,926 rows is priced under a beam of width beam_width(216,100, n); the arm that
+    // used to beam unmeasured is gone either way.
+    assert!(matches!(regime, super::ScopedRegime::Scan), "a narrow scope scans");
+    // A second call seeds nothing more, and a scope over half the tier beams by law.
+    let regime = searcher.scoped_regime(n as u64 / 2 + 1, n, take, |_| unreachable!(), |_| unreachable!());
+    assert!(matches!(regime, super::ScopedRegime::Beam { take: 200 }), "{regime:?}");
     let _ = std::fs::remove_dir_all(&base);
   }
 

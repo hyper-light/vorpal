@@ -3671,15 +3671,37 @@ fn stamp_scope(
 fn with_scope_footer(mut text: String, data: &Value) -> String {
   let outside = data.get("outsideScope").and_then(Value::as_u64).unwrap_or(0);
   if outside > 0 {
-    let within: Vec<&str> = data
-      .pointer("/scope/within")
-      .and_then(Value::as_array)
-      .map(|items| items.iter().filter_map(Value::as_str).collect())
-      .unwrap_or_default();
+    // Name the scope as it was stated: the path facets, and the others when there are no
+    // paths (a `changed_since` or `kind` scope has an empty `within`).
+    let list = |key: &str| -> Option<String> {
+      let items: Vec<&str> = data
+        .pointer(&format!("/scope/{key}"))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+      (!items.is_empty()).then(|| format!("{key}: {}", items.join(", ")))
+    };
+    let scalar = |key: &str, label: &str| -> Option<String> {
+      data
+        .pointer(&format!("/scope/{key}"))
+        .and_then(Value::as_str)
+        .map(|value| format!("{label} {value}"))
+    };
+    let parts: Vec<String> = [
+      list("within"),
+      list("except"),
+      list("classes"),
+      scalar("kind", "kind"),
+      scalar("lang", "lang"),
+      scalar("changedSince", "changed since"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if !text.ends_with('\n') {
       text.push('\n');
     }
-    text.push_str(&format!("outside scope: {outside} rows not listed (within: {})\n", within.join(", ")));
+    text.push_str(&format!("outside scope: {outside} rows not listed ({})\n", parts.join("; ")));
   }
   let frontier = data.get("frontier").and_then(Value::as_u64).unwrap_or(0);
   if frontier > 0 {
