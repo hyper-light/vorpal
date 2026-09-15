@@ -410,6 +410,7 @@ impl Index {
       lang,
       exported_only: exported,
       exclude_tests,
+      within: None,
     };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
@@ -527,7 +528,6 @@ impl Index {
     lang: Option<String>,
     exported: bool,
     exclude_tests: bool,
-    within: None,
   ) -> PyResult<Py<PyAny>> {
     let generation_dir = self.generation_dir.clone();
     crate::async_bridge::dispatch(py, move || {
@@ -673,6 +673,7 @@ pub(crate) fn search_value(
     lang,
     exported_only: exported,
     exclude_tests,
+    within: None,
   };
   let records = vorpal_index::search_records_filtered(generation_dir, query, k, &filter)
     .map_err(|e| e.to_string())?;
