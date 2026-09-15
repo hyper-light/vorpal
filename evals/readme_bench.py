@@ -67,8 +67,12 @@ def cpu_idle_pct():
 # System daemons that are part of this machine's steady state and not a workload: fseventsd
 # sits near one core whenever Docker Desktop's file sharing is up (Docker is required here
 # for the cross-platform lanes), WindowServer paints the screen. They are reported beside
-# every row, not treated as load to wait out.
-BASELINE_DAEMONS = ("fseventsd", "WindowServer")
+# every row, not treated as load to wait out. VORPAL_BENCH_BASELINE names more (comma-
+# separated process basenames) for a run on a machine whose steady state has grown, and
+# VORPAL_BENCH_IDLE_FLOOR moves the idle gate with it; both are recorded in every row's
+# `quiet` sample so the JSON says which gate it was taken under.
+BASELINE_DAEMONS = ("fseventsd", "WindowServer") + tuple(n for n in os.environ.get("VORPAL_BENCH_BASELINE", "").split(",") if n)
+IDLE_FLOOR = float(os.environ.get("VORPAL_BENCH_IDLE_FLOOR", "88"))
 
 def hottest_external():
     """(pcpu, command) of the busiest process that is not this driver, its sampler, or a
@@ -89,17 +93,20 @@ def hottest_external():
             hottest = (pcpu, comm[-70:])
     return hottest, fse
 
-def wait_quiet(max_wait=14400):
+def wait_quiet(max_wait=None):
     """The README's method is best-of-three on a QUIET machine. Quiet, on this machine with
     Docker Desktop running by requirement: two consecutive samples with CPU idle >= 88 %
     (the measured steady floor is 89-91 % with fseventsd near one core) and no process
-    outside the baseline daemons above half a core. Blocks up to `max_wait`; a row taken
-    past that is marked `not_quiet`. Returns what it saw right before the timed run."""
+    outside the baseline daemons above half a core. Blocks up to `max_wait` (default 4 h;
+    VORPAL_BENCH_MAX_WAIT overrides, in seconds, for a run that must not fall through); a
+    row taken past that is marked `not_quiet`. Returns what it saw right before the timed run."""
+    max_wait = max_wait or int(os.environ.get("VORPAL_BENCH_MAX_WAIT", "14400"))
     t0 = time.time(); streak = 0
     while True:
         idle, (hot, fse), load = cpu_idle_pct(), hottest_external(), load1()
-        seen = {"idle_pct": round(idle, 1), "hot_pcpu": hot[0], "hot": hot[1], "fseventsd_pcpu": fse, "load1": round(load, 2), "waited_s": round(time.time() - t0)}
-        streak = streak + 1 if (idle >= 88.0 and hot[0] < 50.0) else 0
+        seen = {"idle_pct": round(idle, 1), "hot_pcpu": hot[0], "hot": hot[1], "fseventsd_pcpu": fse, "load1": round(load, 2), "waited_s": round(time.time() - t0),
+                "idle_floor": IDLE_FLOOR, "baseline": BASELINE_DAEMONS[2:]}
+        streak = streak + 1 if (idle >= IDLE_FLOOR and hot[0] < 50.0) else 0
         if streak >= 2:
             return seen
         if time.time() - t0 > max_wait:

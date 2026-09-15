@@ -5946,3 +5946,163 @@ Parity against the old prefix facet (beam ×4, then filter), 4 queries × 3 scop
 old path returned 0–2 hits on 7 of 12 pairs where the scope holds 8; where both return 8
 the sets and order agree except one pair at 6/8 overlap where the old pool was partially
 starved. The scoped path is the complete one.
+
+
+## The README refresh for 0.10.0: scope, the lexical tier heal, and a machine whose steady state grew (2026-09-14/15)
+
+Binary: `target/rel/release/vorpal` 0.10.0 built from f91ace2 (the heal below included) at
+22:31 on 2026-09-14; every row in this record is from that build unless marked pass 1.
+Drivers: `evals/readme_bench.py` (one phase per invocation, `--append`), `edit_classes.py`,
+`daemon_save_latency.py add|body`, `tgrep_bench.py`, `mcp_percall.py` (now takes
+`VORPAL_BIN` and `VORPAL_PERCALL_REPO`, so the bench's daemon serves a scratch copy of this
+repo rather than the index other daemons hold open), and the new `scope_bench.py`.
+
+### The machine, and the gate these rows were taken under
+
+Two Kubernetes-in-Docker clusters another project keeps up (`desktop-*`, ten nodes, and
+`focal-*`, three) hold the Virtualization VM at 1.4–1.7 cores AT REST: thirteen 4 s idle
+samples with nothing else running read 84.3–87.2 %, so the README's 88 % gate never
+passed (it waited two hours; the driver's 4 h cap would then have marked every row
+`not_quiet`). That project's test bursts (`fleet-*` binaries at ~85 % of a core) come and
+go on top. `readme_bench.py` gained three knobs, all recorded in each row's `quiet`
+sample: `VORPAL_BENCH_MAX_WAIT` (the cap; 86400 here), `VORPAL_BENCH_IDLE_FLOOR` (default
+88) and `VORPAL_BENCH_BASELINE` (extra baseline process names). The suite was split:
+
+- **Group A**, rows a resting VM does not move (daemon round trips, the query suites,
+  parity, save → visible, the single-file lanes, the scope lane): floor 84 % with
+  `com.apple.Virtualization.VirtualMachine` a baseline daemon beside `fseventsd` and
+  `WindowServer`. Everything below is group A.
+- **Group B**, the parallel-build rows (cold index for the 17 corpora with the 0.8.0
+  control, edit lanes, `scan` vs rg, tgrep's and cbm's cold builds, the tier table with its
+  searcheval grades): the strict 88 % gate. The owner asked for the release before the
+  tiers phase finished and group B started, so those README rows keep their 2026-09-07 /
+  2026-09-05 values and dates; the indexing pipeline (crates/ingest, kg, core, language)
+  has no change since v0.9.0. Two of the fifteen pinned corpora (kafka `6e4c555`, neovim
+  `d423675`) no longer resolve through `repos/<o>/<r>/commits/<abbrev>`;
+  `gh api "search/commits?q=repo:<o>/<r>+hash:<abbrev>"` still returns the full sha and the
+  depth-1 fetch works.
+
+### Pass 1 found the lexical tier missing (fixed in f91ace2)
+
+Pass 1 (the build before the heal) read the tgrep lane's daemon `search` median at
+195 ms on the kernel where 0.9.0 read 0.65 ms; the scope lane's unscoped `vfs_read` at
+144–152 ms, scoped fs/ext4 37 ms; the repo per-call search 9.97 ms. `VORPAL_PHASE_TRACE=1`
+put the whole cost between `search: semantic ready` and `search: named ready`, the name
+channel's exhaustive fallback (tokenizing all 8.5 M names). The served generation
+`1f6662eb` (an incremental commit made at 22:05 by the chunk_parity phase's `vorpal
+index`) carried ann.* from Sep 13 but had no `postings.bin`: `commit_generation` carries
+only the six ann.* files (the same list since the tier existed), the posting tier names
+one node segment's ids so it cannot be carried, and `Server::request_warm` returns early
+while the live tier is healthy, so no warm ever rebuilt it. Latent since the posting tier
+shipped; 0.9.0's tgrep row happened to run on a generation that still had the file.
+
+Fix: `vorpal_index::heal_postings` builds the tier for the served generation when it is
+missing or stale, under the same per-index lock as the warm, and hands it to the open
+searcher (`postings` is a `OnceLock` now, no reopen). The daemon runs it in the thread that
+pins a generation, before the scope file table prewarm (the kernel table takes ~20 s and
+delayed the heal when it ran first), and at boot; the boot site also had to recognise
+bucketed generations (it tested only `nodes.vseg`). Kernel: 4.3 s build, 302 MB, 0.4 ms
+per name query after. Test: `crates/index/tests/postings_heal.rs`. Pass-1 rows that never
+went through `search` (save → visible, the tgrep queries suite, text_search, chunk_parity,
+the graph per-call rows) agreed with the final pass within noise and are superseded by it.
+
+### Save → visible (`daemon_save_latency.py`, kernel copy, 7 reps, `fseventsd` at 0 %)
+
+Add a function: 2.654 / 1.319 / 1.333 / 1.284 / 1.263 / 1.647 / 1.621 s → **1.33 s**
+(restore → gone 1.29 s). Body edit: 2.248 / 1.746 / 2.014 / 2.682 / 2.738 / 2.491 / 1.942 s
+→ **2.25 s**; pass 1 read 1.67 s for the same lane in a quieter window (idle after the save
+84–88 % then, 81–84 % now, with gate waits up to 644 s between reps). README: 1.3 s / 2.2 s,
+range 1.3–2.7 s.
+
+### tgrep lane (`tgrep_bench.py --phases queries,calls,chunk_parity,search,text,text_parity`)
+
+- Queries suite (102 regexes, kernel): tgrep median 21.4 ms (total 2.66 s), rg median
+  1.04 s (total 106 s); vorpal `graph references` on the 82 identifier queries: median
+  0.34 ms, total 30 ms.
+- Calls (warm daemon, medians of 3): `kmalloc` — tgrep 26 ms / 3,387 lines, rg 868 ms,
+  `search` 1.0 ms, `code_search kmalloc($A, $B)` 31 ms / 2,715, `structural_search` 30 ms /
+  2,715; `vfs_read` — tgrep 7.9 ms / 13 lines, rg 710 ms, code_search 5 ms / 3, structural
+  4 ms; `$R = schedule_timeout($A)` 10 ms / 72; `devm_platform_ioremap_resource($A, $B)`
+  16 ms / 1,744; `netif_napi_add($A, $B, $C)` 6 ms / 198.
+- chunk_parity: 0 mismatches over 30 rows. `kfree($A)` 92 ms / 40,499; `mutex_lock($A)`
+  48 ms / 22,705; `spin_lock_irqsave($A, $B)` 33 ms / 14,094; `list_for_each_entry($A, $B,
+  $C)` 37 ms / 9,782; `container_of($A, $B, $C)` 76 ms / 19,777 (first call 1.35 s);
+  `WARN_ON($A)` 66–73 ms / 13,734; `if ($C) return $X;` 3.32 s first then 0.37–0.49 s /
+  381,811; `os.path.join($A, $B)` 2 ms / 257 (first 22 ms); `def $F(self, $$$): $$$` 4 ms /
+  1,819.
+- `search`, the 102 queries on the warm daemon: median **0.77 ms**, p95 3.5 ms, first search
+  159 ms after adoption, identifiers top-hit exact 65 / 82, RSS 6.27 GB. The 0.9.0 record
+  says 69 / 82: the 0.9.0 binary gives the same 65 / 82 on today's tier (checked with a
+  0.9.0 worktree build, one-shot, all 82 tops identical between binaries), so the four are
+  tier-specific (`vfs_read`, `single_open` and friends are absent from the vector channel
+  on this tier under the 0.8.0, 0.9.0 and 0.10.0 binaries alike), not code.
+- `text_search`, the 102 queries: median **13.3 ms**, p95 117 ms, total 2.69 s against rg
+  107.5 s; first call 72 ms; parity 0 mismatches against the exhaustive scan (median
+  710 ms). RSS 5.6 GB.
+- Machine during the lane: idle 83–84 %, load 7–18 (the other session's clusters).
+
+### Per-call (`mcp_percall.py`; warm daemon, medians of 5 after a first call)
+
+This repo (scratch copy): callers `tool_result` 0.11 ms, 628 B, 2 records vs rg 18.9 ms,
+3 lines; callees 0.27 ms, 9 records (7 in the 0.8.3 table: the code grew); reachable
+`run_install` out (closure, exact) 0.07 ms, 4 records, 1,024 B vs `rg -A 75` 8.1 ms, 76
+lines, 3,021 B; snippet `render_toml` 0.08 ms vs 41.8 ms in 2 commands, 58 lines; search
+"stdio pump reader thread" 0.59 ms, 5 records vs 17 ms; cold-open first call 106 ms.
+Kernel: callers `schedule_timeout_interruptible` (page of 100) 3.26 ms, 22,829 B, 100 of 140
+vs rg 706 ms, 164 lines, 13,490 B; callers `vfs_read` 0.13 ms, 3 records, 819 B (803 B lean,
+405 B ids, 1,285 B toon) vs 681 ms, 13 lines; callees `vfs_read` 0.11 ms, 4 records vs
+696 ms, 41 lines; node `schedule_timeout` 0.03 ms vs 688 ms; snippet `vfs_read` 0.06 ms vs
+683 ms plus a read of 42 lines; reachable `vfs_read` out depth 2 exact 0.06 ms, 3 records;
+cold-open first call 210 ms. `reachable` answers one ring by default since 0.10, so the
+driver passes `max_depth: 0` for the closure row it has always reported.
+
+### Scope (`scope_bench.py`; medians of 20, warm daemons on default-layout indexes)
+
+Kernel — `graph callers kmalloc` (page of 100): whole tree 43.7 ms, 100 of 2,440, 22.4 KB;
+within `fs` 8.7 ms, 100 of 424 (2,016 outside); within `fs/ext4` 2.6 ms, all 14 (2,426
+outside), 3.2 KB; within `fs`+`mm` 8.8 ms, 100 of 465. `search "vfs_read"` k=8: 0.28 /
+0.72 / 0.93 / 0.73 ms; the pre-0.10 prefix facet on `fs/ext4` returned 0 hits where the
+scope holds 8 (8 on `fs`). `search "read file into user buffer"`: 2.5 / 2.85 / 1.65 / 2.9 ms
+(prefix facet on `fs/ext4`: 0). `text_search kmalloc\(`: 24.5 ms, 3,390 lines in 1,848
+files / 3.9 ms, 490 / 0.73 ms, 15 / 4.3 ms, 602. `code_search kmalloc($A, $B)` k=10: 30.8 ms
+over 3,572 files / 13.0 ms, 436 / 9.4 ms, 10 / 13.1 ms, 488. `reachable vfs_read out`: ring
+0.09 ms, 4 rows, frontier 3; closure 0.087 ms, 8 rows.
+
+CPython — `graph callers PyErr_SetString`: 23.4 ms, 100 of 1,977 / `Objects` 6.8 ms, 100 of
+378 (1,599 outside) / `Lib/asyncio` 1.6 ms, 0 (1,977 outside) / `Python`+`Objects` 11.3 ms,
+100 of 621. `search PyDict_GetItem`: 0.22 / 0.42 / 0.60 (prefix facet 5) / 0.44 ms;
+"parse argument tuple": 0.29 / 0.49 (prefix 5) / 0.45 (prefix 0) / 0.54 ms.
+`text_search PyErr_SetString\(`: 29 ms, 3,337 lines in 335 files / 1.8 ms, 589 / 0.56 ms,
+0 / 2.6 ms, 1,211. `code_search PyErr_SetString($A, $B)`: 145 ms, 328 files / 54 ms, 55 /
+0.56 ms, 0 / 99 ms, 104. `reachable PyDict_GetItem out`: ring 0.04 ms, 1 row, frontier 6;
+closure 9.7 ms, 3,491 rows (page of 100).
+
+This repo (copy) — `graph callers phase_stamp`: 0.28 ms, 14 rows / `crates/index` 0.06 ms,
+0 (14 outside) / `crates/mcp/src` 0.08 ms, 0 / `crates/index`+`crates/kg` 0.26 ms, 14.
+`search tool_result`: 0.17 / 0.73 (prefix 6) / 0.24 / 0.71 ms; "resolve import path": 0.15 /
+0.97 / 0.47 / 1.28 ms. `text_search Path::new\(`: 16.5 ms, 211 lines in 106 files / 0.77 ms,
+47 / 0.44 ms, 6 / 0.67 ms, 48. `code_search Path::new($A)`: 2.5 ms, 231 files / 1.4 ms, 48 /
+1.0 ms, 7 / 1.5 ms, 64. `reachable tool_result out`: ring 0.09 ms, 9 rows, frontier 86;
+closure 2.3 ms, 1,464 rows.
+
+What the numbers say: graph, text and structural answers cost what the scope covers; a
+scoped NAME search is not faster than the tree-wide one (exact candidates come from a scan
+of the scope's rows or a wider beam, both under a millisecond, where the unscoped beam is
+already 0.2–0.3 ms), a descriptive one is, because the body channel reads fewer files;
+the old prefix facet starves on leaf directories (0 of 8 on `fs/ext4`, 5 of 8 on
+`Lib/asyncio`), the scoped path never does.
+
+### Large files (`tree_cache_bench`, 8 rounds, every round byte-verified against a fresh whole-file extraction)
+
+julia `parser.c` 54 MB: fresh 4.41–4.59 s; tree cache only 2.09–2.25 s; with the walk
+splice 0.69–0.71 s on the between-definition rounds (2, 4, 8), 1.90–2.24 s on the
+inside-the-table rounds (3, 5, 7; 1.11 s on round 6). cpp `parser.c` 17 MB: fresh
+1.38–1.75 s; cache only 0.66 s; splice 0.21 s near the top, 0.50–0.58 s in the middle.
+CPython `Parser/parser.c` 1.4 MB: fresh 111–118 ms; cache only 41–42 ms; splice 16–18 ms.
+
+### Artifacts
+
+`/private/tmp/vorpal-profile-0.10/` held the corpora clones, the kernel and repo copies,
+the bench indexes and every driver's JSON (`readme-bench/`, `tgrep-bench/`, `pass1/`);
+removed after this record, per the hygiene rule. The per-row `quiet` samples live in those
+JSONs and are summarised above.

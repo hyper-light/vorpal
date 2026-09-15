@@ -139,33 +139,73 @@ it from `.cursor/mcp.json`).
 > Claude Code loads each MCP tool's schema in a turn of its own the first time a tool is
 > used; the trade-offs of keeping them resident are in [docs/mcp.md](docs/mcp.md).
 
-Tools exposed: `index`, `health`, `schema`, `scope`, `coverage`, `code_search`, `architecture`,
-`compare_generations`, `impact`, `dead_code`, `node`, `graph` (callers, callees, references,
-importers, implementors, type_users, similar, observed), `reachable`, `data_flow`, `query`, `structural_search`,
-`rule_search`, `ast_dump`, `fetch_span`, `snippet`, `why`, `search`, `text_search`. The whole listing is
-under 12 KB on the wire (a test gates it), because a client either loads each schema
-in a model turn or carries the listing in every turn's input; the server's instructions
-also carry the CLI one-liner for its index, so a client with a shell can answer a single
-lookup in two turns with no schema load at all. Tools that return records
-page with cursors and accept `format: "lean" | "toon" | "ids"`; `graph` callers and callees
-rows carry the call-site line so "who calls X" and "what does X call" are one call each.
-`--profile scout|local|analysis|full` limits the
-tool set for read-only agents. Full descriptions and the wire contract:
-**[docs/mcp.md](docs/mcp.md)**.
+What an agent does with it: it asks `graph` who calls `vfs_read` and gets the three
+callers as resolved edges with their call-site lines, in one call. `snippet` returns a
+definition's body, verified against the file; `reachable` what it reaches; `search` finds a
+definition from a name or a description; `text_search` is grep with the enclosing symbol on
+every line; `code_search` runs an ast-grep pattern over the tree in tens of milliseconds,
+because a trigram index says which files can match. Every answer is the complete set at the
+grade its rows state, so none of them needs a grep to confirm it. What that saves against
+grep and read is measured under [How does it compare?](#how-does-it-compare): on the kernel
+a callers question is 0.13 ms and three records against 0.7 s of rescanning 75,954 files and
+13 lines to sift, and the callers question that takes Claude Code five turns with grep
+takes three.
 
-Answers stay inside the area you are working in. `graph`, `reachable`, `impact`, `search`,
-`text_search`, and `code_search` take a `scope`: paths to stay inside (`within`, including
-`@file`, `@dir`, and `@package` relative to the symbol asked about), paths to leave out
-(`except`), path classes such as `source` only, a kind or language, or files changed since
-a git ref. `within` alone is the shorthand, `scope` sets a default for the session, and a client
-that shares its workspace roots gets them as the default when they sit inside the tree.
-Rows outside it are counted in `outsideScope`, not listed, so a complete answer stays
-complete as a number. Search generates its candidates inside the scope rather than
-overfetching and filtering, so a scoped search is complete and costs what the scope
-covers. `reachable` and `impact` return one ring by default and report the next ring's
-size as `frontier`; `max_depth: 0` walks everything. `graph` rows come nearest file first,
-and every answer carries a `radius` field showing how many files and directories the
-session has touched since its first question.
+Tools that return records page with cursors and take `format: "lean" | "toon" | "ids"`;
+`graph` callers and callees rows carry the call-site line, so "who calls X" and "what does X
+call" are one call each. The whole listing stays under 12 KB on the wire (a test gates it),
+because a client either loads each schema in a model turn or carries the listing in every
+turn; the server's instructions also carry the CLI one-liner for its index, so a client with
+a shell can answer a single lookup in two turns with no schema load. `--profile
+scout|local|analysis|full` limits the tool set for read-only agents. The tool list and the
+wire contract: **[docs/mcp.md](docs/mcp.md)**.
+
+**Keeping the agent in its lane.** A complete answer has a cost of its own: handed every
+caller of a symbol across the tree, an agent tends to treat the list as a work list and
+wander off from the question it was asked. So any question can be asked inside a scope:
+
+```json
+{ "relation": "callers", "name": "kmalloc", "within": "fs/ext4" }
+```
+
+comes back with ext4's 14 callers and their call sites, and one number, `outsideScope:
+2426`, for the rest of the tree. The answer is still complete; the agent is just not handed
+2,440 places to go, and the page it reads is 3 KB instead of 22 KB. A `scope` call sets the
+same for the rest of the session, and a client that shares its workspace roots (Claude Code,
+IDE clients) gets them as the default when they sit inside the tree, so an agent opened on
+`fs/ext4` starts scoped without being told. The scope can also name paths to leave out, path
+classes (source only, no tests or vendored code), a kind or language, or the files changed
+since a git ref.
+
+Search inside a scope generates its candidates inside it rather than ranking the whole tree
+and keeping what falls under the path, so `k: 8` within `fs/ext4` returns eight ext4
+definitions; the pre-0.10 prefix filter returned none for the same questions, because the
+tree-wide ranking never reached that deep. `reachable` and `impact` answer one ring at a
+time and say how big the next ring is (`frontier`), so "what does this reach" is a bounded
+answer: on CPython, `reachable PyDict_GetItem` returns its one direct callee and
+`frontier: 6` in 0.04 ms, where the whole closure is 3,491 definitions; `max_depth: 0`
+still walks everything. `graph` rows come nearest file first, so a
+page cut by `limit` drops the far edge of the answer, and every answer carries `radius`: how
+many files and directories the session has touched since its first question, so drift is
+visible while it happens.
+
+What a scope changes, on the kernel index (one warm daemon, medians of 20 calls; the page
+size is the compact JSON Claude Code hands the model):
+
+| Question | Whole tree | Within `fs` | Within `fs/ext4` |
+|---|---:|---:|---:|
+| `graph callers kmalloc`, page of 100 | 44 ms, 100 of 2,440 rows, 22 KB | 8.7 ms, 100 of 424 (2,016 outside) | **2.6 ms**, all 14 rows, 3 KB |
+| `search "vfs_read"`, k = 8 | 0.28 ms | 0.72 ms | 0.93 ms (prefix filter: 0 hits) |
+| `search "read file into user buffer"`, k = 8 | 2.5 ms | 2.8 ms | **1.7 ms** |
+| `text_search kmalloc\(` | 24 ms, 3,390 lines in 1,848 files | 3.9 ms, 490 lines | **0.7 ms**, 15 lines |
+| `code_search kmalloc($A, $B)`, k = 10 | 31 ms, 3,572 files scanned | 13 ms, 436 files | **9.4 ms**, 10 files |
+| `reachable vfs_read`, one ring / whole closure | 0.09 ms, 4 rows, frontier 3 / 0.09 ms, 8 rows | | |
+
+Graph, text, and structural answers cost what the scope covers. A name search inside a
+scope is not faster than the tree-wide one: the exact candidates come from a scan of the
+scope's rows or a wider beam, both a fraction of a millisecond, where the tree-wide beam is
+already that cheap. A descriptive search is, because the scope's body channel reads fewer
+files. Driver: `evals/scope_bench.py`.
 
 ## Language packages
 
@@ -198,18 +238,26 @@ Every command with examples: **[docs/getting-started.md](docs/getting-started.md
 
 ## Performance
 
-Numbers below are release builds of **v0.9.0** on an Apple M5 Max (18 cores, 128 GB,
-macOS 26.4.1, rustc 1.98.0). The kernel, CPython, and this-repo index rows, the structural
-search table, and both tool comparisons were measured 2026-09-07; the other fifteen index
-rows and the tier and agent tables on 2026-09-05 and 06 with v0.8.4. Every dataset is
-pinned by commit. One cold-index number per corpus appears throughout: the one in the
-indexing table.
+Numbers below are release builds on an Apple M5 Max (18 cores, 128 GB, macOS 26.4.1,
+rustc 1.98.0). The daemon round trips, the save rows, the large-file table, the structural
+and text search table, the scope table, and the per-question rows of both tool comparisons
+were measured 2026-09-14 and 15 with **v0.10.0**. The index rows for the kernel, CPython,
+and this repo, the edit lanes, the scan row, and the cold-build rows of the tool
+comparisons are from v0.9.0 on 2026-09-07 (the indexing pipeline did not change in
+0.10.0; a re-run waits for a quieter machine than this one has been since, see the note
+below); the other fifteen index rows and the tier and agent tables from v0.8.4 on
+2026-09-05 and 06. Every dataset is pinned by commit. One cold-index number per corpus
+appears throughout: the one in the indexing table.
 
 Times are wall-clock for the whole CLI invocation, process start included. Cold times are
 the best of three runs. Every run waited for a quiet machine: two consecutive one-second
 `top` samples at least 88 % idle, with nothing above half a core except `WindowServer`
 and `fseventsd`. `fseventsd` runs at a full core while an index build streams file
-events, so its load is recorded beside each result.
+events, so its load is recorded beside each result. The 2026-09-14 rows were taken with
+the gate at 84 % idle and Docker's virtual machine counted as a third baseline daemon: two
+Kubernetes-in-Docker clusters another project keeps up hold it at about a core and a half
+at rest, so 88 % never came. Those are round-trip rows a resting virtual machine does not
+move; the sample each row was taken under is in the driver's output.
 
 Indexing always builds the full graph: calls, imports, types, data flow, near-clone
 pairs, request-to-route links, co-change history. Each number covers the whole product,
@@ -277,10 +325,10 @@ underneath it. To re-run a pinned row, fetch by the full SHA
 
 Yes. `vorpal mcp` watches the tree and re-indexes changed files as you save. Changes
 apply incrementally, including to the semantic-search tier, so a save never re-parses the
-tree. Round trips measured from the client side (medians of 30 calls, kernel index); the
-save rows are medians of seven saves to `fs/read_write.c` on a scratch copy of the kernel,
-polled every 20 ms until the daemon's answer showed the edit (range 1.9–4.9 s; each save
-commits a new generation):
+tree. Round trips measured from the client side on a warm kernel daemon; the save rows
+are medians of seven saves to `fs/read_write.c` on a scratch copy of the kernel, polled
+every 20 ms until the daemon's answer showed the edit (range 1.3–2.7 s; each save commits
+a new generation):
 
 | Operation | Time |
 |---|---|
@@ -288,7 +336,11 @@ commits a new generation):
 | Hybrid search (default tier; per-tier table below) | **0.8 ms** |
 | Server start → answering queries on an existing index | immediate |
 | First search after start (ranking tier warm-up, once) | 0.19 s |
-| Save a file → answers include the change | **2.0 s** (a body edit) · 2.2 s (a new function) |
+| Save a file → answers include the change | **1.3 s** (a new function) · 2.2 s (a body edit) |
+
+After a save commits, the daemon rebuilds the committed generation's name index in the
+background (about 4 s on the kernel). A name search in that window takes the exact scan
+over every name instead, 150 ms on the kernel, and ranks the same.
 
 Repositories with multi-megabyte source files get one more optimization in a long-lived
 process (the MCP daemon, a watch loop, an SDK server calling `indexBuild` per save):
@@ -298,11 +350,11 @@ re-extraction on every row below.
 
 | Edited file (per save) | Fresh | Incremental parse | + walk splice |
 |---|---:|---:|---:|
-| 54 MB generated C (`tree-sitter-julia` parser), edit between definitions | 4.2 s | 1.9 s | **0.7 s** |
-| 54 MB generated C, edit *inside* its single 43 MB parse-table definition | 4.2 s | 1.9 s | **1.7 s** |
-| 17 MB generated C (`tree-sitter-cpp` parser), edit near the top | 1.35 s | 0.60 s | **0.21 s** |
-| 17 MB generated C, edit in the middle | 1.35 s | 0.60 s | **0.47 s** |
-| 1.4 MB hand-written C (CPython `Parser/parser.c`) | 107 ms | 37 ms | **17 ms** |
+| 54 MB generated C (`tree-sitter-julia` parser), edit between definitions | 4.5 s | 2.1 s | **0.7 s** |
+| 54 MB generated C, edit *inside* its single 43 MB parse-table definition | 4.5 s | 2.1 s | **1.9 s** |
+| 17 MB generated C (`tree-sitter-cpp` parser), edit near the top | 1.4 s | 0.66 s | **0.21 s** |
+| 17 MB generated C, edit in the middle | 1.4 s | 0.66 s | **0.50 s** |
+| 1.4 MB hand-written C (CPython `Parser/parser.c`) | 112 ms | 41 ms | **17 ms** |
 
 The granularity is the enclosing definition: an edit inside one giant definition
 re-walks that definition. Walk splicing currently ships for C; if any splice check fails,
@@ -326,13 +378,13 @@ Linux kernel, one daemon, median of 3 calls:
 
 | Query | Before the text index | Now |
 |---|---:|---:|
-| `code_search kmalloc($A, $B)`: 2,715 calls, each with its function | 4.3 s | **35 ms** |
-| `code_search kfree($A)`: 40,499 calls | — | **90 ms** |
-| `structural_search kmalloc($A, $B)` | 4.1 s, stopped at 100 | **51 ms**, all 2,715 |
-| `code_search $R = schedule_timeout($A)` | 4.4 s | **45 ms** |
+| `code_search kmalloc($A, $B)`: 2,715 calls, each with its function | 4.3 s | **31 ms** |
+| `code_search kfree($A)`: 40,499 calls | — | **92 ms** |
+| `structural_search kmalloc($A, $B)` | 4.1 s, stopped at 100 | **30 ms**, all 2,715 |
+| `code_search $R = schedule_timeout($A)` | 4.4 s | **10 ms** |
 | `code_search os.path.join($A, $B)` in Python, second call | — | **2 ms** |
-| `code_search if ($C) return $X;`: 381,811 matches, first call then a repeat | — | 3.7 s, then **0.4 s** |
-| `text_search`, tgrep's 102-query suite, per query | — | **12.8 ms** (tgrep 21 ms, ripgrep about 1 s) |
+| `code_search if ($C) return $X;`: 381,811 matches, first call then a repeat | — | 3.3 s, then **0.4 s** |
+| `text_search`, tgrep's 102-query suite, per query | — | **13 ms** (tgrep 21 ms, ripgrep about 1 s) |
 
 Call patterns whose arguments are all metavariables, such as `f($A, $B)`, `f()`, or
 `f($$$)`, need no parse at all. The index records every call with its argument count, so
@@ -466,23 +518,23 @@ costs about twice a text grep once the parsed products are banked, three times o
 first run, which parses everything.
 
 **Against an agent's built-in tools.** An agent already has grep and read, so we
-measured vorpal against them, on this repo and on the Linux kernel, with the v0.8.3
-binary on 2026-09-05. Each row asks one question of a warm vorpal daemon (one MCP call,
+measured vorpal against them, on this repo and on the Linux kernel, with the v0.10.0
+binary on 2026-09-14. Each row asks one question of a warm vorpal daemon (one MCP call,
 median of five after a first call) and of the ripgrep-plus-read pipeline behind Claude
 Code's Grep and Read tools. Wall time is the tool's own work. The last column is what
 the model then has to read.
 
 | Question | vorpal | rg + read | Output the model reads |
 |---|---:|---:|---|
-| This repo: callers of `tool_result` | 0.10 ms | 16 ms | 2 records with call sites vs 3 text lines |
-| This repo: callees of `tool_result` | 0.14 ms | no equivalent | 7 records with call sites |
-| This repo: what `run_install` reaches | 0.05 ms, 1 call | 6 ms, `rg -A 75` | 4 records vs 76 lines (3 KB) |
-| This repo: source of `render_toml` | 0.05 ms | 39 ms, 2 commands | verified body vs 58 lines |
-| Kernel: callers of `schedule_timeout_interruptible` (page of 100) | 2.7 ms | 748 ms | 100 of 140 resolved records (23 KB) vs 164 lines (13 KB) |
-| Kernel: callers of `vfs_read` | 0.10 ms | 692 ms | 3 records with call sites vs 13 lines |
-| Kernel: callees of `vfs_read` | 0.11 ms | 763 ms, then the body | 4 records with call sites vs 41 lines |
-| Kernel: find `schedule_timeout` | 0.05 ms | 677 ms | 1 record vs 1 line |
-| Kernel: source of `vfs_read` | 0.08 ms | 713 ms, then a read | verified body vs 42 lines |
+| This repo: callers of `tool_result` | 0.11 ms | 19 ms | 2 records with call sites vs 3 text lines |
+| This repo: callees of `tool_result` | 0.27 ms | no equivalent | 9 records with call sites |
+| This repo: what `run_install` reaches | 0.07 ms, 1 call | 8 ms, `rg -A 75` | 4 records vs 76 lines (3 KB) |
+| This repo: source of `render_toml` | 0.08 ms | 42 ms, 2 commands | verified body vs 58 lines |
+| Kernel: callers of `schedule_timeout_interruptible` (page of 100) | 3.3 ms | 706 ms | 100 of 140 resolved records (23 KB) vs 164 lines (13 KB) |
+| Kernel: callers of `vfs_read` | 0.13 ms | 681 ms | 3 records with call sites vs 13 lines |
+| Kernel: callees of `vfs_read` | 0.11 ms | 696 ms, then the body | 4 records with call sites vs 41 lines |
+| Kernel: find `schedule_timeout` | 0.03 ms | 688 ms | 1 record vs 1 line |
+| Kernel: source of `vfs_read` | 0.06 ms | 683 ms, then a read | verified body vs 42 lines |
 | Kernel: what `vfs_read` reaches, depth 2 | 0.06 ms | no equivalent | 3 records |
 
 On a small repo both are far under a model turn; the difference is round trips. On the
@@ -495,15 +547,15 @@ A name with several definitions comes back as a list of candidates, not a merged
 so an earlier version of this table that counted those six as callers was wrong.
 
 The first call in a fresh daemon pays a cold open plus the tree revalidation sweep:
-119 ms on this repo, 0.27 s on the kernel with the tree's metadata cached, 2.8 s once
-when it was not. A kernel tree that changed since its generation pays a rebuild on that
+106 ms on this repo, 0.21 s on the kernel with the tree's metadata cached, 2.8 s once
+when it was not (v0.8.3). A kernel tree that changed since its generation pays a rebuild on that
 first call instead (9.4 s measured with v0.8.2).
 
 Claude Code hands the model a tool's `structuredContent` as compact JSON and drops the
 text block (checked in the 2.1.261 transcripts), so `format` shapes what the model reads
-through the structured half. For the three callers of `vfs_read` that is 753 B by default
-(lean: name, kind, path, grade, and the call site with its line) and 355 B with
-`format: ids`; each page puts its common directory in one `base` field. `toon` only
+through the structured half. For the three callers of `vfs_read` that is 803 B by default
+(lean: name, kind, path, grade, the call site with its line, and the scope and radius
+fields) and 405 B with `format: ids`; each page puts its common directory in one `base` field. `toon` only
 rewrites the text half, which this client never shows.
 
 **What that costs end to end.** We asked Claude Code 2.1.261 (Opus 5, `--effort high`)
@@ -577,19 +629,20 @@ tokens on the kernel callers question, are in `docs/wip/BENCHMARKS.md`.
 **Against tgrep.** [tgrep] (1.0.4) is a trigram-indexed grep with a server. You run
 `tgrep index .`, then `tgrep serve .`, and each `tgrep <pattern> .` connects to the
 server. The vorpal equivalent is `vorpal index .`, one `vorpal mcp` daemon, and one call
-per question. Both tools were built from source and run on the same checkouts on
-2026-09-07. tgrep's index rows are medians of three builds timed with `/usr/bin/time -l`;
-vorpal's are the indexing table's. The driver is `evals/tgrep_bench.py`.
+per question. Both tools were built from source and run on the same checkouts: the
+index rows on 2026-09-07, the query and save rows again on 2026-09-14 with v0.10.0. tgrep's
+index rows are medians of three builds timed with `/usr/bin/time -l`; vorpal's are the
+indexing table's. The driver is `evals/tgrep_bench.py`.
 
 | | tgrep | vorpal |
 |---|---|---|
 | **Linux kernel**, cold index | 8.2 s, 0.31 GB RSS, 1.0 GB on disk, 94,719 files | 8.1 s, 6.1 GB RSS, 4.8 GB on disk, 75,954 files parsed into 8.9 M nodes |
 | **CPython**, cold index | 0.54 s, 0.14 GB, 74 MB | 0.9 s, 0.7 GB, 160 MB |
 | **This repo**, cold index (49 vendored grammars) | 0.69 s, 0.26 GB, 28 MB | 6.9 s, 11.6 GB, 860 MB |
-| tgrep's 102-query kernel suite, median per query | 21 ms, text lines | `text_search` **12.8 ms**, lines with their symbol; `search` **0.65 ms**, ranked definitions |
-| Every call of `kmalloc` in the kernel | 18 ms, 3,387 lines matching `kmalloc\(` | `code_search kmalloc($A, $B)` **35 ms**, 2,715 two-argument calls with their functions |
-| Callers of `vfs_read` | 7.7 ms, 13 lines | `graph callers` 0.10 ms, 3 call edges with their sites |
-| Save a file, then ask again (kernel clone) | 4.4 s | 4.3 s; 2.0 to 2.2 s when `fseventsd` is quiet |
+| tgrep's 102-query kernel suite, median per query | 21 ms, text lines | `text_search` **13 ms**, lines with their symbol; `search` **0.8 ms**, ranked definitions |
+| Every call of `kmalloc` in the kernel | 26 ms, 3,387 lines matching `kmalloc\(` | `code_search kmalloc($A, $B)` **31 ms**, 2,715 two-argument calls with their functions |
+| Callers of `vfs_read` | 7.9 ms, 13 lines | `graph callers` 0.13 ms, 3 call edges with their sites |
+| Save a file, then ask again (kernel clone) | 4.4 s | 1.3 s with `fseventsd` idle; 4.3 s on 2026-09-07 with it at a core |
 
 tgrep indexes bytes, so it builds faster, uses far less memory, and takes any regex. A
 grep question over the kernel costs about 20 ms with either tool. vorpal's answers carry

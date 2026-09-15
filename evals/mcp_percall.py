@@ -7,10 +7,12 @@ pipelines Claude Code's Grep and Read tools run, on this repo and the Linux kern
 
     python3 evals/mcp_percall.py <results.json>
 
-Recorded runs: docs/wip/BENCHMARKS.md (2026-09-05, v0.8.2)."""
+VORPAL_BIN names the binary (default ~/.local/bin/vorpal); VORPAL_PERCALL_REPO names the
+checkout of this repository to serve and grep (default the repo itself; a scratch copy
+keeps the bench's daemon off the index other daemons serve). Recorded runs: docs/wip/BENCHMARKS.md (2026-09-05, v0.8.2)."""
 import json, os, subprocess, sys, time, statistics
-VORPAL = os.path.expanduser("~/.local/bin/vorpal")
-REPO = "/Users/adalundhe/Projects/vorpal"; KERNEL = "/Users/adalundhe/Projects/linux"
+VORPAL = os.environ.get("VORPAL_BIN", os.path.expanduser("~/.local/bin/vorpal"))
+REPO = os.environ.get("VORPAL_PERCALL_REPO", "/Users/adalundhe/Projects/vorpal"); KERNEL = "/Users/adalundhe/Projects/linux"
 class Daemon:
   def __init__(self, index):
     self.p = subprocess.Popen([VORPAL, "mcp", "--index", index], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env={**os.environ, "VORPAL_NO_AUTOWARM": "1"})
@@ -51,7 +53,7 @@ for corpus, root in (("repo", REPO), ("kernel", KERNEL)):
   if corpus == "repo":
     probes = [("callers tool_result", "graph", {"relation":"callers","name":"tool_result"}, r"rg -n 'tool_result\(' crates"),
               ("callees tool_result", "graph", {"relation":"callees","name":"tool_result"}, None),
-              ("reachable run_install out", "reachable", {"name":"run_install","direction":"out","min_grade":"exact"}, r"rg -n -A 75 'fn run_install' crates/cli/src/mcp_install.rs"),
+              ("reachable run_install out", "reachable", {"name":"run_install","direction":"out","min_grade":"exact","max_depth":0}, r"rg -n -A 75 'fn run_install' crates/cli/src/mcp_install.rs"),
               ("snippet render_toml", "snippet", {"name":"render_toml"}, "rg -n 'fn render_toml' crates && sed -n \"$(rg -n 'fn render_toml' crates | head -1 | cut -d: -f2),+56p\" \"$(rg -l 'fn render_toml' crates | head -1)\""),
               ("search 'stdio pump reader thread'", "search", {"query":"stdio pump reader thread","k":5}, r"rg -n -i 'stdio.*pump|reader thread' crates")]
   else:
