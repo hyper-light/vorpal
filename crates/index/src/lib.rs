@@ -2941,14 +2941,7 @@ fn ensure_ann(
   // serialized unrelated indexes for no reason. Late entrants re-check freshness under the
   // dir lock and find the first builder's work done. The key map is bounded by the distinct
   // index dirs this process ever warms.
-  static ANN_BUILDS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-  let dir_lock = {
-    let mut map = ANN_BUILDS
-      .get_or_init(|| Mutex::new(HashMap::new()))
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner());
-    map.entry(index_dir.to_path_buf()).or_default().clone()
-  };
+  let dir_lock = tier_build_lock(index_dir);
   let _guard = dir_lock
     .lock()
     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4690,10 +4683,56 @@ pub fn scope_population(index_dir: &Path, scope: &PathScope) -> Result<(u64, usi
   Ok(cached_searcher(index_dir)?.scope_population(scope))
 }
 
+/// The one-build-at-a-time lock for an index directory's warm tiers (ANN and postings):
+/// an eager background warm, a foreground search that must build, and the lexical heal
+/// on the same index must not build together (duplicate work, racing `tmp + rename`
+/// writes), while unrelated indexes warm concurrently. Late entrants re-check freshness
+/// under the lock and find the first builder's work done.
+fn tier_build_lock(index_dir: &Path) -> Arc<Mutex<()>> {
+  static BUILDS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+  let mut map = BUILDS
+    .get_or_init(|| Mutex::new(HashMap::new()))
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  map.entry(index_dir.to_path_buf()).or_default().clone()
+}
+
 /// Open the generation's searcher and build its scope file table now, so the first scoped
 /// query (or the first query at all) after a commit pays neither. Returns the file count.
 pub fn prewarm_scope_table(index_dir: &Path) -> Result<usize, Box<dyn Error>> {
   Ok(cached_searcher(index_dir)?.file_table().file_count())
+}
+
+/// Give the served generation its lexical posting tier when it is missing or stale, and
+/// hand it to the open searcher without reopening. A commit carries the ANN tier forward
+/// (the overlay reconciles it through `ann.files`) but not the postings: they name the
+/// node ids of one node segment, so the prior generation's cannot be reused. A daemon
+/// whose live tier is healthy never runs the full warm that would rebuild them, and
+/// until this heal every name query after an incremental commit tokenized every node
+/// (150 ms on the kernel against 0.8 ms with the tier). Serialized with the warm on the
+/// same index. Returns whether a build ran.
+pub fn heal_postings(index_dir: &Path) -> Result<bool, Box<dyn Error>> {
+  let searcher = cached_searcher(index_dir)?;
+  if searcher.postings.get().is_some() {
+    return Ok(false);
+  }
+  let dir_lock = tier_build_lock(index_dir);
+  let _guard = dir_lock
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  let built = if postings::postings_are_fresh(&searcher.generation_dir, searcher.stamp) {
+    false
+  } else {
+    vorpal_kg::phase_stamp("postings: heal — the served generation has no fresh lexical tier");
+    postings::build_postings(&searcher.kg, &searcher.generation_dir, searcher.stamp)?;
+    true
+  };
+  if let Some(tier) = postings::Postings::load(&searcher.generation_dir)
+    .filter(|tier| tier.stamp() == searcher.stamp)
+  {
+    let _ = searcher.postings.set(tier);
+  }
+  Ok(built)
 }
 
 pub fn search_report_filtered(
@@ -5017,8 +5056,11 @@ pub struct Searcher {
   /// The persisted ANN tier — present only when fresh for this generation (the common warm
   /// case). Absent → `run` takes the overlay/exhaustive tiers (cold, degraded, load per call).
   ann: Option<AnnIndex>,
-  /// The persisted lexical posting tier — present only when its stamp matches this generation.
-  postings: Option<postings::Postings>,
+  /// The persisted lexical posting tier — set when its stamp matches this generation:
+  /// at open when the file is fresh, else by [`heal_postings`] once it has built one.
+  postings: std::sync::OnceLock<postings::Postings>,
+  /// The node-segment stamp this generation's warm tiers are keyed by.
+  stamp: u64,
   /// The embedder this handle queries with — the PERSISTED tier's model when coherent
   /// (learned models checksum-verified at open), else the lexical default. Every query
   /// vector, overlay embed, and rerank goes through it, so vectors from different
@@ -5099,7 +5141,9 @@ impl Searcher {
       }
       None => (None, ActiveEmbedder::Lexical(LexicalEmbedder::default())),
     };
-    let postings = postings::Postings::load(&generation_dir).filter(|p| p.stamp() == stamp);
+    let postings = postings::Postings::load(&generation_dir)
+      .filter(|p| p.stamp() == stamp)
+      .map_or_else(std::sync::OnceLock::new, std::sync::OnceLock::from);
     let semantic_cutover =
       load_ann_calibration(&generation_dir, stamp, kg.node_count()).unwrap_or(kg.node_count());
     let bm25_enabled = persisted_tier_record(&generation_dir)
@@ -5115,6 +5159,7 @@ impl Searcher {
       scan_stats: Mutex::new(ScanStats::default()),
       ann,
       postings,
+      stamp,
       embedder,
       semantic_cutover,
       bm25_enabled,
@@ -5162,7 +5207,8 @@ impl Searcher {
       file_table: std::sync::OnceLock::new(),
       scan_stats: Mutex::new(ScanStats::default()),
       ann: None,
-      postings: None,
+      postings: std::sync::OnceLock::new(),
+      stamp,
       embedder,
       semantic_cutover,
       bm25_enabled,
@@ -5289,7 +5335,7 @@ impl Searcher {
   /// Bench-only, like [`Searcher::open_exact`].
   #[cfg(feature = "bench-internals")]
   pub fn tiers(&self) -> (bool, bool) {
-    (self.ann.is_some(), self.postings.is_some())
+    (self.ann.is_some(), self.postings.get().is_some())
   }
 
   /// The dense sidecar this handle holds — `(covered rows, channel on)` — or
@@ -6314,7 +6360,7 @@ impl Searcher {
   } else {
     self
       .postings
-      .as_ref()
+      .get()
       .and_then(|p| p.candidates(&lookup_tokens))
       .map(|ids| ids.into_iter().map(|id| id as u64).collect())
   };
@@ -6358,7 +6404,7 @@ impl Searcher {
   // pass, so results never depend on which tier answered.
   let bm25 = if want_bm25 {
     let bm25_admit = |id: u32| filter.is_empty() || compiled_filter.admits(kg, id as u64);
-    match &self.postings {
+    match self.postings.get() {
       Some(postings) => postings
         .bm25_ranked(&query_tokens, pool, bm25_admit)
         .unwrap_or_else(|| postings::bm25_exhaustive(kg, &query_tokens, pool, bm25_admit)),

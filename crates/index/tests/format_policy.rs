@@ -119,7 +119,7 @@ fn generated_table() -> String {
       "VERSION",
       "crates/index/src/postings.rs",
       version_of("crates/index/src/postings.rs", "VERSION"),
-      "scan fallback → warm rebuilds",
+      "scan fallback → the daemon heals it when it pins the generation; a warm rebuilds it",
     ),
     (
       "embedding semantics (`ann.model.json`)",

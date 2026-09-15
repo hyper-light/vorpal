@@ -624,12 +624,17 @@ impl Server {
     // building it the moment the daemon exists (its own gates decline when there is no
     // generation yet, a committer is mid-write, or the environment is custom).
     server.spawn_overlay_build();
-    // A daemon booting on an existing generation warms its scope file table (and
-    // searcher) now, so a `scope` call or scoped query before any generation-bound tool
-    // pays nothing either.
-    if generation.join("nodes.vseg").exists() {
+    // A daemon booting on an existing generation heals its lexical tier and warms its
+    // scope file table (and searcher) now, so a name query, a `scope` call, or a scoped
+    // query before any generation-bound tool pays for neither.
+    if generation.join("nodes.vseg").exists() || generation.join(vorpal_kg::NODES_TOC).is_file() {
       let index_dir = server.index_dir.clone();
       std::thread::spawn(move || {
+        // The lexical tier first: every name query pays for its absence (the scan over
+        // all names), a scope file table only the scoped ones.
+        if autowarm_enabled() {
+          let _ = vorpal_index::heal_postings(&index_dir);
+        }
         let _ = vorpal_index::prewarm_scope_table(&index_dir);
       });
     }
@@ -1178,6 +1183,9 @@ impl Server {
     // first scoped query after a commit pays neither.
     let index_dir = self.index_dir.clone();
     std::thread::spawn(move || {
+      if autowarm_enabled() {
+        let _ = vorpal_index::heal_postings(&index_dir);
+      }
       let _ = vorpal_index::prewarm_scope_table(&index_dir);
     });
   }

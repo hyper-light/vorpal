@@ -404,6 +404,15 @@ atomic `CURRENT` swap publishes new work, and `index` responses are prefixed `(s
 when a child ran. Without a discoverable binary the build runs in-process and says so.
 Child builds are killed after `VORPAL_MCP_BUILD_TIMEOUT_S` (default 1800).
 
+The search tiers heal per generation. A commit carries the semantic (ANN) tier forward and
+the daemon's live tier reconciles it; the lexical posting tier behind name queries names
+one node segment's ids and cannot be carried, so when a commit leaves the served
+generation without one the daemon rebuilds it in the background as soon as it pins that
+generation (about four seconds on the kernel) and hands it to the open searcher. Until it
+lands, name queries take the exact scan over every name (150 ms on the kernel, 0.4 ms
+with the tier), never a wrong answer. `VORPAL_NO_AUTOWARM=1` disables this heal with the
+other background tier builds.
+
 Two rules keep the served graph truthful when the tree and the index move independently:
 
 - **"Unchanged" is measured against what is served, never against what is on disk.** When
