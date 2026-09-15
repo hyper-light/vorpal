@@ -1334,7 +1334,7 @@ fn scope_object_facets_anchors_and_changed_files() {
   assert_eq!(set["deferred"], json!(["@dir"]), "{set}");
   let response = request(&mut fresh, 15, "tools/call", json!({"name": "search", "arguments": {"query": "caller", "k": 5}}));
   assert_eq!(response["result"]["isError"], true, "{response}");
-  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("bind to a symbol"));
+  assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("bind to a symbol"), "{response}");
   let bound = structured(&mut fresh, 16, "graph", json!({"relation": "callers", "name": "caller2"}));
   assert_eq!(bound["total"], 1, "{bound}");
   assert_eq!(bound["scope"]["source"], "session", "{bound}");
