@@ -162,8 +162,14 @@ wire contract: **[docs/mcp.md](docs/mcp.md)**.
 
 ## Filtering
 
-You're swapping `kmalloc` for `kzalloc` in ext4. `kmalloc` has 2,440 callers in the
-kernel. You only care about ext4:
+Every query can be limited to part of the codebase. Pass `--within` on the command line,
+or `within` over MCP, and the answer only includes matches under that path. Everything
+else is counted, so you can see how much was excluded.
+
+Here is how that plays out on the Linux kernel.
+
+Suppose you want to see every place ext4 calls `kmalloc`. Across the whole kernel there
+are 2,440 callers, far more than you want to read. Limit the answer to the ext4 directory:
 
 ```console
 $ vorpal graph callers kmalloc --all --within fs/ext4
@@ -176,18 +182,20 @@ root: /Users/adalundhe/Projects/linux/fs/ext4/
 outside scope: 2426 rows not listed
 ```
 
-14 call sites with line numbers. The rest are counted, not printed.
+You get the 14 callers inside ext4, each with its file and line number, and a note that
+2,426 callers elsewhere were left out.
 
-Same thing from Claude Code:
+An agent using vorpal over MCP asks the same way:
 
 ```json
 { "relation": "callers", "name": "kmalloc", "all": true, "within": "fs/ext4" }
 ```
 
-`total: 14`, `outsideScope: 2426`, 14 rows, 3 KB. Unfiltered, the first page alone is
-22 KB and the agent wanders off into `drivers/`.
+It receives the 14 rows plus `outsideScope: 2426`. Filtering matters more for agents than
+for people. An unfiltered page of 100 callers is 22 KB of JSON, and an agent that reads
+it usually starts poking at code in `drivers/` that has nothing to do with the task.
 
-Ext4 is done. Now the rest of `fs/`, minus ext4, minus tests:
+You can exclude paths as well as include them, and drop test files:
 
 ```console
 $ vorpal graph callers kmalloc --all --within fs --except fs/ext4 --no-tests
@@ -199,15 +207,17 @@ root: /Users/adalundhe/Projects/linux/fs/
 outside scope: 2031 rows not listed
 ```
 
-Over MCP that's a `scope` object. `classes` picks file types: `source`, `test`,
-`vendored`, `generated`.
+This covers all of `fs/` except ext4 and skips anything that looks like a test. Over MCP
+the same request uses a `scope` object. Its `classes` field chooses which kinds of file
+to keep: source, test, vendored, or generated.
 
 ```json
 { "relation": "callers", "name": "kmalloc", "all": true,
   "scope": { "within": ["fs"], "except": ["fs/ext4", "fs/btrfs"], "classes": ["source"] } }
 ```
 
-Three commits in. Which files you touched still call `kmalloc`?
+You can also filter by what changed. This asks for callers of `kmalloc` in the files
+modified by the last three commits:
 
 ```json
 { "relation": "callers", "name": "kmalloc", "all": true, "scope": { "changed_since": "HEAD~3" } }
@@ -219,26 +229,25 @@ Three commits in. Which files you touched still call `kmalloc`?
                { "name": "bio_kmalloc", "path": "block/bio.c", "site_line": 641 } ] }
 ```
 
-Three, all in `block/`, none in ext4. `changed_since` takes any git ref. `"worktree"`
-means uncommitted files.
+Three callers, all in `block/`. `changed_since` accepts any git ref. Use `"worktree"` for
+files with uncommitted changes.
 
-An agent sets the filter once and keeps it:
+An agent does not need to repeat the filter on every call. It can set one for the whole
+session with the `scope` tool:
 
 ```json
 { "within": ["fs"], "classes": ["source"] }
 ```
-```json
-{ "outcome": "scoped", "prefixes": ["/Users/adalundhe/Projects/linux/fs"],
-  "population": { "rows": 114293, "files": 75954 } }
-```
 
-From then on its searches stay in `fs/`. Search "read file into user buffer": `load_script`,
-`fill_read_buffer`, `fsverity_read_buffer`. Without the filter: two USB driver fields. To
-step out for one call, pass `within: []`. `scope {}` shows the filter, `scope { "clear":
-true }` drops it. Claude Code sends its workspace roots, and they become the filter on
-their own.
+After that, every search and graph query stays inside `fs/` until the agent clears the
+filter with `scope { "clear": true }`, or passes `within: []` to go outside it for a
+single call. Claude Code passes its workspace roots to vorpal automatically, so an agent
+opened in a subdirectory starts out filtered to that subdirectory.
 
-Reading code before you change it. One hop at a time:
+Two more filters are useful when you are reading code rather than changing it.
+
+`reachable` follows calls outward from a function. By default it goes one hop and tells
+you how much more there is:
 
 ```json
 { "name": "vfs_read", "direction": "out" }
@@ -249,10 +258,11 @@ Reading code before you change it. One hop at a time:
                { "name": "new_sync_read", "path": "fs/read_write.c", "depth": 1 }, ... ] }
 ```
 
-4 callees, 3 more one hop further. `max_depth: 2` gives 7. `max_depth: 0` gives
-everything. On CPython, `PyDict_GetItem` has one direct callee and a closure of 3,491.
+`vfs_read` calls four functions directly, and three more sit one hop further out. Raise
+`max_depth` to go further, or set it to 0 for the whole call tree.
 
-Callers in the same directory as the function:
+`@dir` limits the answer to the directory a function lives in, which is a quick way to
+see how it is used locally:
 
 ```console
 $ vorpal graph callers vfs_read --within @dir
@@ -263,10 +273,11 @@ root: /Users/adalundhe/Projects/linux/fs/
   read_code	Function	exec.c	constrained	source	T	7606224	ssize_t res = vfs_read(file, (void __user *)addr, len, &pos);	828
 ```
 
-`@file` is the function's file. `@package` is its nearest Cargo.toml, package.json,
-go.mod, pyproject.toml, Kbuild, or Makefile.
+`@file` does the same for the function's own file, and `@package` for the package it
+belongs to.
 
-Search takes the same filters. `k` results means `k` inside the filter:
+Search works the same way. Asking for three results inside `fs/ext4` gives you three
+results from ext4, not three results from the whole tree with the rest filtered out:
 
 ```console
 $ vorpal search "read file into user buffer" -k 3 --within fs/ext4
@@ -275,26 +286,27 @@ $ vorpal search "read file into user buffer" -k 3 --within fs/ext4
 0.0161  ext4_xattr_user_get [Function] /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c
 ```
 
-So do `text_search` and `code_search`. `kind: "Function"` keeps functions only,
-`lang: "python"` keeps Python only.
+`text_search` and `code_search` accept the same filters. You can also filter by symbol
+kind (`"kind": "Function"`) or by language (`"lang": "python"`).
 
-Rules. A filter never changes what the graph walks; a caller reached through a file
-outside the filter is still found, with its `via`. A path that doesn't exist is an error,
-not an empty answer. Text output ends with the same counts (`outside scope: 2426 rows not
-listed`, `frontier: 3 more at depth 2`). Every reply carries `radius`: how many files and
-top-level directories the session has touched so far.
+A few things stay true no matter what you filter. The filter only changes which rows
+come back, not how the graph is walked, so a caller that is only reachable through an
+excluded file is still found. A filter path that does not exist is an error rather than a
+silent empty result. Every reply includes a `radius` field with the number of files and
+directories the session has touched so far, which is a useful check on an agent that has
+wandered.
 
-Cost, kernel index, one warm daemon, medians of 20 calls:
+Filtering also makes queries cheaper, because the work is limited to the filtered part of
+the tree. Kernel index, one warm daemon, medians of 20 calls:
 
-| Question | Whole tree | Within `fs` | Within `fs/ext4` |
+| Query | Whole tree | Within `fs` | Within `fs/ext4` |
 |---|---:|---:|---:|
-| `graph callers kmalloc`, page of 100 | 44 ms, 100 of 2,440 rows, 22 KB | 8.7 ms, 100 of 424 | **2.6 ms**, all 14 rows, 3 KB |
+| `graph callers kmalloc`, page of 100 | 44 ms, 22 KB | 8.7 ms | **2.6 ms**, 3 KB |
 | `search "read file into user buffer"`, k = 8 | 2.5 ms | 2.8 ms | **1.7 ms** |
 | `text_search kmalloc\(` | 24 ms, 3,390 lines | 3.9 ms, 490 lines | **0.7 ms**, 15 lines |
-| `code_search kmalloc($A, $B)`, k = 10 | 31 ms, 3,572 files scanned | 13 ms, 436 files | **9.4 ms**, 10 files |
+| `code_search kmalloc($A, $B)`, k = 10 | 31 ms | 13 ms | **9.4 ms** |
 
-Searching by name is under a millisecond either way. A fresh shell process on the kernel
-adds 0.1 to 1.3 s to open the index. All the filter fields: [docs/mcp.md](docs/mcp.md#scope-rings-and-radius).
+The full list of filter options is in [docs/mcp.md](docs/mcp.md#scope-rings-and-radius).
 
 ## Language packages
 
