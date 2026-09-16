@@ -160,10 +160,13 @@ a shell can answer a single lookup in two turns with no schema load. `--profile
 scout|local|analysis|full` limits the tool set for read-only agents. The tool list and the
 wire contract: **[docs/mcp.md](docs/mcp.md)**.
 
-## Ask inside one part of the tree
+## Filtering
 
-Every question can be limited to part of the tree. Rows outside the part are counted,
-not listed, so the answer stays complete as a number. From the shell, on the kernel:
+By default every answer covers the whole tree. A filter narrows it to the part you care
+about. Rows the filter drops are counted, so you always know what was left out.
+
+**Only look in one directory.** On the kernel, `kmalloc` has 2,440 callers. If you are
+working on ext4, ask for the ones in ext4:
 
 ```console
 $ vorpal graph callers kmalloc --all --within fs/ext4
@@ -174,7 +177,23 @@ root: /Users/adalundhe/Projects/linux/fs/ext4/
   ext4_get_acl	Function	acl.c	heuristic	source	T	2745842	value = kmalloc(retval, GFP_NOFS);	167
   ...
 outside scope: 2426 rows not listed
+```
 
+You get the 14 callers in ext4 with the line each call is on, and the number left out.
+An agent asks the same thing over MCP:
+
+```json
+{ "relation": "callers", "name": "kmalloc", "all": true, "within": "fs/ext4" }
+```
+
+and reads back `total: 14`, `outsideScope: 2426`, and the 14 rows. That page is 3 KB.
+Without the filter the first page of 100 is 22 KB, and an agent given it tends to start
+opening callers in `drivers/` and `net/` that have nothing to do with the task.
+
+**Leave a directory out, skip the tests.** Everything under `fs` except ext4, with test
+files dropped:
+
+```console
 $ vorpal graph callers kmalloc --all --within fs --except fs/ext4 --no-tests
 records[100]:name	kind	path	grade	class	exported	id	site	site_line
 root: /Users/adalundhe/Projects/linux/fs/
@@ -182,64 +201,11 @@ root: /Users/adalundhe/Projects/linux/fs/
   load_elf_binary	Function	binfmt_elf.c	heuristic	source	F	342941	elf_interpreter = kmalloc(elf_ppnt->p_filesz, GFP_KERNEL);	894
   ...
 outside scope: 2031 rows not listed
-
-$ vorpal graph callers vfs_read --within @dir           # the directory vfs_read is defined in
-records[3]:name	kind	path	grade	class	exported	id	site	site_line
-root: /Users/adalundhe/Projects/linux/fs/
-  ksys_read	Function	read_write.c	exact	source	T	1854879	ret = vfs_read(fd_file(f), buf, count, ppos);	716
-  ksys_pread64	Function	read_write.c	exact	source	T	1854881	return vfs_read(fd_file(f), buf, count, &pos);	764
-  read_code	Function	exec.c	constrained	source	T	7606224	ssize_t res = vfs_read(file, (void __user *)addr, len, &pos);	828
-
-$ vorpal search "read file into user buffer" -k 3 --within fs/ext4
-0.0167  /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c [File] /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c
-0.0164  ext4_xattr_user_list [Function] /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c
-0.0161  ext4_xattr_user_get [Function] /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c
 ```
 
-`kmalloc` has 2,440 callers in the tree. Asked within `fs/ext4`, the answer is the 14
-in ext4 with their call sites, and the count of the rest. `--except` leaves a directory
-out, `--no-tests` leaves test files out, and `@dir` means the directory of the symbol
-being asked about (`@file` and `@package` work the same way; `@package` walks up to the
-nearest Cargo.toml, package.json, go.mod, pyproject.toml, Kbuild, Makefile, or similar).
-An entry that names nothing on disk is an error, not an empty answer. From a fresh
-process on the kernel these take 0.1 to 1.3 s, most of it opening the index and building
-its file table; the daemon holds both and answers the first one in 3 ms.
-
-An agent asks the same way. The MCP tools `graph`, `reachable`, `impact`, `search`,
-`text_search`, and `code_search` take `within` (one path or a list) or a `scope` object:
-
-```json
-{ "relation": "callers", "name": "kmalloc", "all": true, "within": "fs/ext4" }
-```
-```json
-{ "outcome": "hits", "total": 14, "outsideScope": 2426,
-  "scope": { "within": ["fs/ext4"], "source": "call" },
-  "base": "/Users/adalundhe/Projects/linux/fs/ext4/",
-  "records": [ { "name": "ext4_fc_snapshot_inode", "kind": "Function", "path": "fast_commit.c",
-                 "site": "snap = kmalloc(struct_size(snap, inode_buf, inode_len), GFP_NOFS);", "site_line": 1138 }, ... ] }
-```
-
-That page is 3 KB. The unscoped page of 100 is 22 KB, and an agent handed it tends to
-treat it as a work list: it opens callers in `drivers/` and `net/` and starts fixing
-things nobody asked about. The scoped answer is the same answer with the far part of it
-as a number.
-
-The scope object takes more than paths. Callers of `kmalloc` in the files changed by the
-last three commits, which is "does my change allocate":
-
-```json
-{ "relation": "callers", "name": "kmalloc", "all": true, "scope": { "changed_since": "HEAD~3" } }
-```
-```json
-{ "total": 3, "outsideScope": 2437, "scope": { "changedSince": "HEAD~3", "changedFiles": 38, "within": [] },
-  "records": [ { "name": "alloc_pvd", "path": "block/partitions/aix.c", "site_line": 118 },
-               { "name": "alloc_lvn", "path": "block/partitions/aix.c", "site_line": 143 },
-               { "name": "bio_kmalloc", "path": "block/bio.c", "site_line": 641 } ] }
-```
-
-`changed_since` takes any git ref, or `"worktree"` for the files with uncommitted edits.
-Callers inside `fs` but not in ext4 or btrfs, source files only (no tests, no vendored or
-generated code):
+Over MCP the same filter is a `scope` object. `classes` picks the kinds of file: `source`,
+`test`, `vendored`, `generated`. Callers of `kmalloc` in `fs`, not in ext4 or btrfs,
+source files only:
 
 ```json
 { "relation": "callers", "name": "kmalloc", "all": true,
@@ -249,33 +215,79 @@ generated code):
 { "total": 390, "outsideScope": 2050, ... }
 ```
 
-The other fields are `kind` (only `Function` rows, say), `lang`, and `exported`. On
-CPython, callers of `PyErr_SetString` within `Objects` that are functions: 378 of 1,977.
-The full field table is in [docs/mcp.md](docs/mcp.md#scope-rings-and-radius).
+**Only the files I changed.** "Does my change allocate?" is callers of `kmalloc` in the
+files the last three commits touched:
 
-**A scope for the whole session.** An agent working in one area sets it once with the
-`scope` tool and every later call answers inside it:
+```json
+{ "relation": "callers", "name": "kmalloc", "all": true, "scope": { "changed_since": "HEAD~3" } }
+```
+```json
+{ "total": 3, "outsideScope": 2437, "scope": { "changedSince": "HEAD~3", "changedFiles": 38 },
+  "records": [ { "name": "alloc_pvd", "path": "block/partitions/aix.c", "site_line": 118 },
+               { "name": "alloc_lvn", "path": "block/partitions/aix.c", "site_line": 143 },
+               { "name": "bio_kmalloc", "path": "block/bio.c", "site_line": 641 } ] }
+```
+
+`changed_since` takes any git ref. `"worktree"` means the files with uncommitted edits.
+
+**Only functions, only one language.** `kind` and `lang` filter by what the row is. Callers
+of `PyErr_SetString` in CPython's `Objects/` that are functions:
+
+```json
+{ "relation": "callers", "name": "PyErr_SetString", "scope": { "within": ["Objects"], "kind": "Function" } }
+```
+
+378 of its 1,977 callers. `"lang": "python"` on a search returns Python definitions only.
+
+**Relative to the symbol you asked about.** `@dir` is the directory the symbol lives in,
+`@file` its file, `@package` its nearest Cargo.toml, package.json, go.mod, pyproject.toml,
+Kbuild, or Makefile:
+
+```console
+$ vorpal graph callers vfs_read --within @dir
+records[3]:name	kind	path	grade	class	exported	id	site	site_line
+root: /Users/adalundhe/Projects/linux/fs/
+  ksys_read	Function	read_write.c	exact	source	T	1854879	ret = vfs_read(fd_file(f), buf, count, ppos);	716
+  ksys_pread64	Function	read_write.c	exact	source	T	1854881	return vfs_read(fd_file(f), buf, count, &pos);	764
+  read_code	Function	exec.c	constrained	source	T	7606224	ssize_t res = vfs_read(file, (void __user *)addr, len, &pos);	828
+```
+
+**Search inside a filter.** Filters apply to `search`, `text_search`, and `code_search`
+too, and `k` results means `k` results inside the filter:
+
+```console
+$ vorpal search "read file into user buffer" -k 3 --within fs/ext4
+0.0167  /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c [File] /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c
+0.0164  ext4_xattr_user_list [Function] /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c
+0.0161  ext4_xattr_user_get [Function] /Users/adalundhe/Projects/linux/fs/ext4/xattr_user.c
+```
+
+The candidates are found inside the filter, not ranked tree-wide and then cut down. Eight
+results within `fs/ext4` are eight ext4 definitions; the old `prefix` option on `search`
+returned none for the same query, because the tree-wide ranking never reached that deep.
+
+**Set it once.** An agent working in one area sets the filter for the session with the
+`scope` tool and every later call uses it:
 
 ```json
 { "within": ["fs"], "classes": ["source"] }
 ```
 ```json
-{ "outcome": "scoped", "scope": { "within": ["fs"], "source": "session" },
-  "prefixes": ["/Users/adalundhe/Projects/linux/fs"],
-  "population": { "rows": 114293, "ranges": 32, "files": 75954 } }
+{ "outcome": "scoped", "prefixes": ["/Users/adalundhe/Projects/linux/fs"],
+  "population": { "rows": 114293, "files": 75954 } }
 ```
 
-A plain `search` for "read file into user buffer" then returns `load_script`,
-`fill_read_buffer`, and `fsverity_read_buffer`, all under `fs/`, stamped
-`scope.source: "session"`; the same search unscoped returns two USB driver fields first.
-One call can step outside with `within: []`, `scope {}` shows the default, and
-`scope { "clear": true }` removes it. A client that shares its workspace roots (Claude
-Code, IDE clients) gets them as the default when they sit inside the tree: an agent
-opened on `fs/ext4` starts scoped without being told, and a `scope` call it makes wins
-over the roots.
+A plain `search` for "read file into user buffer" now returns `load_script`,
+`fill_read_buffer`, and `fsverity_read_buffer`, all under `fs/`, marked
+`scope.source: "session"`; unfiltered, the same search returns two USB driver fields
+first. To step outside for one call, pass `within: []`. `scope {}` shows the current
+filter, `scope { "clear": true }` removes it. Claude Code and IDE clients that share
+their workspace roots get those as the session filter automatically when the roots sit
+inside the tree, so an agent opened on `fs/ext4` starts filtered; a `scope` call it
+makes takes precedence.
 
-**Rings instead of closures.** `reachable` and `impact` return one hop by default and say
-how big the next one is:
+**How far to walk.** `reachable` and `impact` return one hop by default and tell you how
+much the next hop would add:
 
 ```json
 { "name": "vfs_read", "direction": "out" }
@@ -286,38 +298,32 @@ how big the next one is:
                { "name": "new_sync_read", "path": "fs/read_write.c", "depth": 1 }, ... ] }
 ```
 
-`max_depth: 2` returns 7 rows with `frontier: 1`; `max_depth: 0` walks the whole
-closure. On CPython, `reachable PyDict_GetItem` returns its one direct callee and
-`frontier: 6` in 0.04 ms, where the closure is 3,491 definitions. The text answer ends
-with the same numbers (`outside scope: 2426 rows not listed (within: fs/ext4)`,
-`frontier: 3 more at depth 2`), so a client that shows only text sees them too.
+`max_depth: 2` gives 7 rows and `frontier: 1`. `max_depth: 0` walks everything. On
+CPython, `reachable PyDict_GetItem` returns its one direct callee and `frontier: 6`,
+where the full closure is 3,491 definitions.
 
-Three things hold throughout. A scope never changes what the graph walks: a caller two
-hops away through a file outside the scope is still found, with its `via`. `graph` rows
-come nearest file first (the symbol's own file, then its directory, then the longest
-shared parent), so a page cut by `limit` drops the far end of the answer, not a random
-slice. Every answer carries `radius`, the files and top-level directories the session's
-answers have named since its first question, so a session that has drifted into thirty
-directories says so on every reply.
+**What a filter never does.** It never changes what the graph walks: a caller reached
+through a file outside the filter is still found, with its `via`. A path that names
+nothing on disk is an error, not an empty answer. The text output ends with the same
+counts (`outside scope: 2426 rows not listed (within: fs/ext4)`, `frontier: 3 more at
+depth 2`), so a client that shows only text sees them. Every answer also carries
+`radius`: how many files and top-level directories the session's answers have named so
+far, so you can see when a session has wandered.
 
-What it costs, on the kernel index with one warm daemon (medians of 20 calls; the page
+**What it costs**, on the kernel index with one warm daemon (medians of 20 calls; page
 size is the compact JSON Claude Code hands the model):
 
 | Question | Whole tree | Within `fs` | Within `fs/ext4` |
 |---|---:|---:|---:|
-| `graph callers kmalloc`, page of 100 | 44 ms, 100 of 2,440 rows, 22 KB | 8.7 ms, 100 of 424 (2,016 outside) | **2.6 ms**, all 14 rows, 3 KB |
-| `search "vfs_read"`, k = 8 | 0.28 ms | 0.72 ms | 0.93 ms |
+| `graph callers kmalloc`, page of 100 | 44 ms, 100 of 2,440 rows, 22 KB | 8.7 ms, 100 of 424 | **2.6 ms**, all 14 rows, 3 KB |
 | `search "read file into user buffer"`, k = 8 | 2.5 ms | 2.8 ms | **1.7 ms** |
-| `text_search kmalloc\(` | 24 ms, 3,390 lines in 1,848 files | 3.9 ms, 490 lines | **0.7 ms**, 15 lines |
+| `text_search kmalloc\(` | 24 ms, 3,390 lines | 3.9 ms, 490 lines | **0.7 ms**, 15 lines |
 | `code_search kmalloc($A, $B)`, k = 10 | 31 ms, 3,572 files scanned | 13 ms, 436 files | **9.4 ms**, 10 files |
-| `reachable vfs_read`, one ring / whole closure | 0.09 ms, 4 rows, frontier 3 / 0.09 ms, 8 rows | | |
 
-A scoped search finds its candidates inside the scope rather than ranking the tree and
-keeping what falls under the path: `k: 8` within `fs/ext4` returns eight ext4
-definitions, where the pre-0.10 prefix filter returned none, because the tree-wide
-ranking never reached that deep. Graph, text, and structural answers cost what the scope
-covers. A name search inside a scope is not faster than the tree-wide one (both are a
-fraction of a millisecond); a descriptive one is, because it reads fewer files. Driver:
+Graph, text, and structural answers cost what the filter covers. A search by name is
+under a millisecond with or without a filter. From a fresh shell process on the kernel,
+add 0.1 to 1.3 s to open the index. The full list of filter fields is in
+[docs/mcp.md](docs/mcp.md#scope-rings-and-radius); the driver behind the table is
 `evals/scope_bench.py`.
 
 ## Language packages
