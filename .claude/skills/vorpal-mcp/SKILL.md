@@ -6,7 +6,7 @@ description: Run and configure vorpal's MCP server — stdio serving, client con
 # Serving the knowledge graph over MCP
 
 ```
-vorpal mcp [--index DIR] [--profile scout|analysis|full] [--projects] [--no-watch-rebuild]
+vorpal mcp [--index DIR] [--profile scout|analysis|local|full] [--projects] [--no-watch-rebuild]
 ```
 
 Serves over **stdio**. On start it holds the index warm, watches the source tree, and
@@ -34,7 +34,30 @@ Run from the repo root so the default `./.vorpal/index` resolves; pass
 |---|---|
 | `scout` | node, search, snippet, schema, fetch_span — read-only navigation |
 | `analysis` | scout + graph, reachable, why, health, dead_code, coverage, impact, compare_generations, architecture, code_search, data_flow, query |
+| `local` | full minus `reachable` and `impact` — for agents that should not walk closures |
 | `full` (default) | everything: analysis + index, structural_search, rule_search, ast_dump |
+
+## Filtering (keeping an agent in its area)
+
+`graph`, `reachable`, `impact`, `search`, `text_search`, and `code_search` take `within`
+(a path or list of paths) or a `scope` object: `within`, `except`, `classes`
+(`source|test|vendored|generated`), `kind`, `lang`, `exported`, `changed_since` (a git
+ref, or `"worktree"`). `@file`, `@dir`, `@package` are relative to the symbol asked
+about. Rows outside are dropped and counted in `outsideScope`; the answer stays complete
+as a number. Search generates its candidates inside the scope, so `k` means `k` in scope.
+
+```json
+{ "relation": "callers", "name": "kmalloc", "all": true, "within": "fs/ext4" }
+{ "relation": "callers", "name": "kmalloc", "all": true, "scope": { "changed_since": "HEAD~3" } }
+```
+
+The `scope` tool sets a session default (`scope {within: ["fs"], classes: ["source"]}`);
+later calls answer inside it (`scope.source: "session"`), `within: []` steps out for one
+call, `scope {clear: true}` removes it, `scope {}` shows it. A client that shares its
+workspace roots (Claude Code, IDE clients) gets them as the default when they sit inside
+the tree. `reachable` and `impact` return one hop by default and report the next hop as
+`frontier`; `max_depth: 0` walks everything. Every answer carries `radius`, the files and
+top-level directories the session has touched so far.
 
 ## Multi-project daemon
 
@@ -61,4 +84,5 @@ at the stated grade; they need no confirmation by search or grep. Repo health/pl
 `ast_dump` (parse tree for rule authoring). Graph queries: `query` (Cypher-shaped).
 Maintenance: `index` (with `parse_health`/`max_error_ratio`/`semantic_tier` policy).
 
-Full integration guide with per-tool arguments: `docs/MCP.md`.
+Full integration guide with per-tool arguments: `docs/mcp.md` (the scope field table is
+under "Scope, rings, and radius").

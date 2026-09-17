@@ -416,6 +416,11 @@ fn external_id_bookmarks_survive_rebuilds() {
   let _ = fs::remove_dir_all(&base);
 }
 
+/// `VORPAL_VERIFY_CACHE` is process-global and tests run in parallel threads: the test that
+/// sets it and the test that asserts the default mode must not overlap (the "default mode
+/// is reported" assertion failed once in a full-suite run on 2026-09-17 for this reason).
+static VERIFY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Explicit cache-validity modes (IMPROVEMENTS 07-29 §3), adversarial search-fed path: a
 /// banked product whose source then suffers a preserved-mtime same-size edit replays stale
 /// under `fast-stat` outside the racy window (the documented blind spot), and `Verified`
@@ -440,7 +445,10 @@ fn verified_mode_catches_stale_banked_products() {
     h.set_times(fs::FileTimes::new().set_modified(past)).unwrap();
   };
   set_past(&victim);
-  let first = build_index(&src, &out).unwrap();
+  let first = {
+    let _env = VERIFY_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    build_index(&src, &out).unwrap()
+  };
   assert_eq!(first.cache_mode, "fast-stat", "default mode is reported");
 
   // Search banks a product for v2 (same size as v1, mtime restored to the past stamp)…
@@ -1288,9 +1296,13 @@ fn same_size_restored_mtime_edit_is_caught() {
     .set_times(fs::FileTimes::new().set_modified(original_mtime))
     .unwrap();
   drop(handle);
-  unsafe { std::env::set_var("VORPAL_VERIFY_CACHE", "1") };
-  let report = build_index(&src, &out).unwrap();
-  unsafe { std::env::remove_var("VORPAL_VERIFY_CACHE") };
+  let report = {
+    let _env = VERIFY_ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    unsafe { std::env::set_var("VORPAL_VERIFY_CACHE", "1") };
+    let report = build_index(&src, &out).unwrap();
+    unsafe { std::env::remove_var("VORPAL_VERIFY_CACHE") };
+    report
+  };
   assert_eq!(
     report.indexed, 1,
     "verify mode must catch the stat-invisible edit"

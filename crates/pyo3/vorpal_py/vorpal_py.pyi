@@ -116,7 +116,11 @@ class Index:
         kind: Optional[str] = None,
         id: Optional[int] = None,
         all: bool = False,
-    ) -> List[Dict[str, Any]]: ...
+        within: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        classes: Optional[List[str]] = None,
+        changed_since: Optional[str] = None,
+    ) -> Dict[str, Any]: ...
     def reachable(
         self,
         name: str,
@@ -128,7 +132,11 @@ class Index:
         kind: Optional[str] = None,
         id: Optional[int] = None,
         all: bool = False,
-    ) -> List[Dict[str, Any]]: ...
+        within: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        classes: Optional[List[str]] = None,
+        changed_since: Optional[str] = None,
+    ) -> Dict[str, Any]: ...
     def why(
         self,
         from_id: int,
@@ -144,6 +152,11 @@ class Index:
         kind: Optional[str] = None,
         lang: Optional[str] = None,
         exported: bool = False,
+        exclude_tests: bool = False,
+        within: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        classes: Optional[List[str]] = None,
+        changed_since: Optional[str] = None,
     ) -> List[Dict[str, Any]]: ...
 
 def index_build(src: str, out: Optional[str] = None) -> str: ...

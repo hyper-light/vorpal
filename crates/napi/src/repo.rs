@@ -67,6 +67,80 @@ pub struct GraphOptions {
   pub all: Option<bool>,
   /// Append node ids to result lines.
   pub ids: Option<bool>,
+  /// Filter the answer's rows (`Index.related`): rows outside the scope are dropped and
+  /// counted in `outsideScope`. `indexGraph` renders the unscoped text answer and refuses it.
+  pub scope: Option<ScopeOptions>,
+}
+
+/// Path and row filters, the MCP `scope` object: `within` / `except` are path prefixes
+/// relative to the source root (the tree a default-layout `<src>/.vorpal/index` names) or
+/// absolute; `@file`, `@dir`, `@package` bind to the symbol a `related` / `reachable` call
+/// is about; `classes` keeps `source`, `test`, `vendored`, `generated` files; `kind`,
+/// `lang`, `exported` filter rows; `changedSince` keeps files changed since a git ref
+/// (`worktree` = uncommitted edits). A path that names nothing is an error.
+#[napi(object)]
+#[derive(Default, Clone)]
+pub struct ScopeOptions {
+  pub within: Option<Vec<String>>,
+  pub except: Option<Vec<String>>,
+  pub classes: Option<Vec<String>>,
+  pub kind: Option<String>,
+  pub lang: Option<String>,
+  pub exported: Option<bool>,
+  pub changed_since: Option<String>,
+}
+
+fn scope_spec(options: &ScopeOptions) -> vorpal_index::ScopeSpec {
+  vorpal_index::ScopeSpec {
+    within: options.within.clone().unwrap_or_default(),
+    except: options.except.clone().unwrap_or_default(),
+    classes: options.classes.clone().unwrap_or_default(),
+    kind: options.kind.clone(),
+    lang: options.lang.clone(),
+    exported: options.exported,
+    changed_since: options.changed_since.clone(),
+  }
+}
+
+/// Resolve a call's scope against the index's source root, binding `@…` entries to
+/// `anchor` (the symbol's own path). An empty scope is no scope.
+fn resolve_scope(
+  options: Option<&ScopeOptions>,
+  source_root: Option<&std::path::Path>,
+  anchor: Option<&str>,
+) -> Result<Option<vorpal_index::PathScope>> {
+  let Some(options) = options else {
+    return Ok(None);
+  };
+  let spec = scope_spec(options);
+  if spec.is_empty() {
+    return Ok(None);
+  }
+  let scope = vorpal_index::PathScope::from_spec(&spec, source_root, anchor).map_err(Error::from_reason)?;
+  if !scope.deferred().is_empty() {
+    return Err(Error::from_reason(format!(
+      "scope entries {} bind to a symbol: use them on related or reachable, not search",
+      scope.deferred().join(", ")
+    )));
+  }
+  Ok((!scope.is_empty()).then_some(scope))
+}
+
+/// The symbol's own path, for `@file` / `@dir` / `@package` and nearest-first ordering.
+fn anchor_of(kg: &vorpal_kg::Kg, target: &vorpal_index::GraphTarget) -> Option<String> {
+  vorpal_index::resolve_target(kg, target)
+    .ok()
+    .and_then(|ids| ids.first().copied())
+    .and_then(|id| kg.node(id).map(|view| view.path.to_string()))
+}
+
+fn stamp_scope(value: &mut serde_json::Value, scope: Option<&vorpal_index::PathScope>, outside: Option<usize>) {
+  if let Some(scope) = scope {
+    value["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+    if let Some(outside) = outside {
+      value["outsideScope"] = serde_json::json!(outside);
+    }
+  }
 }
 
 /// Graph query with the shared symbol-selector contract.
@@ -78,6 +152,11 @@ pub fn index_graph(
   options: Option<GraphOptions>,
 ) -> Result<String> {
   let options = options.unwrap_or_default();
+  if options.scope.as_ref().is_some_and(|scope| !scope_spec(scope).is_empty()) {
+    return Err(Error::from_reason(
+      "scope is honoured by Index.related; indexGraph renders the unscoped text answer",
+    ));
+  }
   let target = vorpal_index::GraphTarget {
     name,
     id: options.id.and_then(|v| u64::try_from(v).ok()),
@@ -183,6 +262,10 @@ pub struct ReachOptions {
   pub id: Option<i64>,
   /// Merge across all same-named seeds instead of listing candidates.
   pub all: Option<bool>,
+  /// Filter the reached rows; the walk itself is unchanged (a node reached through a file
+  /// outside the scope is still found, with its `via`). Dropped rows are counted in
+  /// `outsideScope`.
+  pub scope: Option<ScopeOptions>,
 }
 
 fn selected_to_value<T: serde::Serialize>(
@@ -234,6 +317,8 @@ pub struct Index {
   kg: std::sync::Arc<vorpal_kg::Kg>,
   generation_dir: std::path::PathBuf,
   generation: String,
+  /// The tree a default-layout index dir names; relative scope entries resolve against it.
+  source_root: Option<std::path::PathBuf>,
 }
 
 #[napi]
@@ -253,6 +338,7 @@ impl Index {
       kg,
       generation_dir,
       generation,
+      source_root: vorpal_index::default_layout_root(root),
     })
   }
 
@@ -283,7 +369,7 @@ impl Index {
     name: String,
     options: Option<GraphOptions>,
   ) -> Result<serde_json::Value> {
-    related_core(&self.kg, verb, name, options)
+    related_core(&self.kg, self.source_root.as_deref(), verb, name, options)
   }
 
   /// Typed relation-restricted traversal: BFS steps with depth, parent (`via`), relation,
@@ -295,7 +381,7 @@ impl Index {
     direction: String,
     options: Option<ReachOptions>,
   ) -> Result<serde_json::Value> {
-    reachable_core(&self.kg, name, direction, options)
+    reachable_core(&self.kg, self.source_root.as_deref(), name, direction, options)
   }
 
   /// Typed evidence (`why`): edge form (`toId`) or absence form (`name`).
@@ -319,7 +405,7 @@ impl Index {
     k: Option<u32>,
     options: Option<SearchOptions>,
   ) -> Result<serde_json::Value> {
-    search_core(&self.generation_dir, query, k, options)
+    search_core(&self.generation_dir, self.source_root.as_deref(), query, k, options)
   }
 
   /// `node`, off the event loop.
@@ -353,8 +439,9 @@ impl Index {
     options: Option<GraphOptions>,
   ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
     let kg = self.kg.clone();
+    let root = self.source_root.clone();
     AsyncTask::new(crate::repo_async::RepoTask::new(move || {
-      related_core(&kg, verb, name, options).map(crate::repo_async::Json)
+      related_core(&kg, root.as_deref(), verb, name, options).map(crate::repo_async::Json)
     }))
   }
 
@@ -368,8 +455,9 @@ impl Index {
     options: Option<ReachOptions>,
   ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
     let kg = self.kg.clone();
+    let root = self.source_root.clone();
     AsyncTask::new(crate::repo_async::RepoTask::new(move || {
-      reachable_core(&kg, name, direction, options).map(crate::repo_async::Json)
+      reachable_core(&kg, root.as_deref(), name, direction, options).map(crate::repo_async::Json)
     }))
   }
 
@@ -396,8 +484,9 @@ impl Index {
     options: Option<SearchOptions>,
   ) -> AsyncTask<crate::repo_async::RepoTask<crate::repo_async::Json>> {
     let generation_dir = self.generation_dir.clone();
+    let root = self.source_root.clone();
     AsyncTask::new(crate::repo_async::RepoTask::new(move || {
-      search_core(&generation_dir, query, k, options).map(crate::repo_async::Json)
+      search_core(&generation_dir, root.as_deref(), query, k, options).map(crate::repo_async::Json)
     }))
   }
 }
@@ -422,18 +511,47 @@ pub(crate) fn nodes_core(kg: &vorpal_kg::Kg, name: String, options: Option<Graph
     serde_json::to_value(records).map_err(|e| Error::from_reason(e.to_string()))
   }
 
-pub(crate) fn related_core(kg: &vorpal_kg::Kg, verb: String, name: String, options: Option<GraphOptions>) -> Result<serde_json::Value> {
-    let options = options.unwrap_or_default();
-    let selected = vorpal_index::records::related_records(
-      kg,
-      &verb,
-      &selector_target(name, &options),
-    )
-    .map_err(Error::from_reason)?;
-    selected_to_value(selected)
-  }
+pub(crate) fn related_core(
+  kg: &vorpal_kg::Kg,
+  source_root: Option<&std::path::Path>,
+  verb: String,
+  name: String,
+  options: Option<GraphOptions>,
+) -> Result<serde_json::Value> {
+  let options = options.unwrap_or_default();
+  let target = selector_target(name, &options);
+  let selected = vorpal_index::records::related_records(kg, &verb, &target).map_err(Error::from_reason)?;
+  let anchor = anchor_of(kg, &target);
+  let scope = resolve_scope(options.scope.as_ref(), source_root, anchor.as_deref())?;
+  // The scope is a view over the rows, and the rows come nearest the symbol's file first,
+  // as the daemon's `graph` answers do.
+  let (selected, outside) = match (selected, &scope) {
+    (vorpal_index::records::Selected::Hits(hits), Some(scope)) => {
+      let before = hits.len();
+      let mut kept: Vec<_> = hits
+        .into_iter()
+        .filter(|hit| vorpal_index::records::scope_admits_record(scope, &hit.node))
+        .collect();
+      if let Some(anchor) = anchor.as_deref() {
+        vorpal_index::records::order_by_proximity(&mut kept, anchor);
+      }
+      let outside = before - kept.len();
+      (vorpal_index::records::Selected::Hits(kept), Some(outside))
+    }
+    (other, _) => (other, None),
+  };
+  let mut value = selected_to_value(selected)?;
+  stamp_scope(&mut value, scope.as_ref(), outside);
+  Ok(value)
+}
 
-pub(crate) fn reachable_core(kg: &vorpal_kg::Kg, name: String, direction: String, options: Option<ReachOptions>) -> Result<serde_json::Value> {
+pub(crate) fn reachable_core(
+  kg: &vorpal_kg::Kg,
+  source_root: Option<&std::path::Path>,
+  name: String,
+  direction: String,
+  options: Option<ReachOptions>,
+) -> Result<serde_json::Value> {
     let options = options.unwrap_or_default();
     let dir = match direction.as_str() {
       "in" => vorpal_kg::Direction::In,
@@ -478,7 +596,24 @@ pub(crate) fn reachable_core(kg: &vorpal_kg::Kg, name: String, direction: String
       min_confidence,
     )
     .map_err(Error::from_reason)?;
-    selected_to_value(selected)
+    // A view over the reached rows: the walk is unchanged, rows outside are counted.
+    let anchor = anchor_of(kg, &target);
+    let scope = resolve_scope(options.scope.as_ref(), source_root, anchor.as_deref())?;
+    let (selected, outside) = match (selected, &scope) {
+      (vorpal_index::records::Selected::Hits(rows), Some(scope)) => {
+        let before = rows.len();
+        let kept: Vec<_> = rows
+          .into_iter()
+          .filter(|row| vorpal_index::records::scope_admits_record(scope, &row.node))
+          .collect();
+        let outside = before - kept.len();
+        (vorpal_index::records::Selected::Hits(kept), Some(outside))
+      }
+      (other, _) => (other, None),
+    };
+    let mut value = selected_to_value(selected)?;
+    stamp_scope(&mut value, scope.as_ref(), outside);
+    Ok(value)
   }
 
 pub(crate) fn why_core(kg: &vorpal_kg::Kg, from_id: i64, to_id: Option<i64>, name: Option<String>) -> Result<serde_json::Value> {
@@ -497,8 +632,15 @@ pub(crate) fn why_core(kg: &vorpal_kg::Kg, from_id: i64, to_id: Option<i64>, nam
     serde_json::to_value(records).map_err(|e| Error::from_reason(e.to_string()))
   }
 
-pub(crate) fn search_core(generation_dir: &std::path::Path, query: String, k: Option<u32>, options: Option<SearchOptions>) -> Result<serde_json::Value> {
+pub(crate) fn search_core(
+  generation_dir: &std::path::Path,
+  source_root: Option<&std::path::Path>,
+  query: String,
+  k: Option<u32>,
+  options: Option<SearchOptions>,
+) -> Result<serde_json::Value> {
     let options = options.unwrap_or_default();
+    let within = resolve_scope(options.scope.as_ref(), source_root, None)?;
     let filter = vorpal_index::SearchFilter {
       path_prefix: options.prefix,
       path_suffix: options.path,
@@ -506,7 +648,7 @@ pub(crate) fn search_core(generation_dir: &std::path::Path, query: String, k: Op
       lang: options.lang,
       exported_only: options.exported.unwrap_or(false),
       exclude_tests: options.exclude_tests.unwrap_or(false),
-      within: None,
+      within,
     };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
@@ -536,6 +678,9 @@ pub struct SearchOptions {
   pub exported: Option<bool>,
   /// Exclude definitions in test files from results.
   pub exclude_tests: Option<bool>,
+  /// Search inside a scope: candidates are generated inside it, so `k` results means `k`
+  /// results in scope. `@…` entries need a symbol and are refused here.
+  pub scope: Option<ScopeOptions>,
 }
 
 /// `vorpal search --ranked`'s core: ONE search, two orderings — the fused ranking
@@ -601,4 +746,104 @@ pub fn index_tune(
   )
   .map_err(Error::from_reason)?;
   serde_json::to_value(report).map_err(|e| Error::from_reason(e.to_string()))
+}
+
+#[cfg(test)]
+mod scope_tests {
+  use super::{GraphOptions, ReachOptions, ScopeOptions, SearchOptions, related_core, reachable_core, search_core};
+
+  fn fixture(tag: &str) -> (std::path::PathBuf, vorpal_kg::Kg) {
+    let base = std::env::temp_dir().join(format!("vorpal-node-scope-{tag}-{}", std::process::id()));
+    let src = base.join("src");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("b.rs"), "pub fn target() -> i32 {\n    0\n}\n").unwrap();
+    std::fs::write(src.join("a.rs"), "use b::target;\n\npub fn caller() -> i32 {\n    target()\n}\n").unwrap();
+    std::fs::write(
+      src.join("sub").join("c.rs"),
+      "use b::target;\n\npub fn caller2() -> i32 {\n    target()\n}\n",
+    )
+    .unwrap();
+    let index = src.join(".vorpal").join("index");
+    vorpal_index::build_index(&src, &index).expect("index");
+    let kg = vorpal_kg::Kg::load(&vorpal_kg::resolve_index_dir(&index)).expect("kg");
+    (index, kg)
+  }
+
+  fn within(entries: &[&str]) -> ScopeOptions {
+    ScopeOptions {
+      within: Some(entries.iter().map(|e| e.to_string()).collect()),
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn related_reachable_and_search_honour_the_scope() {
+    let (index, kg) = fixture("cores");
+    let root = vorpal_index::default_layout_root(&index);
+    assert!(root.is_some(), "default layout names its tree");
+
+    let value = related_core(
+      &kg,
+      root.as_deref(),
+      "callers".into(),
+      "target".into(),
+      Some(GraphOptions { scope: Some(within(&["sub"])), ..Default::default() }),
+    )
+    .unwrap();
+    assert_eq!(value["outcome"], "hits", "{value}");
+    assert_eq!(value["records"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["outsideScope"], 1, "{value}");
+    assert!(value["records"][0]["path"].as_str().unwrap().ends_with("sub/c.rs"), "{value}");
+    assert_eq!(value["scope"]["within"], serde_json::json!(["sub"]), "{value}");
+
+    // `@dir` binds to the symbol asked about: caller2's own directory is `sub`.
+    let value = related_core(
+      &kg,
+      root.as_deref(),
+      "callees".into(),
+      "caller2".into(),
+      Some(GraphOptions { scope: Some(within(&["@dir"])), ..Default::default() }),
+    )
+    .unwrap();
+    assert_eq!(value["records"].as_array().unwrap().len(), 0, "{value}");
+    assert_eq!(value["outsideScope"], 1, "{value}");
+
+    let value = reachable_core(
+      &kg,
+      root.as_deref(),
+      "target".into(),
+      "in".into(),
+      Some(ReachOptions { scope: Some(within(&["sub"])), ..Default::default() }),
+    )
+    .unwrap();
+    assert_eq!(value["outcome"], "hits", "{value}");
+    for row in value["records"].as_array().unwrap() {
+      assert!(row["path"].as_str().unwrap().ends_with("sub/c.rs"), "{value}");
+    }
+    assert_eq!(value["outsideScope"], 1, "{value}");
+
+    let generation = vorpal_kg::resolve_index_dir(&index);
+    let value = search_core(
+      &generation,
+      root.as_deref(),
+      "caller".into(),
+      Some(5),
+      Some(SearchOptions { scope: Some(within(&["sub"])), ..Default::default() }),
+    )
+    .unwrap();
+    let hits = value.as_array().expect("search returns the hit list");
+    assert!(!hits.is_empty(), "{value}");
+    for hit in hits {
+      assert!(hit["path"].as_str().unwrap().ends_with("sub/c.rs"), "{value}");
+    }
+
+    // A scope entry that names nothing is an error, never an empty answer; `@dir` on a
+    // search has no symbol to bind to.
+    let err = search_core(&generation, root.as_deref(), "caller".into(), Some(5), Some(SearchOptions { scope: Some(within(&["nope"])), ..Default::default() })).unwrap_err();
+    assert!(err.reason.contains("nope"), "{err}");
+    let err = search_core(&generation, root.as_deref(), "caller".into(), Some(5), Some(SearchOptions { scope: Some(within(&["@dir"])), ..Default::default() })).unwrap_err();
+    assert!(err.reason.contains("bind to a symbol"), "{err}");
+    let _ = std::fs::remove_dir_all(index.parent().unwrap().parent().unwrap().parent().unwrap());
+  }
 }

@@ -32,6 +32,20 @@ Fuses exact/token name matches, lexical-embedding similarity, and graph in-degre
 | `--lang rust` | language name or alias (rust, py, ts, …) |
 | `--exported` | only exported definitions |
 | `--no-tests` | exclude test-classified paths |
+| `--within PREFIX` | search inside this path only (repeatable; relative to the indexed tree) |
+| `--except PREFIX` | leave this path out (repeatable) |
+| `--class source\|test\|vendored\|generated` | files of this class only (repeatable) |
+| `--changed-since REF` | files changed since a git ref only (`worktree` = uncommitted) |
+
+`--within` and friends generate the candidates inside the filter, so `-k 8 --within
+fs/ext4` returns eight ext4 definitions; `--prefix` ranks the whole tree first and keeps
+what falls under the path, which can starve on a small directory. Prefer `--within`.
+Both modes take them, `--code` included:
+
+```
+vorpal search "read file into user buffer" -k 5 --within fs/ext4
+vorpal search --code 'kmalloc($A, $B)' --lang c --within fs --except fs/ext4
+```
 
 ## Structural mode (`--code`)
 

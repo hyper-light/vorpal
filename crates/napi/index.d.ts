@@ -10,7 +10,7 @@ export { findInFiles, kind, parse, parseAsync, parseFiles, pattern } from './typ
 export { Lang } from './types/lang'
 export { registerDynamicLanguage } from './types/registerDynamicLang'
 export { SgNode, SgRoot } from './types/sgnode'
-export type { BuildReport, GraphOptions, NodeInfo, ReachOptions, SearchOptions, TuneQueryInput } from './types/repo'
+export type { BuildReport, GraphOptions, NodeInfo, ReachOptions, ScopeOptions, SearchOptions, TuneQueryInput } from './types/repo'
 export {
   Index,
   indexBuild, indexBuildAsync,

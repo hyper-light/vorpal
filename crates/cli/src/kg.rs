@@ -235,6 +235,13 @@ pub struct GraphArg {
   /// Drop rows under this path (repeatable).
   #[clap(long, value_name = "PREFIX")]
   except: Vec<String>,
+  /// Keep only rows in files of this class: `source`, `test`, `vendored`, `generated`
+  /// (repeatable).
+  #[clap(long = "class", value_name = "CLASS")]
+  classes: Vec<String>,
+  /// Keep only rows in files changed since this git ref (`worktree` = uncommitted edits).
+  #[clap(long, value_name = "REF")]
+  changed_since: Option<String>,
   /// (reachable) Traversal direction: `in` = everything reaching the symbol (transitive
   /// callers), `out` = everything it reaches, `both` = the undirected closure (hops may
   /// alternate orientation). Default `in`.
@@ -340,6 +347,12 @@ pub struct SearchArg {
   /// Leave this path out (repeatable).
   #[clap(long, value_name = "PREFIX")]
   except: Vec<String>,
+  /// Search only files of this class: `source`, `test`, `vendored`, `generated` (repeatable).
+  #[clap(long = "class", value_name = "CLASS")]
+  classes: Vec<String>,
+  /// Search only files changed since this git ref (`worktree` = uncommitted edits).
+  #[clap(long, value_name = "REF")]
+  changed_since: Option<String>,
   /// Show the base fused ordering and the encoder-reranked ordering side by side —
   /// ONE search, two views (requires the advanced embedder: `vorpal enable` or
   /// `encoderDir`). Text output only.
@@ -1124,7 +1137,11 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
     return Ok(ExitCode::SUCCESS);
   }
 
-  let scope_flags = !arg.within.is_empty() || !arg.except.is_empty() || arg.no_tests;
+  let scope_flags = !arg.within.is_empty()
+    || !arg.except.is_empty()
+    || !arg.classes.is_empty()
+    || arg.changed_since.is_some()
+    || arg.no_tests;
   let output = match (arg.format, &traversal) {
     (OutputFormat::Text, Some((direction, relations, max_depth, min_confidence))) if !scope_flags => {
       let kg = vorpal_index::Kg::load(&dir)
@@ -1147,29 +1164,63 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
         .ok()
         .and_then(|ids| ids.first().copied())
         .and_then(|id| kg.node(id).map(|view| view.path.to_string()));
-      let scope = cli_scope(&dir, &arg.within, &arg.except, arg.no_tests, anchor.as_deref())?;
+      let scope = cli_scope(
+        &dir,
+        &arg.within,
+        &arg.except,
+        &arg.classes,
+        arg.no_tests,
+        arg.changed_since.as_deref(),
+        anchor.as_deref(),
+      )?;
       let cursor = arg.page.cursor.as_deref();
       let value = match (&traversal, arg.verb) {
         (Some((direction, relations, max_depth, min_confidence)), _) => {
-          vorpal_index::records::selected_page_value(
-            vorpal_index::records::reach_records_page(
-              &kg,
-              Some(vorpal_index::resolve_index_dir(&dir)).as_deref(),
-              &target,
-              *direction,
-              relations,
-              *max_depth,
-              *min_confidence,
-              vorpal_index::records::PageRequest {
-                cursor,
-                limit: arg.page.limit,
-              },
-            )
-            .map_err(anyhow::Error::msg)?,
-            cursor,
-            arg.page.limit,
+          // The scope drops steps before paging, as the daemon's `reachable` does: a page
+          // of `limit` holds `limit` rows inside the scope. The CLI walk stays unbounded
+          // by default (scripts want the closure); `--depth` bounds it.
+          let gen_dir = vorpal_index::resolve_index_dir(&dir);
+          let mut outside = None;
+          let selected = match vorpal_index::records::reach_steps(
+            &kg,
+            &target,
+            *direction,
+            relations,
+            *max_depth,
+            *min_confidence,
           )
           .map_err(anyhow::Error::msg)?
+          {
+            vorpal_index::records::SelectedSteps::NoMatch => vorpal_index::records::SelectedPage::NoMatch,
+            vorpal_index::records::SelectedSteps::Ambiguous(candidates) => {
+              vorpal_index::records::SelectedPage::Ambiguous(candidates)
+            }
+            vorpal_index::records::SelectedSteps::Steps(steps) => {
+              let steps = match &scope {
+                Some(scope) => {
+                  let (kept, excluded) = vorpal_index::records::scope_steps(&kg, steps, scope);
+                  outside = Some(excluded);
+                  kept
+                }
+                None => steps,
+              };
+              vorpal_index::records::reach_page_from_steps(
+                &kg,
+                Some(gen_dir.as_path()),
+                relations,
+                &steps,
+                vorpal_index::records::PageRequest { cursor, limit: arg.page.limit },
+              )
+              .map_err(anyhow::Error::msg)?
+            }
+          };
+          let mut value = vorpal_index::records::selected_page_value(selected, cursor, arg.page.limit)
+            .map_err(anyhow::Error::msg)?;
+          if let (Some(scope), Some(outside)) = (&scope, outside) {
+            value["outsideScope"] = serde_json::json!(outside);
+            value["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+          }
+          value
         }
         (None, GraphVerb::Node) => vorpal_index::records::paged_value(
           &vorpal_index::records::listing_records(&kg, &target).map_err(anyhow::Error::msg)?,
@@ -1220,8 +1271,7 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
           value
         }
       };
-      // The traversal and listing arms page inside the index crate; their scope is a view
-      // over the page they return.
+      // The `node` listing pages inside the index crate; its scope is a view over the page.
       let value = match (&scope, value.get("outsideScope").is_some()) {
         (Some(scope), false) => scope_records_value(value, scope),
         _ => value,
@@ -1242,39 +1292,41 @@ pub fn run_graph(arg: GraphArg) -> Result<ExitCode> {
   Ok(ExitCode::SUCCESS)
 }
 
-/// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`).
-/// The default index path is the bare relative `.vorpal/index`, whose grandparent is the
-/// empty path: that is the current directory, as the daemon reads it.
+/// The source root a default-layout index dir implies (`<src>/.vorpal/index` → `<src>`;
+/// the bare relative `.vorpal/index` → the current directory).
 fn source_root_of(index_dir: &Path) -> Option<PathBuf> {
-  let vorpal = index_dir.parent()?;
-  if index_dir.file_name()? != "index" || vorpal.file_name()? != ".vorpal" {
-    return None;
-  }
-  let src = vorpal.parent()?;
-  let src = if src.as_os_str().is_empty() { Path::new(".") } else { src };
-  std::fs::canonicalize(src).ok()
+  vorpal_index::default_layout_root(index_dir)
 }
 
 /// The scope the CLI flags state, resolved as the MCP surface resolves its `scope`:
 /// relative entries against the source root, `@…` entries against `anchor`.
+#[allow(clippy::too_many_arguments)]
 fn cli_scope(
   index_dir: &Path,
   within: &[String],
   except: &[String],
+  classes: &[String],
   no_tests: bool,
+  changed_since: Option<&str>,
   anchor: Option<&str>,
 ) -> Result<Option<vorpal_index::PathScope>> {
-  if within.is_empty() && except.is_empty() && !no_tests {
+  if within.is_empty() && except.is_empty() && classes.is_empty() && !no_tests && changed_since.is_none() {
     return Ok(None);
   }
+  // `--no-tests` is the class filter without `test`; combined with `--class`, it drops
+  // `test` from the list, and naming `test` alongside it is a contradiction, not a guess.
+  let classes: Vec<String> = match (classes.is_empty(), no_tests) {
+    (true, true) => vec!["source".to_string(), "vendored".to_string(), "generated".to_string()],
+    (false, true) if classes.iter().any(|class| class == "test") => {
+      anyhow::bail!("--no-tests and --class test contradict each other")
+    }
+    _ => classes.to_vec(),
+  };
   let spec = vorpal_index::ScopeSpec {
     within: within.to_vec(),
     except: except.to_vec(),
-    classes: if no_tests {
-      vec!["source".to_string(), "vendored".to_string(), "generated".to_string()]
-    } else {
-      Vec::new()
-    },
+    classes,
+    changed_since: changed_since.map(str::to_string),
     ..Default::default()
   };
   let scope = vorpal_index::PathScope::from_spec(&spec, source_root_of(index_dir).as_deref(), anchor)
@@ -1319,6 +1371,17 @@ fn scope_records_value(mut value: serde_json::Value, scope: &vorpal_index::PathS
 pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
   arg.page.reject_for_text(arg.format)?;
   let dir = index_dir(arg.index);
+  // `--no-tests` on search is the filter's own `exclude_tests` facet; the scope carries
+  // the path, class, and changed-since filters, for both modes.
+  let within = cli_scope(
+    &dir,
+    &arg.within,
+    &arg.except,
+    &arg.classes,
+    false,
+    arg.changed_since.as_deref(),
+    None,
+  )?;
   if arg.code {
     let kg = vorpal_index::Kg::load(&dir)
       .map_err(|err| anyhow::anyhow!(err.to_string()))
@@ -1330,7 +1393,7 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
       &vorpal_core::matcher::PatternSpec::plain(&arg.query),
       arg.lang.as_deref(),
       arg.prefix.as_deref(),
-      None,
+      within.as_ref(),
       arg.k.max(1),
     )
     .map_err(anyhow::Error::msg)?;
@@ -1354,7 +1417,6 @@ pub fn run_search(arg: SearchArg) -> Result<ExitCode> {
     }
     return Ok(ExitCode::SUCCESS);
   }
-  let within = cli_scope(&dir, &arg.within, &arg.except, false, None)?;
   let filter = vorpal_index::SearchFilter {
     path_prefix: arg.prefix,
     path_suffix: arg.path,

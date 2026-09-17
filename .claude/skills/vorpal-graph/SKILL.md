@@ -41,12 +41,39 @@ Same-named definitions list as candidates. Narrow with:
 - `--ids` — append node ids to results, for chaining
 - `reachable` extras: `--depth N`, `--min-grade exact|constrained|heuristic` (edge resolution quality floor)
 
+## Filtering the answer
+
+Every relation verb and `reachable` take filters that limit the answer to part of the
+tree. Rows outside are counted (`outside scope: N rows not listed`, `outsideScope` in
+records), never listed, so the answer stays complete as a number.
+
+| flag | keeps |
+|---|---|
+| `--within PREFIX` | rows under this path (repeatable); `@file`, `@dir`, `@package` = the file / directory / nearest manifest of the symbol asked about |
+| `--except PREFIX` | everything except this path (repeatable) |
+| `--no-tests` | non-test files |
+| `--class source\|test\|vendored\|generated` | files of this class (repeatable) |
+| `--changed-since REF` | files changed since a git ref (`worktree` = uncommitted edits) |
+
+Paths are relative to the indexed tree (the default `.vorpal/index` names the current
+directory). A path that names nothing is an error, not an empty answer. The filter never
+changes the walk: a `reachable` row reached through an excluded file is still found.
+
+```
+vorpal graph callers kmalloc --all --within fs/ext4          # 14 rows, "outside scope: 2426"
+vorpal graph callers kmalloc --all --within fs --except fs/ext4 --no-tests
+vorpal graph callers vfs_read --within @dir                  # callers in vfs_read's own directory
+vorpal graph callers kmalloc --all --changed-since HEAD~3    # in the files the last 3 commits touched
+vorpal graph reachable vfs_read --direction out --depth 2 --within fs
+```
+
 ## Recipes
 
 - Orient in an unknown repo: `vorpal graph architecture --top 15`
 - Change-safety check before a refactor: `vorpal graph impact --since origin/main`
 - Everything that can reach a hot function: `vorpal graph reachable handle_request --depth 3`
 - Prune candidates: `vorpal graph dead --exported --no-tests --prefix src/`
+- Does my change allocate? `vorpal graph callers kmalloc --all --changed-since origin/main`
 - Read a definition without opening the file: `vorpal graph snippet parse_config --context 4`
 - Why is this edge believed? Use the MCP `why` tool or `vorpal query` for evidence detail.
 

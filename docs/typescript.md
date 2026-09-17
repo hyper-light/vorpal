@@ -147,6 +147,31 @@ const [callers, reach] = await Promise.all([
 The sync forms remain for scripts and REPLs; on the `Index` class they read from the
 pinned, mmapped generation in well under a millisecond.
 
+## Filtering
+
+`related`, `reachable`, and `search` (and their async twins) take a `scope` in their
+options: the same object the MCP tools take. Rows outside it are dropped and counted in
+`outsideScope`; a search generates its candidates inside it, so `k` results means `k`
+results in scope.
+
+```ts
+const index = Index.open('.vorpal/index')
+// callers of kmalloc inside fs/ext4: 14 rows, outsideScope: 2426
+index.related('callers', 'kmalloc', { all: true, scope: { within: ['fs/ext4'] } })
+// callers in the files the last three commits touched, source files only
+index.related('callers', 'kmalloc', { all: true, scope: { changedSince: 'HEAD~3', classes: ['source'] } })
+// what vfs_read reaches, limited to its own directory
+index.reachable('vfs_read', 'out', { maxDepth: 2, scope: { within: ['@dir'] } })
+// eight ext4 definitions, not eight tree-wide hits filtered down
+index.search('read file into user buffer', 8, { scope: { within: ['fs/ext4'] } })
+```
+
+`within` and `except` are paths relative to the indexed tree (the tree a
+`<src>/.vorpal/index` directory names) or absolute; `@file`, `@dir`, and `@package` are
+relative to the symbol a `related` or `reachable` call is about. `classes` keeps
+`source`, `test`, `vendored`, or `generated` files; `kind`, `lang`, and `exported` filter
+rows; `changedSince` takes a git ref or `'worktree'`. A path that names nothing throws.
+
 ## Large files in long-lived processes
 
 A process that calls `indexBuildAsync` repeatedly (a dev server re-indexing on save)

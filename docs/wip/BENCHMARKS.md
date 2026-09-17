@@ -6141,3 +6141,30 @@ on the kernel index in its default layout, hit three things in a row:
   names whichever facets the scope has (`changed since HEAD~3`, `kind Function`, …).
 
 The README examples in that section are the outputs of the fixed binary.
+
+
+## 0.10.2: the filters on every surface (2026-09-17)
+
+An audit after the 0.10.1 README section found the filters complete over MCP and on the
+main CLI paths, and absent elsewhere. Closed in 0.10.2:
+
+- **CLI**: `vorpal search --code … --within` now filters (the code-search branch dropped
+  the flag); `vorpal graph reachable … --within` scopes the whole answer before paging
+  (it scoped the page: with `--limit` fewer rows than asked for). New flags on `graph`
+  and `search`: `--class source|test|vendored|generated` (repeatable) and
+  `--changed-since REF`; `--no-tests` stays as the short form. Relative entries resolve
+  through one rule now (`vorpal_index::default_layout_root`), shared with the bindings.
+- **Node**: `GraphOptions`, `ReachOptions`, `SearchOptions` take `scope` (`within`,
+  `except`, `classes`, `kind`, `lang`, `exported`, `changedSince`); `related` and
+  `reachable` answers carry `outsideScope` and `scope`; `indexGraph` (text) refuses a
+  scope rather than ignoring it. Test: `scope_tests` in crates/napi/src/repo.rs.
+- **Python**: `related`, `reachable`, `search` and their async twins take `within`,
+  `exclude` (`except` is a keyword), `classes`, `changed_since`; the stub says so.
+- **Skills**: vorpal-graph (filter table + examples), vorpal-search (`--within`
+  preferred over `--prefix`, with why), vorpal-mcp (scope tool, roots, rings, radius,
+  the `local` profile).
+- **Docs**: getting-started (graph and search sections), typescript.md and python.md
+  (a Filtering section each), mcp.md (the CLI and binding spellings), README.
+
+Kernel checks on the release binary are recorded with the commands in the release notes
+below the examples.

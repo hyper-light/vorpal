@@ -87,7 +87,14 @@ Fuses exact/token name matching, lexical-embedding similarity, and graph popular
 ```sh
 vorpal search "retry with backoff"        # top 10 by default
 vorpal search "session store" -k 5        # top 5  (note: -k, no --k)
+vorpal search "session store" -k 5 --within src/store --no-tests   # only that directory
 ```
+
+Filters limit the search to part of the tree, and `-k` results means that many results
+inside it: `--within PATH` (repeatable), `--except PATH`, `--no-tests`,
+`--class source|test|vendored|generated`, `--changed-since REF` (`worktree` for
+uncommitted files). `--kind`, `--lang`, `--exported`, `--prefix`, and `--path` refine by
+what the definition is. `--code` (ast-grep pattern mode) takes the same filters.
 
 ### `graph` — navigate relationships
 
@@ -105,6 +112,24 @@ vorpal graph reachable handle --direction out --relations calls --depth 3
 
 Ambiguous names list candidates; refine with `--path <suffix>`, `--kind <function|struct|…>`,
 or an exact `--id`. Add `--ids` to print stable node ids you can feed back in.
+
+Every verb takes filters that limit the answer to part of the tree. Rows outside are
+counted, not listed:
+
+```sh
+vorpal graph callers kmalloc --all --within fs/ext4              # 14 rows, "outside scope: 2426 rows not listed"
+vorpal graph callers kmalloc --all --within fs --except fs/ext4 --no-tests
+vorpal graph callers vfs_read --within @dir                      # the directory vfs_read is defined in
+vorpal graph callers kmalloc --all --changed-since HEAD~3        # in files the last three commits touched
+vorpal graph reachable vfs_read --direction out --depth 2 --within fs
+```
+
+`--within` and `--except` take paths relative to the indexed tree (the default
+`.vorpal/index` names the current directory) or absolute ones; `@file`, `@dir`, and
+`@package` are relative to the symbol you asked about. `--class` keeps `source`, `test`,
+`vendored`, or `generated` files; `--no-tests` is the short form. A path that names
+nothing is an error. The filter never changes what the graph walks: a `reachable` row
+reached through an excluded file is still found.
 
 ### `run` — structural search & rewrite (ast-grep style)
 

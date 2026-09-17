@@ -108,6 +108,27 @@ idx.why(from_id=10, to_id=42)                            # evidence for an edge
 
 `Index` methods: `open`, `generation`, `node`, `nodes`, `related`, `reachable`, `why`, `search`.
 
+`related`, `reachable`, and `search` take the same filters the MCP tools do. Rows outside
+the filter are dropped and counted in `outsideScope`; a search generates its candidates
+inside it, so `k` results means `k` results in scope:
+
+```python
+# callers of kmalloc inside fs/ext4: 14 rows, outsideScope 2426
+idx.related("callers", "kmalloc", all=True, within=["fs/ext4"])
+# callers in the files the last three commits touched, source files only
+idx.related("callers", "kmalloc", all=True, changed_since="HEAD~3", classes=["source"])
+# what vfs_read reaches, limited to its own directory
+idx.reachable("vfs_read", direction="out", max_depth=2, within=["@dir"])
+# eight ext4 definitions, not eight tree-wide hits filtered down
+idx.search("read file into user buffer", k=8, within=["fs/ext4"])
+```
+
+`within` and `exclude` (`except` is a Python keyword) take paths relative to the indexed
+tree or absolute ones; `@file`, `@dir`, and `@package` are relative to the symbol a
+`related` or `reachable` call is about. `classes` keeps `source`, `test`, `vendored`, or
+`generated` files; `changed_since` takes a git ref or `"worktree"`. A path that names
+nothing raises.
+
 ## Async
 
 The async functions are **real native coroutines** backed by a Rust-owned worker pool — each

@@ -29,7 +29,7 @@ pub mod chunks;
 pub mod callsite;
 pub mod trigrams;
 pub mod scope;
-pub use scope::{PathScope, ScopeSpec};
+pub use scope::{PathScope, ScopeSpec, default_layout_root};
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;

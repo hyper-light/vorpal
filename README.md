@@ -287,7 +287,10 @@ $ vorpal search "read file into user buffer" -k 3 --within fs/ext4
 ```
 
 `text_search` and `code_search` accept the same filters. You can also filter by symbol
-kind (`"kind": "Function"`) or by language (`"lang": "python"`).
+kind (`"kind": "Function"`) or by language (`"lang": "python"`). On the command line the
+same filters are `--within`, `--except`, `--no-tests`, `--class`, and `--changed-since`;
+the Node and Python bindings take them as a `scope` option or keyword arguments
+([docs/typescript.md](docs/typescript.md), [docs/python.md](docs/python.md)).
 
 A few things stay true no matter what you filter. The filter only changes which rows
 come back, not how the graph is walked, so a caller that is only reachable through an

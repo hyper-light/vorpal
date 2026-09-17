@@ -166,31 +166,6 @@ fn record_to_py<T: serde::Serialize>(py: Python<'_>, record: &T) -> PyResult<Py<
   )
 }
 
-/// Map a selector outcome to `{"outcome": ..., "records": [...]}` — ambiguity is an answer
-/// (the candidates to refine with), never an exception.
-fn selected_to_py<T: serde::Serialize>(
-  py: Python<'_>,
-  selected: vorpal_index::records::Selected<T>,
-) -> PyResult<Py<PyAny>> {
-  use pyo3::types::PyDict;
-  let dict = PyDict::new(py);
-  match selected {
-    vorpal_index::records::Selected::NoMatch => {
-      dict.set_item("outcome", "no-match")?;
-      dict.set_item("records", pyo3::types::PyList::empty(py))?;
-    }
-    vorpal_index::records::Selected::Ambiguous(candidates) => {
-      dict.set_item("outcome", "ambiguous")?;
-      dict.set_item("records", record_to_py(py, &candidates)?)?;
-    }
-    vorpal_index::records::Selected::Hits(hits) => {
-      dict.set_item("outcome", "hits")?;
-      dict.set_item("records", record_to_py(py, &hits)?)?;
-    }
-  }
-  Ok(dict.into())
-}
-
 fn target_of(
   name: &str,
   path: Option<String>,
@@ -234,6 +209,8 @@ pub struct Index {
   kg: std::sync::Arc<vorpal_kg::Kg>,
   generation_dir: std::path::PathBuf,
   generation: String,
+  /// The tree a default-layout index dir names; relative scope entries resolve against it.
+  source_root: Option<std::path::PathBuf>,
 }
 
 #[pymethods]
@@ -253,6 +230,7 @@ impl Index {
       kg,
       generation_dir,
       generation,
+      source_root: vorpal_index::default_layout_root(root),
     })
   }
 
@@ -290,7 +268,12 @@ impl Index {
   /// Typed edge query (`callers`/`references`/`importers`/`implementors`/`typeusers`):
   /// `{"outcome": "hits"|"ambiguous"|"no-match", "records": [...]}`, each hit carrying its
   /// resolution grade.
-  #[pyo3(signature = (verb, name, path=None, kind=None, id=None, all=false))]
+  /// `within` / `exclude` / `classes` / `changed_since` filter the answer's rows (the MCP
+  /// `scope`): rows outside are dropped and counted in `outsideScope`. Paths are relative
+  /// to the source root or absolute; `@file`, `@dir`, `@package` bind to the symbol asked
+  /// about; `classes` keeps `source`, `test`, `vendored`, `generated` files;
+  /// `changed_since` keeps files changed since a git ref (`"worktree"` = uncommitted edits).
+  #[pyo3(signature = (verb, name, path=None, kind=None, id=None, all=false, within=None, exclude=None, classes=None, changed_since=None))]
   #[allow(clippy::too_many_arguments)]
   pub fn related(
     &self,
@@ -301,19 +284,31 @@ impl Index {
     kind: Option<String>,
     id: Option<u64>,
     all: bool,
+    within: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    classes: Option<Vec<String>>,
+    changed_since: Option<String>,
   ) -> PyResult<Py<PyAny>> {
-    let selected = vorpal_index::records::related_records(
+    let value = related_value(
       &self.kg,
+      self.source_root.as_deref(),
       verb,
-      &target_of(name, path, kind, id, all),
+      name,
+      path,
+      kind,
+      id,
+      all,
+      ScopeArgs { within, exclude, classes, changed_since },
     )
     .map_err(PyRuntimeError::new_err)?;
-    selected_to_py(py, selected)
+    record_to_py(py, &value)
   }
 
   /// Typed relation-restricted traversal: BFS steps with depth, parent (`via`), relation,
   /// and grade — the same contract as the CLI/MCP `reachable`.
-  #[pyo3(signature = (name, direction, relations=None, max_depth=None, min_grade=None, path=None, kind=None, id=None, all=false))]
+  /// Same scope keywords as `related`; the walk itself is unchanged (a node reached through
+  /// a file outside the scope is still found, with its `via`).
+  #[pyo3(signature = (name, direction, relations=None, max_depth=None, min_grade=None, path=None, kind=None, id=None, all=false, within=None, exclude=None, classes=None, changed_since=None))]
   #[allow(clippy::too_many_arguments)]
   pub fn reachable(
     &self,
@@ -327,48 +322,29 @@ impl Index {
     kind: Option<String>,
     id: Option<u64>,
     all: bool,
+    within: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    classes: Option<Vec<String>>,
+    changed_since: Option<String>,
   ) -> PyResult<Py<PyAny>> {
-    let dir = match direction {
-      "in" => vorpal_kg::Direction::In,
-      "out" => vorpal_kg::Direction::Out,
-      other => {
-        return Err(PyRuntimeError::new_err(format!(
-          "direction must be \"in\" or \"out\", got '{other}'"
-        )));
-      }
-    };
-    let relations = match relations {
-      None => vec![vorpal_kg::EdgeType::CALLS],
-      Some(names) => {
-        let mut out = Vec::with_capacity(names.len());
-        for name in &names {
-          out.push(
-            vorpal_kg::EdgeType::from_name(name)
-              .ok_or_else(|| PyRuntimeError::new_err(format!("unknown relation '{name}'")))?,
-          );
-        }
-        if out.is_empty() {
-          vec![vorpal_kg::EdgeType::CALLS]
-        } else {
-          out
-        }
-      }
-    };
-    let min_confidence =
-      vorpal_index::min_confidence_for_grade(min_grade).map_err(to_py_err)?;
-    let selected = vorpal_index::records::reach_records(
+    let value = reachable_value(
       &self.kg,
-      &target_of(name, path, kind, id, all),
-      dir,
-      &relations,
-      max_depth.filter(|&d| d > 0),
-      min_confidence,
+      self.source_root.as_deref(),
+      name,
+      direction,
+      relations,
+      max_depth,
+      min_grade,
+      path,
+      kind,
+      id,
+      all,
+      ScopeArgs { within, exclude, classes, changed_since },
     )
     .map_err(PyRuntimeError::new_err)?;
-    selected_to_py(py, selected)
+    record_to_py(py, &value)
   }
 
-  /// Typed evidence (`why`): edge form (`to_id`) or absence form (`name`).
   #[pyo3(signature = (from_id, to_id=None, name=None))]
   pub fn why(
     &self,
@@ -389,7 +365,10 @@ impl Index {
   /// Typed hybrid search over the pinned generation: hits with score and per-channel
   /// ranking provenance. Structured filters (IMPROVEMENTS #9) apply to every channel
   /// before ranking, so `k` results means `k` matching results.
-  #[pyo3(signature = (query, k=10, path=None, prefix=None, kind=None, lang=None, exported=false, exclude_tests=false))]
+  /// `within` / `exclude` / `classes` / `changed_since` search inside a scope: candidates
+  /// are generated inside it, so `k` results means `k` results in scope. `@…` entries need
+  /// a symbol and are refused here.
+  #[pyo3(signature = (query, k=10, path=None, prefix=None, kind=None, lang=None, exported=false, exclude_tests=false, within=None, exclude=None, classes=None, changed_since=None))]
   #[allow(clippy::too_many_arguments)]
   pub fn search(
     &self,
@@ -402,22 +381,28 @@ impl Index {
     lang: Option<String>,
     exported: bool,
     exclude_tests: bool,
+    within: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    classes: Option<Vec<String>>,
+    changed_since: Option<String>,
   ) -> PyResult<Py<PyAny>> {
-    let filter = vorpal_index::SearchFilter {
-      path_prefix: prefix,
-      path_suffix: path,
-      kind,
-      lang,
-      exported_only: exported,
-      exclude_tests,
-      within: None,
-    };
     // The pinned generation dir IS the index dir here (resolve is idempotent), so a rebuild
     // landing mid-session cannot swap the ranking's graph or ANN tier under us.
-    let records =
-      vorpal_index::search_records_filtered(&self.generation_dir, query, k, &filter)
-        .map_err(to_py_err)?;
-    record_to_py(py, &records)
+    let value = search_value(
+      &self.generation_dir,
+      self.source_root.as_deref(),
+      query,
+      k,
+      path,
+      prefix,
+      kind,
+      lang,
+      exported,
+      exclude_tests,
+      ScopeArgs { within, exclude, classes, changed_since },
+    )
+    .map_err(PyRuntimeError::new_err)?;
+    record_to_py(py, &value)
   }
 
   // ── Async twins: the same reads, GIL-free on the worker pool, resolved on the
@@ -447,7 +432,7 @@ impl Index {
   }
 
   /// `related`, as an awaitable.
-  #[pyo3(signature = (verb, name, path=None, kind=None, id=None, all=false))]
+  #[pyo3(signature = (verb, name, path=None, kind=None, id=None, all=false, within=None, exclude=None, classes=None, changed_since=None))]
   #[allow(clippy::too_many_arguments)]
   pub fn related_async(
     &self,
@@ -458,15 +443,31 @@ impl Index {
     kind: Option<String>,
     id: Option<u64>,
     all: bool,
+    within: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    classes: Option<Vec<String>>,
+    changed_since: Option<String>,
   ) -> PyResult<Py<PyAny>> {
     let kg = self.kg.clone();
+    let root = self.source_root.clone();
     crate::async_bridge::dispatch(py, move || {
-      related_value(&kg, &verb, &name, path, kind, id, all).map(crate::async_bridge::Pythonized)
+      related_value(
+        &kg,
+        root.as_deref(),
+        &verb,
+        &name,
+        path,
+        kind,
+        id,
+        all,
+        ScopeArgs { within, exclude, classes, changed_since },
+      )
+      .map(crate::async_bridge::Pythonized)
     })
   }
 
   /// `reachable`, as an awaitable — the traversal most worth taking off the loop.
-  #[pyo3(signature = (name, direction, relations=None, max_depth=None, min_grade=None, path=None, kind=None, id=None, all=false))]
+  #[pyo3(signature = (name, direction, relations=None, max_depth=None, min_grade=None, path=None, kind=None, id=None, all=false, within=None, exclude=None, classes=None, changed_since=None))]
   #[allow(clippy::too_many_arguments)]
   pub fn reachable_async(
     &self,
@@ -480,11 +481,17 @@ impl Index {
     kind: Option<String>,
     id: Option<u64>,
     all: bool,
+    within: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    classes: Option<Vec<String>>,
+    changed_since: Option<String>,
   ) -> PyResult<Py<PyAny>> {
     let kg = self.kg.clone();
+    let root = self.source_root.clone();
     crate::async_bridge::dispatch(py, move || {
       reachable_value(
         &kg,
+        root.as_deref(),
         &name,
         &direction,
         relations,
@@ -494,6 +501,7 @@ impl Index {
         kind,
         id,
         all,
+        ScopeArgs { within, exclude, classes, changed_since },
       )
       .map(crate::async_bridge::Pythonized)
     })
@@ -515,7 +523,7 @@ impl Index {
   }
 
   /// `search`, as an awaitable.
-  #[pyo3(signature = (query, k=10, path=None, prefix=None, kind=None, lang=None, exported=false, exclude_tests=false))]
+  #[pyo3(signature = (query, k=10, path=None, prefix=None, kind=None, lang=None, exported=false, exclude_tests=false, within=None, exclude=None, classes=None, changed_since=None))]
   #[allow(clippy::too_many_arguments)]
   pub fn search_async(
     &self,
@@ -528,11 +536,28 @@ impl Index {
     lang: Option<String>,
     exported: bool,
     exclude_tests: bool,
+    within: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    classes: Option<Vec<String>>,
+    changed_since: Option<String>,
   ) -> PyResult<Py<PyAny>> {
     let generation_dir = self.generation_dir.clone();
+    let root = self.source_root.clone();
     crate::async_bridge::dispatch(py, move || {
-      search_value(&generation_dir, &query, k, path, prefix, kind, lang, exported, exclude_tests)
-        .map(crate::async_bridge::Pythonized)
+      search_value(
+        &generation_dir,
+        root.as_deref(),
+        &query,
+        k,
+        path,
+        prefix,
+        kind,
+        lang,
+        exported,
+        exclude_tests,
+        ScopeArgs { within, exclude, classes, changed_since },
+      )
+      .map(crate::async_bridge::Pythonized)
     })
   }
 }
@@ -542,6 +567,8 @@ impl Index {
 // sync methods perform, GIL-free, serialized once to `serde_json::Value` for the
 // bridge's pythonizing resolver. ──
 
+/// Map a selector outcome to `{"outcome": ..., "records": [...]}` — ambiguity is an answer
+/// (the candidates to refine with), never an exception.
 fn selected_to_value<T: serde::Serialize>(
   selected: vorpal_index::records::Selected<T>,
 ) -> Result<serde_json::Value, String> {
@@ -578,24 +605,109 @@ pub(crate) fn nodes_value(
   serde_json::to_value(records).map_err(|e| e.to_string())
 }
 
+/// The scope keywords every query method takes (the MCP `scope` object, spelled for
+/// Python: `exclude` because `except` is a keyword).
+#[derive(Default)]
+pub(crate) struct ScopeArgs {
+  pub within: Option<Vec<String>>,
+  pub exclude: Option<Vec<String>>,
+  pub classes: Option<Vec<String>>,
+  pub changed_since: Option<String>,
+}
+
+impl ScopeArgs {
+  fn spec(&self) -> vorpal_index::ScopeSpec {
+    vorpal_index::ScopeSpec {
+      within: self.within.clone().unwrap_or_default(),
+      except: self.exclude.clone().unwrap_or_default(),
+      classes: self.classes.clone().unwrap_or_default(),
+      changed_since: self.changed_since.clone(),
+      ..Default::default()
+    }
+  }
+
+  /// Resolve against the index's source root, binding `@…` entries to `anchor` (the
+  /// symbol's own path). An empty scope is no scope; a deferred entry with no anchor is
+  /// an error, never a silently unscoped answer.
+  fn resolve(
+    &self,
+    source_root: Option<&std::path::Path>,
+    anchor: Option<&str>,
+  ) -> Result<Option<vorpal_index::PathScope>, String> {
+    let spec = self.spec();
+    if spec.is_empty() {
+      return Ok(None);
+    }
+    let scope = vorpal_index::PathScope::from_spec(&spec, source_root, anchor)?;
+    if !scope.deferred().is_empty() {
+      return Err(format!(
+        "scope entries {} bind to a symbol: use them on related or reachable, not search",
+        scope.deferred().join(", ")
+      ));
+    }
+    Ok((!scope.is_empty()).then_some(scope))
+  }
+}
+
+/// The symbol's own path, for `@file` / `@dir` / `@package` and nearest-first ordering.
+fn anchor_of(kg: &vorpal_kg::Kg, target: &vorpal_index::GraphTarget) -> Option<String> {
+  vorpal_index::resolve_target(kg, target)
+    .ok()
+    .and_then(|ids| ids.first().copied())
+    .and_then(|id| kg.node(id).map(|view| view.path.to_string()))
+}
+
+fn stamp_scope(value: &mut serde_json::Value, scope: Option<&vorpal_index::PathScope>, outside: Option<usize>) {
+  if let Some(scope) = scope {
+    value["scope"] = serde_json::to_value(scope).unwrap_or(serde_json::Value::Null);
+    if let Some(outside) = outside {
+      value["outsideScope"] = serde_json::json!(outside);
+    }
+  }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn related_value(
   kg: &vorpal_kg::Kg,
+  source_root: Option<&std::path::Path>,
   verb: &str,
   name: &str,
   path: Option<String>,
   kind: Option<String>,
   id: Option<u64>,
   all: bool,
+  scope: ScopeArgs,
 ) -> Result<serde_json::Value, String> {
-  let selected =
-    vorpal_index::records::related_records(kg, verb, &target_of(name, path, kind, id, all))?;
-  selected_to_value(selected)
+  let target = target_of(name, path, kind, id, all);
+  let selected = vorpal_index::records::related_records(kg, verb, &target)?;
+  let anchor = anchor_of(kg, &target);
+  let scope = scope.resolve(source_root, anchor.as_deref())?;
+  // The scope is a view over the rows, and the rows come nearest the symbol's file first,
+  // as the daemon's `graph` answers do.
+  let (selected, outside) = match (selected, &scope) {
+    (vorpal_index::records::Selected::Hits(hits), Some(scope)) => {
+      let before = hits.len();
+      let mut kept: Vec<_> = hits
+        .into_iter()
+        .filter(|hit| vorpal_index::records::scope_admits_record(scope, &hit.node))
+        .collect();
+      if let Some(anchor) = anchor.as_deref() {
+        vorpal_index::records::order_by_proximity(&mut kept, anchor);
+      }
+      let outside = before - kept.len();
+      (vorpal_index::records::Selected::Hits(kept), Some(outside))
+    }
+    (other, _) => (other, None),
+  };
+  let mut value = selected_to_value(selected)?;
+  stamp_scope(&mut value, scope.as_ref(), outside);
+  Ok(value)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reachable_value(
   kg: &vorpal_kg::Kg,
+  source_root: Option<&std::path::Path>,
   name: &str,
   direction: &str,
   relations: Option<Vec<String>>,
@@ -605,6 +717,7 @@ pub(crate) fn reachable_value(
   kind: Option<String>,
   id: Option<u64>,
   all: bool,
+  scope: ScopeArgs,
 ) -> Result<serde_json::Value, String> {
   let dir = match direction {
     "in" => vorpal_kg::Direction::In,
@@ -630,15 +743,33 @@ pub(crate) fn reachable_value(
   };
   let min_confidence =
     vorpal_index::min_confidence_for_grade(min_grade).map_err(|e| e.to_string())?;
+  let target = target_of(name, path, kind, id, all);
   let selected = vorpal_index::records::reach_records(
     kg,
-    &target_of(name, path, kind, id, all),
+    &target,
     dir,
     &relations,
     max_depth.filter(|&d| d > 0),
     min_confidence,
   )?;
-  selected_to_value(selected)
+  // A view over the reached rows: the walk is unchanged, rows outside are counted.
+  let anchor = anchor_of(kg, &target);
+  let scope = scope.resolve(source_root, anchor.as_deref())?;
+  let (selected, outside) = match (selected, &scope) {
+    (vorpal_index::records::Selected::Hits(rows), Some(scope)) => {
+      let before = rows.len();
+      let kept: Vec<_> = rows
+        .into_iter()
+        .filter(|row| vorpal_index::records::scope_admits_record(scope, &row.node))
+        .collect();
+      let outside = before - kept.len();
+      (vorpal_index::records::Selected::Hits(kept), Some(outside))
+    }
+    (other, _) => (other, None),
+  };
+  let mut value = selected_to_value(selected)?;
+  stamp_scope(&mut value, scope.as_ref(), outside);
+  Ok(value)
 }
 
 pub(crate) fn why_value(
@@ -657,6 +788,7 @@ pub(crate) fn why_value(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn search_value(
   generation_dir: &std::path::Path,
+  source_root: Option<&std::path::Path>,
   query: &str,
   k: usize,
   path: Option<String>,
@@ -665,7 +797,9 @@ pub(crate) fn search_value(
   lang: Option<String>,
   exported: bool,
   exclude_tests: bool,
+  scope: ScopeArgs,
 ) -> Result<serde_json::Value, String> {
+  let within = scope.resolve(source_root, None)?;
   let filter = vorpal_index::SearchFilter {
     path_prefix: prefix,
     path_suffix: path,
@@ -673,7 +807,7 @@ pub(crate) fn search_value(
     lang,
     exported_only: exported,
     exclude_tests,
-    within: None,
+    within,
   };
   let records = vorpal_index::search_records_filtered(generation_dir, query, k, &filter)
     .map_err(|e| e.to_string())?;

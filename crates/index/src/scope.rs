@@ -658,6 +658,20 @@ fn package_root(dir: &Path, root: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// `path` is `prefix` itself or lies below `prefix/`.
+/// The source root a default-layout index directory implies: `<src>/.vorpal/index` names
+/// `<src>`, and the bare relative `.vorpal/index` (every CLI default) names the current
+/// directory. Canonical, as node paths are. `None` for any other layout: relative scope
+/// entries then have nothing to resolve against and are refused; absolute ones still work.
+pub fn default_layout_root(index_dir: &Path) -> Option<PathBuf> {
+  let vorpal = index_dir.parent()?;
+  if index_dir.file_name()? != "index" || vorpal.file_name()? != ".vorpal" {
+    return None;
+  }
+  let src = vorpal.parent()?;
+  let src = if src.as_os_str().is_empty() { Path::new(".") } else { src };
+  std::fs::canonicalize(src).ok()
+}
+
 fn under(path: &str, prefix: &str) -> bool {
   path.len() >= prefix.len()
     && path.starts_with(prefix)
@@ -682,6 +696,19 @@ pub fn shared_dir_segments(path: &str, anchor_dir: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn default_layout_root_names_the_tree_and_nothing_else() {
+    let base = std::env::temp_dir().join(format!("vorpal-scope-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("tree/.vorpal/index")).unwrap();
+    std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+    let root = super::default_layout_root(&base.join("tree/.vorpal/index")).expect("default layout");
+    assert_eq!(root, std::fs::canonicalize(base.join("tree")).unwrap());
+    assert!(super::default_layout_root(&base.join("elsewhere")).is_none());
+    assert!(super::default_layout_root(&base.join("tree/.vorpal")).is_none());
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
   use super::*;
 
   /// A real tree, because entries must exist: `<base>/fs/read_write.c`, `<base>/fsnotify/`,

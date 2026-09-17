@@ -17,6 +17,29 @@ export interface GraphOptions {
   all?: boolean
   /** Append node ids to rendered result lines (`indexGraph`). */
   ids?: boolean
+  /**
+   * Filter the answer's rows (`Index.related`): rows outside the scope are dropped and
+   * counted in `outsideScope`. `indexGraph` renders the unscoped text answer and rejects it.
+   */
+  scope?: ScopeOptions
+}
+
+/**
+ * Path and row filters, the MCP `scope` object. `within` / `except` are path prefixes
+ * relative to the source root (the tree a default-layout `<src>/.vorpal/index` names) or
+ * absolute; `@file`, `@dir`, `@package` bind to the symbol a `related` / `reachable` call
+ * is about. `classes` keeps `source`, `test`, `vendored`, `generated` files; `kind`,
+ * `lang`, `exported` filter rows; `changedSince` keeps files changed since a git ref
+ * (`worktree` = uncommitted edits). A path that names nothing is an error.
+ */
+export interface ScopeOptions {
+  within?: Array<string>
+  except?: Array<string>
+  classes?: Array<string>
+  kind?: string
+  lang?: string
+  exported?: boolean
+  changedSince?: string
 }
 
 /** Options for `Index.reachable` / `Index.reachableAsync`. */
@@ -35,6 +58,11 @@ export interface ReachOptions {
   maxDepth?: number
   /** Only traverse edges at this resolution grade or better: `exact` | `constrained` | `heuristic`. */
   minGrade?: string
+  /**
+   * Filter the reached rows; the walk itself is unchanged (a node reached through a file
+   * outside the scope is still found, with its `via`). Dropped rows are counted in `outsideScope`.
+   */
+  scope?: ScopeOptions
 }
 
 /** Structured filters for `Index.search` / `Index.searchAsync`. */
@@ -51,6 +79,11 @@ export interface SearchOptions {
   exported?: boolean
   /** Exclude test-classified paths. */
   excludeTests?: boolean
+  /**
+   * Search inside a scope: candidates are generated inside it, so `k` results means `k`
+   * results in scope. `@…` entries need a symbol and are rejected here.
+   */
+  scope?: ScopeOptions
 }
 
 /** One labelled tuning query for `indexTune`. */

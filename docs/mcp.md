@@ -249,7 +249,8 @@ replaced by roots.
 waiting for a symbol, and the population the scope covers (rows, ranges, files). `within:
 []` or `scope: {}` on a call is the unscoped view for that call; `scope {clear: true}`
 removes the default; `scope {}` shows it. On the CLI, `vorpal graph` and `vorpal search`
-take `--within`, `--except`, and `--no-tests`.
+take `--within`, `--except`, `--no-tests`, `--class`, and `--changed-since`; the Node and
+Python bindings take the same fields as a `scope` option (Node) or keywords (Python).
 
 **Rings.** `reachable` and `impact` return one hop by default (`maxDepth: 1`, the direct
 neighbours) and state what the next ring would add as `frontier`. `max_depth: 2` widens by
